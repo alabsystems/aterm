@@ -1218,6 +1218,129 @@ fn a_trust_dialog_for_the_folder_its_starter_trusted_is_answered_under_no_root()
     }
 }
 
+/// ANOTHER HARNESS'S FOLDER-TRUST DIALOG ON A WORKER (`spawn
+/// agent=agy|muse cwd=…`, [`spawned_trust`]): under the safe rules, agy's
+/// and Muse Code's measured dialogs are answered by [`RULE_TRUST_DIALOG`]
+/// where the folder the dialog names is the one the session's starter
+/// trusted and the session stands in it, by Enter on their trust option,
+/// guarded on the path's row — and so at full power on the worker its spawn
+/// named. NEGATIVE CONTROLS: no trusted folder, a trusted folder beside the
+/// dialog's, a trusted folder the session no longer stands in, and a trust
+/// root that holds the folder (the root rule is Claude Code's alone) each
+/// escalate.
+#[test]
+fn another_harnesss_trust_dialog_is_answered_only_in_its_workers_trusted_folder() {
+    use aterm_phase::{agy::fixtures as agy, muse::fixtures as muse};
+    let focus = |label: &str| Choice::Focus {
+        steps: 0,
+        label: label.to_string(),
+    };
+    for (program, text, folder, want, guarded) in [
+        (
+            "agy",
+            agy::BOX_TRUST,
+            "/tmp/at.XXXXXX/work",
+            focus("Yes, I trust this folder"),
+            "/tmp/at.XXXXXX/work",
+        ),
+        (
+            "muse",
+            muse::TRUST_1_4_10,
+            "/private/tmp/at.lab0/proj",
+            focus("Trust and continue"),
+            "Workspace: /private/tmp/at.lab0/proj",
+        ),
+    ] {
+        let rows = phase_fixtures::screen(text);
+        let mut worker = ctx();
+        worker.cwd = PathBuf::from(folder);
+        worker.trusted_cwd = Some(PathBuf::from(folder));
+        let d = decide_screen(Some(program), &rows, &worker).expect("a box");
+        assert_eq!(pressed(&d), (RULE_TRUST_DIALOG, want), "{program}");
+        let Decision::Approve { guard, .. } = &d else {
+            unreachable!()
+        };
+        let row = rows
+            .iter()
+            .find(|r| r.contains(guarded))
+            .unwrap_or_else(|| panic!("{program}: no row {guarded:?}"));
+        assert_eq!(guard, &row_guard(row), "{program}");
+        // Full power answers it by the same rule there, on the worker its
+        // spawn named too.
+        let mut all = worker.clone();
+        all.approve = Approve::All;
+        let d = decide_screen(Some(program), &rows, &all).expect("a box");
+        assert_eq!(approved(&d), Some(RULE_TRUST_DIALOG), "{program}");
+        all.worker_agent = Program::ALL.into_iter().find(|p| p.name() == program);
+        assert!(all.worker_agent.is_some(), "{program}");
+        let d = decide_screen(Some(program), &rows, &all).expect("a box");
+        assert_eq!(approved(&d), Some(RULE_TRUST_DIALOG), "{program}");
+        // The controls.
+        let mut none = worker.clone();
+        none.trusted_cwd = None;
+        let beside = PathBuf::from(format!("{folder}2"));
+        let mut aside = worker.clone();
+        aside.trusted_cwd = Some(beside.clone());
+        let mut moved = worker.clone();
+        moved.cwd = beside;
+        let mut rooted = worker.clone();
+        rooted.trusted_cwd = None;
+        rooted.set_trust_roots(&[folder.to_string()], 502);
+        for (what, c) in [
+            ("no trusted folder", none),
+            ("a trusted folder beside it", aside),
+            ("the session moved", moved),
+            ("a trust root", rooted),
+        ] {
+            let d = decide_screen(Some(program), &rows, &c).expect("a box");
+            assert!(
+                matches!(d, Decision::Escalate { .. }),
+                "{program}, {what}: {d:?}"
+            );
+        }
+    }
+}
+
+/// A GEMINI CLI WORKER'S FOLDER-TRUST DIALOG IS NEVER PRESSED
+/// ([`spawned_trust`], [`gemini_worker_trust`]): it names its folder by the
+/// last component alone (`Trust folder (proj)`), which a folder beside the
+/// trusted one shares, and its `Trust folder` relaunches Gemini CLI with
+/// its argv — the worker's task, sent a second time. Under the safe rules it
+/// escalates even in the folder the spawn trusted, the session standing
+/// there; at full power (the default) on a session whose spawn started
+/// Gemini CLI it escalates as well, never [`RULE_TRUST_ANY`]'s press.
+/// NEGATIVE CONTROL: full power on a Gemini CLI no spawn started (a
+/// person's own, in its tab) still presses its trust option, as before.
+#[test]
+fn a_gemini_cli_workers_trust_dialog_is_never_pressed() {
+    let rows = phase_fixtures::screen(aterm_phase::gemini::fixtures::TRUST);
+    let folder = "/private/tmp/at.7EJB/proj";
+    let mut worker = ctx();
+    worker.cwd = PathBuf::from(folder);
+    worker.trusted_cwd = Some(PathBuf::from(folder));
+    worker.worker_agent = Some(Program::Gemini);
+    let d = decide_screen(Some("gemini"), &rows, &worker).expect("a box");
+    assert!(
+        reason(&d).contains("names no folder by its path"),
+        "the safe rules: {d:?}"
+    );
+    let mut safe_unnamed = worker.clone();
+    safe_unnamed.worker_agent = None;
+    let d = decide_screen(Some("gemini"), &rows, &safe_unnamed).expect("a box");
+    assert!(matches!(d, Decision::Escalate { .. }), "{d:?}");
+    let mut all = worker.clone();
+    all.approve = Approve::All;
+    let d = decide_screen(Some("gemini"), &rows, &all).expect("a box");
+    assert!(
+        reason(&d).contains("folder-trust dialog on a worker"),
+        "full power on its worker: {d:?}"
+    );
+    // NEGATIVE CONTROL: no spawn's worker.
+    all.worker_agent = None;
+    let d = decide_screen(Some("gemini"), &rows, &all).expect("a box");
+    assert_eq!(approved(&d), Some(RULE_TRUST_ANY), "a person's own: {d:?}");
+}
+
 // --- the usage-limit dialog ------------------------------------------------
 
 const STOP: &str = "Stop and wait for limit to reset";
@@ -4331,8 +4454,18 @@ fn every_rm_breaker_kind_is_named_and_full_power_presses_each() {
             "working directory or its ancestor",
         ),
         (
+            "Dangerous rm operation on mounted drive path: /Volumes/x",
+            "mounted drive path",
+        ),
+        (
             "Dangerous rm operation — too many command substitutions to analyze (65)",
-            "too many command substitutions to analyze",
+            "not ruled out: too many command substitutions to analyze; the command need not name rm",
+        ),
+        (
+            "Dangerous rm operation not ruled out — some nested commands or function substitutions \
+             could not be analyzed",
+            "not ruled out: some nested commands or function substitutions could not be analyzed; \
+             the command need not name rm",
         ),
         (
             "Dangerous rmdir operation on critical path: /usr",
@@ -6580,6 +6713,50 @@ fn a_box_taller_than_the_screen_in_a_bypass_session_is_declined_with_its_flagged
     assert_eq!(approved(&d), Some(RULE_ALLOW_ONCE), "{d:?}");
 }
 
+/// The same tall box under a breaker the vendor drew because it could not rule
+/// an rm out (2.1.307 draws these over commands with no rm, MEASURED): the
+/// decline tells the worker to split the line, any removal on its own with
+/// literal paths, never to rerun "the removal" as if the line held one.
+/// NEGATIVE CONTROL: the possibly-empty-variable note keeps its quoted
+/// invocation's fix (above), and a mounted-drive note, which names its
+/// target, keeps the removal's.
+#[test]
+fn a_tall_box_under_a_not_ruled_out_breaker_is_declined_with_a_split() {
+    let note = " │ Dangerous rm operation on possibly-empty variable path: $S/$1 in `rm -rf $S/$1` \
+                (bind $1 and rewrite its $S as \"${S:?}\" or use a literal path)";
+    let screen = owner_screen(OWNER_COMMAND);
+    for why in [
+        "— too many command substitutions to analyze (65)",
+        "not ruled out — too many command substitutions to analyze (65)",
+        "not ruled out — some nested commands or function substitutions could not be analyzed",
+    ] {
+        let rows = with_row(&screen, note, &format!(" │ Dangerous rm operation {why}"));
+        for level in [Approve::All, Approve::Safe] {
+            let d = on_screen(&rows, &owner_ctx(level));
+            let (rule, text) = declined(&d);
+            assert_eq!(rule, RULE_TALL_BOX, "{why}, {level:?}");
+            assert!(
+                text.contains("Split it into shorter commands with fewer substitutions")
+                    && text.contains("literal absolute paths")
+                    && !text.contains("Run the removal"),
+                "{why}, {level:?}: {text}"
+            );
+        }
+    }
+    let rows = with_row(
+        &screen,
+        note,
+        " │ Dangerous rm operation on mounted drive path: /Volumes/x",
+    );
+    let d = on_screen(&rows, &owner_ctx(Approve::Safe));
+    let (rule, text) = declined(&d);
+    assert_eq!(rule, RULE_TALL_BOX);
+    assert!(
+        text.contains("Run the removal on its own") && !text.contains("Split it"),
+        "{text}"
+    );
+}
+
 // --- a subagent's rm breaker in a bypass session -------------------------------
 
 /// A bypass session's screen rebuilt from a screenshot: a `general-purpose`
@@ -8287,4 +8464,178 @@ fn a_trace_names_the_rule_that_decided() {
         decide_traced(&reading, &read, &ctx(), &mut none_kept),
         on_screen(&read, &ctx())
     );
+}
+
+/// CLAUDE CODE 2.1.307'S BOXES AS THE LAB SAW THEM ANSWERED (crates/aterm-lab,
+/// 2026-10-21; docs/measured/claude-code-2.1.307-2026-10-21.md): at full
+/// power the Bash, Write and Edit boxes get the one-shot `1`, never the
+/// standing grant or the mode switch beside it; `Ready to code?` gets its
+/// least-power yes, `2`; the ask rule's and the hook's boxes go to a person at
+/// every level; the rm breaker's `not ruled out — …` boxes are pressed `1` by
+/// full power only, named as the breaker of their kind, and go to a person
+/// under the safe rules, never as a mere vendor note. NEGATIVE CONTROLS: under
+/// `approve = "none"` every box goes to a person, and each screen cut above
+/// its box holds nothing to decide.
+#[test]
+fn the_2_1_307_lab_boxes_are_answered_as_measured() {
+    use phase_fixtures::{
+        BOX_BASH_ASK_RULE_2_1_307, BOX_BASH_HOOK_ASK_2_1_307, BOX_BASH_TOUCH_2_1_307,
+        BOX_EDIT_2_1_307, BOX_RM_MOUNTED_DRIVE_2_1_307, BOX_RM_NESTED_2_1_307,
+        BOX_RM_TOO_MANY_2_1_307, BOX_RM_TOO_MANY_NO_RM_2_1_307,
+        BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307, BOX_STATEMENT_FOLLOWS_16_2_1_307,
+        BOX_WRITE_CREATE_2_1_307, PLAN_READY_2_1_307, screen,
+    };
+    for (what, text, rule, choice) in [
+        (
+            "bash",
+            BOX_BASH_TOUCH_2_1_307,
+            RULE_ALLOW_ONCE,
+            Choice::Digit(1),
+        ),
+        (
+            "write",
+            BOX_WRITE_CREATE_2_1_307,
+            RULE_ALLOW_ONCE,
+            Choice::Digit(1),
+        ),
+        ("edit", BOX_EDIT_2_1_307, RULE_ALLOW_ONCE, Choice::Digit(1)),
+        ("plan", PLAN_READY_2_1_307, RULE_PLAN, Choice::Digit(2)),
+    ] {
+        let rows = screen(text);
+        let d = on_screen(&rows, &full());
+        assert_eq!(pressed(&d), (rule, choice), "{what}: {d:?}");
+        assert_eq!(
+            approved(&on_screen(&rows, &none(full()))),
+            None,
+            "{what}: none"
+        );
+    }
+    for (what, text) in [
+        ("ask rule", BOX_BASH_ASK_RULE_2_1_307),
+        ("hook", BOX_BASH_HOOK_ASK_2_1_307),
+    ] {
+        let rows = screen(text);
+        let full_bypass = ApprovalCtx {
+            bypass_mode: true,
+            ..full()
+        };
+        for (level, c) in [
+            ("full", full()),
+            ("full, bypass", full_bypass),
+            ("safe", ctx()),
+        ] {
+            let d = on_screen(&rows, &c);
+            assert!(
+                reason(&d)
+                    .starts_with("the owner's Claude Code settings send this box to a person"),
+                "{what}, {level}: {d:?}"
+            );
+        }
+    }
+    // The rm breaker, every 2.1.307 box of it MEASURED. The two kinds by
+    // which the vendor could not rule an rm out are named so, and as needing
+    // no rm in the command (2.1.307 draws them over `echo` and 65 `$(true)`,
+    // which aterm's own classifier reads as read-only). Full power presses
+    // `1`, naming the breaker; the safe rules hand each to a person, in a
+    // bypass session too (the rm rule resolves only an rm on a
+    // possibly-empty variable).
+    let too_many = "the rm circuit breaker (not ruled out: too many command substitutions to \
+                    analyze; the command need not name rm)";
+    for (what, text, why) in [
+        ("too many, rm", BOX_RM_TOO_MANY_2_1_307, too_many),
+        ("too many, no rm", BOX_RM_TOO_MANY_NO_RM_2_1_307, too_many),
+        (
+            "too many, no rm, bypass",
+            BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307,
+            too_many,
+        ),
+        (
+            "nested, no rm",
+            BOX_RM_NESTED_2_1_307,
+            "the rm circuit breaker (not ruled out: some nested commands or function \
+             substitutions could not be analyzed; the command need not name rm)",
+        ),
+        (
+            "mounted drive",
+            BOX_RM_MOUNTED_DRIVE_2_1_307,
+            "the rm circuit breaker (mounted drive path)",
+        ),
+    ] {
+        let rows = screen(text);
+        let full_bypass = ApprovalCtx {
+            bypass_mode: true,
+            ..full()
+        };
+        for (level, c) in [("full", full()), ("full, bypass", full_bypass)] {
+            match on_screen(&rows, &c) {
+                Decision::Approve {
+                    rule_id,
+                    choice,
+                    unproven: Some(unproven),
+                    ..
+                } => {
+                    assert_eq!(
+                        (rule_id, choice),
+                        (RULE_ALLOW_ONCE, Choice::Digit(1)),
+                        "{what}, {level}"
+                    );
+                    assert!(unproven.starts_with(why), "{what}, {level}: {unproven}");
+                }
+                d => panic!("{what}, {level}: {d:?}"),
+            }
+        }
+        for (level, c) in [
+            ("safe", ctx()),
+            ("safe, warn", safe_warn()),
+            ("safe, bypass", bypass()),
+            (
+                "safe, warn, bypass",
+                ApprovalCtx {
+                    bypass_mode: true,
+                    ..safe_warn()
+                },
+            ),
+        ] {
+            let d = on_screen(&rows, &c);
+            assert!(reason(&d).starts_with(why), "{what}, {level}: {d:?}");
+        }
+        assert_eq!(
+            approved(&on_screen(&rows, &none(full()))),
+            None,
+            "{what}: none"
+        );
+    }
+    // NEGATIVE CONTROL: the nested shape inside the vendor's budget is no
+    // breaker: full power presses its plain `1`, nothing named; the safe
+    // rules hand it over for its vendor note, not as a breaker.
+    let rows = screen(BOX_STATEMENT_FOLLOWS_16_2_1_307);
+    let d = on_screen(&rows, &full());
+    assert_eq!(pressed(&d), (RULE_ALLOW_ONCE, Choice::Digit(1)), "{d:?}");
+    assert!(
+        !format!("{d:?}").contains("circuit breaker"),
+        "within the budget: {d:?}"
+    );
+    let d = on_screen(&rows, &bypass());
+    assert!(!reason(&d).contains("circuit breaker"), "{d:?}");
+    for text in [
+        BOX_BASH_TOUCH_2_1_307,
+        BOX_WRITE_CREATE_2_1_307,
+        BOX_EDIT_2_1_307,
+        BOX_BASH_ASK_RULE_2_1_307,
+        BOX_BASH_HOOK_ASK_2_1_307,
+        BOX_RM_TOO_MANY_2_1_307,
+        BOX_RM_TOO_MANY_NO_RM_2_1_307,
+        BOX_RM_NESTED_2_1_307,
+        BOX_RM_MOUNTED_DRIVE_2_1_307,
+        PLAN_READY_2_1_307,
+    ] {
+        let rows = screen(text);
+        let (top, _) = aterm_phase::prompt::prompt_box_span(&rows).expect("the span");
+        assert_eq!(
+            decide_screen(Some("claude"), &rows[..top], &full()),
+            None,
+            "{:?}",
+            rows.get(top)
+        );
+    }
 }

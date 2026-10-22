@@ -795,10 +795,14 @@ fn the_exit_table_tells_a_crash_from_a_refusal_and_an_end() {
 // ---------------------------------------------------------------- the line
 
 /// The homes a line carries: `GEMINI_CLI_HOME` where set, `HOME` where it is
-/// another than the user's; read back from a record by name alone. The line
-/// a person is told cds to the project and resumes by the full UUID, behind
-/// those homes. NEGATIVE CONTROLS: the user's own `HOME` is not carried, and
-/// no line is told for an id that is no UUID.
+/// another than the user's, and a worker's own trusted-folders file where an
+/// absolute one is set (its relaunch stays trusted in its folder alone);
+/// read back from a record by name alone, which keeps no trusted-folders
+/// file (the live worker's, removed with its session). The line a person is
+/// told cds to the project and resumes by the full UUID, behind those homes.
+/// The told line never names the trusted-folders file. NEGATIVE CONTROLS:
+/// the user's own `HOME` is not carried, nor a relative trusted-folders
+/// file, and no line is told for an id that is no UUID.
 #[test]
 fn the_line_carries_the_homes_and_the_person_is_told_where_to_run_it() {
     let user = std::path::Path::new("/Users//me");
@@ -821,6 +825,45 @@ fn the_line_carries_the_homes_and_the_person_is_told_where_to_run_it() {
         ]
     );
     assert_eq!(env_of_words(&env_words(&both)), both);
+    let trusted = relaunch_env(
+        env(&[
+            ("GEMINI_CLI_HOME", "/g/home"),
+            (
+                "GEMINI_CLI_TRUSTED_FOLDERS_PATH",
+                "/state/tasks/s-1-1.trust.json",
+            ),
+        ]),
+        user,
+    );
+    assert_eq!(
+        trusted,
+        [
+            ("GEMINI_CLI_HOME".to_string(), "/g/home".to_string()),
+            (
+                TRUSTED_FOLDERS_ENV.to_string(),
+                "/state/tasks/s-1-1.trust.json".to_string()
+            ),
+        ]
+    );
+    assert_eq!(
+        env_of_words(&env_words(&trusted)),
+        [("GEMINI_CLI_HOME".to_string(), "/g/home".to_string())],
+        "a record keeps no trusted-folders file"
+    );
+    assert_eq!(
+        relaunch_env(
+            env(&[("GEMINI_CLI_TRUSTED_FOLDERS_PATH", "tasks/s-1-1.trust.json")]),
+            user
+        ),
+        Vec::<(String, String)>::new(),
+        "a relative one"
+    );
+    // The line a person is told names no worker's trusted-folders file: it
+    // goes with the worker's session, and the person's own trust stands.
+    assert_eq!(
+        told_line(S1, &trusted, "/w/p").as_deref(),
+        Some(format!("cd /w/p && GEMINI_CLI_HOME=/g/home gemini --resume {S1}").as_str())
+    );
     assert_eq!(
         env_of_words(&["PATH=/x".to_string(), "HOME".to_string()]),
         Vec::<(String, String)>::new()

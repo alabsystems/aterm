@@ -162,7 +162,7 @@ fn bounded_wait(mut child: Child, what: &str, deadline: Duration) -> Result<Outp
 
 fn client_ok(inst: &Instance, args: &[&str]) -> String {
     let out = headless_boot::until_served(|| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+        let mut cmd = Command::new(launch_isolation::aterm_executable());
         cmd.args(["ctl", "--sock", &inst.sock])
             .args(args)
             .stdin(Stdio::null())

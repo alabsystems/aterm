@@ -97,8 +97,7 @@ pub(crate) fn run_alone_with(env: &[(&str, &OsStr)]) {
 }
 
 /// [`run_alone_with`]'s child, started and not yet waited for: for a caller
-/// that must hold a lock while the child inherits this process's environment
-/// (`seamless::tests::ENV_LOCK`) but not while the child runs.
+/// that runs several side by side (`seamless::tests::run_in_children`).
 ///
 /// # Panics
 ///

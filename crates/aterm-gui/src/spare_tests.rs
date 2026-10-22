@@ -159,7 +159,7 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     // parked one may be retargeted (`App::spare_retargets`).
     app.session_factory.shell_override = Some("/bin/zsh".to_owned());
     let grid = app.spawn_grid(wid);
-    let plain = SpawnAsk::new(None, None);
+    let plain = SpawnAsk::new(None);
     let id = app.next_session_id;
     app.next_session_id += 1;
     let try_with = |app: &mut App, ask: &SpawnAsk, grid: Grid| {
@@ -178,11 +178,6 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     app.config.spare_shell = None;
     // G2: only a plain ask.
     for ask in [
-        SpawnAsk::new(None, Some("agent")),
-        SpawnAsk {
-            identity_prep: crate::tab_spawn::IdentityPrep::Create,
-            ..SpawnAsk::default()
-        },
         SpawnAsk {
             observe: Some(aterm_session::SessionId::generate()),
             ..SpawnAsk::default()
@@ -208,7 +203,7 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
         .pre_hold
         .store(PRE_HOLD_ZSH, Ordering::Release);
     assert_eq!(
-        try_with(&mut app, &SpawnAsk::new(Some("/private"), None), grid),
+        try_with(&mut app, &SpawnAsk::new(Some("/private")), grid),
         Err("folder")
     );
     app.spares.slot.as_mut().unwrap().cwd = Some("/var".into());
@@ -254,7 +249,7 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     app.spares.slot.as_mut().unwrap().cwd = Some("/var".into());
     assert_eq!(try_with(&mut app, &plain, grid), Err("folder"));
     assert_eq!(
-        try_with(&mut app, &SpawnAsk::new(Some("/usr"), None), grid),
+        try_with(&mut app, &SpawnAsk::new(Some("/usr")), grid),
         Err("folder")
     );
     app.spares.slot.as_mut().unwrap().cwd = Some("/tmp".into());
@@ -284,7 +279,7 @@ fn each_adoption_gate_names_its_miss_and_a_spare_that_passes_them_is_taken() {
     app.spares.slot = Some(parked_slot(&app, id + 2, Some("/var")));
     assert!(try_with(&mut app, &plain, grid).is_ok());
     app.spares.slot = Some(parked_slot(&app, id + 3, Some("/var")));
-    assert!(try_with(&mut app, &SpawnAsk::new(Some("/usr"), None), grid).is_ok());
+    assert!(try_with(&mut app, &SpawnAsk::new(Some("/usr")), grid).is_ok());
 }
 
 /// A spare whose startup files have run and whose escape scan waits out its
@@ -300,7 +295,7 @@ fn a_spare_verifying_its_run_is_taken_as_a_warming_one_is() {
     let mut app = app_in("/tmp");
     app.session_factory.shell_override = Some("/bin/zsh".to_owned());
     let grid = app.spawn_grid(wid);
-    let plain = SpawnAsk::new(None, None);
+    let plain = SpawnAsk::new(None);
     let id = app.next_session_id;
     app.next_session_id += 2;
     app.spares.shared.generation.store(7, Ordering::Release);

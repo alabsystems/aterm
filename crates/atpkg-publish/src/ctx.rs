@@ -6,7 +6,7 @@
 //! Environment knobs are read only in [`Ctx::from_env`] (an unset `HOME` is a named
 //! could-not-run); everything else a verb could vary is a typed flag on that verb. Tests
 //! build a `Ctx` with [`Ctx::new`] over scratch directories, an injected anchor and clock,
-//! and [`crate::host::fake::FakeHost`] hosts.
+//! and `FakeHost` hosts (`crate::host::fake`).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -35,6 +35,16 @@ pub struct Tokens {
     pub staging: PathBuf,
     /// Write on the public channel owner (`~/.secrets/gh_access_token_alabsystems`).
     pub channel: PathBuf,
+}
+
+impl Tokens {
+    /// The token files under `home`.
+    fn under(home: &Path) -> Self {
+        Self {
+            staging: home.join(".secrets/gh_access_token"),
+            channel: home.join(".secrets/gh_access_token_alabsystems"),
+        }
+    }
 }
 
 /// This machine's publishing identity, as files.
@@ -104,29 +114,29 @@ impl Ctx {
         let now = aterm_time::unix_secs()
             .and_then(|s| i64::try_from(s).ok())
             .ok_or_else(|| Error::cannot_run("the system clock reads before 1970"))?;
-        let mut ctx = Self::new(
+        let tokens = Tokens::under(&home);
+        let hosts = Hosts {
+            staging: Arc::new(GhCli::new(token_if_present(&tokens.staging))),
+            channel: Arc::new(GhCli::new(Some(tokens.channel))),
+        };
+        Ok(Self::new(
             &home,
             non_empty_env("XDG_CONFIG_HOME").as_deref(),
             non_empty_env("XDG_STATE_HOME").as_deref(),
             now,
-        );
-        let staging = token_if_present(&ctx.tokens.staging);
-        ctx.hosts = Hosts {
-            staging: Arc::new(GhCli::new(staging)),
-            channel: Arc::new(GhCli::new(Some(ctx.tokens.channel.clone()))),
-        };
-        Ok(ctx)
+            hosts,
+        ))
     }
 
-    /// A context rooted at `home`, with the compiled anchor, production defaults for
-    /// every path, and no network: both hosts are an empty
-    /// [`crate::host::fake::FakeHost`] until the caller sets [`Ctx::hosts`].
+    /// A context rooted at `home` that speaks to `hosts`, with the compiled anchor and
+    /// production defaults for every path.
     #[must_use]
     pub fn new(
         home: &Path,
         xdg_config_home: Option<&Path>,
         xdg_state_home: Option<&Path>,
         now_unix: i64,
+        hosts: Hosts,
     ) -> Self {
         let state_root =
             xdg_state_home.map_or_else(|| home.join(".local/state"), Path::to_path_buf);
@@ -140,10 +150,7 @@ impl Ctx {
                 staging: STAGING_OWNER.to_string(),
                 public: aterm_update_core::ATPKG_INDEX_OWNER.to_string(),
             },
-            tokens: Tokens {
-                staging: home.join(".secrets/gh_access_token"),
-                channel: home.join(".secrets/gh_access_token_alabsystems"),
-            },
+            tokens: Tokens::under(home),
             identity: IdentityPaths {
                 key: home.join(".aterm/machine.key"),
                 record: home.join(".aterm/machine.toml"),
@@ -154,7 +161,7 @@ impl Ctx {
                 .map(|k| (*k).to_string())
                 .collect(),
             now_unix,
-            hosts: Hosts::single(Arc::new(crate::host::fake::FakeHost::new())),
+            hosts,
             elected: Arc::default(),
         }
     }

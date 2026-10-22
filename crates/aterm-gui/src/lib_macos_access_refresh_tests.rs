@@ -255,11 +255,16 @@ fn settings_gesture_restarts_a_settled_watch_with_fresh_evidence() {
 
 /// A window standing in for a new Mac: the probe reads `denied`, the hand-over lane
 /// opens pages and shows panels through counted stand-ins, and the launch state knows a
-/// bundle id. Nothing reaches the OS.
+/// bundle id. Nothing reaches the OS. A planted verdict is served for an hour, so no stall
+/// of the test's own expires it.
 fn new_mac() -> App {
     use crate::consent_launch::{LaunchConsent, LaunchReach};
     use crate::devtools_helper::{Lane, test_arms};
     let mut app = windowed(denied());
+    app.config.privacy = Some(super::app_config::PrivacyConfig {
+        probe_interval_ms: Some(3_600_000),
+        ..Default::default()
+    });
     app.devtools_helper = Lane::windowed_with_fda_for_test(
         test_arms::opening(),
         test_arms::fda_opening(),
@@ -276,6 +281,40 @@ fn new_mac() -> App {
 /// The quiet moment, as a test grants it (no window is focused in a test).
 fn quiet(_app: &App, _now: Instant) -> bool {
     true
+}
+
+#[test]
+fn setup_permission_hold_defers_queued_launch_decisions_and_automatic_page_effects() {
+    use crate::devtools_helper::{HandOver, Origin, test_arms};
+    let now = Instant::now();
+    let mut app = new_mac();
+    test_arms::stand_in(&mut app, test_arms::opening());
+    app.hold_initial_setup_permissions();
+    assert!(app.consent_card.begin_deciding(now));
+    let decision = crate::consent_card::PendingDecision::launch(None);
+    app.decide_macos_access_card(decision);
+    assert_eq!(app.consent_card_host.pending, Some(decision));
+    assert_eq!(app.consent_card.phase(), CardPhase::Deciding { since: now });
+    let opens = test_arms::opens();
+    assert_eq!(
+        app.devtools_hand_over_after_listing(Origin::Automatic, Ok(()), now),
+        HandOver::Queued
+    );
+    assert_eq!(
+        test_arms::opens(),
+        opens,
+        "a late worker cannot open System Settings"
+    );
+    assert_eq!(
+        app.hand_devtools_to_owner(Origin::Settings),
+        HandOver::Opened
+    );
+    assert_eq!(
+        test_arms::opens(),
+        opens + 1,
+        "the owner's explicit button still works"
+    );
+    assert!(app.devtools_helper.next_deadline(now, || true).is_some());
 }
 
 /// A new Mac's launch check: the card settles and the window's own Full Disk Access
@@ -887,7 +926,7 @@ fn main_as_the_successor_of_0_105_0_on_the_owners_mac_hands_full_disk_access_ove
     let opened: u64 = 1_792_226_100;
     let started = opened + 120;
 
-    let root = aterm_tempfile::TempDir::new().expect("scratch directories");
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
     let config = root.path().join("config");
     let state = root.path().join("state");
     for dir in [&config, &state] {
@@ -1276,7 +1315,7 @@ fn later(at: &mut Instant) -> Instant {
 fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() {
     use crate::consent_launch::FdaLaunch;
     use crate::devtools_helper::{Moment, Origin, PanelEvent, test_arms};
-    let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
     let now = Instant::now();
     let mut t = now;
     let mut app = launched(now);
@@ -1358,6 +1397,13 @@ fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() 
         app.consent_launch.walking(),
         "then the folders are asked for"
     );
+    // The record is written off the UI thread: it lands before the folder goes.
+    let cached = app.consent_card_host.record;
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the access record reaches the config folder",
+        || (super::consent_card::read_record(Some(&config)) == cached).then_some(()),
+    );
 }
 
 /// The owner's yes starts the change a press starts — the same lane, the App's one
@@ -1366,7 +1412,7 @@ fn a_new_mac_asks_for_debugger_access_after_both_pages_and_before_the_folders() 
 /// up) the folders wait; once it is over they walk.
 #[test]
 fn a_yes_at_launch_starts_the_change_and_the_folders_wait_for_it() {
-    let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
     let now = Instant::now();
     let mut t = now;
     let mut app = ready_to_ask(root.path(), owner_says_yes);
@@ -1436,7 +1482,7 @@ fn the_debugger_alert_waits_behind_every_page_panel_and_moment() {
         ("not quiet", |_| {}),
     ];
     for (name, block) in blockers {
-        let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+        let root = crate::test_scratch::outlived_dir("aterm-access-");
         let mut t = Instant::now();
         let mut app = ready_to_ask(root.path(), owner_says_no);
         block(&mut app);
@@ -1458,7 +1504,7 @@ fn the_debugger_alert_waits_behind_every_page_panel_and_moment() {
             "{name}: nothing recorded"
         );
     }
-    let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut t = Instant::now();
     let mut app = ready_to_ask(root.path(), owner_says_no);
     let before = debugger_alerts().len();
@@ -1476,7 +1522,7 @@ fn the_debugger_alert_waits_behind_every_page_panel_and_moment() {
 fn a_full_disk_access_hand_over_gone_with_no_panel_holds_nothing() {
     use crate::consent_launch::FdaLaunch;
     use crate::devtools_helper::{Origin, test_arms};
-    let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut t = Instant::now();
     let mut app = launched(t);
     assert_eq!(app.consent_launch.fda(), FdaLaunch::Waiting);
@@ -1504,7 +1550,7 @@ fn a_full_disk_access_hand_over_gone_with_no_panel_holds_nothing() {
     app.look_for_debugger_moment(later(&mut t), quiet);
     assert_eq!(debugger_alerts().len(), before + 1, "asked");
 
-    let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut app = ready_to_ask(root.path(), owner_says_no);
     app.consent_launch.set_fda(FdaLaunch::Waiting);
     let before = debugger_alerts().len();
@@ -1528,7 +1574,7 @@ fn the_debugger_alert_waits_for_a_fresh_reading_of_the_rule() {
     use aterm_containment::consent::{
         DebuggerMember, DebuggerMode, DebuggerProbe, DebuggerProbeLabel, SelfHardening,
     };
-    let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut t = Instant::now();
     let mut app = ready_to_ask(root.path(), owner_says_yes);
     // Older than the slot's own refresh age too: a read through it would dispatch.
@@ -1581,7 +1627,7 @@ fn the_debugger_alert_waits_for_a_fresh_reading_of_the_rule() {
 #[test]
 fn a_change_on_disk_holds_the_ask_and_the_folders_for_a_bounded_span() {
     use crate::debugger_access::{LockTry, REFUSED_FOR, read_asked, take_change_lock};
-    let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
     let config = root.path().join("aterm.toml");
     let mut t = Instant::now();
     let mut app = ready_to_ask(root.path(), owner_says_yes);
@@ -1634,7 +1680,7 @@ fn cold_then_ended() -> Option<&'static str> {
 /// with the key still cold drops the ask.
 #[test]
 fn a_host_read_ending_mid_look_is_not_a_mac_without_a_name() {
-    let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut t = Instant::now();
     let mut app = ready_to_ask(root.path(), owner_says_no);
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1660,7 +1706,7 @@ fn a_host_read_ending_mid_look_is_not_a_mac_without_a_name() {
 /// CONTROL: read in the look, the first look drops the ask.
 #[test]
 fn the_launch_asks_record_is_read_off_the_event_loop() {
-    let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
     let config = root.path().join("aterm.toml");
     crate::debugger_access::note_asked(&config, "READY-MAC", 1).expect("this Mac recorded");
     let mut t = Instant::now();
@@ -1690,7 +1736,7 @@ fn the_launch_asks_record_is_read_off_the_event_loop() {
 /// first look, before any read: no probe dispatched, no record, no alert.
 #[test]
 fn a_headless_app_never_asks_or_probes() {
-    let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut app = App::headless_for_test();
     assert!(!app.debugger_launch.queued(), "never queued headless");
     app.tick_consent_lanes(Instant::now());
@@ -1721,7 +1767,7 @@ fn a_headless_app_never_asks_or_probes() {
 /// probe for it; another Mac sharing that folder (a synced config) is asked once.
 #[test]
 fn a_second_launch_on_the_same_mac_asks_nothing() {
-    let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+    let root = crate::test_scratch::outlived_dir("aterm-access-");
     let mut t = Instant::now();
     let mut first = ready_to_ask(root.path(), owner_says_no);
     first.look_for_debugger_moment(later(&mut t), quiet);
@@ -1789,7 +1835,7 @@ fn an_answered_question_settles_without_an_alert() {
         }),
     ];
     for (name, answered) in cases {
-        let root = aterm_tempfile::TempDir::new().expect("a scratch config folder");
+        let root = crate::test_scratch::outlived_dir("aterm-access-");
         let mut t = Instant::now();
         let mut app = ready_to_ask(root.path(), owner_says_yes);
         answered(&mut app);

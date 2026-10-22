@@ -512,40 +512,64 @@ const RENDEZVOUS_NONCE_HEX: usize = 16;
 
 /// The per-user temporary base the rendezvous directory hangs off, admitted only where no other
 /// uid can plant an entry: `lstat` says a real directory owned by this uid, not
-/// group/other-writable, and not `/tmp`-rooted. `std::env::temp_dir` reads `$TMPDIR`, which
-/// launchd sets to the per-user `/var/folders/…/T/` for everything it starts, and whoever sets
-/// this process's environment is already inside its trust boundary. With `$TMPDIR` unset, std
-/// falls back to `confstr(_CS_DARWIN_USER_TEMP_DIR)`, whose fork hazard `aterm_pty::unix`
-/// describes.
-#[cfg(unix)]
+/// group/other-writable, and not `/tmp`-rooted ([`admits_temp_base`]). `std::env::temp_dir`
+/// reads `$TMPDIR`, which launchd sets to the per-user `/var/folders/…/T/` for everything it
+/// starts, and whoever sets this process's environment is already inside its trust boundary.
+/// With `$TMPDIR` unset, std falls back to `confstr(_CS_DARWIN_USER_TEMP_DIR)`, whose fork
+/// hazard `aterm_pty::unix` describes.
+#[cfg(all(unix, not(test)))]
 fn admitted_temp_base() -> Option<PathBuf> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let base = std::env::temp_dir();
+    let lstat = std::fs::symlink_metadata(&base).ok().map(|meta| BaseFacts {
+        is_dir: meta.file_type().is_dir(),
+        uid: meta.uid(),
+        mode: meta.permissions().mode(),
+    });
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    admits_temp_base(&base, lstat, uid).then_some(base)
+}
+
+/// What `lstat` says of a temporary base ([`admits_temp_base`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct BaseFacts {
+    /// A real directory (`lstat`: a symlink is not one).
+    is_dir: bool,
+    /// Its owner.
+    uid: u32,
+    /// Its mode bits.
+    mode: u32,
+}
+
+/// [`admitted_temp_base`]'s verdict on `base`, `lstat` the facts of it (`None`:
+/// none could be read) and `uid` this process's.
+#[cfg(unix)]
+fn admits_temp_base(base: &Path, lstat: Option<BaseFacts>, uid: u32) -> bool {
     // Absolute only: a relative `$TMPDIR` binds against this process's cwd, which a LaunchServices
     // successor (cwd `/`) cannot dial, so every attempt would park for the whole readiness deadline
     // and never fall back to the fork lane.
     if !base.is_absolute() {
-        return None;
+        return false;
     }
-    let canonical_tmp = |p: &Path| p == Path::new("/tmp") || p == Path::new("/private/tmp");
-    if canonical_tmp(&base) || base.starts_with("/tmp") || base.starts_with("/private/tmp") {
-        return None;
+    if base.starts_with("/tmp") || base.starts_with("/private/tmp") {
+        return false;
     }
-    let meta = std::fs::symlink_metadata(&base).ok()?;
-    // SAFETY: getuid has no preconditions.
-    let uid = unsafe { libc::getuid() };
-    if !meta.file_type().is_dir() || meta.uid() != uid || meta.permissions().mode() & 0o022 != 0 {
-        return None;
-    }
-    Some(base)
+    lstat.is_some_and(|facts| facts.is_dir && facts.uid == uid && facts.mode & 0o022 == 0)
 }
 
 /// The directory the rendezvous socket lives in, without creating anything: the lane-choice
 /// probe asks on every check and must not touch the filesystem. `None` means the control
-/// directory (the fallback).
+/// directory (the fallback). In this crate's test binary, a process root under `/tmp`
+/// instead of the person's `$TMPDIR`.
 #[must_use]
 fn rendezvous_dir_candidate() -> Option<PathBuf> {
-    #[cfg(unix)]
+    #[cfg(all(unix, test))]
+    {
+        Some(crate::test_scratch::short_process_root("aterm-rz-"))
+    }
+    #[cfg(all(unix, not(test)))]
     {
         admitted_temp_base().map(|base| base.join("aterm"))
     }
@@ -1011,6 +1035,8 @@ fn admit_code(
         };
         if held_since.is_none() {
             held_since = Some(Instant::now());
+            #[cfg(test)]
+            HOLDS_FOR_TEST.with(|holds| holds.set(holds.get() + 1));
             aterm_log::warn!(
                 "overlap handoff: holding the rendezvous dialer (pid {pid}) whose code could not \
                  be checked ({silent}); waiting for the check's answer (asked again every {} ms \
@@ -1034,7 +1060,7 @@ fn admit_code(
                     held: held(),
                 });
             }
-            let now = Instant::now();
+            let now = io_now();
             if now >= deadline {
                 return Err(Gated::WaitEnded {
                     end: RendezvousError::Deadline,
@@ -1736,44 +1762,6 @@ impl ClaimedPeer {
         (&self.stream).flush().map_err(partial)?;
         Ok(())
     }
-}
-
-/// [`Rendezvous::bind`] under `nonce` for a test: where production binds it, or, on the two
-/// refusals production takes the fork lane on (no usable control directory; a socket path too
-/// long for `sun_path`, as under a long `$TMPDIR` or `$HOME`), in a fresh private directory under
-/// `/tmp` through [`Rendezvous::bind_in`], returned beside it for the caller to hold as long as
-/// the rendezvous. A test that cannot bind there either fails, naming both reasons.
-#[cfg(test)]
-pub(crate) fn bind_anywhere_for_test(nonce: &str) -> (Rendezvous, Option<aterm_tempfile::TempDir>) {
-    let refused = match Rendezvous::bind(nonce) {
-        Ok(rendezvous) => return (rendezvous, None),
-        Err(refused @ (RendezvousError::NoControlDir | RendezvousError::PathTooLong { .. })) => {
-            refused
-        }
-        Err(error) => panic!("bind: {error}"),
-    };
-    let short_dir = short_dir_for_test(&format!("the rendezvous production refused ({refused})"));
-    let rendezvous = Rendezvous::bind_in(short_dir.path(), nonce).unwrap_or_else(|error| {
-        panic!(
-            "production refused the rendezvous ({refused}), and it could not bind in {} \
-             either: {error}",
-            short_dir.path().display()
-        )
-    });
-    (rendezvous, Some(short_dir))
-}
-
-/// A fresh private (0700) directory under `/tmp` for a socket a test binds
-/// itself, removed when dropped: `/tmp/.tmpXXXXXX/<name>` fits `sun_path`
-/// whatever `$TMPDIR` or `$HOME` is. A stub parent's or a forked listener's
-/// socket under `std::env::temp_dir()` could not bind under a 206-byte
-/// `$TMPDIR`, and four tests failed there for the fixture, not the code. `for_what`
-/// names the socket when no directory can be made.
-#[cfg(test)]
-pub(crate) fn short_dir_for_test(for_what: &str) -> aterm_tempfile::TempDir {
-    aterm_tempfile::TempDir::new_in("/tmp").unwrap_or_else(|error| {
-        panic!("no directory for {for_what} could be made under /tmp: {error}")
-    })
 }
 
 /// A test's dialer: connect to `path` and present `secret`, keeping the stream
@@ -2709,11 +2697,39 @@ fn grant_budget(deadline: Instant) -> Result<Duration, RendezvousError> {
 /// zero-duration timeout, and an expired deadline has to read as an expired
 /// deadline rather than as `InvalidInput` from a socket option.
 fn remaining_io_budget(deadline: Instant) -> Result<Duration, RendezvousError> {
-    let now = Instant::now();
+    let now = io_now();
     if now >= deadline {
         return Err(RendezvousError::Deadline);
     }
     Ok(deadline.saturating_duration_since(now).max(MIN_IO_TIMEOUT))
+}
+
+#[cfg(test)]
+thread_local! {
+    static IO_CLOCK_FOR_TEST: std::cell::RefCell<Option<Box<dyn Fn() -> Instant>>> =
+        const { std::cell::RefCell::new(None) };
+    static HOLDS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many dialers this thread held for a code check `trustd` did not answer ([`admit_code`]).
+#[cfg(test)]
+pub(crate) fn holds_for_test() -> usize {
+    HOLDS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+/// Set (or, with `None`, clear) the clock this thread's budgets are judged by ([`io_now`]).
+#[cfg(test)]
+pub(crate) fn set_io_clock_for_test(clock: Option<Box<dyn Fn() -> Instant>>) {
+    IO_CLOCK_FOR_TEST.with(|slot| *slot.borrow_mut() = clock);
+}
+
+/// The instant a budget is judged at: the clock, or a test thread's ([`set_io_clock_for_test`]).
+fn io_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = IO_CLOCK_FOR_TEST.with(|slot| slot.borrow().as_ref().map(|clock| clock())) {
+        return now;
+    }
+    Instant::now()
 }
 
 #[cfg(test)]
@@ -4010,43 +4026,63 @@ mod tests {
 
     /// A held claim: the parent holds the served stream and the grant still arrives whole,
     /// bounded by the dialer's grant budget, not its already spent dial budget.
+    /// On the dialer's clock ([`set_io_clock_for_test`]) only its first read, before the claim
+    /// write, is inside the dial budget, so only the grant budget can govern the wait.
     #[test]
     fn a_held_claim_is_granted_after_the_hold_under_the_grant_budget() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         let rendezvous = bind_for_test();
         let (master, slave) = open_pty();
         let (ready_rd, ready_wr) = pipe_for_test();
         let (commit_rd, commit_wr) = pipe_for_test();
         let claim = rendezvous.claim().to_string();
         let path = rendezvous.path().to_path_buf();
-        // The dial budget is fixed here, before the dialer exists, and generous for a connect, a
-        // getsockopt and a 70-byte write; the hold sleeps past that instant plus `PAST_THE_DIAL`,
-        // so the grant arrives only after the dial budget is spent and only the grant budget can
-        // govern it.
-        const PAST_THE_DIAL: Duration = Duration::from_millis(250);
-        let dial = Instant::now() + Duration::from_secs(2);
-        // The grant budget is a hang detector, never a latency budget.
+        // Both budgets are hang detectors; the dialer's clock spends the dial's.
+        let dial = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let deadlines = ClaimDeadlines {
             dial,
             grant: dial + 2 * aterm_spec::wait::MUST_HAPPEN,
         };
-        let dialer = std::thread::spawn(move || {
-            dial_and_claim(&path, &claim, TEST_NONCE, deadlines, own_parent(), false)
-        });
-        let peer = admitted(
-            rendezvous.accept_claim(
-                Some(own_pid()),
-                &crate::handoff_rendezvous::DialerCode::this_process(),
-                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
-                &|| false,
-            ),
-            "claimed",
+        let reads = Arc::new(AtomicUsize::new(0));
+        // A dialer that gave up ends the parent's accept too, so its answer is the failure.
+        let ended = Arc::new(AtomicBool::new(false));
+        let dialer = {
+            let (reads, ended) = (Arc::clone(&reads), Arc::clone(&ended));
+            std::thread::spawn(move || {
+                set_io_clock_for_test(Some(Box::new(move || {
+                    if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Instant::now()
+                    } else {
+                        dial + MIN_IO_TIMEOUT
+                    }
+                })));
+                let claimed =
+                    dial_and_claim(&path, &claim, TEST_NONCE, deadlines, own_parent(), false);
+                ended.store(true, Ordering::SeqCst);
+                claimed
+            })
+        };
+        let accepted = rendezvous.accept_claim(
+            Some(own_pid()),
+            &crate::handoff_rendezvous::DialerCode::this_process(),
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            &|| ended.load(Ordering::SeqCst),
         );
+        if accepted.is_err() && ended.load(Ordering::SeqCst) {
+            let gave_up = dialer.join().expect("dialer thread").err();
+            panic!("the dialer ended before its claim was accepted: {gave_up:?}");
+        }
+        let peer = admitted(accepted, "claimed");
         assert!(!peer.poll_hangup(), "a held, idle dialer is not a hangup");
-        std::thread::sleep(dial.saturating_duration_since(Instant::now()) + PAST_THE_DIAL);
-        assert!(Instant::now() > dial, "the hold outlasted the dial budget");
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the dialer's grant wait judged its budget past the dial",
+            || (reads.load(Ordering::SeqCst) >= 2).then_some(()),
+        );
         assert!(
             !peer.poll_hangup(),
-            "…nor after the hold outlasted its dial budget"
+            "…nor once the hold outlasted its dial budget"
         );
         // SAFETY: a descriptor this test owns for the length of the call.
         let borrowed = unsafe { BorrowedFd::borrow_raw(master) };
@@ -4227,32 +4263,82 @@ mod tests {
         assert!(seen.is_some(), "the closed dialer never read as a hangup");
     }
 
-    /// A rendezvous a test bound, and the directory it made for it when
-    /// production's could not hold the socket. The fields drop in order: the
-    /// rendezvous unlinks its socket, then the directory goes.
-    struct BoundForTest {
-        rendezvous: Rendezvous,
-        _short_dir: Option<aterm_tempfile::TempDir>,
-    }
-
-    impl std::ops::Deref for BoundForTest {
-        type Target = Rendezvous;
-
-        fn deref(&self) -> &Rendezvous {
-            &self.rendezvous
+    /// Production's rendezvous base ([`super::admits_temp_base`]): absolute, a real
+    /// directory of this uid that no group or other can write, off `/tmp`.
+    #[cfg(unix)]
+    #[test]
+    fn the_rendezvous_base_is_admitted_only_private_absolute_and_off_tmp() {
+        use super::{BaseFacts, admits_temp_base};
+        use std::path::Path;
+        let uid = 501;
+        let private = BaseFacts {
+            is_dir: true,
+            uid,
+            mode: 0o40700,
+        };
+        let base = Path::new("/var/folders/xy/T");
+        assert!(admits_temp_base(base, Some(private), uid), "a private base");
+        let readable = BaseFacts {
+            mode: 0o40755,
+            ..private
+        };
+        assert!(
+            admits_temp_base(base, Some(readable), uid),
+            "others may read it, as long as they cannot write it"
+        );
+        for (why, base, facts) in [
+            ("relative", Path::new("tmp"), Some(private)),
+            ("/tmp itself", Path::new("/tmp"), Some(private)),
+            ("under /tmp", Path::new("/tmp/x"), Some(private)),
+            (
+                "under /private/tmp",
+                Path::new("/private/tmp/x"),
+                Some(private),
+            ),
+            ("unreadable", base, None),
+            (
+                "a symlink or a file",
+                base,
+                Some(BaseFacts {
+                    is_dir: false,
+                    ..private
+                }),
+            ),
+            (
+                "another uid's",
+                base,
+                Some(BaseFacts {
+                    uid: uid + 1,
+                    ..private
+                }),
+            ),
+            (
+                "group-writable",
+                base,
+                Some(BaseFacts {
+                    mode: 0o40770,
+                    ..private
+                }),
+            ),
+            (
+                "other-writable",
+                base,
+                Some(BaseFacts {
+                    mode: 0o40707,
+                    ..private
+                }),
+            ),
+        ] {
+            assert!(!admits_temp_base(base, facts, uid), "{why} is admitted");
         }
     }
 
-    /// Bind a rendezvous under a test-only nonce, so that the test RUNS
-    /// ([`super::bind_anywhere_for_test`]).
-    fn bind_for_test() -> BoundForTest {
+    /// Bind a rendezvous under a test-only nonce where production binds it (in this
+    /// test binary, its own directory under `/tmp`), failing loudly.
+    fn bind_for_test() -> Rendezvous {
         let nonce = aterm_uds::rand::hex_token::<16>()
             .unwrap_or_else(|error| panic!("a rendezvous test cannot mint its nonce: {error}"));
-        let (rendezvous, _short_dir) = super::bind_anywhere_for_test(&nonce);
-        BoundForTest {
-            rendezvous,
-            _short_dir,
-        }
+        Rendezvous::bind(&nonce).unwrap_or_else(|error| panic!("bind a rendezvous: {error}"))
     }
 
     /// A PTY pair, both ends close-on-exec from birth: no child another test
@@ -4726,7 +4812,7 @@ mod tests {
     ) -> Result<(), RendezvousError> {
         use std::io::Read as _;
 
-        let dir = super::short_dir_for_test("a stub parent's socket");
+        let dir = crate::test_scratch::short_dir("a stub parent's socket");
         let path = dir.path().join("p.sock");
         let listener = aterm_uds::CtlListener::bind(&path).expect("a stub listener");
         let secret = "c".repeat(CLAIM_HEX_LEN);
@@ -5096,7 +5182,7 @@ mod claim_presentation_conformance {
 
     impl ForkedListener {
         fn start() -> Self {
-            let dir = super::short_dir_for_test("a forked listener's socket");
+            let dir = crate::test_scratch::short_dir("a forked listener's socket");
             let path = dir.path().join("l.sock");
             // SAFETY: an all-zero sockaddr_un is a valid empty address.
             let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };

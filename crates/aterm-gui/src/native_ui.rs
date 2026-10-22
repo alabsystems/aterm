@@ -6329,6 +6329,9 @@ fn paint_compiled_node(
                     sky,
                     rim,
                 );
+                if spec.value.as_deref() == Some("system-state-kitty") {
+                    crate::system_state::paint_brand_kitty(prims, rect);
+                }
                 return;
             }
             if spec.audit_id == WORDMARK_AUDIT {

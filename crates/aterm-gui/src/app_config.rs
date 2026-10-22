@@ -711,13 +711,6 @@ pub(crate) struct Config {
     /// from every theme's colours, `"never"` keeps the xterm cube and grey
     /// ramp. An unknown value warns at load and follows the theme.
     pub(crate) palette_generate: Option<String>,
-    /// A theme per session identity (`spawn identity=<name>`): each key is an
-    /// identity name (folded as `spawn identity=` folds it), each value a theme
-    /// selector (a name or a `dark:…,light:…` split). A session spawned under
-    /// that identity draws it unless it has a theme of its own
-    /// ([`crate::session_theme`]). File-only; a key that is not an identity
-    /// name, or a value the catalog cannot draw, is a notice.
-    pub(crate) identity_themes: Option<std::collections::BTreeMap<String, String>>,
     /// SGR 2 (faint): fraction of the foreground kept, blended toward the cell
     /// background in linear light, held to at least 3:1 at the default (less
     /// when the colour itself is under 4.3:1), and always fainter than the
@@ -5637,18 +5630,6 @@ impl Config {
         self.show_build_badge.unwrap_or(false)
     }
 
-    /// The `identity_themes` selector for `identity` (a folded name), if one
-    /// is configured under a key that folds to it.
-    pub(crate) fn identity_theme(&self, identity: &str) -> Option<&str> {
-        self.identity_themes
-            .iter()
-            .flatten()
-            .find(|(key, _)| {
-                crate::agent_identity::parse_name(key).is_ok_and(|name| name == identity)
-            })
-            .map(|(_, selector)| selector.as_str())
-    }
-
     /// Window-chrome appearance ([`WindowTheme`]); default [`WindowTheme::Auto`].
     /// Unknown values warn and fall back to `Auto`.
     pub(crate) fn window_theme_or_default(&self) -> WindowTheme {
@@ -7409,45 +7390,7 @@ pub(crate) fn theme_misses(config: &Config, themes: &ThemeCatalog) -> Vec<String
     theme_selector_notice(config.theme.as_deref())
         .into_iter()
         .chain(theme_catalog_misses(config, themes))
-        .chain(identity_theme_misses(config, themes))
         .collect()
-}
-
-/// Each `identity_themes` entry the window cannot use: a key that is not an
-/// identity name, a selector with grammar issues, or a theme the catalog
-/// cannot draw on either side. Its sessions draw the instance's theme.
-pub(crate) fn identity_theme_misses(config: &Config, themes: &ThemeCatalog) -> Vec<String> {
-    let mut misses = Vec::new();
-    for (key, selector) in config.identity_themes.iter().flatten() {
-        if let Err(why) = crate::agent_identity::parse_name(key) {
-            misses.push(format!(
-                "identity_themes.{key}: not an identity name ({why}); ignored"
-            ));
-            continue;
-        }
-        if let Some(notice) = theme_selector_notice(Some(selector)) {
-            misses.push(format!("identity_themes.{key}: {notice}"));
-            continue;
-        }
-        for appearance in [
-            aterm_types::Appearance::Dark,
-            aterm_types::Appearance::Light,
-        ] {
-            if let crate::resolved_colors::ThemeSource::DefaultFallback { reason } = config
-                .resolved_colors(appearance, themes, Some(selector))
-                .source
-            {
-                let miss = format!(
-                    "identity_themes.{key}: {selector:?} is unavailable ({reason}); its \
-                     sessions draw the instance theme"
-                );
-                if !misses.contains(&miss) {
-                    misses.push(miss);
-                }
-            }
-        }
-    }
-    misses
 }
 
 /// Each configured `theme` name the window cannot use against `themes`, and that it

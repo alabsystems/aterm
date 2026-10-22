@@ -18658,6 +18658,15 @@ impl TurnEndState {
                 // was taken (`act_seen`). A reply that predates the act lands
                 // nothing, and its claim is owed Land's act again.
                 land_judged = landing && act_seen && ok_to_leave;
+                // The seeded act's turn ended at a wall: its retry delivers the act again.
+                if landing && act_seen && reading.wall.is_some() {
+                    self.cut_land = true;
+                }
+                // …and so does the seeded check's ([`Self::seed_done_check`]): the loop
+                // before stopped before it read the wall, so no point row says it cut the check.
+                if checked && reading.wall.is_some() {
+                    self.cut_check = true;
+                }
                 let lands = land_judged && clean;
                 self.done = if lands {
                     2

@@ -212,6 +212,8 @@ pub enum EditorCommand {
     UniversalArgument,
     ExecuteCommand,
     IncrementalSearch,
+    SearchNext,
+    SearchPrevious,
     GotoLine,
     SwitchBuffer,
     RevertBuffer,
@@ -371,11 +373,13 @@ impl Invocation {
 
 impl EditorCommand {
     /// Every command, in the order a blank M-x lists them (Save first).
-    pub const ALL: [Self; 49] = [
+    pub const ALL: [Self; 51] = [
         Self::Save,
         Self::Undo,
         Self::Redo,
         Self::IncrementalSearch,
+        Self::SearchNext,
+        Self::SearchPrevious,
         Self::GotoLine,
         Self::SwitchBuffer,
         Self::RevertBuffer,
@@ -457,6 +461,8 @@ impl EditorCommand {
             | Self::DigitArgument
             | Self::ExecuteCommand
             | Self::IncrementalSearch
+            | Self::SearchNext
+            | Self::SearchPrevious
             | Self::GotoLine
             | Self::SwitchBuffer
             // Recording a macro changes nothing; playing one is an edit, and
@@ -532,6 +538,8 @@ impl EditorCommand {
             Self::UniversalArgument => "universal-argument",
             Self::ExecuteCommand => "execute-extended-command",
             Self::IncrementalSearch => "isearch-forward",
+            Self::SearchNext => "search-next",
+            Self::SearchPrevious => "search-previous",
             Self::GotoLine => "goto-line",
             Self::SwitchBuffer => "switch-to-buffer",
             Self::RevertBuffer => "revert-buffer",
@@ -921,6 +929,8 @@ mod tests {
             ("undo", Edit),
             ("redo", Edit),
             ("isearch-forward", Read),
+            ("search-next", Read),
+            ("search-previous", Read),
             ("goto-line", Read),
             ("switch-to-buffer", Read),
             ("revert-buffer", Edit),
@@ -979,7 +989,11 @@ mod tests {
         )));
         // Negative control: a table that moved one command is caught.
         let mut moved = table.clone();
-        moved[12].1 = Edit;
+        let copied = moved
+            .iter_mut()
+            .find(|(name, _)| *name == "kill-ring-save")
+            .unwrap();
+        copied.1 = Edit;
         assert_ne!(moved, pinned);
     }
 

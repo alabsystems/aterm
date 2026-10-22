@@ -69,16 +69,6 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
     acl::verify_owner_and_harden(dir)
 }
 
-/// [`ensure_private_dir`] for a directory that must already be there: the same
-/// owner check and DACL, but nothing is created. A missing `dir` is `NotFound`
-/// and something there that is no directory, a symlink to nothing included, is
-/// `NotADirectory` (`super::require_dir`); the Unix twin says why a session
-/// identity's admission needs this.
-pub(crate) fn harden_private_dir(dir: &Path) -> std::io::Result<()> {
-    super::require_dir(dir)?;
-    acl::verify_owner_and_harden(dir)
-}
-
 /// [`ensure_private_dir`] for a directory that will hold a control socket and
 /// its token. An elevated process gives it the elevated posture wherever it is,
 /// an explicit `--control-sock`'s directory included, and keeps it open for the

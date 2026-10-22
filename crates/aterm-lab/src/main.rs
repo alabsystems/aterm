@@ -39,7 +39,7 @@
 //! the checkout): `runs/<tag>/` a lab that is up, `logs/<tag>-<time>/` what
 //! `down` keeps (stub log, the tripwire's log with the account masked, the
 //! egress witness, the harness journal, the jail profile, the aterm log, the
-//! relay's log, and what the [`stats`] readers read: Claude Code's debug log,
+//! relay's log, the settings witness's log, and what the [`stats`] readers read: Claude Code's debug log,
 //! the status line's records, the scratch `.claude.json` as `claude.json` and
 //! the transcripts under `claude-projects/`, and the sleep clock's offset and
 //! records under `clock/`; local paths and all, so look
@@ -51,7 +51,8 @@
 //! Inside `runs/<tag>/` the jail keeps two kinds of file apart. `scratch/` is
 //! the ONE place jailed code may write (`home/`, `cfg/`, `state/`, `dump/`,
 //! `modes/`, `mode`, `reply.txt`, `tool.json`, `headers.json`, `account.json`, `stub.log`,
-//! `stub.port`, `security.log`, `relay.log`, `statusline.jsonl`, `claude-debug.log`, and for
+//! `stub.port`, `security.log`, `relay.log`, `statusline.jsonl`, `claude-debug.log`,
+//! `config-change.log` (the settings witness's: [`settings_witness`]), and for
 //! Codex `codex-home/`, `open.log`,
 //! `open-control.log`, `control-home/`, for Gemini CLI and agy `gemini-home/`, `agy-home/`
 //! and their `TMPDIR`, `tmp/`, the sleep clock's records `clock/`); its directories stay where `up` made
@@ -59,7 +60,8 @@
 //! through no link ([`sys::scratch_read`], [`sys::put`]). Everything else
 //! (`env.sh`, `jail.sb`, `jailed.pids`, the witness logs `sockets.log`,
 //! `egress.log`, `members.txt` and `runtime.txt`, the launchers `claude.sh`, `codex.sh`,
-//! `codex-run.sh`, `gemini.sh`, `agy.sh`, `muse.sh` and `apikey.sh`, `bin/aterm-lab` — the copy of this program
+//! `codex-run.sh`, `gemini.sh`, `agy.sh`, `muse.sh`, `apikey.sh` and `config-change.sh` (the settings
+//! witness's `ConfigChange` hook), `bin/aterm-lab` — the copy of this program
 //! the stub, the witness, the tripwire and the open recorder run —
 //! `shim/security`, `shim/open`, `shim/aterm` (the aterm under test, so the
 //! launched agent's `aterm ctl …` runs it; a session the instance spawns lists
@@ -418,6 +420,8 @@ mod screen;
 #[cfg(target_os = "macos")]
 mod selftest;
 #[cfg(target_os = "macos")]
+mod settings_witness;
+#[cfg(target_os = "macos")]
 mod sleep;
 #[cfg(target_os = "macos")]
 mod stats;
@@ -592,7 +596,8 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  request, the account reads and the telemetry among them)
   settings [tag] '<json>'        deep-merge a JSON object into the scratch settings.json (permissions, hooks, ...; a running
                                  Claude re-reads it; null removes a key; a list replaces the list)
-  survey [tag] on|off            CLAUDE_FORCE_DISPLAY_SURVEY in the running Claude's settings env (live)
+  survey [tag] on|off [--reread] CLAUDE_FORCE_DISPLAY_SURVEY in the running Claude's settings env (live); --reread:
+                                 written again every 3 s until Claude Code reports re-reading it (the settings witness)
   setenv [tag] KEY [VALUE]       edit the scratch settings.json env block (a running Claude re-reads it)
   harness [tag] key=value ...    set [harness] keys in the scratch aterm.toml (live), e.g. continue=false; a word that
                                  is no TOML value is written as a string (approve=none: approve = \"none\")
@@ -626,8 +631,9 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
   probe [tag] [--replica]        the isolation probes: this lab's jail (a fresh one if none is up) and a replica home
                                  (--replica: the replica alone, which never touches the owner's tree)
   selftest [tag] [--keep]        the whole proof in ~25 s: up, launch, \"hi\", forced survey card, harness 0, egress,
-                                 keychain tripwire, isolation probes, twin refusing a planted link, an orphan in the jail
-                                 found and witnessed, down and nothing left in the jail; exits 1 on a failed check
+                                 keychain tripwire, the open recorder, isolation probes, twin refusing a planted link, an
+                                 orphan in the jail found and witnessed, down and nothing left in the jail; exits 1 on a
+                                 failed check
   nudge-trial [tag] [--mode on|log|off] [--trials N] [--expect on|log|off] [--via mode|key] [--no-hold]
                                  force N<=3 displacements on the real Claude Code behind the PTY relay and judge what
                                  aterm's repaint nudge does (~2.5 min; no tag: a lab of its own); exit 0 only when every
@@ -653,7 +659,7 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  step=done:landing past the waits and busy:another-sweep). A hold or Land the live
                                  instance's journal never carries on the tab within 30 s fails the run before aterm ends
                                  (1); a tab under Land before --land or --land-open sets it cannot run (3).
-  forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid] [--chains a,b] [--no-surfaces] [tag] [--keep]   FOREVER LAND and FOREVER
+  forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]   FOREVER LAND and FOREVER
                                  CRUISE live on a supervised harness: the real TUI on a lab of its own (all: one after
                                  another, <tag>-<harness>), a tab per scenario chain, each in a scratch git repository
                                  pushed to a local bare origin and left as the chain says, its Autopilot set, the stub
@@ -690,8 +696,8 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  270 s, Land's act only after an orchestrator's turn, judged only where status human_ms=
                                  stamps a person's hand (no control verb does: headless, UNOBSERVED); L14, C3 replies
                                  opening `Wrote the …` read (P2 live); P5 a worker's record working past its startup
-                                 deadline; L15 (Claude Code) a worker spawned from a manager tab's Claude Code: working
-                                 from=<mgr>, landed, await task and result. --mode cap (continue_per_hour = 1, ~72 min):
+                                 deadline; L15 a worker of the harness (spawn agent=<harness>) from a manager tab running
+                                 it: working from=<mgr>, landed, await task and result. --mode cap (continue_per_hour = 1, ~72 min):
                                  the land act the hour's one act, the next point escalated, nothing typed until an
                                  orchestrator's turn after the hour, that turn acted on. --mode wall (every harness, each
                                  drawing its own usage wall, Claude Code on its subscriber path; ~6-12 min): W1 the stub's
@@ -701,6 +707,15 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  local command's output (Muse Code /rules, agy /title) scrolls out of sight while the wait
                                  stands: a screen without the wall read, nothing typed into it, the resume typed there past
                                  the reset, landed.
+                                 --window (a run with land-p): OPENS A WINDOW: the lab's instance windowed, in the same
+                                 jail (no Launch Services: never the active app, `hwkey` key=0), and L13's person types
+                                 land-p's first prompt key by key through `hwkey` (a real NSEvent in the window's own
+                                 event queue, the path a key press takes), at an idle desk, its tab raised, instead of
+                                 the as=person seam: judged only where status human_seq= moved by exactly the keys
+                                 posted (else UNOBSERVED); one windowed lab at a time, ended by its keeper and `down`.
+                                 The windowed instance installs aterm's menu-bar item, as every windowed aterm does: the
+                                 lab's, beside the owner's aterm's, until `down`. Refused under LAB_RESTORE=1 (usage,
+                                 exit 2)
                                  Exit 0 every scenario PASS, 1 one FAIL or UNOBSERVED, 2 usage, 3 could not run
   crash [tag] [--gap SECS] [--keep-tree]   aterm crashes under a lab that is up: its OWN instance (the pid env.sh records,
                                  refused unless that pid is still the lab's) SIGKILLed, and once it ended, the instance started
@@ -709,7 +724,9 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  ended by pid; with it nothing of the tree is touched (a PTY keeper keeps the agent through the
                                  crash: keeper = { enabled = true } in LAB_ATERM_TOML, LAB_INSTANCE_ENV='TMPDIR=/tmp') and
                                  what lives 2 s after is listed. Under LAB_RESTORE it first waits (30 s) for the crash journal
-                                 to name the agent's conversation. Exit 0 the instance is back, 1 refused or failed, 2 usage
+                                 to name the agent's conversation. A windowed lab (forever --window --keep) is refused
+                                 (its recorded pid may be its window's keeper). Exit 0 the instance is back, 1 refused or
+                                 failed, 2 usage
   sleep [tag] --for SECS [--hold SECS] [--at-act [--rule RULE] [--within SECS]]   a sleep of the Mac, emulated on a lab up
                                  with LAB_CLOCK=1 (the Mac never sleeps, the system clock never moves): its OWN instance (the
                                  pid env.sh records) SIGSTOPped, the clock's offset stepped SECS, held --hold SECS (0) more,
@@ -811,6 +828,7 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
 
 Outside any lab (no jail, no stub):
   instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N]
+           [--env NAME=VALUE]…   pass a TMPDIR or ATERM_DEBUG_*/ATERM_DEV_* seam; keeps HOME and state private
            [--toml LINE]... [--toml-after LINE]... [--home DIR] [--harness] [--pre VERB]... [--image PNG] [--post VERB]...
            [--pages cold] [--keep] [-- PROGRAM ARGS]
                                  a private headless aterm in a scratch world (HOME, XDG dirs, the automatic lanes off,
@@ -1103,20 +1121,21 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
     }
 }
 
-/// Before anything is made: the owner's home must be known, and the state
-/// dir must be quotable in a sandbox profile and must not sit in the owner's data.
+/// Before anything is made: the owner's home must be known (the account's,
+/// or `HOME`'s), and the state dir must be quotable in a sandbox profile and
+/// must not sit in the data of any home the jail guards.
 #[cfg(target_os = "macos")]
 fn check_state_dir() -> Result<(), Fail> {
     let p = paths::paths();
     p.need_state()?;
-    let home = p.need_home()?;
+    let homes = p.need_guarded_homes()?;
     let s = p.state.to_string_lossy();
     if !paths::profile_safe(&s) {
         return Err(Fail::die(format!(
             "a quote, a backslash or a control character in LAB_STATE ({s}) cannot go into the sandbox profile"
         )));
     }
-    if protected::inside_protected(&s, home, protected::CCSOCKS) {
+    if protected::inside_any(&s, &homes, protected::CCSOCKS) {
         return Err(Fail::die(format!(
             "LAB_STATE may not sit inside the owner's data ({s})"
         )));

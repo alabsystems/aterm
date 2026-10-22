@@ -17,11 +17,11 @@ use std::time::{Duration, Instant};
 use aterm_agent::supervise::Autopilot;
 use aterm_window::event::{ElementState, MouseButton};
 
-use super::BorderSwitch;
 use super::gesture_tests::{
-    BYPASS, Hosted, PGID, app, autopilot, draw_claude, footer_fp, footer_row, frame, host, pty,
-    publish_facts, px_of,
+    BYPASS, Hosted, PGID, WHOLE_FACTS, app, autopilot, draw_claude, feed, footer_fp, footer_row,
+    frame, hit, host, pty, publish_facts, px_of, row_text,
 };
+use super::{BorderSwitch, Chip};
 use crate::autopilot::{AutopilotView, HarnessSwitch, SwitchOff};
 use crate::native_settings::SettingsRoute;
 use crate::{App, WindowId};
@@ -788,4 +788,54 @@ fn the_harness_tint_is_the_rules_and_only_its_mark_and_switch_are_held() {
         (b.cols.start..b.cols.end).all(&covered),
         "the switch's cells, spaces and all"
     );
+}
+
+/// A POINTED AGENTS-PANEL ROW LEAVES THE OVERLAY STANDING (owner, 2026-10-21:
+/// the facts, the chips and the switch went when the pointer reached the
+/// bottom of the screen): Claude Code 2.1.307's full-screen renderer (the
+/// alternate screen, `1003` mouse tracking) hangs its agents panel under the
+/// mode row and a blank, and points at the row the pointer hovers with `❯ `
+/// in column 0. Pointed or not, the switch stands on the composer's top rule
+/// and the facts and the Autopilot chip in its bottom rule, on the same rows.
+/// RED with a876b81f9d's reader reverted, which read the pointed row as the
+/// caret, lost the frame and drew none of them. CONTROL: the panel unpointed.
+#[test]
+fn a_pointed_agents_panel_row_keeps_the_switch_the_facts_and_the_chip() {
+    let (mut app, wid, session, _reader, _host) = claude_pane(120);
+    let rule = "\u{2500}".repeat(120);
+    // The pane's row 0 in the frame (`footer_row` is `draw_claude`'s row 22).
+    let strip = footer_row(&app, wid) - 22;
+    let (main, agent) = ("\u{23FA} main", "\u{25EF} general-purpose  Searching");
+    for (main, agent) in [
+        (format!("  {main}"), format!("  {agent}")),
+        (format!("  {main}"), format!("\u{276F} {agent}")),
+        (format!("\u{276F} {main}"), format!("  {agent}")),
+    ] {
+        let screen = format!(
+            "\x1b[?1049h\x1b[?1003h\x1b[?1006h\x1b[2J\x1b[16;1H\u{25CF} done\x1b[18;1H{rule}\
+             \x1b[19;1H\u{276F} \x1b[20;1H{rule}\x1b[21;1H  \u{23F5}\u{23F5} bypass permissions \
+             on \u{B7} 2 shells \u{B7} \u{2193} to manage\x1b[23;1H{main}\x1b[24;1H{agent}\
+             \x1b[19;3H"
+        );
+        feed(&app, session, screen.as_bytes());
+        frame(&mut app, wid);
+        let b = switch(&app, wid).unwrap_or_else(|| panic!("{main:?} / {agent:?}: no switch"));
+        assert_eq!(
+            b.frame_row,
+            strip + 17,
+            "{main:?} / {agent:?}: the top rule"
+        );
+        let face = painted(&app, wid, &b, b.switch.clone());
+        assert!(face.contains("claude harness \u{25cf} on"), "{face:?}");
+        let facts = row_text(&app, wid, strip + 19);
+        assert!(
+            facts.contains(WHOLE_FACTS),
+            "{main:?} / {agent:?}: {facts:?}"
+        );
+        assert_eq!(
+            hit(&app, wid, Chip::Autopilot).0,
+            strip + 19,
+            "{main:?} / {agent:?}: the chip in the bottom rule"
+        );
+    }
 }

@@ -28,7 +28,7 @@ use crate::{SessionCtx, term_lock};
 
 /// `sessions` -> list the process-wide registry: `OK <n>\n` then one line per
 /// session, sorted by local id: `<local> <sid> <parent|-> <state> <title> meta=<1|0>
-/// window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|-> identity=<name|->
+/// window=<id|none|-> active=<1|0|-> wfocus=<1|0|-> detail=<pct|->
 /// path=<frozen|live> program=<name|-> agent=<word|-> agent_detail=<pct|->
 /// agent_rev=<n> agent_since_ms=<ms> … supervisor=<holder|-> autopilot=<off|cruise|land|->
 /// path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|-> copy=<managed|foreign|->
@@ -46,8 +46,6 @@ use crate::{SessionCtx, term_lock};
 ///   window hosts it; `-` means the hop failed, and the line is still printed.
 /// - `detail=` is the sanitized running command
 ///   ([`crate::session_status::executing_detail`]), `-` when idle or the lock is contended.
-/// - `identity=` is the agent identity the session was spawned under (`spawn identity=`), `-`
-///   for the human's own config or an adopted shell without the field.
 /// - `path=<frozen|live>` says whether the shell fronts aterm's managed `agents/` on PATH:
 ///   measured from a program the shell started where it can be, else the registry's adoption
 ///   mark ([`crate::session_store::SessionStore::has_frozen_path`]); `path_evidence=` says which
@@ -287,11 +285,6 @@ pub(crate) fn sessions_lines(
         let detail = session_detail(h)
             .as_deref()
             .map_or_else(|| "-".to_string(), pct_encode);
-        // Already in the grammar `[a-z0-9][a-z0-9._-]*`, which the codec leaves as it is.
-        let identity = h
-            .identity
-            .as_deref()
-            .map_or_else(|| "-".to_string(), pct_encode);
         // Program and agent verdict after `path=`: the status sweep's
         // publication on the session timeline (a leaf lock, no hop), the same
         // fields `status` prints. From the same read: `path=` itself (measured
@@ -340,7 +333,7 @@ pub(crate) fn sessions_lines(
         let _ = writeln!(
             out,
             "{} {} {} {} {} meta={has_meta} nonce={nonce} window={window} active={active} \
-             wfocus={wfocus} detail={detail} identity={identity} path={path} {agent} \
+             wfocus={wfocus} detail={detail} path={path} {agent} \
              human_ms={human} role={role} attention={attention} user_title={user_title} \
              supervisor={supervisor} autopilot={autopilot} {owner} land_at={land_at} task={task} \
              pause={pause} {task_record}",
@@ -1637,11 +1630,58 @@ pub(crate) fn await_log_seamed(
 /// since=<n>` anchor taken before it still means "after turn n".
 static NEXT_TURN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The turn-id count this thread's calls answer to: [`NEXT_TURN_ID`], the
+/// process's one, in every build. A test thread may count on its own
+/// ([`own_turn_ids`]): a test that reads the count twice is then never moved
+/// between its reads by another test's `turn` or update intake (an intake
+/// raises the count by a reserve and more, `seamless::intake_turn_floor`).
+fn turn_id_count() -> &'static std::sync::atomic::AtomicU64 {
+    #[cfg(test)]
+    if let Some(own) = OWN_TURN_IDS.get() {
+        return own;
+    }
+    &NEXT_TURN_ID
+}
+
+#[cfg(test)]
+thread_local! {
+    /// TESTS ONLY: the count [`turn_id_count`] answers on this thread, when not
+    /// the process's.
+    static OWN_TURN_IDS: std::cell::Cell<Option<&'static std::sync::atomic::AtomicU64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// TESTS ONLY: this thread mints, reads and raises turn ids on a count of its
+/// own, from 0, until the guard drops; no other test's moves it, and it moves
+/// no other test's. The count is leaked (one word per test). The process's
+/// count stays the one every other thread answers to: production has one.
+#[cfg(test)]
+pub(crate) fn own_turn_ids() -> OwnTurnIds {
+    let own: &'static std::sync::atomic::AtomicU64 =
+        Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+    OwnTurnIds {
+        previous: OWN_TURN_IDS.replace(Some(own)),
+    }
+}
+
+/// TESTS ONLY: the guard [`own_turn_ids`] returns.
+#[cfg(test)]
+pub(crate) struct OwnTurnIds {
+    previous: Option<&'static std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(test)]
+impl Drop for OwnTurnIds {
+    fn drop(&mut self) {
+        OWN_TURN_IDS.set(self.previous);
+    }
+}
+
 /// Mint the next turn id (see [`NEXT_TURN_ID`]), and give it to every journaled
 /// session's crash-restore region before the caller hands it to anyone (it
 /// mints under the session's ledger lock, before the lease or a reply names it).
 fn mint_turn_id() -> u64 {
-    let id = NEXT_TURN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let id = turn_id_count().fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     #[cfg(unix)]
     crate::crash_restore::note_turn_ids();
     id
@@ -1656,14 +1696,14 @@ pub(crate) fn mint_turn_id_for_test() -> u64 {
 /// The last turn id minted — by this process, or by the one it continued the
 /// count from ([`raise_turn_ids`]); 0 before either — for the handoff manifest.
 pub(crate) fn turn_ids_minted() -> u64 {
-    NEXT_TURN_ID.load(std::sync::atomic::Ordering::Relaxed)
+    turn_id_count().load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Continue the turn-id count from `minted` (an earlier process's [`turn_ids_minted`]). Never
 /// lowers it, nor raises it past `handoff_carry::MAX_TURN_ID`: a carried count is input, and
 /// one at `u64::MAX` would overflow the next `+ 1` and break the rising ids.
 pub(crate) fn raise_turn_ids(minted: u64) {
-    NEXT_TURN_ID.fetch_max(
+    turn_id_count().fetch_max(
         minted.min(crate::handoff_carry::MAX_TURN_ID),
         std::sync::atomic::Ordering::Relaxed,
     );
@@ -2109,7 +2149,7 @@ impl TypingHold {
                 Look::Held(cursor) => return Ok((cursor, waited)),
                 Look::Stop(why) => return Err(why),
                 Look::Wait => {
-                    let now = std::time::Instant::now();
+                    let now = hold_wait_now();
                     if now >= deadline {
                         return Err("deadline");
                     }
@@ -2119,6 +2159,29 @@ impl TypingHold {
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static HOLD_WAIT_FOR_TEST: std::cell::RefCell<Option<Box<dyn Fn() -> std::time::Instant>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A test's hand at this thread's typing-hold waits: it plays the program there and answers
+/// the instant the wait is judged at (`None`: the clock).
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn set_hold_wait_for_test(hand: Option<Box<dyn Fn() -> std::time::Instant>>) {
+    HOLD_WAIT_FOR_TEST.with(|slot| *slot.borrow_mut() = hand);
+}
+
+/// The instant a [`TypingHold`]'s wait is judged at: the clock, or a test's hand.
+fn hold_wait_now() -> std::time::Instant {
+    #[cfg(test)]
+    if let Some(now) = HOLD_WAIT_FOR_TEST.with(|slot| slot.borrow().as_ref().map(|hand| hand())) {
+        return now;
+    }
+    std::time::Instant::now()
 }
 
 /// Whether the program has yet to read keys already written to it: bytes in the slave's input
@@ -4223,8 +4286,9 @@ impl RingPage {
 ///   fields) — `OK title=<pct> user_title=<pct|-> description=<pct|-> icon=<pct|->
 ///   role=<pct|-> attention=<pct|-> cwd=<pct|-> state=<s>`, then the additive
 ///   tail `attention_owner= attention_owners= attention_kinds= supervisor=
-///   questions= agent_cwd= trusted_cwd= autopilot= land_at= autopilot_by=
-///   autopilot_since=` (`land_at=`: the instant a timed Cruise lands, unix
+///   questions= agent_cwd= trusted_cwd= worker= autopilot= land_at= autopilot_by=
+///   autopilot_since=` (`worker=`: the agent a worker's spawn started, its
+///   task record's; `land_at=`: the instant a timed Cruise lands, unix
 ///   seconds, `-` while none; `autopilot_by=`/`autopilot_since=`: who set the
 ///   pair and when, [`autopilot_by_fields`]). Every free-text value is pct-encoded so the reply is always
 ///   one line; `-` marks an unset optional. Readers find a field by key.
@@ -4703,7 +4767,54 @@ pub(crate) fn cmd_meta_supervisor(
     }
 }
 
-/// `meta set harness_act <act>` — an agent that supervises itself records an
+const HARNESS_ACT_LEASE_MS: u64 = 5_000;
+const HARNESS_ACT_USAGE: &str =
+    "ERR usage: meta prepare harness_act | meta set harness_act <act> [until_us=<n>]\n";
+
+enum HarnessActRequest<'a> {
+    Prepare,
+    Set { act: &'a str, until_us: Option<u64> },
+}
+
+/// Counts and report state read together before a task-face act is admitted.
+#[derive(Clone, Copy)]
+pub(crate) struct HarnessActSnapshot {
+    pub mark: crate::session_timeline::LandingMark,
+    pub left_at_rest: bool,
+}
+
+fn harness_act_request(rest: &str) -> Option<Result<HarnessActRequest<'_>, &'static str>> {
+    let mut toks = rest.split_whitespace();
+    let sub = toks.next()?;
+    if !matches!(sub, "prepare" | "set" | "unset") || toks.next() != Some("harness_act") {
+        return None;
+    }
+    let parsed = match sub {
+        "prepare" if toks.next().is_none() => Some(HarnessActRequest::Prepare),
+        "set" => toks.next().and_then(|act| {
+            if !crate::session_timeline::valid_owner_token(act) {
+                return None;
+            }
+            let until_us = match toks.next() {
+                None => None,
+                Some(tok) => {
+                    let value = tok.strip_prefix("until_us=")?;
+                    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    Some(value.parse::<u64>().ok()?)
+                }
+            };
+            toks.next()
+                .is_none()
+                .then_some(HarnessActRequest::Set { act, until_us })
+        }),
+        _ => None,
+    };
+    Some(parsed.ok_or(HARNESS_ACT_USAGE))
+}
+
+/// `meta set harness_act <act> [until_us=<n>]` — an agent that supervises itself records an
 /// act it took on the session (the native harness contract §5, law 5: who is
 /// driving a session is seen per session). `None` for every other form, so
 /// the caller falls through.
@@ -4727,32 +4838,55 @@ pub(crate) fn cmd_meta_supervisor(
 /// commits in that same hold:
 /// another request cannot record a later landing and then have an earlier
 /// request overwrite its mark after the commit.
+///
+/// `meta prepare harness_act` grants an opaque metrics-clock deadline and its
+/// duration (`OK until_us=<n> lease_ms=5000`), without recording anything. A
+/// conditional set is refused at or after that deadline, checked after the
+/// pre-admission turn-count snapshot and after both commit locks are held.
+/// Thus a client that keeps native startup behind the acknowledged set, or
+/// behind the full lease measured from receipt of prepare's answer, cannot
+/// let a late request include that newer turn in its landing mark. A request
+/// preempted after its check retains its earlier mark even if it commits late.
+/// Conditional `left-to-person@v1` additionally requires an explicit
+/// Idle/Done/Error report in that same earlier snapshot. A submitted turn
+/// already reports Working before native acceptance; Blocked and unknown
+/// reports likewise cannot establish a separate at-rest count. Refuse those
+/// points under the proof/commit guards, without changing the session.
 pub(crate) fn cmd_meta_harness_act(
     ctx: &SessionCtx,
-    landing_mark: Option<crate::session_timeline::LandingMark>,
+    snapshot: Option<HarnessActSnapshot>,
     conn: Option<u64>,
     by: aterm_slog::Actor,
     prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
     rest: &str,
 ) -> Option<(String, bool)> {
-    const USAGE: &str = "ERR usage: meta set harness_act <act>\n";
-    let mut toks = rest.split_whitespace();
-    let sub = toks.next()?;
-    if !matches!(sub, "set" | "unset") || toks.next() != Some("harness_act") {
-        return None;
-    }
-    if sub == "unset" {
-        return Some((USAGE.to_string(), false));
-    }
-    let (Some(act), None) = (toks.next(), toks.next()) else {
-        return Some((USAGE.to_string(), false));
+    cmd_meta_harness_act_with_clock(
+        ctx,
+        snapshot,
+        conn,
+        by,
+        prove,
+        rest,
+        &crate::metrics::now_us,
+    )
+}
+
+pub(super) fn cmd_meta_harness_act_with_clock(
+    ctx: &SessionCtx,
+    snapshot: Option<HarnessActSnapshot>,
+    conn: Option<u64>,
+    by: aterm_slog::Actor,
+    prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    rest: &str,
+    now_us: &dyn Fn() -> u64,
+) -> Option<(String, bool)> {
+    let request = match harness_act_request(rest)? {
+        Ok(request) => request,
+        Err(usage) => return Some((usage.to_string(), false)),
     };
-    if !crate::session_timeline::valid_owner_token(act) {
-        return Some((USAGE.to_string(), false));
-    }
     let holder = {
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-        meta.live_claim(crate::metrics::now_us()).and_then(|claim| {
+        meta.live_claim(now_us()).and_then(|claim| {
             let proven = claim.proven.as_ref()?;
             let bound = conn.is_some() && claim.conn == conn;
             Some((
@@ -4775,19 +4909,55 @@ pub(crate) fn cmd_meta_harness_act(
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     if meta.supervisor_revision != revision
         || meta
-            .live_claim(crate::metrics::now_us())
+            .live_claim(now_us())
             .and_then(|claim| claim.proven.as_ref())
             != Some(&proven)
     {
         return Some(("ERR denied\n".to_string(), false));
     }
+    let HarnessActRequest::Set { act, until_us } = request else {
+        let Some(until_us) = now_us().checked_add(HARNESS_ACT_LEASE_MS * 1_000) else {
+            return Some(("ERR clock unavailable\n".to_string(), false));
+        };
+        return Some((
+            format!("OK until_us={until_us} lease_ms={HARNESS_ACT_LEASE_MS}\n"),
+            false,
+        ));
+    };
     {
         let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        // Read only after the last possibly blocking lock acquisition. The
+        // caller already captured the snapshot: even a preemption after this
+        // check cannot incorporate a later native turn into that snapshot.
+        let now = now_us();
+        // A claim's TTL can expire while the final timeline lock is blocked,
+        // even while meta prevents its renewal or replacement.
+        if meta.live_claim(now).and_then(|claim| claim.proven.as_ref()) != Some(&proven) {
+            return Some(("ERR denied\n".to_string(), false));
+        }
+        if let Some(until_us) = until_us {
+            if now >= until_us {
+                return Some(("ERR expired harness_act\n".to_string(), false));
+            }
+            if until_us - now > HARNESS_ACT_LEASE_MS * 1_000 {
+                return Some((HARNESS_ACT_USAGE.to_string(), false));
+            }
+            if crate::harness_task::self_claim_act_face(act)
+                == Some(aterm_agent::harness::acts::TaskFace::Theirs)
+                && !snapshot.is_some_and(|point| point.left_at_rest)
+            {
+                // A pending submission already reports Working before Core
+                // accepts its turn. Working/Blocked/unknown cannot establish
+                // an earlier at-rest point; otherwise its count could become
+                // the new turn's own landing mark and never reopen the face.
+                return Some(("ERR busy harness_act\n".to_string(), false));
+            }
+        }
         timeline.note_harness_act(act, &holder, by);
         if harness_act_face(rest).is_some_and(crate::harness_task::holds_until_another_turn)
-            && let Some(mark) = landing_mark
+            && let Some(point) = snapshot
         {
-            timeline.mark_landing(mark);
+            timeline.mark_landing(point.mark);
         }
         if let Some(face) = crate::harness_task::self_claim_act_face(act) {
             timeline.queue_self_task(face);
@@ -4807,14 +4977,9 @@ pub(crate) fn cmd_meta_harness_act(
 /// one and for every other `meta` line. Read only where the line was recorded (the arm's
 /// `on_change`): [`cmd_meta_harness_act`] answered `OK`.
 pub(crate) fn harness_act_face(rest: &str) -> Option<aterm_agent::harness::acts::TaskFace> {
-    let mut toks = rest.split_whitespace();
-    if toks.next() != Some("set") || toks.next() != Some("harness_act") {
+    let HarnessActRequest::Set { act, .. } = harness_act_request(rest)?.ok()? else {
         return None;
-    }
-    let act = toks.next()?;
-    if toks.next().is_some() {
-        return None;
-    }
+    };
     crate::harness_task::self_claim_act_face(act)
 }
 
@@ -4871,13 +5036,14 @@ fn meta_status(
     // The foreground program's own working directory, read from the OS (its timeline lock is a
     // leaf after the store's): an agent's folder-trust dialog asks for exactly this folder,
     // and a shell with no OSC 7 reports no `cwd=`.
+    let (pgid, worker) = {
+        let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            timeline.agent().program_pgid,
+            timeline.task().and_then(|t| t.agent),
+        )
+    };
     let agent_cwd = {
-        let pgid = ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .agent()
-            .program_pgid;
         u32::try_from(pgid)
             .ok()
             .filter(|p| *p > 0)
@@ -4896,18 +5062,20 @@ fn meta_status(
     // owner prints `%2D` by the rule above), how many owners hold one, each
     // entry's kind (`kind=`), the live supervisor, the session's question policy
     // word, the foreground program's own working directory, the one folder a
-    // worker's starter trusted for it (`spawn agent=`), the session's Autopilot
+    // worker's starter trusted for it (`spawn agent=`) and the agent that
+    // spawn started (`worker=`), the session's Autopilot
     // word (always named, `-` while unset: the supervisor's loop reads the word
     // only off a reply that names it), the instant a timed Cruise lands
     // (`land_at=`, unix seconds, `-` while unset), and who set the pair and when
-    // (`autopilot_by=`, `autopilot_since=`; [`autopilot_by_fields`]). Beside
-    // `supervisor=`, `supervisor_proven=<0|1>`: whether the live claim is a
-    // proven self-claim ([`crate::self_claim`]).
+    // (`autopilot_by=`, `autopilot_since=`; [`autopilot_by_fields`]).
+    // `worker=` is the agent's word, `-` for none: the task record's, which
+    // the window harness's trust rules read. Beside `supervisor=`, `supervisor_proven=<0|1>`: whether the live
+    // claim is a proven self-claim ([`crate::self_claim`]).
     format!(
         "OK title={} user_title={} description={} icon={} role={} attention={} cwd={} state={state} \
          attention_owner={} attention_owners={} attention_kinds={} supervisor={} supervisor_proven={} \
-         questions={} agent_cwd={} trusted_cwd={} autopilot={} land_at={} autopilot_by={} \
-         autopilot_since={}\n",
+         questions={} agent_cwd={} trusted_cwd={} worker={} autopilot={} land_at={} \
+         autopilot_by={} autopilot_since={}\n",
         pct_encode(&title),
         opt(meta.user_title.as_deref()),
         opt(meta.description.as_deref()),
@@ -4923,6 +5091,7 @@ fn meta_status(
         opt(meta.questions.as_deref()),
         opt(agent_cwd.as_deref()),
         opt(meta.trusted_cwd.as_deref()),
+        worker.map_or("-", aterm_phase::Program::name),
         opt(meta.autopilot.as_deref()),
         crate::autopilot::land_at_field(meta.land_at),
         autopilot_by,
@@ -6316,6 +6485,9 @@ mod tests {
     /// only a parent that outruns the reserve stands its Commit down.
     #[test]
     fn the_handoff_turn_count_leaves_room_for_turns_in_the_overlap() {
+        // Its own count: another test's intake between the two reads would
+        // raise the process's past the reserve.
+        let _own = super::own_turn_ids();
         let carried = super::turn_ids_for_handoff();
         let overlap = super::mint_turn_id();
         assert!(
@@ -6763,7 +6935,6 @@ mod tests {
             term: term.clone(),
             master: -1,
             ctx,
-            identity: None,
         }
     }
 
@@ -7396,15 +7567,15 @@ mod tests {
         assert_eq!(lines[0], "OK 3");
         assert_eq!(
             tail(lines[1]),
-            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=0 detail=- identity=- path=live"
+            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=0 detail=- path=live"
         );
         assert_eq!(
             tail(lines[2]),
-            "1 - alive tab-1 meta=0 window=3 active=0 wfocus=1 detail=- identity=- path=live"
+            "1 - alive tab-1 meta=0 window=3 active=0 wfocus=1 detail=- path=live"
         );
         assert_eq!(
             tail(lines[3]),
-            "2 - alive tab-2 meta=0 window=none active=0 wfocus=0 detail=- identity=- path=live"
+            "2 - alive tab-2 meta=0 window=none active=0 wfocus=0 detail=- path=live"
         );
     }
 
@@ -7553,11 +7724,11 @@ mod tests {
         assert_eq!(lines[0], "OK 2");
         assert_eq!(
             tail(lines[1]),
-            "0 - alive tab-0 meta=0 window=- active=- wfocus=- detail=- identity=- path=live"
+            "0 - alive tab-0 meta=0 window=- active=- wfocus=- detail=- path=live"
         );
         assert_eq!(
             tail(lines[2]),
-            "1 - alive tab-1 meta=0 window=- active=- wfocus=- detail=sleep identity=- path=live"
+            "1 - alive tab-1 meta=0 window=- active=- wfocus=- detail=sleep path=live"
         );
     }
 
@@ -7659,7 +7830,7 @@ mod tests {
             |_| false,
         );
         assert!(
-            out.contains(" window=0 active=1 wfocus=1 detail=targo%20test identity=- path=live "),
+            out.contains(" window=0 active=1 wfocus=1 detail=targo%20test path=live "),
             "{out}"
         );
         assert!(
@@ -7675,7 +7846,7 @@ mod tests {
             |_| false,
         );
         assert!(
-            out.contains(" detail=- identity=- path=live "),
+            out.contains(" detail=- path=live "),
             "contended reads `-` (and the published columns need no terminal lock): {out}"
         );
         drop(held);
@@ -7688,75 +7859,8 @@ mod tests {
             |_| false,
         );
         assert!(
-            out.contains(" detail=- identity=- path=live "),
+            out.contains(" detail=- path=live "),
             "complete reads `-`: {out}"
-        );
-    }
-
-    /// `identity=` names the agent identity each session was spawned under, `-` for the human's
-    /// own. It sits right after `detail=`, so aterm-ctl's `roster_tail` (which reads the tail by
-    /// key back to `meta=`) is unmoved; `path=` and the agent columns follow it.
-    #[test]
-    fn sessions_lines_carry_the_identity_after_detail_as_a_name_or_a_dash() {
-        let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
-        let t1 = Arc::new(Mutex::new(Terminal::new(24, 80)));
-        let mut worker = handle(0, &t0);
-        worker.identity = Some(Arc::from("worker"));
-        let snapshot = vec![worker, handle(1, &t1)];
-        let rows = vec![row(0, 0, true, true), row(1, 0, false, true)];
-        let out = sessions_lines(
-            &snapshot,
-            Ok(&rows),
-            crate::autopilot::HarnessPosture::default(),
-            |_| false,
-        );
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "OK 2");
-        assert_eq!(
-            tail(lines[1]),
-            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=1 detail=- identity=worker path=live"
-        );
-        assert_eq!(
-            tail(lines[2]),
-            "1 - alive tab-1 meta=0 window=0 active=0 wfocus=1 detail=- identity=- path=live"
-        );
-        for line in &lines[1..] {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            let detail_at = fields
-                .iter()
-                .position(|f| f.starts_with("detail="))
-                .expect("detail= column");
-            assert!(
-                fields[detail_at + 1].starts_with("identity="),
-                "identity= sits right after detail=: {line}"
-            );
-            assert!(
-                fields[detail_at + 2].starts_with("path="),
-                "path= sits right after identity=: {line}"
-            );
-            assert_eq!(
-                fields.len(),
-                detail_at + 3 + AGENT_COLUMNS.len(),
-                "only the published agent columns follow path=: {line}"
-            );
-            for (i, key) in AGENT_COLUMNS.iter().enumerate() {
-                assert!(fields[detail_at + 3 + i].starts_with(key), "{line}");
-            }
-        }
-        // The failed-hop arm carries it too: the label is a handle field, not
-        // a main-thread answer.
-        let out = sessions_lines(
-            &snapshot,
-            Err("no event loop"),
-            crate::autopilot::HarnessPosture::default(),
-            |_| false,
-        );
-        assert!(
-            out.lines()
-                .nth(1)
-                .unwrap()
-                .contains(" detail=- identity=worker path=live program=-"),
-            "{out}"
         );
     }
 
@@ -7778,11 +7882,11 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
             tail(lines[1]),
-            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=1 detail=- identity=- path=frozen"
+            "0 - alive tab-0 meta=0 window=0 active=1 wfocus=1 detail=- path=frozen"
         );
         assert_eq!(
             tail(lines[2]),
-            "1 - alive tab-1 meta=0 window=0 active=0 wfocus=1 detail=- identity=- path=live"
+            "1 - alive tab-1 meta=0 window=0 active=0 wfocus=1 detail=- path=live"
         );
         let out = sessions_lines(
             &snapshot,
@@ -7794,7 +7898,7 @@ mod tests {
             out.lines()
                 .nth(1)
                 .unwrap()
-                .contains(" detail=- identity=- path=frozen program=-"),
+                .contains(" detail=- path=frozen program=-"),
             "the failed-hop arm carries the mark too: {out}"
         );
         // Through the verb: the store's own mark, read under the snapshot's guard.
@@ -7809,11 +7913,11 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "OK 2");
         assert!(
-            tail(lines[1]).ends_with(" detail=- identity=- path=frozen"),
+            tail(lines[1]).ends_with(" detail=- path=frozen"),
             "the marked session reads frozen: {out}"
         );
         assert!(
-            tail(lines[2]).ends_with(" detail=- identity=- path=live"),
+            tail(lines[2]).ends_with(" detail=- path=live"),
             "an unmarked session reads live: {out}"
         );
     }

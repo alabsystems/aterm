@@ -693,17 +693,10 @@ fn the_typing_streak_flashes_no_pixel_more_than_three_times_a_second() {
     for style in [Lumen, Comet, Sparkle, Fire] {
         cases.push((style, true, false, default));
     }
-    // Each run is its own engine, meter and clock, so they run side by side.
-    let worst: Vec<usize> = std::thread::scope(|s| {
-        let runs: Vec<_> = cases
-            .iter()
-            .map(|&(style, chords, text, knobs)| {
-                s.spawn(move || typing_streak_flashes(style, chords, text, knobs))
-            })
-            .collect();
-        runs.into_iter()
-            .map(|run| run.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-            .collect()
+    // Each run is its own engine, meter and clock, so they run side by side,
+    // on no more threads than libtest gives the binary.
+    let worst = crate::test_pool::par_map(&cases, |&(style, chords, text, knobs)| {
+        typing_streak_flashes(style, chords, text, knobs)
     });
     let flashes = |case| worst[cases.iter().position(|&c| c == case).expect("a run case")];
     let mut failures = Vec::new();

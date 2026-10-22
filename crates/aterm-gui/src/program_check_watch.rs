@@ -16,8 +16,10 @@
 //! The reads run on a thread of their own, one at a time ([`start`]), never
 //! on a pass of the harness host: in a wedge another reader on that pass can
 //! hang for good (reading the arguments of a program held mid-start, M29 of
-//! the leftover-processes design), and the watch must still read. A headless
-//! instance and every test start none.
+//! the leftover-processes design), and the watch must still read. Every
+//! macOS instance starts it, a headless one too: its harness supervises
+//! agents by default (`[harness] headless`), and the hold is theirs. No test
+//! starts one.
 //!
 //! A development build's `program-check full` holds each look's reading at
 //! the kernel's limit ([`cmd`]), so the whole path — the five-minute judge,
@@ -171,9 +173,7 @@ fn parse(rest: &str, injection: bool, watching: bool) -> Result<Option<bool>, &'
         return Err("program-check full|live needs a development build (dev-seams)");
     }
     if !watching {
-        return Err(
-            "program-check full|live: this instance runs no stuck check (headless, or not macOS)",
-        );
+        return Err("program-check full|live: this instance runs no stuck check (not macOS)");
     }
     Ok(Some(full))
 }
@@ -214,7 +214,7 @@ pub(crate) fn stuck(board: &Mutex<Board>) -> bool {
 
 /// `status`'s program check fields: `syspolicyd=<-|ok|full|stuck>
 /// syspolicyd_workers=<n>/<limit|-> syspolicyd_full_ms=<ms>`, `-` each where
-/// unknown (not read yet, not macOS, a headless instance), and the limit's `-`
+/// unknown (not read yet, not macOS), and the limit's `-`
 /// where the kernel names none. From the board under its leaf lock; no I/O.
 pub(crate) fn status_fields() -> String {
     let b = BOARD.lock().unwrap_or_else(PoisonError::into_inner);
@@ -246,13 +246,12 @@ fn every() -> std::time::Duration {
     aterm_gui_timing::current().of(crate::harness_host::DISK_TICK)
 }
 
-/// Start the watch: on a windowed macOS instance a thread of its own reads
+/// Start the watch: on macOS, windowed or headless, a thread of its own reads
 /// `syspolicyd` once a minute, from a minute after the start, for the life of
-/// the process, each note it owes handed to `note`; nothing for a headless
-/// instance and off macOS. A read that panics is said and the next is taken
-/// at its time.
-pub(crate) fn start(headless: bool, note: Arc<dyn Fn(HostNote) + Send + Sync>) {
-    if headless || !cfg!(target_os = "macos") {
+/// the process, each note it owes handed to `note`; nothing off macOS. A read
+/// that panics is said and the next is taken at its time.
+pub(crate) fn start(note: Arc<dyn Fn(HostNote) + Send + Sync>) {
+    if !cfg!(target_os = "macos") {
         return;
     }
     let spawned = std::thread::Builder::new()

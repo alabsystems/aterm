@@ -325,6 +325,7 @@ impl App {
                         state.replace_drawn_faces(drawn.clone())
                     }
                     crate::native_app::AppViewState::Markdown(_)
+                    | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_) => false,
                 });
@@ -367,6 +368,7 @@ impl App {
                         state.replace_font_refusals(refusals.to_vec(), announce)
                     }
                     crate::native_app::AppViewState::Markdown(_)
+                    | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_) => false,
                 });
@@ -408,6 +410,7 @@ impl App {
                         state.replace_font_families(std::sync::Arc::clone(families))
                     }
                     crate::native_app::AppViewState::Markdown(_)
+                    | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_) => false,
                 });
@@ -617,6 +620,7 @@ impl App {
                         state.replace_macos_access(access.clone()) || armed
                     }
                     crate::native_app::AppViewState::Markdown(_)
+                    | crate::native_app::AppViewState::SystemState(_)
                     | crate::native_app::AppViewState::Editor(_)
                     | crate::native_app::AppViewState::Recovery(_) => false,
                 });
@@ -2236,45 +2240,6 @@ impl App {
                             p.select(idx);
                         }
                         self.palette_activate();
-                    }
-                    _ => {}
-                }
-            }
-            // The session picker, with the palette's id scheme: Focus moves the cursor,
-            // Click chooses; stale-epoch nodes decode to nothing.
-            OverlayKind::SessionPicker => {
-                let Some(idx) = self
-                    .windows
-                    .get(&wid)
-                    .and_then(|ws| ws.session_picker())
-                    .and_then(|picker| picker.a11y_filtered_index(req.target_node))
-                else {
-                    return; // root / list container carries no row action
-                };
-                match req.action {
-                    aterm_a11y::model::Action::Focus => {
-                        if let Some(p) = self
-                            .windows
-                            .get_mut(&wid)
-                            .and_then(|ws| ws.session_picker_mut())
-                        {
-                            p.select(idx);
-                        }
-                        self.overlay_a11y_update();
-                        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
-                        {
-                            w.request_redraw();
-                        }
-                    }
-                    aterm_a11y::model::Action::Click => {
-                        if let Some(p) = self
-                            .windows
-                            .get_mut(&wid)
-                            .and_then(|ws| ws.session_picker_mut())
-                        {
-                            p.select(idx);
-                        }
-                        self.session_picker_activate(wid);
                     }
                     _ => {}
                 }

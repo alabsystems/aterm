@@ -1,0 +1,32 @@
+[
+  {
+    "sha": "0123456789abcdef0123456789abcdef01234567",
+    "commit": {
+      "author": {"name": "Fixture Dev", "date": "2026-10-18T12:00:00Z"},
+      "committer": {"name": "Fixture Dev", "date": "2026-10-18T12:05:00Z"},
+      "message": "packs: read the index once\n\nThe second paragraph of the message."
+    },
+    "author": {"login": "fixture-dev-bot", "id": 9000002, "type": "Bot"},
+    "html_url": "https://github.com/fixture-dev/packs/commit/0123456789abcdef0123456789abcdef01234567"
+  },
+  {
+    "sha": "1123456789abcdef0123456789abcdef01234567",
+    "commit": {
+      "author": {"name": "Fixture Ext", "date": "2026-10-17T08:00:00Z"},
+      "committer": {"name": "Fixture Ext", "date": "2026-10-17T08:30:00Z"},
+      "message": "docs: a one-line subject"
+    },
+    "author": null,
+    "html_url": "https://github.com/fixture-dev/packs/commit/1123456789abcdef0123456789abcdef01234567"
+  },
+  {
+    "sha": "2123456789abcdef0123456789abcdef01234567",
+    "commit": {
+      "author": {"name": "Fixture Dev", "date": "2026-10-16T07:00:00Z"},
+      "committer": {"name": "Fixture Dev", "date": "2026-10-16T07:01:00Z"},
+      "message": "Merge branch 'parity_journal'\n\n* parity_journal:\n  journal: one more row"
+    },
+    "author": {"login": "fixture-dev-bot", "id": 9000002, "type": "Bot"},
+    "html_url": "https://github.com/fixture-dev/packs/commit/2123456789abcdef0123456789abcdef01234567"
+  }
+]

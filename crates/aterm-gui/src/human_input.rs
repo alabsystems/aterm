@@ -831,14 +831,6 @@ mod tests {
     #[test]
     fn the_persons_stamps_cross_a_seamless_update_at_its_commit() {
         use crate::App;
-        // The control dir is the process's (`XDG_RUNTIME_DIR`), read at the
-        // write and again at the take, which refuses a sidecar outside it:
-        // a seamless test's scratch moved it between the two, under
-        // ENV_LOCK, and the stamps read as never carried (2026-10-18,
-        // `(None, Some(0))` for both, beside the seamless module).
-        let _env = crate::seamless::tests::ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = crate::control_auth::socket_dir().expect("a private control dir");
         let path = dir.join(format!(
             "seamless-{}-{}.person",

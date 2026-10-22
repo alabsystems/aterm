@@ -1,0 +1,13 @@
+{
+  "tagName": "v0.97.0",
+  "isDraft": false,
+  "isPrerelease": false,
+  "publishedAt": "2026-10-01T09:30:00Z",
+  "createdAt": "2026-10-01T09:00:00Z",
+  "assets": [
+    {"name": "SHA256SUMS", "size": 512, "updatedAt": "2026-10-01T09:11:00Z"},
+    {"name": "aterm-0.97.0.dmg", "size": 48123456, "updatedAt": "2026-10-01T09:20:00Z"},
+    {"name": "aterm-appcast.toml", "size": 2048, "updatedAt": "2026-10-01T09:22:00Z"},
+    {"name": "aterm-0.97.0.dmg.sig", "size": 88, "updatedAt": "2026-10-01T09:23:00Z"}
+  ]
+}

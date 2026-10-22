@@ -639,6 +639,7 @@ mod tests {
             cwd: None,
             draft_empty: None,
             frame: None,
+            initializing: false,
         })
     }
 
@@ -824,6 +825,7 @@ mod tests {
                 cwd: None,
                 draft_empty: None,
                 frame: None,
+                initializing: false,
             }))
         };
         forget(sid);

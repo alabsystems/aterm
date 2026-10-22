@@ -60,6 +60,7 @@ pub(super) struct RecentTypedRun {
 }
 
 impl RecentTypedRun {
+    #[inline]
     pub(super) fn end(&self) -> u16 {
         self.col0.saturating_add(self.len)
     }
@@ -97,6 +98,8 @@ impl Default for TypedStamps {
 /// Backspace price memory (`app_input.rs`'s `ErasePriceMemory`) is bounded by
 /// it.
 pub const TYPED_STAMP_DEPTH: usize = 128;
+const STAMP_RING_MASK: usize = TYPED_STAMP_DEPTH - 1;
+const _: () = assert!(TYPED_STAMP_DEPTH.is_power_of_two());
 
 /// The in-flight patience (seconds): the upper bound on how long a typed press
 /// waits for its row to echo before the clock forgets it. Every real edge
@@ -166,6 +169,7 @@ pub(super) struct UnownedCaret {
 
 impl HandRow {
     /// The hand's row after a licensed typed echo landed on `row`.
+    #[inline]
     pub(super) fn at(row: u16) -> Self {
         Self {
             row,
@@ -178,6 +182,7 @@ impl HandRow {
     /// the hand typed at the caret (`at_caret`) the caret's screen row is kept
     /// beside it until the caret settles which is right. Carried off the grid,
     /// the caret's screen row is the only candidate.
+    #[inline]
     pub(super) fn carried(self, map: &impl Fn(u16) -> Option<u16>, at_caret: bool) -> Option<Self> {
         let caret_row = self.caret_row.or(at_caret.then_some(self.row));
         match map(self.row) {
@@ -189,6 +194,7 @@ impl HandRow {
     /// The caret was seen on `caret_row`: on the doubted screen row the
     /// composer stayed put and the hand's row follows the caret; on the
     /// content's row the doubt is over. Elsewhere nothing is settled.
+    #[inline]
     pub(super) fn settle(&mut self, caret_row: u16) {
         if self.caret_row == Some(caret_row) {
             *self = Self::at(caret_row);
@@ -398,17 +404,20 @@ impl Default for PressCredits {
 
 impl PressCredits {
     /// Bank one press worth `credits` cells.
+    #[inline]
     pub(super) fn bank(&mut self, now: Instant, credits: u8, glyph: Option<char>) {
         self.slots[self.head] = Some((now, credits, glyph));
-        self.head = (self.head + 1) % TYPED_STAMP_DEPTH;
+        self.head = (self.head + 1) & STAMP_RING_MASK;
     }
 
     /// Hold every press banked through `at` ([`Self::held_through`]).
+    #[inline]
     pub(super) fn hold_through(&mut self, at: Instant) {
         self.held_through = self.held_through.max(Some(at));
     }
 
     /// Whether the press banked at `at` is held ([`Self::held_through`]).
+    #[inline]
     pub(super) fn held(&self, at: Instant) -> bool {
         self.held_through.is_some_and(|through| at <= through)
     }
@@ -417,6 +426,7 @@ impl PressCredits {
     /// for the move being judged: unpaid, younger than
     /// [`IN_FLIGHT_PATIENCE_S`], and free — or held while the judged move
     /// stays on the hand's row ([`Self::admit_held`]).
+    #[inline]
     pub(super) fn payable(&self, at: Instant, credits: u8, now: Instant) -> bool {
         credits > 0
             && now.saturating_duration_since(at).as_secs_f32() <= IN_FLIGHT_PATIENCE_S
@@ -425,6 +435,7 @@ impl PressCredits {
 
     /// The live presses: unpaid, younger than [`IN_FLIGHT_PATIENCE_S`], and
     /// payable for the move being judged ([`Self::payable`]).
+    #[inline]
     pub(super) fn within(
         &self,
         now: Instant,
@@ -441,6 +452,7 @@ impl PressCredits {
     /// (before a stamp: presses whose glyphs lie left of that key's cell; at or
     /// after it: the key's own press and later; at or before a park: the
     /// presses in flight when it was observed).
+    #[inline]
     pub(super) fn cells_where(&self, now: Instant, keep: impl Fn(Instant) -> bool) -> usize {
         self.within(now)
             .filter(|(t, _, _)| keep(*t))
@@ -449,16 +461,19 @@ impl PressCredits {
     }
 
     /// Unpaid cells of every live press.
+    #[inline]
     pub(super) fn cells_within(&self, now: Instant) -> usize {
         self.cells_where(now, |_| true)
     }
 
     /// Unpaid presses — the same pool counted in keys.
+    #[inline]
     pub(super) fn presses_within(&self, now: Instant) -> usize {
         self.within(now).count()
     }
 
     /// Whether any unpaid press is live at `now`.
+    #[inline]
     pub(super) fn any_within(&self, now: Instant) -> bool {
         self.within(now).next().is_some()
     }
@@ -504,7 +519,7 @@ impl PressCredits {
         freshness_s: f32,
     ) -> Option<(usize, char)> {
         for k in 0..TYPED_STAMP_DEPTH {
-            let i = (self.head + k) % TYPED_STAMP_DEPTH;
+            let i = (self.head + k) & STAMP_RING_MASK;
             if let Some((at, credits, glyph)) = self.slots[i]
                 && self.payable(at, credits, now)
                 && now.saturating_duration_since(at).as_secs_f32() <= freshness_s
@@ -573,7 +588,7 @@ impl PressCredits {
             [None; EXACT_COALESCED_PREFIX_MAX + EXACT_COALESCED_STALE_PREFIX_MAX];
         let mut n = 0;
         for k in 0..TYPED_STAMP_DEPTH {
-            let i = (self.head + k) % TYPED_STAMP_DEPTH;
+            let i = (self.head + k) & STAMP_RING_MASK;
             let Some((at, credits, glyph)) = self.slots[i] else {
                 continue;
             };
@@ -631,7 +646,7 @@ impl PressCredits {
             if n == glyphs.len() {
                 break;
             }
-            let i = (self.head + k) % TYPED_STAMP_DEPTH;
+            let i = (self.head + k) & STAMP_RING_MASK;
             let Some((at, credits, glyph)) = self.slots[i] else {
                 continue;
             };
@@ -653,7 +668,7 @@ impl PressCredits {
     /// position, since two keys can share an input timestamp.
     pub(super) fn retire_before_slot(&mut self, selected: usize) {
         for k in 0..TYPED_STAMP_DEPTH {
-            let i = (self.head + k) % TYPED_STAMP_DEPTH;
+            let i = (self.head + k) & STAMP_RING_MASK;
             if i == selected {
                 return;
             }
@@ -676,7 +691,7 @@ impl PressCredits {
                 if cells == 0 {
                     return drained;
                 }
-                let i = (self.head + k) % TYPED_STAMP_DEPTH;
+                let i = (self.head + k) & STAMP_RING_MASK;
                 let Some((t, c, _)) = self.slots[i] else {
                     continue;
                 };
@@ -748,7 +763,7 @@ impl PressCredits {
         let mut keys = [None; ORPHAN_EXACT_KEYS_MAX];
         let mut n = 0;
         for k in 0..TYPED_STAMP_DEPTH {
-            let i = (self.head + k) % TYPED_STAMP_DEPTH;
+            let i = (self.head + k) & STAMP_RING_MASK;
             let Some((at, credits, glyph)) = self.slots[i] else {
                 continue;
             };
@@ -792,7 +807,7 @@ impl PressCredits {
     pub(super) fn merge(&mut self, later: Self) {
         if self.head == 0 && self.slots.iter().all(Option::is_none) {
             for k in 0..TYPED_STAMP_DEPTH {
-                let i = (later.head + k) % TYPED_STAMP_DEPTH;
+                let i = (later.head + k) & STAMP_RING_MASK;
                 if let Some((t, c, glyph)) = later.slots[i] {
                     self.bank(t, c, glyph);
                 }
@@ -807,6 +822,7 @@ impl PressCredits {
     }
 
     /// The slot of the newest press, if any.
+    #[inline]
     pub(super) fn newest(&self) -> Option<usize> {
         self.slots
             .iter()
@@ -818,6 +834,7 @@ impl PressCredits {
 
     /// Retire the newest press (the key a Backspace erases), whole, however
     /// many cells it was priced at.
+    #[inline]
     pub(super) fn retire_newest(&mut self) {
         if let Some(i) = self.newest() {
             self.slots[i] = None;
@@ -830,6 +847,7 @@ impl PressCredits {
     /// slot goes only when its last cell is paid. An erase wider than the slot
     /// takes the slot and no more. A zero-cell erase (a zero-width cluster)
     /// takes nothing, leaving the press before the run standing.
+    #[inline]
     pub(super) fn retire_newest_cells(&mut self, cells: u8) {
         if cells == 0 {
             return;
@@ -846,6 +864,7 @@ impl PressCredits {
 
     /// Whether no press is banked at all (spent or unspent — a slot with
     /// zero credits left is `None`).
+    #[inline]
     pub(super) fn is_empty(&self) -> bool {
         self.slots.iter().all(Option::is_none)
     }
@@ -1030,12 +1049,14 @@ pub(super) struct EraseWitness {
 
 impl EraseWitness {
     /// Whether a retreat is still owed at `now`, within the press patience.
+    #[inline]
     pub(super) fn owed_at(&self, now: Instant) -> bool {
         self.owed > 0
             && now.saturating_duration_since(self.at).as_secs_f32() <= IN_FLIGHT_PATIENCE_S
     }
 
     /// The retired glyphs still to echo.
+    #[inline]
     pub(super) fn retired(&self) -> &[char] {
         &self.retired[..usize::from(self.retired_n)]
     }
@@ -1109,6 +1130,7 @@ pub(super) struct HeldPark {
 }
 
 impl HeldPark {
+    #[inline]
     pub(super) fn patience(&self) -> Duration {
         if self.cross_row {
             Duration::from_secs_f32(IN_FLIGHT_PATIENCE_S)
@@ -1117,6 +1139,7 @@ impl HeldPark {
         }
     }
 
+    #[inline]
     pub(super) fn fresh(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.at) <= self.patience()
     }
@@ -1215,6 +1238,7 @@ pub(super) struct OrphanExactRun {
 }
 
 impl OrphanExactRun {
+    #[inline]
     pub(super) fn current(self) -> Option<OrphanExactKey> {
         self.keys.get(self.next).copied().flatten()
     }
@@ -1311,6 +1335,7 @@ impl InsertSeam {
     /// The armed licence while fresh: [`CursorGlow::INSERT_HINT_FRESH`] for a
     /// priced insert, the shorter [`CursorGlow::INSERT_GESTURE_HINT_FRESH`] for
     /// the unknown class.
+    #[inline]
     pub(super) fn fresh(&self, now: Instant) -> Option<InsertLicence> {
         self.armed.filter(|i| {
             let window = if i.known {
@@ -1323,6 +1348,7 @@ impl InsertSeam {
     }
 
     /// Drop the licence and the credit it accumulated into.
+    #[inline]
     pub(super) fn clear(&mut self) {
         self.armed = None;
         self.undo.licence = None;
@@ -1398,6 +1424,7 @@ impl InsertSeam {
     /// Whether a retreat to `col` on `row` lands inside the span a delivered
     /// insert laid within [`CursorGlow::INSERT_REWRITE_FRESH`]: the rewrite
     /// window's shape half (the rest is [`CursorGlow::insert_rewrite`]).
+    #[inline]
     pub(super) fn span_admits_retreat(&self, row: u16, col: u16, now: Instant) -> bool {
         self.span.is_some_and(|span| {
             span.row == row
@@ -1594,6 +1621,7 @@ impl CursorGlow {
     /// the typed advance as a typed re-anchor: a TUI input box (Claude Code's
     /// Ink prompt) rewraps per keystroke, so the caret lands left of its
     /// launch column without travelling (see `classify_move`).
+    #[inline]
     pub fn note_typed(&mut self, now: Instant) {
         self.note_typed_cells(now, 1);
     }
@@ -1602,6 +1630,7 @@ impl CursorGlow {
     /// at 2, an IME commit at its summed cells, so CJK typing is not refused
     /// for budget (see [`Self::type_press_ring`]). Clamped to the sweep max.
     /// Plain keyboard input goes through the 1-cell [`Self::note_typed`].
+    #[inline]
     pub fn note_typed_cells(&mut self, now: Instant, cells: u16) {
         self.note_typed_glyph(now, cells, false, rk::TypedClass::Glyph);
     }
@@ -1611,6 +1640,7 @@ impl CursorGlow {
     /// an m1; a space lays ribbon and deals no star) and an echo cannot tell.
     /// Only seam point 2 reads the extra fields; the wrapper is otherwise
     /// identical.
+    #[inline]
     pub fn note_typed_glyph(
         &mut self,
         now: Instant,
@@ -1654,6 +1684,7 @@ impl CursorGlow {
     /// The one-cell typed hint with the input glyph's exact identity. Hosts
     /// that know only a cell count use [`Self::note_typed_glyph`] and cannot
     /// enter the same-caret inference lane; every ordinary move is unchanged.
+    #[inline]
     pub fn note_typed_expected(
         &mut self,
         now: Instant,
@@ -1678,6 +1709,7 @@ impl CursorGlow {
     /// place), so the hand leaves its row ([`Self::hand_row`]); the next
     /// licensed typed echo names the new row. An Enter into a foreground
     /// program's composer is [`Self::note_return_keeping_hand`].
+    #[inline]
     pub fn note_return(&mut self, now: Instant) {
         self.note_return_keeping_hand(now);
         self.hand_row = None;
@@ -1759,6 +1791,7 @@ impl CursorGlow {
     /// The row fill an erase key stamps as its pre-erase baseline
     /// ([`Self::bs_baseline`]): this frame's probe if landed, else the last
     /// presented truth.
+    #[inline]
     pub(super) fn row_fill_at_key(&self) -> Option<(u16, u16)> {
         self.row_cur_meta
             .or(self.row_prev_meta)
@@ -1768,6 +1801,7 @@ impl CursorGlow {
     /// The row fill an erase delivery stamps as its baseline: the previous
     /// probe first, since receipts apply after this frame's
     /// `observe_row_with_trust` and `row_cur_meta` may already be post-erase.
+    #[inline]
     pub(super) fn row_fill_at_delivery(&self) -> Option<(u16, u16)> {
         self.row_prev_meta
             .or(self.row_cur_meta)
@@ -1796,6 +1830,7 @@ impl CursorGlow {
     /// matching hop refused within [`Self::INSERT_RETRO_FRESH`], at or after
     /// `dispatched_at`, is retro-licensed ([`PendingHop`]); bytes cannot echo
     /// before dispatch. `Cells(0)` arms nothing.
+    #[inline]
     pub fn note_insert_delivered_from(
         &mut self,
         dispatched_at: Instant,
@@ -1839,6 +1874,7 @@ impl CursorGlow {
     /// the press. A pending hop is left for a real receipt. The licence is
     /// stamped at `at`, so a queued Tab's revoke finds it and the delivery
     /// re-arm counts the gesture once and makes the retro claim.
+    #[inline]
     pub fn note_insert_armed(&mut self, at: Instant, width: InsertWidth) {
         let _ = self.arm_insert(at, at, width);
     }
@@ -1888,6 +1924,7 @@ impl CursorGlow {
     /// transcript printing above) or on the established row is never demoted.
     /// A caret shown on a fresh row since the lane last licensed elsewhere
     /// reads as parked until an echo names its row.
+    #[inline]
     pub(super) fn insert_row(&self, now: Instant) -> Option<u16> {
         let established = self.last_anchor_sweep.map(|(row, _)| row);
         if let Some((row, _)) = self.last
@@ -1906,6 +1943,7 @@ impl CursorGlow {
     /// Remember a refused same-row forward hop `col0 → col1` on `row` for one
     /// in-flight delivery receipt ([`PendingHop`]); Rainbow Kitty only. Shared
     /// by `spawn_judged` and `echo_anchor_pass`.
+    #[inline]
     pub(super) fn remember_refused_hop(
         &mut self,
         row: u16,
@@ -1927,6 +1965,7 @@ impl CursorGlow {
     /// Move the insert's row-addressed members with a scroll or band move
     /// ([`InsertSeam::translate_rows`]); the lane's own row witness names an
     /// absolute row too and is dropped with them.
+    #[inline]
     pub(super) fn translate_insert_rows(&mut self, map: &impl Fn(u16) -> Option<u16>) {
         self.insert.translate_rows(map);
         self.last_licensed_row = None;
@@ -1934,6 +1973,7 @@ impl CursorGlow {
 
     /// How many cells the fresh delivered insert `ins` may buy on a same-row
     /// forward echo: its width plus the unpaid typed credits queued behind it.
+    #[inline]
     pub(super) fn insert_reach(&self, ins: InsertLicence, now: Instant) -> usize {
         usize::from(ins.cells) + self.typed_credits_within(now)
     }
@@ -1941,6 +1981,7 @@ impl CursorGlow {
     /// The insert echo shape: a same-row forward move no wider than the fresh
     /// insert's reach, under Rainbow Kitty. `None` otherwise, and the move is
     /// program output to this class.
+    #[inline]
     pub(super) fn insert_echo(
         &self,
         pr: u16,
@@ -1966,6 +2007,7 @@ impl CursorGlow {
     /// multi-line body, bounded at [`Self::INSERT_GESTURE_CELLS`]) is spent on
     /// the witnessed row alone: not a prompt a later Return printed, not a
     /// ⇧Tab mode line, not an untyped row.
+    #[inline]
     pub(super) fn insert_row_identity(row: u16, hop: usize, ins: InsertLicence) -> bool {
         let own_row = ins.row == Some(row);
         own_row || (ins.known && hop >= usize::from(ins.cells))
@@ -1977,6 +2019,7 @@ impl CursorGlow {
     /// ([`Self::insert_echo`]) on the insert's own row
     /// ([`Self::insert_row_identity`]) with no fresher press class owning the
     /// hop ([`Self::fresher_class_owns_hop`]).
+    #[inline]
     pub(super) fn visible_insert_echo(
         &self,
         pr: u16,
@@ -2056,6 +2099,7 @@ impl CursorGlow {
     /// Whether a keyed erase class is fresh (Backspace, kill chord,
     /// navigation): a caret retreat under one is that key's own, never a
     /// program rewrite.
+    #[inline]
     pub(super) fn erase_key_fresh(&self, now: Instant) -> bool {
         hint_fresh(self.quench_hint, now, Self::QUENCH_HINT_FRESH)
             || hint_fresh(self.kill_hint, now, Self::KILL_HINT_FRESH)
@@ -2068,6 +2112,7 @@ impl CursorGlow {
     /// lit cells under blanks). A readline redraw caught between CR and reprint
     /// has the text still on the row and retracts nothing. With no probe for
     /// this row, geometry alone decides.
+    #[inline]
     pub(super) fn probe_blank_from(&self, row: u16, col: u16, now: Instant) -> bool {
         let Some(meta) = self.row_cur_meta else {
             return true;
@@ -2085,6 +2130,7 @@ impl CursorGlow {
     /// (Claude Code swapping a dropped path for `[Image #1] `), with the row
     /// probe (when it speaks) showing the suffix blank. Returns the cells
     /// retreated; `None` otherwise.
+    #[inline]
     pub(super) fn insert_rewrite(
         &self,
         pr: u16,
@@ -2220,6 +2266,7 @@ impl CursorGlow {
     }
 
     /// `trail status`'s insert rows — see [`InsertTally`].
+    #[inline]
     #[must_use]
     pub fn insert_tally(&self) -> InsertTally {
         self.insert.tally
@@ -2227,6 +2274,7 @@ impl CursorGlow {
 
     /// `trail status`'s in-flight rows ([`InFlightTally`]), read at the last
     /// tick's clock (`heat_at`).
+    #[inline]
     #[must_use]
     pub fn in_flight_tally(&self) -> InFlightTally {
         InFlightTally {
@@ -2296,6 +2344,7 @@ impl CursorGlow {
 
     /// Scripted typed-move twin for previews, examples and benchmarks that
     /// deliberately exercise the typing classifier without a live terminal.
+    #[inline]
     #[doc(hidden)]
     pub fn note_synthetic_typed(&mut self, now: Instant, cells: u16) {
         self.note_typed_cells(now, cells);
@@ -2303,6 +2352,7 @@ impl CursorGlow {
 
     /// Whether the bounded reflow classifier stamp is currently armed. This is
     /// observability for lifecycle tests, not an admission licence.
+    #[inline]
     #[must_use]
     pub fn reflow_hint_armed(&self) -> bool {
         self.reflow_hint.is_some()
@@ -2311,6 +2361,7 @@ impl CursorGlow {
     /// Committed cell credits in flight (unpaid, inside
     /// [`IN_FLIGHT_PATIENCE_S`]): the press budget the anti-stray gates read
     /// (see [`Self::type_press_ring`]).
+    #[inline]
     pub(super) fn typed_credits_within(&self, now: Instant) -> usize {
         self.type_press_ring.cells_within(now)
     }
@@ -2322,6 +2373,7 @@ impl CursorGlow {
     /// press echoing as a multi-cell hop (`w` over a five-cell word: 1 credit
     /// against 5). The two-press floor reads the raw ledger: one unechoed
     /// press is indistinguishable from a stale stamp.
+    #[inline]
     pub(super) fn share_rule(credits: usize, paid: usize, cells: usize) -> bool {
         credits >= 2 && paid * 4 >= cells * 3
     }
@@ -2339,11 +2391,18 @@ impl CursorGlow {
     /// `presses >= 0.75 * glyphs`, the narrow rule in glyph space.
     pub(super) fn typed_share_paid(&self, row: u16, pc: u16, cc: u16, now: Instant) -> bool {
         let credits = self.typed_credits_within(now);
+        if credits < 2 {
+            return false;
+        }
+        let cells = usize::from(cc.saturating_sub(pc));
+        if Self::share_rule(credits, credits, cells) {
+            return true;
+        }
         let paid = credits.saturating_add(
             self.swept_wide_continuations(row, pc, cc, now)
                 .min(self.type_press_ring.presses_within(now)),
         );
-        Self::share_rule(credits, paid, usize::from(cc.saturating_sub(pc)))
+        Self::share_rule(credits, paid, cells)
     }
 
     /// How many columns of the same-row run `[from_col, to_col)` are wide
@@ -2392,6 +2451,7 @@ impl CursorGlow {
     /// phantom. The only trace is `swallowed_no_echo=` on `trail status`.
     /// Raw-mode programs (Claude Code, vim, readline, `read -s -n`) echo for
     /// themselves and never come here.
+    #[inline]
     pub fn note_typed_swallowed_no_echo(&mut self) {
         self.in_flight_tally.swallowed_no_echo += 1;
     }
@@ -2481,12 +2541,14 @@ impl CursorGlow {
     /// synchronized update) is younger than [`Self::BLINK_HINT_FRESH`]. It
     /// separates a full-redraw TUI's re-anchor and coalesce from a deliberate
     /// vim/less jump; the main screen never asks.
+    #[inline]
     pub(super) fn blink_fresh(&self, now: Instant) -> bool {
         hint_fresh(self.blink_hint, now, Self::BLINK_HINT_FRESH)
     }
 
     /// The focused pane's `(first column, width)` under the host's pane
     /// columns ([`Self::pane_columns`]), or the whole grid.
+    #[inline]
     pub(super) fn pane_span(&self, geom: Geom) -> (usize, usize) {
         self.pane_columns.map_or((0, geom.cols), |(col0, cols)| {
             (usize::from(col0), usize::from(cols))
@@ -2496,6 +2558,7 @@ impl CursorGlow {
     /// A move's pane-local columns for the fold shapes: `(pane_cols,
     /// pc_local, cc_local, pane_contains_move)` under the host's pane columns
     /// ([`Self::pane_columns`]) or the whole grid.
+    #[inline]
     pub(super) fn pane_local(&self, pc: u16, cc: u16, geom: Geom) -> (usize, usize, usize, bool) {
         let (pane_col0, pane_cols) = self.pane_span(geom);
         let pane_col1 = pane_col0.saturating_add(pane_cols);
@@ -2635,22 +2698,28 @@ impl CursorGlow {
             return None;
         }
         let unit = rk::witness::unit_at;
-        let word = cc..pc;
-        if word.clone().any(|c| unit(&self.row_prev, c).is_blank())
-            || word
-                .clone()
-                .all(|c| unit(&self.row_cur, c) == unit(&self.row_prev, c))
-        {
+        let mut any_changed = false;
+        for c in cc..pc {
+            let prev_u = unit(&self.row_prev, c);
+            if prev_u.is_blank() {
+                return None;
+            }
+            any_changed |= unit(&self.row_cur, c) != prev_u;
+        }
+        if !any_changed {
             return None;
         }
         let end = u16::try_from(self.ink_end_in_pane(&self.row_above_cur)).ok()?;
         let dst = end.checked_sub(pc - cc)?;
         let before = dst.checked_sub(1)?;
-        let arrived = word.clone().zip(dst..end).all(|(src, now)| {
+        if !unit(&self.row_above_cur, before).is_blank() {
+            return None;
+        }
+        let arrived = (cc..pc).zip(dst..end).all(|(src, now)| {
             unit(&self.row_above_cur, now) == unit(&self.row_prev, src)
                 && unit(&self.row_above_prev, now).is_blank()
         });
-        (arrived && unit(&self.row_above_cur, before).is_blank()).then_some(dst)
+        arrived.then_some(dst)
     }
 
     /// The tight fold shape, shared by the classifier (`shape_wrap`'s first arm
@@ -2662,6 +2731,7 @@ impl CursorGlow {
     /// plus landing head before `cc`: 1..=3), or `None` off the shape. The tail
     /// is 0 when the pane's last cell was already paid as the pending-wrap
     /// print ([`Self::fold_origin_tail`], [`Self::wrap_paid_row`]).
+    #[inline]
     pub(super) fn fold_shape(
         &self,
         pr: u16,
@@ -2685,6 +2755,7 @@ impl CursorGlow {
     /// the fold leaves the last column and the anchored lane already licensed
     /// that cell as the pending-wrap print ([`Self::wrap_paid_row`]). A
     /// last-column glyph arriving with the wrap prices both cells.
+    #[inline]
     pub(super) fn fold_origin_tail(&self, pr: u16, pc_local: usize, pane_cols: usize) -> usize {
         if pc_local.saturating_add(1) == pane_cols && self.wrap_paid_row == Some(pr) {
             0
@@ -2702,6 +2773,7 @@ impl CursorGlow {
     /// relocation). Returns the cells laid (2..=7) or `None`. The classifier
     /// admits it under a live typing rhythm or the in-flight licence; the seam
     /// admits it with exact payment.
+    #[inline]
     pub(super) fn coalesced_fold_shape(
         &self,
         pr: u16,
@@ -2780,6 +2852,7 @@ impl CursorGlow {
     /// [`Self::note_kill`] for a word-scale kill chord (^W, Alt-D, Alt/Ctrl-
     /// Backspace): the same licence, but the poof speaks
     /// [`crate::trail_sound::SoundKind::KillWord`] instead of the swoosh.
+    #[inline]
     pub fn note_word_kill(&mut self, now: Instant, moves_cursor: bool) {
         self.note_kill(now, moves_cursor);
         self.kill_hint_word = true;
@@ -2797,6 +2870,7 @@ impl CursorGlow {
     /// press may open a minibuffer (zle's Ctrl-R/S, Alt-X, Escape into vi's
     /// `/`) or hand the keyboard to another program. Line-editing keys and bare
     /// modifier edges use [`Self::clear_typed_keeping_hand`].
+    #[inline]
     pub fn clear_typed(&mut self, now: Instant) {
         self.clear_typed_keeping_hand(now);
         // The hand did something other than type or edit its line.
@@ -2813,6 +2887,7 @@ impl CursorGlow {
     /// the hand's input, so a park observed after the hand moves on to another
     /// row (a composer's next line, then Backspace back) cannot disown it. A
     /// doubt about another row stands.
+    #[inline]
     pub(super) fn hand_lands_on(&mut self, row: u16) {
         self.hand_row = Some(HandRow::at(row));
         if self.unowned_caret.is_some_and(|caret| caret.row == row) {
@@ -2867,6 +2942,7 @@ impl CursorGlow {
     /// host calls this instead of `clear_typed` on the printable-glyph arm
     /// (and ahead of `note_return` / `note_user_gesture` for Enter, Tab and
     /// ⌃V); [`Self::note_typed_glyph`] calls it before banking its stamp.
+    #[inline]
     pub fn supersede_typed_press(&mut self) {
         self.user_gesture_hint = None;
         self.reflow_hint = None;
@@ -2915,6 +2991,7 @@ impl CursorGlow {
     /// never saw the key): [`Self::revoke_input_hints_at`] plus the press
     /// credit, which alone would license the next program `+1` as `inflight`.
     /// A merely queued key keeps its credit, since it will echo.
+    #[inline]
     pub fn revoke_failed_input_at(&mut self, at: Instant) {
         self.revoke_input_hints_at(at);
         self.type_press_ring.revoke_at(at);

@@ -36,6 +36,7 @@ pub(crate) const BODY_CONTRAST_GUARD: f32 = 0.05;
 /// The darkest a light-ground body may composite, in WCAG relative
 /// luminance: the theme's text keeps [`BODY_CONTRAST_BAR`] (plus the guard)
 /// over it. A function of the foreground alone.
+#[inline]
 #[must_use]
 pub(crate) fn light_body_floor(theme_fg: u32) -> f32 {
     light_floor_at(theme_fg, BODY_CONTRAST_BAR + BODY_CONTRAST_GUARD)
@@ -43,6 +44,7 @@ pub(crate) fn light_body_floor(theme_fg: u32) -> f32 {
 
 /// The darkest a light-ground mark may composite, in WCAG relative
 /// luminance, for `theme_fg` to keep `bar` over it.
+#[inline]
 #[must_use]
 pub(crate) fn light_floor_at(theme_fg: u32, bar: f32) -> f32 {
     bar * (relative_luminance(theme_fg) + 0.05) - 0.05
@@ -50,6 +52,7 @@ pub(crate) fn light_floor_at(theme_fg: u32, bar: f32) -> f32 {
 
 /// A walk toward white by `w`: `c + w · (255 − c)`. Channel differences
 /// survive unscaled, so the hue direction is kept and only saturation falls.
+#[inline]
 fn toward_white(rgb: u32, w: f32) -> u32 {
     let ch = |sh: u32| {
         let c = ((rgb >> sh) & 0xff) as f32;
@@ -417,6 +420,7 @@ pub(crate) struct LightGround {
 
 impl LightGround {
     /// The ground of a resolved config.
+    #[inline]
     #[must_use]
     pub(crate) fn of(cfg: &GlowConfig) -> Self {
         Self {
@@ -431,6 +435,7 @@ impl LightGround {
     /// ([`LIGHT_BODY_ALPHA_CAP`], opaque): the bodies under the letters
     /// stack (a crown over a tail over the typing glow), and a stack of one
     /// ink composites toward the ink itself, so the ink alone keeps the bar.
+    #[inline]
     #[must_use]
     pub(crate) fn body_ink(self, rgb: u32) -> u32 {
         #[cfg(test)]

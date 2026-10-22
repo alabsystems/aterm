@@ -44,12 +44,14 @@ pub struct DogBakeKey {
 impl DogBakeKey {
     /// Resolve this key's ramp index + local palette into concrete bake fills (floats appear
     /// only past this point).
+    #[inline]
     #[must_use]
     pub fn fills(&self) -> ResolvedFills {
         ResolvedFills::from_context(self.coat, DOG_IRIS_STOP, self.colors)
     }
 
     /// Bake the tile this key describes (the cache-miss path).
+    #[inline]
     #[must_use]
     pub fn bake(&self) -> Tile {
         bake_breed(
@@ -62,6 +64,7 @@ impl DogBakeKey {
 
     /// A stable `u64` id for [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile):
     /// FNV-1a over the salt and the key's integer fields, high bit set.
+    #[inline]
     #[must_use]
     pub fn host_id(&self) -> u64 {
         host_tile_id(&[
@@ -100,10 +103,12 @@ pub fn bake_breed(breed: DogGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> T
 }
 
 impl ExactTileKey for DogBakeKey {
+    #[inline]
     fn size(&self) -> (u16, u16) {
         (self.w, self.h)
     }
 
+    #[inline]
     fn bake_tile(&self) -> Tile {
         self.bake()
     }
@@ -115,6 +120,7 @@ pub type DogBaker = ExactTileBaker<DogBakeKey>;
 impl DogBaker {
     /// The authored aspect (width ÷ height) of a breed head, clamped away from zero so a
     /// degenerate asset cannot produce a NaN/∞ destination rect.
+    #[inline]
     #[must_use]
     pub fn aspect(breed: DogGlyphId) -> f32 {
         (f32::from(DOG_GLYPHS[breed as usize].aspect_x1000) / 1000.0).max(0.001)

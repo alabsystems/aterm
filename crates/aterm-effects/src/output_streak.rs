@@ -858,6 +858,13 @@ impl OutputStreak {
 
     /// Emit this frame's light and return its fingerprint (`0` ⇒ nothing drawn).
     fn emit(&self, geom: Geom, cfg: &StreakConfig, out: &mut Vec<GlowQuad>) -> u64 {
+        let peak = (ALPHA_DEFAULT * cfg.intensity.clamp(0.0, 1.0)).min(ALPHA_CLAMP);
+        // Governor 5: halved on a light ground, where the light flips to a
+        // tinted shadow (additive light cannot darken a pale ground).
+        let amp = if cfg.dark_theme { peak } else { peak * 0.5 };
+        if amp <= 0.0 {
+            return 0;
+        }
         let before = out.len();
         let mut fp: u64 = 0;
 
@@ -879,7 +886,16 @@ impl OutputStreak {
                 // Bright head, fading tail; squared so the tail thins fast and
                 // the comet reads as motion rather than a painted bar.
                 let shape = (1.0 - u) * (1.0 - u);
-                self.push_cell(out, geom, cfg, row, col, c.hue + u * HUE_SPAN, shape * life);
+                self.push_cell(
+                    out,
+                    geom,
+                    cfg,
+                    amp,
+                    row,
+                    col,
+                    c.hue + u * HUE_SPAN,
+                    shape * life,
+                );
             }
             fp = fp
                 .wrapping_mul(1_000_003)
@@ -897,7 +913,7 @@ impl OutputStreak {
             let shape = 0.55 * fade;
             for col in r.from_col..=r.to_col {
                 let t = r.hue + (col as f32 / cols_f) * HUE_SPAN;
-                self.push_cell(out, geom, cfg, row, col, t, shape);
+                self.push_cell(out, geom, cfg, amp, row, col, t, shape);
             }
             fp = fp
                 .wrapping_mul(31)
@@ -923,6 +939,7 @@ impl OutputStreak {
         out: &mut Vec<GlowQuad>,
         geom: Geom,
         cfg: &StreakConfig,
+        amp: f32,
         row: i32,
         col: i32,
         hue_t: f32,
@@ -931,10 +948,6 @@ impl OutputStreak {
         if row < 0 || col < 0 || shape <= 0.0 {
             return;
         }
-        let peak = (ALPHA_DEFAULT * cfg.intensity.clamp(0.0, 1.0)).min(ALPHA_CLAMP);
-        // Governor 5: halved on a light ground, where the light flips to a
-        // tinted shadow (additive light cannot darken a pale ground).
-        let amp = if cfg.dark_theme { peak } else { peak * 0.5 };
         let a = (amp * shape.clamp(0.0, 1.0) * 255.0).round() as u8;
         if a == 0 {
             return;

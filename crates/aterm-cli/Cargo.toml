@@ -28,6 +28,8 @@ aterm-theme-pack = { workspace = true }
 # `aterm help rust` calls the REAL toolchain discovery (`atpkg::toolchain`) rather
 # than restating it. The one `aterm` binary links atpkg already.
 atpkg = { workspace = true }
+# `aterm help agh`: the manual is generated from agh's verb and exit tables.
+agh = { workspace = true }
 # `aterm doctor`'s rows are converge items (docs/DESIGN-init-system-2026-10-20.md S5);
 # `crates/aterm` composes them with atpkg's.
 aterm-converge = { workspace = true }
@@ -76,6 +78,8 @@ aterm-link = { path = "../aterm-link" }
 # provisioning library's plist codec.
 [target.'cfg(target_os = "macos")'.dependencies]
 aterm-machines = { workspace = true }
+aterm-secrets = { workspace = true }
+aterm-digest = { workspace = true }
 
 [lints]
 workspace = true

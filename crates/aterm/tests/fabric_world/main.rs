@@ -4,7 +4,7 @@
 //! The fabric worlds, one test binary: a guarded broker, a headless `aterm`
 //! and the `aterm link serve` bridge it launches, driven end to end.
 //!
-//! The subject is THIS package's own binary (`CARGO_BIN_EXE_aterm`), so cargo
+//! The subject is THIS package's own binary (`harness::aterm`), so cargo
 //! builds it, and rebuilds it after any edit below it, before a test here runs.
 //! Every world scratches under its own tag and this process's pid
 //! (`/tmp/atl-<tag>-<pid>`, `/tmp/a5-<tag><pid>`): private sockets, state and
@@ -25,6 +25,7 @@ mod doctor_retire;
 mod exactly_once;
 mod fabric_cli;
 mod fabric_on;
+mod handoff_cost;
 mod link_state;
 mod log_mail;
 mod log_mirror;

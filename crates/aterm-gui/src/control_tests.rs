@@ -76,9 +76,8 @@ fn an_ambiguous_id_is_refused_by_the_resolver_every_seam_shares() {
     use super::{Resolution, Selector, resolve};
     use aterm_session::{LaunchNonce, SessionId};
 
-    let _guard = crate::identity_claim::rendezvous_test_guard();
     let dir = aterm_tempfile::tempdir().expect("scratch control dir");
-    crate::identity_claim::set_rendezvous_override(Some(dir.path().to_path_buf()));
+    let _override = crate::identity_claim::rendezvous_override(dir.path());
 
     // A hosted session under an adopted id: the only kind that can be doubly held.
     let store = crate::session_store::new_store();
@@ -149,9 +148,8 @@ fn an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit() 
     use crate::identity_claim::project_handoff_address_owner as project;
     use aterm_session::SessionId;
 
-    let _guard = crate::identity_claim::rendezvous_test_guard();
     let dir = aterm_tempfile::tempdir().expect("scratch control dir");
-    crate::identity_claim::set_rendezvous_override(Some(dir.path().to_path_buf()));
+    let _override = crate::identity_claim::rendezvous_override(dir.path());
     let model = aterm_models_session::handoff_address_owner_model();
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
 
@@ -254,7 +252,6 @@ fn an_id_handed_to_this_processs_update_candidate_is_served_here_until_commit() 
     let _ = candidate.kill();
     let _ = candidate.wait();
     assert!(conforms(&model, "dead").is_none());
-    crate::identity_claim::set_rendezvous_override(None);
 }
 
 /// An explicit selector naming the tab on screen (`@self` expands to `@<sid>`) routes
@@ -3817,7 +3814,7 @@ fn a_stale_graph_entry_answers_no_such_session_without_a_probe() {
     use std::io::{BufRead, BufReader, Write};
     /// The read timeout a lane serves a connection under.
     const LANE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
-    let scratch = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch control dir");
+    let scratch = crate::test_scratch::short_dir("the control dir");
     let dir = scratch.path();
     let store = crate::session_store::new_store();
     let nonce = LaunchNonce::generate();
@@ -3975,10 +3972,10 @@ fn a_stale_graph_entry_answers_no_such_session_without_a_probe() {
 #[test]
 #[cfg(unix)]
 fn sibling_forward_plan_presents_instance_token_and_keeps_selector() {
-    // Serialize with every other test touching the process-global self sock.
+    // A discovery state of its own: no other test's self socket is read here.
     let _guard = crate::proxy::self_sock_test_guard();
-    let dir = std::env::temp_dir().join(format!("aterm-sib-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+    let dir_guard = crate::test_scratch::short_dir("the sibling's socket");
+    let dir = dir_guard.path().to_path_buf();
     let store = crate::session_store::new_store();
     let sid = SessionId::generate();
     let nonce = LaunchNonce::generate();
@@ -4076,7 +4073,6 @@ fn sibling_forward_plan_presents_instance_token_and_keeps_selector() {
         plan_for(&out_line, Scope::Owner, &store, &dir).is_none(),
         "an out-of-dir sibling socket must fail closed",
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A selector body that is no session id is never joined into a graph path: the
@@ -4090,7 +4086,7 @@ fn sibling_forward_plan_presents_instance_token_and_keeps_selector() {
 fn an_invalid_sid_is_never_joined_into_a_path() {
     use aterm_session::{LaunchNonce, SessionId};
     let _guard = crate::proxy::self_sock_test_guard();
-    let dir = aterm_tempfile::tempdir().expect("scratch control dir");
+    let dir = crate::test_scratch::short_dir("the planted host's socket");
     let dir = dir.path();
     let store = crate::session_store::new_store();
     let nonce = LaunchNonce::generate();
@@ -4532,12 +4528,11 @@ fn proxy_forward_plan_conforms_to_no_transitive_authority() {
 fn sibling_forward_plan_conforms_to_proxy_forward_one_hop() {
     use aterm_spec::verify::validate_transition_tiered;
     use std::collections::BTreeMap;
-    // Serialize with every other test touching the process-global self sock.
+    // A discovery state of its own: no other test's self socket is read here.
     let _guard = crate::proxy::self_sock_test_guard();
     crate::proxy::clear_self_sock();
-    let dir = std::env::temp_dir().join(format!("aterm-sib1-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let dir_guard = crate::test_scratch::short_dir("the host's socket");
+    let dir = dir_guard.path().to_path_buf();
     // The host: a live listener, its token, and its entries (one for a session
     // it hosts, one left for a session it no longer hosts).
     let hosted = registered_session(93, -1, b"");
@@ -4610,7 +4605,6 @@ fn sibling_forward_plan_conforms_to_proxy_forward_one_hop() {
             );
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A forward planned to a host that an update's successor replaces before the
@@ -4622,9 +4616,8 @@ fn sibling_forward_plan_conforms_to_proxy_forward_one_hop() {
 #[cfg(unix)]
 fn a_sibling_replaced_after_the_plan_is_sent_its_own_token() {
     use std::io::{BufRead, BufReader, Write};
-    let dir = std::env::temp_dir().join(format!("aterm-sibrep-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let dir_guard = crate::test_scratch::short_dir("the replaced sibling's socket");
+    let dir = dir_guard.path().to_path_buf();
     let store = crate::session_store::new_store();
     let sid = SessionId::generate();
     let sock = hosting_instance(&dir, 77021, &sid, "deadbeef");
@@ -4681,7 +4674,6 @@ fn a_sibling_replaced_after_the_plan_is_sent_its_own_token() {
         probe, "TOKEN cafef00d version\n",
         "the successor was sent a token read before the connect"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Tier-1 conformance of the forward path to
@@ -4704,8 +4696,8 @@ fn a_sibling_replaced_after_the_plan_is_sent_its_own_token() {
 fn try_proxy_forward_conforms_to_forward_handshake() {
     use aterm_spec::verify::validate_transition_tiered;
     use std::io::{BufRead, BufReader, Write};
-    let dir = std::env::temp_dir().join(format!("aterm-fhs-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir_guard = crate::test_scratch::short_dir("the forward's host socket");
+    let dir = dir_guard.path().to_path_buf();
     let sid = SessionId::generate();
     let sock = hosting_instance(&dir, 77070, &sid, "c0ffee02");
     let listener = aterm_uds::CtlListener::bind(&sock).expect("bind the host");
@@ -4779,7 +4771,6 @@ fn try_proxy_forward_conforms_to_forward_handshake() {
         // the wedge in the model's terms (without joining a thread that may
         // still be parked).
         hang_up(client);
-        let _ = std::fs::remove_dir_all(&dir);
         panic!(
             "the real forward is parked at {parked:?} with the client waiting: the \
              committed model enables `Relay` there (enabled={}), only Buggy=1 \
@@ -4822,7 +4813,6 @@ fn try_proxy_forward_conforms_to_forward_handshake() {
         "the forward owned the line"
     );
     join_after_hang_up(host_side, "the stand-in host to finish serving");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `parse_mouse`: the additive `mods=`/`count=`/`side=`/`block=` grammar, one labelled row
@@ -6288,7 +6278,7 @@ fn update_check_and_apply_are_owner_only_subcommands() {
 /// and every `find` form answers with a match position, so it would give a
 /// keystroke-only edge a screen read (the dispatch requires write on top instead).
 /// The spawn fence tokenizes as `parse_spawn_args` does, so quoting or position
-/// cannot walk a `connected=`/`identity=` past it.
+/// cannot walk a `connected=` past it.
 #[test]
 fn escalated_op_fences_argument_dependent_seams() {
     use Need::{Op as EOp, OwnerOnly};
@@ -6364,14 +6354,6 @@ fn escalated_op_fences_argument_dependent_seams() {
         ("spawn", "model=opus", owner),
         ("spawn", "from=s-ab12", owner),
         ("spawn", "len=5", owner),
-        ("spawn", "identity=worker", owner),
-        ("spawn", "cwd=/tmp identity=-", owner),
-        ("spawn", "\"identity=worker\" cwd=/tmp", owner),
-        (
-            "spawn",
-            "connected=controlled place=tab of=s-abc identity=worker",
-            owner,
-        ),
         ("spawn", "\"connected=controller\" of=s-abc", owner),
         (
             "spawn",
@@ -6596,11 +6578,7 @@ fn front_drive_fence_requires_owner_for_overlays_and_config_write_for_native_set
     // Every overlay is a gateway with Owner-only bindings (About copies and opens
     // URLs; the Overview raises and stops workers), so input verbs escalate
     // identically.
-    for kind in [
-        OverlayKind::Palette,
-        OverlayKind::SessionPicker,
-        OverlayKind::Overview,
-    ] {
+    for kind in [OverlayKind::Palette, OverlayKind::Overview] {
         for verb in [
             "key", "ctrl", "mouse", "paste", "focus", "send", "feed", "turn",
         ] {
@@ -7571,7 +7549,6 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
         term,
         master,
         ctx,
-        identity: None,
     }
 }
 
@@ -7925,6 +7902,37 @@ fn a_questions_write_is_owner_only() {
             "{rest:?} is not a questions write"
         );
     }
+}
+
+/// `meta`'s `worker=` IS THE AGENT A WORKER'S SPAWN STARTED, its task
+/// record's (`TaskRecord::agent`), after `trusted_cwd=`: what the window
+/// harness's trust rules read (a Gemini CLI worker's folder-trust dialog is
+/// never pressed). NEGATIVE CONTROLS: a session with no task, and one whose
+/// record a `task mark` made, print `worker=-`.
+#[test]
+fn meta_names_the_agent_a_workers_spawn_started() {
+    use crate::task_record::{TaskMark, TaskState, mark_session_task};
+    let store = session_store::new_store();
+    let h = registered_session(0, -1, b"");
+    store.write().unwrap().register(h.clone());
+    let read = || cmd_meta(&h.term, &store, 0, &h.ctx, "").0;
+    assert!(
+        read().contains(" trusted_cwd=- worker=- autopilot="),
+        "{}",
+        read()
+    );
+    mark_session_task(&h.ctx, 0, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    assert!(read().contains(" worker=- "), "a mark's record: {}", read());
+    h.ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .set_task_agent(aterm_phase::Program::Muse);
+    assert!(
+        read().contains(" trusted_cwd=- worker=muse autopilot="),
+        "{}",
+        read()
+    );
 }
 
 /// The Autopilot word on the wire: the supervisor's three modes and the owner's words for
@@ -13059,31 +13067,54 @@ fn a_digit_waits_for_the_key_before_it_to_echo() {
 /// can be satisfied by an older key's echo while later keys sit unread, keys a box mounting
 /// then would take. On a real pty a line written to the master stands unread until read
 /// ([`aterm_session::sink::SinkWriter::input_backlog`]): left unread after key 8, the text
-/// stops at its deadline with no digit and no Enter (where the deadline falls is the clock's,
-/// so only a prefix of `version ` is asserted, not `typed=8`); read meanwhile, the digit goes
+/// stops at its deadline with no digit and no Enter, `typed=8`; read meanwhile, the digit goes
 /// out, the text is submitted, and no digit ever goes out over an unread queue. Negative
 /// control: a text of letters types every key past the same unread line.
+///
+/// The program is played at the hold's wait ([`super::control_session::set_hold_wait_for_test`]):
+/// the deadline comes there for the line never read, and the line is read there otherwise.
 ///
 /// macOS only: elsewhere a tty cannot count its unread input (`aterm_pty::input_queue_len`
 /// answers `None`), and the digit keeps the caret check alone (`control_session::keys_unread`).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_digit_waits_for_the_program_to_read_every_key_before_it() {
+    use super::control_session::set_hold_wait_for_test;
     use aterm_session::sink::Discard;
+    use std::time::Instant;
+    /// The thread's holds wait on the clock again however the test ends.
+    struct Clock;
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            set_hold_wait_for_test(None);
+        }
+    }
+    let _clock = Clock;
     let (master, slave) = aterm_pty::open_pty_pair().expect("a pty pair");
+    // The turn's budget, a hang detector for the turns that must finish.
+    let budget = aterm_spec::wait::MUST_HAPPEN;
+    let opts = format!("timeout={}", budget.as_millis());
     let digits_over_unread = std::cell::Cell::new(0usize);
-    let unread_after = |at: usize, drain: bool| {
+    let waits = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    // At key `at` the program is sent a line; at each wait of the hold it `reads` it, or the
+    // wait finds the turn's budget spent.
+    let unread_after = |at: usize, reads: bool| {
         let digits_over_unread = &digits_over_unread;
+        let waits = std::rc::Rc::clone(&waits);
         move |k: usize, c: &Composer, h: &SessionHandle| {
             if k == at {
                 aterm_pty::write_all(master, b"x\n");
-                if drain {
-                    let sink = h.ctx.sink.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                let waits = std::rc::Rc::clone(&waits);
+                let sink = h.ctx.sink.clone();
+                set_hold_wait_for_test(Some(Box::new(move || {
+                    waits.set(waits.get() + 1);
+                    if reads {
                         let _ = sink.discard_unread_input(Discard::Flush);
-                    });
-                }
+                        Instant::now()
+                    } else {
+                        Instant::now() + budget
+                    }
+                })));
             }
             let sent_digit = c
                 .draft
@@ -13097,50 +13128,40 @@ fn a_digit_waits_for_the_program_to_read_every_key_before_it() {
     };
     let rule = composer_rule();
     let text = "version 2.1.291 is in";
-    let t = composer_turn_on(
-        master,
-        &rule,
-        76,
-        "timeout=1500",
-        text,
-        &unread_after(8, false),
-    );
-    let typed = t.keys.concat();
+    // Never read: the digit's wait finds the turn's budget spent.
+    let t = composer_turn_on(master, &rule, 76, &opts, text, &unread_after(8, false));
+    set_hold_wait_for_test(None);
     assert!(
-        t.verdict.contains("skipped reason=deadline typed=")
-            && t.verdict.contains(&format!(" typed={} ", t.keys.len())),
+        t.verdict.contains("skipped reason=deadline typed=8 "),
         "{}",
         t.verdict
     );
-    assert!(
-        "version ".starts_with(&typed),
-        "no digit while the line stands unread: {typed:?}"
+    assert_eq!(
+        t.keys.concat(),
+        "version ",
+        "no digit while the line stands unread"
     );
     assert_eq!(t.enters, 0);
-    // Negative control: letters do not wait on it.
-    let letters = "version is in";
-    let t = composer_turn_on(
-        master,
-        &rule,
-        76,
-        "timeout=60000",
-        letters,
-        &unread_after(3, false),
+    assert_eq!(
+        waits.get(),
+        1,
+        "the digit waited, and its deadline came there"
     );
+    // Negative control: letters do not wait on it.
+    waits.set(0);
+    let letters = "version is in";
+    let t = composer_turn_on(master, &rule, 76, &opts, letters, &unread_after(3, false));
+    set_hold_wait_for_test(None);
     assert!(t.verdict.contains(" submitted=1 "), "{}", t.verdict);
     assert_eq!(t.keys.concat(), letters);
+    assert_eq!(waits.get(), 0, "no key of letters waited");
     // Read meanwhile: the digit goes out, the text is whole — and no
     // digit went out while the line was still unread.
-    let t = composer_turn_on(
-        master,
-        &rule,
-        76,
-        "timeout=60000",
-        text,
-        &unread_after(8, true),
-    );
+    let t = composer_turn_on(master, &rule, 76, &opts, text, &unread_after(8, true));
+    set_hold_wait_for_test(None);
     assert!(t.verdict.contains(" submitted=1 "), "{}", t.verdict);
     assert_eq!(t.keys.concat(), text);
+    assert!(waits.get() >= 1, "the digit waited for the line to be read");
     assert_eq!(
         digits_over_unread.get(),
         0,
@@ -13215,8 +13236,8 @@ fn a_typed_turn_the_deadline_overtakes_is_never_submitted() {
 }
 
 /// `await momentum` returns when the ribbon exhales and never polls: with the metric
-/// at 0.40 and a floor of 0.30 the release law puts the crossing at
-/// `2·ln(0.40/0.30)` = 575 ms, and the verb takes exactly two readings (the one it
+/// at 0.31 and a floor of 0.30 the release law puts the crossing at
+/// `2·ln(0.31/0.30)` = 66 ms, and the verb takes exactly two readings (the one it
 /// solved from and the confirming one). If the human re-lights the ribbon during the
 /// park, it solves the next crossing from that reading and takes a third; a ribbon
 /// that never exhales answers `OK timeout` with one deadline read. (A dark ribbon
@@ -13236,7 +13257,7 @@ fn await_momentum_returns_when_the_ribbon_exhales_and_never_polls() {
     let reads = Cell::new(0u32);
     let read = || {
         reads.set(reads.get() + 1);
-        Ok((if reads.get() == 1 { 0.40 } else { 0.10 }, Instant::now()))
+        Ok((if reads.get() == 1 { 0.31 } else { 0.10 }, Instant::now()))
     };
     let t0 = Instant::now();
     let out = cmd_await_momentum(
@@ -13250,7 +13271,7 @@ fn await_momentum_returns_when_the_ribbon_exhales_and_never_polls() {
     let waited = t0.elapsed();
     assert_eq!(out, "OK momentum 0.10\n");
     assert_eq!(reads.get(), 2, "solve, then confirm — no read in between");
-    let crossing = Duration::from_secs_f32(2.0 * (0.40f32 / 0.30).ln());
+    let crossing = Duration::from_secs_f32(2.0 * (0.31f32 / 0.30).ln());
     // Not before the crossing (load only makes a wake later); that it is
     // no tick is the read count above.
     assert!(
@@ -13263,8 +13284,8 @@ fn await_momentum_returns_when_the_ribbon_exhales_and_never_polls() {
     let read = || {
         reads.set(reads.get() + 1);
         let v = match reads.get() {
-            1 => 0.40,
-            2 => 0.35,
+            1 => 0.31,
+            2 => 0.305,
             _ => 0.05,
         };
         Ok((v, Instant::now()))
@@ -13281,7 +13302,7 @@ fn await_momentum_returns_when_the_ribbon_exhales_and_never_polls() {
     let waited = t0.elapsed();
     assert_eq!(out, "OK momentum 0.05\n");
     assert_eq!(reads.get(), 3);
-    let second = Duration::from_secs_f32(2.0 * (0.35f32 / 0.30).ln());
+    let second = Duration::from_secs_f32(2.0 * (0.305f32 / 0.30).ln());
     assert!(waited >= crossing + second, "two crossings: {waited:?}");
 
     // 3 — a ribbon that never exhales: the deadline, one deadline read.
@@ -13323,7 +13344,7 @@ fn a_yielding_turn_types_only_after_the_ribbon_exhales() {
     let reads = Cell::new(0u32);
     let momentum = || {
         reads.set(reads.get() + 1);
-        Ok((if reads.get() == 1 { 0.40 } else { 0.0 }, Instant::now()))
+        Ok((if reads.get() == 1 { 0.31 } else { 0.0 }, Instant::now()))
     };
     let t0 = Instant::now();
     let out = cmd_turn(
@@ -13345,7 +13366,7 @@ fn a_yielding_turn_types_only_after_the_ribbon_exhales() {
         },
     );
     let verdict = out.lines().next().unwrap_or("");
-    let crossing = Duration::from_secs_f32(2.0 * (0.40f32 / 0.30).ln());
+    let crossing = Duration::from_secs_f32(2.0 * (0.31f32 / 0.30).ln());
     let typed_after = pasted_at.borrow().expect("the turn typed") - t0;
     assert!(
         typed_after >= crossing,
@@ -14245,7 +14266,8 @@ fn turn_submit_verification_rows() {
             control: None,
         },
     ];
-    for row in rows {
+    // Each row is a session of its own, judged by its own presses and windows: side by side.
+    let run = |row: &Row| {
         let store = session_store::new_store();
         let h = registered_session(0, -1, b"");
         store.write().unwrap().register(h.clone());
@@ -14285,15 +14307,27 @@ fn turn_submit_verification_rows() {
                 ..TurnIo::paste_only()
             },
         );
+        (out, presses.get(), first_press.get())
+    };
+    let ran: Vec<_> = std::thread::scope(|scope| {
+        let runs: Vec<_> = rows
+            .iter()
+            .map(|row| scope.spawn(move || run(row)))
+            .collect();
+        runs.into_iter()
+            .map(|r| r.join().expect("a row's turn"))
+            .collect()
+    });
+    for (row, (out, presses, first_press)) in rows.iter().zip(ran) {
         assert!(
             out.contains(row.verdict),
             "{}: {}",
             row.label,
             out.lines().next().unwrap_or("")
         );
-        assert_eq!(presses.get(), row.presses, "{}: {}", row.label, row.why);
+        assert_eq!(presses, row.presses, "{}: {}", row.label, row.why);
         if let Some((misjudges, what)) = row.control {
-            let (before, after) = first_press.get().expect("the turn pressed");
+            let (before, after) = first_press.expect("the turn pressed");
             assert!(
                 misjudges(before, after),
                 "{}: control: {what} (started blocks {} -> {}, content_seq {} -> {})",
@@ -14732,7 +14766,11 @@ fn history_names_who_typed_each_turn_and_the_harness_hand_reads_harness() {
     let h = registered_session(0, -1, b"");
     store.write().unwrap().register(h.clone());
     let paste = |_: &str| true;
-    let press = |_: &str| true;
+    // Each press moves the screen, so each turn is verified at its press, not its window's close.
+    let press = |_: &str| {
+        h.term.lock().unwrap().process(b"\r\nran\r\n");
+        true
+    };
     let turn = |by: TurnBy, text: &str| {
         let io = TurnIo {
             paste: &paste,
@@ -14744,11 +14782,14 @@ fn history_names_who_typed_each_turn_and_the_harness_hand_reads_harness() {
             &h.term,
             &store,
             0,
-            &format!("timeout=300 idle=1 {text}"),
+            &format!("timeout=60000 idle=1 {text}"),
             &h.ctx,
             &io,
         );
-        assert!(reply.starts_with("OK "), "{text}: {reply}");
+        assert!(
+            reply.starts_with("OK ") && reply.contains(" submitted=1 "),
+            "{text}: {reply}"
+        );
     };
     let lease = |request: &str| {
         let rest = request.strip_prefix("lease ").unwrap_or(request);
@@ -16567,6 +16608,13 @@ fn the_worker_spawn_frame_detector_agrees_with_the_spawn_tokenizer() {
             "ERR spawn agent=claude: the task is 65537 bytes (max 65536)\n".to_string()
         ))
     );
+    assert_eq!(
+        spawn_frame_len(&control_request::head("spawn agent=muse len=65537")),
+        Some(Err(
+            "ERR spawn agent=muse: the task is 65537 bytes (max 65536)\n".to_string()
+        )),
+        "named by the spawn's own worker word"
+    );
     assert!(
         spawn_frame_len(&control_request::head("spawn agent=claude len=abc"))
             .is_some_and(|len| len.is_err_and(|e| e.starts_with("ERR usage: spawn")))
@@ -16651,6 +16699,15 @@ fn a_worker_frame_for_another_instance_is_refused_never_relayed() {
         refused.as_deref().is_some_and(|r| r
             .starts_with("ERR spawn agent=claude: @s-0ffcafe is not a session of this instance")),
         "{refused:?}"
+    );
+    let gemini = worker_frame_refusal(
+        &control_request::head("@s-0ffcafe spawn agent=gemini len=4"),
+        &store,
+    );
+    assert!(
+        gemini.as_deref().is_some_and(|r| r
+            .starts_with("ERR spawn agent=gemini: @s-0ffcafe is not a session of this instance")),
+        "{gemini:?}"
     );
     assert!(!request_waits(
         "@s-0ffcafe spawn agent=claude len=4",
@@ -18834,9 +18891,8 @@ fn a_late_owner_grant_on_an_initially_empty_closed_table_remains_revocable() {
 #[test]
 fn an_ambiguous_closed_sid_is_refused() {
     use super::{Scope, Selector, closed_session_reply};
-    let _guard = crate::identity_claim::rendezvous_test_guard();
     let dir = aterm_tempfile::tempdir().expect("scratch control dir");
-    crate::identity_claim::set_rendezvous_override(Some(dir.path().to_path_buf()));
+    let _override = crate::identity_claim::rendezvous_override(dir.path());
     let (mut app, ctx, _) = closed_session_fixture(&[]);
     let local = local_of(&app, &ctx);
     app.retire_session_registration(local);
@@ -18858,7 +18914,6 @@ fn an_ambiguous_closed_sid_is_refused() {
             && refusal.contains(&format!("pid {LIVE_FOREIGN_PID}")),
         "{refusal}"
     );
-    crate::identity_claim::set_rendezvous_override(None);
 }
 
 /// A journal under `<scratch>/logs` holding one dead chain for `sid`, as an
@@ -20794,6 +20849,16 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         Ok(DriveLine::Act { line, .. }) => assert_eq!(line, "spawn agent=claude raise=false len=5"),
         other => panic!("{other:?}"),
     }
+    // Every harness's worker is a drive's to spawn.
+    for word in ["gemini", "agy", "muse"] {
+        match gate(&format!("spawn agent={word} model=m-1 cwd=/tmp len=5")) {
+            Ok(DriveLine::Act { line, .. }) => assert_eq!(
+                line,
+                format!("spawn agent={word} model=m-1 cwd=/tmp len=5 raise=false")
+            ),
+            other => panic!("{word}: {other:?}"),
+        }
+    }
     for line in [
         "settings set columns 80".to_owned(),
         "open settings".to_owned(),
@@ -20832,12 +20897,14 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         "spawn agent=claude".to_owned(),
         "spawn len=5".to_owned(),
         "spawn agent=codex len=5".to_owned(),
+        "spawn agent=generic len=5".to_owned(),
+        "spawn agent=gemini".to_owned(),
+        "spawn agent=agy identity=x len=5".to_owned(),
         "spawn agent=claude cwd=src len=5".to_owned(),
         format!("spawn agent=claude from={MINE} len=5"),
         "spawn agent=claude raise=true len=5".to_owned(),
         "spawn agent=claude window=1 len=5".to_owned(),
         "spawn agent=claude split=v len=5".to_owned(),
-        "spawn agent=claude identity=x len=5".to_owned(),
         "spawn agent=claude theme=x len=5".to_owned(),
         format!("spawn connected=controlled place=tab of={W}"),
         format!("@{W} spawn agent=claude len=5"),

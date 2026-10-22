@@ -86,6 +86,64 @@ fn a_relaunch_carries_the_provider_and_drops_what_the_session_keeps() {
     assert_eq!(rewrite_argv(&dashed, Some(S1)), Ok(argv(&["resume", S1])));
 }
 
+/// A WORKER FOLLOWS HOW ITS STARTER'S MUSE CODE REACHES ITS PROVIDER
+/// ([`provider_flags`]): `--provider`, `--preset`, `--base-url`, `-c` and
+/// `--config`, each with its value attached or apart, verbatim and in order,
+/// on either side of `resume`. NEGATIVE CONTROLS: every other option stays
+/// behind (the session's model, its permission mode, `--trust-workspace`),
+/// a session's ref and the words after `--` are no flags, and a flag the
+/// table does not know — or a value-taking one with no value — refuses
+/// rather than guess.
+#[test]
+fn a_worker_follows_how_its_starter_reaches_its_provider() {
+    let launch = argv(&[
+        STORE,
+        "--yolo",
+        "--base-url",
+        "http://127.0.0.1:60955",
+        "--model",
+        "lab-stub",
+        "-c",
+        "provider_retry.max_attempts=3",
+        "--trust-workspace",
+        "resume",
+        "my-session-name",
+        "--config=a.b=1",
+        "--provider=meta",
+        "--preset",
+        "fast",
+        "--",
+        "--provider",
+        "x",
+    ]);
+    assert_eq!(
+        provider_flags(&launch),
+        Ok(argv(&[
+            "--base-url",
+            "http://127.0.0.1:60955",
+            "-c",
+            "provider_retry.max_attempts=3",
+            "--config=a.b=1",
+            "--provider=meta",
+            "--preset",
+            "fast",
+        ]))
+    );
+    assert_eq!(
+        provider_flags(&argv(&[STORE, "--yolo", "--model", "m", "a prompt"])),
+        Ok(Vec::new())
+    );
+    assert_eq!(
+        provider_flags(&argv(&[STORE, "--brand-new", "x", "--provider", "p"])),
+        Err(ArgvRefusal::UnknownFlag("--brand-new".to_string()))
+    );
+    assert_eq!(
+        provider_flags(&argv(&[STORE, "--provider"])),
+        Err(ArgvRefusal::UnknownFlag("--provider".to_string())),
+        "a value-taking flag with no value"
+    );
+}
+
 /// A launch no relaunch brings back is refused with its word, and a flag
 /// the table does not know refuses (nothing guesses its arity). NEGATIVE
 /// CONTROL: a Session Name is never typed in place of the UUID.

@@ -803,6 +803,7 @@ pub(super) const CLASSIC_RING_LIFE_PER_IMPACT: f32 = 0.267;
 
 /// How much wider a ring of impact `scale` expands: `1.0` at impact 1 (and for
 /// anything non-finite or below), `2.0` at the 3.5 cap.
+#[inline]
 pub(super) fn classic_ring_radius_factor(scale: f32) -> f32 {
     if !scale.is_finite() {
         return 1.0;
@@ -813,6 +814,7 @@ pub(super) fn classic_ring_radius_factor(scale: f32) -> f32 {
 
 /// A ring's life in seconds: `base` graded by impact `scale` — `base` itself at
 /// impact 1, `base · 1.667` at the cap (0.18 s → 0.30 s).
+#[inline]
 pub(super) fn classic_ring_life(base: f32, scale: f32) -> f32 {
     if !scale.is_finite() {
         return base;
@@ -825,6 +827,7 @@ pub(super) fn classic_ring_life(base: f32, scale: f32) -> f32 {
 /// the single ramp shared by the live animator ([`CursorGlow::comet_color`])
 /// and the settings-card demo. `hue` is the rolling rainbow phase in turns
 /// (rainbow/sparkle only).
+#[inline]
 pub fn style_comet_color(style: GlowStyle, color: u32, accent: u32, hue: f32, pos: f32) -> u32 {
     match style {
         GlowStyle::Lumen => lerp_rgb(accent, color, pos),
@@ -876,6 +879,7 @@ pub fn style_comet_color(style: GlowStyle, color: u32, accent: u32, hue: f32, po
 /// with per-particle seed `hue` — shared by the live ember/droplet/spark emitters
 /// and the settings-card effect demo. `color` is the style's base hue
 /// (`GlowConfig::color`), used only by the monochrome Laser.
+#[inline]
 pub fn style_particle_color(style: GlowStyle, color: u32, hue: f32, fade: f32) -> u32 {
     match style {
         GlowStyle::Fire => fire_ramp(fade.min(0.83)), // hot amber → cool red (capped short of white)
@@ -907,6 +911,7 @@ pub fn style_particle_color(style: GlowStyle, color: u32, hue: f32, fade: f32) -
     }
 }
 
+#[inline]
 #[allow(
     clippy::too_many_arguments,
     reason = "centre + per-axis radii + colour + peak; a param struct would obscure the geometry at the many emitter call sites"
@@ -940,6 +945,7 @@ pub(crate) fn push_halo_over(
 /// there (a landing at the grid's left column once left a bloom sliced by a
 /// hard vertical edge): the centre moves inward by at most a cell on each
 /// axis, then both radii shrink together until the ellipse fits.
+#[inline]
 pub(crate) fn fit_glow_in_box(
     geom: Geom,
     (cx, cy): (f32, f32),
@@ -1040,6 +1046,7 @@ pub(crate) const LIGHT_WIDE_BED_KEEP: f32 = 0.75;
 /// the laser ablation spark, the rainbow kitty shooting-star body and the
 /// sparkle mini-comet. `tail` colours the trailing vertex at quarter
 /// coverage, `head` the tip at full.
+#[inline]
 #[allow(
     clippy::too_many_arguments,
     reason = "output + geometry + position + live velocity + trail/thickness knobs + \
@@ -1066,6 +1073,7 @@ pub(super) fn push_velocity_dash(
 /// source-over ([`comet_beam_over`]) in `ink` at opacity `alpha` (its tail at
 /// a quarter of it), capped at the may-touch-text ceiling
 /// ([`LIGHT_INK_ALPHA_CAP`]). `ink` is already darkened by the caller.
+#[inline]
 #[allow(
     clippy::too_many_arguments,
     reason = "the dash's parameter set, with one ink in place of two tints"
@@ -1089,6 +1097,7 @@ pub(super) fn push_velocity_dash_over(
 
 /// The dash's two vertices: the tail `trail_s` seconds back along the live
 /// velocity at a quarter of `cov`, the head at `(x, y)` at full.
+#[inline]
 #[allow(
     clippy::too_many_arguments,
     reason = "position + live velocity + trail + the two tints + coverage"
@@ -1127,6 +1136,7 @@ fn dash_verts(
 /// (and any emitter that sheds round grains on white): source-over buys
 /// presence with area where additive light uses coverage, so callers pass
 /// the dark radius times [`crate::effect_util::STAR_ARM_INK`].
+#[inline]
 pub(super) fn push_light_mote(
     out: &mut Vec<RainHalo>,
     geom: Geom,
@@ -1280,6 +1290,7 @@ pub(super) fn push_crescent(
 /// Push one radial halo of premultiplied peak light: its rect is clamped to
 /// the window interior and split into per-cell-row [`RainHalo`] quads sharing
 /// one centre and falloff radii. Radii are floored to 1.
+#[inline]
 pub(super) fn push_halo(
     out: &mut Vec<RainHalo>,
     geom: Geom,
@@ -1366,6 +1377,7 @@ pub(crate) fn push_halo_rows(
 /// small hot core at [`STAR_CORE`] of the radius carrying the rest. That keeps
 /// the total light where the plus had it and keeps the soft edge. Every
 /// additive stardust site calls this; [`push_light_mote`] is its light twin.
+#[inline]
 pub(super) fn push_dust_halo(
     out: &mut Vec<RainHalo>,
     geom: Geom,
@@ -1426,6 +1438,7 @@ pub(crate) fn push_ripple_ring(
 }
 
 /// Fractional part `x − ⌊x⌋`: unlike `f32::fract`, never negative.
+#[inline]
 pub(super) fn fract(x: f32) -> f32 {
     x - x.floor()
 }
@@ -1437,6 +1450,7 @@ pub(super) fn fract(x: f32) -> f32 {
 /// [`BOLT_BURN_START`]) extinguishes it. Never rising again is the point: a
 /// pixel a bolt lights rises once and falls once, so lightning's flash count
 /// is its onset count (`CursorGlow::admit_bolt`).
+#[inline]
 pub(super) fn bolt_flash(u: f32) -> f32 {
     if u < BOLT_HOLD {
         1.0
@@ -1455,6 +1469,7 @@ pub(super) const BOLT_BURN_START: f32 = 0.55;
 /// The beam power envelope: full power for the first 40% of a spark's life,
 /// then one cosine down to zero. Shared by the tube's brightness and its
 /// thickness collapse (`core_thick`), so the rod dims and thins as one object.
+#[inline]
 pub(super) fn beam_power(frac: f32) -> f32 {
     if frac < 0.40 {
         1.0
@@ -1465,6 +1480,7 @@ pub(super) fn beam_power(frac: f32) -> f32 {
 
 /// HSV (all `0..1`; `h` in turns, any real, wrapped) → `0x00RRGGBB`: the colour
 /// wheel the classic wake and the phaser turn.
+#[inline]
 pub(crate) fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
     let h = (h.fract() + 1.0).fract() * 6.0;
     let i = h.floor() as i32;
@@ -1485,6 +1501,7 @@ pub(crate) fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
 }
 
 /// Cubic smoothstep `0..1` (Hermite): the classic AA/feather easing.
+#[inline]
 pub(super) fn smoothstep01(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)

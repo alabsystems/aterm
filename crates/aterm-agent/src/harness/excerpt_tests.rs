@@ -27,14 +27,14 @@ fn result(tool: &str) -> String {
     )
 }
 
-fn body(rows: &[String]) -> Vec<u8> {
-    let mut out = rows.join("\n").into_bytes();
-    out.push(b'\n');
-    out
+/// `rows` (oldest first, as a transcript holds them) scanned.
+fn scan(rows: &[String]) -> Scan {
+    let newest_first: Vec<&str> = rows.iter().rev().map(String::as_str).collect();
+    Scan::of(&newest_first)
 }
 
 fn excerpts(rows: &[String]) -> Excerpts {
-    Scan::of(&body(rows)).excerpts()
+    scan(rows).excerpts()
 }
 
 fn texts(e: &Excerpts) -> Vec<&str> {
@@ -116,8 +116,8 @@ fn any_split_reads_as_the_whole() {
     for end in 1..=rows.len() {
         let whole = excerpts(&rows[..end]);
         for split in 0..=end {
-            let older = Scan::of(&body(&rows[..split]));
-            let newer = Scan::of(&body(&rows[split..end]));
+            let older = scan(&rows[..split]);
+            let newer = scan(&rows[split..end]);
             assert_eq!(
                 newer.over(older).excerpts(),
                 whole,
@@ -126,9 +126,9 @@ fn any_split_reads_as_the_whole() {
             // Three runs, folded as the walk back folds them: the newest
             // over the middle, then that over the oldest.
             for first in 0..=split {
-                let oldest = Scan::of(&body(&rows[..first]));
-                let middle = Scan::of(&body(&rows[first..split]));
-                let newest = Scan::of(&body(&rows[split..end]));
+                let oldest = scan(&rows[..first]);
+                let middle = scan(&rows[first..split]);
+                let newest = scan(&rows[split..end]);
                 assert_eq!(
                     newest.over(middle).over(oldest).excerpts(),
                     whole,
@@ -377,9 +377,9 @@ fn said_drops_the_done_tokens_lines_as_the_result_does() {
         Some("Finished the review: one real issue.")
     );
     // The token's row alone in the newer read: the older read says it.
-    let newer = Scan::of(&body(&rows[2..]));
+    let newer = scan(&rows[2..]);
     assert_eq!(newer.excerpts().said, None);
-    let joined = newer.over(Scan::of(&body(&rows[..2])));
+    let joined = newer.over(scan(&rows[..2]));
     assert_eq!(
         joined.excerpts().said.as_deref(),
         Some("Finished the review: one real issue.")

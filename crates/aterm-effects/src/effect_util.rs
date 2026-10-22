@@ -830,20 +830,30 @@ pub(crate) fn push_twinkle_star(
         return true;
     }
     let at = |share: f32| premul_rgb(color, (f32::from(cov) * share) as u8);
+    let body_paint = premul_rgb(color, cov);
+    let glint_paint = if gold { at(STAR_GLINT_COV) } else { 0 };
+    let mut last_tip: Option<(u8, u32)> = None;
     let mut ended = false;
     for (i, p) in star_pieces(arm, gold).iter().enumerate() {
         let paint = match p.part {
-            StarPart::Body => premul_rgb(color, cov),
+            StarPart::Body => body_paint,
             StarPart::Core => at(STAR_CORE_ADD),
-            StarPart::Tip { taper, .. } => {
-                let tip = at(taper);
+            StarPart::Tip { step, taper } => {
+                let tip = match last_tip {
+                    Some((s, cached)) if s == step => cached,
+                    _ => {
+                        let c = at(taper);
+                        last_tip = Some((step, c));
+                        c
+                    }
+                };
                 ended |= tip == 0;
                 if ended {
                     continue;
                 }
                 tip
             }
-            StarPart::Glint => at(STAR_GLINT_COV),
+            StarPart::Glint => glint_paint,
         };
         if i > 0 && out.len() >= max_quads {
             return false;

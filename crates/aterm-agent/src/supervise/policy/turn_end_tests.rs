@@ -18573,6 +18573,64 @@ fn a_done_check_a_loop_before_this_one_asked_is_answered_for_this_one() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A DONE CHECK A LOOP BEFORE THIS ONE ASKED, CUT BY A 529, IS TYPED AGAIN
+/// AFTER THE `/compact` A FULL CONTEXT IN ITS RETRY'S TURN NEEDS
+/// ([`TurnEndState::seed_done_check`], [`TurnEndState::compact_owes`]): the
+/// seed's cut (the check's point carried the wall's retry mark,
+/// [`crate::supervise::approvals::done_check_owed`]) — or, where the loop
+/// before stopped before it read the 529, this loop's own first point at the
+/// wall — makes the retry deliver the check again, so the compaction's
+/// continuation is the check, as for the loop that typed it. Without the
+/// first point's cut, a loop attached between the check and its 529 typed
+/// `keep going` there. NEGATIVE CONTROL: no check owed, the continuation is
+/// `keep going`.
+#[test]
+fn a_seeded_check_a_529_cut_is_typed_again_after_the_compaction() {
+    let overloaded = walled(WallKind::Overloaded, "API Error: 529 Overloaded.", None);
+    let context = walled(WallKind::Context, "Context limit reached", Some(4 * MIN));
+    let compacted = idle("Conversation compacted.", Some(Duration::from_secs(40)));
+    let again = TurnEndAction::Type {
+        text: done_check_text(None, true),
+        rule_id: RULE_COMPACT,
+    };
+    let cases = [
+        ("the seed's cut", Some(true), again.clone()),
+        ("its first point the wall", Some(false), again),
+        ("control: none owed", None, typed(RULE_COMPACT)),
+    ];
+    for (case, seed, want) in cases {
+        let mut st = TurnEndState::default();
+        if let Some(cut) = seed {
+            st.seed_done_check(RULE_DONE_CHECK, cut, false);
+        }
+        let mut now = t0();
+        let mut a = at(&mut st, &overloaded, now);
+        for _ in 0..8 {
+            let TurnEndAction::WaitUntil { until, .. } = a else {
+                break;
+            };
+            now = until;
+            a = at(&mut st, &overloaded, now);
+        }
+        assert_eq!(a.rule_id(), Some(RULE_API_RETRY), "{case}: {a:?}");
+        st.acted(&a, &overloaded, now);
+        now += 4 * MIN;
+        let compact = act(&mut st, &context, now);
+        assert!(
+            matches!(
+                compact,
+                TurnEndAction::TypeCommand {
+                    rule_id: RULE_COMPACT,
+                    ..
+                }
+            ),
+            "{case}: {compact:?}"
+        );
+        now += MIN;
+        assert_eq!(act(&mut st, &compacted, now), want, "{case}");
+    }
+}
+
 /// The task's face and the landed seed (`turn_end_face_tests.rs`; the
 /// Autopilot design's §9.4.2, §9.4.5).
 mod face {

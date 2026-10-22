@@ -968,7 +968,6 @@ pub(crate) struct Tag {
     pub(crate) sid: Option<String>,
     /// The window that registered it: the journal a recovery reads is its.
     pub(crate) owner: Option<u32>,
-    pub(crate) identity: Option<String>,
     pub(crate) rekey: bool,
     pub(crate) loader: bool,
     pub(crate) frozen: bool,
@@ -1010,9 +1009,6 @@ impl Tag {
         if let Some(owner) = self.owner {
             put("owner", &owner.to_string());
         }
-        if let Some(identity) = &self.identity {
-            put("identity", identity);
-        }
         if let Some((owner, id)) = self.handed {
             put("handed", &format!("{owner}:{id}"));
         }
@@ -1050,7 +1046,6 @@ impl Tag {
             match k {
                 "sid" if valid_sid(v) => tag.sid = Some(v.to_string()),
                 "owner" => tag.owner = v.parse().ok(),
-                "identity" if valid_label(v) => tag.identity = Some(v.to_string()),
                 "rekey" => tag.rekey = v == "1",
                 "loader" => tag.loader = v == "1",
                 "frozen" => tag.frozen = v == "1",
@@ -1073,13 +1068,6 @@ pub(crate) fn valid_sid(s: &str) -> bool {
     s.len() <= 64
         && s.strip_prefix("s-")
             .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
-/// An identity label: `[A-Za-z0-9._-]`, 1–64 characters.
-fn valid_label(s: &str) -> bool {
-    (1..=64).contains(&s.len())
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// A process's start time in the keeper wire's shape, from the pty crate's
@@ -1273,7 +1261,6 @@ fn admit_recovered_journaled(
         control,
         repaint,
         frozen_path: tag.frozen,
-        identity: tag.identity,
         topics: fabric.topics,
         fg_holder: 0,
         rekey: tag.rekey,
@@ -1759,7 +1746,7 @@ impl TestLink {
 }
 
 /// What `session`'s registration by window `own_pid` says of it: its sid,
-/// its window, its identity and channels — and, for a shell this window
+/// its window and channels — and, for a shell this window
 /// adopted in an update from `predecessor`, the parent's (window, id) it was
 /// ([`Tag::handed`]).
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -1771,7 +1758,6 @@ pub(crate) fn registration_tag(
     Tag {
         sid: Some(session.ctx.self_id.as_str().to_string()),
         owner: Some(own_pid),
-        identity: session.identity.clone().filter(|l| valid_label(l)),
         rekey: session.rekey_channel,
         loader: session.body_loader,
         frozen: session.frozen_path,
@@ -2058,7 +2044,6 @@ mod tests {
         let tag = Tag {
             sid: Some("s-00ff".into()),
             owner: Some(4242),
-            identity: Some("worker".into()),
             rekey: true,
             loader: false,
             frozen: true,
@@ -2075,8 +2060,11 @@ mod tests {
         assert_eq!(
             hostile,
             Tag::default(),
-            "a sid, label, owner or parent that is not one is dropped; unknown keys ignored"
+            "a sid, owner or parent that is not one is dropped; unknown keys ignored"
         );
+        let retired = Tag::decode(b"v=1\nsid=s-00ff\nidentity=worker\n").expect("v1");
+        assert_eq!(retired.sid.as_deref(), Some("s-00ff"));
+        assert!(!retired.encode().windows(9).any(|w| w == b"identity="));
         assert!(tag_under_the_wire_bound());
         // An older window's tag has no epoch; an epoch of 0 is none.
         let older = Tag::decode(b"v=1\nsid=s-00ff\nowner=7\n").expect("v1");
@@ -2089,7 +2077,6 @@ mod tests {
         let long = Tag {
             sid: Some(format!("s-{}", "f".repeat(62))),
             owner: Some(u32::MAX),
-            identity: Some("x".repeat(64)),
             rekey: true,
             loader: true,
             frozen: true,
@@ -2252,7 +2239,6 @@ mod tests {
         Tag {
             sid: Some("s-0123456789abcdef0123".into()),
             owner: Some(1),
-            identity: None,
             rekey: true,
             loader: false,
             frozen: false,

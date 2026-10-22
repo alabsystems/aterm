@@ -110,7 +110,7 @@ fn launch(root: &Path, reroute: bool) -> (String, String) {
     // SAFETY: both fds come from the successful open above and are owned here.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+    let mut cmd = Command::new(launch_isolation::aterm_executable());
     launch_isolation::apply(&mut cmd, root);
     cmd.arg("--session");
     if !reroute {

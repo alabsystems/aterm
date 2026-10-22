@@ -19,7 +19,7 @@ use atpkg_publish::error::{Error, Result};
 use atpkg_publish::host::fake::{FakeHost, FakeRelease};
 use atpkg_publish::host::{Replace, Slug};
 use atpkg_publish::identity::MachineKey;
-use atpkg_publish::lane::report::Recorded;
+use atpkg_publish::lane::report::{Notifier as _, Recorded};
 use atpkg_publish::testkit::{Keys, NOW};
 use atpkg_publish::triple::Triple;
 
@@ -53,8 +53,7 @@ pub fn git_at(dir: &Path, args: &[&str], day: Option<&str>) -> String {
             "init.templateDir=",
         ])
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env("GIT_TERMINAL_PROMPT", "0");
     if let Some(day) = day {
         let stamp = format!("{day}T12:00:00Z");
         cmd.env("GIT_AUTHOR_DATE", &stamp)
@@ -205,7 +204,12 @@ impl Fx {
     /// A rostered machine with both token files, no channel yet.
     #[must_use]
     pub fn new(label: &str) -> Self {
-        let tmp = scratch(label);
+        Self::at(scratch(label))
+    }
+
+    /// [`Fx::new`] in `tmp`.
+    #[must_use]
+    pub fn at(tmp: aterm_tempfile::TempDir) -> Self {
         let keys = Arc::new(Keys::mint("m3", &[]));
         let host = Arc::new(FakeHost::new());
         let home = tmp.path().join("home");
@@ -220,6 +224,87 @@ impl Fx {
             ledger: Mutex::new(BTreeMap::new()),
             tmp,
             keys,
+            host,
+            ctx,
+        }
+    }
+
+    /// What this world holds besides its directory, for [`Fx::laid`].
+    #[must_use]
+    pub fn held(&self) -> Held {
+        let root = self.tmp.path();
+        Held {
+            root: root.to_path_buf(),
+            keys: self.keys.clone(),
+            host: Arc::new(self.host.forked(root, root)),
+            packs: self.packer.requests.lock().expect("requests").clone(),
+            pack_fail: self.packer.fail.lock().expect("fail").clone(),
+            unproven: self.packer.unproven.load(Ordering::SeqCst),
+            lacks: self.packer.lacks.lock().expect("lacks").clone(),
+            indexes: self.indexer.requests.lock().expect("requests").clone(),
+            index_fail: self.indexer.fail.load(Ordering::SeqCst),
+            notes: self.notes.shown(),
+            ledger: self.ledger.lock().expect("ledger").clone(),
+        }
+    }
+
+    /// The world `held` was taken from, in `tmp`, which holds its directory laid down
+    /// (`super::super::shared::made_once`): the same keys, a fork of its host, and its
+    /// fakes as it left them, every path under its root moved under this one.
+    #[must_use]
+    pub fn laid(tmp: aterm_tempfile::TempDir, held: &Held) -> Self {
+        let root = tmp.path().to_path_buf();
+        let to = |p: &Path| {
+            p.strip_prefix(&held.root)
+                .map_or_else(|_| p.to_path_buf(), |rel| root.join(rel))
+        };
+        let host = Arc::new(held.host.forked(&held.root, &root));
+        let ctx = held.keys.ctx_over(&root.join("home"), host.clone());
+        let packs = held
+            .packs
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                r.checkout = to(&r.checkout);
+                r.out = to(&r.out);
+                r.merge_from = r.merge_from.as_deref().map(to);
+                r.toolchain = r.toolchain.as_deref().map(to);
+                r
+            })
+            .collect();
+        let indexes = held
+            .indexes
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                if let Baseline::Dir(dir) = &r.baseline {
+                    r.baseline = Baseline::Dir(to(dir));
+                }
+                r.out = to(&r.out);
+                r.pack_dir = r.pack_dir.as_deref().map(to);
+                r
+            })
+            .collect();
+        let notes = Recorded::default();
+        for note in &held.notes {
+            notes.notify("", note);
+        }
+        Self {
+            packer: FakePacker {
+                requests: Mutex::new(packs),
+                fail: Mutex::new(held.pack_fail.clone()),
+                unproven: AtomicBool::new(held.unproven),
+                lacks: Mutex::new(held.lacks.clone()),
+            },
+            indexer: FakeIndexer {
+                requests: Mutex::new(indexes),
+                fail: AtomicBool::new(held.index_fail),
+                ..FakeIndexer::new(held.keys.clone(), host.clone())
+            },
+            notes,
+            ledger: Mutex::new(held.ledger.clone()),
+            tmp,
+            keys: held.keys.clone(),
             host,
             ctx,
         }
@@ -398,6 +483,23 @@ impl Fx {
             .filter(|c| c.starts_with(prefix))
             .collect()
     }
+}
+
+/// What an [`Fx`] holds besides its directory ([`Fx::held`]): its keys, a fork of its host,
+/// and its packer, indexer, notifier and ledger as it left them.
+#[derive(Clone)]
+pub struct Held {
+    root: PathBuf,
+    keys: Arc<Keys>,
+    host: Arc<FakeHost>,
+    packs: Vec<PackRequest>,
+    pack_fail: BTreeSet<(String, Triple)>,
+    unproven: bool,
+    lacks: Option<String>,
+    indexes: Vec<IndexRequest>,
+    index_fail: bool,
+    notes: Vec<String>,
+    ledger: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// How a release is published.

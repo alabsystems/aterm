@@ -42,6 +42,7 @@ pub(crate) struct ActRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum OpenRequest {
+    SystemState,
     Settings(crate::native_settings::SettingsRoute),
     Markdown(String),
     Editor(String),
@@ -139,6 +140,7 @@ pub(crate) fn parse_act(rest: &str) -> Result<ActRequest, String> {
 
 pub(crate) fn parse_open(rest: &str) -> Result<OpenRequest, String> {
     match aterm_types::app_inspection::parse_open_app(rest).map_err(|error| error.to_string())? {
+        WireOpenAppRequest::SystemState => Ok(OpenRequest::SystemState),
         WireOpenAppRequest::Settings { route } => {
             let route = if route == "/" {
                 Some(crate::native_settings::SettingsRoute::Home)
@@ -225,16 +227,22 @@ impl App {
         // socket parse and delivery cannot redirect the action to another view.
         let mut inspected = self.compile_view(request.view)?;
         let key = UiKey::new(request.ui_key.clone());
-        // A Settings list draws one screen of its rows; a row it holds off
+        // A native list draws one screen of its rows; a row it holds off
         // screen (absent, or in the tree off the screen) is scrolled into
         // view first, as a hand would, so `act` reaches every listed control.
         if inspected
             .compiled
             .semantic(&key)
             .is_none_or(|node| node.offscreen)
-            && let Some(crate::native_app::AppViewState::Settings(state)) =
-                self.native_runtime.view_state_mut(request.view)
-            && state.reveal_listed_control(&key)
+            && match self.native_runtime.view_state_mut(request.view) {
+                Some(crate::native_app::AppViewState::Settings(state)) => {
+                    state.reveal_listed_control(&key)
+                }
+                Some(crate::native_app::AppViewState::SystemState(state)) => {
+                    state.reveal_listed_control(&key)
+                }
+                _ => false,
+            }
         {
             self.invalidate_native_view_cache(
                 wid,
@@ -347,6 +355,12 @@ impl App {
 
     pub(crate) fn open_app(&mut self, request: OpenRequest) -> Result<String, String> {
         match request {
+            OpenRequest::SystemState => self
+                .open_system_state_tab()
+                .then(|| "app system-state".to_string())
+                .ok_or_else(|| {
+                    "System State could not be opened in the requesting window".to_string()
+                }),
             OpenRequest::Settings(route) => self
                 .open_settings_tab(route)
                 .then(|| format!("app settings {}", route.path()))
@@ -1327,6 +1341,10 @@ mod tests {
 
     #[test]
     fn wire_requests_become_stable_owned_targets() {
+        assert_eq!(
+            parse_open("app system-state").unwrap(),
+            OpenRequest::SystemState
+        );
         assert_eq!(
             parse_inspect("app/v1 view 42 controls").unwrap(),
             InspectRequest::View {

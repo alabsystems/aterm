@@ -7975,12 +7975,6 @@ impl App {
             },
             // The Autopilot menu's live rows, by the tab menu's rule.
             AuxTarget::AutopilotMenu => self.autopilot_menu_controls(),
-            // The picker reads its INTERACTIVE state only (the tab-menu rule:
-            // the surface exists or honestly does not).
-            AuxTarget::SessionPicker => match self.front().and_then(|ws| ws.session_picker()) {
-                Some(picker) => picker.controls_lines(),
-                None => vec!["session-picker open=false".to_string()],
-            },
             // Every session of the instance (Owner-gated at the dispatch): the
             // OPEN card's rows only.
             AuxTarget::Overview => match self.front().and_then(|ws| ws.overview()) {
@@ -12606,6 +12600,7 @@ mod encode_worker_tests {
             committed.pixels[0], baseline.pixels[0],
             "{verb}: the drag yields to the modal"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -14141,7 +14136,8 @@ mod encode_worker_tests {
             return;
         }
 
-        let root = aterm_tempfile::tempdir().expect("temporary video root");
+        // Shallow: confinement walks the root a component at a time under 16 descriptors.
+        let root = crate::test_scratch::short_dir("the video root");
         ensure_private_dir(root.path()).unwrap();
         let dir =
             crate::control_auth::confine_video_dir(root.path()).expect("server-minted video dir");

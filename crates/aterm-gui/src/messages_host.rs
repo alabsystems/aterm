@@ -384,6 +384,13 @@ fn admissible_log_path(path: &str, log_dir: &Path) -> Option<PathBuf> {
         .then(|| p.to_path_buf())
 }
 
+/// Whether `Open in browser` may open `url`, checked at the press: the engine's rule for
+/// the address an entry carries ([`aterm_messages::link_host`]: https, no user, no port)
+/// and the gate every link a click opens passes ([`crate::is_safe_url`]), both.
+fn openable_link(url: &str) -> bool {
+    aterm_messages::link_host(url).is_some() && crate::is_safe_url(url)
+}
+
 /// Open `path` in the platform's text editor, OFF the UI thread, if and only
 /// if [`admissible_log_path`] admits it under `logging::log_dir()` — the
 /// host-minted paths the crash reporter carries, re-validated at press time
@@ -1239,8 +1246,9 @@ impl App {
     }
 
     /// Post what the pre-App inbox holds at each park, each with the stamp it
-    /// was queued under, raise the exceptions queued there
-    /// ([`crate::message_inbox::queue_exception`]), and settle verified
+    /// was queued under, raise or end the exceptions queued there
+    /// ([`crate::message_inbox::queue_exception`],
+    /// [`crate::message_inbox::queue_exception_clear`]), and settle verified
     /// workstation setup and the folders fresh shells could not start in
     /// ([`Self::fold_folder_faults`]).
     pub(crate) fn drain_message_inbox(&mut self) {
@@ -1252,8 +1260,11 @@ impl App {
         {
             return;
         }
-        for entry in &exceptions {
-            self.except(entry);
+        for word in &exceptions {
+            match word {
+                crate::message_inbox::ExceptionWord::Raise(entry) => self.except(entry),
+                crate::message_inbox::ExceptionWord::Clear(key) => self.except_clear(key),
+            }
         }
         for m in queued {
             match m.restored {
@@ -1343,7 +1354,10 @@ impl App {
         // stay, and a record re-offered from the page is a no-op.
         let navigation = matches!(
             intent,
-            Intent::OpenSettings { .. } | Intent::OpenConfigEditor { .. } | Intent::OpenPath { .. }
+            Intent::OpenSettings { .. }
+                | Intent::OpenConfigEditor { .. }
+                | Intent::OpenPath { .. }
+                | Intent::OpenLink { .. }
         );
         let performed = self.perform_intent_inner(wid, id, intent, now);
         if navigation && performed && self.messages.mark_seen(id, now) {
@@ -1448,6 +1462,21 @@ impl App {
                     self.note_macos_access_settings_opened(now);
                 }
                 opened
+            }
+            // `Open in browser` on an entry a tool filed (`notice later … url=`): the
+            // page it named, in the browser, only past `openable_link`, so a record
+            // or a carry that reached here by another road opens nothing else. A
+            // headless instance opens nothing and says so.
+            Intent::OpenLink { url } => {
+                if !openable_link(&url) {
+                    aterm_log::warn!("message {id}: refused to open a link");
+                    return false;
+                }
+                if self.headless {
+                    return false;
+                }
+                crate::app_mouse::open_url_external(&url);
+                true
             }
             Intent::ApplyUpdate { build } => {
                 if self.apply_press_applies(id, build) {

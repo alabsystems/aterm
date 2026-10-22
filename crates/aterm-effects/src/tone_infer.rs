@@ -86,6 +86,7 @@ impl Default for ToneTracker {
 impl ToneTracker {
     /// The cached verdict before the `tone_melody` knob, for introspection;
     /// [`Self::effective`] is what rides a sound event.
+    #[inline]
     pub fn current(&self) -> Tone {
         self.tone
     }
@@ -94,6 +95,7 @@ impl ToneTracker {
     /// [`crate::trail_sound::SoundEvent`]: the cached verdict with the knob on,
     /// the neutral [`Tone::Technical`] with it off, even while a verdict from
     /// before the toggle is cached. Every sound seam takes its tone from here.
+    #[inline]
     pub fn effective(&self, tone_melody: bool) -> Tone {
         if tone_melody {
             self.tone
@@ -104,12 +106,14 @@ impl ToneTracker {
 
     /// Chars currently in the window. The count only, never the text: the window
     /// holds keystrokes typed at a password prompt that the screen never echoed.
+    #[inline]
     pub fn window_chars(&self) -> usize {
         self.buf.len()
     }
 
     /// Bind the window to `session`, clearing it on a switch; the cached tone
     /// survives.
+    #[inline]
     fn rekey(&mut self, session: u64) {
         if self.session != Some(session) {
             self.buf.clear();
@@ -146,6 +150,7 @@ impl ToneTracker {
     /// Run the inference a keystroke marked due, if any. The render-tick sound
     /// drain calls this right before reading the tone, so a verdict trails its
     /// key by at most one frame.
+    #[inline]
     pub fn drain_pending_inference(&mut self, now: Instant) {
         if self.infer_pending {
             self.infer_pending = false;
@@ -155,6 +160,7 @@ impl ToneTracker {
 
     /// A plain Backspace pops one char. Deletion alone never re-infers: only new
     /// evidence moves the mood.
+    #[inline]
     pub fn note_backspace(&mut self, session: u64) {
         self.rekey(session);
         self.buf.pop_back();
@@ -162,6 +168,7 @@ impl ToneTracker {
 
     /// A word-breaking key (Enter/Tab/Escape/Delete/nav/kill chords, raw byte
     /// sequences) clears the window; the cached tone persists.
+    #[inline]
     pub fn note_break(&mut self) {
         self.buf.clear();
     }
@@ -169,6 +176,7 @@ impl ToneTracker {
     /// Serious Mode's drain: clear the partial typing window and any owed
     /// re-inference while keeping the cached tone, throttle timestamp, and
     /// warmed-up scratch buffers intact. Idempotent.
+    #[inline]
     pub fn drain_serious(&mut self) {
         self.buf.clear();
         self.infer_pending = false;

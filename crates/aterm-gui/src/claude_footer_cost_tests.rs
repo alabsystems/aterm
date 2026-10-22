@@ -39,6 +39,8 @@ struct Cost {
     compared: usize,
     /// Chrome band tones derived.
     tones: usize,
+    /// Autopilot chip titles built (`claude_lights::autopilot_title`).
+    titles: usize,
 }
 
 /// Run one pass on `wid` and say what it cost: the counters are taken
@@ -55,6 +57,7 @@ fn cost(app: &mut App, wid: WindowId) -> Cost {
         crate::work_counts::take_footer_block_fits(),
         crate::work_counts::take_footer_rows_compared(),
         crate::work_counts::take_band_derives(),
+        crate::work_counts::take_autopilot_titles_built(),
     );
     let (_, allocations) = crate::work_counts::allocations_in(|| pass_on(app, wid, &plan, route));
     Cost {
@@ -68,6 +71,7 @@ fn cost(app: &mut App, wid: WindowId) -> Cost {
         fits: crate::work_counts::take_footer_block_fits(),
         compared: crate::work_counts::take_footer_rows_compared(),
         tones: crate::work_counts::take_band_derives(),
+        titles: crate::work_counts::take_autopilot_titles_built(),
     }
 }
 
@@ -326,8 +330,8 @@ fn a_frame_at_rest_costs_the_footer_nothing() {
 /// else the footer counts: no allocation, no
 /// reading, no fit, no composition (the rule's cells are the last frame's).
 /// At this pane's width, beside these facts, Autopilot's is a LEANER form
-/// (v1's words, the menu's line given up: §9.2.1), laid from slices of the
-/// whole into the block's reused buffers — costing a frame nothing more.
+/// (`claude_lights::lean_titles`, §9.2.1), laid from slices of the whole
+/// into the block's reused buffers — costing a frame nothing more.
 ///
 /// CONTROLS: the chips on the rule at rest cost nothing; the hover's first
 /// frame builds its title (it allocates); the pointer gone, nothing again.
@@ -360,9 +364,19 @@ fn a_hovered_chip_costs_its_title_alone() {
         let _ = pass(&mut app, wid);
     }
     let hovered = glass_row(&app, wid, rule);
+    let (whole, _) = crate::claude_lights::autopilot_title(
+        crate::autopilot::AutopilotView::Cruise,
+        &app.chip_glass(session),
+        "",
+        None,
+        crate::claude_lights::TitleWords::default(),
+    );
     assert!(
-        hovered.contains("autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land ")
-            && !hovered.contains("right-click"),
+        !hovered.contains(&whole)
+            && crate::claude_lights::lean_titles(&whole)
+                .iter()
+                .filter(|(head, _)| !head.is_empty())
+                .any(|(head, tail)| hovered.contains(&format!("{head}{tail} "))),
         "CONTROL: a leaner form is the one laid: {hovered:?}"
     );
     for i in 0..12 {
@@ -381,6 +395,165 @@ fn a_hovered_chip_costs_its_title_alone() {
         Cost::default(),
         "CONTROL: the pointer gone"
     );
+}
+
+/// Session `session`'s own Autopilot word, written as `meta set autopilot`
+/// writes it, its `MetaChanged` wake taken.
+fn set_word(app: &mut App, session: u64, word: &str) {
+    app.pool
+        .get(session)
+        .expect("session")
+        .ctx
+        .meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .set("autopilot", Some(word.into()));
+    app.on_meta_changed(session);
+}
+
+/// The `i`th harness need on session `session`, as the loop's request
+/// lands it: the needs owner's entry and its `MetaChanged` wake, which
+/// publishes it (`App::publish_need`).
+fn need(app: &mut App, session: u64, i: usize) {
+    let entry =
+        format!("claude needs you: approve the release notes of 0.4{i}.0 \u{2014} carrying on");
+    app.pool
+        .get(session)
+        .expect("session")
+        .ctx
+        .meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .set_attention_kind(
+            crate::harness_host::NEEDS_ATTENTION_OWNER,
+            Some(entry),
+            Some(aterm_types::needs::AttentionKind::Ask),
+        )
+        .expect("a slot");
+    app.on_meta_changed(session);
+}
+
+/// Land's `i`th hold on session `session`, as the loop tells it: stored on
+/// the timeline by the live hook, then the wake that carries nothing
+/// (`HarnessFact::LandHeld`). Each a nudge more than the last.
+fn hold(app: &mut App, session: u64, i: usize) {
+    use aterm_agent::harness::acts::HoldLeg;
+    let held = aterm_agent::harness::acts::LandHeld {
+        since_ms: Some(1_792_159_320_000),
+        nudges: u32::try_from(i + 1).expect("small"),
+        read: true,
+        legs: HoldLeg::Repo.bit(),
+        unpushed: 2,
+        ..aterm_agent::harness::acts::LandHeld::default()
+    };
+    let sid = app
+        .pool
+        .get(session)
+        .expect("session")
+        .ctx
+        .self_id
+        .as_str()
+        .to_string();
+    assert!(crate::harness_host::store_land_held(
+        &app.store,
+        &sid,
+        Some(held)
+    ));
+    app.apply_harness_fact(&sid, crate::HarnessFact::LandHeld);
+}
+
+/// What the title says beside the glass, moved while nobody reads it and
+/// while it is read (the W4 title slice): under the session's word `word`,
+/// each `change` moves the trail's generation (CONTROL). With nobody
+/// pointing at the chip it asks no window for a frame, and the footer's
+/// next pass builds no title, composes nothing, allocates nothing and keys
+/// what it keyed at rest — the chips' block alone laid again from its kept
+/// buffers, as after any act or pause (`ChipGlass::trail` is in its key) —
+/// then costs nothing. With the pointer on the chip, each asks the window
+/// that reads it for a frame and builds the title once, then nothing.
+fn read_only_while_read(word: &str, what: &str, change: fn(&mut App, u64, usize)) {
+    use crate::claude_lights::Chip;
+    let asked = || crate::claude_lights::TITLE_READERS_ASKED.with(|a| a.replace(0));
+    let (mut app, wid, session) = probe_glass();
+    let _host = hosted(&mut app);
+    set_word(&mut app, session, word);
+    for _ in 0..3 {
+        let _ = pass(&mut app, wid);
+    }
+    let rest = pass(&mut app, wid);
+    assert_eq!(cost(&mut app, wid), Cost::default(), "CONTROL: at rest");
+    let generation = |app: &App| {
+        app.harness_glass
+            .get(&session)
+            .map_or(0, crate::harness_glass::SessionGlass::trail_gen)
+    };
+    let _ = asked();
+    for i in 0..3 {
+        let before = generation(&app);
+        change(&mut app, session, i);
+        assert_ne!(
+            generation(&app),
+            before,
+            "CONTROL: {what} {i} moves the trail's generation"
+        );
+        assert_eq!(asked(), 0, "{what} {i}, nobody reading: no frame asked");
+        let moved = cost(&mut app, wid);
+        assert_eq!(
+            Cost { fits: 0, ..moved },
+            Cost::default(),
+            "{what} {i}, nobody reading: no title, nothing composed ({moved:?})"
+        );
+        assert_eq!(pass(&mut app, wid), rest, "{what} {i}: the key at rest");
+        assert_eq!(
+            cost(&mut app, wid),
+            Cost::default(),
+            "{what} {i}: then nothing"
+        );
+    }
+    app.hover_claude_chip(wid, Some((session, Chip::Autopilot)));
+    for _ in 0..2 {
+        let _ = pass(&mut app, wid);
+    }
+    assert_eq!(
+        cost(&mut app, wid),
+        Cost::default(),
+        "CONTROL: hovered, nothing moved"
+    );
+    for i in 3..6 {
+        change(&mut app, session, i);
+        assert_eq!(asked(), 1, "{what} {i}, read: its window asked for a frame");
+        let first = cost(&mut app, wid);
+        assert_eq!(
+            (first.titles, first.fits),
+            (1, 1),
+            "{what} {i}, read: the title built again, once ({first:?})"
+        );
+        assert_eq!(cost(&mut app, wid), Cost::default(), "{what} {i}: once");
+    }
+}
+
+/// A NEED THAT MOVES WHILE NOBODY READS COSTS NO FRAME (§12.2.4, §12.2.6;
+/// slice 2e): a harness's need published anew under Cruise, three times
+/// with the pointer elsewhere and three with it on the chip
+/// ([`read_only_while_read`]). NEGATIVE CONTROLS (as run): the trail's
+/// generation folded into the footer's term at rest (`glass_bits` keying
+/// `trail` whether or not the title is read) composes the rule anew at rest
+/// and fails `nobody reading`; `publish_need` without its bump asks no
+/// frame of the title's reader and fails `its window asked for a frame`.
+#[test]
+fn a_need_that_moves_while_nobody_reads_costs_no_frame() {
+    read_only_while_read("cruise", "a need", need);
+}
+
+/// A HOLD THAT MOVES WHILE NOBODY READS COSTS NO FRAME (§12.3.4, §12.3.6;
+/// slice 3d): Land's hold told anew under Land, a nudge at a time, three
+/// times with the pointer elsewhere and three with it on the chip
+/// ([`read_only_while_read`]). NEGATIVE CONTROL (as run): the trail's
+/// generation folded into the footer's term at rest fails `nobody
+/// reading`.
+#[test]
+fn a_hold_that_moves_while_nobody_reads_costs_no_frame() {
+    read_only_while_read("land", "a hold", hold);
 }
 
 /// The costs of `passes` frames that each rebuild the pane's text, `change`

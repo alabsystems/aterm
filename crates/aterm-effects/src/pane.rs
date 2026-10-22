@@ -48,36 +48,40 @@ pub fn translate_rain_into_pane(
             },
         )
     };
-    quads.retain_mut(|q| {
-        let Some((x, y, w, h)) = clip(
-            u32::from(q.x),
-            u32::from(q.y),
-            u32::from(q.w),
-            u32::from(q.h),
-        ) else {
-            return false;
-        };
-        (q.x, q.y, q.w, q.h) = (x, y, w, h);
-        q.row = q.row.saturating_add(row_off);
-        true
-    });
-    add.retain_mut(|q| {
-        let Some((x, y, w, h)) = clip(
-            u32::from(q.x),
-            u32::from(q.y),
-            u32::from(q.w),
-            u32::from(q.h),
-        ) else {
-            return false;
-        };
-        (q.x, q.y, q.w, q.h) = (x, y, w, h);
-        q.row = q.row.saturating_add(row_off);
-        // The falloff centre shifts with the quad; it may lie outside the
-        // clipped rect, since the radial math is absolute.
-        q.cx = (u32::from(q.cx) + dx).min(u32::from(u16::MAX)) as u16;
-        q.cy = (u32::from(q.cy) + dy).min(u32::from(u16::MAX)) as u16;
-        true
-    });
+    if !quads.is_empty() {
+        quads.retain_mut(|q| {
+            let Some((x, y, w, h)) = clip(
+                u32::from(q.x),
+                u32::from(q.y),
+                u32::from(q.w),
+                u32::from(q.h),
+            ) else {
+                return false;
+            };
+            (q.x, q.y, q.w, q.h) = (x, y, w, h);
+            q.row = q.row.saturating_add(row_off);
+            true
+        });
+    }
+    if !add.is_empty() {
+        add.retain_mut(|q| {
+            let Some((x, y, w, h)) = clip(
+                u32::from(q.x),
+                u32::from(q.y),
+                u32::from(q.w),
+                u32::from(q.h),
+            ) else {
+                return false;
+            };
+            (q.x, q.y, q.w, q.h) = (x, y, w, h);
+            q.row = q.row.saturating_add(row_off);
+            // The falloff centre shifts with the quad; it may lie outside the
+            // clipped rect, since the radial math is absolute.
+            q.cx = (u32::from(q.cx) + dx).min(u32::from(u16::MAX)) as u16;
+            q.cy = (u32::from(q.cy) + dy).min(u32::from(u16::MAX)) as u16;
+            true
+        });
+    }
 }
 
 /// Where one pane sits inside the composed window grid.
@@ -97,6 +101,7 @@ impl PanePlace {
     /// The pane's grid-interior pixel box `(x0, y0, x1, y1)`. An edge on the window's own edge
     /// stays open (a sprite may overhang the window pad); every interior edge is a divider and
     /// clips hard.
+    #[inline]
     fn px_box(self) -> (i32, i32, i32, i32) {
         let (cw, ch) = (self.cell_w as i32, self.cell_h as i32);
         // Half the range: unreachable by any real sprite, far from overflow in `x0 + w`.
@@ -126,6 +131,7 @@ impl PanePlace {
     }
 
     /// Grid-interior pixel shift from pane-local to window-content coords.
+    #[inline]
     fn px_shift(self) -> (i32, i32) {
         (
             i32::from(self.col_off) * self.cell_w as i32,
@@ -137,6 +143,9 @@ impl PanePlace {
 /// Move one pane's sparkle-word decorations into the composed window grid. `row`/`col` are
 /// viewport cells, so the shift is the pane's cell offset; the sub-cell `dx`/`dy` ride untouched.
 pub fn translate_decos_into_pane(decos: &mut Vec<aterm_render::WordDecoration>, place: PanePlace) {
+    if decos.is_empty() {
+        return;
+    }
     decos.retain_mut(|d| {
         if d.row >= place.rows || d.col >= place.cols {
             return false;
@@ -151,6 +160,9 @@ pub fn translate_decos_into_pane(decos: &mut Vec<aterm_render::WordDecoration>, 
 /// re-sort the merged stream by `(row, col)`: `aterm_render::sparse_row_slice` binary-searches
 /// it and debug-asserts strict column order.
 pub fn translate_ink_into_pane(ink: &mut Vec<aterm_render::InkCell>, place: PanePlace) {
+    if ink.is_empty() {
+        return;
+    }
     ink.retain_mut(|c| {
         if c.row >= place.rows || c.col >= place.cols {
             return false;

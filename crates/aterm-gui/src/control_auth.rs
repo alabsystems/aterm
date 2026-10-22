@@ -48,9 +48,7 @@ mod imp;
 // Also read by `native_document_journal` (the key file must be ours) and the tests.
 #[cfg(unix)]
 pub(crate) use imp::our_uid;
-pub(crate) use imp::{
-    ensure_private_dir, harden_private_dir, lock_socket_file, peer_check, provision_token,
-};
+pub(crate) use imp::{ensure_private_dir, lock_socket_file, peer_check, provision_token};
 // The directory a control socket and its token go in: on Windows an elevated
 // instance holds it to the elevation law (`control_auth_win.rs`,
 // `docs/WINDOWS_PARAGON_DESIGN.md` §5.7); everywhere else it is a private dir.
@@ -81,33 +79,6 @@ pub(crate) fn publish_latest_link(link: &Path, sock_path: &str) {
 #[must_use]
 pub(crate) fn random_token_hex() -> Option<String> {
     aterm_uds::rand::hex_token::<32>().ok()
-}
-
-/// That `dir` is a directory, following a symlink as `harden_private_dir`
-/// does on both platforms: nothing there is `NotFound`, and something there
-/// that is no directory is `NotADirectory`, a symlink to nothing included. A
-/// followed `stat` alone answers `NotFound` for that link, which a session
-/// identity's admission reads as a folder `identities forget` took
-/// (`agent_identity::harden_identity`), when the identity is there and only
-/// its agent folder is no folder.
-fn require_dir(dir: &Path) -> std::io::Result<()> {
-    let not_a_directory = |what: &str| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotADirectory,
-            format!("{}: {what}", dir.display()),
-        )
-    };
-    match std::fs::metadata(dir) {
-        Ok(meta) if meta.is_dir() => Ok(()),
-        Ok(_) => Err(not_a_directory("not a directory")),
-        Err(e)
-            if e.kind() == std::io::ErrorKind::NotFound
-                && std::fs::symlink_metadata(dir).is_ok() =>
-        {
-            Err(not_a_directory("a symlink to nothing"))
-        }
-        Err(e) => Err(e),
-    }
 }
 
 /// Filename of the `latest` symlink in the per-user directory, pointing at
@@ -4120,11 +4091,9 @@ mod tests {
         if !crate::test_alone::alone() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("aterm-live-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("s.sock");
+        let dir = crate::test_scratch::short_dir("the probed socket");
+        let path = dir.path().join("s.sock");
         let ps = path.to_string_lossy().into_owned();
-        let _ = std::fs::remove_file(&path);
         assert!(!socket_is_live(&ps), "absent socket is not live");
         let listener = aterm_uds::CtlListener::bind(&path).expect("bind");
         assert!(socket_is_live(&ps), "bound socket is live");
@@ -4136,8 +4105,6 @@ mod tests {
             "stale socket file (no listener) becomes not-live",
             || (!socket_is_live(&ps)).then_some(()),
         );
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
     }
 
     /// A liveness probe must remain bounded even when nobody drains accept().
@@ -4146,7 +4113,7 @@ mod tests {
     #[test]
     fn socket_teardown_wait_does_not_block_on_a_full_accept_backlog() {
         use std::os::fd::AsRawFd;
-        let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+        let dir = crate::test_scratch::short_dir("the control socket");
         let path = dir.path().join("backlog.sock");
         let listener = aterm_uds::CtlListener::bind(&path).unwrap();
         // SAFETY: lower the backlog of this test's own live listener.
@@ -4181,7 +4148,7 @@ mod tests {
     #[test]
     fn the_teardown_dial_is_close_on_exec_and_non_blocking() {
         use std::os::fd::AsRawFd;
-        let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+        let dir = crate::test_scratch::short_dir("the control socket");
         let path = dir.path().join("cloexec.sock");
         let listener = aterm_uds::CtlListener::bind(&path).unwrap();
         let stream = connect_socket_nonblocking(path.to_str().unwrap()).unwrap();
@@ -4264,7 +4231,7 @@ mod tests {
     #[test]
     fn the_socket_plan_names_every_refusal() {
         use SocketDirective::{Disabled, Explicit, PerInstance};
-        let temp = aterm_tempfile::tempdir().unwrap();
+        let temp = crate::test_scratch::short_dir("the explicit socket");
         let short = temp.path().join("a.sock").to_string_lossy().into_owned();
         let SocketResolution::Enabled(plan) =
             resolve_socket_plan_for(Explicit(short.clone()), || None)
@@ -5327,8 +5294,8 @@ mod tests {
         if !crate::test_alone::alone() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("aterm-socksweep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = crate::test_scratch::short_dir("the swept sockets");
+        let dir = scratch.path().join("socks");
         ensure_private_dir(&dir).unwrap();
         // A certainly-dead pid: a reaped child cannot be signalled any more.
         #[cfg(unix)]
@@ -5439,7 +5406,6 @@ mod tests {
         // An absent directory is `None`, not an empty report.
         assert!(sweep_stale_socket_files(&dir.join("absent"), Duration::ZERO, true).is_none());
         drop(live);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6161,7 +6127,8 @@ mod tests {
             return;
         }
 
-        let temp = aterm_tempfile::tempdir().expect("temporary automatic image root");
+        // Shallow: confinement walks the root a component at a time under the limit.
+        let temp = crate::test_scratch::short_dir("the automatic image root");
         let target = confine_automatic_image_path(temp.path(), "image")
             .expect("confinement fits the descriptor budget");
         let namespace_root = target.dir.parent().unwrap().to_path_buf();
@@ -6230,7 +6197,8 @@ mod tests {
             return;
         }
 
-        let temp = aterm_tempfile::tempdir().expect("temporary video root");
+        // Shallow: confinement walks the root a component at a time under the limit.
+        let temp = crate::test_scratch::short_dir("the video root");
         let root = temp.path();
         for sequence in 0..32 {
             write_completed_video_fixture(root, &format!("rec-{sequence:020}-000"));

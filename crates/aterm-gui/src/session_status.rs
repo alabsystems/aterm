@@ -4525,15 +4525,6 @@ impl crate::App {
         // `fleet=` (2026-10-15), after the fabric's tail: the INSTANCE's fleet
         // listener (`crate::fleet_listen`), one leaf-mutex read.
         let fleet = crate::fleet_listen::fleet_status_word();
-        // IDENTITY (session identities, 2026-09-17), additive and LAST: the
-        // agent identity the session was spawned under — the same word the
-        // `sessions` roster carries, from the same spawn-time field — `-` for
-        // the human's own agent config. A plain field read on the pooled
-        // session; this polled record pays nothing for it.
-        let identity = pooled
-            .identity
-            .as_deref()
-            .map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode);
         let pin = {
             let meta = pooled.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             meta.presentation_value("title")
@@ -4675,7 +4666,7 @@ impl crate::App {
             appearance_probe.map(|(_, _, bg)| bg),
         );
         // `session_theme= theme_origin=` right after: the theme this session
-        // asks for of its own (or its identity's) and who chose it, `instance`
+        // asks for of its own and who chose it, `instance`
         // when it draws the instance's ([`crate::session_theme`]).
         let appearance = format!("{appearance} {}", self.session_theme_fields(session));
         // ` conpty=<openconsole|inbox|->` (Windows only, right before
@@ -5020,7 +5011,7 @@ impl crate::App {
                  confidence=unknown reasons=- attribution={} fs_consent={} conflict=false \
                  revision=0 enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
                  fabric={fabric} {fabric_tail} fleet={fleet} \
-                 identity={identity} {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} program_state={program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
+                 {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} program_state={program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
                  {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
                  human_seq={human_seq} {launch} {owner} \
                  history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \
@@ -5059,7 +5050,7 @@ impl crate::App {
              detail={} confidence={} reasons={reasons} attribution={} fs_consent={} \
              conflict={} revision={} enabled={enabled} hold={hold} hold_advisory={hold_advisory} \
              fabric={fabric} {fabric_tail} fleet={fleet} \
-             identity={identity} {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} program_state={program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
+             {presence} needs={needs} hold_by={hold_by} {typed} path={path} {agent} program_state={program_state} last_act={last_act} {appearance}{conpty} integration={integration} \
              {input} supervisor={supervisor} autopilot={autopilot} human_ms={human_ms} \
              human_seq={human_seq} {launch} {owner} \
              history_lost={history_lost} {journal} integration_rev={integration_rev} {born} {resize} \

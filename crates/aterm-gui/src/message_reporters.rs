@@ -2115,15 +2115,30 @@ pub(crate) fn theme_not_saved(label: &str, detail: &str, indeterminate: bool) ->
 /// The fabric bridge set `files` torn state files aside (`link set-aside`,
 /// `fabric::Registry::torn_state_set_aside`): the last bridge stopped
 /// uncleanly in an earlier boot (a power cut, a crash of the machine), and
-/// files of its state dir that serve only sessions — which that reboot ended —
-/// did not read whole, so the first bridge after it moved each, with its exact
-/// bytes, into the dir's `quarantine/` and attached rather than refuse them at
-/// every attach. Nothing is lost that a later boot reads, so this is a fact
-/// for the owner's later look — the bytes are theirs to read or remove — never
-/// an alert. One line however many cuts it covers (`fabric.state.torn`); a
-/// later count restates it.
+/// files of its state dir did not read whole, so the first bridge after it
+/// moved each, with its exact bytes, into the dir's `quarantine/` and attached
+/// rather than refuse them at every attach. Most serve only sessions, which
+/// that reboot ended. One may be the session-log mirror's pin (`logpin`),
+/// which holds what a reboot does not end, the node's alias key and lifetime
+/// total; it is moved only when their durable copies (`logkey`, `logfloor`)
+/// are on the media, and a whole pin is written from them in its place. Its
+/// lost batch is taken again, and its exact total gives way to the floor,
+/// which counts at most the floor's lease and one batch more. So nothing a
+/// later boot needs is lost, and this is a fact for the owner's later look —
+/// the bytes are theirs to read or remove — never an alert. One line however
+/// many cuts it covers (`fabric.state.torn`); a later count restates it.
+///
+/// ITS CAUSE ENDS WHEN THE OWNER TAKES THE BYTES AWAY: a bridge says how many
+/// torn files its quarantine still holds at its start and as the owner
+/// empties it (`link quarantine torn=<k>`), and at 0 the entry ends
+/// ([`torn_state_key`], `App::except_clear`) — at once if open, and a
+/// dismissal of it is forgotten, so a later power cut's is news again. Only a
+/// bridge that says so (`told_when_empty`, its `hello` lane at
+/// `LINK_QUARANTINE_LANE` or later) gets the line that the entry ends on its
+/// own; one from an older aterm never says, so its entry says to dismiss it.
+/// The words differ, the key does not.
 #[cfg(any(unix, test))]
-pub(crate) fn torn_state_set_aside_entry(files: u64) -> Entry {
+pub(crate) fn torn_state_set_aside_entry(files: u64, told_when_empty: bool) -> Entry {
     let what = if files == 1 {
         "1 file".to_string()
     } else {
@@ -2137,14 +2152,30 @@ pub(crate) fn torn_state_set_aside_entry(files: u64) -> Entry {
         Why::OnlyYou(Reason::new(
             "aterm keeps the torn bytes for you and reads them no more",
         )),
-        Then::step("Look through the quarantine folder in the state dir aterm fabric shows"),
+        Then::step(
+            "Look through the quarantine folder in the state dir aterm fabric shows, then empty it",
+        ),
     )
     .resurface(Resurface::CHOICE)
     .more(format!(
         "{what} found torn after an unclean shutdown moved into quarantine in the bridge's \
          state dir"
     ))
+    .more(if told_when_empty {
+        "This ends once the quarantine holds none of them"
+    } else {
+        "The bridge [fabric] command names is from an older aterm and does not say when the \
+         quarantine is empty: dismiss this once it is"
+    })
     .log_line(format!("fabric.state torn set_aside={files}"))
+}
+
+/// The key the torn-files entry is filed under
+/// ([`torn_state_set_aside_entry`]), which a bridge's `link quarantine
+/// torn=0` ends: read off the entry itself, so the two cannot drift.
+#[cfg(any(unix, test))]
+pub(crate) fn torn_state_key() -> String {
+    torn_state_set_aside_entry(1, true).key()
 }
 
 /// The bridge was lost and nothing was halted (`fabric::bridge_lost`): `n`
@@ -3393,18 +3424,17 @@ pub(crate) fn autopilot_set(
     cancelled: Option<crate::claude_lights::LandAtGlass>,
     set_by: Option<&str>,
 ) -> Message {
-    use crate::autopilot::AutopilotView;
+    use crate::autopilot::{AutopilotView, mode_words};
+    use aterm_agent::supervise::Autopilot;
     let agent_off;
+    // What each mode does, from the one table (`autopilot::MODE_WORDS`).
     let (title, what): (&str, &str) = match view {
         AutopilotView::Cruise => (
             "Autopilot set to cruise",
-            "the harness keeps the work moving",
+            mode_words(Autopilot::Cruise).record,
         ),
-        AutopilotView::Land => (
-            "Autopilot set to land",
-            "the harness wraps the work up, then stops",
-        ),
-        AutopilotView::Off => ("Autopilot set to off", "the harness keeps its hands off"),
+        AutopilotView::Land => ("Autopilot set to land", mode_words(Autopilot::Land).record),
+        AutopilotView::Off => ("Autopilot set to off", mode_words(Autopilot::Off).record),
         AutopilotView::MasterOff => (
             "Autopilot set, harness off",
             "the harness is off in Settings, so nothing is supervised",
@@ -3478,10 +3508,7 @@ pub(crate) fn autopilot_timer_set(
         ),
     )
     .line(atpkg::progress::sanitize_for_tty(
-        &tab_led(
-            place,
-            "the harness keeps the work moving, then wraps it up at that time",
-        ),
+        &tab_led(place, crate::autopilot::TIMED_CRUISE_RECORD),
         aterm_messages::DETAIL_LINE_CAP,
     ));
     set_by_line(message, set_by)
@@ -3548,9 +3575,12 @@ pub(crate) fn autopilot_timer_ended(
                 |c| format!("at {c} Autopilot switched to land"),
             );
             let then = match over {
-                FireOver::Work => "the harness lands all of the work on the remote main branch, \
-                                   then stops"
-                    .to_string(),
+                // Land's own sentence (`autopilot::MODE_WORDS`).
+                FireOver::Work => {
+                    crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Land)
+                        .record
+                        .to_string()
+                }
                 FireOver::MasterOff => {
                     "the harness is off in Settings, so nothing is landed".to_string()
                 }

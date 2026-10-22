@@ -405,6 +405,9 @@ thread_local! {
     /// Chip blocks fitted and laid (`App::claude_lights_block`), as against
     /// a pane's block kept from a frame whose fit key was the same.
     static FOOTER_BLOCK_FITS: Cell<usize> = const { Cell::new(0) };
+    /// Autopilot chip titles built (`claude_lights::autopilot_title`): one
+    /// where a reading starts or its inputs moved, none while nobody reads.
+    static AUTOPILOT_TITLES_BUILT: Cell<usize> = const { Cell::new(0) };
     /// Pane rows whose text a footer rebuild compared with the last
     /// rebuild's (`claude_footer::PaneTextCache::rows_as`), as against rows
     /// the engine's revisions vouch unchanged.
@@ -578,6 +581,12 @@ pub(crate) fn take_input_slices() -> (usize, usize) {
 
 pub(crate) fn footer_block_fitted() {
     bump(&FOOTER_BLOCK_FITS);
+}
+pub(crate) fn autopilot_title_built() {
+    bump(&AUTOPILOT_TITLES_BUILT);
+}
+pub(crate) fn take_autopilot_titles_built() -> usize {
+    take(&AUTOPILOT_TITLES_BUILT)
 }
 pub(crate) fn take_footer_block_fits() -> usize {
     take(&FOOTER_BLOCK_FITS)

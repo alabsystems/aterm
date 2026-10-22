@@ -24,8 +24,9 @@ use atpkg_publish::triple::Triple;
 
 use super::fixture::{
     CPU_ARM64, CPU_X86_64, DORMANT_LEDGER, EM_AARCH64, FakeTools, MINTED_LEDGER, SEAL_COMMIT,
-    SEAL_DRIVER, SEAL_TRIPLE, client_verifies, elf, fat, git, macho, put, put_exe, ran, scratch,
-    seal_fixture, seed_mint, set_mode, toolchain as fixture_toolchain, trust_repo, version_text,
+    SEAL_DRIVER, SEAL_TRIPLE, checkout as fixture_checkout, client_verifies, elf, fat, git, macho,
+    put, put_exe, ran, scratch, seal_fixture, seed_mint, set_mode, toolchain as fixture_toolchain,
+    trust_repo, version_text,
 };
 
 fn native(body: &str) -> Vec<u8> {
@@ -79,10 +80,10 @@ fn world(label: &str) -> World {
     }
     std::fs::create_dir_all(seal.join("libexec")).expect("libexec");
     let src = root.join("trust-src");
-    put(&src.join("README"), b"trust\n");
-    git(&src, &["init", "-q", "."]);
-    git(&src, &["add", "-A"]);
-    git(&src, &["commit", "-q", "-m", "one"]);
+    fixture_checkout(&src, &[("README", b"trust\n")]);
+    // The pack reads the checkout's state with its own git, which reads this machine's
+    // global config: a person's global ignore file would hide the file that makes it dirty.
+    git(&src, &["config", "core.excludesFile", "/dev/null"]);
     World {
         _tmp: tmp,
         root,

@@ -19,6 +19,7 @@ pub enum AdmissionPhase {
 
 impl AdmissionPhase {
     /// The wire token the `trail` control verb prints.
+    #[inline]
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -212,6 +213,7 @@ pub enum BlockFillOwner {
 
 impl BlockFillOwner {
     /// The wire token for the `trail status` row.
+    #[inline]
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -228,6 +230,7 @@ impl BlockFillOwner {
 
     /// Where this owner's body colour comes from: whether OSC 12 should be
     /// reaching the caret right now, without a capture.
+    #[inline]
     #[must_use]
     pub const fn base_from(self) -> BlockFillBase {
         match self {
@@ -271,6 +274,7 @@ pub enum BlockFillBase {
 
 impl BlockFillBase {
     /// The wire token for the `trail status` row.
+    #[inline]
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -310,6 +314,7 @@ impl BlockFill {
     /// says what an owner takes when handed a base, not whether one was handed:
     /// a `CursorColor` owner with no pinned `cursor_color` builds from the
     /// theme-polar white, and this reports that.
+    #[inline]
     #[must_use]
     pub const fn base_from(self) -> BlockFillBase {
         match (self.owner.base_from(), self.base) {
@@ -458,6 +463,7 @@ impl TrailStatus<'_> {
     /// Whether a multi-hue rainbow is on glass: at least two ribbon cells in at
     /// least two distinct hues (one cell is a glow under the caret; one hue is a
     /// monochrome bar). The verb's headline verdict.
+    #[inline]
     #[must_use]
     pub fn ribbon_active(&self) -> bool {
         // A falling curtain is still a ribbon: `ribbon_segments` is floored at
@@ -471,6 +477,7 @@ impl TrailStatus<'_> {
 
     /// The `resolved=` token: the resolved style's label (a fallback's is the
     /// default it draws; `issue=` says why), else `off`.
+    #[inline]
     #[must_use]
     pub fn resolved_label(&self) -> &'static str {
         self.style.map_or("off", GlowStyle::label)
@@ -621,6 +628,7 @@ impl TrailStatus<'_> {
 impl CursorGlow {
     /// V2's `trail status` counters, `Some` only while v2 owns the frame; hand
     /// it to [`TrailStatus::line_v2`].
+    #[inline]
     #[must_use]
     pub fn v2_status(&self) -> Option<rk::Status> {
         self.v2.engaged().then(|| self.v2.status())
@@ -631,6 +639,7 @@ impl CursorGlow {
     /// both read this, the gate `cue_keystroke_shifted` tests first. The host's
     /// sound gates (`trail_sounds`, `trail_sound_volume`, the resize-quiet
     /// window, a dead audio worker) are downstream and reported separately.
+    #[inline]
     #[must_use]
     pub const fn sound_seam_open(&self) -> bool {
         self.sound_live
@@ -639,6 +648,7 @@ impl CursorGlow {
     /// The flow seam: `trail status`'s `flow=` / `combo=` / `combo_best=`
     /// ([`rk::Flow`]), read off v2's spine, never a second counter;
     /// `Flow::default()` for every style but rainbow kitty v2.
+    #[inline]
     #[must_use]
     pub fn flow_status(&self) -> rk::Flow {
         if self.v2.engaged() {
@@ -653,6 +663,7 @@ impl CursorGlow {
     /// [`NbrProbe::Probed`] (the state whose bytes the content witnesses read);
     /// `None` before any probe. Observability for lifecycle tests, not a
     /// licence.
+    #[inline]
     #[must_use]
     pub fn neighbor_rows_probed(&self) -> Option<(bool, bool)> {
         self.row_prev_meta
@@ -661,18 +672,21 @@ impl CursorGlow {
 
     /// The last admission-diagnosis records, oldest → newest (at most
     /// [`ADMISSION_LOG_CAP`]); the ring the `trail` verb serves.
+    #[inline]
     pub fn admission_log(&self) -> impl Iterator<Item = &AdmissionRecord> {
         self.admission_log.iter()
     }
 
     /// The cumulative admission scoreboard ([`AdmissionTally`]), which outlives
     /// the ring; served by `trail status`.
+    #[inline]
     #[must_use]
     pub fn admission_tally(&self) -> AdmissionTally {
         self.admission_log.tally
     }
 
     /// Moves the spawn seam has licensed over this engine's life.
+    #[inline]
     #[must_use]
     pub fn spawns(&self) -> u64 {
         self.spawns
@@ -680,6 +694,7 @@ impl CursorGlow {
 
     /// Row-band moves the host has replayed into this engine
     /// ([`Self::note_band_move`]) over its life.
+    #[inline]
     #[must_use]
     pub fn band_moves(&self) -> u64 {
         self.coord_band_moves
@@ -749,6 +764,7 @@ impl CursorGlow {
     /// `rainbow kitty` band spans now, reported as `ribbon_segments`. Jump/comet
     /// sparks are excluded (a leap's streak, not the typed band). `0` while
     /// nothing was typed recently.
+    #[inline]
     #[must_use]
     pub fn ribbon_segments(&self) -> usize {
         if self.v2.engaged() {
@@ -762,6 +778,7 @@ impl CursorGlow {
     /// (`rk::ribbon::reads_as_ink`), reported as `ribbon_drawn=`. The claim is
     /// floored at `rk::ribbon::STATUS_LIT_COV` (solved for the arc's dimmest
     /// stop). `0` for every style but rainbow kitty.
+    #[inline]
     #[must_use]
     pub fn ribbon_drawn(&self) -> usize {
         if self.v2.engaged() {
@@ -772,6 +789,7 @@ impl CursorGlow {
 
     /// Milliseconds left in a falling curtain (`rk::ribbon::CURTAIN_S`), or `None`:
     /// `trail status`'s `ribbon_curtain_ms=`.
+    #[inline]
     #[must_use]
     pub fn curtain_left_ms(&self, now: Instant) -> Option<u32> {
         if self.v2.engaged() {
@@ -782,6 +800,7 @@ impl CursorGlow {
 
     /// Distinct twentieth-of-the-arc bands among the lit ribbon boundaries;
     /// `0` unless v2 owns the frame.
+    #[inline]
     #[must_use]
     pub fn ribbon_hue_bands(&self) -> usize {
         if self.v2.engaged() {
@@ -795,6 +814,7 @@ impl CursorGlow {
     /// but not the typed band". The two engines never both hold sparks: any
     /// tick of another style resets the classic one, and the classic branch
     /// settles this one before it draws.
+    #[inline]
     #[must_use]
     pub fn live_sparks(&self) -> usize {
         self.sparks.len() + self.classic.live_sparks()

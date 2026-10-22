@@ -1183,7 +1183,9 @@ pub const BLANK_GAP: usize = 4;
 
 /// THE ONE NAME TABLE: the agent a program name is, by its name alone —
 /// the basename of its first word, a login shell's `-` dropped: `claude` and
-/// `claude-code` are Claude Code, `codex` is Codex, `agy` is agy, `muse` is
+/// `claude-code` are Claude Code, `codex` is Codex and so is `codex-old`
+/// (OpenAI's own build beside codex-alab, as atpkg lays it: its entry cloned
+/// under that name, so its argv0 says so), `agy` is agy, `muse` is
 /// Muse Code and so is `muse-bin-<version>` (Meta's own installer's launcher
 /// execs its build so named: `muse-bin-1.4.10-R6427.1`, measured), `gemini`
 /// is Gemini CLI (a name its own process never carries: it runs as `node`),
@@ -1199,7 +1201,7 @@ pub fn program_of(program: &str) -> Option<Program> {
     let is = |name: &str| word.eq_ignore_ascii_case(name);
     if is("claude") || is("claude-code") {
         Some(Program::Claude)
-    } else if is("codex") {
+    } else if is("codex") || is("codex-old") {
         Some(Program::Codex)
     } else if is("agy") {
         Some(Program::Agy)
@@ -1370,6 +1372,17 @@ mod tests {
             ("muse-bin-latest", None),
             ("muse-binary", None),
             ("codexx", None),
+            // atpkg's `codex-old` (OpenAI's own build beside codex-alab) runs
+            // as that name; one that only begins or ends so is no Codex.
+            ("codex-old", Some(Program::Codex)),
+            (
+                "/opt/pkg/store/codex-old/1000000000163000000/bin/codex-old resume",
+                Some(Program::Codex),
+            ),
+            ("CODEX-OLD", Some(Program::Codex)),
+            ("codex-older", None),
+            ("xcodex-old", None),
+            ("codex-", None),
             ("claude-codes", None),
             ("node", None),
             ("", None),

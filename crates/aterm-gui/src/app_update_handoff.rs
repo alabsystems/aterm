@@ -5255,6 +5255,16 @@ impl App {
             ));
         }
         #[cfg(target_os = "macos")]
+        if self.workstation_setup.pending() {
+            // A deferral where the unix lanes spell one; elsewhere an admission
+            // refusal, which keeps the intent and spends no retry budget too.
+            const WHY: &str = "the Mac setup countdown is still open";
+            #[cfg(unix)]
+            return Err(crate::UpdateHandoffStartError::activity(WHY));
+            #[cfg(not(unix))]
+            return Err(crate::UpdateHandoffStartError::refused(WHY));
+        }
+        #[cfg(target_os = "macos")]
         if self.askpass_sheet.is_some() {
             return Err(crate::UpdateHandoffStartError::activity(
                 "a sudo password prompt is still open",
@@ -8571,6 +8581,7 @@ impl App {
             );
         }
         let exact_activity = self.update_handoff_activity_epoch == pending_activity_epoch
+            && !self.workstation_setup.pending()
             // A prelaunch can capture its epoch after a tab was queued. The
             // epoch alone cannot attest that unfinished tab's ownership.
             && self.tab_spawns.is_empty()

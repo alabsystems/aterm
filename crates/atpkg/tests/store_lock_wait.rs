@@ -106,12 +106,14 @@ impl Fixture {
     /// A command confined to this fixture's HOME, config and registry, both pipes
     /// captured — for the dev `atpkg` itself or for a shell that runs it. Clears
     /// `ATERM_STATE_HOME` so a suite run inside a private instance does not skip
-    /// the `[machine]` edge or write logs into that instance's root.
+    /// the `[machine]` edge or write logs into that instance's root. A waiter announces
+    /// at its first contended poll: no test here but the orphan's is about the grace.
     fn command(&self, program: &str) -> Command {
         let mut cmd = Command::new(program);
         cmd.env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", &self.config_home)
             .env("ATPKG_REGISTRY", format!("dir:{}", self.registry.display()))
+            .env(atpkg::lock::WAIT_ANNOUNCE_GRACE_SEAM, "0")
             .env_remove("ATERM_STATE_HOME")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -229,8 +231,8 @@ fn lock_path_of(prefix: &Path) -> String {
     .to_string()
 }
 
-/// A hang detector, not a latency budget: the grace itself is 2 s, and the first exec
-/// of a freshly linked binary has been measured at 26 s on a loaded machine.
+/// A hang detector, not a latency budget: the first exec of a freshly linked binary has
+/// been measured at 26 s on a loaded machine.
 const ANNOUNCE_WITHIN: Duration = Duration::from_secs(60);
 
 /// Assert that a refused pass prints only `[machine]` host lines and no window
@@ -254,6 +256,117 @@ fn no_progress_marker(stdout: &[String]) {
             !stdout.iter().any(|l| l.contains(marker)),
             "no {marker:?} for a typed verb: {stdout:?}"
         );
+    }
+}
+
+#[test]
+fn a_conditional_link_waits_and_rechecks_the_selection_under_the_lock() {
+    // Every path is inside the fixture; include empty directories and link targets so a
+    // refusal cannot hide a landing sweep, notice preparation, twin or pass-log write.
+    fn inventory(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        fn visit(root: &Path, path: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+            let meta = std::fs::symlink_metadata(path).unwrap();
+            let mut bytes = Vec::new();
+            if meta.file_type().is_symlink() {
+                bytes.push(b'L');
+                bytes.extend_from_slice(
+                    std::fs::read_link(path)
+                        .unwrap()
+                        .as_os_str()
+                        .as_encoded_bytes(),
+                );
+            } else if meta.is_dir() {
+                bytes.push(b'D');
+                for entry in std::fs::read_dir(path).unwrap() {
+                    visit(root, &entry.unwrap().path(), out);
+                }
+            } else {
+                assert!(meta.is_file());
+                bytes.push(b'F');
+                bytes.extend(std::fs::read(path).unwrap());
+            }
+            out.push((path.strip_prefix(root).unwrap().to_path_buf(), bytes));
+        }
+        let mut out = Vec::new();
+        visit(root, root, &mut out);
+        out.sort();
+        out
+    }
+    for (selection_changes, candidate_missing) in [(false, false), (true, false), (false, true)] {
+        let fx = Fixture::new("conditional-link");
+        let layout = fx.layout();
+        let guard = fx.hold();
+        let checkout = |name| {
+            let path = fx.home.join(name);
+            std::fs::create_dir_all(path.join("bin")).unwrap();
+            std::fs::write(path.join("bin/codex"), b"fixture\n").unwrap();
+            path
+        };
+        let old = checkout("old");
+        let new = checkout("new");
+        let manual = checkout("manual");
+        if candidate_missing {
+            std::fs::remove_file(new.join("bin/codex")).unwrap();
+        }
+        let bins = [PathBuf::from("bin/codex")];
+        atpkg::link(&layout, "codex", &old, &bins).unwrap();
+        let args = [
+            "link",
+            "codex",
+            new.to_str().unwrap(),
+            "bin/codex",
+            "--if-checkout",
+            old.to_str().unwrap(),
+            "--if-prefix",
+            fx.prefix.to_str().unwrap(),
+        ];
+        let (status, _, _, _) = stream(fx.spawn(&args)).finish(ANNOUNCE_WITHIN);
+        assert_eq!(status.code(), Some(i32::from(atpkg::lock::CONTENDED_EXIT)));
+        assert_eq!(
+            atpkg::linkmode::linked_checkout(&layout, "codex"),
+            Some(old.clone())
+        );
+        let mut waiting_args = args.to_vec();
+        waiting_args.extend(["--wait-lock", "60"]);
+        let mut child = stream(fx.spawn(&waiting_args));
+        child.wait_for_line(&waiting_line(), ANNOUNCE_WITHIN);
+        assert_eq!(
+            atpkg::linkmode::linked_checkout(&layout, "codex"),
+            Some(old.clone())
+        );
+        if selection_changes {
+            atpkg::link(&layout, "codex", &manual, &bins).unwrap();
+        }
+        for dir in [layout.landing_dir(), layout.prefix.join("optin")] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("retained"), b"earlier pass evidence\n").unwrap();
+        }
+        let before = inventory(&layout.prefix);
+        drop(guard);
+        let (status, _, stdout, stderr) = child.finish(ANNOUNCE_WITHIN);
+        let accepted = !selection_changes && !candidate_missing;
+        assert_eq!(status.success(), accepted, "{stdout:?}; {stderr}");
+        assert!(stdout.iter().any(|line| line.starts_with(&acquired_line())));
+        assert_eq!(
+            atpkg::linkmode::linked_checkout(&layout, "codex"),
+            Some(if selection_changes {
+                manual
+            } else if accepted {
+                new
+            } else {
+                old
+            })
+        );
+        if accepted {
+            assert!(!layout.landing_dir().exists());
+            assert!(!layout.prefix.join("optin").exists());
+        } else {
+            assert_eq!(
+                inventory(&layout.prefix),
+                before,
+                "a refused comparison must not start a pass"
+            );
+        }
     }
 }
 
@@ -318,8 +431,7 @@ fn a_waiting_seed_proceeds_once_the_holder_releases() {
 fn a_waiting_seed_times_out_with_exit_75() {
     let fx = Fixture::new("timeout");
     let _guard = fx.hold();
-    let bound = atpkg::lock::WAIT_ANNOUNCE_GRACE + Duration::from_secs(1);
-    let child = stream(fx.spawn(&["seed", "--wait-lock", &bound.as_secs().to_string()]));
+    let child = stream(fx.spawn(&["seed", "--wait-lock", "1"]));
     let (status, _, stdout, stderr) = child.finish(Duration::from_secs(60));
     assert_eq!(
         status.code(),
@@ -413,6 +525,8 @@ fn an_orphaned_waiter_stands_down(case: &str, script: &str) {
     let guard = fx.hold();
     let sh = fx
         .command("/bin/sh")
+        // The real grace: it is what keeps a waiter silent while its spawner exits.
+        .env_remove(atpkg::lock::WAIT_ANNOUNCE_GRACE_SEAM)
         .arg("-c")
         // The waiter inherits both pipes, so this process sees EOF on them only
         // once the waiter itself has exited.
@@ -519,13 +633,16 @@ const ORPHAN_BOUND_SECS: u64 = 600;
 /// A waiter whose parent is already init/subreaper when it starts (with no
 /// `ATPKG_SPAWNER_PID`) records that initial `getppid()` as its spawner and
 /// waits normally instead of treating itself as orphaned. A throwaway `sh`
-/// forks a subshell that sleeps until re-parented and then `exec`s the waiter.
+/// forks a subshell that waits on a FIFO gate; the test reaps the `sh` (so the
+/// subshell is re-parented) and only then opens the gate for it to `exec` the
+/// waiter. A waiter that stands down fails at its exit, not at the deadline.
 #[test]
 fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
     use std::io::Write as _;
     let fx = Fixture::new("init-parent");
     let _guard = fx.hold();
-    let bound = atpkg::lock::WAIT_ANNOUNCE_GRACE + Duration::from_secs(1);
+    // Outlives every check below; the waiter is killed once they pass.
+    let bound = aterm_spec::wait::MUST_HAPPEN;
     // The gate, held open read-write here, so the subshell's open of it never waits for
     // a writer and the line written below waits in the pipe until it reads.
     let gate_path = fx.home.with_file_name("gate");
@@ -572,13 +689,25 @@ fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
     };
     assert!(exited.success(), "the throwaway parent itself: {exited}");
     gate.write_all(b"go\n").expect("open the gate");
-    // The announcement is the proof it did NOT stand down: it is printed only
-    // after the grace and only while the waiter still wants the lock.
+    // The announcement is the proof it did NOT stand down: it is printed only while the
+    // waiter still wants the lock. With the `sh` reaped, the waiter alone holds the pipes,
+    // so their end is its exit: a waiter that ends before it announces stood down, and
+    // fails here at once.
     let deadline = Instant::now() + ANNOUNCE_WITHIN;
-    while !streamed.stdout_has(&waiting_line()) {
+    loop {
+        // Read before the lines, so an end seen here follows every line it read.
+        let ended = streamed.stdout_reader.is_finished();
+        if streamed.stdout_has(&waiting_line()) {
+            break;
+        }
+        assert!(
+            !ended,
+            "no announcement — the waiter stood down: it exited with stdout {:?}",
+            streamed.stdout.lock().unwrap()
+        );
         assert!(
             Instant::now() < deadline,
-            "no announcement — the waiter stood down: {:?}",
+            "no announcement and no exit within {ANNOUNCE_WITHIN:?}: {:?}",
             streamed.stdout.lock().unwrap()
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -594,12 +723,7 @@ fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
         })
         .expect("the waiter's pid line");
     // The shape held: the announcing waiter's parent is not the (reaped) `sh`.
-    let ppid = Command::new("ps")
-        .args(["-o", "ppid=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u32>().ok());
+    let ppid = parent_of(pid);
     assert!(
         ppid.is_some_and(|p| p != sh_pid),
         "the waiter (pid {pid}) is re-parented away from sh (pid {sh_pid}): ppid {ppid:?}"
@@ -612,6 +736,20 @@ fn a_waiter_whose_parent_is_init_from_the_start_is_not_an_orphan() {
         .status();
     // Both pipes reach EOF once the waiter is gone.
     let _ = streamed.finish(Duration::from_secs(60));
+}
+
+/// `pid`'s parent, read from the kernel's process table as `ps -o ppid=` reads it, without
+/// running `ps`; `None` once no process has that pid.
+fn parent_of(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    let parent = aterm_sysprobe::kproc::record(pid).map(|r| r.ppid);
+    #[cfg(not(target_os = "macos"))]
+    let parent = aterm_sysprobe::processes()?
+        .procs
+        .into_iter()
+        .find(|p| p.pid == pid)
+        .map(|p| p.ppid);
+    parent
 }
 
 /// No contention, no marker: the flag changes nothing about an uncontended pass.

@@ -7,7 +7,7 @@
 //! nothing saying why. Now the pane stays, with one line naming the shell and how
 //! it ended, and the instance keeps running.
 //!
-//! The real binary (`CARGO_BIN_EXE_aterm`) under a scratch world
+//! The real binary (`launch_isolation::aterm_executable`) under a scratch world
 //! (`support/launch_isolation.rs`), its shell a stub script given by `--shell`:
 //!
 //! * `exit 3` at start: the instance stays up, `text` shows
@@ -74,7 +74,7 @@ fn stub_shell(root: &Path, name: &str, body: &str) -> PathBuf {
 /// ([`headless_boot::until_served`]).
 fn ctl(inst: &headless_boot::Instance, args: &[&str]) -> Output {
     headless_boot::until_served(|| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+        let mut cmd = Command::new(launch_isolation::aterm_executable());
         launch_isolation::apply(&mut cmd, &inst.tmp);
         cmd.arg("ctl")
             .arg("--sock")
@@ -183,7 +183,7 @@ fn ends_by_itself(prefix: &str, extra: impl FnOnce(&Path, &mut Command)) {
     let log = root.join("gui.log");
     let out = std::fs::File::create(&log).expect("the instance log");
     let err = out.try_clone().expect("the instance log, twice");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+    let mut cmd = Command::new(launch_isolation::aterm_executable());
     launch_isolation::apply(&mut cmd, &root);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
         .args(launch_isolation::control_sock(&root))

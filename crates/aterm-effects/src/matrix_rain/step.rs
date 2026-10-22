@@ -39,6 +39,7 @@ impl RainLatches {
     /// is its rising edge (executing now, not executing last frame in the same
     /// session). Called every frame, rain on or off, so an enable mid-command
     /// does not read the command's start as news.
+    #[inline]
     pub fn note_shell_executing(&mut self, session: u64, executing: bool) -> bool {
         let rising =
             matches!(self.shell_executing, Some((sid, false)) if sid == session) && executing;
@@ -49,6 +50,7 @@ impl RainLatches {
     /// Keep the completion latch baselined on a frame that draws no rain (a
     /// suspended pane, a disabled session), so a completion during suppression
     /// does not fire a stale ember/wave on resume.
+    #[inline]
     pub fn baseline_completion(&mut self, session: u64, cmd_seq: Option<u64>) {
         self.last_cmd = Some((session, cmd_seq.unwrap_or(0)));
     }
@@ -57,6 +59,7 @@ impl RainLatches {
     /// observing (Execute level and completion baseline), so an engine built
     /// on enable reads neither a running command's start nor a completion
     /// from while the rain was off as news.
+    #[inline]
     pub fn observe_without_engine(&mut self, session: u64, executing: bool, cmd_seq: Option<u64>) {
         let _ = self.note_shell_executing(session, executing);
         self.baseline_completion(session, cmd_seq);
@@ -64,6 +67,7 @@ impl RainLatches {
 
     /// Exit status → weather (OSC 133/633): `Some(failed)` once per new
     /// completion in the same session; a tab switch re-baselines silently.
+    #[inline]
     fn take_new_completion(&mut self, session: u64, cmd_done: Option<(u64, i32)>) -> Option<bool> {
         let key = (session, cmd_done.map_or(0, |(seq, _)| seq));
         if self.last_cmd == Some(key) {

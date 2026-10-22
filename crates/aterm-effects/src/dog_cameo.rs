@@ -23,6 +23,10 @@ const FADE_IN: Duration = Duration::from_millis(140);
 const HOLD: Duration = Duration::from_millis(2600);
 /// Exit fade.
 const FADE_OUT: Duration = Duration::from_millis(420);
+const FADE_IN_HOLD: Duration = Duration::from_millis(140 + 2600);
+const VISIT_LIFE: Duration = Duration::from_millis(140 + 2600 + 420);
+const _: () = assert!(FADE_IN_HOLD.as_nanos() == FADE_IN.as_nanos() + HOLD.as_nanos());
+const _: () = assert!(VISIT_LIFE.as_nanos() == FADE_IN_HOLD.as_nanos() + FADE_OUT.as_nanos());
 
 /// Entry bounce: two equal-length hops, the second half as high, finished inside the hold.
 const HOP_MS: u64 = 420;
@@ -36,6 +40,7 @@ const COAT_SALT: u64 = 0x646f_6721_636f_6174; // b"dog!coat"
 
 /// Reduce a mixed seed onto `[0, upper)` with multiply-high (constant-time,
 /// rejection-free, bias at most one part in 2^64).
+#[inline]
 fn scale(entropy: u64, upper: usize) -> usize {
     ((u128::from(entropy) * upper as u128) >> 64) as usize
 }
@@ -85,10 +90,11 @@ impl DogCameo {
     }
 
     /// Whether a visit is in progress (any nonzero-alpha phase).
+    #[inline]
     #[must_use]
     pub fn active(&self, now: Instant) -> bool {
         self.since
-            .is_some_and(|at| now.saturating_duration_since(at) < FADE_IN + HOLD + FADE_OUT)
+            .is_some_and(|at| now.saturating_duration_since(at) < VISIT_LIFE)
     }
 
     /// The visit's presence envelope at `now`: `0..=255` through fade-in →
@@ -102,10 +108,10 @@ impl DogCameo {
         if t < FADE_IN {
             let f = t.as_secs_f32() / FADE_IN.as_secs_f32();
             (f * 255.0).round().clamp(0.0, 255.0) as u8
-        } else if t < FADE_IN + HOLD {
+        } else if t < FADE_IN_HOLD {
             255
-        } else if t < FADE_IN + HOLD + FADE_OUT {
-            let f = (t - FADE_IN - HOLD).as_secs_f32() / FADE_OUT.as_secs_f32();
+        } else if t < VISIT_LIFE {
+            let f = (t - FADE_IN_HOLD).as_secs_f32() / FADE_OUT.as_secs_f32();
             ((1.0 - f) * 255.0).round().clamp(0.0, 255.0) as u8
         } else {
             0
@@ -132,6 +138,7 @@ impl DogCameo {
 
     /// The current visit's rolled identity (`None` before the first summon).
     /// Stays set through the fade-out so a mid-fade frame keeps its sprite.
+    #[inline]
     #[must_use]
     pub fn look(&self) -> Option<DogLook> {
         self.look

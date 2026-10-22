@@ -29,9 +29,19 @@ const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 const HOLD_AT: usize = 64 * 1024;
 
 /// A wait for something that must happen: a hang detector, never a latency budget. The
-/// silent hold costs the quick stall bound once (about 14 s measured); the pre-PKG-8 lane
-/// waited 120 s on it.
+/// silent hold costs the quick stall bound once, cut for a fresh attempt to
+/// [`FRESH_STALL_SECS`]; the pre-PKG-8 lane waited 120 s on it.
 const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The shipped quick stall bound (`--speed-time`) of a download's attempt from byte 0
+/// (aterm-update-core's `StallBound::Quick`), the one bound the curl stand-in cuts: spelled
+/// here, so a lane that opens on any other bound still waits that bound out.
+const QUICK_STALL_SECS: &str = "8";
+
+/// What the curl stand-in cuts [`QUICK_STALL_SECS`] to for an attempt from byte 0. curl's
+/// speed is a moving average over its last five seconds, so the hold is noticed about that
+/// long plus this after its last byte (about 14 s at the shipped bound).
+const FRESH_STALL_SECS: u32 = 2;
 
 /// The scratch updates root under `dir`, laid out as [`Staging::resolve`] lays the real one.
 fn e2e_staging(dir: &std::path::Path) -> Staging {
@@ -317,16 +327,23 @@ fn a_check_over_real_curl_stages_a_release_whose_container_transfer_goes_silent(
     let world = dir.path().join("world");
     std::fs::create_dir_all(world.join("Applications")).unwrap();
     // The real curl, every option as the lane wrote it, the github.com URL (the last
-    // argument) sent to the scratch host instead.
+    // argument) sent to the scratch host instead — but for a fresh attempt's quick stall
+    // bound, cut to FRESH_STALL_SECS, so the silent hold is noticed in seconds. Only that
+    // bound of an attempt from byte 0: the attempt that continues the file, and any other
+    // bound (the patient 120 s, or the pre-PKG-8 lane's), run as the lane wrote them.
+    let quick = QUICK_STALL_SECS;
     let wrapper = dir.path().join("curl");
     std::fs::write(
         &wrapper,
         format!(
             "#!/bin/sh\nunset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY\n\
-             n=$#; i=0\nfor a do\n  i=$((i+1))\n  [ $i -eq 1 ] && set --\n  \
+             fresh=1\nfor a do [ \"$a\" = --continue-at ] && fresh=0; done\n\
+             n=$#; i=0; prev=\nfor a do\n  i=$((i+1))\n  [ $i -eq 1 ] && set --\n  \
              if [ $i -eq $n ]; then set -- \"$@\" \"$(printf '%s' \"$a\" | \
              sed 's#^https://github.com/#http://127.0.0.1:{port}/#')\"; \
-             else set -- \"$@\" \"$a\"; fi\ndone\nexec /usr/bin/curl \"$@\"\n"
+             elif [ $fresh = 1 ] && [ \"$prev\" = --speed-time ] && [ \"$a\" = {quick} ]; \
+             then set -- \"$@\" {FRESH_STALL_SECS}; \
+             else set -- \"$@\" \"$a\"; fi\n  prev=$a\ndone\nexec /usr/bin/curl \"$@\"\n"
         ),
     )
     .unwrap();

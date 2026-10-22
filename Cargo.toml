@@ -10,7 +10,7 @@ members = ["crates/*"]
 # `--workspace` and `-p` still reach every member. List new crates here unless
 # they are publication tools or check runners.
 default-members = [
-    "crates/amacs", "crates/amacs-files", "crates/amacs-term",
+    "crates/agh", "crates/agh-fake", "crates/amacs", "crates/amacs-files", "crates/amacs-term",
     "crates/aterm", "crates/aterm-a11y", "crates/aterm-agent", "crates/aterm-alloc", "crates/aterm-arrayvec",
     "crates/aterm-bidi", "crates/aterm-bits", "crates/aterm-buffer",
     "crates/aterm-caffeine", "crates/aterm-cap",
@@ -29,7 +29,7 @@ default-members = [
     "crates/aterm-keeper", "crates/aterm-lexicon", "crates/aterm-libc", "crates/aterm-libm",
     "crates/aterm-link", "crates/aterm-log", "crates/aterm-machines", "crates/aterm-log-shim", "crates/aterm-lz4",
     "crates/aterm-macro-support", "crates/aterm-messages", "crates/aterm-net", "crates/aterm-objc",
-    "crates/aterm-models-atpkg", "crates/aterm-models-core", "crates/aterm-models-effects",
+    "crates/aterm-models-agh", "crates/aterm-models-atpkg", "crates/aterm-models-core", "crates/aterm-models-effects",
     "crates/aterm-models-gui", "crates/aterm-models-harness", "crates/aterm-models-misc",
     "crates/aterm-models-native", "crates/aterm-models-release", "crates/aterm-models-render",
     "crates/aterm-models-session", "crates/aterm-models-update",
@@ -79,7 +79,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.109.0"
+version = "0.110.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -104,6 +104,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 ring = { version = "0.17.14", default-features = false }
 
 # --- internal aterm crates ---
+# agh: aterm's GitHub client, the library and the `aterm agh` CLI (docs/DESIGN-agh-2026-10-19.md).
+agh = { path = "crates/agh" }
+# agh's loopback GitHub (api, uploads, web and CDN origins over plain HTTP): tests only.
+agh-fake = { path = "crates/agh-fake" }
 # Headless editor engine.
 amacs = { path = "crates/amacs" }
 # File I/O and persistence shared by the native view and terminal UI.
@@ -173,6 +177,7 @@ aterm-macro-support = { path = "crates/aterm-macro-support" }
 aterm-messages = { path = "crates/aterm-messages" }
 # Formal models, one crate per domain; `aterm-models` aggregates all domains for checks.
 aterm-models = { path = "crates/aterm-models" }
+aterm-models-agh = { path = "crates/aterm-models-agh" }
 aterm-models-atpkg = { path = "crates/aterm-models-atpkg" }
 aterm-models-core = { path = "crates/aterm-models-core" }
 aterm-models-effects = { path = "crates/aterm-models-effects" }

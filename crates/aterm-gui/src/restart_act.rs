@@ -1066,10 +1066,10 @@ fn kill(ctx: &Weak<SessionCtx>, watch: &Watch) -> &'static str {
 }
 
 /// Finishes an in-flight restart across an instance handoff: if `state` holds a
-/// stamp for `ctx` with more than [`KILL_READ_MARGIN`] remaining, watches the
-/// process on a background thread until the stamp reaches [`DEADLINE`] and calls
-/// [`kill`]. Returns whether a watch (newly spawned or already listed in
-/// [`watch`]) covers the process.
+/// stamp for `ctx` with more than [`KILL_READ_MARGIN`] remaining at `now_s` (unix
+/// seconds), watches the process on a background thread until the stamp reaches
+/// [`DEADLINE`] and calls [`kill`]. Returns whether a watch (newly spawned or
+/// already listed in [`watch`]) covers the process.
 #[cfg(unix)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -1079,18 +1079,17 @@ fn kill(ctx: &Weak<SessionCtx>, watch: &Watch) -> &'static str {
         project = "harness_host::tests::project_restart_stamp"
     )
 )]
-pub(crate) fn carry(ctx: &Arc<SessionCtx>, state: &std::path::Path) -> bool {
+pub(crate) fn carry(ctx: &Arc<SessionCtx>, state: &std::path::Path, now_s: u64) -> bool {
     let Some(stamp) = restart_stamp::read(state, ctx.self_id.as_str()) else {
         return false;
     };
     let Ok(pgrp) = i32::try_from(stamp.pid) else {
         return false;
     };
-    let now = aterm_time::unix_secs().unwrap_or(0);
-    if stamp.stands_for(now) <= KILL_READ_MARGIN {
+    if stamp.stands_for(now_s) <= KILL_READ_MARGIN {
         return false;
     }
-    let left = DEADLINE.saturating_sub(Duration::from_secs(stamp.age_s(now)));
+    let left = DEADLINE.saturating_sub(Duration::from_secs(stamp.age_s(now_s)));
     let Some(watch) = watch(state, pgrp, &stamp) else {
         aterm_log::info!(
             "restart: pid {pgrp}: an act a Commit cut is watched already; that watch ends it"
@@ -1125,8 +1124,9 @@ impl crate::App {
     pub(crate) fn carry_cut_restarts(&self) {
         #[cfg(unix)]
         if let Some(state) = crate::harness_host::harness_state() {
+            let now_s = aterm_time::unix_secs().unwrap_or(0);
             for session in self.pool.iter().filter(|s| s.handoff_local_id.is_some()) {
-                let _ = carry(&session.ctx, &state);
+                let _ = carry(&session.ctx, &state, now_s);
             }
         }
     }

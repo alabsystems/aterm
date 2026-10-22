@@ -42,7 +42,14 @@ enum Node {
 /// A directory tree held in memory — each directory, and each file's bytes and mode, by its
 /// path under the root — so a fixture whose making costs processes (a git repository) is
 /// made once per process and laid down per test.
-pub struct Tree(Vec<(std::path::PathBuf, Node)>);
+///
+/// It remembers the root it was read from: a made tree can name it (git writes a clone's
+/// source path into the clone's config, reflogs and `FETCH_HEAD`), and [`Tree::lay`] moves
+/// that name to the root it lays the tree at.
+pub struct Tree {
+    root: Vec<u8>,
+    nodes: Vec<(std::path::PathBuf, Node)>,
+}
 
 impl Tree {
     /// Everything under `root`.
@@ -58,41 +65,73 @@ impl Tree {
                 let e = e.expect("a fixture entry");
                 let rel = rel.join(e.file_name());
                 let meta = e.metadata().expect("stat a fixture entry");
+                // `metadata` here does not follow a link. Read as a file, a link would be laid
+                // down as a copy of what it names (a world unlike the one made), and a fifo
+                // would hang the read.
+                assert!(
+                    meta.is_dir() || meta.is_file(),
+                    "{} is neither a file nor a directory: a made fixture holds only those",
+                    e.path().display()
+                );
                 if meta.is_dir() {
-                    out.0.push((rel.clone(), Node::Dir));
+                    out.nodes.push((rel.clone(), Node::Dir));
                     walk(root, &rel, out);
                 } else {
                     let bytes = std::fs::read(e.path()).expect("read a fixture file");
                     let mode = meta.permissions().mode();
-                    out.0.push((rel, Node::File { bytes, mode }));
+                    out.nodes.push((rel, Node::File { bytes, mode }));
                 }
             }
         }
-        let mut tree = Self(Vec::new());
+        use std::os::unix::ffi::OsStrExt as _;
+        let mut tree = Self {
+            root: root.as_os_str().as_bytes().to_vec(),
+            nodes: Vec::new(),
+        };
         walk(root, std::path::Path::new(""), &mut tree);
         tree
     }
 
-    /// The tree under `root`.
+    /// The tree under `root`, each file's mention of the root it was read from moved to
+    /// `root`.
     ///
     /// # Panics
     ///
     /// When it cannot be written.
     pub fn lay(&self, root: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt as _;
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::create_dir_all(root).expect("mkdir a fixture root");
-        for (rel, node) in &self.0 {
+        let to = root.as_os_str().as_bytes();
+        for (rel, node) in &self.nodes {
             let path = root.join(rel);
             match node {
                 Node::Dir => std::fs::create_dir_all(&path).expect("mkdir a fixture dir"),
                 Node::File { bytes, mode } => {
-                    std::fs::write(&path, bytes).expect("write a fixture file");
+                    std::fs::write(&path, moved(bytes, &self.root, to))
+                        .expect("write a fixture file");
                     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(*mode))
                         .expect("chmod a fixture file");
                 }
             }
         }
     }
+}
+
+/// `bytes` with every `from` replaced by `to`.
+fn moved<'a>(bytes: &'a [u8], from: &[u8], to: &[u8]) -> std::borrow::Cow<'a, [u8]> {
+    if from.is_empty() || !bytes.windows(from.len()).any(|w| w == from) {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut rest = bytes;
+    while let Some(at) = rest.windows(from.len()).position(|w| w == from) {
+        out.extend_from_slice(&rest[..at]);
+        out.extend_from_slice(to);
+        rest = &rest[at + from.len()..];
+    }
+    out.extend_from_slice(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 /// What [`made_once`] made, by key: each tree with what its making returned.

@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use aterm_core::terminal::{AltArchiveImport, Terminal, TerminalCheckpoint};
 
 use super::tests::{
-    ENV_LOCK, ScratchEnv, StageCarry, StagedHandoff, child_proof_from, pipe_pair, restage_session,
-    restore_env, stage_carry_handoff, stage_history_handoff, stage_ladder_handoff,
+    ENV_LOCK, ScratchEnv, StageCarry, StagedHandoff, child_proof_from, env_alone, pipe_pair,
+    restage_session, restore_env, stage_carry_handoff, stage_history_handoff, stage_ladder_handoff,
 };
 use super::*;
 use crate::handoff_carry::{self, ControlCarry};
@@ -100,7 +100,6 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 land_at: None,
                 control: None,
                 frozen_path: false,
-                identity: None,
                 topics: Vec::new(),
                 fg_holder: None,
                 rekey: false,
@@ -401,7 +400,7 @@ fn is_chrome(row: &str) -> bool {
 /// `complete=1`, no chrome; `history` shows the turn `carried=1`.
 #[test]
 fn a_report_across_a_handoff_has_every_row_and_no_chrome() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let (n, m) = (60, 40);
     let mut app = FakeApp::new();
@@ -458,7 +457,7 @@ fn a_report_across_a_handoff_has_every_row_and_no_chrome() {
 /// (duplicates allowed, never a loss) and no chrome.
 #[test]
 fn a_report_across_a_handoff_and_a_resize_says_gap_and_loses_nothing() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let (n, m) = (60, 40);
     let mut app = FakeApp::new();
@@ -507,7 +506,7 @@ fn a_report_across_a_handoff_and_a_resize_says_gap_and_loses_nothing() {
 /// the count.
 #[test]
 fn the_session_log_crosses_the_real_files() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
@@ -614,7 +613,7 @@ fn the_session_log_crosses_the_real_files() {
 /// handoff, and `history since=<old id>` goes on from there.
 #[test]
 fn the_carry_round_trips_the_ledger_and_the_archive_tail() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 60);
@@ -651,7 +650,7 @@ fn the_carry_round_trips_the_ledger_and_the_archive_tail() {
 /// screen, so `history` and `offscreen` read on across the update.
 #[test]
 fn a_repainted_session_keeps_its_ledger_and_archive_rows() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 60);
@@ -689,7 +688,7 @@ fn a_repainted_session_keeps_its_ledger_and_archive_rows() {
 /// of a fresh archive, and the report reader lost the turn's rows.
 #[test]
 fn a_receiver_degraded_screen_without_a_meta_keeps_its_archive_rows() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 60);
@@ -793,7 +792,7 @@ fn a_lost_control_carry_names_its_cause() {
 /// the proof checks out.
 #[test]
 fn a_bad_sidecar_only_drops_the_carry() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
@@ -862,7 +861,7 @@ fn a_bad_sidecar_only_drops_the_carry() {
 /// bytes it reads.
 #[test]
 fn the_proof_digests_do_not_see_the_sidecar() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
@@ -904,7 +903,7 @@ fn the_proof_digests_do_not_see_the_sidecar() {
 /// `run_handoff_decision` does).
 #[test]
 fn a_new_sender_hands_off_to_a_receiver_built_before_the_carry() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
@@ -995,7 +994,6 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             land_at: None,
             control: Some(handoff_carry::stamp(b"{}")),
             frozen_path: true,
-            identity: Some("worker".to_string()),
             // Non-empty on purpose: the topic set is consent, and this
             // roundtrip proves a seamless update keeps it.
             topics: vec!["build.failed head".to_string(), "sat-comp @42".to_string()],
@@ -1044,10 +1042,6 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
     assert!(!old_wire.contains("control") && !old_wire.contains("next_turn_id"));
     assert!(!old_wire.contains("outgoing_build") && !old_wire.contains("frozen_path"));
     assert!(
-        wire.contains("identity = \"worker\"") && !old_wire.contains("identity"),
-        "the identity label rides this build's wire and an old reader drops it"
-    );
-    assert!(
         wire.contains("fg_holder = 4242") && !old_wire.contains("fg_holder"),
         "the foreground holder rides this build's wire and an old reader drops it"
     );
@@ -1078,10 +1072,6 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
         "absent: the old build's wire predates"
     );
     assert!(!read.sessions[0].frozen_path);
-    assert_eq!(
-        read.sessions[0].identity, None,
-        "dropped by the old build: the label is gone"
-    );
     assert_eq!(read.sessions[0].control, None);
     assert_eq!(
         read.sessions[0].fg_holder, None,
@@ -1106,7 +1096,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
 /// restored engine it is the engine's debt again; the first full clear zeroes it.
 #[test]
 fn the_render_debt_crosses_the_handoff_and_only_onto_a_carried_alt_screen() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
@@ -1247,7 +1237,7 @@ fn the_startup_sweep_retires_only_a_dead_senders_files() {
 /// takes the sidecars alone — of this attempt only.
 #[test]
 fn a_senders_retirements_take_its_sidecars_and_nothing_else() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _scratch = ScratchEnv::runtime("retire");
     let dir = crate::control_auth::socket_dir().expect("scratch control dir");
     let pid = std::process::id();
@@ -1284,7 +1274,7 @@ fn a_senders_retirements_take_its_sidecars_and_nothing_else() {
 /// path — a planted symlink included — and never fails the handoff for it.
 #[test]
 fn a_sidecar_is_never_written_through_a_planted_path() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let target = std::env::temp_dir().join(format!("aterm-carry-target-{}", std::process::id()));
     std::fs::write(&target, b"untouched").unwrap();
@@ -1316,7 +1306,7 @@ fn a_sidecar_is_never_written_through_a_planted_path() {
 /// (`history since=` and `ERR busy turn=` rely on rising ids).
 #[test]
 fn a_carried_turn_id_past_the_manifest_range_is_left_out() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
@@ -1354,7 +1344,7 @@ fn a_carried_turn_id_past_the_manifest_range_is_left_out() {
 #[test]
 fn a_fifo_at_the_sidecar_path_does_not_stall_the_adoption() {
     use std::os::unix::ffi::OsStrExt as _;
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let mut app = FakeApp::new();
     let (term, turns) = old_session(&mut app, 30);
@@ -1871,7 +1861,7 @@ fn stamp_with(
 /// import after Commit gives the adopted engine the parent's whole history.
 #[test]
 fn the_history_carry_crosses_the_real_wire_outside_the_proof() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let term = deep_shell(4000);
     let parent = shell_history(&term.lock().unwrap());
@@ -1925,7 +1915,7 @@ fn the_history_carry_crosses_the_real_wire_outside_the_proof() {
 /// after the proof.
 #[test]
 fn a_receiver_built_before_the_history_carry_skips_it_and_proves() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let term = deep_shell(2000);
     let (carry, head) = park_history(&term);

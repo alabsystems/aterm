@@ -405,28 +405,39 @@ pub(crate) fn would_supervise(cfg: &SupervisorConfig, headless: bool) -> bool {
     cfg.enabled && (!headless || cfg.headless)
 }
 
-/// The switch that would leave a worker (`spawn agent=claude`) with nothing
+/// The switch that would leave a worker (`spawn agent=<word>`) with nothing
 /// to see its task through in this instance — its spawn's `ERR unsupervised:
-/// <switch>` — or `None` when this host would carry the worker's Claude Code
+/// <switch>` — or `None` when this host would carry the worker's `agent`
 /// session. The host's own three gates, in its order: it supervises at all
 /// ([`would_supervise`]: `[harness] enabled`, and in a headless instance not
-/// `headless = false`); it admits Claude Code ([`admitted_mask`]: under
-/// `[harness.claude] enabled = false` none is, and no session word lifts
+/// `headless = false`); it admits the worker's agent ([`admitted_mask`]: under
+/// `[harness.<agent>] enabled = false` none is, and no session word lifts
 /// that); and the table's default is not Off
 /// ([`SupervisorConfig::autopilot_for`]): the spawn writes the newborn's own
 /// word (`land`, or the spawn's `autopilot=cruise`), but under `autopilot =
 /// "off"` the owner took the harness's hands off by default, and a starter's
 /// spawn is not the owner opting a session in, so it is refused rather than
 /// handed a word that would lift that.
-pub(crate) fn worker_unsupervised(cfg: &SupervisorConfig, headless: bool) -> Option<&'static str> {
+pub(crate) fn worker_unsupervised(
+    cfg: &SupervisorConfig,
+    headless: bool,
+    agent: Program,
+) -> Option<&'static str> {
     if !would_supervise(cfg, headless) {
         Some(if cfg.enabled {
             "[harness] headless = false"
         } else {
             "[harness] enabled = false"
         })
-    } else if admitted_mask(cfg) & agent_bit(Program::Claude) == 0 {
-        Some("[harness.claude] enabled = false")
+    } else if admitted_mask(cfg) & agent_bit(agent) == 0 {
+        Some(match agent {
+            Program::Claude => "[harness.claude] enabled = false",
+            Program::Codex => "[harness.codex] enabled = false",
+            Program::Agy => "[harness.agy] enabled = false",
+            Program::Muse => "[harness.muse] enabled = false",
+            Program::Gemini => "[harness.gemini] enabled = false",
+            Program::Generic => "[harness.generic] enabled = false",
+        })
     } else if cfg.autopilot_for(None) == Autopilot::Off {
         Some("[harness] autopilot = \"off\"")
     } else {
@@ -10067,35 +10078,6 @@ fn self_claimed_exit(
             copy.start
         );
     }
-    // A process no snapshot read reached while it ran (it claimed and died
-    // within moments: AD-5, AD-3's second crash) is relaunched at the shell
-    // that holds its tab now, from its copy ([`Acts::self_snapshot`]).
-    let snap = crash_snapshot(snap, copy).or_else(|| {
-        let resume = copy.resume.as_ref().ok()?;
-        let snap = (hooks.acts.self_snapshot)(sid, copy, resume)?;
-        aterm_log::info!(
-            "harness @{sid}: no snapshot of the crashed codex-alab {} was read while it ran; \
-             its copy's line is relaunched at the shell holding the tab ({})",
-            copy.pid,
-            snap.shell
-        );
-        Some(snap)
-    });
-    let Some(snap) = snap else {
-        settled(job);
-        forget_snapshot(job, hooks);
-        task_exited(job, hooks);
-        aterm_log::info!(
-            "harness @{sid}: the self-supervised codex-alab crashed; not relaunched: it was the \
-             tab's own program, with no shell to relaunch it at"
-        );
-        inform(format!(
-            "codex-alab ({}) crashed and is not relaunched: it was this tab's own program, with \
-             no shell to start it again at",
-            copy.pid
-        ));
-        return None;
-    };
     let resume = match &copy.resume {
         Ok(resume) => resume.clone(),
         Err(why) if copy.seen == self_claimed::Seen::Never => {
@@ -10128,6 +10110,34 @@ fn self_claimed_exit(
             ));
             return None;
         }
+    };
+    // A process no snapshot read reached while it ran (it claimed and died
+    // within moments: AD-5, AD-3's second crash) is relaunched at the shell
+    // that holds its tab now, from its copy ([`Acts::self_snapshot`]).
+    let snap = crash_snapshot(snap, copy).or_else(|| {
+        let snap = (hooks.acts.self_snapshot)(sid, copy, &resume)?;
+        aterm_log::info!(
+            "harness @{sid}: no snapshot of the crashed codex-alab {} was read while it ran; \
+             its copy's line is relaunched at the shell holding the tab ({})",
+            copy.pid,
+            snap.shell
+        );
+        Some(snap)
+    });
+    let Some(snap) = snap else {
+        settled(job);
+        forget_snapshot(job, hooks);
+        task_exited(job, hooks);
+        aterm_log::info!(
+            "harness @{sid}: the self-supervised codex-alab crashed; not relaunched: it was the \
+             tab's own program, with no shell to relaunch it at"
+        );
+        inform(format!(
+            "codex-alab ({}) crashed and is not relaunched: it was this tab's own program, with \
+             no shell to start it again at",
+            copy.pid
+        ));
+        return None;
     };
     aterm_log::info!(
         "harness @{sid}: the self-supervised codex-alab crashed; relaunching it on its \
@@ -15532,8 +15542,8 @@ pub(crate) enum StartupState {
 /// What a worker's screen says of its start ([`startup_seen`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StartupSeen {
-    /// The agent has taken its task up: Claude Code's composer is drawn, or
-    /// a box of a tool or a question the agent asks along its work.
+    /// The agent has taken its task up: its composer is drawn, or a box of a
+    /// tool or a question the agent asks along its work.
     Started,
     /// Not yet: what holds the screen instead.
     Holds(StartupHold),
@@ -15543,19 +15553,22 @@ pub(crate) enum StartupSeen {
 }
 
 /// WHAT HOLDS A WORKER'S SCREEN where its composer should be
-/// ([`startup_seen`]), named for a person in [`Self::attention`].
+/// ([`startup_seen`]), named for a person in [`Self::attention`]: each by
+/// `agent`, the agent whose reader read it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StartupHold {
-    /// Claude Code's folder-trust dialog, which no rule answered.
-    Trust,
-    /// Another box Claude Code drew: its title.
-    Box { title: String },
-    /// Claude Code with no composer and no box: a login or onboarding
-    /// screen.
-    NoComposer,
-    /// No Claude Code at all: `program`, the tab's foreground program, holds
+    /// The agent's folder-trust dialog, which no rule answered.
+    Trust { agent: Program },
+    /// Another box the agent drew: its title.
+    Box { agent: Program, title: String },
+    /// The agent with no composer and no box: a login or onboarding screen.
+    NoComposer { agent: Program },
+    /// No such agent at all: `program`, the tab's foreground program, holds
     /// it (the shell at its prompt, where the launch line was never typed).
-    NoAgent { program: Option<String> },
+    NoAgent {
+        agent: Program,
+        program: Option<String>,
+    },
 }
 
 impl StartupHold {
@@ -15564,18 +15577,33 @@ impl StartupHold {
     #[must_use]
     pub(crate) fn attention(&self) -> String {
         let what = match self {
-            Self::Trust => "Claude Code's folder-trust dialog stands on its screen".to_string(),
-            Self::Box { title } => {
+            Self::Trust { agent } => {
+                format!(
+                    "{}'s folder-trust dialog stands on its screen",
+                    agent.product()
+                )
+            }
+            Self::Box { agent, title } => {
                 let title: String = title.trim().chars().take(60).collect();
-                format!("a box Claude Code drew stands on its screen ({title})")
+                format!(
+                    "a box {} drew stands on its screen ({title})",
+                    agent.product()
+                )
             }
-            Self::NoComposer => {
-                "Claude Code shows no composer (a login or onboarding screen)".to_string()
+            Self::NoComposer { agent } => format!(
+                "{} shows no composer (a login or onboarding screen)",
+                agent.product()
+            ),
+            Self::NoAgent {
+                agent,
+                program: Some(p),
+            } => {
+                format!("no {} started; `{p}` holds the tab", agent.product())
             }
-            Self::NoAgent { program: Some(p) } => {
-                format!("no Claude Code started; `{p}` holds the tab")
-            }
-            Self::NoAgent { program: None } => "no Claude Code started".to_string(),
+            Self::NoAgent {
+                agent,
+                program: None,
+            } => format!("no {} started", agent.product()),
         };
         format!("{STARTUP_HEAD}{what} (its task is marked stalled why=startup)")
     }
@@ -16204,49 +16232,58 @@ fn look_at_held_stall(
 /// WHAT A WORKER'S SCREEN SAYS OF ITS START ([`look_at_startups`]): STARTED
 /// where a box of a tool it runs or a question it asks stands (the agent is
 /// at its task), or, with no box, where its composer is drawn — read by the
-/// reader of `agent`, the tab's published agent ([`agent_of`]), Claude
-/// Code's where none is published; else what holds the screen
-/// ([`StartupHold`]) — Claude Code's folder-trust dialog, another box it
-/// drew (by its title), a screen of its own with no composer (a login or
-/// onboarding screen), or no Claude Code at all (`program`, the tab's
-/// foreground program, holds it: the shell at its prompt, where the launch
-/// line was never typed). A worker runs Claude Code (`spawn agent=claude`);
-/// a record an Owner's `task mark` gave another harness's tab is read by
-/// that agent's own composer, which Claude Code's reader does not find on
-/// agy's or Gemini CLI's screen (the forever lab, 2026-10-20: a working
-/// agy's record was stalled `why=startup`, "no Claude Code started; `agy`
-/// holds the tab").
+/// reader of `agent`, the tab's published agent ([`agent_of`]), else of
+/// `expected`, the agent its spawn started (`spawn agent=<word>`, the task
+/// record's `crate::task_record::TaskRecord::agent`, which a seamless update
+/// carries: a Gemini
+/// CLI's first screens, its trust dialog among them, are drawn before its
+/// screen names it), else Claude Code's; else what holds the screen
+/// ([`StartupHold`]) — the agent's folder-trust dialog, another box it drew
+/// (by its title), a screen of its own with no composer (a login or
+/// onboarding screen: a published agent the tab's foreground program is not
+/// a shell under), or no such agent at all (`program`, the tab's foreground
+/// program, holds it: the shell at its prompt, where the launch line was
+/// never typed). A record an Owner's `task mark` gave another harness's tab
+/// is read by that agent's own composer, which Claude Code's reader does not
+/// find on agy's or Gemini CLI's screen (the forever lab, 2026-10-20: a
+/// working agy's record was stalled `why=startup`, "no Claude Code started;
+/// `agy` holds the tab").
 pub(crate) fn startup_seen(
     rows: &[String],
     program: Option<&str>,
     agent: Option<Program>,
+    expected: Option<Program>,
 ) -> StartupSeen {
     use aterm_phase::prompt::PromptKind;
-    if let Some(p) = aterm_phase::parse_prompt_v2(rows) {
+    let reader = agent.or(expected).unwrap_or(Program::Claude);
+    let read = aterm_phase::read(Some(reader.name()), rows, None);
+    // Claude Code's boxes by its own grammar, wherever the cursor stands;
+    // another agent's by its reader's.
+    let prompt = match reader {
+        Program::Claude => aterm_phase::parse_prompt_v2(rows),
+        Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic => {
+            read.prompt
+        }
+    };
+    if let Some(p) = prompt {
         return match p.kind {
-            PromptKind::Trust => StartupSeen::Holds(StartupHold::Trust),
-            PromptKind::Other => StartupSeen::Holds(StartupHold::Box { title: p.title }),
+            PromptKind::Trust => StartupSeen::Holds(StartupHold::Trust { agent: reader }),
+            PromptKind::Other => StartupSeen::Holds(StartupHold::Box {
+                agent: reader,
+                title: p.title,
+            }),
             _ => StartupSeen::Started,
         };
     }
-    let reader = agent.unwrap_or(Program::Claude).name();
-    if aterm_phase::read(Some(reader), rows, None)
-        .composer
-        .is_some()
-    {
+    if read.composer.is_some() {
         return StartupSeen::Started;
     }
-    let claude = match agent {
-        Some(Program::Claude) => true,
-        Some(
-            Program::Codex | Program::Agy | Program::Muse | Program::Gemini | Program::Generic,
-        )
-        | None => false,
-    };
-    StartupSeen::Holds(if claude {
-        StartupHold::NoComposer
+    let its_own = agent.is_some() && !program.is_some_and(crate::quit_safety::is_shell_name);
+    StartupSeen::Holds(if its_own {
+        StartupHold::NoComposer { agent: reader }
     } else {
         StartupHold::NoAgent {
+            agent: reader,
             program: program.map(str::to_string),
         }
     })
@@ -19214,7 +19251,8 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
         .iter()
         .filter(|h| h.state != SessionState::Exited)
         .filter_map(|h| {
-            // The meta, then the timeline, never one under the other.
+            // The meta, then the timeline, never one under the other: the
+            // standing attention.
             let standing = h
                 .ctx
                 .meta
@@ -19231,9 +19269,9 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
                     .unwrap_or_else(PoisonError::into_inner);
                 let record = tl.task()?.clone();
                 let publication = tl.agent();
-                // A worker runs Claude Code (`spawn agent=claude`); the
-                // startup deadline reads the start of the agent the tab
-                // publishes, by its own reader ([`startup_seen`]).
+                // The startup deadline reads the start of the agent the tab
+                // publishes, else the one its spawn started, by its own
+                // reader ([`startup_seen`]).
                 let agent = agent_of(publication);
                 let held = HeldRead {
                     word: publication.word.to_string(),
@@ -19303,7 +19341,7 @@ fn startups_of(store: &Store, judged: &std::collections::HashSet<String>) -> Vec
                 })
                 .flatten();
             let seen = match (&rows, for_start) {
-                (Some(rows), true) => startup_seen(rows, program.as_deref(), agent),
+                (Some(rows), true) => startup_seen(rows, program.as_deref(), agent, record.agent),
                 _ => StartupSeen::Unread,
             };
             if for_held {
@@ -21205,7 +21243,7 @@ fn working_dirs(store: &Store, sids: &[String]) -> Vec<std::path::PathBuf> {
 /// temp root for this uid; and who may hold a session,
 /// `running` (the running Claude Codes and the directories the processes
 /// were started with, or why a process that may be one could not be read),
-/// its end read in those directories and the identities'.
+/// its end read in those directories.
 fn disk_roots(
     cwds: &[std::path::PathBuf],
     agents: &[u32],
@@ -21226,29 +21264,16 @@ fn disk_roots(
         .filter(|p| p.is_absolute())
         .collect();
     // Who may hold a session: each running Claude Code, by what the kernel says of it, and
-    // where its end is read: `~/.claude`, the Claude Code directory each was started with,
-    // and each identity's. None ends while a process that may be a Claude Code is unreadable.
+    // where its end is read: `~/.claude` and the Claude Code directory each was started with.
+    // None ends while a process that may be a Claude Code is unreadable.
     let (running, claude_unread) = match running {
         Ok(running) => (running, None),
         Err(why) => (discover::Running::default(), Some(why)),
     };
-    let home_var = aterm_agent::harness::accounts::HOME_ENV;
-    let identities = aterm_types::dirs::identities_dir()
-        .map(|root| {
-            crate::agent_identity::roster()
-                .into_iter()
-                .flat_map(|name| crate::agent_identity::env(&root.join(name)))
-                .filter(|(var, _)| var == home_var)
-                .filter_map(|(_, dir)| {
-                    aterm_agent::harness::footer::claude_dir_of(Some(&dir), None, || None)
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     discover::Roots {
         cwds: cwds.to_vec(),
         home: Some(home.to_path_buf()),
-        claude_dirs: discover::claude_dirs(Some(home), running.dirs.into_iter().chain(identities)),
+        claude_dirs: discover::claude_dirs(Some(home), running.dirs),
         claudes: running.claudes,
         claude_unread,
         agent_target_dirs,

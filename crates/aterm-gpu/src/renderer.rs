@@ -19569,11 +19569,18 @@ impl GpuRenderer {
                         (gc, bu)
                     }
                 };
-                let Some((rect, uv)) =
-                    slot.quad((pad + cx) as f32, anchor_y, baseline, scale, (aw, ah))
-                else {
+                let quad = slot.quad((pad + cx) as f32, anchor_y, baseline, scale, (aw, ah));
+                // A windowed row's halo stamps are each derived under the window
+                // where they land, so a glyph whose own ink misses the window still
+                // lends the ring a stamp shifted into it: an apron row whose ink
+                // stays in its cell while its ring reaches a pixel or two above,
+                // into the rebuilt band (the CPU's `blit_glyph_halo` clips each
+                // copy where it lands). Skipping the cell there lost those rows
+                // from a scissored present on the GL arm (row_overshoot_gpu,
+                // accent/fire_halo).
+                if quad.is_none() && !windowed {
                     continue;
-                };
+                }
                 // Contrast halo for an engulfed cell: the glyph's coverage quad
                 // stamped at each shared offset into `glyph_halo` (drawn over the
                 // flame, under the ink) at the `fire_halo_alpha` byte. Only the
@@ -19588,8 +19595,8 @@ impl GpuRenderer {
                         // the offset. The `dy` shift stays post-hoc, so a windowed
                         // row re-derives it too, under the window shifted back by
                         // `dy`: the CPU clips the copy to the window where it lands.
-                        let (hrect, huv) = match run {
-                            None if !windowed => (
+                        let (hrect, huv) = match (run, quad) {
+                            (None, Some((rect, uv))) if !windowed => (
                                 [rect[0] + dx as f32, rect[1] + dy as f32, rect[2], rect[3]],
                                 uv,
                             ),
@@ -19622,6 +19629,9 @@ impl GpuRenderer {
                         });
                     }
                 }
+                let Some((rect, uv)) = quad else {
+                    continue;
+                };
                 match raster_split.filter(|sp| usize::from(sp.col) == c && !cell_selected) {
                     // A chrome raster's ink split (`ChromeRaster::split`): the quad
                     // drawn twice under complementary clips, as the CPU blits two

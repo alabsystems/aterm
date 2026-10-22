@@ -11,8 +11,8 @@ use crate::supervise::tape::codec::Item;
 
 /// The lab's names on a recording machine, as a promote's scrub takes them.
 /// The home is `/Users/_a`, which the public export keeps as written: it
-/// doubles the separator of every `/Users/<letter>` (aterm-release's
-/// `transforms::rewrite`), which a scrub refuses as a path with an empty name.
+/// doubles the separator of every `/Users/<letter>` (aterm-census's
+/// `export::rewrite`), which a scrub refuses as a path with an empty name.
 fn lab_scrub() -> Scrub {
     let mut s = Scrub::new();
     s.path(

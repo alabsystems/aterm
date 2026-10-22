@@ -77,6 +77,7 @@ pub const PET_HIT_SLOP_PX: i32 = 4;
 
 /// Whether a pointer at `(x, y)` (frame px) lands on the pet's drawn body `rect`
 /// (`(x0, x1, y0, y1)`, right/bottom exclusive), padded by `slop` on every side.
+#[inline]
 #[must_use]
 pub fn pet_rect_hit(rect: (i32, i32, i32, i32), x: f64, y: f64, slop: i32) -> bool {
     let (x0, x1, y0, y1) = rect;
@@ -154,8 +155,9 @@ pub fn cursor_cat_color_key(
             sampled += 1;
             if let Some(cell) = cell
                 && !cell.wide
-                && !cell.ch.is_whitespace()
+                && cell.ch != ' '
                 && cell.ch != '\0'
+                && !cell.ch.is_whitespace()
             {
                 principal_fg.get_or_insert(cell.fg);
                 for (dst, src) in fg_sum.iter_mut().zip(cell.fg) {
@@ -233,6 +235,7 @@ pub fn cursor_companion_on_glass(
 /// capture, immediately before its tick. A composed surface passes `pane`, which
 /// must be bound before the ink read: [`WordDecorations`] parks one scan per
 /// session. Single-grid callers bind their scan session earlier and pass `None`.
+#[inline]
 pub fn prepare_resident_pet_tick(
     word_decos: &mut WordDecorations,
     pet: &mut PetBrain,
@@ -255,6 +258,7 @@ pub fn prepare_resident_pet_tick(
 ///     ceremony nobody can see is noise. It is not committed, so the debt is kept.
 ///     A pet never yet dressed (`worn` `None`) keeps its ceremony.
 #[must_use]
+#[inline]
 pub fn pet_arrival_for_sync(
     rung: CompanionRung,
     authorised: PetArrival,
@@ -280,6 +284,7 @@ pub fn pet_arrival_for_sync(
 
 /// The pet's petting hit box: the brain's drawn body (`PetFrame::body_px`) offset
 /// into frame px by `origin`. `None` ("nothing drawn") clears the stash.
+#[inline]
 #[must_use]
 pub fn pet_hit_rect_win(
     body: Option<(i32, i32, i32, i32)>,
@@ -301,6 +306,7 @@ pub fn pet_hit_rect_win(
 /// perks the pet), the viewport is at the live bottom, and the pane is not on the
 /// alternate screen: a full-screen program rewrites its own cells in place, so
 /// its composer would read as a build log.
+#[inline]
 #[must_use]
 pub fn pet_output_burst(
     scrolled: bool,
@@ -316,6 +322,7 @@ pub fn pet_output_burst(
 /// serial changed since this surface's last read; a session switch or first read
 /// stores the baseline. `!=` rather than `>`, because main/alt buffer swaps keep
 /// per-grid serials: inequality costs at most one spurious wrap at a swap.
+#[inline]
 pub fn wrap_fact_edge(seen: &mut Option<(u64, u64)>, session: u64, serial: u64) -> bool {
     let wrapped = matches!(*seen, Some((sid, s)) if sid == session && s != serial);
     *seen = Some((session, serial));
@@ -325,6 +332,7 @@ pub fn wrap_fact_edge(seen: &mut Option<(u64, u64)>, session: u64, serial: u64) 
 /// Map the frame-px pointer onto the pet's pane as a fractional cell `(col, row)`;
 /// `None` outside the pane's grid.
 #[must_use]
+#[inline]
 pub fn pet_pointer_cell(
     pointer_px: (f64, f64),
     origin: (i32, i32),
@@ -345,12 +353,14 @@ pub fn pet_pointer_cell(
 
 /// Whether the open-mouth singing face is live; it does not move custody. A
 /// non-finite drive reads as not live.
+#[inline]
 #[must_use]
 pub fn sing_face_live(drive: f32) -> bool {
     drive >= 0.33
 }
 
 /// Resolve [`CompanionDuty`] from this frame's two already-gated alphas.
+#[inline]
 #[must_use]
 pub fn cursor_companion_duty(
     pet_on_glass: bool,
@@ -370,6 +380,7 @@ pub fn cursor_companion_duty(
 
 /// Cursor companions belong to the live grid: the decoration lifecycle keeps
 /// running while history is visible, but no companion is drawn over retained rows.
+#[inline]
 #[must_use]
 pub fn cursor_companion_presentable(decoration_presentable: bool, live_viewport: bool) -> bool {
     decoration_presentable && live_viewport
@@ -435,6 +446,7 @@ pub fn shed_envelope_transitioning(shed_active: bool, envelope: f32) -> bool {
 
 /// Suppress the flying companion's exit flourish on a pet-mode frame copy.
 /// The resident keeps custody even when the hidden flying episode winds down.
+#[inline]
 pub fn pin_pet_mode_exit(pet_mode: bool, frame: &mut crate::kitty_cursor::CatFrame) {
     if pet_mode {
         frame.exit = crate::kitty_cursor::CatExit::Plain;
@@ -561,6 +573,7 @@ impl PetTick {
     /// companion at the caret) from it puts both bodies on one caret; the raw
     /// cursor took the head up the transcript to wherever a torn repaint
     /// stopped writing.
+    #[inline]
     #[must_use]
     pub fn escort_caret(&self) -> Option<(u16, u16)> {
         self.escort_caret
@@ -790,6 +803,7 @@ impl CompanionOwner {
     /// An owner the host dresses every frame through [`Self::set_look`] rather
     /// than the seed. Enabled from birth; ownership is resolved per frame.
     #[must_use]
+    #[inline]
     pub fn dressed_by_host() -> Self {
         Self {
             enabled: true,
@@ -812,6 +826,7 @@ impl CompanionOwner {
 
     /// Dress the pet from the native verdict ([`crate::companion_look`]); only a
     /// `Program` rung may carry a ceremony.
+    #[inline]
     pub fn set_look(&mut self, pair: (u8, u8), arrival: PetArrival, rung: CompanionRung) {
         self.pair = pair;
         self.arrival = arrival;
@@ -821,6 +836,7 @@ impl CompanionOwner {
     /// Which animal the pet is drawn as: kept for every `prepare` to re-apply (so
     /// a drain's fresh brain wears it) and written to the brain now. Switching
     /// swaps the sprite without resetting the companion.
+    #[inline]
     pub fn set_species(&mut self, s: PetSpecies) {
         self.species = s;
         self.pet.set_species(s);
@@ -829,6 +845,7 @@ impl CompanionOwner {
     /// The pointer in frame px between frames: `true` iff the stored value changed,
     /// so an idle hover costs no render. A non-finite sample is dropped; a sample
     /// fed with the frame ([`HostFrameInput::pointer_px`]) wins.
+    #[inline]
     pub fn set_pointer(&mut self, px: Option<(f32, f32)>) -> bool {
         let next = px.filter(|(x, y)| x.is_finite() && y.is_finite());
         if px.is_some() && next.is_none() {
@@ -842,6 +859,7 @@ impl CompanionOwner {
     /// Classify the cell plane being presented, minus the host's late overlays
     /// (`exclusions`, all protected). Advances no animation or input seq;
     /// returns the cells classified.
+    #[inline]
     pub fn observe_console(
         &mut self,
         input: &aterm_core::render::RenderInput,
@@ -858,6 +876,7 @@ impl CompanionOwner {
     /// Autopilot menu). Both protect their cells; an overlay, like a live
     /// selection, never moves where the pet rests
     /// ([`crate::kitty_pet::PetBrain::observe_console_with_overlays`]).
+    #[inline]
     pub fn observe_console_with_overlays(
         &mut self,
         input: &aterm_core::render::RenderInput,
@@ -881,6 +900,7 @@ impl CompanionOwner {
     /// [`Self::observe_console_with_overlays`], with the person's typed
     /// glyphs (the predicted echo, the IME preedit) reserved as ink
     /// ([`crate::pet_world::PetReserve`]): what the native host observes.
+    #[inline]
     pub fn observe_console_reserved(
         &mut self,
         input: &aterm_core::render::RenderInput,
@@ -1206,6 +1226,7 @@ impl CompanionOwner {
 
     /// The half of [`Self::prepare`] that reads the word engine: bind the composed
     /// pane, apply the species, and hand the brain the per-row ink.
+    #[inline]
     pub fn feed_ink(&mut self, decos: &mut WordDecorations, pane: Option<(u64, (i32, i32))>) {
         prepare_resident_pet_tick(decos, &mut self.pet, self.species, pane);
     }
@@ -1353,6 +1374,7 @@ impl CompanionOwner {
     /// body by [`cursor_cat_color_key`] with [`ContrastFallback`]). Draws and syncs
     /// nothing unless the pet is on glass. Returns the fingerprint fold and the
     /// sync outcome for [`Self::commit_hello_due`].
+    #[inline]
     pub fn emit(
         &mut self,
         t: &CompanionFrame,
@@ -1457,6 +1479,7 @@ impl CompanionOwner {
     /// `outcome.parked` edge, since a capture syncing first would consume that edge;
     /// the commit consumes the authorisation, so the next present cannot repeat it.
     #[must_use]
+    #[inline]
     pub fn commit_hello_due(&self, present: bool, outcome: SyncLookOutcome) -> bool {
         present
             && self.last_sync.is_some_and(|(pair, arrival)| {
@@ -1465,18 +1488,21 @@ impl CompanionOwner {
     }
 
     /// The terminal BEL rang in the pane this pet is chasing.
+    #[inline]
     pub fn note_bell(&mut self, now: Instant) {
         self.pet.note_bell(now);
     }
 
     /// The hand found its flow (`CursorGlow::take_flow_entry`), forwarded between
     /// [`Self::prepare`] and [`Self::tick`].
+    #[inline]
     pub fn note_flow(&mut self, now: Instant) {
         self.pet.note_flow(now);
     }
 
     /// Rainbow kitty v2's offer to the resident, after [`Self::tick`]: at most one
     /// star comes back on the paw's landing frame for `CursorGlow::catch_star`.
+    #[inline]
     pub fn note_v2_offer(
         &mut self,
         offer: &crate::rainbow_kitty::companion::PetOffer,
@@ -1488,36 +1514,42 @@ impl CompanionOwner {
     /// `crate::typed_tricks::TrickListener` reported. A tentative fire
     /// (`confirmed = false`) is followed by a confirmed one or [`Self::revoke_trick`].
     /// Latch only: later ticks perform it. Dropped with no resident on glass.
+    #[inline]
     pub fn note_trick(&mut self, now: Instant, trick: aterm_lexicon::Trick, confirmed: bool) {
         self.pet.note_trick(now, trick, confirmed);
     }
 
     /// The typed line turned into prose, or was aborted: take back a tentative
     /// kitty command not yet performed. Idempotent.
+    #[inline]
     pub fn revoke_trick(&mut self) {
         self.pet.revoke_trick();
     }
 
     /// The whole submitted line was pet talk (`sit` + Enter at a shell): the
     /// brain does not grieve the fast `command not found` that follows.
+    #[inline]
     pub fn note_trick_submit(&mut self, now: Instant) {
         self.pet.note_trick_submit(now);
     }
 
     /// One accepted console input intent. This supplies attention provenance,
     /// never evidence that the program changed a particular range of text.
+    #[inline]
     pub fn note_console_input(&mut self, now: Instant, kind: PetInputKind) {
         self.pet.note_console_input(now, kind);
     }
 
     /// Accepted input intentions observed by this brain; reading does not tick.
     #[must_use]
+    #[inline]
     pub fn console_input_seq(&self) -> u64 {
         self.pet.console_input_seq()
     }
 
     /// Most recent classified input intention; no display-edit claim is implied.
     #[must_use]
+    #[inline]
     pub fn console_input_kind(&self) -> Option<PetInputKind> {
         self.pet.console_input_kind()
     }
@@ -1526,6 +1558,7 @@ impl CompanionOwner {
     /// [`PET_HIT_SLOP_PX`]) strokes the cat and is consumed, so it never starts a
     /// selection or reaches a mouse-tracking app. Latch only: the host should ask
     /// for a frame.
+    #[inline]
     pub fn press(&mut self, now: Instant, px: (f32, f32)) -> PressOutcome {
         let Some(rect) = self.hit_rect else {
             return PressOutcome::Pass;
@@ -1537,6 +1570,7 @@ impl CompanionOwner {
         PressOutcome::Pet
     }
 
+    #[inline]
     fn clear_surface_state(&mut self) {
         self.hit_rect = None;
         self.drawn_frame = None;
@@ -1551,6 +1585,7 @@ impl CompanionOwner {
     /// Retire the resident's surface-relative state (the brain's coordinates and
     /// the hit rect) at a presentability boundary. Session-keyed latches and
     /// durable identity (species, worn look, contentment) survive. Idempotent.
+    #[inline]
     pub fn retire_coordinate_space(&mut self) {
         self.pet.retire_coordinate_space();
         self.clear_surface_state();
@@ -1559,6 +1594,7 @@ impl CompanionOwner {
     /// The same surface, re-gridded (a resize, a font step, a DPI change, a divider
     /// drag): the body keeps its place, alpha and pose; only the facts measured
     /// against the old grid and the hit rect go. Idempotent.
+    #[inline]
     pub fn rebase_geometry(&mut self) {
         self.pet.rebase_geometry();
         self.hit_rect = None;
@@ -1593,6 +1629,7 @@ impl CompanionOwner {
 
     /// The host withdrew this frame's drawn body (a torn projection, a route that
     /// draws no pet), so the petting rect goes with it.
+    #[inline]
     pub fn withdraw_hit_rect(&mut self) {
         self.hit_rect = None;
     }
@@ -1601,6 +1638,7 @@ impl CompanionOwner {
     /// [`Self::retire_coordinate_space`] retires, and the stream latches
     /// re-baseline so the old stream's completion, wrap, and caret state are
     /// not replayed. Idempotent.
+    #[inline]
     pub fn retire_owner(&mut self) {
         self.retire_coordinate_space();
         self.latches = Latches::default();
@@ -1609,6 +1647,7 @@ impl CompanionOwner {
     /// [`Self::retire_owner`] with the re-sighting crossfade: what the hosts'
     /// owner fences run. A visible resident hands over to its replacement in a
     /// quarter-second crossfade instead of vanishing.
+    #[inline]
     pub fn resight_owner(&mut self) {
         self.resight_coordinate_space();
         self.latches = Latches::default();
@@ -1616,6 +1655,7 @@ impl CompanionOwner {
 
     /// Drop everything the brain owns (body, motes, departures, cadence debt)
     /// because its owner went away. Identity survives for the next appearance.
+    #[inline]
     pub fn retire(&mut self) {
         self.pet.retire_unowned();
         self.clear_surface_state();
@@ -1625,6 +1665,7 @@ impl CompanionOwner {
 
     /// Serious Mode's drain: a fresh brain. The session latches, the opt-in and the
     /// verdict in hand survive. Idempotent.
+    #[inline]
     pub fn drain(&mut self) {
         self.pet = self.pet.reborn();
         self.clear_surface_state();
@@ -1634,6 +1675,7 @@ impl CompanionOwner {
 
     /// Retire the pet's frozen contrast samples, its ghosts' included (a theme or
     /// palette change). Behaviour, position and breed handoff continue.
+    #[inline]
     pub fn invalidate_colors(&mut self) {
         self.pet.invalidate_colors();
     }
@@ -1641,6 +1683,7 @@ impl CompanionOwner {
     /// The cadence gate: [`PetBrain::needs_frames`] (something is moving), never
     /// `is_active()` (a cat exists). A static posture or a tick under the load-shed
     /// latch leaves the frame train to [`Self::next_change_deadline`].
+    #[inline]
     #[must_use]
     pub fn needs_frames(&self) -> bool {
         !self.last_static && self.last_shed_tick.is_none() && self.pet.needs_frames()
@@ -1677,24 +1720,28 @@ impl CompanionOwner {
     /// The brain's failure droop is on glass or owed ([`PetBrain::grieving`]); the
     /// host hushes the glow's caret-jump fanfare meanwhile, reading this between
     /// [`Self::prepare`] and [`Self::tick`].
+    #[inline]
     #[must_use]
     pub fn grieving(&self) -> bool {
         self.pet.grieving()
     }
 
     /// The host's opt-in as last set.
+    #[inline]
     #[must_use]
     pub fn enabled(&self) -> bool {
         self.enabled
     }
 
     /// The alpha the last tick put on glass (`0` = nothing drawn).
+    #[inline]
     #[must_use]
     pub fn alpha(&self) -> u8 {
         self.last_alpha
     }
 
     /// This frame's drawn body in frame px, `None` when the pet is not drawn.
+    #[inline]
     #[must_use]
     pub fn hit_rect(&self) -> Option<(i32, i32, i32, i32)> {
         self.hit_rect
@@ -1710,6 +1757,7 @@ impl CompanionOwner {
 
     /// Read-only access to the brain for the host's projections; a shared borrow
     /// cannot tick it.
+    #[inline]
     #[must_use]
     pub fn brain(&self) -> &PetBrain {
         &self.pet

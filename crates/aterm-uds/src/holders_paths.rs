@@ -196,6 +196,46 @@ pub fn scan_path_users_of(pids: &[u32], dirs: &[PathBuf], skip: &[u32]) -> io::R
     Ok(scan)
 }
 
+/// The path of every file `pid` holds open through a descriptor, in descriptor order, as the
+/// kernel names it (a link followed, `/private/var` for `/var`): what `lsof -p <pid>` names for
+/// its descriptors, read in this process. Its working directory, executable and mappings are
+/// not descriptors and are not named. A descriptor closed or revoked mid-read names nothing.
+///
+/// # Errors
+///
+/// `NotFound` when `pid` has exited (a zombie's descriptors are closed at its exit);
+/// `PermissionDenied` when the kernel will not describe one of them to this process (a file
+/// in a protected folder, which only an entitled reader such as `lsof` is told), or will not
+/// list the table; `Other` for any other failure; `Unsupported` off macOS.
+#[cfg(target_vendor = "apple")]
+// Skip: bottoms out at the libproc FFI calls.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
+    mac::open_files(pid).map_err(|failed| {
+        let kind = match failed {
+            super::Failed::Exited => io::ErrorKind::NotFound,
+            super::Failed::Refused => io::ErrorKind::PermissionDenied,
+            super::Failed::Closed | super::Failed::Dead | super::Failed::Other => {
+                io::ErrorKind::Other
+            }
+        };
+        io::Error::new(kind, format!("the descriptors of {pid}: {failed:?}"))
+    })
+}
+
+/// See the macOS twin.
+///
+/// # Errors
+///
+/// Always `Unsupported`.
+#[cfg(not(target_vendor = "apple"))]
+pub fn open_files(_pid: u32) -> io::Result<Vec<PathBuf>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "a process's descriptors are read in process through libproc (macOS)",
+    ))
+}
+
 /// Is `pid` a child of one of `parents` still running that parent's
 /// executable (a fork that has not exec'd)? An equal executable proves that
 /// only when it names a program, not an interpreter that runs others: this
@@ -570,6 +610,25 @@ mod mac {
             }
         }
         Ok(out)
+    }
+
+    /// [`super::open_files`]: the path of every vnode descriptor of `pid`;
+    /// one closed since the listing or on a dead vnode names none, and any
+    /// other failure is the whole answer's.
+    pub(super) fn open_files(pid: u32) -> Result<Vec<PathBuf>, Failed> {
+        let n = i32::try_from(pid).map_err(|_| Failed::Other)?;
+        let mut files = Vec::new();
+        for (fd, kind) in list_fds(n)? {
+            if kind != ffi::PROX_FDTYPE_VNODE {
+                continue;
+            }
+            match fd_path(n, fd) {
+                Ok(path) => files.extend(path),
+                Err(Failed::Closed | Failed::Dead) => {}
+                Err(failed) => return Err(failed),
+            }
+        }
+        Ok(files)
     }
 
     /// The first use `pid` makes of a path under `dirs`: `Ok(None)` when
@@ -2090,10 +2149,24 @@ pub fn write_open_files(_pid: u32) -> io::Result<Vec<PathBuf>> {
     ))
 }
 
-/// The writes reader against files this test opens, in this process.
+/// The descriptor readers against files this test opens, in this process.
 #[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
 mod writes_tests {
+    use std::path::{Path, PathBuf};
+
     use super::write_open_files;
+
+    /// Past any pid the kernel hands out (`PID_MAX` 99,998 on macOS, 2^22 on Linux).
+    const NO_SUCH_PID: u32 = 2_147_483_647;
+
+    /// `p` among `got`, as itself or under its `/System/Volumes/Data` form.
+    fn named(got: &[PathBuf], p: &Path) -> bool {
+        got.iter().any(|g| {
+            g == p
+                || g.strip_prefix("/System/Volumes/Data")
+                    .is_ok_and(|rel| Path::new("/").join(rel) == p)
+        })
+    }
 
     #[test]
     fn the_writes_reader_names_the_regular_files_open_for_writing_and_nothing_else() {
@@ -2117,16 +2190,9 @@ mod writes_tests {
             .open("/dev/null")
             .expect("open /dev/null for writing");
         let got = write_open_files(std::process::id()).expect("own table");
-        let named = |p: &std::path::Path| {
-            got.iter().any(|g| {
-                g == p
-                    || g.strip_prefix("/System/Volumes/Data")
-                        .is_ok_and(|rel| std::path::Path::new("/").join(rel) == p)
-            })
-        };
-        assert!(named(&wo), "{wo:?} not in {got:?}");
-        assert!(named(&rw), "{rw:?} not in {got:?}");
-        assert!(!named(&ro), "a read-only open is no write: {got:?}");
+        assert!(named(&got, &wo), "{wo:?} not in {got:?}");
+        assert!(named(&got, &rw), "{rw:?} not in {got:?}");
+        assert!(!named(&got, &ro), "a read-only open is no write: {got:?}");
         assert!(
             !got.iter().any(|g| g.starts_with("/dev")),
             "a device is no regular file: {got:?}"
@@ -2135,9 +2201,22 @@ mod writes_tests {
 
     #[test]
     fn a_process_that_does_not_exist_holds_no_file() {
-        // Past any pid the kernel hands out (`PID_MAX` 99,998 on macOS, 2^22 on Linux).
-        const NO_SUCH_PID: u32 = 2_147_483_647;
         assert_eq!(write_open_files(NO_SUCH_PID).ok(), Some(Vec::new()));
+    }
+
+    /// A lock an agent opened read-only is named too; an exited pid is `NotFound`, not empty.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_open_files_reader_names_a_read_only_file_and_refuses_an_exited_pid() {
+        let tmp = aterm_tempfile::TempDir::new().expect("tempdir");
+        let dir = tmp.path().canonicalize().expect("canonical scratch dir");
+        let lock = dir.join("held.lock");
+        std::fs::write(&lock, b"").expect("seed the lock");
+        let _held = std::fs::File::open(&lock).expect("open read-only");
+        let got = super::open_files(std::process::id()).expect("own table");
+        assert!(named(&got, &lock), "{lock:?} not in {got:?}");
+        let gone = super::open_files(NO_SUCH_PID).map_err(|e| e.kind());
+        assert_eq!(gone, Err(std::io::ErrorKind::NotFound));
     }
 }
 

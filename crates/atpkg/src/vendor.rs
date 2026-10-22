@@ -1284,21 +1284,58 @@ mod tests {
         }
     }
 
-    /// The pin is per program: no vendor's URLs are admitted for another's
-    /// program, and a program with no row is admitted nowhere.
+    /// The pin is per vendor's lane: a URL is admitted for another program only when the
+    /// two rows are one vendor's lane (one head: `codex-old` beside `codex`), and rows that
+    /// share a head share every pin, so one vendor's word is read under one set of rules.
+    /// No other vendor's URL reaches a program, and a program with no row is admitted
+    /// nowhere.
+    ///
+    /// NEGATIVE CONTROL: claude's, agy's and muse's URLs are refused for `codex-old`.
     #[test]
-    fn a_vendor_direct_url_is_admitted_only_for_its_own_program() {
-        let programs = crate::vendor_direct::VENDORS.iter().map(|s| s.program);
+    fn a_vendor_direct_url_is_admitted_only_for_its_own_vendors_lane() {
+        use crate::vendor_direct::VENDORS;
         for (program, url) in VENDOR_DIRECT_URLS {
-            for other in programs.clone().chain(["ay", "", "CLAUDE"]) {
-                if other != *program {
-                    assert!(
-                        !vendor_direct_url_allowed(other, url),
-                        "{url} admitted for {other:?}"
-                    );
-                }
+            let own = crate::vendor_direct::spec(program).unwrap();
+            for other in VENDORS.iter().filter(|s| s.program != *program) {
+                assert_eq!(
+                    vendor_direct_url_allowed(other.program, url),
+                    other.head_url == own.head_url,
+                    "{url} for {}",
+                    other.program
+                );
+            }
+            for nobody in ["ay", "", "CLAUDE", "CODEX-OLD", "codex-older"] {
+                assert!(
+                    !vendor_direct_url_allowed(nobody, url),
+                    "{url} admitted for {nobody:?}"
+                );
             }
         }
+        for a in VENDORS {
+            for b in VENDORS.iter().filter(|b| b.head_url == a.head_url) {
+                let pins = |s: &crate::vendor_direct::VendorSpec| {
+                    (
+                        s.vendor,
+                        s.anchor,
+                        s.apple_team,
+                        s.url_prefixes,
+                        s.url_query,
+                        s.digest_docs,
+                    )
+                };
+                assert_eq!(pins(a), pins(b), "{} and {}", a.program, b.program);
+            }
+        }
+        let mut shared = 0;
+        for (program, url) in VENDOR_DIRECT_URLS {
+            let admitted = vendor_direct_url_allowed("codex-old", url);
+            assert_eq!(admitted, *program == "codex", "{program} {url}");
+            shared += usize::from(admitted);
+        }
+        assert!(
+            shared > 0,
+            "PRECONDITION: codex-old reads codex's documents"
+        );
     }
 
     /// Lookalike hosts, other schemes, userinfo, ports, case and trailing-dot spellings,

@@ -531,7 +531,6 @@ fn a_word_carried_from_before_this_process_starts_no_span() {
         autopilot: Some(word.to_string()),
         land_at: None,
         autopilot_by: None,
-        identity: None,
         agent: None,
         supervised: None,
         lost: None,
@@ -947,10 +946,21 @@ fn a_self_claims_landing_act_is_landed_and_every_other_act_is_open() {
     );
     assert_eq!(face("set  harness_act   continue@v1"), Some(TaskFace::Open));
     assert_eq!(face("set harness_act upgrade@v1"), None);
+    assert_eq!(
+        face("set harness_act left-to-person@v1 until_us=5000000"),
+        Some(TaskFace::Theirs)
+    );
+    assert_eq!(
+        face("set harness_act landed@v1 until_us=0"),
+        Some(TaskFace::Landed)
+    );
     for rest in [
+        "prepare harness_act",
         "unset harness_act",
         "set harness_act",
         "set harness_act landed@v1 extra",
+        "set harness_act landed@v1 until_us=bad",
+        "set harness_act landed@v1 until_us=1 extra",
         "set harness_acts landed@v1",
         "set autopilot land",
         "",
@@ -1120,6 +1130,11 @@ fn a_proven_self_claims_landed_act_on_the_wire_reads_task_landed_then_open() {
     let (reply, wakes) = serve("set harness_act landed@v1", Some(2));
     assert_eq!(reply, "ERR denied\n");
     assert!(wakes.is_empty(), "a refused act posts nothing: {wakes:?}");
+    assert_ne!(task(&app), "landed");
+    let (reply, wakes) = serve("prepare harness_act", Some(1));
+    assert!(reply.starts_with("OK until_us="), "{reply}");
+    assert!(reply.ends_with(" lease_ms=5000\n"), "{reply}");
+    assert!(wakes.is_empty(), "a prepare posts no face: {wakes:?}");
     assert_ne!(task(&app), "landed");
     let (reply, wakes) = serve("set harness_act landed@v1", Some(1));
     assert_eq!(reply, "OK\n");

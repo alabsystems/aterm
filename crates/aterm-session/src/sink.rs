@@ -540,6 +540,12 @@ pub enum Seam {
     /// In a blocking frame write ([`SinkWriter::write_frame`]), after it
     /// found the spill empty and before it waits for the fd lock.
     FrameLock,
+    /// A blocking writer (direct lane, metered paste) about to wait in `poll(2)` for
+    /// room in a full tty input queue: at the park and before each recheck, fd lock held.
+    WriterPark,
+    /// The spill drainer about to wait in `poll(2)` for room in a full tty input
+    /// queue: at the park and before each recheck, fd lock held.
+    DrainPark,
 }
 
 /// What the non-parking body does where a frame cannot be taken without
@@ -2883,7 +2889,12 @@ impl Shared {
                     // errors — reported writable, so the retry surfaces it),
                     // looking again every PARK_RECHECK_MS: a discard's flush
                     // does not wake this poll, and neither does a stop.
-                    while !aterm_pty::poll_writable(fd, Self::PARK_RECHECK_MS)? {
+                    loop {
+                        #[cfg(any(test, debug_assertions))]
+                        self.at_seam(Seam::WriterPark);
+                        if aterm_pty::poll_writable(fd, Self::PARK_RECHECK_MS)? {
+                            break;
+                        }
                         if self.discarded_since(since)
                             || stop.is_some_and(BulkMeter::stop_requested)
                         {
@@ -3038,6 +3049,8 @@ impl Shared {
                 // again every PARK_RECHECK_MS: a discard's flush does not wake
                 // this poll.
                 aterm_pty::NonParkWrite::WouldBlock => loop {
+                    #[cfg(any(test, debug_assertions))]
+                    self.at_seam(Seam::DrainPark);
                     match aterm_pty::poll_writable(fd, Self::PARK_RECHECK_MS) {
                         Ok(true) => break,
                         Ok(false) if !self.discarded_since(since) => {}
@@ -4949,6 +4962,26 @@ mod input_io_tests {
         [PASTE_OPEN, body, PASTE_CLOSE].concat()
     }
 
+    /// Each pass of `sink` at `park` from now on, as it passes it.
+    fn parks(sink: &SinkWriter, park: Seam) -> mpsc::Receiver<()> {
+        let (tx, rx) = mpsc::channel();
+        sink.seam_for_testing(move |seam| {
+            if seam == park {
+                let _ = tx.send(());
+            }
+        });
+        rx
+    }
+
+    /// Wait (a hang detector) for a [`Seam::WriterPark`] passed after this call,
+    /// letting go of the ones the writer reported before it.
+    fn parked_after(parks: &mpsc::Receiver<()>) {
+        while parks.try_recv().is_ok() {}
+        parks
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the blocking writer parked on the full queue");
+    }
+
     /// Fill the spill to `SPILL_CAP` through the interactive egress and return the
     /// frames it accepted, oldest first. Odd-sized frames, so the last accepted one
     /// carries the spill strictly past the cap (the room wait's condition) and the
@@ -4985,6 +5018,7 @@ mod input_io_tests {
     #[test]
     fn a_stop_reaches_a_paste_parked_on_a_tty_that_is_not_draining() {
         let (sink, mut reader, filled) = wedged();
+        let parks = parks(&sink, Seam::WriterPark);
         let frame = bracketed(&vec![b'p'; 256 * 1024]);
         let meter = Arc::new(BulkMeter::new());
         let (tx, rx) = mpsc::channel();
@@ -4999,14 +5033,11 @@ mod input_io_tests {
         // The program reads the fill and a little of the paste, then stops.
         let mut head = vec![0u8; filled + 64 * 1024];
         reader.read_exact(&mut head).expect("the fill and a head");
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while meter.progress().sent == 0 {
-            assert!(Instant::now() < deadline, "the paste never began");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        // Let the writer take whatever room the read made, then park.
-        std::thread::sleep(Duration::from_millis(250));
+        // A park reported after the read, with nobody reading since, is on a
+        // full queue: the writer took the room the read made.
+        parked_after(&parks);
         let before = meter.progress();
+        assert!(before.sent > 0, "the paste began: {before:?}");
         assert_eq!(before.state, BulkState::Writing, "{before:?}");
         assert!(before.sent < frame.len() as u64, "the writer is parked");
 
@@ -5203,6 +5234,27 @@ mod input_io_tests {
         assert_eq!(&got[filled..], frame.as_slice());
     }
 
+    /// A SEVER ENDS A DRAINER PARKED ON A FULL QUEUE: a sever flushes nothing, so
+    /// only the park's recheck of the epoch can end a drainer stood at its park.
+    #[test]
+    fn a_sever_ends_a_drainer_parked_on_a_full_queue() {
+        let (sink, _reader, _filled) = wedged();
+        let parks = parks(&sink, Seam::DrainPark);
+        assert_eq!(sink.write_frame_nonparking(b"spilled").expect("spill"), 7);
+        parks
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the drainer parked on the full queue");
+        sink.sever_input();
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the parked drainer ended at the sever",
+            || {
+                let s = sink.shared.spill.lock().unwrap_or_else(|p| p.into_inner());
+                (!s.draining).then_some(())
+            },
+        );
+    }
+
     /// TEARDOWN UNBLOCKS EVERY WAITER. Three writers wait on a program that
     /// will never read again: a paste parked on the direct lane, a key waiting
     /// for spill room behind a spill past its cap, and the spill drainer. A
@@ -5211,6 +5263,7 @@ mod input_io_tests {
     #[test]
     fn a_sever_unblocks_every_waiter() {
         let (sink, _reader, _filled) = wedged();
+        let parks = parks(&sink, Seam::WriterPark);
         let (tx, rx) = mpsc::channel::<(&str, Result<usize, String>)>();
         let spawn = |name: &'static str, bytes: Vec<u8>| {
             let (sink, tx) = (sink.clone(), tx.clone());
@@ -5222,7 +5275,7 @@ mod input_io_tests {
         // The direct-lane paste: the spill is empty, so it takes the fd lock
         // and parks in the poll loop.
         let paste = spawn("paste", vec![b'p'; 64 * 1024]);
-        std::thread::sleep(Duration::from_millis(100));
+        parked_after(&parks);
         // Keys behind it concede to the spill (the lock is held) until the
         // cap; one more blocking frame then waits for room.
         let mut keys = 0usize;

@@ -89,9 +89,19 @@ struct Row {
     spoken: String,
 }
 
-/// Every state of §§9.2–9.5 and §10.2, in the words of the design.
+/// Every state of §§9.2–9.5 and §10.2, in the words of the design; each
+/// mode's sentence read from the one table (`autopilot::MODE_WORDS`,
+/// §12.4.1), never a copy of its words.
 fn rows() -> Vec<Row> {
+    use crate::autopilot::mode_words;
     use ChipTone::{Accent, Amber, Dim};
+    use aterm_agent::supervise::Autopilot;
+    let timed = crate::autopilot::TIMED_CRUISE_CHIP;
+    let (cruise, land, off) = (
+        mode_words(Autopilot::Cruise).chip,
+        mode_words(Autopilot::Land).chip,
+        mode_words(Autopilot::Off).chip,
+    );
     let row = |view, glass, face, drawn, glyph, tones, whole: &str, short, spoken: &str| Row {
         view,
         glass,
@@ -111,8 +121,9 @@ fn rows() -> Vec<Row> {
             "\u{221e}",
             "\u{221e}",
             (Accent, Accent),
-            "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} right-click: \
-             more",
+            &format!(
+                "autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more"
+            ),
             "autopilot: cruise",
             "Autopilot: cruise.",
         ),
@@ -123,8 +134,10 @@ fn rows() -> Vec<Row> {
             "\u{221e} \u{2913}18:00",
             "\u{221e}",
             (Accent, Amber),
-            "autopilot: cruise until 18:00, then land \u{2014} keeps the work moving \u{b7} \
-             click: land now \u{b7} right-click: more",
+            &format!(
+                "autopilot: cruise until 18:00, then land \u{2014} {timed} \u{b7} click: land now \
+                 \u{b7} right-click: more"
+            ),
             "autopilot: cruise until 18:00, then land",
             "Autopilot: cruise. Lands at 18:00.",
         ),
@@ -135,8 +148,10 @@ fn rows() -> Vec<Row> {
             "\u{221e} \u{2913}16:00",
             "\u{221e}",
             (Accent, Amber),
-            "autopilot: cruise until Sat 16:00, then land \u{2014} keeps the work moving \u{b7} \
-             click: land now \u{b7} right-click: more",
+            &format!(
+                "autopilot: cruise until Sat 16:00, then land \u{2014} {timed} \u{b7} click: land \
+                 now \u{b7} right-click: more"
+            ),
             "autopilot: cruise until Sat 16:00, then land",
             "Autopilot: cruise. Lands Saturday at 16:00.",
         ),
@@ -150,8 +165,9 @@ fn rows() -> Vec<Row> {
             "\u{221e}",
             "\u{221e}",
             (Accent, Accent),
-            "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} right-click: \
-             more",
+            &format!(
+                "autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more"
+            ),
             "autopilot: cruise",
             "Autopilot: cruise.",
         ),
@@ -162,8 +178,10 @@ fn rows() -> Vec<Row> {
             "\u{221e} \u{2913}16:00",
             "\u{221e}",
             (Accent, Amber),
-            "autopilot: cruise until Sat 16:00, then land \u{2014} keeps the work moving \u{b7} \
-             click: land now \u{b7} right-click: more",
+            &format!(
+                "autopilot: cruise until Sat 16:00, then land \u{2014} {timed} \u{b7} click: land \
+                 now \u{b7} right-click: more"
+            ),
             "autopilot: cruise until Sat 16:00, then land",
             "Autopilot: cruise. Lands Saturday at 16:00.",
         ),
@@ -176,8 +194,9 @@ fn rows() -> Vec<Row> {
             "\u{221e}",
             "\u{221e}",
             (Accent, Accent),
-            "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} right-click: \
-             more",
+            &format!(
+                "autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more"
+            ),
             "autopilot: cruise",
             "Autopilot: cruise.",
         ),
@@ -188,8 +207,10 @@ fn rows() -> Vec<Row> {
             "\u{221e} \u{2913}18:00",
             "\u{221e}",
             (Accent, Amber),
-            "autopilot: cruise until 18:00, then land \u{2014} keeps the work moving \u{b7} \
-             click: land now \u{b7} right-click: more",
+            &format!(
+                "autopilot: cruise until 18:00, then land \u{2014} {timed} \u{b7} click: land now \
+                 \u{b7} right-click: more"
+            ),
             "autopilot: cruise until 18:00, then land",
             "Autopilot: cruise. Lands at 18:00.",
         ),
@@ -200,7 +221,7 @@ fn rows() -> Vec<Row> {
             "\u{2913} land",
             "\u{2913}",
             (Amber, Amber),
-            "autopilot: land \u{2014} wrapping up \u{b7} click: off \u{b7} right-click: more",
+            &format!("autopilot: land \u{2014} {land} \u{b7} click: off \u{b7} right-click: more"),
             "autopilot: land",
             "Autopilot: land.",
         ),
@@ -211,7 +232,7 @@ fn rows() -> Vec<Row> {
             "\u{2913} land",
             "\u{2913}",
             (Amber, Amber),
-            "autopilot: land \u{2014} wrapping up \u{b7} click: off \u{b7} right-click: more",
+            &format!("autopilot: land \u{2014} {land} \u{b7} click: off \u{b7} right-click: more"),
             "autopilot: land",
             "Autopilot: land.",
         ),
@@ -247,7 +268,7 @@ fn rows() -> Vec<Row> {
             "\u{25cb} off",
             "\u{25cb}",
             (Dim, Dim),
-            "autopilot: off \u{2014} hands off \u{b7} click: cruise \u{b7} right-click: more",
+            &format!("autopilot: off \u{2014} {off} \u{b7} click: cruise \u{b7} right-click: more"),
             "autopilot: off",
             "Autopilot: off.",
         ),
@@ -323,7 +344,7 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
         seen.insert(format!("{:?}", row.face));
         assert_eq!(row.face.tones(), row.tones, "{what}");
         assert_eq!(
-            autopilot_title(row.view, &row.glass, "", Some(TODAY)),
+            autopilot_title(row.view, &row.glass, "", Some(TODAY), TitleWords::default()),
             (row.whole.clone(), row.short.to_owned()),
             "{what}"
         );
@@ -477,7 +498,7 @@ fn every_face_clock_names_its_day_when_it_is_not_today() {
         let glass = told(task);
         let face = ChipFace::of(view, &glass);
         let what = format!("{view:?} {task:?}");
-        let (whole, short) = autopilot_title(view, &glass, "", tomorrow);
+        let (whole, short) = autopilot_title(view, &glass, "", tomorrow, TitleWords::default());
         assert!(
             short.ends_with(&format!("{word} Fri 17:42")),
             "{what}: {short}"
@@ -486,7 +507,7 @@ fn every_face_clock_names_its_day_when_it_is_not_today() {
         let said = face.spoken(&glass, tomorrow);
         assert!(said.ends_with(" on Friday at 17:42."), "{what}: {said}");
         for today in [Some(TODAY), None] {
-            let (whole, short) = autopilot_title(view, &glass, "", today);
+            let (whole, short) = autopilot_title(view, &glass, "", today, TitleWords::default());
             assert!(
                 short.ends_with(&format!("{word} 17:42")),
                 "{what} {today:?}: {short}"
@@ -501,7 +522,13 @@ fn every_face_clock_names_its_day_when_it_is_not_today() {
     }
     // NEGATIVE CONTROL: no clock, no day.
     let quiet = told(TaskFace::Theirs);
-    let (whole, short) = autopilot_title(AutopilotView::Land, &quiet, "", tomorrow);
+    let (whole, short) = autopilot_title(
+        AutopilotView::Land,
+        &quiet,
+        "",
+        tomorrow,
+        TitleWords::default(),
+    );
     assert!(!whole.contains("Fri"), "{whole}");
     assert_eq!(short, "autopilot: land, quiet");
 }
@@ -521,7 +548,13 @@ fn each_mode_phrase_holds_no_cut_mark() {
         assert_eq!(phrase, row.short);
         let trail = "\u{2713} approved 14:05, \u{21bb} kept going 14:02";
         for trail in ["", trail] {
-            let (whole, short) = autopilot_title(row.view, &row.glass, trail, Some(TODAY));
+            let (whole, short) = autopilot_title(
+                row.view,
+                &row.glass,
+                trail,
+                Some(TODAY),
+                TitleWords::default(),
+            );
             assert_eq!(short, row.short, "{whole}");
             assert_eq!(short_title(&whole), row.short, "{whole}");
             assert!(whole.ends_with(" \u{b7} right-click: more"), "{whole}");
@@ -531,9 +564,12 @@ fn each_mode_phrase_holds_no_cut_mark() {
             );
             if !trail.is_empty() {
                 let at = whole.find(" \u{b7} last: ").expect("the trail");
-                let explained = row.face.explanation(&row.glass).map_or(0, |e| {
-                    whole.find(e.as_ref()).expect("the explanation") + e.len()
-                });
+                let explained = row
+                    .face
+                    .explanation(&row.glass, TitleWords::default(), Some(TODAY))
+                    .map_or(0, |e| {
+                        whole.find(e.as_ref()).expect("the explanation") + e.len()
+                    });
                 assert!(explained <= at, "the explanation leads the trail: {whole}");
                 assert!(whole.contains(&format!(" \u{b7} last: {trail} \u{b7} click: ")));
             }
@@ -543,7 +579,8 @@ fn each_mode_phrase_holds_no_cut_mark() {
             // than the short form and narrower than the one before.
             let [no_trail, words, clicks, click] =
                 lean_titles(&whole).map(|(head, tail)| format!("{head}{tail}"));
-            let (bare, _) = autopilot_title(row.view, &row.glass, "", Some(TODAY));
+            let (bare, _) =
+                autopilot_title(row.view, &row.glass, "", Some(TODAY), TitleWords::default());
             if trail.is_empty() {
                 assert_eq!(no_trail, "", "no trail, no form without one: {whole}");
             } else {
@@ -566,7 +603,9 @@ fn each_mode_phrase_holds_no_cut_mark() {
             // is narrower than v1's words, then the phrase with the click —
             // each narrower than the form before it and wider than the
             // short form; none where the title has no explanation.
-            let explained = row.face.explanation(&row.glass);
+            let explained = row
+                .face
+                .explanation(&row.glass, TitleWords::default(), Some(TODAY));
             let click_words = format!(" \u{b7} click: {}", row.face.click(&row.glass));
             match explained {
                 None => assert_eq!(
@@ -637,7 +676,13 @@ fn every_face_keeps_its_clicks_after_its_explanation() {
     };
     let whole_facts = footer::fit_rule(&facts, 400, None).segments;
     let hovered = |row: &Row, trail: &str| {
-        let (whole, short) = autopilot_title(row.view, &row.glass, trail, Some(TODAY));
+        let (whole, short) = autopilot_title(
+            row.view,
+            &row.glass,
+            trail,
+            Some(TODAY),
+            TitleWords::default(),
+        );
         let w = lights(row.view, row.glass);
         let mut block = Block::default();
         assert!(w.fit_into(
@@ -693,7 +738,10 @@ fn every_face_keeps_its_clicks_after_its_explanation() {
         let what = format!("{:?} {:?}", row.view, row.glass);
         for trail in ["", "\u{2713} approved 14:05"] {
             let (block, widths) = hovered(&row, trail);
-            let explained = row.face.explanation(&row.glass).is_some();
+            let explained = row
+                .face
+                .explanation(&row.glass, TitleWords::default(), Some(TODAY))
+                .is_some();
             let both = widths.lean[2] > 0;
             let mut want = vec![TitleFit::Full];
             if !trail.is_empty() {
@@ -971,13 +1019,13 @@ fn the_default_glass_is_v1s_chip() {
         assert_eq!(drawn, view.label(), "{view:?}");
         assert_eq!(face.tones(), (view.tone(), view.tone()), "{view:?}");
         assert_eq!(face.clock(&rest), None, "{view:?}");
-        let (whole, short) = autopilot_title(view, &rest, "", None);
+        let (whole, short) = autopilot_title(view, &rest, "", None, TitleWords::default());
         assert_eq!(
             whole,
             format!("{} \u{b7} right-click: more", view.title()),
             "{view:?}"
         );
-        assert_eq!(short, short_title(view.title()), "{view:?}");
+        assert_eq!(short, short_title(&view.title()), "{view:?}");
         let [_, (head, tail), ..] = lean_titles(&whole);
         assert_eq!(
             format!("{head}{tail}"),
@@ -1005,18 +1053,28 @@ fn the_default_glass_is_v1s_chip() {
 fn the_autopilot_title_is_sized_once() {
     let rest = ChipGlass::default();
     for view in AutopilotView::ALL {
-        let ((whole, short), allocations) =
-            crate::work_counts::allocations_in(|| autopilot_title(view, &rest, "", None));
+        let ((whole, short), allocations) = crate::work_counts::allocations_in(|| {
+            autopilot_title(view, &rest, "", None, TitleWords::default())
+        });
         assert_eq!(allocations, 2, "{view:?}: {whole}");
-        assert!(whole.starts_with(view.title()), "CONTROL {view:?}: {whole}");
+        assert!(
+            whole.starts_with(&view.title()),
+            "CONTROL {view:?}: {whole}"
+        );
         assert!(whole.ends_with("right-click: more"), "CONTROL {view:?}");
         assert_eq!(whole.capacity(), whole.len(), "sized exactly: {whole}");
-        assert_eq!(short, short_title(view.title()), "CONTROL {view:?}");
+        assert_eq!(short, short_title(&view.title()), "CONTROL {view:?}");
     }
     // A trail is sized in too: one more part, no regrowth.
     let trail = "\u{2713} approved 14:05";
     let ((whole, _), allocations) = crate::work_counts::allocations_in(|| {
-        autopilot_title(AutopilotView::Cruise, &rest, trail, None)
+        autopilot_title(
+            AutopilotView::Cruise,
+            &rest,
+            trail,
+            None,
+            TitleWords::default(),
+        )
     });
     assert_eq!(allocations, 2, "{whole}");
     assert_eq!(whole.capacity(), whole.len(), "sized exactly: {whole}");
@@ -1393,4 +1451,321 @@ fn the_lights_own_hue_clears_the_text_floor_on_every_builtin_theme() {
             "NEGATIVE CONTROL: the fixed {mode:?} hue fails a light ground: {under:?}"
         );
     }
+}
+
+/// WHAT THE TITLE SAYS BESIDE THE GLASS, ON EVERY FACE
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.1, §12.3.1; the W4
+/// title slice): every face of the table, with no hold and no need, with a
+/// harness's need, with Land's hold read (`not landed yet: …`) and unread
+/// (`landing since …`), and with a hold and a need together. With neither
+/// the title is the table's own. A need follows the explanation, before the
+/// clicks — ` · needs you: sign 0.48.0, the release credential, on this Mac
+/// (+1 more); carrying on`, the worker's ` · ` and ` — ` made `, ` — on
+/// every face a harness explains, none where no harness runs, and said once
+/// under a read hold that names it. A hold is said under `⤓ land` alone:
+/// read, it is the explanation (its legs, then `· landing since 14:02, 3
+/// nudges`); unread, the sentence then its clock. Each title is sized
+/// exactly, keeps one ` — ` at most and one ` · click: `, and its leaner
+/// forms keep their cuts: the first (no trail) none, v1's words the whole
+/// without the menu's line (the hold and the need kept), the clicks'
+/// forms the phrase and the clicks alone (the hold and the need given up
+/// with the explanation). The description says the hold, then the need,
+/// glyph-free, and nothing where neither stands; the label is the face's
+/// own whatever they say (WCAG 2.5.3: the painted word in it).
+///
+/// NEGATIVE CONTROLS (as run): `need_title` without `title_safe` gives the
+/// need's part `sign 0.48.0 · the release credential — on this Mac`, and
+/// the Cruise row's title fails its expected words and its one ` — `;
+/// `TitleWords::need_under` without its face filter gives `⊘ off`'s
+/// `harness off in Settings` title a need it cannot carry on.
+#[test]
+fn every_face_says_a_hold_and_a_need_where_its_harness_explains() {
+    use crate::harness_glass::hold_tests::{ask, glass, held, unread};
+    let need = ask();
+    let (read, fresh) = (glass(held(), TODAY), glass(unread(), TODAY));
+    let need_part = " \u{b7} needs you: sign 0.48.0, the release credential, on this Mac (+1 more); \
+                     carrying on";
+    let need_said = "Needs you: sign 0.48.0 the release credential on this Mac. And 1 more.";
+    let legs = "2 unpushed commits; open work in its report: follow-up, not pushed";
+    let since = "landing since 14:02, 3 nudges";
+    let glyph_free = |text: &str| {
+        text.chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | ':' | ','))
+    };
+    for row in rows() {
+        let face = row.face;
+        let explained = !matches!(
+            face,
+            ChipFace::MasterOff | ChipFace::AgentOff(_) | ChipFace::Unhosted
+        );
+        let land = face == ChipFace::Land;
+        let click_at = row.whole.rfind(" \u{b7} click: ").expect("a click");
+        let (head, clicks) = row.whole.split_at(click_at);
+        let menu_at = clicks.rfind(" \u{b7} right-click: more").expect("the menu");
+        for (case, hold, said_need) in [
+            ("none", None, None),
+            ("a need", None, Some(&need)),
+            ("a read hold", Some(&read), None),
+            ("an unread hold", Some(&fresh), None),
+            ("a read hold and a need", Some(&read), Some(&need)),
+            ("an unread hold and a need", Some(&fresh), Some(&need)),
+        ] {
+            let words = TitleWords {
+                hold,
+                need: said_need,
+            };
+            let (whole, short) = autopilot_title(row.view, &row.glass, "", Some(TODAY), words);
+            // What the table's title says beside the glass.
+            let read_hold = land && hold.is_some_and(|h| h.read());
+            let mut expected = match hold.filter(|_| land) {
+                Some(h) if h.read() => {
+                    let first = if said_need.is_some() {
+                        "needs you: sign 0.48.0, the release credential, on this Mac (+1 more)"
+                    } else {
+                        "a need named earlier in its reply"
+                    };
+                    format!(
+                        "{} \u{2014} not landed yet: {first}; {legs} \u{b7} {since}",
+                        row.short
+                    )
+                }
+                Some(_) => format!("{head} \u{b7} {since}"),
+                None => head.to_owned(),
+            };
+            if said_need.is_some() && explained && !read_hold {
+                expected.push_str(need_part);
+            }
+            let head_said = expected.clone();
+            expected.push_str(clicks);
+            assert_eq!(whole, expected, "{face:?}, {case}");
+            assert_eq!(short, row.short, "{face:?}, {case}");
+            assert_eq!(whole.capacity(), whole.len(), "sized exactly: {whole}");
+            assert!(whole.matches(" \u{2014} ").count() <= 1, "{whole}");
+            assert_eq!(whole.matches(" \u{b7} click: ").count(), 1, "{whole}");
+            assert!(!whole.contains(" \u{b7} last: "), "{whole}");
+            assert!(!whole.contains(" \u{b7} pausing until "), "{whole}");
+            // The leaner forms keep their cuts.
+            let [lean, v1, both, click] =
+                lean_titles(&whole).map(|(head, tail)| format!("{head}{tail}"));
+            assert_eq!(lean, "", "no trail: {whole}");
+            assert_eq!(
+                v1,
+                format!("{head_said}{}", &clicks[..menu_at]),
+                "v1's words keep the hold and the need: {whole}"
+            );
+            if whole.contains(" \u{2014} ") {
+                assert_eq!(
+                    click,
+                    format!("{}{}", row.short, &clicks[..menu_at]),
+                    "{whole}"
+                );
+                assert!(
+                    both.is_empty() || both == format!("{}{clicks}", row.short),
+                    "{whole}"
+                );
+            } else {
+                assert_eq!((both.as_str(), click.as_str()), ("", ""), "{whole}");
+            }
+            for form in [&both, &click] {
+                for word in ["needs you", "landing since", "not landed"] {
+                    assert!(
+                        !form.contains(word),
+                        "given up with the explanation: {form}"
+                    );
+                }
+            }
+            // The description: the hold, then the need; the label the face's.
+            let description = autopilot_description(face, &row.glass, words, Some(TODAY), None);
+            let mut sentences = Vec::new();
+            match hold.filter(|_| land) {
+                Some(h) if h.read() => sentences.push(format!(
+                    "Not landed yet. {} 2 unpushed commits. Open work in its report: follow up, \
+                     not pushed. Landing since 14:02, 3 nudges.",
+                    if said_need.is_some() {
+                        need_said
+                    } else {
+                        "A need named earlier in its reply."
+                    }
+                )),
+                Some(_) => sentences.push("Landing since 14:02, 3 nudges.".to_owned()),
+                None => {}
+            }
+            if said_need.is_some() && explained && !read_hold {
+                sentences.push(format!("{need_said} Carrying on."));
+            }
+            let wanted = (!sentences.is_empty()).then(|| sentences.join(" "));
+            assert_eq!(description, wanted, "{face:?}, {case}");
+            if let Some(description) = &description {
+                assert!(glyph_free(description), "{description}");
+            }
+            assert_eq!(face.spoken(&row.glass, Some(TODAY)), row.spoken);
+        }
+    }
+}
+
+/// A NEED IN THE TITLE KEEPS ITS CUT MARKS (§12.2.3 item 6, slice 2e): a
+/// worker's need holding ` · last: `, ` · click: ` and ` — ` gives a title
+/// with the very words and the same four lean forms as the need already
+/// written with `, ` — under a pause and a trail, so every cut stands — on
+/// every face a harness explains. NEGATIVE CONTROL (as run): the need's raw
+/// words (`need_title` without `title_safe`) cut the first leaner form at
+/// the need's own ` · last: ` and the face's title fails the match.
+#[test]
+fn a_need_in_the_title_keeps_its_cut_marks() {
+    use crate::harness_glass::PauseGlass;
+    let raw = crate::needs::HarnessAsk {
+        first: "sign 0.48.0 \u{b7} last: the release credential \u{2014} on this Mac \u{b7} \
+                click: approve"
+            .to_string(),
+        more: 1,
+        others: Vec::new(),
+        program: aterm_phase::Program::Claude,
+    };
+    let written = crate::needs::HarnessAsk {
+        first: "sign 0.48.0, last: the release credential, on this Mac, click: approve".to_string(),
+        ..raw.clone()
+    };
+    let trail = "\u{2713} approved 14:05";
+    for row in rows() {
+        let glass = ChipGlass {
+            pause: Some(PauseGlass::of(crate::PausePlan {
+                at_unix: 1_792_159_500,
+                short: 3,
+            })),
+            ..row.glass
+        };
+        let title = |need: &crate::needs::HarnessAsk| {
+            autopilot_title(
+                row.view,
+                &glass,
+                trail,
+                Some(TODAY),
+                TitleWords {
+                    hold: None,
+                    need: Some(need),
+                },
+            )
+            .0
+        };
+        let (cut, plain) = (title(&raw), title(&written));
+        assert_eq!(cut, plain, "{:?}", row.face);
+        let forms = lean_titles(&cut);
+        assert_eq!(forms, lean_titles(&plain), "{cut}");
+        let [lean, v1, ..] = forms;
+        assert!(!lean.0.is_empty(), "{cut}");
+        assert!(!v1.0.is_empty(), "{cut}");
+        if matches!(
+            row.face,
+            ChipFace::MasterOff | ChipFace::AgentOff(_) | ChipFace::Unhosted
+        ) {
+            assert!(!cut.contains("needs you"), "no harness carries on: {cut}");
+        } else {
+            assert!(
+                lean.0.contains("; carrying on \u{b7} pausing until "),
+                "the first leaner form keeps the need and the pause: {cut}"
+            );
+            assert!(v1.0.ends_with("; carrying on"), "v1 keeps the need: {cut}");
+        }
+    }
+}
+
+/// A HELD LANDING KEEPS THE TITLE'S FOUR LEAN FORMS (§12.3.1, slice 3d):
+/// under `⤓ land` with a read hold whose need holds ` · ` and ` — `, a
+/// pause and a trail, every leg's words hold no ` — `, ` · last: ` or ` ·
+/// pausing until `; the four lean forms stand (without the trail; v1's
+/// words, the hold kept; the clicks; the click), the last two with no hold;
+/// and what a screen reader hears ([`App::autopilot_spoken`], the
+/// accessibility node's and `chrome`'s words) is the face's label, unchanged
+/// (`Autopilot: land.`, the painted word in it), and a description that
+/// leads with the hold, glyph-free. NEGATIVE CONTROLS (as run): `speakable`
+/// keeping a hyphen fails the glyph-free check (`follow-up`); the hold put
+/// in the label fails the label's.
+#[test]
+fn a_held_landing_keeps_the_titles_four_lean_forms() {
+    use crate::harness_glass::hold_tests::{ask, glass, held};
+    let hold = glass(held(), TODAY);
+    let need = ask();
+    let pause = crate::harness_glass::PauseGlass::of(crate::PausePlan {
+        at_unix: 1_792_159_500,
+        short: 3,
+    });
+    let chip = ChipGlass {
+        pause: Some(pause),
+        ..ChipGlass::default()
+    };
+    let words = TitleWords {
+        hold: Some(&hold),
+        need: Some(&need),
+    };
+    let (whole, short) = autopilot_title(
+        AutopilotView::Land,
+        &chip,
+        "\u{2913} nudged 14:22",
+        Some(TODAY),
+        words,
+    );
+    assert_eq!(short, "autopilot: land");
+    let explanation = ChipFace::Land
+        .explanation(&chip, words, Some(TODAY))
+        .expect("the hold");
+    let (legs, since) = explanation
+        .split_once(" \u{b7} ")
+        .expect("the legs, then the clock");
+    assert_eq!(since, "landing since 14:02, 3 nudges", "{whole}");
+    for leg in legs.split("; ") {
+        for mark in [
+            " \u{2014} ",
+            " \u{b7} last: ",
+            " \u{b7} pausing until ",
+            " \u{b7} ",
+        ] {
+            assert!(!leg.contains(mark), "{leg:?} in {whole}");
+        }
+    }
+    assert!(
+        whole.starts_with(&format!(
+            "autopilot: land \u{2014} {explanation} \u{b7} pausing until "
+        )),
+        "{whole}"
+    );
+    assert_eq!(whole.matches(" \u{2014} ").count(), 1, "{whole}");
+    let [lean, v1, clicks, click] = lean_titles(&whole).map(|(head, tail)| format!("{head}{tail}"));
+    assert_eq!(
+        lean,
+        whole.replace(" \u{b7} last: \u{2913} nudged 14:22", ""),
+        "without the trail"
+    );
+    assert_eq!(
+        v1,
+        format!("autopilot: land \u{2014} {explanation} \u{b7} click: off"),
+        "v1's words keep the hold"
+    );
+    assert_eq!(
+        clicks,
+        "autopilot: land \u{b7} click: off \u{b7} right-click: more"
+    );
+    assert_eq!(click, "autopilot: land \u{b7} click: off");
+    // What a screen reader hears, through the App's one door.
+    let mut app = App::headless_for_test();
+    assert!(crate::harness_glass::on_land_held(
+        &mut app,
+        0,
+        Some(held())
+    ));
+    let (label, description) = app.autopilot_spoken(0, AutopilotView::Land, &chip);
+    assert_eq!(label, ChipFace::Land.spoken(&chip, Some(TODAY)));
+    assert_eq!(label, "Autopilot: land.", "the painted word, unchanged");
+    let description = description.expect("the hold described");
+    assert!(
+        description
+            .starts_with("Not landed yet. A need named earlier in its reply. 2 unpushed commits."),
+        "{description}"
+    );
+    assert!(
+        description
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | ':' | ',')),
+        "glyph-free: {description}"
+    );
+    assert!(description.contains(" Pausing until "), "{description}");
 }

@@ -60,6 +60,7 @@ fn config_identity(repo: &Path) {
 }
 
 fn bare_fixture(name: &str) -> BareFixture {
+    static BUILT: crate::template::Template<(String, String)> = crate::template::Template::new();
     let parent = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("publisher-fence-liveness");
     std::fs::create_dir_all(&parent).expect("create fixture root");
     let dir = aterm_tempfile::Builder::new()
@@ -67,6 +68,20 @@ fn bare_fixture(name: &str) -> BareFixture {
         .tempdir_in(parent)
         .expect("create fixture root");
     let root = dir.path();
+    let (owner, other_owner) = BUILT.lay(root, build_bare);
+    BareFixture {
+        repo_a: root.join("publisher-a"),
+        repo_b: root.join("publisher-b"),
+        owner,
+        other_owner,
+        _root: dir,
+    }
+}
+
+/// [`bare_fixture`]'s tree, built from nothing under `root` (once per process,
+/// [`crate::template::Template`]): a bare origin holding two claim
+/// commits and two clones of it; the two commits.
+fn build_bare(root: &Path) -> (String, String) {
     let remote = root.join("origin.git");
     let seed = root.join("seed");
     assert!(
@@ -119,13 +134,9 @@ fn bare_fixture(name: &str) -> BareFixture {
         config_identity(&path);
         path
     };
-    BareFixture {
-        repo_a: clone("publisher-a"),
-        repo_b: clone("publisher-b"),
-        owner,
-        other_owner,
-        _root: dir,
-    }
+    clone("publisher-a");
+    clone("publisher-b");
+    (owner, other_owner)
 }
 
 /// Write a fence whose body we choose, exactly as a publisher would: an

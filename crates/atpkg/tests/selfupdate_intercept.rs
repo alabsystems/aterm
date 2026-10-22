@@ -291,9 +291,9 @@ fn wait_markers(stdout: &[String]) -> Vec<&str> {
         .collect()
 }
 
-/// When the store lock is held at start, the `update claude --wait-lock 1800`
-/// child prints `lock-waiting:` on stdout after the 2 s grace, waits until the
-/// lock is released, prints `lock-acquired:`, and then runs the check.
+/// When the store lock is held at start, the `update claude --wait-lock 1800` child
+/// prints `lock-waiting:` on stdout after the grace (none here), waits until the lock is
+/// released, prints `lock-acquired:`, and then runs the check.
 #[test]
 fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
     if !atpkg::manager_enabled_with(atpkg::PKG_TRUST_ANCHORS) {
@@ -310,7 +310,10 @@ fn a_held_store_is_waited_for_and_the_check_runs_once_the_holder_lets_go() {
     let registry = format!("dir:{}", missing.display());
     let mut child = stream(fx.command(
         &fx.verb_argv("claude", &["update"]),
-        &[("ATPKG_REGISTRY", &registry)],
+        &[
+            ("ATPKG_REGISTRY", &registry),
+            (atpkg::lock::WAIT_ANNOUNCE_GRACE_SEAM, "0"),
+        ],
     ));
     let waiting = format!("atpkg: {}", atpkg::cli::LOCK_WAITING_MARKER);
     child.wait_for_line(&waiting, ANNOUNCE_WITHIN);

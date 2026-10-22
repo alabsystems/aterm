@@ -48,48 +48,57 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// The seeded origin and both clones under a scratch dir of this test's own, built once
+    /// per process ([`crate::template::Template`]).
     fn new(name: &str) -> Fixture {
+        static BUILT: crate::template::Template<()> = crate::template::Template::new();
         let dir = aterm_tempfile::Builder::new()
             .prefix(&format!("aterm-ledger-race-{name}-"))
             .tempdir()
             .unwrap();
         let root = dir.path();
-        let origin = root.join("origin.git");
-        run(
-            root,
-            "git",
-            &["init", "-q", "--bare", "-b", "main", "origin.git"],
-        );
-        ledger::testing::config(&origin, &[]);
-        let rival = root.join("rival");
-        run(
-            root,
-            "git",
-            &["clone", "-q", origin.to_str().unwrap(), "rival"],
-        );
-        config_identity(&rival);
-        // A clone of an empty repo names its unborn branch from local config
-        // (init.defaultBranch): force main so the seed push matches the claim's refs.
-        run(&rival, "git", &["symbolic-ref", "HEAD", "refs/heads/main"]);
-        fs::write(rival.join("RELEASES.ledger"), SEED_LEDGER).unwrap();
-        fs::write(rival.join("CHANGELOG.md"), SEED_CHANGELOG).unwrap();
-        run(&rival, "git", &["add", "-A"]);
-        run(&rival, "git", &["commit", "-q", "-m", "seed"]);
-        run(&rival, "git", &["push", "-q", "-u", "origin", "main"]);
-        let work = root.join("work");
-        run(
-            root,
-            "git",
-            &["clone", "-q", origin.to_str().unwrap(), "work"],
-        );
-        config_identity(&work);
+        BUILT.lay(root, build);
         Fixture {
+            origin: root.join("origin.git"),
+            rival: root.join("rival"),
+            work: root.join("work"),
             root: dir,
-            origin,
-            rival,
-            work,
         }
     }
+}
+
+/// [`Fixture::new`]'s tree, built from nothing under `root`: a bare origin seeded with the
+/// ledger and the changelog, the rival's clone that pushed the seed, and the claimant's.
+fn build(root: &Path) {
+    let origin = root.join("origin.git");
+    run(
+        root,
+        "git",
+        &["init", "-q", "--bare", "-b", "main", "origin.git"],
+    );
+    ledger::testing::config(&origin, &[]);
+    let rival = root.join("rival");
+    run(
+        root,
+        "git",
+        &["clone", "-q", origin.to_str().unwrap(), "rival"],
+    );
+    config_identity(&rival);
+    // A clone of an empty repo names its unborn branch from local config
+    // (init.defaultBranch): force main so the seed push matches the claim's refs.
+    run(&rival, "git", &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    fs::write(rival.join("RELEASES.ledger"), SEED_LEDGER).unwrap();
+    fs::write(rival.join("CHANGELOG.md"), SEED_CHANGELOG).unwrap();
+    run(&rival, "git", &["add", "-A"]);
+    run(&rival, "git", &["commit", "-q", "-m", "seed"]);
+    run(&rival, "git", &["push", "-q", "-u", "origin", "main"]);
+    let work = root.join("work");
+    run(
+        root,
+        "git",
+        &["clone", "-q", origin.to_str().unwrap(), "work"],
+    );
+    config_identity(&work);
 }
 
 /// Run a command, assert success, return stdout. Setup only: the code under test never comes
@@ -592,26 +601,36 @@ fn a_checkout_off_the_published_commit_is_refused_before_anything() {
 
 /// Build once: the reserved number is the one its bytes carry, so a lost race whose winner took
 /// a number at or past it is never re-numbered. The claim refuses with nothing burned and names
-/// the re-run that reserves anew.
+/// the re-run that reserves anew. Both edges: a winner AT the reserved n (a claim past it would
+/// leave two lines of one build), and one past it.
 #[test]
 fn a_reservation_the_tail_reached_refuses_and_burns_nothing() {
-    let fix = Fixture::new("stale");
-    let source = head_of(&fix.work);
-    let winner = "1790000123 0.99.0"; // past the reserved n
-    let runner = HookRunner::new(&fix.work, |attempt| {
-        if attempt == 1 {
-            rival_append(&fix, winner);
-        }
-    });
-    let (res, _) = do_claim(&runner, &fix.work, "0.26.0", false);
-    res.unwrap_err();
-    assert_eq!(runner.pushes.get(), 1, "never a push under another number");
-    assert_clean_at(&fix, &source);
-    assert_eq!(
-        origin_file(&fix, "RELEASES.ledger"),
-        format!("{SEED_LEDGER}{winner}\n"),
-        "the winner's line, and nothing of ours"
-    );
+    for (name, winner) in [
+        ("stale-at", format!("{NOW} 0.99.0")), // the reserved n itself
+        ("stale-past", format!("{} 0.99.0", NOW + 123)),
+    ] {
+        let winner = winner.as_str();
+        let fix = Fixture::new(name);
+        let source = head_of(&fix.work);
+        let runner = HookRunner::new(&fix.work, |attempt| {
+            if attempt == 1 {
+                rival_append(&fix, winner);
+            }
+        });
+        let (res, _) = do_claim(&runner, &fix.work, "0.26.0", false);
+        res.unwrap_err();
+        assert_eq!(
+            runner.pushes.get(),
+            1,
+            "{winner}: never a push under another number"
+        );
+        assert_clean_at(&fix, &source);
+        assert_eq!(
+            origin_file(&fix, "RELEASES.ledger"),
+            format!("{SEED_LEDGER}{winner}\n"),
+            "{winner}: the winner's line, and nothing of ours"
+        );
+    }
 }
 
 /// The re-run reserves anew from the winner's tail: a fresh, strictly higher
@@ -891,7 +910,8 @@ fn a_claim_that_landed_unjournaled_is_spent_and_the_re_run_claims_anew() {
     struct FailingCheckout(Git);
     impl GitRunner for FailingCheckout {
         fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
-            if args.first() == Some(&"checkout") {
+            // Wherever it sits: the claim's checkout comes after its `-c` pairs.
+            if args.contains(&"checkout") {
                 return Ok(RunOut {
                     status: 128,
                     stdout: Vec::new(),

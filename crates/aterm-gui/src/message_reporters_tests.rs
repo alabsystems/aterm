@@ -147,7 +147,10 @@ fn a_label_cannot_fault_the_signed_out_entry() {
 /// tab shows leads with nothing.
 #[test]
 fn an_autopilot_set_from_the_window_is_a_keyed_record() {
-    use crate::autopilot::AutopilotView;
+    use crate::autopilot::{AutopilotView, mode_words};
+    use aterm_agent::supervise::Autopilot;
+    // Each mode's line is its sentence from the one table (§12.4.1).
+    let (land, cruise) = (mode_words(Autopilot::Land), mode_words(Autopilot::Cruise));
     let msg = super::autopilot_set("s-a1", "in tab 2", AutopilotView::Land, true, None, None);
     assert_eq!(msg.title, "Autopilot set to land");
     assert_eq!(attention(&msg), Ok(Attention::Record));
@@ -156,8 +159,8 @@ fn an_autopilot_set_from_the_window_is_a_keyed_record() {
     assert_eq!(
         msg.detail,
         [
-            "Tab 2: the harness wraps the work up, then stops",
-            "this session's own setting"
+            format!("Tab 2: {}", land.record),
+            "this session's own setting".to_string()
         ]
     );
     let back = super::autopilot_set(
@@ -171,10 +174,7 @@ fn an_autopilot_set_from_the_window_is_a_keyed_record() {
     assert_eq!(back.title, "Autopilot set to cruise");
     assert_eq!(
         back.detail,
-        [
-            "the harness keeps the work moving",
-            "back to the default, [harness] autopilot"
-        ]
+        [cruise.record, "back to the default, [harness] autopilot"]
     );
 }
 
@@ -235,7 +235,7 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
     assert_eq!(set.title, "Autopilot cruises until 18:00");
     assert_eq!(
         set.detail,
-        ["Tab 3: the harness keeps the work moving, then wraps it up at that time"]
+        [format!("Tab 3: {}", crate::autopilot::TIMED_CRUISE_RECORD)]
     );
     let saturday = super::autopilot_timer_set("s-1", "in tab 3", sat, None);
     assert_eq!(saturday.title, "Autopilot cruises until Sat 16:00");
@@ -245,11 +245,10 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
         super::autopilot_timer_ended("s-1", "in tab 3", clock, passed, over, None)
     };
     let turned = "Tab 3: at 18:00 Autopilot switched to land; ";
+    // Land's own sentence, from the one table (`autopilot::MODE_WORDS`).
+    let land_record = crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Land).record;
     for (over, then) in [
-        (
-            FireOver::Work,
-            "the harness lands all of the work on the remote main branch, then stops".to_string(),
-        ),
+        (FireOver::Work, land_record.to_string()),
         (
             FireOver::MasterOff,
             "the harness is off in Settings, so nothing is landed".to_string(),
@@ -311,10 +310,7 @@ fn the_autopilot_records_keep_the_title_rule_and_say_what_the_fire_found() {
     let unzoned = ended(None, None, FireOver::Work);
     assert_eq!(
         unzoned.detail,
-        [
-            "Tab 3: Autopilot switched to land; the harness lands all of the work on the remote \
-             main branch, then stops"
-        ]
+        [format!("Tab 3: Autopilot switched to land; {land_record}")]
     );
     titles.push(unzoned.title);
     for title in &titles {

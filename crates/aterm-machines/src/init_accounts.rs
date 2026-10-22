@@ -13,6 +13,7 @@ use crate::items::{Ctx, Item};
 use crate::model::{PValue, Probe, User};
 use crate::plist::{self, Entries};
 use crate::port::{Cmd, System};
+use aterm_types::macos_setup::{Selection, Setting};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -72,12 +73,26 @@ struct SignOut {
 /// # Errors
 /// A selected user has no absolute home directory.
 pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
+    selected_items(ctx, Selection::all())
+}
+
+/// Build only the selected account operations; unchecked accounts are never probed.
+///
+/// # Errors
+/// A selected user has no absolute home directory.
+pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item>>, String> {
     let mut items: Vec<Box<dyn Item>> = Vec::new();
     for user in &ctx.users {
         if !Path::new(&user.home).is_absolute() {
             return Err("account sign-out needs an absolute user home".into());
         }
-        for service in [Service::Messages, Service::FaceTime] {
+        for (service, setting) in [
+            (Service::Messages, Setting::Messages),
+            (Service::FaceTime, Setting::FaceTime),
+        ] {
+            if !selected.contains(setting) {
+                continue;
+            }
             items.push(Box::new(SignOut {
                 service,
                 user: user.clone(),
@@ -314,10 +329,22 @@ const AX_REQUEST: &str = "ObjC.import('Foundation'); ObjC.import('ApplicationSer
 /// # Errors
 /// The console account or the shared plan cannot be resolved.
 pub fn accessibility_needed(sys: &dyn System) -> Result<bool, String> {
-    let rows = crate::init::run_workstation(
+    accessibility_needed_selected(sys, Selection::all())
+}
+
+/// Whether a selected account needs sign-out, without reading unchecked accounts.
+///
+/// # Errors
+/// The console account or the selected shared plan cannot be resolved.
+pub fn accessibility_needed_selected(
+    sys: &dyn System,
+    selected: Selection,
+) -> Result<bool, String> {
+    let rows = crate::init::run_workstation_selected(
         sys,
         crate::init::WorkstationGroup::Accounts,
         crate::model::Mode::Plan,
+        selected,
     )?;
     Ok(rows
         .iter()

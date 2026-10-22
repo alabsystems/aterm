@@ -35,23 +35,8 @@ pub(super) fn ensure_private_dir_as(dir: &Path, owner: u32) -> std::io::Result<(
     tighten_and_verify(dir, owner)
 }
 
-/// [`ensure_private_dir`] for a directory that must already be there: the same
-/// fresh-stat fast path, `0700` and SEC-3 gate, but nothing is created. A
-/// missing `dir` is `NotFound` and something there that is no directory, a
-/// symlink to nothing included, is `NotADirectory` (`super::require_dir`). A
-/// session identity's admission hardens the folders of an identity it did not
-/// make with this (`agent_identity::harden_identity`), so a folder that goes
-/// between its look and its hardening is never made again by a create here.
-pub(crate) fn harden_private_dir(dir: &Path) -> std::io::Result<()> {
-    if already_private(dir, our_uid()) {
-        return Ok(());
-    }
-    super::require_dir(dir)?;
-    tighten_and_verify(dir, our_uid())
-}
-
-/// Whether `dir` already IS what [`ensure_private_dir`] and
-/// [`harden_private_dir`] return success for — a directory, exactly `0700`,
+/// Whether `dir` already IS what [`ensure_private_dir`] returns success for —
+/// a directory, exactly `0700`,
 /// passing the SEC-3 predicate on a fresh stat — so nothing needs creating or
 /// writing: one `stat(2)`, where the full path is four (`mkdir`, the `EEXIST`
 /// stat, two more). Every spawn asks for the control dir and its subdirs about

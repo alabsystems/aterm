@@ -187,7 +187,7 @@ print "PID $$\n$a$b";
 #[test]
 fn a_lease_taken_by_another_process_names_it_whatever_its_holder_says() {
     use std::io::Read as _;
-    let dir = aterm_tempfile::TempDir::new().expect("dir");
+    let dir = crate::test_scratch::short_dir("the lease's socket");
     let sock = dir.path().join("l.sock");
     let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
     listener

@@ -256,6 +256,7 @@ pub struct RomMaster {
 impl RomMaster {
     /// Scanline `y` of glyph `g` (low 24 bits valid).
     #[must_use]
+    #[inline]
     pub fn row(&self, glyph: usize, y: usize) -> u32 {
         self.rows[glyph * MASTER_H + y]
     }
@@ -293,6 +294,7 @@ pub(crate) fn decorative_master() -> &'static RomMaster {
 /// sampler skips an unsupported code point rather than substituting a
 /// different-looking character, so the rain only ever shows real output.
 #[must_use]
+#[inline]
 pub fn material_bitmap(c: char) -> Option<[u8; 8]> {
     super::bitmap_font::bitmap(c)
 }
@@ -308,16 +310,16 @@ pub fn rasterize_material_master(chars: &[char]) -> RomMaster {
     // fork the memoized copy instead of re-rasterizing.
     let mut master = decorative_master().clone();
     for (glyph_index, &ch) in chars.iter().take(ROM_GLYPHS).enumerate() {
-        author_material_glyph(&mut master, glyph_index, ch);
+        let _ = author_material_glyph(&mut master, glyph_index, ch);
     }
     master
 }
 
 /// Author one material slot over the decorative glyph already in it. An
 /// unsupported code point leaves the decorative glyph untouched.
-fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) {
+fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) -> bool {
     let Some(bitmap) = material_bitmap(ch) else {
-        return;
+        return false;
     };
     let glyph = &mut master.rows[slot * MASTER_H..(slot + 1) * MASTER_H];
     glyph.fill(0);
@@ -326,14 +328,16 @@ fn author_material_glyph(master: &mut RomMaster, slot: usize, ch: char) {
             continue;
         }
         let mut row_mask = 0u32;
-        for sx in 0..8usize {
-            if bits & (1 << sx) != 0 {
-                row_mask |= 0b11 << (4 + sx * 2);
-            }
+        let mut b = bits;
+        while b != 0 {
+            let sx = b.trailing_zeros() as usize;
+            b &= b - 1;
+            row_mask |= 0b11 << (4 + sx * 2);
         }
         let y0 = 4 + sy * 5;
         glyph[y0..y0 + 5].fill(row_mask);
     }
+    true
 }
 
 /// Re-author one slot of an already authored master in place: restore the
@@ -345,14 +349,17 @@ pub fn reauthor_material_glyph(master: &mut RomMaster, slot: usize, ch: Option<c
     if slot >= ROM_GLYPHS {
         return;
     }
+    if let Some(ch) = ch
+        && author_material_glyph(master, slot, ch)
+    {
+        return;
+    }
     let range = slot * MASTER_H..(slot + 1) * MASTER_H;
     master.rows[range.clone()].copy_from_slice(&decorative_master().rows[range]);
-    if let Some(ch) = ch {
-        author_material_glyph(master, slot, ch);
-    }
 }
 
 /// Set pixel `(x, y)` if in bounds.
+#[inline]
 fn plot(glyph: &mut [u32], x: i32, y: i32) {
     if (0..MASTER_W as i32).contains(&x) && (0..MASTER_H as i32).contains(&y) {
         glyph[y as usize] |= 1 << x;
@@ -361,6 +368,7 @@ fn plot(glyph: &mut [u32], x: i32, y: i32) {
 
 /// Stamp a `THICK×THICK` square centered-ish on `(x, y)` (offset −1 keeps the
 /// stroke visually centered on the authored line).
+#[inline]
 fn stamp_thick(glyph: &mut [u32], x: i32, y: i32) {
     for dy in -1..THICK - 1 {
         for dx in -1..THICK - 1 {

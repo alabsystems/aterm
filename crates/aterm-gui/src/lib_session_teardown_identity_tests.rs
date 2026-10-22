@@ -140,9 +140,9 @@ fn dropping_an_adopted_session_before_commit_leaves_its_shell_alive() {
 /// RED before the fix: both files were gone after the uncommitted drop.
 #[test]
 fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_body_files() {
-    let _env = crate::seamless::tests::ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(_env) = crate::seamless::tests::env_alone() else {
+        return;
+    };
     let _scratch = crate::seamless::tests::ScratchEnv::runtime("predecessor-files");
     for committed in [false, true] {
         let commit = Arc::new(crate::shell_rekey::Deferred::holding());

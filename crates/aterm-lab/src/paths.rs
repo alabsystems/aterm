@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where the lab keeps what it makes, which aterm it tests, whose home it
+//! Where the lab keeps what it makes, which aterm it tests, whose homes it
 //! guards, and the rule that the calling shell's own agent and aterm
 //! variables never reach a lab.
 
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -22,8 +23,12 @@ pub struct Paths {
     pub aterm: Option<PathBuf>,
     /// Why `$LAB_ATERM` was not taken, when it was not.
     pub aterm_note: Option<String>,
-    /// The UID account's physical home, independently of `HOME`; empty when
-    /// it cannot be resolved safely, which [`Paths::need_home`] refuses.
+    /// The UID account's physical home, independently of `HOME` (the account
+    /// database's: [`aterm_uds::account::home`]); empty when it cannot be
+    /// resolved safely, which [`Paths::need_home`] refuses. A lab run under a
+    /// scratch `HOME`, as every agent run here is, guards this one all the
+    /// same ([`Paths::guarded_homes`]) and finds the managed agents in its
+    /// package store ([`Paths::store_home`]).
     pub real_home: String,
     /// The calling shell's physical `HOME`, when it names a directory.
     pub caller_home: String,
@@ -87,6 +92,13 @@ pub fn forgotten(key: &str) -> bool {
 
 impl Paths {
     fn resolve() -> Paths {
+        Paths::resolve_with(aterm_uds::account::home(), std::env::var_os("HOME"))
+    }
+
+    /// [`Paths::resolve`] with the account database's home (`account`) and
+    /// `$HOME` (`home`) given: the seam a test hands a fake account home.
+    #[must_use]
+    pub fn resolve_with(account: Option<PathBuf>, home: Option<OsString>) -> Paths {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
@@ -101,8 +113,8 @@ impl Paths {
         let state = physical(Path::new(state.to_string_lossy().trim_end_matches('/')));
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aterm-lab"));
         let (aterm, aterm_note) = find_aterm(&exe, &repo);
-        let real_home = home_path(aterm_uds::account::home().as_deref());
-        let caller_home = home_path(std::env::var_os("HOME").as_deref().map(Path::new));
+        let real_home = home_path(account.as_deref());
+        let caller_home = home_path(home.as_deref().map(Path::new));
         let user = crate::sys::login_name()
             .or_else(|| std::env::var("USER").ok().filter(|u| !u.is_empty()))
             .unwrap_or_else(|| crate::sys::getuid().to_string());
@@ -117,6 +129,61 @@ impl Paths {
             exe,
             repo,
         }
+    }
+
+    /// Every home the jail's witnesses and scrubs take as the owner's
+    /// ([`guarded`]): the account's, and the caller's `HOME` when it names
+    /// another (the homes [`crate::jail::render`] fences).
+    #[must_use]
+    pub fn guarded_homes(&self) -> Vec<String> {
+        guarded(&self.real_home, &self.caller_home)
+    }
+
+    /// The guarded homes, or the refusal when neither the account database
+    /// nor `HOME` names a directory.
+    ///
+    /// # Errors
+    /// No home to guard.
+    pub fn need_guarded_homes(&self) -> Result<Vec<String>, String> {
+        let homes = self.guarded_homes();
+        if homes.is_empty() {
+            return Err(
+                "neither the account database nor HOME names a home directory: the jail protects the owner's home, \
+                 so one must be known"
+                    .into(),
+            );
+        }
+        Ok(homes)
+    }
+
+    /// The home whose package store holds the managed agents: the account's,
+    /// whatever `HOME` says (a scratch `HOME` holds no store), else the
+    /// caller's.
+    #[must_use]
+    pub fn store_home(&self) -> &str {
+        if self.real_home.is_empty() {
+            &self.caller_home
+        } else {
+            &self.real_home
+        }
+    }
+
+    /// [`Paths::store_home`], or the refusal when there is none.
+    ///
+    /// # Errors
+    /// Neither the account database nor `HOME` names a directory.
+    pub fn need_store_home(&self) -> Result<&str, String> {
+        match self.store_home() {
+            "" => Err("neither the account database nor HOME names a home directory, so no package store can be found".into()),
+            home => Ok(home),
+        }
+    }
+
+    /// Whether the caller's `HOME` is a scratch one: it names a directory
+    /// that is not the account's home (every agent run here sets one).
+    #[must_use]
+    pub fn scratch_home(&self) -> bool {
+        !self.caller_home.is_empty() && self.caller_home != self.real_home
     }
 
     /// The state dir, or the refusal of a relative `$LAB_STATE`.
@@ -301,6 +368,22 @@ pub fn valid_tag(t: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// The homes a lab guards, from the account's home (`account`, the account
+/// database's) and the caller's `HOME` (`caller`): the account's first, then
+/// the caller's when it names another, each only when known. A superset of
+/// either, never a narrowing: a scratch `HOME` adds its own home and takes
+/// nothing of the account's away.
+#[must_use]
+pub fn guarded(account: &str, caller: &str) -> Vec<String> {
+    let mut homes: Vec<String> = Vec::new();
+    for h in [account, caller] {
+        if !h.is_empty() && !homes.iter().any(|k| k == h) {
+            homes.push(h.to_string());
+        }
+    }
+    homes
+}
+
 /// A home fence must name an existing physical directory exactly, never a
 /// lossy replacement of its name or the whole filesystem.
 fn home_path(path: Option<&Path>) -> String {
@@ -394,5 +477,101 @@ mod tests {
             home_path(Some(&bytes)).is_empty(),
             "a fence cannot use a lossy name"
         );
+    }
+
+    /// The homes a lab guards are a superset, never a narrowing: the
+    /// account's first, then the caller's `HOME` when it names another, each
+    /// once, an unknown one left out.
+    #[test]
+    fn the_guarded_homes_are_the_account_s_and_home_s_each_once() {
+        assert_eq!(guarded("/Users//o", "/tmp/s"), ["/Users//o", "/tmp/s"]);
+        assert_eq!(guarded("/Users//o", "/Users//o"), ["/Users//o"]);
+        assert_eq!(guarded("", "/tmp/s"), ["/tmp/s"]);
+        assert_eq!(guarded("/Users//o", ""), ["/Users//o"]);
+        assert!(guarded("", "").is_empty());
+    }
+
+    /// THE ACCOUNT'S HOME IS RESOLVED FROM THE ACCOUNT DATABASE, NOT `HOME`: a
+    /// fake account home handed in through the seam ([`Paths::resolve_with`])
+    /// is guarded beside a scratch `HOME`, by its physical path, and is the
+    /// package store's home. NEGATIVE CONTROLS: with no account home known
+    /// (or one that names no directory) only `$HOME` is guarded and holds the
+    /// store, `HOME` the account's own is no scratch home, and with neither
+    /// the lab has no home to guard.
+    #[test]
+    fn a_fake_account_home_is_guarded_beside_a_scratch_home() {
+        let top = aterm_tempfile::Builder::new()
+            .prefix("lab-homes-")
+            .tempdir()
+            .unwrap();
+        let real = std::fs::canonicalize(top.path()).unwrap();
+        let (account, scratch) = (top.path().join("account"), top.path().join("scratch"));
+        for d in [&account, &scratch] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (a, s) = (
+            real.join("account").display().to_string(),
+            real.join("scratch").display().to_string(),
+        );
+        let p = Paths::resolve_with(Some(account.clone()), Some(scratch.clone().into()));
+        assert_eq!(
+            (p.real_home.as_str(), p.caller_home.as_str()),
+            (a.as_str(), s.as_str())
+        );
+        assert_eq!(p.guarded_homes(), [a.clone(), s.clone()]);
+        assert_eq!(p.need_guarded_homes(), Ok(vec![a.clone(), s.clone()]));
+        assert_eq!(p.store_home(), a);
+        assert_eq!(p.need_home(), Ok(a.as_str()));
+        assert!(p.scratch_home());
+        // NEGATIVE CONTROLS
+        let own = Paths::resolve_with(Some(account.clone()), Some(account.clone().into()));
+        assert_eq!(own.guarded_homes(), std::slice::from_ref(&a));
+        assert!(
+            !own.scratch_home(),
+            "HOME the account's own is no scratch home"
+        );
+        let env_only = Paths::resolve_with(None, Some(scratch.clone().into()));
+        assert_eq!(env_only.guarded_homes(), std::slice::from_ref(&s));
+        assert_eq!(env_only.store_home(), s);
+        assert!(
+            env_only.need_home().is_err(),
+            "the jail refuses an unknown account home"
+        );
+        let gone = Paths::resolve_with(Some(real.join("no-such-home")), Some(scratch.into()));
+        assert_eq!(gone.guarded_homes(), std::slice::from_ref(&s));
+        let none = Paths::resolve_with(None, None);
+        assert!(none.need_guarded_homes().is_err() && none.need_store_home().is_err());
+    }
+
+    /// THE LAB'S OWN FACTS ([`paths`]) TAKE THE ACCOUNT'S HOME FROM THE
+    /// ACCOUNT DATABASE: whatever `HOME` the test runs under (a scratch one,
+    /// by this repository's rule, or the account's own), `real_home` is the
+    /// home `getpwuid_r` names, by its physical path; it is guarded, holds the
+    /// store, and `caller_home` is `HOME`'s. Only the paths are compared:
+    /// nothing under the account's home is read. NEGATIVE CONTROL: the same
+    /// facts resolved without the account database (`HOME` alone, the lab
+    /// before the fence) name no account home, which the jail refuses.
+    #[test]
+    fn the_lab_s_own_paths_take_the_account_home_from_the_account_database() {
+        let want = home_path(aterm_uds::account::home().as_deref());
+        assert!(
+            !want.is_empty(),
+            "the account database names this account's home"
+        );
+        let p = paths();
+        assert_eq!(p.real_home, want);
+        assert!(p.guarded_homes().contains(&want));
+        assert_eq!(p.store_home(), want);
+        assert_eq!(
+            p.caller_home,
+            home_path(std::env::var_os("HOME").as_deref().map(Path::new))
+        );
+        assert_eq!(
+            p.scratch_home(),
+            !p.caller_home.is_empty() && p.caller_home != want
+        );
+        // NEGATIVE CONTROL
+        let env_only = Paths::resolve_with(None, std::env::var_os("HOME"));
+        assert!(env_only.real_home.is_empty() && env_only.need_home().is_err());
     }
 }

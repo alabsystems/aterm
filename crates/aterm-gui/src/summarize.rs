@@ -52,6 +52,7 @@ pub(crate) fn summary_order(fleet: bool) -> crate::task_launch::TaskOrder {
     let brief = if fleet { FLEET_BRIEF } else { MAC_BRIEF };
     crate::task_launch::TaskOrder {
         task: brief.as_bytes().to_vec(),
+        agent: aterm_phase::Program::Claude,
         model: None,
         caller: None,
         trusted_cwd: None,
@@ -344,7 +345,7 @@ impl crate::App {
     /// spawn would refuse ([`Self::worker_shell`], the spawn's own check), or
     /// no `claude` is on the PATH a new tab starts from ([`claude_on_path`]).
     pub(crate) fn summarize_start_block(&self) -> Option<StartBlock> {
-        if let Err(block) = self.worker_shell() {
+        if let Err(block) = self.worker_shell(aterm_phase::Program::Claude) {
             return Some(StartBlock::Worker(block));
         }
         (!claude_on_path()).then_some(StartBlock::NoClaude)
@@ -369,7 +370,7 @@ impl crate::App {
         // In aterm's own folder, trusted as a spawn's named folder is; with
         // none, nothing is booked.
         let (order, booking) = summary_spawn(in_fleet(), summary_folder().as_deref())?;
-        let plan = self.resolve_spawn(crate::control::SpawnAim::Front, None, Some(order))?;
+        let plan = self.resolve_spawn(crate::control::SpawnAim::Front, Some(order))?;
         self.book_spawn(
             plan,
             booking,
@@ -706,7 +707,10 @@ mod tests {
             aterm_spec::wait::first_exec(&fish, &["--version"]);
             let mut app = workers_app();
             app.session_factory.shell_override = Some(fish.to_string_lossy().into_owned());
-            assert!(app.worker_shell().is_ok(), "{version}: not known yet");
+            assert!(
+                app.worker_shell(aterm_phase::Program::Claude).is_ok(),
+                "{version}: not known yet"
+            );
             // A hang detector, not a latency budget: the question must end.
             let asked = std::time::Instant::now();
             let answered = loop {
@@ -725,7 +729,10 @@ mod tests {
                 assert_eq!(app.summarize_start_block(), Some(block.clone()));
                 assert_eq!(app.summarize_in_new_tab(), Err(block.hint()));
             } else {
-                assert!(app.worker_shell().is_ok(), "{version} takes the operand");
+                assert!(
+                    app.worker_shell(aterm_phase::Program::Claude).is_ok(),
+                    "{version} takes the operand"
+                );
             }
         }
     }

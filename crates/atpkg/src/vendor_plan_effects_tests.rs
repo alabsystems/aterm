@@ -388,7 +388,7 @@ fn a_first_runs_agent_repair_survives_a_dangling_primary_read_by_the_set() {
     // repairing program first in its lane so no unrelated agent waits behind that
     // turn before the repair can announce its own publication attempt.
     let cfg = crate::config::PackagesConfig {
-        exclude: Some(["claude", "agy", "muse"].map(str::to_string).to_vec()),
+        exclude: Some(agents_except(&["codex"])),
         ..Default::default()
     };
     assert_eq!(

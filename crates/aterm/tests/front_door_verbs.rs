@@ -38,10 +38,15 @@ fn isolated<'a>(cmd: &'a mut Command, root: &Path) -> &'a mut Command {
 /// failure it catches is the verb not exiting, and `cargo test` has no per-test timeout.
 const DEADLINE: Duration = Duration::from_secs(60);
 
+/// A command for the aterm under test ([`launch_isolation::aterm_executable`]).
+fn aterm_cmd() -> Command {
+    Command::new(launch_isolation::aterm_executable())
+}
+
 /// Run `aterm <args…>` with a real terminal on all three streams and return everything it
 /// wrote: an operator's situation.
 fn on_a_terminal(root: &Path, args: &[&str]) -> String {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+    let mut cmd = aterm_cmd();
     isolated(&mut cmd, root).args(args);
     capture_on_a_terminal(cmd)
 }
@@ -118,7 +123,7 @@ fn read_available(pty: &mut std::fs::File, out: &mut Vec<u8>, start: Instant) {
 
 /// The same invocation with stdio piped, for the parity check.
 fn through_a_pipe(root: &Path, args: &[&str]) -> String {
-    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_aterm")), root)
+    let out = isolated(&mut aterm_cmd(), root)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -183,7 +188,8 @@ fn every_verb_is_routed_by_the_front_door_at_a_terminal() {
 #[test]
 fn edit_answers_as_aterm_edit_aterm_amacs_and_the_amacs_alias() {
     let root = private_root();
-    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+    let aterm = launch_isolation::aterm_executable();
+    let aterm = aterm.as_path();
     let bin = root.path().join("bin");
     std::fs::create_dir_all(&bin).expect("a bin dir");
     let alias = bin.join("amacs");
@@ -297,6 +303,9 @@ fn an_answer_into_a_closed_pipe_exits_cleanly() {
         &["theme", "list"],
         &["agents", "primer"],
         &["pkg", "--help"],
+        &["agh", "--help"],
+        &["agh", "help"],
+        &["agh"],
         &["update", "--help"],
         &["drive", "--help"],
         &["drive", "help"],
@@ -311,7 +320,7 @@ fn an_answer_into_a_closed_pipe_exits_cleanly() {
     ] {
         let (reader, writer) = std::io::pipe().expect("a pipe");
         drop(reader);
-        let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_aterm")), root.path())
+        let out = isolated(&mut aterm_cmd(), root.path())
             .args(args)
             .stdin(Stdio::null())
             .stdout(writer)
@@ -344,6 +353,7 @@ fn an_answer_a_full_disk_refused_exits_1_and_says_so() {
     let root = private_root();
     for args in [
         &["--help"][..],
+        &["agh", "--help"],
         &["drive", "--help"],
         &["drive", "classify", "ls"],
         &["drive", "classify", "rm -rf build"],
@@ -357,7 +367,7 @@ fn an_answer_a_full_disk_refused_exits_1_and_says_so() {
             .write(true)
             .open("/dev/full")
             .expect("open /dev/full");
-        let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_aterm")), root.path())
+        let out = isolated(&mut aterm_cmd(), root.path())
             .args(args)
             .stdin(Stdio::null())
             .stdout(full)
@@ -389,7 +399,7 @@ fn an_answer_a_full_disk_refused_exits_1_and_says_so() {
 fn drive_reaches_this_images_own_control_client() {
     let root = private_root();
     let sock = root.path().join("nobody-serves.sock");
-    let out = isolated(&mut Command::new(env!("CARGO_BIN_EXE_aterm")), root.path())
+    let out = isolated(&mut aterm_cmd(), root.path())
         .args(["drive", "--sock"])
         .arg(&sock)
         .args(["phase", "@s-1"])

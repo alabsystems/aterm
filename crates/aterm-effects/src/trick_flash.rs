@@ -209,12 +209,14 @@ pub(crate) struct TrickFlash {
 }
 
 impl TrickFlash {
+    #[inline]
     fn base_y_slice(&self) -> &[(Option<u64>, i64)] {
         &self.base_y[..usize::from(self.base_y_len)]
     }
 
     /// The host's declaration for the one rescan it is about to run in `scope`,
     /// which spends it. `None` withdraws it: every scroll delta then reads zero.
+    #[inline]
     pub(crate) fn declare_base_y(&mut self, scope: Option<u64>, base_y: Option<i64>) {
         self.declared = base_y.map(|y| (scope, y));
     }
@@ -281,6 +283,7 @@ impl TrickFlash {
 
     /// Drop the flash. Idempotent, so the engine's per-pane reset may call it per
     /// pane. The debounce clock and memo observe the keyboard and grid, and stay.
+    #[inline]
     pub(crate) fn clear(&mut self) {
         self.slot = None;
     }
@@ -396,6 +399,7 @@ impl TrickFlash {
     }
 
     /// See [`TrickFlashPhase`].
+    #[inline]
     pub(crate) fn phase(&self, now: Instant) -> TrickFlashPhase {
         let Some(slot) = self.slot.as_ref() else {
             return TrickFlashPhase::Idle;
@@ -547,24 +551,35 @@ impl TrickFlash {
             let hue = (hue0 + (i as f32 / denom) * span + time_deg).rem_euclid(360.0);
             let target = hsv2rgb(hue, loc.sat, loc.val);
             let col = loc.cols[i];
-            let at = ink[search_from..].binary_search_by_key(&(loc.row, col), |c| (c.row, c.col));
-            let cell = match at {
-                Ok(rel) => {
-                    let j = search_from + rel;
-                    search_from = j + 1;
-                    ink[j].color = u32_to_rgb3(mix_rgb(rgb3_to_u32(ink[j].color), target, tint));
-                    ink[j]
-                }
-                Err(rel) => {
-                    let j = search_from + rel;
-                    search_from = j + 1;
-                    let cell = InkCell {
-                        row: loc.row,
-                        col,
-                        color: u32_to_rgb3(mix_rgb(rgb3_to_u32(loc.fg[i]), target, tint)),
-                    };
-                    ink.insert(j, cell);
-                    cell
+            let cell = if ink.last().is_none_or(|c| (c.row, c.col) < (loc.row, col)) {
+                let cell = InkCell {
+                    row: loc.row,
+                    col,
+                    color: u32_to_rgb3(mix_rgb(rgb3_to_u32(loc.fg[i]), target, tint)),
+                };
+                ink.push(cell);
+                search_from = ink.len();
+                cell
+            } else {
+                match ink[search_from..].binary_search_by_key(&(loc.row, col), |c| (c.row, c.col)) {
+                    Ok(rel) => {
+                        let j = search_from + rel;
+                        search_from = j + 1;
+                        ink[j].color =
+                            u32_to_rgb3(mix_rgb(rgb3_to_u32(ink[j].color), target, tint));
+                        ink[j]
+                    }
+                    Err(rel) => {
+                        let j = search_from + rel;
+                        search_from = j + 1;
+                        let cell = InkCell {
+                            row: loc.row,
+                            col,
+                            color: u32_to_rgb3(mix_rgb(rgb3_to_u32(loc.fg[i]), target, tint)),
+                        };
+                        ink.insert(j, cell);
+                        cell
+                    }
                 }
             };
             *fp = fold_ink(*fp, &cell);
@@ -602,6 +617,7 @@ impl TrickFlash {
 
 /// What decides a flash's opening hue: the word and where it was typed, and
 /// nothing else — no clock and no counter, so a replay paints the same bytes.
+#[inline]
 fn hue_seed(caret: (u16, u16), chars: &[char]) -> u64 {
     let at = fnv_mix_u64(
         fnv_mix_u64(FNV64_OFFSET, u64::from(caret.0)),
@@ -613,6 +629,7 @@ fn hue_seed(caret: (u16, u16), chars: &[char]) -> u64 {
 /// The pane test every hook shares (and the typed-edit witness's): `None` on
 /// either side names no pane (a single-grid host, or an engine with no declared
 /// session), so there is nothing to cross; two named panes must be equal.
+#[inline]
 fn pane_matches(flash_pane: Option<u64>, scope: Option<u64>) -> bool {
     match (flash_pane, scope) {
         (Some(typed_in), Some(scanning)) => typed_in == scanning,
@@ -622,12 +639,14 @@ fn pane_matches(flash_pane: Option<u64>, scope: Option<u64>) -> bool {
 
 /// `now − then` in ms, zero when `now` is the earlier one: the introspection
 /// capture path can legitimately hand the engine a rewound clock.
+#[inline]
 fn millis_since(now: Instant, then: Instant) -> u64 {
     now.saturating_duration_since(then).as_millis() as u64
 }
 
 /// How long a located flash lasts, ms from `since`: the whole window, or —
 /// revoked — the short fade from the revoke, whichever ends first.
+#[inline]
 fn window_ms(loc: &Located, revoked_at: Option<Instant>) -> u64 {
     let whole = u64::from(FLASH_MS);
     revoked_at.map_or(whole, |at| {
@@ -638,6 +657,7 @@ fn window_ms(loc: &Located, revoked_at: Option<Instant>) -> u64 {
 /// The tint envelope at `t` ms: smooth ramp in, hold, smoothstep fade over the
 /// last [`FADE_MS`]; zero at both ends. A revoke at `revoked_t` multiplies in
 /// its own short fade, continuous at the revoke, so revoking never pops.
+#[inline]
 fn envelope(t: u64, revoked_t: Option<u64>) -> f32 {
     let t = t as f32;
     let ramp = smoothstep(t / RAMP_MS as f32);
@@ -661,6 +681,7 @@ fn flash_hue(hue0: f32, i: usize, n: usize, t: u64) -> f32 {
 
 /// The rainbow colorway's theme rule: a light background takes deep candy
 /// tones that can clear the contrast bound on white.
+#[inline]
 fn resolve_sat_val(bg: u32) -> (f32, f32) {
     let table = crate::color_math::relative_luminance_table();
     if crate::color_math::relative_luminance_with(table, bg) > 0.5 {
@@ -726,6 +747,7 @@ fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
 /// A scalar inside a word on the glass: a token character of a spaced script,
 /// or any no-space-script scalar. A match bounded by one of these is part of a
 /// longer word (`sit` in `site`).
+#[inline]
 fn is_word_char(c: char) -> bool {
     is_token_char(c) || is_no_space_script(c)
 }
@@ -733,6 +755,7 @@ fn is_word_char(c: char) -> bool {
 /// Strong right-to-left scalars: Hebrew, Arabic and neighbours in the BMP, the
 /// presentation forms, and the SMP's RTL planes. Only decides whether the
 /// mirrored spelling is also tried, so a generous range is safe.
+#[inline]
 fn is_strong_rtl(c: char) -> bool {
     matches!(c as u32,
         0x0590..=0x08FF       // Hebrew, Arabic, Syriac, Thaana, NKo, Samaritan, Mandaic, Arabic Ext
@@ -844,8 +867,8 @@ fn find_in_row(
         if caret < start - reach || caret > end + 1 + reach {
             continue;
         }
-        let typed_left = (1..=2).any(|w| caret == end + 1 + w * back);
-        let committed_right = (1..=2).any(|w| caret + w * back == start);
+        let typed_left = caret == end + 1 + back || caret == end + 1 + 2 * back;
+        let committed_right = caret + back == start || caret + 2 * back == start;
         if exact_only && !typed_left {
             continue;
         }
@@ -907,6 +930,7 @@ fn find_word(
 
 /// `row − (base_y_now − base_y_then)`: where a live row stands after the scroll
 /// the snapshot reports. With either side unknown the delta is zero.
+#[inline]
 fn scrolled(row: u16, then: Option<i64>, now: Option<i64>) -> (i64, i64) {
     let delta = match (then, now) {
         (Some(then), Some(now)) => now.saturating_sub(then),

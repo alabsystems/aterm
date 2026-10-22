@@ -38,6 +38,7 @@ impl CursorGlow {
 
     /// Record one sound cue (drops when the backlog is full). Non-cursor
     /// gestures carry no travel direction (`dir = 0`).
+    #[inline]
     pub(super) fn cue_sound(&mut self, kind: crate::trail_sound::SoundKind, col: u16) {
         self.cue_sound_at(kind, col, self.blaze());
     }
@@ -46,6 +47,7 @@ impl CursorGlow {
     /// key-time click. Echo-born cues pass `blaze()`; only
     /// [`Self::cue_keystroke`] passes the heat its own keystroke is about to
     /// add, which `self.heat` does not carry until the echo arrives.
+    #[inline]
     pub(super) fn cue_sound_at(
         &mut self,
         kind: crate::trail_sound::SoundKind,
@@ -56,6 +58,7 @@ impl CursorGlow {
     }
 
     /// [`Self::cue_sound_at`] with shiftedness supplied, for the key-time seam.
+    #[inline]
     pub(super) fn cue_sound_shifted(
         &mut self,
         kind: crate::trail_sound::SoundKind,
@@ -106,6 +109,7 @@ impl CursorGlow {
     /// step is audible (`one_keystroke_of_heat_lag_is_audible` in
     /// `trail_sound`). `self.heat` is not written: the light charges at the
     /// echo, where the classification is known.
+    #[inline]
     pub fn cue_keystroke(&mut self, now: Instant) -> bool {
         self.cue_keystroke_kind(now, crate::trail_sound::SoundKind::Typed)
     }
@@ -114,6 +118,7 @@ impl CursorGlow {
     /// spacebar's comma ([`trail_sound::SoundKind::Space`]) rides here, since
     /// only the host knows the key. Silence law, backlog bound, column, timbre
     /// prediction and echo-muting credit are shared.
+    #[inline]
     pub fn cue_keystroke_kind(
         &mut self,
         now: Instant,
@@ -213,6 +218,7 @@ impl CursorGlow {
     /// The standing heat/flare cooled to `now` as the next tick will cool them:
     /// [`Self::keyed_blaze`] without the cadence charge, for a cue whose press
     /// earns no echo (the Shift lift). Pure read.
+    #[inline]
     pub(super) fn cooled_blaze(&self, now: Instant) -> (f32, f32) {
         let dt = self
             .heat_at
@@ -252,6 +258,7 @@ impl CursorGlow {
     /// Drop every unspent key-time click credit, alongside clearing
     /// [`Self::sound_cues`], so no credit mutes the first click after the
     /// aurora returns.
+    #[inline]
     pub(super) fn clear_keyed_clicks(&mut self) {
         self.keyed_clicks = 0;
         self.keyed_click_at = None;
@@ -294,6 +301,7 @@ impl CursorGlow {
     /// hand it to the synth at the key rather than at the next
     /// [`Self::drain_sound_cues`]. Valid only right after a `true` from
     /// `cue_keystroke`: it pops the most recent cue.
+    #[inline]
     pub fn take_key_cue(&mut self) -> Option<SoundCue> {
         self.sound_cues.pop()
     }
@@ -315,6 +323,7 @@ impl CursorGlow {
     /// [`Self::heat_tau_live`]) from this tick's config (pure functions of `cfg`
     /// that never read `intensity`). Every tick that may open the key seam calls
     /// this first.
+    #[inline]
     pub(super) fn store_key_timbre(&mut self, cfg: &GlowConfig) {
         self.heat_gain_live = Self::heat_gain(matches!(cfg.style, GlowStyle::Fire));
         self.heat_tau_live = Self::heat_tau(cfg);

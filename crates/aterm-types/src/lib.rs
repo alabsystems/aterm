@@ -23,6 +23,9 @@ pub mod dev_seam;
 // The argv0 aliases of the one `aterm` binary: the list the bundle lays and every
 // Rust reader shares.
 pub mod argv0;
+// The public release channel's GitHub owner: aterm-update-core's owners and agh's
+// release floor share it.
+pub mod channel;
 pub mod cli_path;
 
 pub mod identity;
@@ -109,6 +112,7 @@ pub mod pipeline_timestamps;
 pub use pipeline_timestamps::PipelineTimestamps;
 mod callback_types;
 pub mod charset;
+pub mod macos_setup;
 pub mod paragraph_direction;
 pub mod selection;
 mod shell_blocks;

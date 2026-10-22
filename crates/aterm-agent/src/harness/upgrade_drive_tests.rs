@@ -34,7 +34,7 @@ const STATUS: &str = "OK schema=1 sid=0 subject=%E2%97%90%20Git%20commit%20and%2
     subject_source=osc observed=true phase=running since_ms=4431314 outcome=none exit_code=- \
     signal=- detail=- confidence=strong reasons=fg_job,content_activity attribution=adopted \
     fs_consent=unknown conflict=false revision=171 enabled=true hold=0 fabric=absent \
-    fabric_rtt_ms=- fabric_link_age_ms=- identity=- hand=- level=quiet story=0 seq=232803 \
+    fabric_rtt_ms=- fabric_link_age_ms=- hand=- level=quiet story=0 seq=232803 \
     hash=7adef2d5e8547a9e";
 
 /// [`file_holders`] (the holder scan) names the holders `lsof -t` names, of a lock held through
@@ -17702,37 +17702,93 @@ fn the_notice_is_fenced_on_the_generation_it_was_judged_on() {
     assert!(!typed[0].contains("if-gen="), "{typed:?}");
 }
 
-/// The notice is typed under the harness's own hand (`lease acquire … hard`, [`Hand`]), so the
-/// window shows no driver row for it, and a refused fence (a ticking footer moves the generation
-/// about one try in ninety) is retried on a fresh read up to [`NOTICE_FENCE_TRIES`]. Negative
-/// controls: another driver's hold waits `held`; a server with no hard lease types without a
-/// hand; a fence that keeps refusing waits.
+/// A tab with an idle Claude Code for [`type_fenced`] alone: `text --json` draws an empty
+/// composer at one generation, a `cell` reads plain, `help` takes `if-gen=`, the `lease
+/// acquire` is answered `lease` (a `lease release` is `OK lease released` after an acquire it
+/// granted, `OK lease none` otherwise), and each `turn` the next of `turns`, the last repeating.
+/// Returns every request it read once the client is gone.
 #[cfg(unix)]
-#[test]
-fn the_notice_is_typed_under_the_harnesss_hand_and_a_refused_fence_is_retried() {
+fn hand_tab(
+    lease: &'static str,
+    turns: Vec<&'static str>,
+) -> (Client, std::thread::JoinHandle<Vec<String>>) {
+    use std::io::BufRead as _;
     let rule = "─".repeat(20);
     let screen = format!(
         r#"{{"rows":["{rule}","❯ ","{rule}"],"cursor":{{"row":1,"col":2}},"seq":77,"first":0,"gen":"4.77","human_ms":null}}"#
     );
-    let help = "OK 1\nturn [option=value ...] <text>: ... [if-gen=<epoch>.<seq>] ...";
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("pair");
+    let server = std::thread::spawn(move || {
+        let mut out = theirs.try_clone().expect("clone");
+        let mut asked = Vec::new();
+        let mut turns = turns.into_iter().peekable();
+        let mut last = "ERR no turn scripted";
+        for line in std::io::BufReader::new(theirs).lines() {
+            let Ok(line) = line else { break };
+            let verb = line
+                .split_whitespace()
+                .find(|w| !w.starts_with('@'))
+                .unwrap_or("");
+            let reply = match verb {
+                "lease" if line.contains(" lease release ") => {
+                    if lease.starts_with("OK lease acquired") {
+                        "OK lease released".to_string()
+                    } else {
+                        "OK lease none".to_string()
+                    }
+                }
+                "lease" => lease.to_string(),
+                "help" => "OK 1\nturn [option=value ...] <text>: ... [if-gen=<epoch>.<seq>] ..."
+                    .to_string(),
+                "text" => format!("OK {screen}"),
+                "cell" => "OK %20 d0d0d0 111318 none".to_string(),
+                "turn" => {
+                    last = turns.next().unwrap_or(last);
+                    last.to_string()
+                }
+                _ => "ERR unscripted".to_string(),
+            };
+            asked.push(line);
+            if writeln!(out, "{reply}").is_err() {
+                break;
+            }
+        }
+        asked
+    });
+    (RelayClient::new(ours), server)
+}
+
+/// The notice is typed under the harness's own hand (`lease acquire … hard`, [`Hand`]), so the
+/// window shows no driver row for it, and a refused fence (a ticking footer moves the generation
+/// about one try in ninety) is retried on a fresh read up to [`NOTICE_FENCE_TRIES`], the hand
+/// given back after. Negative controls: another driver's hold is `held` with nothing typed; a
+/// server with no hard lease types without a hand; a fence that keeps refusing is `changed`.
+/// [`type_fenced`] alone, over a scripted socket pair, as [`announce`] calls it.
+#[cfg(unix)]
+#[test]
+fn the_notice_is_typed_under_the_harnesss_hand_and_a_refused_fence_is_retried() {
     let held = "OK lease acquired holder=x ttl_ms=60000 expires_in_ms=60000 hard=1";
     let refused = "OK 0 turn skipped reason=changed submitted=0 seq=78 id=1";
     let taken = "OK 0 id=2 submitted=1 status=settled";
-    let rig = |name: &str, lease: &'static str, turn: Vec<&'static str>| {
-        Parked::new(
-            name,
-            Answers {
-                screen: screen.clone(),
-                help,
-                turn,
-                lease,
-                ..Answers::default()
-            },
-            settled(),
-            3600,
-        )
+    let retry = Retry {
+        looked: HandAt::Never,
+        owner_now: false,
+        at_break: false,
+        grace_s: 120,
     };
-    let requests = |h: &Parked| h.asked.lock().map(|a| a.clone()).unwrap_or_default();
+    let typed = |lease: &'static str, turns: Vec<&'static str>| {
+        let (mut c, server) = hand_tab(lease, turns);
+        let out = type_fenced(
+            &mut c,
+            TAB,
+            "[aterm harness] the notice",
+            Some(&retry),
+            Put::Pressed,
+            Duration::ZERO,
+        );
+        drop(c);
+        (out, server.join().expect("server"))
+    };
     let order = |asked: &[String]| -> Vec<&'static str> {
         asked
             .iter()
@@ -17749,10 +17805,9 @@ fn the_notice_is_typed_under_the_harnesss_hand_and_a_refused_fence_is_retried() 
             })
             .collect()
     };
-    // The fence refuses once and the second try lands, in one visit.
-    let h = rig("hand-retry", held, vec![refused, taken]);
-    assert_eq!(h.visit().step, "announced:1");
-    let asked = requests(&h);
+    // The fence refuses once and the second try lands, under the hard hold.
+    let (out, asked) = typed(held, vec![refused, taken]);
+    assert_eq!(out, Ok(()), "{asked:?}");
     assert_eq!(order(&asked), ["acquire", "turn", "turn", "release"]);
     assert!(
         asked
@@ -17761,32 +17816,31 @@ fn the_notice_is_typed_under_the_harnesss_hand_and_a_refused_fence_is_retried() 
             .is_some_and(|l| l.ends_with(" hard")),
         "the hard hold: {asked:?}"
     );
-    drop(h);
-    // A fence that keeps refusing: a wait, the hand still given back.
-    let h = rig("hand-refused", held, vec![refused]);
-    assert_eq!(h.visit().step, "wait:announce-refused:changed");
+    assert!(
+        asked
+            .iter()
+            .filter(|l| l.contains(" turn "))
+            .all(|l| l.contains(" if-gen=4.77 ")),
+        "each try fenced: {asked:?}"
+    );
+    // A fence that keeps refusing: `changed`, the hand still given back.
+    let (out, asked) = typed(held, vec![refused]);
+    assert_eq!(out, Err(Typed::Changed), "{asked:?}");
     let mut want = vec!["acquire"];
     want.extend(std::iter::repeat_n("turn", NOTICE_FENCE_TRIES));
     want.push("release");
-    assert_eq!(order(&requests(&h)), want);
-    drop(h);
+    assert_eq!(order(&asked), want);
     // Another driver holds the tab: nothing typed.
-    let h = rig("hand-busy", "ERR busy lease=orchestrator", vec![taken]);
-    assert_eq!(h.visit().step, "wait:announce-refused:held");
-    assert_eq!(order(&requests(&h)), ["acquire"]);
-    assert_eq!(
-        load(&h.opts, SESSION).map(|st| st.phase),
-        Some(Phase::Pending)
-    );
-    drop(h);
-    // Negative control: no hard lease to take (an older server).
-    let h = rig(
-        "hand-older",
+    let (out, asked) = typed("ERR busy lease=orchestrator", vec![taken]);
+    assert_eq!(out, Err(Typed::Refused("held".to_string())));
+    assert_eq!(order(&asked), ["acquire"]);
+    // Negative control: no hard lease to take (an older server), so none to give back.
+    let (out, asked) = typed(
         "ERR lease acquire: unknown arg 'hard' (ttl=<ms> holder=<name>)",
         vec![taken],
     );
-    assert_eq!(h.visit().step, "announced:1");
-    assert_eq!(order(&requests(&h)), ["acquire", "turn"]);
+    assert_eq!(out, Ok(()), "{asked:?}");
+    assert_eq!(order(&asked), ["acquire", "turn"]);
 }
 
 /// The wait log (the ledger holds only acts): each change of wait and each act is one row

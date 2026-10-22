@@ -1164,15 +1164,6 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         &["palette", "ansi", "colors", "colours", "slot", "indexed"],
         true,
     ),
-    // A theme per session identity (`identity_themes = { worker = "Hearth" }`):
-    // file-only, documented in `aterm help themes` (`crate::session_theme`).
-    manual(
-        "identity_themes",
-        "Theme per session identity",
-        ConfigSchemaKind::DynamicStringMap,
-        &["theme", "identity", "profile", "session", "worker"],
-        true,
-    ),
     manual(
         "update",
         "Software update",

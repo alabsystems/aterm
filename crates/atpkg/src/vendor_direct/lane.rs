@@ -1144,7 +1144,10 @@ fn land(
         .record_bytes()
         .map_err(|e| FlowError::VendorRefused(e.to_string()))?;
     // (a) no execute bit off a native executable, (b) the darwin Developer ID gate, (c) the
-    // recorded root is the root of the tree as it stands after (a).
+    // recorded root is the root of the tree as it stands after (a). The row's aliases are
+    // laid before this hook runs (`StageHooks::aliases`), so (b) judges each clone as a file
+    // of its own; with any laid, the stage folds the root after this hook itself, so (c)
+    // needs no walk of its own.
     let final_root: RefCell<Option<String>> = RefCell::new(None);
     let gate =
         crate::install::developer_id_gate(spec.apple_team, spec.exposes, lane.trust.team_check);
@@ -1167,7 +1170,7 @@ fn land(
                 return Err(StageError::SignerRefused(recut(c, &first)));
             }
         }
-        if demoted {
+        if demoted && spec.aliases.is_empty() {
             *final_root.borrow_mut() = Some(crate::tree::tree_root(tree).map_err(StageError::Io)?);
         }
         Ok(())
@@ -1186,6 +1189,7 @@ fn land(
     let hooks = StageHooks {
         pre_swap: Some(&pre_swap),
         sidecars: Some(&sidecars),
+        aliases: spec.aliases,
     };
     let exposes: Vec<String> = spec.exposes.iter().map(|t| (*t).to_string()).collect();
     let shim_env = spec.shim_env();
@@ -2433,6 +2437,10 @@ mod tests {
         super::super::spec("codex").unwrap()
     }
 
+    fn codex_old() -> &'static VendorSpec {
+        super::super::spec("codex-old").unwrap()
+    }
+
     /// Run the lane for `spec` once, unattended.
     fn run(layout: &Layout, fetcher: &Fake, policy: &Policy, spec: &'static VendorSpec) -> Outcome {
         run_with(layout, fetcher, policy, &world::trust(), spec, false)
@@ -3270,6 +3278,146 @@ mod tests {
                 0
             );
         }
+    }
+
+    /// CODEX-OLD LANDS OPENAI'S BUILD UNDER ITS OWN NAME (owner ruling 2026-10-20), end to
+    /// end on a scratch store: OpenAI's own package, read from OpenAI's head under codex's
+    /// pins, lands in `codex-old`'s own store with its entry cloned to `bin/codex-old` — a
+    /// regular file holding exactly OpenAI's `bin/codex` bytes at its mode, beside the
+    /// vendor's entry left as it shipped — and the `bin/` shim and the `agents/` twin run that
+    /// clone. The record's root is the tree as built, alias and all, so `atpkg verify` reads
+    /// no drift; and it lays no `codex` of its own.
+    #[test]
+    fn codex_old_lands_openais_build_under_its_own_name() {
+        let l = world::layout("codex-old");
+        let f = Fake::default();
+        f.publish_codex_default("0.163.0");
+        let o = run(&l, &f, &Policy::default(), codex_old());
+        assert!(
+            matches!(
+                o.verdict,
+                Verdict::Installed {
+                    reason: InstallReason::Fresh,
+                    ..
+                }
+            ),
+            "{o:?}"
+        );
+        let dir = world::build_dir(&l, "codex-old", "0.163.0");
+        let (entry, alias) = (
+            dir.join(world::bin("codex")),
+            dir.join(world::bin("codex-old")),
+        );
+        let meta = |p: &Path| std::fs::symlink_metadata(p).unwrap();
+        assert!(
+            meta(&alias).file_type().is_file(),
+            "a regular file, never a link"
+        );
+        assert_eq!(std::fs::read(&alias).unwrap(), native_exe("codex 0.163.0"));
+        assert_eq!(std::fs::read(&entry).unwrap(), native_exe("codex 0.163.0"));
+        assert_eq!(meta(&alias).permissions(), meta(&entry).permissions());
+        let tool = |name: &str| crate::store::ToolName::new(name).unwrap();
+        assert_eq!(
+            crate::platform::resolve_shim(&l.shim(&tool("codex-old"))),
+            Some(alias.clone())
+        );
+        assert_eq!(
+            crate::activate::twin_target(&l, "codex-old"),
+            Some(alias.clone())
+        );
+        assert!(std::fs::symlink_metadata(l.shim(&tool("codex"))).is_err());
+        assert_eq!(shim_build(&l, "codex-old"), Some(v("0.163.0").build_id()));
+        assert_eq!(shim_build(&l, "codex"), None);
+        let record = complete_record(&dir).unwrap();
+        assert_eq!(record.program, "codex-old");
+        let modes = crate::store::declared_modes(&dir).unwrap();
+        assert_eq!(
+            record.tree_root,
+            crate::tree::tree_root_declared(&dir, &modes).unwrap()
+        );
+        assert_eq!(
+            crate::verify::verify_program(&l, "codex-old"),
+            crate::verify::VerifyOutcome::VendorRoot {
+                build: v("0.163.0").build_id(),
+                vendor: "OpenAI".into(),
+                drift: None,
+            }
+        );
+        assert!(
+            f.gets
+                .borrow()
+                .iter()
+                .all(|(url, _)| crate::vendor::vendor_direct_url_allowed("codex", url)),
+            "only OpenAI's documents, under codex's pins"
+        );
+        assert_eq!(
+            f.downloads.borrow().as_slice(),
+            [Fake::codex_payload_url("0.163.0")]
+        );
+    }
+
+    /// THE GATE JUDGES THE CLONE AS A MACH-O OF ITS OWN: a codesign verdict refusing
+    /// `bin/codex-old` alone refuses the landing — nothing swapped in, nothing shimmed —
+    /// though OpenAI's own entry passes. The control: the same package lands under a verdict
+    /// that passes it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_gate_judges_codex_olds_clone_as_a_mach_o_of_its_own() {
+        fn refuse_the_alias(
+            path: &Path,
+            _: &str,
+            _: std::time::Instant,
+        ) -> Result<(), aterm_update_core::codesign::CodesignError> {
+            if path.ends_with("bin/codex-old") {
+                Err(aterm_update_core::codesign::CodesignError::Refused {
+                    code: Some(3),
+                    stderr: "test-requirement: code failed to satisfy specified code \
+                             requirement(s)\n"
+                        .into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+        let f = Fake::default();
+        f.publish_codex_default("0.163.0");
+        let refusing = Trust {
+            team_check: refuse_the_alias,
+            ..world::trust()
+        };
+        let l = world::layout("codex-old-gate");
+        let o = run_with(&l, &f, &Policy::default(), &refusing, codex_old(), false);
+        assert!(matches!(o.verdict, Verdict::Refused { .. }), "{o:?}");
+        assert!(o.line().contains("bin/codex-old"), "{}", o.line());
+        assert_eq!(shim_build(&l, "codex-old"), None);
+        assert!(!crate::store::build_is_complete(&world::build_dir(
+            &l,
+            "codex-old",
+            "0.163.0"
+        )));
+        let control = world::layout("codex-old-gate-control");
+        let o = run(&control, &f, &Policy::default(), codex_old());
+        assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+    }
+
+    /// A PACKAGE WITH NO ENTRY TO CLONE lands nothing: OpenAI's tree without `bin/codex`
+    /// fails `codex-old`'s landing before the swap, its shim never laid — never a shim
+    /// running a file that is not there, on any platform.
+    #[test]
+    fn a_codex_package_without_its_entry_lands_no_codex_old() {
+        let f = Fake::default();
+        f.publish_codex("0.163.0", &[("codex-path/rg", &native_exe("rg"), 0o755)]);
+        let l = world::layout("codex-old-no-entry");
+        let o = run(&l, &f, &Policy::default(), codex_old());
+        assert!(o.is_failure(), "{o:?}");
+        let missing_entry = format!("{} is not a regular file", world::bin("codex"));
+        assert!(o.line().contains(&missing_entry), "{}", o.line());
+        assert_eq!(shim_build(&l, "codex-old"), None);
+        assert!(!crate::store::build_is_complete(&world::build_dir(
+            &l,
+            "codex-old",
+            "0.163.0"
+        )));
     }
 
     /// Staging names carry the version, so a `.part` left by another version is never

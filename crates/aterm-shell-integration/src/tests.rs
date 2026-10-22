@@ -85,6 +85,23 @@ impl std::ops::DerefMut for ShellCommand {
     }
 }
 
+/// fish's marks that its man-page completions were made, under a home whose
+/// XDG dirs are [`aterm_spec::host::hermetic_env`]'s: fish 4 reads its cache
+/// dir's, fish 3 its data dir's ([`FISH3_COMPLETIONS_MADE`]). An interactive
+/// fish that finds its own missing starts fish_update_completions at its first
+/// prompt: a detached python that parses every man page on the host (~0.4 CPU-s
+/// and 200 files a second, measured with fish 4.9.3) and outlives the test. With
+/// fish 3's missing, one run of this crate's lib tests in the Linux lane
+/// (Ubuntu's fish 3.7.0) left 20 running, and ten runs of one fish test drove
+/// the guest's load to 87.
+#[cfg(unix)]
+const FISH_COMPLETIONS_MADE: [&str; 2] =
+    [".cache/fish/generated_completions", FISH3_COMPLETIONS_MADE];
+
+/// fish 3's mark of [`FISH_COMPLETIONS_MADE`], in its data dir.
+#[cfg(unix)]
+const FISH3_COMPLETIONS_MADE: &str = ".local/share/fish/generated_completions";
+
 /// Spawn a shell with a hermetic environment for integration tests.
 ///
 /// # The developer's own dotfiles are NOT part of the fixture
@@ -199,17 +216,10 @@ fn shell_command(shell: &str) -> ShellCommand {
         .tempdir()
         .expect("create hermetic HOME for shell integration tests");
     let home = dir.path();
-    // `fish/generated_completions` in the cache dir already: an interactive fish
-    // whose cache has none starts fish_update_completions at its first prompt, a
-    // detached python that parses every man page on the host into it for as long
-    // as the shell lives (~0.4 CPU-s and 200 files a second, measured with fish
-    // 4.9.3), so every live fish of this binary ran one beside it.
-    for sub in [
-        ".config/fish/conf.d",
-        ".local/share/fish",
-        ".local/state",
-        ".cache/fish/generated_completions",
-    ] {
+    for sub in [".config/fish/conf.d", ".local/state"]
+        .into_iter()
+        .chain(FISH_COMPLETIONS_MADE)
+    {
         std::fs::create_dir_all(home.join(sub))
             .expect("create hermetic HOME for shell integration tests");
     }
@@ -2785,6 +2795,84 @@ struct LiveShell {
     /// The hermetic home the shell's environment points into, when the
     /// [`ShellCommand`] that made it is gone ([`Self::holding`]).
     home: Option<aterm_tempfile::TempDir>,
+    /// An rc's background job, armed before any wait/assertion can unwind.
+    job: Option<ShellJob>,
+    job_cleanup_started: bool,
+}
+
+#[cfg(unix)]
+struct ShellJob {
+    pid_file: PathBuf,
+    root: std::sync::Arc<std::sync::Mutex<Option<aterm_tempfile::TempDir>>>,
+    script: Option<OwnedShellPid>,
+    /// The same open FIFO the fixture holds, never a reopened pathname.
+    release: std::fs::File,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OwnedShellPid {
+    pid: i32,
+    start: aterm_uds::process::ProcessStart,
+}
+
+#[cfg(unix)]
+impl OwnedShellPid {
+    fn read(pid: u32) -> Option<Self> {
+        let pid = i32::try_from(pid).ok().filter(|pid| *pid > 1)?;
+        Some(Self {
+            pid,
+            start: aterm_uds::process::read_process_start(pid)?,
+        })
+    }
+
+    fn current(self) -> bool {
+        Self::read(self.pid as u32) == Some(self)
+    }
+
+    fn ended(self) -> bool {
+        !aterm_uds::process::pid_alive(self.pid as u32)
+            || Self::read(self.pid as u32).is_some_and(|now| now != self)
+    }
+}
+
+#[cfg(unix)]
+impl ShellJob {
+    /// A private PID file alone is no signal authority: the still-current job
+    /// must descend from this exact live `script` child. Re-read every start
+    /// across its parent observation; never signal a process with unknown custody.
+    fn owned(&self) -> Result<OwnedShellPid, String> {
+        let script = self.script.ok_or("script's start was unreadable")?;
+        let text = std::fs::read_to_string(&self.pid_file).map_err(|e| e.to_string())?;
+        let job = text
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .and_then(OwnedShellPid::read)
+            .ok_or("job's positive live PID/start was unreadable")?;
+        let mut child = job;
+        for _ in 0..8 {
+            let parent = aterm_uds::process::read_process_parent(child.pid)
+                .and_then(OwnedShellPid::read)
+                .ok_or("job's parent was unreadable")?;
+            if !child.current() {
+                return Err("job ancestry changed".to_owned());
+            }
+            if parent == script {
+                return (script.current() && job.current())
+                    .then_some(job)
+                    .ok_or_else(|| "job or script identity changed".to_owned());
+            }
+            child = parent;
+        }
+        Err("job is not a descendant of this script".to_owned())
+    }
+
+    fn preserve(&self) {
+        if let Some(root) = self.root.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            eprintln!("unconfirmed shell job: kept {}", root.keep().display());
+        }
+    }
 }
 
 // `#[cfg(test)]` is redundant for the compiler (this file is `include!`d into lib.rs's
@@ -2798,13 +2886,19 @@ fn pump(mut reader: impl std::io::Read + Send + 'static) -> std::sync::Arc<Pumpe
         bytes: std::sync::Mutex::new(Vec::new()),
         grew: std::sync::Condvar::new(),
         ended: std::sync::atomic::AtomicBool::new(false),
+        eof: std::sync::atomic::AtomicBool::new(false),
     });
     let out = std::sync::Arc::clone(&sink);
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => {
+                    out.eof.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
                 Ok(n) => out
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2831,6 +2925,8 @@ struct Pumped {
     bytes: std::sync::Mutex<Vec<u8>>,
     grew: std::sync::Condvar,
     ended: std::sync::atomic::AtomicBool,
+    /// Only a successful zero-byte read proves EOF; a stopped reader may have failed.
+    eof: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(unix)]
@@ -2898,6 +2994,8 @@ impl LiveShell {
             stdout,
             stderr,
             home: None,
+            job: None,
+            job_cleanup_started: false,
         }
     }
 
@@ -2906,6 +3004,69 @@ impl LiveShell {
     fn holding(mut self, home: aterm_tempfile::TempDir) -> Self {
         self.home = Some(home);
         self
+    }
+
+    /// Retire a positively owned background job before the direct child, on
+    /// success or unwinding. Kernel PID checks cannot eliminate the final
+    /// read-to-signal race; no signal is sent on an unknown/mismatched read.
+    fn stop_owned_job(&mut self) -> Result<(), String> {
+        use std::io::Write as _;
+        let Some(mut job) = self.job.take() else {
+            return Ok(());
+        };
+        self.job_cleanup_started = true;
+        let until = std::time::Instant::now() + Self::TIMEOUT;
+        let result = (|| {
+            let owned = job.owned()?;
+            // SAFETY: positive PID of this still-current child's descendant,
+            // with its kernel start checked immediately before this signal.
+            // No group/zero/negative PID or pathname-derived executable is signalled.
+            if !owned.current() || unsafe { libc::kill(owned.pid, libc::SIGKILL) } != 0 {
+                return Err("owned job could not be killed".to_owned());
+            }
+            // A warm fish is blocked in its FIFO read. Let its event loop run
+            // and reap this job before closing the PTY: killing script first
+            // can leave the dead job waiting for its parent to reap it.
+            // These private pipes carry only the fixture's bounded protocol.
+            job.release
+                .write_all(b"go\n")
+                .map_err(|e| format!("release the owned shell's hold: {e}"))?;
+            self.stdin
+                .write_all(format!("wait {}\n", owned.pid).as_bytes())
+                .and_then(|()| self.stdin.flush())
+                .map_err(|e| format!("ask the owned shell to reap its job: {e}"))?;
+            while !owned.ended() {
+                if std::time::Instant::now() >= until {
+                    return Err(format!("owned shell did not reap its job: {owned:?}"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Ok(owned)
+        })();
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+        }
+        let mut reaped = false;
+        loop {
+            reaped |= matches!(self.child.try_wait(), Ok(Some(_)));
+            let job_ended = result.as_ref().is_ok_and(|owned| owned.ended());
+            let pipes_ended = [&self.stdout, &self.stderr]
+                .into_iter()
+                .all(|pipe| pipe.eof.load(std::sync::atomic::Ordering::SeqCst));
+            if reaped && job_ended && pipes_ended {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= until || (reaped && result.is_err()) {
+                job.preserve();
+                if let Some(home) = self.home.take() {
+                    eprintln!("unconfirmed shell job: kept {}", home.keep().display());
+                }
+                return Err(result.err().unwrap_or_else(|| {
+                    format!("cleanup unconfirmed: script_reaped={reaped}, job_ended={job_ended}, pipes_ended={pipes_ended}")
+                }));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 
     fn stderr_text(&self) -> String {
@@ -3044,6 +3205,10 @@ impl LiveShell {
     }
 
     fn finish(mut self) {
+        if self.job.is_some() {
+            self.stop_owned_job().expect("owned background job retired");
+            return;
+        }
         self.send("exit");
         self.wait_exit_status("did not exit after `exit`");
     }
@@ -3056,6 +3221,16 @@ impl LiveShell {
 #[cfg(unix)]
 impl Drop for LiveShell {
     fn drop(&mut self) {
+        let owns_job = self.job.is_some() || self.job_cleanup_started;
+        if let Err(error) = self.stop_owned_job() {
+            eprintln!("{}: {error}", self.label);
+        }
+        if owns_job {
+            // Its bounded cleanup already reaped the direct child, or kept
+            // every directory on an unconfirmed result. Do not enter a second,
+            // unbounded wait during unwinding.
+            return;
+        }
         if !matches!(self.child.try_wait(), Ok(Some(_))) {
             let _ = self.child.kill();
             let _ = self.child.wait();

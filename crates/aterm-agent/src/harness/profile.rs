@@ -1098,6 +1098,56 @@ pub fn subscription_and_plan_for(
     Some((selected.subscription(now), plan))
 }
 
+/// THE ACCOUNT A MUSE CODE PROCESS IS SIGNED IN AS, for the footer's
+/// volatile display ([`SubscriptionDisplay`]): Muse Code's own login
+/// store, `muse/auth.json` under the config home its environment names
+/// (`XDG_CONFIG_HOME`, else `~/.config`; MEASURED on 1.4.11-R6667.1,
+/// where the `meta` provider's row carries `user_email` beside its
+/// `oauth` mechanism and the credential itself in the keychain). The
+/// tier and the weekly quota are not in the store; the window reads
+/// those off Muse Code's own `/status` and `/usage` cards
+/// (`aterm_phase::muse::status_card_account`,
+/// `aterm_phase::muse::usage_card_weekly`). `None` where the process
+/// runs on an API key (`META_API_KEY` in its environment: its `/status`
+/// card then names no account), no store reads, or its `meta` row names
+/// no address: nothing shown rather than guessed, and the address is
+/// returned only as this display, never logged or recorded.
+#[must_use]
+pub fn muse_subscription_for(env: &[String], user_home: &Path) -> Option<SubscriptionDisplay> {
+    let var = |key: &str| {
+        env.iter()
+            .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
+            .filter(|value| !value.is_empty())
+    };
+    if var("META_API_KEY").is_some() {
+        return None;
+    }
+    let config = match var("XDG_CONFIG_HOME").map(PathBuf::from) {
+        Some(xdg) if xdg.is_absolute() => xdg,
+        _ => var("HOME")
+            .map_or_else(|| user_home.to_path_buf(), PathBuf::from)
+            .join(".config"),
+    };
+    let email = read_with(&config.join("muse").join("auth.json"), |bytes| {
+        let Obj(raw) =
+            aterm_json::from_slice::<Obj<RawMuseAuth>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+        let meta = raw.and_then(|auth| auth.providers.0).and_then(|p| p.meta.0);
+        Ok(meta.and_then(|meta| {
+            let oauth = meta.mechanism.0.as_deref().is_none_or(|m| m == "oauth");
+            oauth
+                .then_some(meta.email.0)
+                .flatten()
+                .filter(|email| email.contains('@') && !email.chars().any(char::is_whitespace))
+        }))
+    })
+    .ok()??;
+    Some(SubscriptionDisplay {
+        email: Some(email),
+        plan: None,
+        weekly: None,
+    })
+}
+
 /// One read of a process's selected profile ([`selected_profile`]).
 struct Selected {
     /// What the profile says of its account.
@@ -1834,6 +1884,29 @@ macro_rules! lenient_scalars {
             Ok($none)
         }
     };
+}
+
+/// Muse Code's login store (`auth.json`), the `meta` provider's address
+/// alone kept: every other key read past unkept, as [`RawWho`]'s are, so
+/// no credential material another mechanism keeps there is materialized.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawMuseAuth {
+    providers: Obj<RawMuseProviders>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawMuseProviders {
+    meta: Obj<RawMuseMeta>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawMuseMeta {
+    mechanism: Address,
+    #[serde(rename = "user_email")]
+    email: Address,
 }
 
 /// The email-only allowlist shared by the login check and volatile footer display.

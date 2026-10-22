@@ -17,7 +17,7 @@ use crate::LAB;
 use crate::door::Door;
 use crate::paths::{paths, valid_tag};
 use crate::procs::{self, alive, descendants};
-use crate::protected::{CCSOCKS, inside_protected};
+use crate::protected::{CCSOCKS, inside_any};
 use crate::pyjson::J;
 use crate::run::{Run, all_runs, take_only_tag, take_tag};
 use crate::util::{atomic_write, keep_file, keep_tree, now_secs, shell_quote};
@@ -68,6 +68,10 @@ pub struct UpOpts {
     /// `LAB_CLOCK=1`: the lab's sleep clock loaded into its instance and its
     /// Claude Code ([`crate::clock`]), which `sleep` steps.
     pub clock: bool,
+    /// The lab's instance OPENS A WINDOW on this desk, in the same jail
+    /// ([`windowed`]): a verb's own choice (`forever --window`), never the
+    /// environment's.
+    pub window: bool,
 }
 
 impl UpOpts {
@@ -95,44 +99,43 @@ impl UpOpts {
             lifeline: false,
             instance_env: var("LAB_INSTANCE_ENV"),
             clock: set("LAB_CLOCK"),
+            window: false,
         }
     }
 }
 
 /// The managed Claude Code, launched by path (not through its shim): the last
 /// path of the arrow chain `aterm pkg which claude` prints under a clean
-/// environment (`claude → <shim> → <store binary> — managed <ver> — …`), or `$LAB_CLAUDE`.
+/// environment (`claude → <shim> → <store binary> — managed <ver> — …`,
+/// [`pkg_which`]), or `$LAB_CLAUDE`.
 ///
 /// # Errors
 /// Neither names an executable.
 pub fn find_claude() -> Result<String, String> {
     let c = match std::env::var("LAB_CLAUDE") {
         Ok(c) if !c.is_empty() => c,
-        _ => {
-            let aterm = paths().need_aterm()?;
-            let out = aterm_uds::spawnfd::command(aterm)
-                .env_clear()
-                .env("HOME", &paths().real_home)
-                .env("PATH", "/usr/bin:/bin")
-                .env("xcrun_nocache", "1")
-                .args(["pkg", "which", "claude"])
-                .stdin(Stdio::null())
-                .output()
-                .map_err(|e| format!("cannot run {}: {e}", aterm.display()))?;
-            let text = String::from_utf8_lossy(&out.stdout);
-            let line = text.lines().next().unwrap_or("").to_string();
-            managed_claude(&line).ok_or_else(|| {
-                format!(
-                    "cannot tell which Claude Code is managed here (aterm pkg which claude said: {}); set LAB_CLAUDE=/path/to/claude",
-                    if line.is_empty() { "nothing" } else { &line }
-                )
-            })?
-        }
+        _ => store_claude(paths(), paths().need_aterm()?)?,
     };
     if !crate::sys::executable(&c) {
         return Err(format!("cannot execute {c}"));
     }
     Ok(fs::canonicalize(&c).map_or(c, |p| p.to_string_lossy().into_owned()))
+}
+
+/// The managed Claude Code of the package store the lab's facts `p` name
+/// ([`crate::paths::Paths::store_home`], the account's whatever `HOME` says),
+/// as `aterm` reports it ([`pkg_which`]).
+///
+/// # Errors
+/// `aterm` could not be run, or named no managed Claude Code.
+fn store_claude(p: &crate::paths::Paths, aterm: &Path) -> Result<String, String> {
+    let line = pkg_which(aterm, p.store_home(), "claude")?;
+    managed_claude(&line).ok_or_else(|| {
+        format!(
+            "cannot tell which Claude Code is managed here (aterm pkg which claude said: {}); set LAB_CLAUDE=/path/to/claude",
+            if line.is_empty() { "nothing" } else { &line }
+        )
+    })
 }
 
 /// The store binary of a `pkg which claude` line: the path after its last `→`.
@@ -156,20 +159,38 @@ pub fn managed_bin(name: &str, line: &str) -> Option<String> {
 }
 
 /// The store binary of the managed `name`: the last path of `aterm pkg which
-/// <name>`'s arrow chain under a clean environment (not the atpkg shim).
+/// <name>`'s arrow chain under a clean environment (not the atpkg shim,
+/// [`pkg_which`]).
 pub(crate) fn managed_store_bin(name: &str) -> Option<String> {
-    let aterm = paths().need_aterm().ok()?;
+    managed_store_bin_in(paths(), paths().need_aterm().ok()?, name)
+}
+
+/// [`managed_store_bin`] in the package store the lab's facts `p` name
+/// ([`crate::paths::Paths::store_home`]), as `aterm` reports it.
+fn managed_store_bin_in(p: &crate::paths::Paths, aterm: &Path, name: &str) -> Option<String> {
+    managed_bin(name, &pkg_which(aterm, p.store_home(), name).ok()?)
+}
+
+/// The first line `aterm pkg which <name>` prints, run under a clean
+/// environment whose `HOME` is `home`: the home whose package store holds the
+/// managed agents ([`crate::paths::Paths::store_home`], the account's), never
+/// the caller's `HOME`, which under a scratch `HOME` holds no store and would
+/// leave every agent to a `LAB_*` variable set by hand.
+///
+/// # Errors
+/// `aterm` could not be run.
+fn pkg_which(aterm: &Path, home: &str, name: &str) -> Result<String, String> {
     let out = aterm_uds::spawnfd::command(aterm)
         .env_clear()
-        .env("HOME", &paths().real_home)
+        .env("HOME", home)
         .env("PATH", "/usr/bin:/bin")
         .env("xcrun_nocache", "1")
         .args(["pkg", "which", name])
         .stdin(Stdio::null())
         .output()
-        .ok()?;
+        .map_err(|e| format!("cannot run {}: {e}", aterm.display()))?;
     let text = String::from_utf8_lossy(&out.stdout);
-    managed_bin(name, text.lines().next().unwrap_or(""))
+    Ok(text.lines().next().unwrap_or("").to_string())
 }
 
 /// `c` by its physical path when it is executable, else `None`.
@@ -561,6 +582,115 @@ fn lifeline_flag() -> Vec<String> {
 /// [`aterm_uds::deadline::FIRST_EXEC_HANG`] instead.
 const READY_HANG: Duration = Duration::from_secs(60);
 
+/// `sandbox-exec -f <jail> env -i <vars> <program…>` as a std `Command`, in a
+/// session of its own, started in the scratch, its output appended to `out`,
+/// every descriptor above stdio stripped first (`InheritNothing`): the jailed
+/// launch [`launch_ready`] and [`launch_window`] spawn.
+///
+/// # Errors
+/// `out` could not be opened.
+fn jailed_command(
+    run: &Run,
+    vars: &[(String, String)],
+    program: &[String],
+    out: &Path,
+    stdin: Option<fs::File>,
+) -> Result<aterm_uds::spawnfd::StdCommand, String> {
+    use aterm_uds::spawnfd::InheritNothing as _;
+    let (o, e) = append_to_std(out).map_err(|e| e.to_string())?;
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the jailed launch: a headless one hands a descriptor above stdio (--ready-fd)"
+    )]
+    let mut cmd = std::process::Command::new("/usr/bin/sandbox-exec");
+    cmd.inherit_nothing();
+    cmd.arg("-f")
+        .arg(run.run.join("jail.sb"))
+        .args(["/usr/bin/env", "-i", "xcrun_nocache=1"]);
+    for (k, v) in vars {
+        cmd.arg(format!("{k}={v}"));
+    }
+    cmd.args(program)
+        .current_dir(&run.w)
+        .stdin(stdin.map_or_else(std::process::Stdio::null, std::process::Stdio::from))
+        .stdout(o)
+        .stderr(e);
+    crate::sys::in_own_session(&mut cmd);
+    Ok(cmd)
+}
+
+/// A WINDOWED instance launched in the jail ([`jailed_command`]): a window
+/// takes no ready signal (`--ready-fd` is a headless launch's, refused for a
+/// window a person sees come up), so it is ready once its control socket
+/// answers `version` through the lab's door, asked every 250 ms up to `hang`
+/// (the hang detector). `pid` is set to the child's as soon as it is spawned,
+/// so a caller's cleanup ends it.
+///
+/// # Errors
+/// The launch failed, the child ended before its socket answered, it did not
+/// answer within `hang`, or the run was interrupted (`interrupted`).
+fn launch_window(
+    run: &Run,
+    vars: &[(String, String)],
+    program: &[String],
+    out: &Path,
+    stdin: Option<fs::File>,
+    (pid, hang): (&mut i32, Duration),
+) -> Result<(), String> {
+    let mut cmd = jailed_command(run, vars, program, out, stdin)?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot start {}: {e}", program.join(" ")))?;
+    *pid = procs::keep_forked(child);
+    let door = Door::new(run)?;
+    let child = *pid;
+    until_answered(
+        || door.ctl(&["version"]).is_ok_and(|r| r.code == 0),
+        || alive(child),
+        hang,
+        || stop::sleep(Duration::from_millis(250)).map_err(|_| "interrupted".to_string()),
+    )
+}
+
+/// A window's readiness ([`launch_window`]): `answers` (its control socket
+/// answered `version`) is asked first, then `alive` (the child still runs),
+/// then the hang detector `hang`; between the asks, `pause` (250 ms, which
+/// fails `interrupted` on an interrupt).
+///
+/// # Errors
+/// The child ended before an answer, nothing answered within `hang`, or
+/// `pause` failed.
+fn until_answered(
+    mut answers: impl FnMut() -> bool,
+    mut alive: impl FnMut() -> bool,
+    hang: Duration,
+    mut pause: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    let end = std::time::Instant::now() + hang;
+    loop {
+        if answers() {
+            return Ok(());
+        }
+        if !alive() {
+            return Err("the window's instance ended before its control socket answered".into());
+        }
+        if std::time::Instant::now() >= end {
+            return Err("its control socket did not answer within the hang detector".into());
+        }
+        pause()?;
+    }
+}
+
+/// Why `o` cannot bring a lab up, before anything is made: a windowed lab
+/// (`forever --window`) under `LAB_RESTORE=1`, since the headless-restore
+/// seam is a headless instance's. `None`: nothing in `o` conflicts.
+#[must_use]
+pub(crate) fn opts_refused(o: &UpOpts) -> Option<&'static str> {
+    (o.window && o.restore).then_some(
+        "a windowed lab takes no LAB_RESTORE=1: the headless-restore seam is a headless instance's",
+    )
+}
+
 /// `sandbox-exec -f <jail> env -i <vars> <program…>`, in a session of its
 /// own, started in the scratch, its output appended to `out` — its `program`
 /// handed a READY SIGNAL
@@ -586,26 +716,7 @@ pub(crate) fn launch_ready(
     stdin: Option<fs::File>,
     (pid, hang): (&mut i32, Duration),
 ) -> Result<(), String> {
-    use aterm_uds::spawnfd::InheritNothing as _;
-    let (o, e) = append_to_std(out).map_err(|e| e.to_string())?;
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the one lab spawn that hands a descriptor above stdio (--ready-fd)"
-    )]
-    let mut cmd = std::process::Command::new("/usr/bin/sandbox-exec");
-    cmd.inherit_nothing();
-    cmd.arg("-f")
-        .arg(run.run.join("jail.sb"))
-        .args(["/usr/bin/env", "-i", "xcrun_nocache=1"]);
-    for (k, v) in vars {
-        cmd.arg(format!("{k}={v}"));
-    }
-    cmd.args(program)
-        .current_dir(&run.w)
-        .stdin(stdin.map_or_else(std::process::Stdio::null, std::process::Stdio::from))
-        .stdout(o)
-        .stderr(e);
-    crate::sys::in_own_session(&mut cmd);
+    let mut cmd = jailed_command(run, vars, program, out, stdin)?;
     let mut ready =
         aterm_agent::ready::Ready::open(&run.run).map_err(|e| format!("the ready signal: {e}"))?;
     ready.hand(&mut cmd);
@@ -659,9 +770,16 @@ fn append_to_std(path: &Path) -> std::io::Result<(std::process::Stdio, std::proc
 
 /// What the lab itself sets in its instance's environment (`env -i` drops
 /// everything else): the shim's PATH, the jail's HOME, XDG dirs and state
-/// root, the headless-restore seam when the lab runs under it (`SEAM=1`),
-/// the harness tape, and the sleep clock when the lab is up with it
-/// (`CLOCK=1`: [`crate::clock::vars`]).
+/// root, the open recorder as `BROWSER` with its log, the headless-restore
+/// seam when the lab runs under it (`SEAM=1`), the harness tape, and the
+/// sleep clock when the lab is up with it (`CLOCK=1`: [`crate::clock::vars`]).
+///
+/// The recorder rides the instance's environment for the sessions it
+/// spawns itself (a worker's Claude Code, `spawn agent=claude`): their login
+/// shell rebuilds PATH with the shim LAST (macOS's `path_helper`), so a
+/// bare-name `open` there is `/usr/bin/open`, which the jail refuses and
+/// nothing logs; `BROWSER` passes that shell untouched, and Claude Code opens
+/// a URL as `$BROWSER <url>`.
 fn lab_vars(run: &Run, user: &str) -> Vec<(String, String)> {
     let w = run.w.to_string_lossy().into_owned();
     let mut vars: Vec<(String, String)> = [
@@ -680,6 +798,8 @@ fn lab_vars(run: &Run, user: &str) -> Vec<(String, String)> {
         ("XDG_CONFIG_HOME", format!("{w}/cfg")),
         ("XDG_RUNTIME_DIR", run.sockdir.clone()),
         ("ATERM_STATE_HOME", format!("{w}/state")),
+        ("BROWSER", run.run.join("shim/open").display().to_string()),
+        ("LAB_OPEN_LOG", format!("{w}/open.log")),
     ]
     .map(|(k, v)| (k.to_string(), v))
     .to_vec();
@@ -768,18 +888,43 @@ pub(crate) fn instance_vars(run: &Run, user: &str) -> Result<Vec<(String, String
     Ok(vars)
 }
 
+/// Whether the lab's instance opens a window (`WINDOW=1`, `forever
+/// --window`): the windowed twin of the headless instance, for what only a
+/// window carries (`hwkey`, the OS event queue a key press takes).
+#[must_use]
+pub(crate) fn windowed(run: &Run) -> bool {
+    run.window == "1"
+}
+
 /// The instance's command line: `aterm --headless`, the lifeline's flag when
 /// it holds one, then the lab's own socket, project dir and grid (and
-/// `--scale`): the same at `up` and at each relaunch on the same record.
+/// `--scale`): the same at `up` and at each relaunch on the same record. A
+/// WINDOWED lab's ([`windowed`]) has no `--headless` and no lifeline flag (a
+/// window refuses `--lifeline-fd`: it is a person's to close): where it holds
+/// a lifeline, the lab's keeper ([`crate::instance::keeper_main`], the lab's
+/// own copy of its program) leads the line, holds it on its stdin and ends
+/// the window by pid when it is cut.
 pub(crate) fn instance_argv(
     run: &Run,
     aterm: &str,
     scale: Option<&str>,
     lifeline: bool,
 ) -> Vec<String> {
-    let mut prog: Vec<String> = [aterm, "--headless"].map(str::to_string).to_vec();
-    if lifeline {
-        prog.extend(lifeline_flag());
+    let mut prog: Vec<String> = Vec::new();
+    if windowed(run) {
+        if lifeline {
+            prog.extend([
+                run.run.join(BIN).to_string_lossy().into_owned(),
+                "keeper".to_string(),
+                "--".to_string(),
+            ]);
+        }
+        prog.push(aterm.to_string());
+    } else {
+        prog.extend([aterm, "--headless"].map(str::to_string));
+        if lifeline {
+            prog.extend(lifeline_flag());
+        }
     }
     prog.extend(
         [
@@ -805,17 +950,24 @@ pub(crate) fn instance_argv(
 /// harness at its defaults ([`instance_vars`], [`instance_argv`]). `up`
 /// starts it; `restore` and `crash` start it again on the same state and
 /// socket. With the seam (`SEAM=1`) the instance keeps its desk as a window
-/// does. Sets the instance pid; fails when no socket came up.
+/// does. A windowed lab's ([`windowed`]) opens a window, in the same jail
+/// ([`launch_window`]). Sets the instance pid (a keeper's, where one holds a
+/// window's lifeline); fails when no socket came up.
 pub fn start_instance(run: &mut Run, scale: Option<&str>, armed: bool) -> Result<(), String> {
     let aterm = run.need_aterm()?.to_string_lossy().into_owned();
     let vars = instance_vars(run, &paths().user)?;
     let stdin = lifeline_end(run, armed).map_err(|e| format!("the lifeline: {e}"))?;
     let prog = instance_argv(run, &aterm, scale, stdin.is_some());
     // NO LIFELINE unless the lab is the verb's own: a lab `up` makes outlives the verb, until `down` ends it by pid.
-    // Ready is the instance's own word that its control socket listens (`--ready-fd`), never a poll of the socket.
+    // Ready is the instance's own word that its control socket listens (`--ready-fd`), never a poll of the socket;
+    // a window takes no such word, so its socket's first answer is its ready.
     let out = run.run.join("aterm.out");
     let mut pid = 0;
-    let launched = launch_ready(run, &vars, &prog, &out, stdin, (&mut pid, READY_HANG));
+    let launched = if windowed(run) {
+        launch_window(run, &vars, &prog, &out, stdin, (&mut pid, READY_HANG))
+    } else {
+        launch_ready(run, &vars, &prog, &out, stdin, (&mut pid, READY_HANG))
+    };
     run.instance_pid = pid;
     run.save();
     launched.map_err(|e| {
@@ -892,6 +1044,10 @@ fn room_for(run: &Run, now: std::time::SystemTime) -> Result<(), Fail> {
 /// Why it could not come up (whatever it had started is taken down first).
 #[allow(clippy::too_many_lines)]
 pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
+    // options that conflict are refused first, before anything is made or caught
+    if let Some(why) = opts_refused(o) {
+        return Err(Fail::usage(why));
+    }
     stop::install();
     if !valid_tag(tag) {
         return Err(Fail::die(format!(
@@ -912,14 +1068,16 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     let aterm = p.need_aterm()?.to_path_buf();
     run.aterm = aterm.to_string_lossy().into_owned();
     need_sandbox()?;
-    // the jail hides the owner's data from the lab, so neither the lab's program nor the aterm under test may live in it
-    if inside_protected(&p.exe.to_string_lossy(), &p.real_home, CCSOCKS) {
+    // the jail hides the owner's data from the lab, so neither the lab's program nor the aterm under test may live in it:
+    // the data of every home it guards (the account's, and HOME's when it names another)
+    let homes = p.guarded_homes();
+    if inside_any(&p.exe.to_string_lossy(), &homes, CCSOCKS) {
         return Err(Fail::die(format!(
             "the lab's own program sits inside the owner's data ({}): the jail would hide it from the stub; use a checkout elsewhere",
             p.exe.display()
         )));
     }
-    if inside_protected(&aterm.to_string_lossy(), &p.real_home, CCSOCKS) {
+    if inside_any(&aterm.to_string_lossy(), &homes, CCSOCKS) {
         return Err(Fail::die(format!(
             "the aterm under test sits inside the owner's data ({}): the jail would hide it; build or copy it elsewhere",
             aterm.display()
@@ -928,9 +1086,12 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     run.claude_bin = find_claude()?;
     // the Codex, Gemini CLI, agy and Muse Code under test, when there is one: in aterm's package store (the jail re-allows its
     // build), or anywhere outside the owner's data
-    let store = format!("{}/Library/Application Support/aterm/", p.real_home);
+    let stores: Vec<String> = homes
+        .iter()
+        .map(|h| format!("{h}/Library/Application Support/aterm/"))
+        .collect();
     let outside = |what: &str, c: String| {
-        if !c.starts_with(&store) && inside_protected(&c, &p.real_home, CCSOCKS) {
+        if !stores.iter().any(|st| c.starts_with(st)) && inside_any(&c, &homes, CCSOCKS) {
             return Err(Fail::die(format!(
                 "the {what} under test sits inside the owner's data ({c}): the jail would hide it"
             )));
@@ -953,6 +1114,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     run.cols.clone_from(&o.cols);
     run.rows.clone_from(&o.lines);
     run.seam = if o.restore { "1" } else { "0" }.into();
+    run.window = if o.window { "1" } else { "0" }.into();
     let w = run.w.clone();
     for d in crate::protected::SCRATCH_DIRS {
         fs::create_dir_all(w.join(d))
@@ -988,7 +1150,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     // under test: the shim leads the launched agent's PATH, so its `aterm ctl …` (a manager starting workers)
     // runs the build the lab tests, never an installed release, and reaches this lab's instance. A session the
     // instance spawns (a worker) gets the PATH its login shell rebuilds, the shim LAST: there an `aterm` earlier
-    // on that PATH would answer.
+    // on that PATH would answer, and its opens reach the recorder by the BROWSER the instance hands on ([`lab_vars`]).
     let bin = run.run.join(BIN);
     let made = fs::create_dir_all(run.run.join("bin"))
         .and_then(|()| fs::copy(&p.exe, &bin).map(|_| ()))
@@ -1144,6 +1306,13 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     );
     let _ = fs::write(&helper, script)
         .and_then(|()| fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)));
+    // the settings witness's ConfigChange hook (scratch_claude_config names it)
+    let witness = run.run.join(crate::settings_witness::SCRIPT);
+    let _ = fs::write(
+        &witness,
+        crate::settings_witness::script(&w.join(crate::settings_witness::LOG)),
+    )
+    .and_then(|()| fs::set_permissions(&witness, fs::Permissions::from_mode(0o755)));
     run.proxy = if o.proxy_dead {
         "http://127.0.0.1:9".into()
     } else {
@@ -1257,7 +1426,13 @@ fn scratch_claude_config(run: &Run, helper: &str, proj: &str, o: &UpOpts) -> (St
     if o.survey {
         env.set("CLAUDE_FORCE_DISPLAY_SURVEY", J::s("1"));
     }
-    let settings = J::obj([("apiKeyHelper", J::s(helper)), ("env", env)]);
+    // the settings witness: Claude Code reports each re-read of a settings file it detected
+    let hooks = crate::settings_witness::hooks(&run.run.join(crate::settings_witness::SCRIPT));
+    let settings = J::obj([
+        ("apiKeyHelper", J::s(helper)),
+        ("env", env),
+        ("hooks", hooks),
+    ]);
     let mut cj = J::obj([
         ("hasCompletedOnboarding", J::Bool(true)),
         ("theme", J::s("dark")),
@@ -1483,7 +1658,12 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     // the relay's log is its proof that it ran ([`RELAY_RAN`]): read before the scratch goes
     let relay_ran = relay_shown_running(&r);
     // the scratch's files through the one reader that follows no link (the jail may have put one in their place)
-    for f in ["stub.log", "relay.log", "open.log"] {
+    for f in [
+        "stub.log",
+        "relay.log",
+        "open.log",
+        crate::settings_witness::LOG,
+    ] {
         if let Ok(Some(b)) = crate::sys::scratch_read(&r.w.join(f)) {
             let _ = fs::write(keep.join(f), b);
         }
@@ -1701,7 +1881,9 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
 
 /// The launcher the tab runs (`sh claude.sh`): it ends in `exec`, so the tab's
 /// process IS the real binary, launched by path (not through the managed shim,
-/// which would add its own environment); behind the relay with `--relay`.
+/// which would add its own environment); behind the relay with `--relay`. Its
+/// opens are the open recorder's, logged to the scratch's `open.log`
+/// ([`crate::recorder`]), and its keychain calls the tripwire's.
 #[must_use]
 pub fn launcher(run: &Run, l: &Launch) -> String {
     let q = shell_quote;
@@ -1739,9 +1921,13 @@ pub fn launcher(run: &Run, l: &Launch) -> String {
     s.push_str(
         "  NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost DISABLE_AUTOUPDATER=1 \\\n",
     );
+    // every open goes to the recorder's log: Claude Code runs `$BROWSER <url>`, or a bare-name `open` when it is
+    // unset, which the shim's `open` leading PATH answers
     s.push_str(&format!(
-        "  LAB_SECURITY_LOG={} \\\n",
-        q(&format!("{w}/security.log"))
+        "  LAB_SECURITY_LOG={} LAB_OPEN_LOG={} BROWSER={} \\\n",
+        q(&format!("{w}/security.log")),
+        q(&format!("{w}/open.log")),
+        q(&run.run.join("shim/open").to_string_lossy())
     ));
     for kv in &envs {
         s.push_str(&format!("  {} \\\n", q(kv)));
@@ -1866,6 +2052,49 @@ pub fn cmd_claude(args: &[String]) -> Res {
 mod tests {
     use super::*;
 
+    /// Every lab's scratch Claude Code settings carry the settings witness: a
+    /// `ConfigChange` hook that runs the run directory's `config-change.sh`
+    /// (written from outside the jail), beside the fake key helper and the
+    /// env. NEGATIVE CONTROL: another run's script is not the one named.
+    #[test]
+    fn a_lab_ups_claude_settings_carry_the_settings_witness_hook() {
+        let run = Run {
+            run: "/l/runs/t".into(),
+            w: "/l/runs/t/scratch".into(),
+            port: "1".into(),
+            proxy: "http://127.0.0.1:2".into(),
+            ..Run::default()
+        };
+        let (settings, _) =
+            scratch_claude_config(&run, "/l/runs/t/apikey.sh", "/p", &UpOpts::default());
+        let d = J::parse(&settings).unwrap();
+        // the written file's key order is its own: compare each hook's command
+        let commands = |hooks: Option<&J>| -> Vec<String> {
+            hooks
+                .and_then(|h| h.get("ConfigChange"))
+                .and_then(J::as_arr)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|m| m.get("hooks").and_then(J::as_arr))
+                .flatten()
+                .filter(|c| c.get("type").and_then(J::as_str) == Some("command"))
+                .filter_map(|c| c.get("command").and_then(J::as_str).map(str::to_string))
+                .collect()
+        };
+        let named = |run: &str| {
+            commands(Some(&crate::settings_witness::hooks(
+                &Path::new(run).join(crate::settings_witness::SCRIPT),
+            )))
+        };
+        assert_eq!(commands(d.get("hooks")), named("/l/runs/t"));
+        assert_eq!(named("/l/runs/t"), ["/l/runs/t/config-change.sh"]);
+        assert_ne!(commands(d.get("hooks")), named("/l/runs/u"));
+        assert_eq!(
+            d.get("apiKeyHelper").and_then(J::as_str),
+            Some("/l/runs/t/apikey.sh")
+        );
+    }
+
     /// `lab up`'s scratch `aterm.toml` starts with the audible bell off, and
     /// `LAB_ATERM_TOML` can turn it back on (`bell_sound = true`, the one key
     /// the file then holds). Its other lines keep their places: the root key
@@ -1969,8 +2198,111 @@ mod tests {
         };
         let s = launcher(&run, &l);
         assert!(s.starts_with("#!/bin/sh\nclear\nexec /s/runs/t/relay/node --log /s/runs/t/scratch/relay.log -- env PATH=\"/s/runs/t/shim:$PATH\""), "{s}");
+        assert!(s.contains("  LAB_SECURITY_LOG=/s/runs/t/scratch/security.log LAB_OPEN_LOG=/s/runs/t/scratch/open.log BROWSER=/s/runs/t/shim/open \\\n"), "{s}");
         assert!(s.contains("  'K=v 1' \\\n  CLAUDE_CODE_NO_FLICKER=1 \\\n  CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-LABLABLAB"), "{s}");
         assert!(s.ends_with("  '/a b/claude' --model 'x y'\n"), "{s}");
+        // the words the shell execs: env's assignments route every open to the recorder's log, and the binary
+        // is the program with each user word one argument
+        let words = exec_words(&s);
+        assert!(opens_recorded(&words, &run), "{words:?}");
+        let at = words.iter().position(|w| w == "/a b/claude").unwrap();
+        assert_eq!(words[at + 1..], ["--model", "x y"], "{words:?}");
+        let plain = launcher(&run, &Launch::default());
+        assert!(opens_recorded(&exec_words(&plain), &run), "{plain}");
+        // NEGATIVE CONTROLS: a line without LAB_OPEN_LOG, or without BROWSER, leaves an open unlogged; so does
+        // the variable handed to Claude Code as an argument instead of in its environment
+        for gone in [
+            " LAB_OPEN_LOG=/s/runs/t/scratch/open.log",
+            " BROWSER=/s/runs/t/shim/open",
+        ] {
+            let cut = plain.replace(gone, "");
+            assert_ne!(cut, plain);
+            assert!(!opens_recorded(&exec_words(&cut), &run), "{cut}");
+        }
+        let as_arg = Launch {
+            args: vec!["LAB_OPEN_LOG=/s/runs/t/scratch/open.log".into()],
+            ..Launch::default()
+        };
+        let arg_only =
+            launcher(&run, &as_arg).replacen(" LAB_OPEN_LOG=/s/runs/t/scratch/open.log", "", 1);
+        let arg_words = exec_words(&arg_only);
+        assert_eq!(
+            arg_words.last().map(String::as_str),
+            Some("LAB_OPEN_LOG=/s/runs/t/scratch/open.log"),
+            "{arg_only}"
+        );
+        assert!(!opens_recorded(&arg_words, &run), "{arg_only}");
+    }
+
+    /// The words of a launcher's `exec` command as `sh` reads them: its
+    /// continuation lines joined, split at blanks outside quotes, single and
+    /// double quotes and backslashes removed.
+    fn exec_words(script: &str) -> Vec<String> {
+        let line = script
+            .split_once("exec ")
+            .map_or("", |(_, rest)| rest)
+            .replace("\\\n", "");
+        let line = line.lines().next().unwrap_or("");
+        let (mut words, mut cur, mut open) = (Vec::new(), String::new(), false);
+        let mut it = line.chars();
+        while let Some(c) = it.next() {
+            match c {
+                '\'' => {
+                    open = true;
+                    cur.extend(it.by_ref().take_while(|&d| d != '\''));
+                }
+                '"' => {
+                    open = true;
+                    while let Some(d) = it.next() {
+                        match d {
+                            '"' => break,
+                            '\\' => cur.extend(it.next()),
+                            _ => cur.push(d),
+                        }
+                    }
+                }
+                '\\' => cur.extend(it.next()),
+                c if c.is_whitespace() => {
+                    if open || !cur.is_empty() {
+                        words.push(std::mem::take(&mut cur));
+                    }
+                    open = false;
+                }
+                c => cur.push(c),
+            }
+        }
+        if open || !cur.is_empty() {
+            words.push(cur);
+        }
+        words
+    }
+
+    /// Whether `env`'s assignments in a launcher's words (those between `env`
+    /// and the program it runs) route every open of the program to the open
+    /// recorder: the shim leads `PATH` (a bare-name `open`), `BROWSER` is the
+    /// shim's `open`, and `LAB_OPEN_LOG` is the scratch's `open.log`.
+    fn opens_recorded(words: &[String], run: &Run) -> bool {
+        let Some(env) = words.iter().position(|w| w == "env") else {
+            return false;
+        };
+        let is_assignment = |w: &str| {
+            w.split_once('=').is_some_and(|(k, _)| {
+                !k.is_empty()
+                    && !k.starts_with(|c: char| c.is_ascii_digit())
+                    && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+        };
+        let vars: Vec<&str> = words[env + 1..]
+            .iter()
+            .map(String::as_str)
+            .take_while(|w| is_assignment(w))
+            .collect();
+        let has = |want: &str| vars.contains(&want);
+        let shim = run.run.join("shim");
+        vars.iter()
+            .any(|v| v.starts_with(&format!("PATH={}:", shim.display())))
+            && has(&format!("BROWSER={}", shim.join("open").display()))
+            && has(&format!("LAB_OPEN_LOG={}/open.log", run.w.display()))
     }
 
     #[test]
@@ -2134,6 +2466,180 @@ mod tests {
         }
     }
 
+    /// THE STORE IS LOOKED UP IN THE ACCOUNT'S HOME UNDER A SCRATCH `HOME`:
+    /// `aterm pkg which` reads the package store under the `HOME` it is given,
+    /// and a scratch `HOME` holds none, so the lab hands that one call the
+    /// account's home (the account database's, [`crate::paths::Paths::store_home`]).
+    /// A stand-in `aterm` answers from the `HOME` it got. NEGATIVE CONTROL: the call handed `$HOME` (the
+    /// lab before this) finds the scratch's store, which is not the
+    /// account's; and with no account home known, `$HOME`'s is the one asked.
+    #[test]
+    fn the_store_lookup_is_handed_the_account_home_under_a_scratch_home() {
+        let top = aterm_tempfile::Builder::new()
+            .prefix("lab-which-")
+            .tempdir()
+            .expect("a scratch dir");
+        let root = fs::canonicalize(top.path()).expect("its physical path");
+        let (account, scratch) = (root.join("account"), root.join("scratch-home"));
+        for d in [&account, &scratch] {
+            fs::create_dir_all(d).expect("a home");
+        }
+        let stand_in = root.join("aterm");
+        fs::write(
+            &stand_in,
+            "#!/bin/sh\n[ \"$1 $2\" = 'pkg which' ] || exit 2\n\
+             printf '%s → %s → %s — managed 1.0 — x\\n' \"$3\" \"$HOME/pkg/bin/$3\" \"$HOME/pkg/store/$3/1/bin/$3\"\n",
+        )
+        .and_then(|()| fs::set_permissions(&stand_in, fs::Permissions::from_mode(0o755)))
+        .expect("the stand-in");
+        let p =
+            crate::paths::Paths::resolve_with(Some(account.clone()), Some(scratch.clone().into()));
+        assert_eq!(p.store_home(), account.display().to_string());
+        let store =
+            |home: &Path, name: &str| format!("{}/pkg/store/{name}/1/bin/{name}", home.display());
+        // the lookups the lab makes: Claude Code's, and every other managed agent's
+        assert_eq!(store_claude(&p, &stand_in), Ok(store(&account, "claude")));
+        for name in ["codex", "agy", "muse"] {
+            assert_eq!(
+                managed_store_bin_in(&p, &stand_in, name),
+                Some(store(&account, name)),
+                "{name}"
+            );
+        }
+        // NEGATIVE CONTROL: the facts of a lab that took HOME for the account's home find the
+        // scratch's store, which is not the account's
+        let bare =
+            crate::paths::Paths::resolve_with(Some(scratch.clone()), Some(scratch.clone().into()));
+        assert_eq!(
+            store_claude(&bare, &stand_in),
+            Ok(store(&scratch, "claude"))
+        );
+        assert_eq!(
+            managed_store_bin_in(&bare, &stand_in, "codex"),
+            Some(store(&scratch, "codex"))
+        );
+        let asked = |home: &str| {
+            let line = pkg_which(&stand_in, home, "claude").expect("the stand-in runs");
+            managed_claude(&line).unwrap_or_else(|| panic!("no managed line: {line}"))
+        };
+        assert_eq!(asked(p.store_home()), store(&account, "claude"));
+        assert_eq!(
+            managed_bin(
+                "agy",
+                &pkg_which(&stand_in, p.store_home(), "agy").expect("agy")
+            ),
+            Some(format!("{}/pkg/store/agy/1/bin/agy", account.display()))
+        );
+        // NEGATIVE CONTROL: $HOME's lookup finds the scratch's store
+        assert_eq!(p.caller_home, scratch.display().to_string());
+        assert_ne!(asked(&p.caller_home), store(&account, "claude"));
+        assert_eq!(asked(&p.caller_home), store(&scratch, "claude"));
+        // no account home known: $HOME's is the one asked
+        let only = crate::paths::Paths::resolve_with(None, Some(scratch.clone().into()));
+        assert_eq!(only.store_home(), scratch.display().to_string());
+    }
+
+    /// Whether a shell's environment routes an agent's URL open to the open
+    /// recorder: its log (`LAB_OPEN_LOG`) is the scratch's `open.log`, and the
+    /// opener is the shim's `open`: `BROWSER` when it is set (Claude Code opens
+    /// `$BROWSER <url>`), else the bare-name `open` the shell finds (`which`).
+    fn opens_logged(browser: &str, log: &str, which: &str, run: &Run) -> bool {
+        let shim = run.run.join("shim/open").display().to_string();
+        let opener = if browser.is_empty() { which } else { browser };
+        log == format!("{}/open.log", run.w.display()) && opener == shim
+    }
+
+    /// `BROWSER`, `LAB_OPEN_LOG` and `command -v open` as a login zsh started
+    /// with exactly `vars` (`env -i`) reads them: the shell a session the
+    /// instance spawns runs in, after `/etc/zprofile`'s `path_helper`.
+    fn login_shell_reads(vars: &[(String, String)], cwd: &Path) -> Vec<String> {
+        let mut cmd = aterm_uds::spawnfd::command("/bin/zsh");
+        cmd.env_clear()
+            .args([
+                "-l",
+                "-c",
+                r#"printf '%s\n' "${BROWSER-}" "${LAB_OPEN_LOG-}" "$(command -v open)""#,
+            ])
+            .current_dir(cwd)
+            .stdin(Stdio::null());
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        let out = aterm_uds::deadline::output_until(
+            &mut cmd,
+            std::time::Instant::now() + Duration::from_secs(60),
+        )
+        .expect("a login zsh ends within the hang detector");
+        assert!(
+            out.status.success(),
+            "{:?}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A SESSION THE INSTANCE SPAWNS OPENS THROUGH THE RECORDER: a worker's
+    /// Claude Code (`spawn agent=claude`) is typed into a login shell the
+    /// instance spawned, never behind `claude.sh`, and that shell's
+    /// `path_helper` puts the shim LAST, so its bare-name `open` is
+    /// `/usr/bin/open`, which the jail refuses and nothing logs. The
+    /// instance's environment names the recorder as `BROWSER` with its log, and
+    /// a real login zsh given exactly that environment keeps both. NEGATIVE
+    /// CONTROL: the same login shell without `BROWSER` finds `/usr/bin/open`
+    /// for a bare-name open (the shim on PATH is not enough), so nothing would
+    /// be logged.
+    #[test]
+    fn a_session_the_instance_spawns_opens_through_the_recorder() {
+        let top = aterm_tempfile::Builder::new()
+            .prefix("lab-browser-")
+            .tempdir()
+            .expect("a scratch dir");
+        let root = fs::canonicalize(top.path()).expect("its physical path");
+        let mut run = recorded("", "0");
+        run.run = root.join("runs/k1");
+        run.w = run.run.join("scratch");
+        fs::create_dir_all(run.w.join("home")).expect("the scratch home");
+        fs::create_dir_all(run.run.join("shim")).expect("the shim");
+        std::os::unix::fs::symlink("/usr/bin/true", run.run.join("shim/open")).expect("its open");
+        let vars = instance_vars(&run, "owner").expect("the instance's environment");
+        let get = |k: &str| {
+            vars.iter()
+                .filter(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+        };
+        let shim_open = run.run.join("shim/open").display().to_string();
+        let log = format!("{}/open.log", run.w.display());
+        assert_eq!(get("BROWSER"), [shim_open.as_str()]);
+        assert_eq!(get("LAB_OPEN_LOG"), [log.as_str()]);
+        assert!(get("PATH")[0].starts_with(&format!("{}/shim:", run.run.display())));
+        // neither can be handed over by LAB_INSTANCE_ENV
+        assert!(lab_sets("BROWSER") && lab_sets("LAB_OPEN_LOG"));
+        let read = login_shell_reads(&vars, &run.w);
+        assert_eq!(read.len(), 3, "{read:?}");
+        assert_eq!(read[0], shim_open, "BROWSER passes the login shell");
+        assert_eq!(read[1], log, "LAB_OPEN_LOG passes the login shell");
+        assert_eq!(read[2], "/usr/bin/open", "path_helper puts the shim last");
+        assert!(opens_logged(&read[0], &read[1], &read[2], &run), "{read:?}");
+        // NEGATIVE CONTROL: the instance's environment without BROWSER (the lab before this) leaves a spawned
+        // session's open to /usr/bin/open
+        let bare: Vec<(String, String)> = vars
+            .iter()
+            .filter(|(k, _)| k != "BROWSER")
+            .cloned()
+            .collect();
+        let read = login_shell_reads(&bare, &run.w);
+        assert_eq!(read.first().map(String::as_str), Some(""), "{read:?}");
+        assert!(
+            !opens_logged(&read[0], &read[1], &read[2], &run),
+            "{read:?}"
+        );
+    }
+
     /// THE SLEEP CLOCK GOES WHERE `LAB_CLOCK=1` PUTS IT: every launch of the
     /// instance of a lab up with it (`up`'s and each relaunch's, off the
     /// record) loads it, and `claude.sh` hands it to Claude Code past the
@@ -2220,6 +2726,129 @@ mod tests {
             armed[armed.len() - 2..],
             ["--scale", "2"].map(str::to_string)
         );
+    }
+
+    /// A WINDOWED LAB'S INSTANCE (`forever --window`) opens a window: no
+    /// `--headless` and no lifeline flag (a window refuses `--lifeline-fd`),
+    /// the same socket, project dir and grid after its program; where it
+    /// holds a lifeline, the lab's own keeper leads the line and holds it.
+    /// CONTROL: the headless record's line, which a window would refuse.
+    #[test]
+    fn a_windowed_lab_s_instance_opens_a_window_its_keeper_holding_the_lifeline() {
+        let tail = [
+            "--no-reroute",
+            "--control-sock",
+            "/tmp/at.AbCd/a.sock",
+            "-d",
+            "/tmp/at.AbCd/proj",
+            "--columns",
+            "144",
+            "--lines",
+            "50",
+        ]
+        .map(str::to_string);
+        let run = Run {
+            window: "1".into(),
+            ..recorded("", "0")
+        };
+        assert!(windowed(&run));
+        let bare = instance_argv(&run, "/b/aterm", None, false);
+        assert_eq!(bare[0], "/b/aterm");
+        assert_eq!(bare[1..], tail[..]);
+        let kept = instance_argv(&run, "/b/aterm", None, true);
+        assert_eq!(
+            kept[..4],
+            ["/s/runs/k1/bin/aterm-lab", "keeper", "--", "/b/aterm"].map(str::to_string)
+        );
+        assert_eq!(kept[4..], tail[..]);
+        for line in [&bare, &kept] {
+            assert!(
+                !line
+                    .iter()
+                    .any(|a| a == "--headless" || a.starts_with("--lifeline")),
+                "{line:?}"
+            );
+        }
+        // CONTROL: the record without the window, headless with its flag
+        for headless in ["0", ""] {
+            let run = Run {
+                window: headless.into(),
+                ..recorded("", "0")
+            };
+            assert!(!windowed(&run));
+            let line = instance_argv(&run, "/b/aterm", None, true);
+            assert_eq!(line[..2], ["/b/aterm", "--headless"].map(str::to_string));
+            assert_eq!(line[2..4], lifeline_flag()[..]);
+        }
+    }
+
+    /// A WINDOWED LAB UNDER `LAB_RESTORE=1` IS REFUSED, as a usage error and
+    /// before anything is made: the headless-restore seam is a headless
+    /// instance's. CONTROLS: the window alone, the seam alone and neither
+    /// are refused by nothing.
+    #[test]
+    fn a_windowed_lab_under_the_restore_seam_is_refused_before_anything_is_made() {
+        let o = |window, restore| UpOpts {
+            window,
+            restore,
+            ..UpOpts::default()
+        };
+        let why = opts_refused(&o(true, true)).expect("refused");
+        assert!(why.contains("LAB_RESTORE=1"), "{why}");
+        // `up` refuses it first, before it even judges the tag: under a tag no
+        // lab may have, an `up` that went on would end at the tag (exit 1),
+        // so nothing is made either way
+        let f = up("not a tag!", &o(true, true)).expect_err("refused");
+        assert_eq!(f.code, 2, "{f:?}");
+        assert_eq!(f.msg.as_deref(), Some(why));
+        for (window, restore) in [(true, false), (false, true), (false, false)] {
+            assert_eq!(
+                opts_refused(&o(window, restore)),
+                None,
+                "window {window} restore {restore}"
+            );
+        }
+    }
+
+    /// A WINDOW IS READY ONCE ITS CONTROL SOCKET ANSWERS: an answer at the
+    /// third ask is ready, asked before whether the child lives. NEGATIVE
+    /// CONTROLS: a child that ended before any answer, and one that never
+    /// answers (a zero hang detector), each fail with their own reason; an
+    /// interrupt during the pause ends the wait as `interrupted`.
+    #[test]
+    fn a_window_is_ready_once_its_socket_answers_and_never_on_a_dead_child_or_a_hang() {
+        let asks = std::cell::Cell::new(0u32);
+        let answered = until_answered(
+            || {
+                asks.set(asks.get() + 1);
+                asks.get() == 3
+            },
+            || true,
+            READY_HANG,
+            || Ok(()),
+        );
+        assert_eq!(answered, Ok(()));
+        assert_eq!(asks.get(), 3);
+        // an answer stands even where the child has ended since
+        assert_eq!(
+            until_answered(|| true, || false, READY_HANG, || Ok(())),
+            Ok(())
+        );
+        let e = until_answered(|| false, || false, READY_HANG, || Ok(())).expect_err("dead");
+        assert!(
+            e.contains("ended before its control socket answered"),
+            "{e}"
+        );
+        let e = until_answered(|| false, || true, Duration::ZERO, || Ok(())).expect_err("hang");
+        assert!(e.contains("hang detector"), "{e}");
+        let e = until_answered(
+            || false,
+            || true,
+            READY_HANG,
+            || Err("interrupted".to_string()),
+        )
+        .expect_err("interrupted");
+        assert_eq!(e, "interrupted");
     }
 
     /// A pid is the lab's only while its command line names the lab's run or

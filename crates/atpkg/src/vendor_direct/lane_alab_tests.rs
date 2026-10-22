@@ -354,3 +354,78 @@ fn an_alab_command_restore_error_is_a_failed_outcome() {
         "each actual restoration error must fail its pass"
     );
 }
+
+/// CODEX-OLD IS ALWAYS THE VENDOR'S BYTES (owner ruling 2026-10-20: `codex` is codex-alab
+/// where ALab builds it, upstream Codex is `codex-old`, both bundled). With `codex` on an
+/// active ALab build that its lane keeps without reading a head, the codex-old lane reads
+/// OpenAI's head and lands OpenAI's package in its own store: its shim and twin run that
+/// build's clone of OpenAI's entry, which is no ALab executable, and `codex` stays on its
+/// ALab build. Even an ALab package laid in codex-old's own store is never kept as ALab's:
+/// no ALab row names the program, so the lane decides it against the vendor's head.
+///
+/// NEGATIVE CONTROL: the same ALab package in codex's store is kept, as above.
+#[test]
+fn codex_old_is_the_vendors_bytes_where_codex_is_alab() {
+    let l = world::layout("alab-codex-old");
+    alab_codex(&l, B, true);
+    let f = Fake::default();
+    f.publish_codex_default("0.163.0");
+    let (policy, trust) = (Policy::default(), world::trust());
+    let old = super::super::spec("codex-old").unwrap();
+    let kept = install_one(&alab_lane(&l, &f, &policy, &trust, false), codex(), false);
+    assert!(matches!(kept.verdict, Verdict::AlabKept { .. }), "{kept:?}");
+    assert!(
+        f.gets.borrow().is_empty(),
+        "PRECONDITION: codex read no head"
+    );
+
+    let o = install_one(&lane(&l, &f, &policy, &trust, false), old, false);
+    assert!(matches!(o.verdict, Verdict::Installed { .. }), "{o:?}");
+    let build = super::super::Version::parse("0.163.0").unwrap().build_id();
+    let alias = l
+        .build_dir("codex-old", build)
+        .join(world::bin("codex-old"));
+    assert_eq!(std::fs::read(&alias).unwrap(), native_exe("codex 0.163.0"));
+    assert!(!crate::alab::exe_is_alab(&alias));
+    let tool = |name: &str| crate::store::ToolName::new(name).unwrap();
+    assert_eq!(
+        crate::platform::resolve_shim(&l.shim(&tool("codex-old"))),
+        Some(alias.clone())
+    );
+    assert_eq!(crate::activate::twin_target(&l, "codex-old"), Some(alias));
+    assert_eq!(active(&l), Some(B), "codex stays on its ALab build");
+
+    // An ALab package in codex-old's own store is no ALab build of it: the vendor's head,
+    // asked for, replaces it, where codex's own is kept.
+    let alab_old = l.build_dir("codex-old", B);
+    std::fs::create_dir_all(alab_old.join("bin")).unwrap();
+    std::fs::write(alab_old.join(world::bin("codex-old")), native_exe("alab")).unwrap();
+    std::fs::write(
+        alab_old.join(crate::alab::PACKAGE_JSON),
+        format!(
+            r#"{{"layoutVersion":1,"version":"0.164.0-dev.1+gabc","entrypoint":"{}"}}"#,
+            world::bin("codex-old")
+        ),
+    )
+    .unwrap();
+    std::fs::write(alab_old.join(crate::alab::ALAB_BUILD_JSON), b"{}").unwrap();
+    crate::store::mark_build_ready(&alab_old).unwrap();
+    crate::activate::activate_build(&l, &alab_old).unwrap();
+    crate::activate::install_shims(
+        &l,
+        &alab_old,
+        &["codex-old".to_string()],
+        crate::Aliases::Off,
+    )
+    .unwrap();
+    assert!(crate::alab::active_alab_build(&l, "codex-old", ALAB_TARGET).is_none());
+    let o = install_one(&lane(&l, &f, &policy, &trust, true), old, false);
+    assert!(!matches!(o.verdict, Verdict::AlabKept { .. }), "{o:?}");
+    assert_eq!(
+        crate::ops::active_builds(&l).get("codex-old").copied(),
+        Some(build),
+        "{o:?}"
+    );
+    let kept = install_one(&alab_lane(&l, &f, &policy, &trust, true), codex(), false);
+    assert!(matches!(kept.verdict, Verdict::AlabKept { .. }), "{kept:?}");
+}

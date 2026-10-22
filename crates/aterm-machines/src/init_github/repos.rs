@@ -95,7 +95,7 @@ impl Item for Repositories {
         }
         let (_, missing) = self.scan(sys)?;
         for repo in missing {
-            clone_one(sys, &self.user, &self.config.owner, &repo)?;
+            clone_one(sys, &self.user, &repo.owner, &repo)?;
         }
         Ok(())
     }
@@ -103,42 +103,55 @@ impl Item for Repositories {
 
 impl Repositories {
     fn scan(&self, sys: &dyn System) -> Result<(Vec<Repo>, Vec<Repo>), String> {
-        let home = Path::new(&self.user.home);
-        let stat = sys
-            .stat(home)
-            .map_err(|_| "cannot inspect the repository destination home")?;
-        if !home.is_absolute() || !stat.dir || stat.symlink || stat.uid != self.user.uid {
-            return Err("repository destination must be this user's own home directory".into());
-        }
-        if !sys.stat(Path::new(GIT)).is_ok_and(|stat| !stat.dir) {
-            return Err("Command Line Tools git is not installed; no repositories changed".into());
-        }
+        admit_home(sys, &self.user)?;
         let all = enumerate(sys, &self.user, &self.config)?;
-        let mut missing = Vec::new();
-        for repo in &all {
-            let path = home.join(&repo.name);
-            match sys.stat(&path) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(repo.clone()),
-                Ok(stat) if stat.dir && !stat.symlink => {
-                    verify_existing(sys, &self.user, &self.config.owner, repo, &path)?
-                }
-                Ok(_) => {
-                    return Err(format!(
-                        "~/{} is occupied or linked; left untouched",
-                        repo.name
-                    ));
-                }
-                Err(_) => return Err(format!("cannot inspect ~/{}; left untouched", repo.name)),
-            }
-        }
+        let missing = missing(sys, &self.user, &all)?;
         Ok((all, missing))
     }
 }
 
+pub(super) fn missing(sys: &dyn System, user: &User, all: &[Repo]) -> Result<Vec<Repo>, String> {
+    admit_home(sys, user)?;
+    let home = Path::new(&user.home);
+    let mut missing = Vec::new();
+    for repo in all {
+        let path = home.join(&repo.name);
+        match sys.stat(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(repo.clone()),
+            Ok(stat) if stat.dir && !stat.symlink => {
+                verify_existing(sys, user, &repo.owner, repo, &path)?
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "~/{} is occupied or linked; left untouched",
+                    repo.name
+                ));
+            }
+            Err(_) => return Err(format!("cannot inspect ~/{}; left untouched", repo.name)),
+        }
+    }
+    Ok(missing)
+}
+
+pub(super) fn admit_home(sys: &dyn System, user: &User) -> Result<(), String> {
+    let home = Path::new(&user.home);
+    let stat = sys
+        .stat(home)
+        .map_err(|_| "cannot inspect the repository destination home")?;
+    if !home.is_absolute() || !stat.dir || stat.symlink || stat.uid != user.uid {
+        return Err("repository destination must be this user's own home directory".into());
+    }
+    if !sys.stat(Path::new(GIT)).is_ok_and(|stat| !stat.dir) {
+        return Err("Command Line Tools git is not installed; no repositories changed".into());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
-struct Repo {
-    name: String,
-    default_branch: Option<String>,
+pub(super) struct Repo {
+    pub(super) owner: String,
+    pub(super) name: String,
+    pub(super) default_branch: Option<String>,
 }
 
 fn component(value: &str, owner: bool) -> bool {
@@ -194,7 +207,9 @@ fn text(sys: &dyn System, cmd: &Cmd, why: &str) -> Result<String, String> {
     String::from_utf8(ran.stdout).map_err(|_| why.to_owned())
 }
 
-fn response(text: &str) -> Result<(Value, BTreeMap<String, String>), String> {
+pub(super) type Response = (Value, BTreeMap<String, String>);
+
+pub(super) fn response(text: &str) -> Result<Response, String> {
     let normalized = text.replace("\r\n", "\n");
     let (headers, body) = normalized
         .split_once("\n\n")
@@ -208,11 +223,26 @@ fn response(text: &str) -> Result<(Value, BTreeMap<String, String>), String> {
     if status.len() < 2 || !status[0].starts_with("HTTP/") || status[1] != "200" {
         return Err("GitHub repository listing did not return HTTP 200".into());
     }
-    let mut fields = BTreeMap::new();
+    let mut fields = Vec::new();
     for line in lines {
         let (name, value) = line
             .split_once(':')
             .ok_or("unrecognized GitHub response header")?;
+        fields.push((name.to_owned(), value.trim().to_owned()));
+    }
+    response_parts(200, fields, body.as_bytes())
+}
+
+pub(super) fn response_parts(
+    status: u16,
+    headers: impl IntoIterator<Item = (String, String)>,
+    body: &[u8],
+) -> Result<Response, String> {
+    if status != 200 {
+        return Err("GitHub repository listing did not return HTTP 200".into());
+    }
+    let mut fields = BTreeMap::new();
+    for (name, value) in headers {
         let name = name.to_ascii_lowercase();
         // Only pagination headers affect this reader. Repeated unrelated headers
         // (e.g. Set-Cookie) are legal; repeated Link fields are ambiguous here.
@@ -221,7 +251,7 @@ fn response(text: &str) -> Result<(Value, BTreeMap<String, String>), String> {
         }
     }
     let value =
-        aterm_json::from_str(body).map_err(|_| "unrecognized GitHub repository response")?;
+        aterm_json::from_slice(body).map_err(|_| "unrecognized GitHub repository response")?;
     Ok((value, fields))
 }
 
@@ -247,20 +277,32 @@ fn enumerate(sys: &dyn System, user: &User, config: &Github) -> Result<Vec<Repo>
             config.owner
         )
     };
+    enumerate_pages(&base, Some(&config.owner), |endpoint| {
+        response(&api(sys, user, endpoint)?)
+    })
+}
+
+/// Inventory must finish, including cross-owner destination admission, before
+/// callers may start credentials or filesystem mutations.
+pub(super) fn enumerate_pages(
+    base: &str,
+    owner: Option<&str>,
+    mut api: impl FnMut(&str) -> Result<Response, String>,
+) -> Result<Vec<Repo>, String> {
     let mut repositories = Vec::new();
     let mut names = BTreeSet::new();
     let mut ids = BTreeSet::new();
     let mut last = None;
     for page in 1..=10_000 {
         let endpoint = format!("{base}&page={page}");
-        let (value, headers) = response(&api(sys, user, &endpoint)?)?;
+        let (value, headers) = api(&endpoint)?;
         let values = value
             .as_array()
             .ok_or("GitHub repository page is not an array")?;
         if values.len() > PAGE_SIZE {
             return Err("GitHub repository page exceeds its requested bound".into());
         }
-        let (next, advertised_last) = pagination(headers.get("link"), &base, page)?;
+        let (next, advertised_last) = pagination(headers.get("link"), base, page)?;
         if let Some(advertised) = advertised_last {
             if advertised < page || last.is_some_and(|last| last != advertised) {
                 return Err("GitHub pagination changed during enumeration; run init again".into());
@@ -268,14 +310,14 @@ fn enumerate(sys: &dyn System, user: &User, config: &Github) -> Result<Vec<Repo>
             last = Some(advertised);
         }
         for value in values {
-            let repo = repo(value, &config.owner)?;
+            let repo = repo(value, owner)?;
             let id = value
                 .get("id")
                 .and_then(Value::as_u64)
                 .filter(|id| *id != 0)
                 .ok_or("repository identity is missing")?;
             if !ids.insert(id) || !names.insert(repo.name.to_ascii_lowercase()) {
-                return Err("duplicate repositories in GitHub pagination; run init again".into());
+                return Err("duplicate or colliding repository destinations in GitHub inventory; no repositories changed".into());
             }
             repositories.push(repo);
         }
@@ -291,9 +333,8 @@ fn enumerate(sys: &dyn System, user: &User, config: &Github) -> Result<Vec<Repo>
         if values.len() == PAGE_SIZE {
             // Exactly one full final page is valid. Confirm the next page is empty
             // rather than treating a missing Link header as evidence of completion.
-            let (tail, tail_headers) =
-                response(&api(sys, user, &format!("{base}&page={}", page + 1))?)?;
-            let (tail_next, tail_last) = pagination(tail_headers.get("link"), &base, page + 1)?;
+            let (tail, tail_headers) = api(&format!("{base}&page={}", page + 1))?;
+            let (tail_next, tail_last) = pagination(tail_headers.get("link"), base, page + 1)?;
             if tail.as_array().is_none_or(|tail| !tail.is_empty())
                 || tail_next
                 || tail_last.is_some_and(|last| last != page)
@@ -379,17 +420,19 @@ fn pagination(
     Ok((next, last))
 }
 
-fn repo(value: &Value, owner: &str) -> Result<Repo, String> {
+fn repo(value: &Value, expected_owner: Option<&str>) -> Result<Repo, String> {
+    let owner = value
+        .get("owner")
+        .and_then(|owner| owner.get("login"))
+        .and_then(Value::as_str)
+        .filter(|owner| component(owner, true))
+        .ok_or("invalid GitHub repository owner")?;
     let name = value
         .get("name")
         .and_then(Value::as_str)
         .filter(|name| component(name, false))
         .ok_or("invalid GitHub repository name")?;
-    if value
-        .get("owner")
-        .and_then(|owner| owner.get("login"))
-        .and_then(Value::as_str)
-        .is_none_or(|login| !login.eq_ignore_ascii_case(owner))
+    if expected_owner.is_some_and(|expected| !owner.eq_ignore_ascii_case(expected))
         || value
             .get("full_name")
             .and_then(Value::as_str)
@@ -410,6 +453,7 @@ fn repo(value: &Value, owner: &str) -> Result<Repo, String> {
         _ => return Err("invalid or missing GitHub default branch".into()),
     };
     Ok(Repo {
+        owner: owner.into(),
         name: name.into(),
         default_branch,
     })
@@ -599,7 +643,12 @@ fn admit_endpoint(
     Ok(())
 }
 
-fn clone_one(sys: &dyn System, user: &User, owner: &str, repo: &Repo) -> Result<(), String> {
+pub(super) fn clone_one(
+    sys: &dyn System,
+    user: &User,
+    owner: &str,
+    repo: &Repo,
+) -> Result<(), String> {
     let home = Path::new(&user.home);
     let destination = home.join(&repo.name);
     match sys.stat(&destination) {
@@ -1186,6 +1235,7 @@ mod tests {
 
     fn script_clone(sys: &Fake, who: &User, empty: bool) -> (Repo, PathBuf, String) {
         let repo = Repo {
+            owner: "alice".into(),
             name: "new".into(),
             default_branch: Some("main".into()),
         };
@@ -1487,6 +1537,7 @@ mod tests {
         sys.write_file(&path.join("dirty.txt"), b"local owner edits", 0o600)
             .unwrap();
         let repo = Repo {
+            owner: "alice".into(),
             name: "existing".into(),
             default_branch: Some("main".into()),
         };
@@ -1518,6 +1569,7 @@ mod tests {
             "history intentionally unavailable",
         );
         let repo = Repo {
+            owner: "alice".into(),
             name: "existing".into(),
             default_branch: Some("main".into()),
         };

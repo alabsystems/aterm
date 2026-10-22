@@ -170,7 +170,7 @@ pub(crate) use clipboard::{pbpaste_owned, primary_get, primary_get_owned, primar
 pub(crate) mod control_media;
 /// The aimed-spawn target: built in `control_media::cmd_spawn`, carried in
 /// `Wake::SpawnSession`.
-pub(crate) use control_media::{IdentitySpec, SpawnAim, resolve_spawn_identity};
+pub(crate) use control_media::SpawnAim;
 
 /// The handshake's `ERR auth` audit line, thinned per refusal kind; and the
 /// fleet's refusals (`crate::fleet_listen`, the fleet gate), thinned by the
@@ -197,6 +197,9 @@ pub(crate) use control_session::{TURN_ID_RESERVE, raise_turn_ids, turn_ids_minte
 // A turn id minted as `turn` mints one, for the crash-restore tests.
 #[cfg(all(test, unix))]
 pub(crate) use control_session::mint_turn_id_for_test;
+// A test that reads the turn-id count twice counts on its own.
+#[cfg(test)]
+pub(crate) use control_session::own_turn_ids;
 // The two reads a handoff's end-to-end test drives the harness's report reader
 // (`Session::report`) through (the handoff is unix-only, and so is that test).
 #[cfg(all(test, unix))]
@@ -801,6 +804,19 @@ fn need_of(form: &aterm_types::control_verbs::Resolved, verb: &str, rest: &str) 
     op_of(form.op).map(Need::Op)
 }
 
+#[cfg(test)]
+#[test]
+fn system_state_open_requires_the_config_authority() {
+    assert_eq!(
+        argument_escalation("open", "app system-state"),
+        Some(Need::Op(Op::ConfigWrite))
+    );
+    assert_eq!(
+        argument_escalation("open", "app settings"),
+        Some(Need::Op(Op::ConfigWrite))
+    );
+}
+
 /// Authority that depends on an argument's VALUE, which no table form can match:
 /// seams where a plain `WriteInput` edge could otherwise reach a fenced op.
 ///
@@ -822,7 +838,7 @@ fn need_of(form: &aterm_types::control_verbs::Resolved, verb: &str, rest: &str) 
 ///   * `open menu` / `open palette` and `open update` are Owner-only, like
 ///     their `invoke` twins, and `open overview` (its old `connections`
 ///     keyword too) lists every session, Owner-only like `flows`.
-///   * `spawn connected=…|identity=…`, `brief all`, `log n` (the instance's
+///   * `spawn connected=…`, `brief all`, `log n` (the instance's
 ///     node log), `sys`'s wide forms and `await sys … scope=aterm` are
 ///     Owner-only.
 ///
@@ -857,10 +873,11 @@ fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
         "open"
             if matches!(
                 aterm_types::app_inspection::parse_open_app(rest),
-                Ok(aterm_types::app_inspection::OpenAppRequest::Settings { .. })
+                Ok(aterm_types::app_inspection::OpenAppRequest::Settings { .. }
+                    | aterm_types::app_inspection::OpenAppRequest::SystemState)
             ) =>
         {
-            // The versioned Settings app is the same capability as `open prefs`;
+            // The native setup/config apps are the same capability as `open prefs`;
             // classify it here, before the main-thread hop.
             Some(Need::Op(Op::ConfigWrite))
         }
@@ -882,8 +899,7 @@ fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
             Some(Need::Op(Op::ConfigWrite))
         }
         // A connected spawn (`spawn connected=… of=<sid>`) mints session-connection
-        // authority, `identity=` opens a session under another login's
-        // credentials, and a worker (`agent=`, with its `model=`, its
+        // authority, and a worker (`agent=`, with its `model=`, its
         // `from=` and its task frame's `len=`) starts an agent in a folder
         // trusted for it: all Owner-only. A plain `spawn [cwd=…]` keeps
         // WriteInput.
@@ -892,16 +908,9 @@ fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
         "spawn"
             if control_media::split_quoted_tokens(rest).is_none_or(|tokens| {
                 tokens.iter().any(|t| {
-                    [
-                        "connected=",
-                        "identity=",
-                        "agent=",
-                        "model=",
-                        "from=",
-                        "len=",
-                    ]
-                    .iter()
-                    .any(|key| t.starts_with(key))
+                    ["connected=", "agent=", "model=", "from=", "len="]
+                        .iter()
+                        .any(|key| t.starts_with(key))
                 })
             }) =>
         {
@@ -2568,7 +2577,18 @@ pub(crate) struct ControlReply {
 /// A seamless update's Commit waits (bounded) on these so its `_exit` cannot
 /// land between handing a `video` reply to the channel and writing it.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ReplyWire(Arc<(Mutex<bool>, std::sync::Condvar)>);
+pub(crate) struct ReplyWire(Arc<(Mutex<WireLatch>, std::sync::Condvar)>);
+
+/// What a [`ReplyWire`]'s lock holds.
+#[derive(Debug, Default)]
+struct WireLatch {
+    /// The reply is written (or never will be).
+    released: bool,
+    /// TESTS ONLY: a [`ReplyWire::wait_released`] began on it
+    /// ([`ReplyWritten::awaited_within`]).
+    #[cfg(test)]
+    awaited: bool,
+}
 
 /// The connection thread's half of a [`ReplyWire`]; dropping it releases the
 /// latch.
@@ -2586,11 +2606,11 @@ impl ReplyWire {
     /// Whether the reply is written (or never will be).
     #[must_use]
     pub(crate) fn is_released(&self) -> bool {
-        *self
-            .0
+        self.0
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .released
     }
 
     /// Wait until the latch is released or `deadline` passes; whether it was
@@ -2598,17 +2618,49 @@ impl ReplyWire {
     #[cfg(any(unix, test))]
     #[must_use]
     pub(crate) fn wait_released(&self, deadline: std::time::Instant) -> bool {
-        let (released, changed) = &*self.0;
-        let mut released = released
+        let (latch, changed) = &*self.0;
+        let mut latch = latch
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !*released {
+        #[cfg(test)]
+        {
+            latch.awaited = true;
+            changed.notify_all();
+        }
+        while !latch.released {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return false;
             }
-            released = changed
-                .wait_timeout(released, remaining)
+            latch = changed
+                .wait_timeout(latch, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+}
+
+#[cfg(all(test, unix))]
+impl ReplyWritten {
+    /// TESTS ONLY: wait up to `within` for a [`ReplyWire::wait_released`] to
+    /// begin on this latch; whether one did. A stand-in connection writes its
+    /// reply only then, so a waiter that went on without waiting finds it
+    /// unwritten, every run.
+    #[must_use]
+    pub(crate) fn awaited_within(&self, within: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + within;
+        let (latch, changed) = &*(self.0).0;
+        let mut latch = latch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !latch.awaited {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            latch = changed
+                .wait_timeout(latch, remaining)
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
@@ -2618,10 +2670,11 @@ impl ReplyWire {
 
 impl Drop for ReplyWritten {
     fn drop(&mut self) {
-        let (released, changed) = &*(self.0).0;
-        *released
+        let (latch, changed) = &*(self.0).0;
+        latch
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .released = true;
         changed.notify_all();
     }
 }
@@ -5073,19 +5126,26 @@ fn serve_meta(
     // hold the landing turn's own reports. The screen's count is read with it,
     // so a busy a sweep's read began meanwhile stays past it too. Leaf locks,
     // each let go before the next: the terminal, then the timeline.
-    let landing_mark = control_session::harness_act_face(rest)
+    let snapshot = control_session::harness_act_face(rest)
         .is_some_and(crate::harness_task::holds_until_another_turn)
         .then(|| {
-            let program_turns = term_lock(term).program_state().turns;
+            use aterm_core::terminal::program_state::ProgramStateWord as W;
+            let report = term_lock(term).program_state();
+            let left_at_rest = report
+                .state
+                .is_some_and(|state| matches!(state.state, W::Idle | W::Done | W::Error));
             let busy_entries = ctx
                 .timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .agent()
                 .busy_entries;
-            crate::session_timeline::LandingMark {
-                program_turns,
-                busy_entries,
+            control_session::HarnessActSnapshot {
+                mark: crate::session_timeline::LandingMark {
+                    program_turns: report.turns,
+                    busy_entries,
+                },
+                left_at_rest,
             }
         });
     let (resp, changed) =
@@ -5094,7 +5154,7 @@ fn serve_meta(
                 let by = control_session::log_actor(scope, ctx);
                 control_session::cmd_meta_harness_act(
                     ctx,
-                    landing_mark,
+                    snapshot,
                     serving_connection(),
                     by,
                     prove,
@@ -6046,9 +6106,6 @@ fn dispatch_owner(
         // The exit ledger is a store read like `sessions`: the instance's past
         // stays answerable with no terminal at all.
         "exits" => control_session::cmd_exits(store, rest),
-        // The identity roster is a directory plus store read, so identities stay
-        // listable and forgettable with no terminal.
-        "identities" => crate::agent_identity::cmd_identities(store, rest),
         // The op-level authority primitives and their connection-grain twins
         // share the repaint poke: a successful act moves the tab marks, which no
         // funnel epoch would otherwise notice.
@@ -6081,7 +6138,7 @@ fn dispatch_owner(
         "raise" => control_session::cmd_raise(proxy, store, scope, rest),
         // `appnotice <lane> <text>`: a pull-down row from outside the process.
         "appnotice" => control_query::cmd_appnotice(proxy, rest),
-        // `notice <post|progress|done|ask|dismiss|act> …`: the message band's
+        // `notice <post|progress|done|ask|later|dismiss|act> …`: the message band's
         // write face.
         "notice" => control_query::cmd_notice(proxy, rest),
         // `devtools hand-over [now]`: the window's Developer Tools hand-over (a
@@ -7952,8 +8009,8 @@ const DRIVE_CLOSE_REFUSED: &str = "a drive closes only a worker it spawned since
 /// * `@<sid> status|text|screen|result`, reads;
 /// * `@<sid> turn|key|send`, writes;
 /// * `hold <sid> on|off [reason=<pct>]`, with no `origin=`;
-/// * `spawn agent=claude [model=<m>] [cwd=<absolute>] [from=<sid>]
-///   [raise=false] len=<n>`, a worker's frame, `raise=false` added where it
+/// * `spawn agent=<claude|gemini|agy|muse> [model=<m>] [cwd=<absolute>]
+///   [from=<sid>] [raise=false] len=<n>`, a worker's frame, `raise=false` added where it
 ///   is absent, `from=` naming no session of this instance;
 /// * `await task @<sid>[:<rev>][,…] …`, the list form;
 /// * `@<sid> close` of a worker this node spawned.
@@ -8041,7 +8098,7 @@ fn drive_gate(
                 Ok(read())
             }
             _ => Err(format!(
-                "a drive serves survey, version, hold, spawn agent=claude and await task, \
+                "a drive serves survey, version, hold, spawn agent=<word> and await task, \
                  and @<sid> status|text|screen|result|turn|key|send|close; not `{}`",
                 verb.chars().take(32).collect::<String>()
             )),
@@ -8090,7 +8147,8 @@ fn drive_turn(rest: &str) -> Result<(), String> {
 }
 
 /// A drive's `spawn` line as it goes on, or why it is refused
-/// ([`drive_gate`]): a worker's frame alone — `agent=claude`, `len=<n>`, and
+/// ([`drive_gate`]): a worker's frame alone — `agent=<word>` of a worker
+/// (`aterm_agent::harness::worker::WORKERS`), `len=<n>`, and
 /// of the rest only `model=`, an absolute `cwd=`, a `from=` naming no session
 /// of this instance (`hosts`) and `raise=false`, which is added where it is
 /// absent: another Mac's worker never takes this Mac's front window.
@@ -8100,14 +8158,20 @@ fn drive_spawn(
     rest: &str,
     hosts: &dyn Fn(&SessionId) -> bool,
 ) -> Result<String, String> {
-    const USAGE: &str = "a drive spawns only a worker: spawn agent=claude [model=<m>] \
-                         [cwd=<absolute>] [from=<sid>] [raise=false] len=<n>";
+    const USAGE: &str = "a drive spawns only a worker: spawn agent=<claude|gemini|agy|muse> \
+                         [model=<m>] [cwd=<absolute>] [from=<sid>] [raise=false] len=<n>";
     let tokens = control_media::split_quoted_tokens(rest).ok_or(USAGE)?;
     let (mut agent, mut framed, mut raise) = (false, false, false);
     for token in &tokens {
         let (key, value) = token.split_once('=').ok_or(USAGE)?;
         match key {
-            "agent" if value == "claude" => agent = true,
+            "agent"
+                if aterm_agent::harness::worker::WORKERS
+                    .iter()
+                    .any(|w| w.word == value) =>
+            {
+                agent = true;
+            }
             "len" => framed = true,
             "model" => {}
             "cwd" if std::path::Path::new(value).is_absolute() => {}
@@ -9285,7 +9349,7 @@ fn post_frame_len(rest: &str) -> Option<Result<usize, String>> {
         .map(crate::fabric::post_len)
 }
 
-/// Whether this request is a WORKER's spawn (`spawn … agent=claude len=<n>`),
+/// Whether this request is a WORKER's spawn (`spawn … agent=<word> len=<n>`),
 /// whose task — at most [`crate::task_launch::TASK_MAX`] raw bytes — travels
 /// on the stream after the line (`task_launch`). `Some(Ok(n))` announces n
 /// bytes; `Some(Err(reply))` is a `len=` the server will not read
@@ -9304,10 +9368,12 @@ fn spawn_frame_len(head: &Head<'_>) -> Option<Result<usize, String>> {
     let rest = head.rest;
     let tokens = control_media::split_quoted_tokens(rest)
         .unwrap_or_else(|| rest.split_whitespace().map(str::to_string).collect());
+    let agent =
+        crate::task_launch::worker_word(tokens.iter().find_map(|tok| tok.strip_prefix("agent=")));
     tokens
         .iter()
         .find_map(|tok| tok.strip_prefix("len="))
-        .map(crate::task_launch::frame_len)
+        .map(|len| crate::task_launch::frame_len(len, agent))
 }
 
 /// A worker's task: the `n` bytes after its spawn line ([`spawn_frame_len`]),
@@ -9341,6 +9407,11 @@ fn read_worker_task(
 /// the client asks the instance its own session lives on.
 fn worker_frame_refusal(head: &Head<'_>, store: &Store) -> Option<String> {
     spawn_frame_len(head)?.ok()?;
+    let agent = crate::task_launch::worker_word(
+        head.rest
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("agent=")),
+    );
     let Some(selector @ Selector::Sid(sid)) = head.selector else {
         return None;
     };
@@ -9351,7 +9422,7 @@ fn worker_frame_refusal(head: &Head<'_>, store: &Store) -> Option<String> {
         .is_some();
     (!hosted).then(|| {
         format!(
-            "ERR spawn agent=claude: @{} is not a session of this instance; ask the one that \
+            "ERR spawn agent={agent}: @{} is not a session of this instance; ask the one that \
              hosts it\n",
             sid.as_str()
         )

@@ -49,6 +49,11 @@
 //!   checking it after idle watches lapse, so stale or reset quota clears within a minute.
 //!   A settings/provider/profile-store check once per registered image and working
 //!   directory suppresses the whole tuple when Claude uses a different auth source.
+//!   Muse Code's tuple is its own login store's address (read on the resolver
+//!   thread, `profile::muse_subscription_for`) with the tier and weekly quota read
+//!   off its `/status` and `/usage` cards on the glass, as agy's is read off its
+//!   launch card; until a card has shown, Muse Code's quota says `weekly
+//!   unavailable` rather than a guess.
 //! * THE ACCOUNT. Where `accounts.toml` lists two or more, `⎆ <label>` names
 //!   the roster row the process's login is (`accounts::footer_label`),
 //!   between the model and the path. The login is what the exec environment
@@ -2623,6 +2628,20 @@ fn resolve_facts_at(
                 .as_deref()
                 .and_then(footer::footer_model_name)
                 .or(launch.model);
+            // Muse Code's account is its own login store's, read here on
+            // the resolver thread; its tier and weekly quota are read off
+            // its `/status` and `/usage` cards on the glass and kept in
+            // `prev_sub` between reads, so only a missing address is asked
+            // of the store.
+            let mut sub = prev_sub;
+            if prog == aterm_phase::Program::Muse
+                && sub.email.is_none()
+                && let (Some(args), Some(home)) = (args.as_ref(), home.as_deref())
+                && let Some(read) =
+                    aterm_agent::harness::profile::muse_subscription_for(&args.env, home)
+            {
+                sub.email = read.email;
+            }
             facts = Some(FooterFacts {
                 model_open: model.is_none(),
                 model,
@@ -2643,7 +2662,7 @@ fn resolve_facts_at(
                 }),
                 upgrade: None,
                 account: None,
-                subscription: Some(prev_sub),
+                subscription: Some(sub),
                 // The plan is read for a Claude Code's model only.
                 plan: None,
                 context: prev_ctx,
@@ -3925,15 +3944,31 @@ impl App {
                 // the glass; a drawer with no facts has no footer to fill.
                 if held && let Some(Some(cached)) = texts.panes.get(leaf_index) {
                     let shown = texts.footers[leaf_index].shown();
-                    let want_acct =
-                        agent == Some(aterm_phase::Program::Agy) && shown.subscription.is_some();
+                    // agy's launch card and Muse Code's `/status` card each
+                    // name their signed-in account on the glass; Muse
+                    // Code's `/usage` card names its weekly quota beside
+                    // it. Claude Code's account is its profile's, read on
+                    // the resolver thread instead.
+                    let want_acct = matches!(
+                        agent,
+                        Some(aterm_phase::Program::Agy | aterm_phase::Program::Muse)
+                    ) && shown.subscription.is_some();
                     // The context fact follows Claude Code's own indicator: a reading or
                     // nothing, so whether one is shown yet is no gate. agy and Muse Code
                     // draw no such indicator (none in any screen measured of either).
                     let want_ctx = agent == Some(aterm_phase::Program::Claude);
                     if want_acct || want_ctx {
                         let screen_acct = want_acct
-                            .then(|| aterm_phase::agy::launch_card_account(&cached.rows))
+                            .then(|| match agent {
+                                Some(aterm_phase::Program::Muse) => {
+                                    aterm_phase::muse::status_card_account(&cached.rows)
+                                }
+                                _ => aterm_phase::agy::launch_card_account(&cached.rows),
+                            })
+                            .flatten();
+                        let screen_weekly = (agent == Some(aterm_phase::Program::Muse)
+                            && want_acct)
+                            .then(|| aterm_phase::muse::usage_card_weekly(&cached.rows))
                             .flatten();
                         let screen_ctx = want_ctx
                             .then(|| {
@@ -3946,6 +3981,11 @@ impl App {
                                 sub.email.as_deref() != Some(email.as_str())
                                     || sub.plan.as_deref() != plan.as_deref()
                             })
+                        }) || screen_weekly.as_ref().is_some_and(|weekly| {
+                            shown
+                                .subscription
+                                .as_ref()
+                                .is_some_and(|sub| sub.weekly.as_ref() != Some(weekly))
                         });
                         // A new reading is written; a reading Claude Code no longer shows
                         // (as after `/compact`) goes. A box over the composer, a menu in
@@ -3972,6 +4012,11 @@ impl App {
                                 {
                                     sub.email = Some(email);
                                     sub.plan = plan;
+                                }
+                                if let Some(weekly) = screen_weekly
+                                    && let Some(sub) = facts.subscription.as_mut()
+                                {
+                                    sub.weekly = Some(weekly);
                                 }
                                 if need_ctx {
                                     facts.context = screen_ctx;
@@ -4747,7 +4792,9 @@ fn collect_composer_border_brand_edits(
             [88, 166, 255],
             "agy",
         ),
-        aterm_phase::Program::Muse => (" \u{25C6} muse ", 2usize, [168, 130, 255], "muse"),
+        // Muse Code's own done-diamond (`◆`, its reply's glyph) in Meta
+        // blue (`#0082FB`).
+        aterm_phase::Program::Muse => (" \u{25C6} muse ", 2usize, [0, 130, 251], "muse"),
         _ => return,
     };
     let term_row = region.row_off + top_rule;
@@ -4795,6 +4842,32 @@ fn collect_composer_border_brand_edits(
             }
         } else {
             cur_start = None;
+        }
+    }
+    // Muse Code's rule at rest is labelled (`── Voice input (⌥ + v to
+    // start) ──…`): where the harness brands the rule, its branding takes
+    // the label's cells too, so the tool's logo stands at the rule's left
+    // as Claude's and agy's do (owner, 2026-10-21) — on the glass alone;
+    // the grid keeps Muse Code's row for its readers, and a voice state
+    // with news (`Recording`, `Transcribing`, …) keeps its words, the
+    // branding staying on the plain run after it.
+    if paint.branded
+        && program == aterm_phase::Program::Muse
+        && let (Some(first), Some(last)) = (
+            pane_slice.iter().position(|c| c.ch == '\u{2500}'),
+            pane_slice.iter().rposition(|c| c.ch == '\u{2500}'),
+        )
+        && first < best.start
+    {
+        let text: String = pane_slice.iter().map(|c| c.ch).collect();
+        let untouched = (first..=last).all(|idx| {
+            let col = region.col_off + idx;
+            !touches(&scratch.clusters, frame_row, &(col..col + 1))
+                && !touches(&scratch.combining, frame_row, &(col..col + 1))
+                && !touches(&scratch.images, frame_row, &(col..col + 1))
+        });
+        if untouched && aterm_phase::muse::is_idle_voice_rule(&text) {
+            best = first..last + 1;
         }
     }
     let span_len = best.len();
@@ -5495,10 +5568,16 @@ pub(crate) mod rig {
         aterm_types::dirs::test_root().map(|root| root.join("home"))
     }
 
-    /// A Claude home under a fresh temp root, with the registry row of `pid`
-    /// naming the image `started_at`: `(root, home)`.
+    /// Where [`claude_home`] puts the home named `name`: a short process root, so
+    /// its work folder's project slug stays under 255 bytes whatever `$TMPDIR` is.
+    pub(crate) fn home_root(name: &str) -> PathBuf {
+        crate::test_scratch::short_process_root("aterm-cf-").join(name)
+    }
+
+    /// A Claude home under a fresh root ([`home_root`]), with the registry row of
+    /// `pid` naming the image `started_at`: `(root, home)`.
     pub(crate) fn claude_home(name: &str, pid: i32, started_at: u64) -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir().join(format!("aterm-gui-{name}-{}", std::process::id()));
+        let root = home_root(name);
         let _ = std::fs::remove_dir_all(&root);
         let (cwd, claude) = (root.join("work"), root.join("claude"));
         std::fs::create_dir_all(&cwd).unwrap();
@@ -5789,15 +5868,18 @@ mod tests {
     fn the_chips_keep_a_blank_cell_on_each_side_at_every_width() {
         let blank = cell(' ', [200, 200, 200]);
         let rule = cell('\u{2500}', [90, 90, 90]);
+        // Cruise's hovered title, its explanation from the one table: the
+        // length the app draws.
+        let cruise = format!(
+            "autopilot: cruise \u{2014} {} \u{b7} click: land  ",
+            crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip
+        );
         for facts in [facts(), facts_with_usage(), FooterFacts::default()] {
             for chips in [1usize, 3, 6, 8, 10, 14] {
                 for (title, short) in [
                     ("", ""),
                     ("Permission mode: plan  ", "plan  "),
-                    (
-                        "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land  ",
-                        "autopilot: cruise  ",
-                    ),
+                    (cruise.as_str(), "autopilot: cruise  "),
                 ] {
                     let block = crate::claude_lights::Block::of_chips(
                         row_of(&"\u{25CB}".repeat(chips), [150, 150, 150]),
@@ -5963,8 +6045,7 @@ mod tests {
         const S: &str = "00000000-0000-4000-8000-000000000c01";
         const A: &str = "00000000-0000-4000-8000-000000000c02";
         const B: &str = "00000000-0000-4000-8000-000000000c03";
-        let root =
-            std::env::temp_dir().join(format!("aterm-gui-footer-lapse-{}", std::process::id()));
+        let root = super::rig::home_root("footer-lapse");
         let _ = std::fs::remove_dir_all(&root);
         let cwd = root.join("work");
         let claude = root.join("claude");
@@ -6788,10 +6869,7 @@ mod tests {
     #[test]
     fn unread_exec_directory_is_retried_for_the_same_process() {
         fn recovered_args(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
-            let home = std::env::temp_dir().join(format!(
-                "aterm-gui-footer-exec-context-{}",
-                std::process::id()
-            ));
+            let home = super::rig::home_root("footer-exec-context");
             Some(atpkg::caller_shell::ProcArgs {
                 argv: vec!["claude".to_string()],
                 env: vec![
@@ -6895,10 +6973,7 @@ mod tests {
         }
         fn args(registered: bool) -> Option<atpkg::caller_shell::ProcArgs> {
             EXEC_READS.set(EXEC_READS.get() + 1);
-            let root = std::env::temp_dir().join(format!(
-                "aterm-gui-footer-readable-launcher-{}",
-                std::process::id()
-            ));
+            let root = super::rig::home_root("footer-readable-launcher");
             let mut env = vec![format!(
                 "HOME={}",
                 root.join(if registered {
@@ -7204,10 +7279,7 @@ mod tests {
         let mut memo = RosterMemo::default();
         let asks = Asks {
             args: |_| {
-                let root = std::env::temp_dir().join(format!(
-                    "aterm-gui-footer-subscription-resolve-{}",
-                    std::process::id()
-                ));
+                let root = super::rig::home_root("footer-subscription-resolve");
                 Some(args_of(&[
                     &format!("HOME={}", root.display()),
                     &format!("CLAUDE_CONFIG_DIR={}", root.join("claude").display()),
@@ -7304,10 +7376,7 @@ mod tests {
             static ALLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
         fn args(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
-            let root = std::env::temp_dir().join(format!(
-                "aterm-gui-footer-subscription-auth-{}",
-                std::process::id()
-            ));
+            let root = super::rig::home_root("footer-subscription-auth");
             Some(atpkg::caller_shell::ProcArgs {
                 argv: vec![
                     "claude".into(),
@@ -7465,10 +7534,7 @@ mod tests {
             aterm_agent::harness::profile::path_in(&root, Some(&claude.to_string_lossy()), &claude);
         let asks = Asks {
             args: |_| {
-                let root = std::env::temp_dir().join(format!(
-                    "aterm-gui-footer-subscription-expiry-{}",
-                    std::process::id()
-                ));
+                let root = super::rig::home_root("footer-subscription-expiry");
                 Some(args_of(&[
                     &format!("HOME={}", root.display()),
                     &format!("CLAUDE_CONFIG_DIR={}", root.join("claude").display()),
@@ -8251,11 +8317,19 @@ mod tests {
         const PILL: &str = "\x1b[38;2;255;110;90m";
         const DIM: &str = "\x1b[38;2;130;130;130m";
         if row.starts_with('\u{2500}') {
+            // A labelled rule as the vendors draw it: the dashes in the
+            // rule's colour on both sides, the label between in its own
+            // (Claude Code's effort tag; Muse Code's `Voice input …`,
+            // measured `4b4f55` rule, `8a9098` label).
             let rule: String = row.chars().take_while(|c| *c == '\u{2500}').collect();
-            let label = &row[rule.len()..];
-            let (label, end) = label
-                .strip_suffix('\u{2500}')
-                .map_or((label, ""), |l| (l, "\u{2500}"));
+            let rest = &row[rule.len()..];
+            let trail = rest
+                .chars()
+                .rev()
+                .take_while(|c| *c == '\u{2500}')
+                .map(char::len_utf8)
+                .sum::<usize>();
+            let (label, end) = rest.split_at(rest.len() - trail);
             return format!("{RULE}{rule}{LABEL}{label}{RULE}{end}\x1b[0m");
         }
         if footer::is_mode_row(row) {
@@ -9442,6 +9516,115 @@ mod tests {
         host.shutdown_and_join();
     }
 
+    /// MUSE CODE'S SIGNED-IN CARDS POPULATE THE FOOTER (owner, 2026-10-21;
+    /// measured on 1.4.11 signed in): with a `/status` and a `/usage` card
+    /// over the composer the bottom rule names the account, its tier and
+    /// `weekly 29% left` — not `account unavailable` / `weekly
+    /// unavailable` — and the top rule's branding stands where its idle
+    /// `Voice input` label was. CONTROL: the same pane before any card
+    /// shows the unavailable words and keeps them.
+    #[test]
+    fn muse_signed_in_cards_populate_the_footer() {
+        let (mut app, wid, session) = glass(160);
+        {
+            let entry = app.pool.get(session).expect("session");
+            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline.note_foreground_group(6161);
+            timeline.set_program(6161, Some("muse".into()));
+            assert!(timeline.set_claude_footer(
+                6161,
+                None,
+                Some(FooterFacts {
+                    model_open: true,
+                    effort_open: true,
+                    path: Some("~/aterm".into()),
+                    branch: Some("main".into()),
+                    owner: Some(footer::FactsOwner {
+                        floor: None,
+                        session_id: "muse-6161".into(),
+                    }),
+                    subscription: Some(
+                        aterm_agent::harness::profile::SubscriptionDisplay::default(),
+                    ),
+                    ..FooterFacts::default()
+                }),
+            ));
+        }
+        let host = crate::harness_host::HostHandle::for_supervised_test(
+            Vec::new(),
+            std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+        );
+        app.harness = Some(host.clone());
+        let ctx = app.pool.get(session).expect("session").ctx.clone();
+        crate::session_timeline::claim_supervisor(
+            &ctx,
+            &crate::harness_host::holder(),
+            None,
+            None,
+            crate::metrics::now_us(),
+        )
+        .expect("claim");
+
+        let rule = "\u{2500}".repeat(160);
+        let labelled = format!(
+            "\u{2500}\u{2500} Voice input (\u{2325} + v to start) {}",
+            "\u{2500}".repeat(128)
+        );
+        let footer_row = "  gpt-5.4 \u{00B7} high \u{00B7} ~/aterm \u{00B7} Auto-review";
+        let bare = vec![
+            String::new(),
+            "  Muse Code 0.9.3".into(),
+            String::new(),
+            labelled.clone(),
+            "\u{276F} ".into(),
+            rule.clone(),
+            footer_row.into(),
+        ];
+        feed_rows(&app, session, &bare);
+        frame(&mut app, wid);
+        let strip = strip(&app, wid);
+        let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
+        assert!(
+            bottom.contains("account unavailable") && bottom.contains("weekly unavailable"),
+            "CONTROL: no card shown yet: {bottom:?}"
+        );
+
+        let carded = vec![
+            String::new(),
+            "  Muse Code 0.9.3".into(),
+            "\u{250C}".to_owned() + &"\u{2500}".repeat(80) + "\u{2510}",
+            "\u{2502}  MUSE CODE 0.9.3                                                    IDLE \u{2502}".into(),
+            "\u{2502}  ACCOUNT        Redacted User (redacted-user@example.test)              \u{2502}".into(),
+            "\u{2502}  BILLING        Subscription \u{00B7} Muse Code Max Usage                     \u{2502}".into(),
+            "\u{2514}".to_owned() + &"\u{2500}".repeat(80) + "\u{2518}",
+            "\u{250C}".to_owned() + &"\u{2500}".repeat(55) + "\u{2510}",
+            "\u{2502}  Session usage                                        \u{2502}".into(),
+            "\u{2502}    Weekly         71% used \u{00B7} Resets Oct 25 at 5:00 PM \u{2502}".into(),
+            "\u{2514}".to_owned() + &"\u{2500}".repeat(55) + "\u{2518}",
+            labelled,
+            "\u{276F} ".into(),
+            rule,
+            footer_row.into(),
+        ];
+        feed_rows(&app, session, &carded);
+        frame(&mut app, wid);
+        // The reading is written back for the next compose.
+        frame(&mut app, wid);
+        let top = text_of(&app.windows[&wid].input_scratch.cells[strip + 11]);
+        assert!(
+            !top.contains("Voice input") && top.contains("\u{25C6} muse"),
+            "the branded top rule: {top:?}"
+        );
+        let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 13]);
+        assert!(
+            bottom.contains("redacted-user@example.test")
+                && bottom.contains("weekly 29% left")
+                && !bottom.contains("unavailable"),
+            "the cards populate account and weekly: {bottom:?}"
+        );
+        host.shutdown_and_join();
+    }
+
     /// NO `ctx auto` (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.3 item 5, slice 4e):
     /// the context fact is a reading or nothing. A fresh Claude Code pane (its facts from its
     /// registry row, through the resolver), a fresh agy and a fresh Muse Code pane (the facts
@@ -9809,7 +9992,12 @@ mod tests {
             String::new(),
             "  Muse Code 0.9.3".into(),
             String::new(),
-            rule.clone(),
+            // Muse Code's own top rule at rest is labelled: the harness
+            // branding replaces the label on the glass (owner, 2026-10-21).
+            format!(
+                "\u{2500}\u{2500} Voice input (\u{2325} + v to start) {}",
+                "\u{2500}".repeat(128)
+            ),
             "\u{276F} ".into(),
             rule,
             "  gpt-5.4 \u{00B7} high \u{00B7} ~/aterm \u{00B7} Auto-review".into(),
@@ -9892,6 +10080,21 @@ mod tests {
                     bottom_on.contains("redacted-user@example.test")
                         && bottom_on.contains("Google AI Ultra"),
                     "agy: launch card account email and plan populate standardized footer: {bottom_on:?}"
+                );
+            }
+            if prog == "muse" {
+                assert!(
+                    !top_on.contains("Voice input"),
+                    "muse: the branded top rule takes the idle voice label's cells: {top_on:?}"
+                );
+                let diamond = app.windows[&wid].input_scratch.cells[strip + top_rule_row]
+                    .iter()
+                    .find(|c| c.ch == '\u{25C6}')
+                    .expect("the muse diamond");
+                assert!(
+                    diamond.fg[2] > 150 && diamond.fg[0] < 80,
+                    "muse: the diamond is Meta blue, not purple: {:?}",
+                    diamond.fg
                 );
             }
             let card_on = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);

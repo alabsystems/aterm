@@ -304,7 +304,45 @@ pub(crate) struct State {
     /// NEGATIVE CONTROLS of the arm itself ([`law_check`]'s): lose below the
     /// durable head; lose with no move.
     pub(crate) mutant: ArmMutant,
+    /// A SIBLING RACING AN ATTACH ([`Race`]), in the worlds that have one.
+    pub(crate) race: Option<Race>,
     notes: Vec<String>,
+}
+
+/// A SIBLING THAT RACES ONE OF THE NODE'S ATTACHES (finding F4's review,
+/// `super::world::Opts::race`): a copy of the state dir, under the node's id
+/// and so its producer, whose bridge read the node face before this node's
+/// attach presented anything and takes the incarnation above it — one this
+/// node's state dir took for an attach the broker refused, which presented
+/// nothing. The broker refuses the node's [`Race::refuse_will`]-th will
+/// request, as a batch whose commit failed; inside a later one, while
+/// nothing of the refused incarnation is on the log, the sibling's node row
+/// and its session's row land at that incarnation's sequences, flushed, and
+/// it never dies. Inside the request, so the attach that sent it read the
+/// face before them: the interleaving a sibling acting between two of the
+/// scheduler's steps never reaches.
+#[derive(Debug, Default)]
+pub(crate) struct Race {
+    /// Which of the node's will requests is refused, counting from 1.
+    pub(crate) refuse_will: u32,
+    /// The node's will requests so far.
+    pub(crate) wills: u32,
+    /// The refused will's incarnation.
+    pub(crate) refused: Option<u64>,
+    /// The incarnation the sibling attached under, once it has.
+    pub(crate) raced: Option<u64>,
+    /// The sibling's node face and session face.
+    pub(crate) node_face: String,
+    pub(crate) session_face: String,
+    /// What the sibling's rows carry past the fields every row has, each
+    /// token led by its space.
+    pub(crate) extra: String,
+    /// Instead of a previously refused incarnation, take the attach's current
+    /// incarnation after its Last read, before its will is registered. Its
+    /// first node publish then collides and its own will fires on disconnect.
+    pub(crate) alias: bool,
+    /// The actual colliding first node publish and sibling record offset.
+    pub(crate) collision: Option<(u64, u64)>,
 }
 
 /// One defect of the simulated arm, for the law check's negative controls.
@@ -370,6 +408,7 @@ impl Broker {
                 tries_not_yet: 0,
                 seen_before_ack: 0,
                 mutant: ArmMutant::None,
+                race: None,
                 notes: Vec::new(),
             }),
         }
@@ -597,6 +636,46 @@ impl Broker {
             .map_or(0, |upto| upto + 1)
     }
 
+    /// Whether a will of `producer` at `seq` firing now would be FENCED — a
+    /// record of the producer at a higher sequence is on the log — as
+    /// [`State::fire`] judges one.
+    pub(crate) fn fences(&self, producer: u64, seq: u64) -> bool {
+        lock(&self.state)
+            .max_seq
+            .get(&producer)
+            .is_some_and(|max| *max > seq)
+    }
+
+    /// The highest incarnation `producer` ever put anything on the log under,
+    /// in astream's layout — a record, hidden or not, or a will's
+    /// registration — or 0: what a power cut's next boot must take its
+    /// incarnations above, for the oracle.
+    pub(crate) fn max_incarnation(&self, producer: u64) -> u64 {
+        lock(&self.state).max_incarnation(producer)
+    }
+
+    /// The finite alias actually registered two wills at one incarnation,
+    /// collided on the first node publish, and fired only the loser's will.
+    pub(crate) fn alias_collision_completed(&self) -> bool {
+        let s = lock(&self.state);
+        let Some(race) = s
+            .race
+            .as_ref()
+            .filter(|race| race.alias && race.collision.is_some())
+        else {
+            return false;
+        };
+        let Some(seq) = race.raced.and_then(astream_broker::will_seq) else {
+            return false;
+        };
+        let wills: Vec<&Will> = s.wills.iter().filter(|will| will.seq == seq).collect();
+        wills.len() == 2
+            && wills
+                .iter()
+                .any(|will| will.conn.is_some() && will.fired_at.is_none())
+            && wills.iter().any(|will| will.fired_at.is_some())
+    }
+
     /// Every visible record, for the oracle.
     pub(crate) fn records(&self) -> Vec<Visible> {
         let s = lock(&self.state);
@@ -701,6 +780,141 @@ impl State {
         self.principals.get(&producer).map(String::as_str)
     }
 
+    /// [`Broker::max_incarnation`], under the lock already held.
+    fn max_incarnation(&self, producer: u64) -> u64 {
+        let records = self
+            .log
+            .iter()
+            .filter_map(|r| r.key)
+            .filter(|(p, _)| *p == producer)
+            .map(|(_, seq)| seq);
+        let wills = self
+            .wills
+            .iter()
+            .filter(|w| w.producer == producer)
+            .map(|w| w.seq);
+        records
+            .chain(wills)
+            .filter_map(astream_broker::incarnation_of)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// THE RACE ([`Race`]) at one of a NODE producer's will requests: the
+    /// one it refuses, and the later one inside which the sibling attaches at
+    /// the refused incarnation — while nothing of that incarnation is on the
+    /// log, so the sibling takes it as a bridge takes `max(local, Last) + 1`.
+    /// The refusal's answer, or `None` for a will to register as usual.
+    fn race_at_will(&mut self, producer: u64, seq: u64) -> Option<Vec<Response>> {
+        if !self
+            .principal(producer)
+            .is_some_and(|p| p.starts_with("n-"))
+        {
+            return None;
+        }
+        let mut race = self.race.take()?;
+        race.wills += 1;
+        let at = astream_broker::incarnation_of(seq);
+        let mut refusal = None;
+        if race.alias && race.raced.is_none() && race.wills == race.refuse_will {
+            if let Some(n) = at {
+                if let Some(base) = astream_broker::incarnation_base(n) {
+                    let refuse_next = std::mem::take(&mut self.refuse_next);
+                    // A distinct live connection takes the SAME will through
+                    // the normal broker handler. The race is taken out of
+                    // self during this call, so it cannot recurse into itself.
+                    let sibling_conn = self.next_conn;
+                    self.next_conn += 1;
+                    self.conns.insert(
+                        sibling_conn,
+                        ConnState {
+                            pid: u64::MAX,
+                            inbound: Vec::new(),
+                            out: VecDeque::new(),
+                            held: VecDeque::new(),
+                            open: true,
+                            sub: None,
+                        },
+                    );
+                    let _ = self.handle(
+                        sibling_conn,
+                        Request::Will {
+                            producer_id: producer,
+                            producer_seq: astream_broker::will_seq(n)
+                                .expect("the current incarnation"),
+                            subject: race.node_face.clone(),
+                            body: format!(
+                                "v=1 t=1 state=away inc={n} fabric=disconnected{}",
+                                race.extra
+                            )
+                            .into_bytes(),
+                        },
+                    );
+                    for (k, (subject, body)) in (1u64..).zip([
+                        (
+                            race.node_face.clone(),
+                            format!("v=1 t=1 state=live inc={n} fabric=connected{}", race.extra),
+                        ),
+                        (
+                            race.session_face.clone(),
+                            format!(
+                                "v=1 t=1 inc={n} epoch=- gen=- state=live hold=0 attention=-{}",
+                                race.extra
+                            ),
+                        ),
+                    ]) {
+                        self.publish(producer, base + k, &subject, body.as_bytes())
+                            .expect("the live sibling's rows before this attach's node publish");
+                    }
+                    self.refuse_next = refuse_next;
+                    self.durable = self.log.len() as u64;
+                    race.raced = Some(n);
+                    self.notes
+                        .push(format!("PROBE sibling aliases current inc={n}"));
+                }
+            }
+        } else if !race.alias && race.wills == race.refuse_will {
+            race.refused = at;
+            self.notes.push(format!("PROBE will seq={seq} refused"));
+            refusal = Some(vec![Response::Error {
+                code: astream_broker::proto::ERR_REFUSED,
+                msg: "commit failed: the will was rolled back (simulated)".to_string(),
+            }]);
+        } else if let (false, Some(n), None, Some(at)) = (race.alias, race.refused, race.raced, at)
+        {
+            let base = astream_broker::incarnation_base(n);
+            if let Some(base) = base.filter(|_| at > n && self.max_incarnation(producer) + 1 == n) {
+                // ANOTHER BRIDGE'S BATCH: the node's rolled-back batches are
+                // this bridge's, not the sibling's.
+                let refuse_next = std::mem::take(&mut self.refuse_next);
+                let rows = [
+                    (
+                        race.node_face.clone(),
+                        format!("v=1 t=1 state=live inc={n} fabric=connected{}", race.extra),
+                    ),
+                    (
+                        race.session_face.clone(),
+                        format!(
+                            "v=1 t=1 inc={n} epoch=- gen=- state=live hold=0 attention=-{}",
+                            race.extra
+                        ),
+                    ),
+                ];
+                for (k, (subject, body)) in (1u64..).zip(&rows) {
+                    let _ = self.publish(producer, base + k, subject, body.as_bytes());
+                }
+                self.refuse_next = refuse_next;
+                self.durable = self.log.len() as u64;
+                race.raced = Some(n);
+                self.notes.push(format!(
+                    "PROBE sibling attaches inc={n} inside the attach at {at}"
+                ));
+            }
+        }
+        self.race = Some(race);
+        refusal
+    }
+
     /// QUEUE `responses` ON `conn`'S STREAM, in order: sent at once, or HELD
     /// (aterm-0) — an ack the broker answers late, its batch still in its
     /// flush, while the record it names is already readable, as a real
@@ -785,6 +999,15 @@ impl State {
             ));
         }
         if let Some(&off) = self.dedup.get(&(producer, seq)) {
+            if let Some(race) = self.race.as_mut().filter(|race| race.alias) {
+                if race
+                    .raced
+                    .and_then(astream_broker::incarnation_base)
+                    .is_some_and(|base| seq == base + 1 && subject == race.node_face)
+                {
+                    race.collision.get_or_insert((seq, off));
+                }
+            }
             return Ok((off, true));
         }
         if self.refuse_next > 0
@@ -958,6 +1181,9 @@ impl State {
                         code: astream_broker::proto::ERR_REFUSED,
                         msg: "a will's sequence in the ack half".to_string(),
                     }];
+                }
+                if let Some(refusal) = self.race_at_will(producer_id, producer_seq) {
+                    return refusal;
                 }
                 for w in &mut self.wills {
                     if w.conn == Some(conn) {

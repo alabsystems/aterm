@@ -207,6 +207,7 @@ impl TerminalFacts {
 /// unfinished frame, and a hidden one on a finished frame (including a bracket
 /// closed and reopened with nothing written). [`hidden_caret_withheld`] reads
 /// both cases under the same lock as the caret.
+#[inline]
 #[must_use]
 pub fn motion_caret(
     caret: Option<(u16, u16)>,
@@ -222,6 +223,7 @@ pub fn motion_caret(
 /// anything (`draws_ink`). A styled blank (a TUI's inverse-space caret, a
 /// coloured line) counts as something. Read under the same lock as the caret;
 /// the row is walked only while the cursor is hidden.
+#[inline]
 #[must_use]
 pub fn hidden_caret_withheld(term: &Terminal) -> bool {
     term.sync_frame_unfinished() || (!term.cursor_visible() && cursor_row_empty(term))
@@ -245,6 +247,7 @@ pub fn hidden_caret_withheld(term: &Terminal) -> bool {
 /// program's account of where it typed whatever the frame's state (an
 /// unfinished latch outlives a program that died mid-frame), so its anchor
 /// passes, as the caret does.
+#[inline]
 #[must_use]
 pub fn motion_print_anchor(term: &Terminal) -> (Option<(u16, u16, u64)>, Option<char>) {
     if term.sync_frame_unfinished() && !term.cursor_visible() {
@@ -263,6 +266,7 @@ fn cursor_row_empty(term: &Terminal) -> bool {
 /// Whether `cell` puts anything on the glass: a glyph, a background, or a
 /// decoration a space still shows (inverse, a line under, through or over it).
 /// A foreground colour, bold, dim, italic or blink on a space draws nothing.
+#[inline]
 fn draws_ink(cell: &aterm_core::grid::Cell) -> bool {
     use aterm_core::grid::CellFlags;
     let flags = cell.flags();

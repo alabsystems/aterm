@@ -330,51 +330,61 @@ impl EffectsPipeline {
     // --- the engines, for the host's feeds and readings ---------------------
 
     /// The cursor family (aurora, comet, cadence, block bodies, scratch).
+    #[inline]
     #[must_use]
     pub fn cursor(&self) -> &CursorFx {
         &self.cursor
     }
 
+    #[inline]
     pub fn cursor_mut(&mut self) -> &mut CursorFx {
         &mut self.cursor
     }
 
     /// The word engine (sparkle words, peeking cats, the sprite atlas).
+    #[inline]
     #[must_use]
     pub fn decos(&self) -> &WordDecorations {
         &self.decos
     }
 
+    #[inline]
     pub fn decos_mut(&mut self) -> &mut WordDecorations {
         &mut self.decos
     }
 
     /// The resident pet's one driver.
+    #[inline]
     #[must_use]
     pub fn companion(&self) -> &CompanionOwner {
         &self.companion
     }
 
+    #[inline]
     pub fn companion_mut(&mut self) -> &mut CompanionOwner {
         &mut self.companion
     }
 
     /// Which cat the companions wear ([`crate::companion_look::LookPolicy`]).
+    #[inline]
     #[must_use]
     pub fn look(&self) -> &crate::companion_look::LookPolicy {
         &self.look
     }
 
+    #[inline]
     pub fn look_mut(&mut self) -> &mut crate::companion_look::LookPolicy {
         &mut self.look
     }
 
     /// The companions beside the resident pet ([`crate::companions`]).
+    #[inline]
     #[must_use]
     pub fn companions(&self) -> &crate::companions::Companions {
         &self.companions
     }
 
+    #[inline]
     pub fn companions_mut(&mut self) -> &mut crate::companions::Companions {
         &mut self.companions
     }
@@ -382,6 +392,7 @@ impl EffectsPipeline {
     /// The companions and the cursor family together, for a host step that
     /// feeds one from the other in one breath (the song's sync reads the
     /// glow's style while it drives the flying head).
+    #[inline]
     pub fn companions_with_cursor(
         &mut self,
     ) -> (&mut crate::companions::Companions, &mut CursorFx) {
@@ -411,18 +422,21 @@ impl EffectsPipeline {
     // --- readings, and the seams a host's conformance tests stand on ----------
 
     /// The frame's free sprites (peeking cats, their gaze dots, companions).
+    #[inline]
     #[must_use]
     pub fn free_sprites(&self) -> &[FreeSprite] {
         &self.free_scratch
     }
 
     /// The frame's additive nova light (the supernovae, then prism wake).
+    #[inline]
     #[must_use]
     pub fn nova(&self) -> &[GlowQuad] {
         &self.nova_scratch
     }
 
     /// The rain driver's session-keyed edges.
+    #[inline]
     #[must_use]
     pub fn rain_latches(&self) -> &crate::matrix_rain::RainLatches {
         &self.rain_latches
@@ -430,6 +444,7 @@ impl EffectsPipeline {
 
     /// The owner the cursor family's retained light belongs to:
     /// `(terminal identity, alternate screen)`, `None` before the first frame.
+    #[inline]
     #[must_use]
     pub fn owner_space(&self) -> Option<(u64, bool)> {
         self.cursor_owner_space
@@ -504,6 +519,7 @@ impl EffectsPipeline {
 
     /// The last content-scroll snapshot the cursor family consumed — the
     /// baseline a host's witness capture compares its rows against.
+    #[inline]
     #[must_use]
     pub fn scroll_baseline(&self) -> Option<ContentScrollState> {
         self.cursor_scroll_state
@@ -643,6 +659,7 @@ impl EffectsPipeline {
         self.decos.begin_host_frame();
     }
 
+    #[inline]
     fn clear_word_scratch(&mut self) {
         self.deco_scratch.clear();
         self.ink_scratch.clear();
@@ -838,7 +855,9 @@ impl EffectsPipeline {
         }
         // `ink_row_slice` binary-searches by row and asserts strictly
         // increasing columns within one: a vertical split emits pane-major.
-        self.ink_scratch.sort_unstable_by_key(|c| (c.row, c.col));
+        if self.ink_scratch.len() > 1 {
+            self.ink_scratch.sort_unstable_by_key(|c| (c.row, c.col));
+        }
         out
     }
 
@@ -855,6 +874,7 @@ impl EffectsPipeline {
     }
 
     /// Clear the pane staging sprites before a host companion draws into it.
+    #[inline]
     pub fn clear_pane_sprites(&mut self) {
         self.pane_free.clear();
     }
@@ -1119,6 +1139,7 @@ impl EffectsPipeline {
     // --- PHOSPHOR rain ---------------------------------------------------------
 
     /// The rain engine, when one is built.
+    #[inline]
     #[must_use]
     pub fn rain(&self) -> Option<&MatrixRain> {
         self.rain.as_deref()
@@ -1133,6 +1154,7 @@ impl EffectsPipeline {
 
     /// The rain engine, for the host's notes into it (a config reload, the
     /// agent-output and focus notes).
+    #[inline]
     pub fn rain_mut(&mut self) -> Option<&mut MatrixRain> {
         self.rain.as_deref_mut()
     }
@@ -1199,6 +1221,7 @@ impl EffectsPipeline {
     }
 
     /// The frame's rain channels are empty.
+    #[inline]
     #[must_use]
     pub fn rain_empty(&self) -> bool {
         self.rain_scratch.is_empty() && self.rain_add_scratch.is_empty()
@@ -1219,6 +1242,7 @@ impl EffectsPipeline {
     // --- Prism wake --------------------------------------------------------------
 
     /// The single grid's output-streak engine, when one is built.
+    #[inline]
     #[must_use]
     pub fn streak(&self) -> Option<&OutputStreak> {
         self.streak.as_deref()

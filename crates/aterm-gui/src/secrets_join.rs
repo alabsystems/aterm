@@ -783,6 +783,7 @@ fn live_configured_now() -> bool {
 /// A join to run: the typed password (wiped when the job drops; `None` to be approved by
 /// code), where its end goes, and `aterm.toml`'s path ([`OWED_RECORD`] lives beside it).
 pub(crate) struct JoinJob {
+    pub(crate) source: String,
     pub(crate) password: Option<SecretBytes>,
     pub(crate) post: Post,
     pub(crate) config: Option<PathBuf>,
@@ -869,6 +870,7 @@ fn spawn_join(job: JoinJob) -> bool {
         crate::qos::Role::Background,
         move || {
             let JoinJob {
+                source,
                 password,
                 post,
                 config,
@@ -876,7 +878,7 @@ fn spawn_join(job: JoinJob) -> bool {
             let end = match Paths::live() {
                 Ok(paths) => join_vault(&JoinPlan {
                     paths: &paths,
-                    source: "",
+                    source: &source,
                     wait: JOIN_WAIT,
                     password: &|| password.clone(),
                     install: &|| install_subscriber(&paths.home, config.as_deref()),
@@ -1571,6 +1573,9 @@ impl App {
         now: Instant,
         quiet: fn(&Self, Instant) -> bool,
     ) {
+        if self.workstation_setup.unified() {
+            return;
+        }
         if let Some(id) = self.secrets_join.expired(now) {
             self.expire_secrets_sheet(id);
         }
@@ -1665,26 +1670,31 @@ impl App {
     /// the event loop; Not Now writes nothing.
     fn answer_secrets_sheet(&mut self, id: u64, choice: Choice) {
         #[cfg(target_os = "macos")]
-        let typed = self.take_secrets_sheet(id, choice == Choice::Join);
+        let typed = self.take_secrets_sheet_with_source(id, choice == Choice::Join);
         #[cfg(not(target_os = "macos"))]
-        let typed: Option<SecretBytes> = None;
+        let typed: Option<(String, Option<SecretBytes>)> = None;
         let Some(choice) = self.secrets_join.answered(id, choice) else {
             return;
         };
         aterm_log::info!("secrets vault: the ask was answered: {}", choice.as_str());
         match choice {
-            Choice::Join => self.start_secrets_join(typed),
+            Choice::Join => {
+                let (source, password) =
+                    typed.unwrap_or_else(|| (aterm_secrets::ALAB_DEFAULT_URL.to_owned(), None));
+                self.start_secrets_join(source, password);
+            }
             Choice::NotNow => {}
             Choice::Never => self.decline_secrets_join(),
         }
     }
 
     /// Start the join; the band shows it in flight until its answer replaces the row.
-    pub(crate) fn start_secrets_join(&mut self, password: Option<SecretBytes>) {
+    pub(crate) fn start_secrets_join(&mut self, source: String, password: Option<SecretBytes>) {
         let Some(post) = self.secrets_post() else {
             return;
         };
         let started = self.secrets_join.run(JoinJob {
+            source,
             password,
             post,
             config: self.consent_card_config.clone(),
@@ -2523,6 +2533,7 @@ mod tests {
         let (post, _) = recorder();
         assert!(
             !inert.run(JoinJob {
+                source: aterm_secrets::ALAB_DEFAULT_URL.to_owned(),
                 password: Some(SecretBytes::from(b"synthetic-test-value".as_slice())),
                 post,
                 config: None,

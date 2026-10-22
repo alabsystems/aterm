@@ -173,6 +173,13 @@ pub fn holder_path(layout: &Layout) -> PathBuf {
 }
 
 impl StoreLock {
+    /// The layout this guard actually locked, even if configuration changes meanwhile.
+    pub(crate) fn layout(&self) -> Layout {
+        Layout {
+            prefix: self.prefix.clone(),
+        }
+    }
+
     /// Say who holds the store ([`holder_path`]): this pid, and whether it is a person's
     /// typed verb (stdin a terminal, which no machine lane's is), for a Settings Check
     /// deciding whether to queue behind the holder ([`person_holder`]). Best-effort; removed
@@ -344,6 +351,10 @@ const WAIT_POLL: Duration = Duration::from_millis(50);
 /// that installed nothing; a real install holds the lock for minutes.
 pub const WAIT_ANNOUNCE_GRACE: Duration = Duration::from_secs(2);
 
+/// A development seam (`aterm_types::dev_seam!`; a shipped binary does not read it): the
+/// grace in milliseconds, so a test that needs only the announcement does not wait it out.
+pub const WAIT_ANNOUNCE_GRACE_SEAM: &str = "ATPKG_WAIT_ANNOUNCE_GRACE_MS";
+
 /// The longest wait a caller can ask for. A `--wait-lock` value is parsed from argv,
 /// and `u64::MAX` seconds must not overflow the deadline arithmetic.
 const WAIT_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
@@ -363,10 +374,14 @@ pub fn lock_store_waiting(
     on_first_contention: impl FnOnce(&Path),
     still_wanted: impl Fn() -> bool,
 ) -> Result<StoreLock, StoreLockError> {
+    let grace = aterm_types::dev_seam!(WAIT_ANNOUNCE_GRACE_SEAM)
+        .and_then(|ms| ms.to_str()?.parse().ok())
+        .map_or(WAIT_ANNOUNCE_GRACE, Duration::from_millis);
     lock_store_waiting_on(
         &MonotonicClock,
         layout,
         timeout,
+        grace,
         on_first_contention,
         still_wanted,
     )
@@ -393,13 +408,14 @@ impl WaitClock for MonotonicClock {
     }
 }
 
-/// [`lock_store_waiting`] on `clock`: the grace, the bound and every poll's pause are
-/// read and waited on it — a test drives one whose sleep moves its time, so a wait
-/// of seconds runs its every poll with none of them spent.
+/// [`lock_store_waiting`] on `clock`, announcing after `grace`: the grace, the bound and
+/// every poll's pause are read and waited on it — a test drives one whose sleep moves its
+/// time, so a wait of seconds runs its every poll with none of them spent.
 pub(crate) fn lock_store_waiting_on(
     clock: &impl WaitClock,
     layout: &Layout,
     timeout: Duration,
+    grace: Duration,
     on_first_contention: impl FnOnce(&Path),
     still_wanted: impl Fn() -> bool,
 ) -> Result<StoreLock, StoreLockError> {
@@ -419,7 +435,7 @@ pub(crate) fn lock_store_waiting_on(
                     return Err(StoreLockError::Contended(path));
                 }
                 let now = clock.now();
-                if now.duration_since(started) >= WAIT_ANNOUNCE_GRACE
+                if now.duration_since(started) >= grace
                     && let Some(announce) = announce.take()
                 {
                     announce(&path);
@@ -1038,6 +1054,7 @@ mod tests {
             &ManualClock::new(),
             &b,
             Duration::from_secs(120),
+            WAIT_ANNOUNCE_GRACE,
             |_| announced.set(announced.get() + 1),
             || {
                 polls.set(polls.get() + 1);
@@ -1076,6 +1093,7 @@ mod tests {
             &clock,
             &b,
             Duration::from_secs(120),
+            WAIT_ANNOUNCE_GRACE,
             |p| {
                 announced
                     .borrow_mut()
@@ -1110,6 +1128,7 @@ mod tests {
             &clock,
             &b,
             timeout,
+            WAIT_ANNOUNCE_GRACE,
             |_| announced.set(announced.get() + 1),
             || true,
         ) {
@@ -1161,7 +1180,14 @@ mod tests {
                 std::fs::rename(&a.prefix, &aside).expect("the prefix is movable under a holder");
             }
         });
-        let got = lock_store_waiting_on(&clock, &b, aterm_spec::wait::MUST_HAPPEN, |_| {}, || true);
+        let got = lock_store_waiting_on(
+            &clock,
+            &b,
+            aterm_spec::wait::MUST_HAPPEN,
+            WAIT_ANNOUNCE_GRACE,
+            |_| {},
+            || true,
+        );
         assert!(
             got.is_ok(),
             "the re-created prefix's lock is free: {:?}",
@@ -1268,6 +1294,7 @@ mod tests {
                 &ManualClock::new(),
                 &b,
                 Duration::from_secs(120),
+                WAIT_ANNOUNCE_GRACE,
                 |_| {},
                 still_wanted,
             ) {
@@ -1319,6 +1346,7 @@ mod tests {
             &clock,
             &l,
             Duration::from_secs(120),
+            WAIT_ANNOUNCE_GRACE,
             |_| announced.set(announced.get() + 1),
             || {
                 polls.set(polls.get() + 1);
@@ -1354,6 +1382,7 @@ mod tests {
             &clock,
             &b,
             Duration::from_secs(120),
+            WAIT_ANNOUNCE_GRACE,
             |_| announced.set(announced.get() + 1),
             || {
                 polls.set(polls.get() + 1);
@@ -1392,6 +1421,7 @@ mod tests {
             &clock,
             &b,
             Duration::from_secs(30),
+            WAIT_ANNOUNCE_GRACE,
             |_| announced.set(announced.get() + 1),
             || {
                 let still = clock.elapsed() < WAIT_ANNOUNCE_GRACE;

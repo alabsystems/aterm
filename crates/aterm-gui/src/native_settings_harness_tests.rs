@@ -1507,7 +1507,10 @@ fn the_harness_switches_draw_their_notes() {
         let context = format!("{width}\u{d7}{height}");
         for (key, note) in [
             (prefs::EDIT_HARNESS_ENABLED, prefs::HARNESS_NOTE),
-            (prefs::EDIT_HARNESS_AUTOPILOT, prefs::HARNESS_AUTOPILOT_NOTE),
+            (
+                prefs::EDIT_HARNESS_AUTOPILOT,
+                prefs::HARNESS_AUTOPILOT_NOTE.as_str(),
+            ),
             (prefs::EDIT_HARNESS_APPROVE, prefs::HARNESS_APPROVE_NOTE),
         ] {
             assert!(
@@ -4164,4 +4167,121 @@ fn the_page_draws_its_landings_and_the_done_claims_checked() {
             "{key}"
         );
     }
+}
+
+/// EVERY MODE'S SENTENCE COMES FROM ONE TABLE (§12.4.1, §12.4.6; slice 4d):
+/// for each mode, the Autopilot chip's title (`autopilot: <mode> — <chip>`),
+/// the `Autopilot set to <mode>` record's line, the SESSIONS row's button's
+/// description as a screen reader reads it off this page, the note under
+/// the page's Default autopilot row (`prefs::footnote_of`, which the page
+/// paints: `the_harness_switches_draw_their_notes`), and `aterm help
+/// harness`'s AUTOPILOT section each say that surface's form from
+/// `autopilot::MODE_WORDS` — and a timed Cruise's title, record and manual
+/// line theirs. The test reads the table, never a copy of its words.
+/// NEGATIVE CONTROLS (as run): main's literal record (`the harness wraps the
+/// work up, then stops`) fails Land's record; main's literal note (`Cruise
+/// keeps the work going, …`) fails Cruise's note.
+#[test]
+fn every_mode_sentence_comes_from_mode_words() {
+    use crate::autopilot::{MODE_WORDS, TIMED_CRUISE_CHIP, TIMED_CRUISE_RECORD};
+    use crate::claude_lights::{ChipGlass, LandAtGlass, TitleWords, autopilot_title};
+    // `aterm help harness`'s AUTOPILOT section, its wrapping undone.
+    const MANUAL: &str = include_str!("../../aterm-cli/src/manual.rs");
+    let at = MANUAL
+        .find("\nAUTOPILOT \u{2014} ")
+        .expect("the AUTOPILOT section");
+    let section = &MANUAL[at + 1..];
+    let end = section[1..]
+        .find("\n\n")
+        .map_or(section.len(), |end| end + 1);
+    let manual = section[..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let (mut runtime, instance, view) = harness_route(fixture());
+    let pages = every_page(&mut runtime, instance, view, &view_cx());
+    let note = prefs::footnote_of(prefs::EDIT_HARNESS_AUTOPILOT).expect("the default's note");
+    for words in MODE_WORDS {
+        let mode = words.mode;
+        let shown = AutopilotView::from_mode(mode);
+        let (title, _) = autopilot_title(
+            shown,
+            &ChipGlass::default(),
+            "",
+            None,
+            TitleWords::default(),
+        );
+        assert!(
+            title.starts_with(&format!(
+                "autopilot: {} \u{2014} {} \u{b7} click: ",
+                mode.word(),
+                words.chip
+            )),
+            "{mode:?}'s chip: {title}"
+        );
+        let record =
+            crate::message_reporters::autopilot_set("s-1", "in tab 2", shown, true, None, None);
+        assert_eq!(
+            record.detail.first().map(String::as_str),
+            Some(format!("Tab 2: {}", words.record).as_str()),
+            "{mode:?}'s record"
+        );
+        let button = node(
+            &pages,
+            &format!("harness/session/7/autopilot/{}", mode.word()),
+        );
+        assert!(
+            button
+                .description
+                .as_deref()
+                .is_some_and(|d| d.starts_with(words.button)),
+            "{mode:?}'s button: {:?}",
+            button.description
+        );
+        assert!(
+            manual.contains(&format!("`{}`", words.chip)),
+            "{mode:?}'s sentence in the manual's AUTOPILOT: {manual}"
+        );
+        assert!(
+            note.contains(words.record),
+            "{mode:?}'s sentence in the default autopilot's note: {note}"
+        );
+    }
+    // A timed Cruise: its title, its record, the manual.
+    let timed = ChipGlass {
+        land_at: Some(LandAtGlass {
+            clock: crate::claude_lights::Clock::of_minute(18 * 60),
+            other_day: None,
+        }),
+        ..ChipGlass::default()
+    };
+    let (title, _) = autopilot_title(
+        AutopilotView::Cruise,
+        &timed,
+        "",
+        None,
+        TitleWords::default(),
+    );
+    assert!(
+        title.contains(&format!(", then land \u{2014} {TIMED_CRUISE_CHIP} \u{b7} ")),
+        "{title}"
+    );
+    let record = crate::message_reporters::autopilot_timer_set(
+        "s-1",
+        "in tab 2",
+        timed.land_at.expect("the timer"),
+        None,
+    );
+    assert!(
+        record
+            .detail
+            .iter()
+            .any(|line| line == &format!("Tab 2: {TIMED_CRUISE_RECORD}")),
+        "{:?}",
+        record.detail
+    );
+    assert!(
+        manual.contains(&format!("`{TIMED_CRUISE_CHIP}`")),
+        "the timed sentence in the manual: {manual}"
+    );
 }

@@ -25,6 +25,7 @@ use crate::site::pages::{self, Difference};
 use crate::site::{
     Disagreement, Env, Failure, Guard, Launch, Options, Outcome, Ran, Refusal, Stop, World,
 };
+use crate::template::Tree;
 
 const SLUG: &str = "alabsystems/aterm";
 const PIN: &str = "1.97.1";
@@ -145,7 +146,7 @@ struct Git {
 
 impl Git {
     fn output(&self, dir: &Path, args: &[&str]) -> std::process::Output {
-        aterm_uds::spawnfd::command("git")
+        crate::ledger::testing::git()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -486,61 +487,6 @@ struct Lab {
     live: PathBuf,
 }
 
-/// One entry of a [`Tree`].
-enum Node {
-    Dir,
-    File { bytes: Vec<u8>, mode: u32 },
-}
-
-/// A directory tree held in memory: each directory, and each file's bytes and mode, by its
-/// path under the root it was read from.
-struct Tree(Vec<(PathBuf, Node)>);
-
-impl Tree {
-    fn read(root: &Path) -> Self {
-        fn walk(root: &Path, rel: &Path, out: &mut Tree) {
-            use std::os::unix::fs::PermissionsExt as _;
-            for e in std::fs::read_dir(root.join(rel)).unwrap() {
-                let e = e.unwrap();
-                let rel = rel.join(e.file_name());
-                let meta = e.metadata().unwrap();
-                if meta.is_dir() {
-                    out.0.push((rel.clone(), Node::Dir));
-                    walk(root, &rel, out);
-                } else {
-                    let bytes = std::fs::read(e.path()).unwrap();
-                    let mode = meta.permissions().mode();
-                    out.0.push((rel, Node::File { bytes, mode }));
-                }
-            }
-        }
-        let mut tree = Self(Vec::new());
-        walk(root, Path::new(""), &mut tree);
-        tree
-    }
-
-    /// The tree under `root`, each git `config` that named `from` (the root it was read
-    /// from) naming `root` instead.
-    fn lay(&self, from: &Path, root: &Path) {
-        use std::os::unix::fs::PermissionsExt as _;
-        let (from, to) = (from.to_string_lossy(), root.to_string_lossy());
-        for (rel, node) in &self.0 {
-            let path = root.join(rel);
-            let Node::File { bytes, mode } = node else {
-                std::fs::create_dir_all(&path).unwrap();
-                continue;
-            };
-            if rel.file_name().is_some_and(|n| n == "config") {
-                let text = String::from_utf8_lossy(bytes).replace(&*from, &to);
-                std::fs::write(&path, text).unwrap();
-            } else {
-                std::fs::write(&path, bytes).unwrap();
-            }
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(*mode)).unwrap();
-        }
-    }
-}
-
 /// A fresh lab's whole scratch dir, built once per process for each shape (in the scratch dir
 /// of the test that first asks, which then uses it) and laid down for every other test:
 /// building one takes fifteen git processes, a clone and a push among them.
@@ -617,6 +563,9 @@ impl Lab {
                 ("HOME".into(), home.to_string_lossy().into_owned()),
                 ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
                 ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+                // Nor a person's global ignore or attributes file, which git finds under
+                // `$XDG_CONFIG_HOME` before `HOME` ([`aterm_uds::fixture_git::hermetic`]).
+                ("XDG_CONFIG_HOME".into(), "/dev/null".into()),
                 ("GIT_TERMINAL_PROMPT".into(), "0".into()),
                 // No template: no repository here or cloned by the sync carries sample
                 // hooks, a description or info/exclude, which every test lays down and

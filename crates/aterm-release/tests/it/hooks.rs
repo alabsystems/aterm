@@ -35,6 +35,9 @@ impl Git {
                 ("HOME".into(), home.to_string_lossy().into_owned()),
                 ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
                 ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+                // Nor a person's global ignore or attributes file, which git finds under
+                // `$XDG_CONFIG_HOME` before `HOME` ([`aterm_uds::fixture_git::hermetic`]).
+                ("XDG_CONFIG_HOME".into(), "/dev/null".into()),
                 ("GIT_TERMINAL_PROMPT".into(), "0".into()),
                 ("GIT_CONFIG_COUNT".into(), "4".into()),
                 ("GIT_CONFIG_KEY_0".into(), "protocol.file.allow".into()),
@@ -55,7 +58,7 @@ impl Git {
     }
 
     fn ok(&self, dir: &Path, args: &[&str]) -> String {
-        let o = aterm_uds::spawnfd::command("git")
+        let o = crate::ledger::testing::git()
             .arg("-C")
             .arg(dir)
             .args(args)

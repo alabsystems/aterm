@@ -10,8 +10,14 @@
 //! task file's text as its argument — byte for byte, through every character
 //! a shell could read into it, at 60 KiB. The stand-in `claude` (the only one
 //! on the instance's PATH) writes its argv NUL-separated and exits, and the
-//! pane's shell draws its next prompt. Under zsh and under bash. A worker
-//! whose shell never draws a prompt is `stalled why=shell`, nothing typed.
+//! pane's shell draws its next prompt. Under zsh and under bash. The same for
+//! `agent=gemini`, `agent=agy` and `agent=muse`: each one's stand-in is
+//! started by its own first-prompt flag, the task one argument; Muse Code's
+//! trust flag rides because the shell stands in the folder the spawn
+//! trusted, and Gemini CLI gets a session id of its own and, in its
+//! environment, a trusted-folders file of its own naming that folder alone
+//! (never `--skip-trust`, which trusts every folder). A worker whose shell
+//! never draws a prompt is `stalled why=shell`, nothing typed.
 //!
 //! THE HARNESS IS ON, as a worker needs (`ERR unsupervised:` otherwise; the
 //! last test boots the isolation config's harness-off instance to prove it),
@@ -39,12 +45,16 @@ use crate::{child_output, headless_boot, launch_isolation};
 
 use headless_boot::{Instance, boot_session, client_command, ctl, ctl_ok, field};
 
-/// The stand-in `claude`: `--version` answers at once (the helper runs every
-/// fake once that way, `headless_boot::standin`); any other call writes its
-/// argv NUL-separated to `$HOME/argv.bin`, whole (written aside, then
-/// renamed), and exits 0.
+/// The stand-in `claude` (and `gemini`, `agy`, `muse`: the same script under
+/// each name): `--version` answers at once (the helper runs every fake once
+/// that way, `headless_boot::standin`); any other call writes the
+/// trusted-folders file its environment names (Gemini CLI's
+/// `GEMINI_CLI_TRUSTED_FOLDERS_PATH`, empty where none) to
+/// `$HOME/trust.txt`, then its argv NUL-separated to `$HOME/argv.bin`, whole
+/// (written aside, then renamed), and exits 0.
 const STANDIN: &str = "#!/bin/sh\n\
     case \"$1\" in --version) echo '2.1.0 (Claude Code)'; exit 0 ;; esac\n\
+    printf '%s' \"${GEMINI_CLI_TRUSTED_FOLDERS_PATH-}\" > \"$HOME/trust.txt\"\n\
     for a in \"$@\"; do printf '%s\\000' \"$a\"; done > \"$HOME/argv.part\" && \
     mv \"$HOME/argv.part\" \"$HOME/argv.bin\"\n";
 
@@ -72,7 +82,11 @@ fn boot(tag: &str, shell: &str, harness: Option<&str>, rc: Option<(&str, &str)>)
                     .expect("write the config");
             }
             let bin = tmp.join("bin");
-            headless_boot::standin(&bin.join("claude"), STANDIN);
+            // Every worker agent's word names its stand-in, or the boot's
+            // guard ends the test COULD NOT RUN before anything is typed.
+            for word in ["claude", "gemini", "agy", "muse"] {
+                headless_boot::standin(&bin.join(word), STANDIN);
+            }
             std::fs::create_dir_all(tmp.join("work")).expect("the worker's folder");
             cmd.env("SHELL", shell)
                 .env(
@@ -172,16 +186,22 @@ fn sid_of(stdout: &str) -> String {
 }
 
 fn run_worker(tag: &str, shell: &str, model: Option<&str>) {
+    run_agent_worker(tag, shell, model, "claude");
+}
+
+/// [`run_worker`] for the worker agent `word` (`spawn agent=<word>`).
+fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
     let inst = boot(tag, shell, Some(SUPERVISED), None);
     let (_, manager) = boot_session(&inst);
     let work = inst.tmp.join("work");
     let task = hostile_task();
     let model_arg = model.map(|m| format!("model={m}"));
-    let mut args = vec!["@self", "spawn", "agent=claude", "raise=false"];
+    let agent_arg = format!("agent={word}");
+    let mut args = vec!["@self", "spawn", agent_arg.as_str(), "raise=false"];
     args.extend(model_arg.as_deref());
     args.push("-");
     let (ok, stdout, stderr) = spawn_as(&inst, &manager, &work, &args, task.as_bytes());
-    assert!(ok, "spawn agent=claude: {stdout} {stderr}");
+    assert!(ok, "spawn {agent_arg}: {stdout} {stderr}");
     let worker = sid_of(&stdout);
 
     // The record stands before anything was waited for.
@@ -204,8 +224,10 @@ fn run_worker(tag: &str, shell: &str, model: Option<&str>) {
         ("1".into(), "0".into()),
         "{roster}"
     );
-    // The folder it was started in is trusted for it alone.
+    // The folder it was started in is trusted for it alone, and the agent its
+    // spawn started is named.
     let meta = ctl_ok(&inst, &[&format!("@{worker}"), "meta"]);
+    assert_eq!(field(&meta, "worker"), Some(word), "{meta}");
     let trusted = std::fs::canonicalize(&work).expect("canonical work folder");
     assert_eq!(
         field(&meta, "trusted_cwd").map(pct_decode),
@@ -233,7 +255,9 @@ fn run_worker(tag: &str, shell: &str, model: Option<&str>) {
     );
 
     // The task file: 0600 in a 0700 folder, the task, a blank line, one line
-    // of fact naming the manager.
+    // of fact naming the manager. agy's holds no blank line (it draws one in
+    // a message as the gap that ends it), so its fact is the line under the
+    // task.
     let tasks = inst.tmp.join("state/tasks");
     let file = tasks.join(format!("{worker}-1.txt"));
     let home = inst.tmp.join("home");
@@ -245,23 +269,73 @@ fn run_worker(tag: &str, shell: &str, model: Option<&str>) {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!((mode(&tasks), mode(&file)), (0o700, 0o600));
     }
-    let head = format!("{task}\n\n");
+    let gap = if word == "agy" { "" } else { "\n" };
+    let head = format!("{task}\n{gap}");
     let fact = text
         .strip_prefix(head.as_bytes())
-        .unwrap_or_else(|| panic!("the file opens with the task and a blank line"));
+        .unwrap_or_else(|| panic!("{word}: the file opens with the task, then {gap:?}"));
     let fact = std::str::from_utf8(fact).expect("utf-8 fact");
     assert_eq!(fact.matches('\n').count(), 1, "one line of fact: {fact:?}");
     assert!(fact.ends_with('\n') && fact.contains(&manager), "{fact:?}");
 
-    // The argv: the model, the end of options, and the file's text whole.
+    // The argv: Muse Code's trust-for-this-run flag (the shell stands in the
+    // folder the spawn trusted), the model, Gemini CLI's own session id,
+    // then the file's text whole as one argument: after the end of options,
+    // or attached to the first-prompt flag.
     let argv = std::fs::read(&argv_file).expect("the argv");
     let argv: Vec<&[u8]> = argv.split(|b| *b == 0).collect();
     let whole = text.strip_suffix(b"\n").expect("the file ends its line");
     let mut want: Vec<&[u8]> = Vec::new();
+    if word == "muse" {
+        want.push(b"--trust-workspace");
+    }
     if let Some(m) = model {
         want.extend([b"--model".as_slice(), m.as_bytes()]);
     }
-    want.extend([b"--".as_slice(), whole, b"".as_slice()]);
+    let session = argv
+        .iter()
+        .position(|a| *a == b"--session-id")
+        .and_then(|at| argv.get(at + 1))
+        .map(|id| String::from_utf8_lossy(id).into_owned());
+    if word == "gemini" {
+        let id = session.as_deref().expect("Gemini CLI's own session id");
+        let bytes = id.as_bytes();
+        assert!(
+            bytes.len() == 36
+                && [8, 13, 18, 23].iter().all(|&k| bytes[k] == b'-')
+                && bytes[14] == b'4',
+            "a version-4 UUID: {id}"
+        );
+        want.extend([b"--session-id".as_slice(), bytes]);
+    } else {
+        assert_eq!(session, None, "{word}: no session id of the line's");
+    }
+    // Gemini CLI's own trusted-folders file names the folder the spawn
+    // trusted and no other, 0600 beside the task file; no other agent's
+    // line names one.
+    let trust = std::fs::read_to_string(home.join("trust.txt")).expect("the stand-in's trust");
+    if word == "gemini" {
+        let path = tasks.join(format!("{worker}-1.trust.json"));
+        assert_eq!(Path::new(&trust), path, "its own file");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let folders = std::fs::read_to_string(&path).expect("the trusted folders");
+        let trusted = std::fs::canonicalize(inst.tmp.join("work")).expect("the folder");
+        assert!(
+            folders.contains(&format!("\"{}\"", trusted.display()))
+                && folders.matches("TRUST_FOLDER").count() == 1
+                && folders.matches('"').count() == 4,
+            "the one folder: {folders}"
+        );
+    } else {
+        assert_eq!(trust, "", "{word}: no trusted-folders file");
+    }
+    let attached = [b"--prompt-interactive=".as_slice(), whole].concat();
+    match word {
+        "gemini" | "agy" => want.extend([attached.as_slice(), b"".as_slice()]),
+        _ => want.extend([b"--".as_slice(), whole, b"".as_slice()]),
+    }
     assert!(
         argv == want,
         "argv: {} parts, the last {:?}",
@@ -294,6 +368,26 @@ fn a_worker_runs_its_task_as_claudes_argv_in_a_background_tab_under_zsh() {
 #[test]
 fn a_worker_runs_its_task_as_claudes_argv_in_a_background_tab_under_bash() {
     run_worker("b", "/bin/bash", None);
+}
+
+#[test]
+fn a_gemini_worker_runs_its_task_as_its_prompt_interactive_argv() {
+    run_agent_worker(
+        "g",
+        headless_boot::need_zsh(),
+        Some("gemini-2.5-pro"),
+        "gemini",
+    );
+}
+
+#[test]
+fn an_agy_worker_runs_its_task_as_its_prompt_interactive_argv() {
+    run_agent_worker("a", "/bin/bash", None, "agy");
+}
+
+#[test]
+fn a_muse_worker_runs_its_task_after_the_end_of_options() {
+    run_agent_worker("m", headless_boot::need_zsh(), Some("m-1"), "muse");
 }
 
 /// With the window harness off nothing would finish a worker's task: `ERR

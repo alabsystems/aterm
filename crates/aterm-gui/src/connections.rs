@@ -541,7 +541,6 @@ mod tests {
             term: Arc::new(Mutex::new(aterm_core::terminal::Terminal::new(24, 80))),
             master: -1,
             ctx,
-            identity: None,
         }
     }
 

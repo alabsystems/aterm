@@ -551,7 +551,7 @@ impl App {
     #[allow(
         clippy::too_many_arguments,
         reason = "the window's birth facts — geometry, cwd, the seamless adoptee, the \
-                  connection lineage and the agent identity — are each a per-open datum; \
+                  connection lineage — are each a per-open datum; \
                   a wrapper struct would relocate the list, not simplify it"
     )]
     pub(crate) fn create_window_logical(
@@ -566,9 +566,6 @@ impl App {
         // injects the controller hint env (`ATERM_OBSERVE_SESSION_ID`).
         lineage_parent: Option<aterm_session::SessionId>,
         observe: Option<&aterm_session::SessionId>,
-        // The agent identity the first session spawns under (`spawn … place=window
-        // identity=<name>`); `None` for ordinary opens and restores.
-        identity: Option<&str>,
     ) -> Option<WindowId> {
         // Mint the window id first so the spawned session's `Wake`s (Output/Exit/Bell) are
         // stamped with the window that owns them.
@@ -583,14 +580,6 @@ impl App {
         let cwd = cwd_override
             .map(str::to_owned)
             .or_else(|| self.frontmost_window.and_then(|w| self.focused_pane_cwd(w)));
-        // A fresh shell under an identity with a theme of its own starts on that
-        // theme's side (`COLORFGBG`); an adopted one keeps the env it has.
-        #[cfg(windows)]
-        let shell_factory =
-            (adopt.is_none() && identity.is_some()).then(|| self.shell_factory(None, identity));
-        #[cfg(windows)]
-        let factory = shell_factory.as_ref().unwrap_or(&self.session_factory);
-        #[cfg(not(windows))]
         let factory = &self.session_factory;
         let session = match spawn_session(
             sid,
@@ -605,7 +594,6 @@ impl App {
             &proxy,
             cwd.as_deref(),
             observe,
-            identity,
             None,  // no worker's task
             adopt, // SEAMLESS: `Some` re-adopts this window's handed-off first-leaf shell
         ) {
@@ -745,7 +733,7 @@ impl App {
     #[allow(
         clippy::too_many_arguments,
         reason = "the window's birth facts — cwd, the seamless adoptee, the connection \
-                  lineage, the agent identity and an update's carried frame and place — \
+                  lineage and an update's carried frame and place — \
                   are each a per-open datum, as in `create_window_logical`"
     )]
     pub(crate) fn create_window_internal_connected(
@@ -755,20 +743,12 @@ impl App {
         adopt: Option<crate::spawn::Adopted>,
         lineage_parent: Option<aterm_session::SessionId>,
         observe: Option<&aterm_session::SessionId>,
-        identity: Option<&str>,
         carried: Option<CarriedFrame>,
         placement: ((Option<i32>, Option<i32>), Option<bool>),
     ) -> Option<WindowId> {
         let ((rows, cols), carried_inner_px) = self.new_window_frame(carried);
-        let wid = self.create_window_logical(
-            rows,
-            cols,
-            cwd_override,
-            adopt,
-            lineage_parent,
-            observe,
-            identity,
-        )?;
+        let wid =
+            self.create_window_logical(rows, cols, cwd_override, adopt, lineage_parent, observe)?;
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.take_carried_frame(carried_inner_px);
         }

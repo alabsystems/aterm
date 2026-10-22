@@ -3878,16 +3878,14 @@ fn the_stats_reading_dials_a_sibling_on_its_auth_line_and_never_blind() {
     use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicBool, Ordering};
-    let dir = aterm_uds::control_socket_dir().expect("this test binary's control dir");
-    std::fs::create_dir_all(&dir).expect("the control dir");
-    // Two pids no listener here owns: the folder is this binary's own control
-    // folder, so no live instance's socket can be in it.
+    let scratch = crate::test_scratch::short_dir("the siblings' sockets");
+    let dir = scratch.path().to_path_buf();
+    // Two pids no listener here owns: the folder is this test's own, so no live
+    // instance's socket can be in it.
     let (with, without) = (4_000_001_u32, 4_000_002_u32);
     let sock = |pid: u32| dir.join(format!("aterm-{pid}.sock"));
     let token_file = dir.join(format!("aterm-{with}.token"));
     let token = "ab".repeat(32);
-    let _ = std::fs::remove_file(sock(with));
-    let _ = std::fs::remove_file(sock(without));
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -3927,13 +3925,10 @@ fn the_stats_reading_dials_a_sibling_on_its_auth_line_and_never_blind() {
     };
     let (answered, blind) = (listen(with), listen(without));
 
-    let _ = collect_sibling_aterm_tabs();
+    let _ = sibling_aterm_tabs_in(vec![dir.clone()]);
     done.store(true, Ordering::Release);
     let answered = answered.join().expect("the sibling's listener");
     let blind = blind.join().expect("the tokenless sibling's listener");
-    let _ = std::fs::remove_file(sock(with));
-    let _ = std::fs::remove_file(sock(without));
-    let _ = std::fs::remove_file(&token_file);
 
     assert!(!answered.is_empty(), "the reading dials the sibling");
     for bytes in &answered {

@@ -258,6 +258,49 @@ fn a_cross_row_park_sleeps_until_its_own_expiry() {
     }
 }
 
+/// The held presses ([`PressCredits::held_through`]) pay exactly for a move
+/// that stays on the hand's row ([`CursorGlow::judging_on_rows`]). They do not
+/// pay for a move that leaves the row, one that arrives on it from another
+/// row (a foreign-row park's return is judged from the park's origin, on the
+/// hand's row), or one on another row, and they are not payable outside a
+/// judgment, after any judgment, nor in a move off the row once a judgment
+/// nested in it ends (a park's return released inside the move that returns,
+/// [`CursorGlow::release_held_park`]). Control: a free press pays for all
+/// four moves, inside and outside.
+#[test]
+fn held_presses_pay_only_for_a_move_that_stays_on_the_hand_s_row() {
+    let t0 = Instant::now();
+    for held in [false, true] {
+        let mut glow = CursorGlow {
+            hand_row: Some(HandRow::at(5)),
+            ..CursorGlow::default()
+        };
+        glow.type_press_ring.bank(t0, 1, Some('x'));
+        if held {
+            glow.type_press_ring.hold_through(t0);
+        }
+        // Each move's credits inside its judgment, then outside after it.
+        let moves = [(5u16, 5u16), (5, 4), (4, 5), (4, 4)].map(|(from, to)| {
+            let inside = glow.judging_on_rows(from, to, |g| g.typed_credits_within(t0));
+            (inside, glow.typed_credits_within(t0))
+        });
+        let nested = glow.judging_on_rows(4, 5, |g| {
+            g.judging_on_rows(5, 5, |_| ());
+            g.typed_credits_within(t0)
+        });
+        assert_eq!(
+            (moves, nested),
+            if held {
+                ([(1, 0), (0, 0), (0, 0), (0, 0)], 0)
+            } else {
+                ([(1, 1); 4], 1)
+            },
+            "held {held}: (credits for 5→5, 5→4, 4→5, 4→4 with the hand on row 5, each \
+             inside its judgment and outside after it; credits for 4→5 once a nested 5→5 ended)"
+        );
+    }
+}
+
 /// The tick's degenerate-geometry guard covers rows and columns beside
 /// `cw`/`ch`, matching the v2 engage gate; on a 0-row or 0-column grid the
 /// first settling star would otherwise hit `clamp` with `min > max`.

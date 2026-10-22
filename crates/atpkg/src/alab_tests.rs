@@ -171,6 +171,52 @@ fn a_pin_routes_only_from_alab_repo_on_alab_targets() {
     assert_eq!(index_pin(&good, "ay", ARM_MAC), None);
 }
 
+/// CODEX-OLD NEVER ROUTES TO ALAB (owner ruling 2026-10-20: `codex` is codex-alab, upstream
+/// Codex is `codex-old`): an index naming `codex-old` from ALab's repo with a pin in the
+/// window, on the target ALab builds for, pins nothing for it; its source is the vendor's
+/// lane, a recorded vendor choice is none of its business, and the planner never takes it.
+///
+/// NEGATIVE CONTROL: the same index routes `codex` to its pin, and the planner takes it.
+#[test]
+fn codex_old_is_the_vendors_lane_whatever_the_index_names() {
+    let l = scratch("codex-old");
+    let text = index_text("codex-alab", Some(BUILD), "")
+        .replace(
+            "[[channels]]",
+            "[programs.codex-old]\nrepo = \"codex-alab\"\n[[channels]]",
+        )
+        .replace(
+            &format!("codex = {BUILD}"),
+            &format!("codex = {BUILD}, codex-old = {BUILD}"),
+        );
+    let index = parsed(&text);
+    assert_eq!(
+        index.program("codex-old").map(|p| p.repo.as_str()),
+        Some("codex-alab"),
+        "PRECONDITION: the index names it from ALab's repo"
+    );
+    assert_eq!(index_pin(&index, "codex", ARM_MAC), Some(BUILD));
+    assert_eq!(index_pin(&index, "codex-old", ARM_MAC), None);
+    assert_eq!(
+        source(&l, "codex", ARM_MAC, Some(&index)),
+        Source::Index { build: BUILD }
+    );
+    assert_eq!(
+        source(&l, "codex-old", ARM_MAC, Some(&index)),
+        Source::VendorDirect
+    );
+    assert!(!index_owns(&l, "codex-old", ARM_MAC, Some(&index)));
+    std::fs::create_dir_all(l.prefix.join("sources")).unwrap();
+    std::fs::write(vendor_choice_path(&l, "codex-old"), b"").unwrap();
+    assert!(!vendor_chosen(&l, "codex-old"));
+    let ch = index.channel_for("stable", ARM_MAC).unwrap();
+    let members: Vec<String> = crate::apply::plan_groups_here(&l, &index, &ch, ARM_MAC)
+        .into_iter()
+        .flat_map(|g| g.members)
+        .collect();
+    assert_eq!(members, ["ay", "codex"]);
+}
+
 /// A pin outside the window, yanked, or under its floor names nothing here: the installed
 /// build stays as the rest of the rule decides.
 #[test]
@@ -298,6 +344,164 @@ fn the_exe_form_finds_the_root_whose_entrypoint_is_the_exe() {
     assert!(!exe_is_alab(&d.join("missing")));
     std::fs::remove_file(root.join(ALAB_BUILD_JSON)).unwrap();
     assert!(!exe_is_alab(&root.join("bin/codex")));
+}
+
+// ------------------------------------------------------------------- the upstream
+
+/// The upstream commit a test record names.
+pub(crate) const UPSTREAM_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+/// An `alab-build.json` whose `upstream` field is `upstream` (raw JSON), the rest of the
+/// record as `alab/package.sh` writes it.
+pub(crate) fn upstream_record(upstream: &str) -> String {
+    format!(r#"{{"source":"0","version":"0.164.0-dev.12+gabc","upstream":{upstream}}}"#)
+}
+
+/// The field as the packager writes it: release, commit and commit date.
+pub(crate) fn full_upstream() -> String {
+    format!(
+        r#"{{"release":"rust-v0.163.0","commit":"{UPSTREAM_SHA}","commit_date":"2026-10-15T18:02:11Z"}}"#
+    )
+}
+
+/// THE UPSTREAM A BUILD IS BASED ON is its record's `upstream` field, read whole or not at
+/// all: the field says `based on upstream <release>+g<12 hex>` with or without its commit
+/// date, a record from before the field says nothing, and no malformed shape says a part
+/// of it.
+#[test]
+fn the_upstream_is_read_off_the_record_whole_or_not_at_all() {
+    let parsed = parse_upstream(&upstream_record(&full_upstream())).expect("the field");
+    assert_eq!(
+        parsed,
+        Upstream {
+            release: "rust-v0.163.0".into(),
+            commit: UPSTREAM_SHA.into(),
+        }
+    );
+    assert_eq!(
+        parsed.words(),
+        "based on upstream rust-v0.163.0+g0123456789ab"
+    );
+    // The commit date is optional, and a sha in capitals is said in lowercase.
+    let bare = format!(
+        r#"{{"release":"rust-v0.163.0","commit":"{}"}}"#,
+        UPSTREAM_SHA.to_ascii_uppercase()
+    );
+    assert_eq!(parse_upstream(&upstream_record(&bare)), Some(parsed));
+    // A record from before the field.
+    assert_eq!(parse_upstream(r#"{"source":"0"}"#), None);
+    let sha = UPSTREAM_SHA;
+    let long = "v".repeat(129);
+    for field in [
+        r#""rust-v0.163.0""#.to_string(),
+        "null".to_string(),
+        "{}".to_string(),
+        r#"{"release":"rust-v0.163.0"}"#.to_string(),
+        format!(r#"{{"commit":"{sha}"}}"#),
+        format!(r#"{{"release":"","commit":"{sha}"}}"#),
+        format!(r#"{{"release":"rust v0.163.0","commit":"{sha}"}}"#),
+        format!(r#"{{"release":"rust-v0.163.0\u001b[2J","commit":"{sha}"}}"#),
+        format!(r#"{{"release":"{long}","commit":"{sha}"}}"#),
+        format!(r#"{{"release":163,"commit":"{sha}"}}"#),
+        r#"{"release":"rust-v0.163.0","commit":"0123456789ab"}"#.to_string(),
+        format!(r#"{{"release":"rust-v0.163.0","commit":"{sha}0"}}"#),
+        format!(
+            r#"{{"release":"rust-v0.163.0","commit":"{}"}}"#,
+            "g".repeat(40)
+        ),
+        r#"{"release":"rust-v0.163.0","commit":1}"#.to_string(),
+    ] {
+        assert_eq!(parse_upstream(&upstream_record(&field)), None, "{field}");
+    }
+    let whole = upstream_record(&full_upstream());
+    for text in [
+        "not json",
+        "",
+        "[]",
+        &whole[..whole.len() - 1],
+        r#""upstream""#,
+    ] {
+        assert_eq!(parse_upstream(text), None, "{text}");
+    }
+}
+
+/// On disk the upstream is an ALab package's, read off its record (never by running the
+/// binary): from the root, from its entrypoint, and from the copy a program's shim runs.
+/// A record from before the field, one that is not UTF-8, one past the bound, one through a
+/// link and a vendor package each say none.
+#[test]
+fn a_package_s_upstream_is_its_record_s_and_an_older_package_has_none() {
+    let d = crate::testdir::dir("atpkg-alab-upstream-");
+    let root = d.join("pkg");
+    package(&root, "0.164.0-dev.12+gabc", b"x", true);
+    assert_eq!(upstream_of(&root), None, "a record from before the field");
+    assert_eq!(upstream_of_exe(&root.join("bin/codex")), None);
+    std::fs::write(
+        root.join(ALAB_BUILD_JSON),
+        upstream_record(&full_upstream()),
+    )
+    .unwrap();
+    let words = |u: Option<Upstream>| u.map(|u| u.words());
+    let said = Some("based on upstream rust-v0.163.0+g0123456789ab".to_string());
+    assert_eq!(words(upstream_of(&root)), said);
+    assert_eq!(words(upstream_of_exe(&root.join("bin/codex"))), said);
+    std::fs::write(root.join("bin/other"), b"x").unwrap();
+    assert_eq!(
+        upstream_of_exe(&root.join("bin/other")),
+        None,
+        "not the entrypoint"
+    );
+    #[cfg(unix)]
+    {
+        let link = d.join("link-to-codex");
+        std::os::unix::fs::symlink(root.join("bin/codex"), &link).unwrap();
+        assert_eq!(
+            words(upstream_of_exe(&link)),
+            said,
+            "a link to the entrypoint"
+        );
+        let linked = d.join("linked-record");
+        package(&linked, "0.164.0-dev.12+gabc", b"x", false);
+        std::os::unix::fs::symlink(root.join(ALAB_BUILD_JSON), linked.join(ALAB_BUILD_JSON))
+            .unwrap();
+        assert_eq!(upstream_of(&linked), None, "a record through a link");
+    }
+    // The vendor's own package carries no record, whatever sits beside it.
+    let vendor = d.join("vendor");
+    package(&vendor, "0.164.0", b"x", false);
+    std::fs::write(vendor.join("upstream.json"), full_upstream()).unwrap();
+    assert_eq!(upstream_of(&vendor), None);
+    for bad in [
+        b"\xff\xfe{\"upstream\":{}}".to_vec(),
+        format!(
+            "{}{}",
+            " ".repeat(MAX_PACKAGE_JSON_BYTES),
+            upstream_record(&full_upstream())
+        )
+        .into_bytes(),
+        br#"{"upstream":{"release":"rust-v0.163.0","commit":"#.to_vec(),
+    ] {
+        std::fs::write(root.join(ALAB_BUILD_JSON), &bad).unwrap();
+        assert_eq!(
+            upstream_of(&root),
+            None,
+            "{}",
+            String::from_utf8_lossy(&bad)
+        );
+    }
+
+    // The copy a program's shim runs: its active store build; a program ALab does not
+    // build has none.
+    let l = scratch("upstream");
+    let dir = store_build(&l, BUILD, true);
+    assert_eq!(
+        program_upstream(&l, "codex"),
+        None,
+        "a record from before the field"
+    );
+    std::fs::write(dir.join(ALAB_BUILD_JSON), upstream_record(&full_upstream())).unwrap();
+    assert_eq!(words(program_upstream(&l, "codex")), said);
+    assert_eq!(program_upstream(&l, "claude"), None);
 }
 
 /// A store build is ALab's by its marker alone, for a program ALab builds, at an id that is

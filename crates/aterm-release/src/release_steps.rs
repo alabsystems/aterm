@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use crate::gates::{Outcome, Precheck, PrecheckGate};
 use crate::interrupt;
-use crate::ledger::{GitCli, GitRunner};
+use crate::ledger::{BYTE_EXACT, GitCli, GitRunner};
 use crate::provision::{AskWords, Finding};
 use crate::release::{
     AfterCut, Answer, Artifact, Backend, Built, Candidate, CutState, EngineNow, EngineRows, Facts,
@@ -763,8 +763,15 @@ impl Real {
             cmd.arg("-C").arg(&copy).args(args);
             cmd
         };
-        if !ran(command("git").args(["clone", "--quiet", "--shared", "--no-checkout", &e, &copy_s]))
-        {
+        let mut clone = command("git");
+        clone.arg("clone").args(BYTE_EXACT).args([
+            "--quiet",
+            "--shared",
+            "--no-checkout",
+            &e,
+            &copy_s,
+        ]);
+        if !ran(&mut clone) {
             return Err(Refusal::new(
                 format!("git could not copy the engine {e} into {copy_s}"),
                 "fix what keeps it from being written, then run it again",
@@ -945,18 +952,17 @@ impl Real {
             }
             out.is_ok_and(|o| o.status.success())
         };
+        let clone = |from: &str, into: &str| {
+            let args = [
+                &["clone"][..],
+                &BYTE_EXACT,
+                &["--quiet", "--shared", "--no-checkout", from, into],
+            ];
+            git(base, &args.concat())
+        };
         let (repo, root_s) = (self.repo.display().to_string(), root.display().to_string());
-        if !git(
-            base,
-            &[
-                "clone",
-                "--quiet",
-                "--shared",
-                "--no-checkout",
-                &repo,
-                &root_s,
-            ],
-        ) || !git(root, &["remote", "set-url", "origin", &origin])
+        if !clone(&repo, &root_s)
+            || !git(root, &["remote", "set-url", "origin", &origin])
             || !git(
                 root,
                 &[
@@ -996,18 +1002,7 @@ impl Real {
             let dest = root.join(&path);
             let _ = std::fs::remove_dir_all(&dest);
             let (sub_s, dest_s) = (sub.display().to_string(), dest.display().to_string());
-            if !git(
-                base,
-                &[
-                    "clone",
-                    "--quiet",
-                    "--shared",
-                    "--no-checkout",
-                    &sub_s,
-                    &dest_s,
-                ],
-            ) || !git(&dest, &["checkout", "--quiet", "--detach", &rev])
-            {
+            if !clone(&sub_s, &dest_s) || !git(&dest, &["checkout", "--quiet", "--detach", &rev]) {
                 return Err(format!(
                     "git could not clone the submodule {path} at {} into the scratch clone",
                     short(&rev)
@@ -1197,16 +1192,16 @@ impl Real {
         // special builtin's error, `2>/dev/null` or not, so the archive never ran
         // there; `command set` only fails, and the pipe's status is then tar's, which
         // an empty archive fails too.
+        let script = format!(
+            "command set -o pipefail 2>/dev/null; git {} -C \"$1\" archive \"$2\" | tar -x -C \"$3\"",
+            BYTE_EXACT.join(" ")
+        );
         let tar = |repo: &Path, rev: &str, into: &Path| -> bool {
             let mut pipe = command("/bin/sh");
-            pipe.args([
-                "-c",
-                "command set -o pipefail 2>/dev/null; git -C \"$1\" archive \"$2\" | tar -x -C \"$3\"",
-                "archive",
-            ])
-            .arg(repo)
-            .arg(rev)
-            .arg(into);
+            pipe.args(["-c", &script, "archive"])
+                .arg(repo)
+                .arg(rev)
+                .arg(into);
             self.output_forwarded(&mut pipe)
                 .is_ok_and(|o| o.status.success())
         };
@@ -4442,7 +4437,7 @@ mod tests {
         let dir = aterm_tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let git = |cwd: &Path, args: &[&str]| -> String {
-            let out = command("git")
+            let out = crate::ledger::testing::git()
                 .current_dir(cwd)
                 .args([
                     "-c",
@@ -4579,7 +4574,7 @@ mod tests {
         let dir = aterm_tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let git = |cwd: &Path, args: &[&str]| -> String {
-            let out = command("git")
+            let out = crate::ledger::testing::git()
                 .current_dir(cwd)
                 .args(["-c", "user.name=t", "-c", "user.email=t@t"])
                 .args(["-c", "commit.gpgsign=false"])
@@ -4661,6 +4656,199 @@ mod tests {
         assert!(scratch.dir.join("wasm-src/publish/config.sh").is_file());
     }
 
+    /// The env that turns [`probe_every_tree_the_release_writes_under_a_crlf_config`] on:
+    /// the directory it works in.
+    const CRLF_PROBE_ENV: &str = "ATERM_RELEASE_CRLF_PROBE_DIR";
+    /// That probe's name, as `--exact` wants it.
+    const CRLF_PROBE: &str =
+        "release_steps::tests::probe_every_tree_the_release_writes_under_a_crlf_config";
+
+    /// The child half of [`every_tree_the_release_writes_is_the_commits_bytes`]: the engine
+    /// copy, the dry run's clone, the wasm32 gate's archive and the cut tree (made, moved,
+    /// then claimed) hold R's bytes, submodules included. Outside that child (the env
+    /// unset) it does nothing: the config it runs under is the whole process's.
+    #[test]
+    fn probe_every_tree_the_release_writes_under_a_crlf_config() {
+        use crate::ledger::testing;
+        use std::fs;
+        let Some(root) = std::env::var_os(CRLF_PROBE_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let ident = [
+            ("user.name", "t"),
+            ("user.email", "t@example.invalid"),
+            ("commit.gpgsign", "false"),
+        ];
+        let git = |at: &Path, args: &[&str]| -> String {
+            let out = testing::git()
+                .arg("-C")
+                .arg(at)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let write = |path: &Path, body: &str| {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, body).unwrap();
+        };
+        let sub = root.join("sub");
+        testing::init(&sub, &ident);
+        write(&sub.join("s.sh"), "#!/bin/sh\n");
+        git(&sub, &["add", "-A"]);
+        git(&sub, &["commit", "-q", "-m", "s"]);
+        // R, its own engine too: a script, a file its attributes call text, a submodule,
+        // and the ledger and changelog a claim rolls
+        let (repo, origin) = (root.join("aterm"), root.join("aterm.git"));
+        testing::init(&repo, &ident);
+        write(&repo.join(".gitattributes"), "*.txt text\n");
+        write(&repo.join("bin/pub"), "#!/bin/sh\n");
+        write(&repo.join("notes.txt"), "one\n");
+        write(&repo.join("RELEASES.ledger"), "1783354739 0.25.0\n");
+        write(
+            &repo.join("CHANGELOG.md"),
+            "## [Unreleased]\n\n### Added\n- An entry.\n",
+        );
+        let sub_s = sub.display().to_string();
+        let add_sub = ["submodule", "add", "-q", &sub_s, "vendor/sub"];
+        git(
+            &repo,
+            &[&["-c", "protocol.file.allow=always"][..], &add_sub].concat(),
+        );
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "r"]);
+        git(&root, &["init", "-q", "--bare", "-b", "main", "aterm.git"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", &origin.display().to_string()],
+        );
+        git(&repo, &["push", "-q", "origin", "main"]);
+        let r = git(&repo, &["rev-parse", "HEAD"]);
+        let lf = |tree: &Path, notes: &str, with_sub: bool| {
+            let read = |rel: &str| fs::read_to_string(tree.join(rel)).unwrap();
+            assert_eq!(read("bin/pub"), "#!/bin/sh\n", "{}", tree.display());
+            assert_eq!(read("notes.txt"), notes, "{}", tree.display());
+            if with_sub {
+                assert_eq!(read("vendor/sub/s.sh"), "#!/bin/sh\n", "{}", tree.display());
+            }
+        };
+        let real = Real::new(&repo, Some(&repo), true, false).unwrap();
+        let scratch = Scratch {
+            dir: root.join("scratch"),
+            cache: root.join("cache"),
+        };
+        fs::create_dir_all(&scratch.dir).unwrap();
+        lf(&real.scratch_engine(&scratch).unwrap(), "one\n", false);
+        let clone = scratch.dir.join("dry-run/aterm");
+        real.dry_clone(&scratch.dir, &clone, &r).unwrap();
+        lf(&clone, "one\n", true);
+        let archive = root.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        assert!(real.archive_into(&r, &archive));
+        lf(&archive, "one\n", true);
+        let place = |commit: &str| {
+            let source = crate::gates::PublishedSource {
+                commit: commit.to_string(),
+                verified_at: "2026-10-21T00:00:00+00:00".to_string(),
+            };
+            crate::gates::place_published(&GitCli::new(&repo), &repo, &source).unwrap()
+        };
+        lf(&place(&r).tree, "one\n", true);
+        write(&repo.join("notes.txt"), "one\ntwo\n");
+        git(&repo, &["commit", "-q", "-am", "two"]);
+        git(&repo, &["push", "-q", "origin", "main"]);
+        let source = git(&repo, &["rev-parse", "HEAD"]);
+        let moved = place(&source);
+        assert!(moved.moved);
+        lf(&moved.tree, "one\ntwo\n", true);
+        // The claim puts the cut tree on the release commit, whose changelog it rolled.
+        let plan = crate::ledger::ClaimPlan {
+            version: "0.26.0",
+            now: 0,
+            allow_existing_section: false,
+            max_attempts: 1,
+            source: &source,
+        };
+        let rolls = |source: &str, main: &str| {
+            crate::changelog::claim_changelogs(source, main, "0.26.0", "2026-10-21")
+        };
+        let cut = GitCli::new(&moved.tree);
+        let reserved = crate::ledger::reserve(&cut, &plan, &rolls).unwrap();
+        crate::ledger::claim(&cut, &moved.tree, &plan, &reserved, &rolls).unwrap();
+        let rolled = fs::read_to_string(moved.tree.join("CHANGELOG.md")).unwrap();
+        assert!(
+            rolled.contains("## [0.26.0]") && !rolled.contains('\r'),
+            "{rolled:?}"
+        );
+    }
+
+    /// Every tree a release writes from git holds the commit's own bytes under a
+    /// releaser's global config that turns LF into CRLF (`core.autocrlf`, `core.eol`, an
+    /// attributes file): a CRLF `bin/pub` does not run, and a CRLF cut tree reads clean to
+    /// the clean-tree judge. The config is the environment's, so the trees are written in a
+    /// child of this test binary that runs only
+    /// [`probe_every_tree_the_release_writes_under_a_crlf_config`].
+    #[test]
+    fn every_tree_the_release_writes_is_the_commits_bytes() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let config = root.join("gitconfig");
+        std::fs::write(
+            &config,
+            "[core]\n\tautocrlf = true\n\tsafecrlf = true\n\teol = crlf\n[protocol \"file\"]\n\tallow = always\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("xdg/git")).unwrap();
+        std::fs::write(root.join("xdg/git/attributes"), "* text eol=crlf\n").unwrap();
+        let work = root.join("work");
+        std::fs::create_dir(&work).unwrap();
+        for leaf in ["home", "tmp", "state"] {
+            std::fs::create_dir(root.join(leaf)).unwrap();
+        }
+        let mut child = command(std::env::current_exe().unwrap());
+        // Production git runs inside the probe too: inherited GIT_DIR or
+        // GIT_CONFIG_PARAMETERS must not redirect it outside this fixture.
+        aterm_uds::fixture_git::hermetic(&mut child)
+            .args(["--exact", "--nocapture", "--test-threads=1", CRLF_PROBE])
+            .env(CRLF_PROBE_ENV, &work)
+            .env("HOME", root.join("home"))
+            .env("TMPDIR", root.join("tmp"))
+            .env("TMP", root.join("tmp"))
+            .env("TEMP", root.join("tmp"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("GIT_CONFIG_GLOBAL", &config)
+            .env("XDG_CONFIG_HOME", root.join("xdg"))
+            .stdin(Stdio::null());
+        let out = aterm_uds::deadline::outputs_until(
+            &mut [&mut child],
+            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            aterm_spec::wait::MUST_HAPPEN,
+        )
+        .pop()
+        .expect("one probe");
+        let out = match out {
+            Ok(out) => out,
+            Err(error) => {
+                // A bounded reap is not proof that all forwarded git
+                // children ended. Keep their owned files on uncertainty.
+                let kept = dir.keep();
+                panic!("CRLF probe: {error}; retained fixture {}", kept.display());
+            }
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the probe under a CRLF config: {}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// `ship check`'s exit: a refusal outranks a gate that could not run, which
     /// outranks a pass.
     #[test]
@@ -4689,16 +4877,16 @@ mod tests {
         // the committed line's shape (publish/config.sh, which the public snapshot
         // withholds, so it is quoted here rather than read)
         let good = "CHECK_CMD_DEFAULT=\"rustup run trust targo trust check && rustup target add \
-                    --toolchain 1.95.0 wasm32-unknown-unknown && RUSTFLAGS='-C \
-                    target-feature=+simd128' RUSTC=$(rustup which --toolchain 1.95.0 rustc) \
-                    rustup run 1.95.0 cargo check --locked --target wasm32-unknown-unknown -p \
-                    aterm-wasm\"\n";
+                    --toolchain 1.95.0 wasm32-unknown-unknown && sh -c \
+                    'RUSTFLAGS=-Ctarget-feature=+simd128 RUSTC=$(rustup which --toolchain 1.95.0 \
+                    rustc) rustup run 1.95.0 cargo check --locked --target wasm32-unknown-unknown \
+                    -p aterm-wasm'\"\n";
         let clause = wasm_clause(good).unwrap();
         assert_eq!(clause.pin, "1.95.0");
         assert!(
             clause
                 .clause
-                .starts_with("RUSTFLAGS='-C target-feature=+simd128' RUSTC=")
+                .starts_with("sh -c 'RUSTFLAGS=-Ctarget-feature=+simd128 RUSTC=")
         );
         for config in [
             "CHECK_CMD_DEFAULT=\"targo check\"\n",

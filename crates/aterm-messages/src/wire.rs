@@ -3,7 +3,7 @@
 
 //! The wire grammars: the `messages` read query and its row, the
 //! byte-identical `appstatus` compatibility face, and the `notice` verb
-//! (`post`, `progress`, `done`, `ask`, `dismiss`, `act`) with its verdicts,
+//! (`post`, `progress`, `done`, `ask`, `later`, `dismiss`, `act`) with its verdicts,
 //! caps, budgets, key namespace and paint pacing. The percent-encoder is
 //! injected (`aterm_control::wire::pct_encode` in the host): the grammar lives
 //! beside the state, the bytes stay the host's, and no second encoder can
@@ -20,11 +20,14 @@ use crate::model::{
     ActionIndex, Amount, Glyph, Hold, Intent, Load, Message, MessageId, Meter, Origin, Restatement,
     Severity, Tag, Unit, WallStamp, tags,
 };
+use crate::need::{
+    DIGEST_CAP, Fingerprint, LaterAsk, Mover, REASON_CAP, Reason, Resurface, STEP_CAP, Then, Why,
+};
 use crate::text::{clip, glass_title_fault, is_stripped};
 use crate::{
     DETAIL_LINE_CAP, DETAIL_LINES_CAP, Duration, Instant, LOG_CAP, MAX_ACTIONS, PROGRESS_GRACE,
     STALE_WIRE, STATS_CAP, TITLE_CAP, WIRE_BYTES_PER_WINDOW, WIRE_KEY_MAX, WIRE_KEY_PREFIX,
-    WIRE_LIVE_CAP, WIRE_MINT_WINDOW, WIRE_MINTS_PER_WINDOW, WIRE_PAINT_GAP,
+    WIRE_LATER_CAP, WIRE_LIVE_CAP, WIRE_MINT_WINDOW, WIRE_MINTS_PER_WINDOW, WIRE_PAINT_GAP,
     WIRE_PRESSES_PER_WINDOW,
 };
 
@@ -378,7 +381,8 @@ pub fn activity_rows_compat(
 // ---------------------------------------------------------------------------
 
 /// The `notice` verb's usage line: a missing or unknown sub-form.
-pub(crate) const NOTICE_USAGE: &str = "usage: notice <post|progress|done|ask|dismiss|act> \u{2026}";
+pub(crate) const NOTICE_USAGE: &str =
+    "usage: notice <post|progress|done|ask|later|dismiss|act> \u{2026}";
 /// The `notice progress` usage line.
 pub(crate) const PROGRESS_USAGE: &str = "usage: notice progress <key> [tag=<tag>] [pct=<0..100>|done=<n>/<total>|busy] [unit=<bytes|items|steps>] [load=<network|disk|cpu>] <title>[ -- <stats>]";
 /// The `notice done` usage line.
@@ -386,6 +390,25 @@ pub(crate) const DONE_USAGE: &str = "usage: notice done <key> [ok|warn|withdraw]
 /// The `notice ask` usage line.
 pub(crate) const ASK_USAGE: &str =
     "usage: notice ask <key> [tag=<tag>] <title> -- <reason> -- <step>";
+/// The `notice later` usage line.
+pub(crate) const LATER_USAGE: &str = "usage: notice later <key> [tag=<tag>] [url=<https-url>] <title> -- <reason> -- <step>[ -- <detail>]";
+/// A `url=` the wire refuses ([`crate::model::link_host`]): the entry's one button opens
+/// it, so it is a web page on a host the entry can name.
+pub(crate) const URL_REFUSAL: &str = "notice: url is https://<host>[/<path>] with no user and no port, at most 512 printable characters";
+/// A `notice later` reason past [`REASON_CAP`]: the digest shows it whole or not at all.
+pub(crate) const REASON_LONG: &str = "notice: reason over 90 characters";
+/// A `notice later` step past [`STEP_CAP`].
+pub(crate) const STEP_LONG: &str = "notice: step over 90 characters";
+/// A `notice later` detail past [`crate::exceptions::MORE_LINES`] lines of
+/// [`DETAIL_LINE_CAP`] characters.
+pub(crate) const DETAIL_LONG: &str = "notice: detail over 3 lines (split by \\n) of 240 characters";
+const _: () = assert!(
+    REASON_CAP == 90
+        && STEP_CAP == 90
+        && crate::exceptions::MORE_LINES == 3
+        && DETAIL_LINE_CAP == 240
+        && crate::model::LINK_URL_CAP == 512
+);
 /// The `notice dismiss` usage line.
 pub(crate) const DISMISS_USAGE: &str = "usage: notice dismiss <id|review>";
 /// The `notice act` usage line.
@@ -963,7 +986,7 @@ impl AskRequest {
         title_form(&title, true)?;
         let ask = Self::ask_of(&reason, &step);
         if let Some(fault) = ask.fault() {
-            return Err(ask_refusal(fault));
+            return Err(ask_refusal(fault, ASK_USAGE));
         }
         Ok(Self {
             key,
@@ -992,9 +1015,144 @@ impl AskRequest {
     }
 }
 
+/// `notice later <key> [tag=<tag>] [url=<https-url>] <title> -- <reason> -- <step>[ --
+/// <detail>]`: a tool that is not aterm says the owner is needed, but not now (an
+/// account's security setup, a renewal due next month). It is one keyed entry of the
+/// digest, the exceptions list in the menu-bar item and Settings ▸ Messages, never a band
+/// row, so a fact every tab and every launch of the tool would raise is one line
+/// however often it is said: a repeat folds into it, new words restate it in place, and
+/// once the owner dismisses it the same key is quiet for a week, then four weeks, then
+/// three months ([`Resurface::WAIT`] backed off), across restarts. The door's word
+/// rules hold here as for `ask`, and the fields are whole or refused, never cut. With
+/// `url=`, the entry's one button is `Open in browser` on that page (fixed words; the
+/// entry's detail names the host), and a press files the entry answered. `notice done
+/// <key>` ends it; it files itself after 14 days. Owner-only, as every `notice`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LaterRequest {
+    /// The full key, `wire.<key>`: the fact's identity, kept whole.
+    pub key: String,
+    /// `script` by default; never aterm's own families.
+    pub tag: Tag,
+    /// The page the one button opens ([`crate::model::link_host`] admits it).
+    pub url: Option<String>,
+    /// The glass title form.
+    pub title: String,
+    /// Why the owner, and not the machine, is needed: at most [`REASON_CAP`].
+    pub reason: String,
+    /// The one step that settles it: at most [`STEP_CAP`].
+    pub step: String,
+    /// At most [`crate::exceptions::MORE_LINES`] lines (split on a literal `\n`) of at
+    /// most [`DETAIL_LINE_CAP`], behind `Details ›`.
+    pub detail: Vec<String>,
+}
+
+impl LaterRequest {
+    /// Parse the words after `notice later`.
+    ///
+    /// # Errors
+    /// [`LATER_USAGE`] for a missing key, title, reason or step, a bad option or a
+    /// second `url=`; [`KEY_REFUSAL`]; [`OWN_TAG_REFUSAL`]; [`URL_REFUSAL`];
+    /// [`REASON_LONG`], [`STEP_LONG`] and [`DETAIL_LONG`] for a field past its cap;
+    /// `notice: <fault>` for a title out of form, a reason that only says something is
+    /// pending, or a step that is a snooze or two actions.
+    pub fn parse(rest: &str) -> Result<Self, &'static str> {
+        let (key, rest) = first_word(rest);
+        if key.is_empty() {
+            return Err(LATER_USAGE);
+        }
+        let key = wire_key(key)?;
+        let mut tag = tags::SCRIPT;
+        let mut url = None;
+        let rest = options(rest, |word| {
+            if let Some(v) = word.strip_prefix("tag=") {
+                tag = wire_tag(v, LATER_USAGE)?;
+            } else if let Some(v) = word.strip_prefix("url=") {
+                crate::model::link_host(v).ok_or(URL_REFUSAL)?;
+                if url.replace(v.to_string()).is_some() {
+                    return Err(LATER_USAGE);
+                }
+            } else {
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
+        let (title, tail) = split_title(rest);
+        let (reason, tail) = split_title(tail);
+        let (step, detail) = split_title(tail);
+        let title = clip_words(title, TITLE_CAP);
+        let (reason, step) = (clip_words(reason, usize::MAX), clip_words(step, usize::MAX));
+        if title.is_empty() || reason.is_empty() || step.is_empty() {
+            return Err(LATER_USAGE);
+        }
+        title_form(&title, true)?;
+        if reason.chars().count() > REASON_CAP {
+            return Err(REASON_LONG);
+        }
+        if step.chars().count() > STEP_CAP {
+            return Err(STEP_LONG);
+        }
+        let detail: Vec<String> = detail
+            .split("\\n")
+            .map(|l| clip_words(l, usize::MAX))
+            .filter(|l| !l.is_empty())
+            .collect();
+        if detail.len() > crate::exceptions::MORE_LINES
+            || detail.iter().any(|l| l.chars().count() > DETAIL_LINE_CAP)
+        {
+            return Err(DETAIL_LONG);
+        }
+        let req = Self {
+            key,
+            tag,
+            url,
+            title,
+            reason,
+            step,
+            detail,
+        };
+        if let Some(fault) = req.ask().fault() {
+            return Err(ask_refusal(fault, LATER_USAGE));
+        }
+        Ok(req)
+    }
+
+    /// The ask: the owner only, the step (on the link's button when there is one), the
+    /// key kept whole, a week's quiet after a dismissal.
+    fn ask(&self) -> LaterAsk {
+        let then = match self.url.as_deref().and_then(Mover::open_link) {
+            Some(mover) => Then::press(mover, &self.step),
+            None => Then::step(&self.step),
+        };
+        LaterAsk::person(
+            Why::OnlyYou(Reason::new(&self.reason)),
+            then,
+            Fingerprint::wire(&self.key),
+            Resurface::WAIT,
+        )
+    }
+
+    /// The entry: Info, `Origin::Wire`, keyed by the ask, its reason and step leading
+    /// the detail, then the host the button opens (aterm's words, so a link is never
+    /// only the sender's say-so), then the sender's lines.
+    #[must_use]
+    pub(crate) fn into_message(self) -> Message {
+        let ask = self.ask();
+        let host = self
+            .url
+            .as_deref()
+            .and_then(crate::model::link_host)
+            .map(|h| format!("Opens a page on {}", h.to_ascii_lowercase()));
+        Message::new(self.tag, Severity::Info, self.title)
+            .later(ask)
+            .origin(Origin::Wire)
+            .lines(host)
+            .lines(self.detail)
+    }
+}
+
 /// The refusal for an ask the door would not stand (`need::Ask::fault`), in the
-/// script author's words.
-fn ask_refusal(fault: &'static str) -> &'static str {
+/// script author's words; `usage` for a fault the parse already answered.
+fn ask_refusal(fault: &'static str, usage: &'static str) -> &'static str {
     match fault {
         "a reason that only says something is pending" => {
             "notice: the reason only says something is pending; say why only the owner can close it"
@@ -1005,7 +1163,7 @@ fn ask_refusal(fault: &'static str) -> &'static str {
         "two actions in one sentence" => {
             "notice: two actions in one step; name the one that closes it"
         }
-        _ => ASK_USAGE,
+        _ => usage,
     }
 }
 
@@ -1020,7 +1178,7 @@ pub enum Press {
     Details,
 }
 
-/// `notice <post|progress|done|ask|dismiss|act> …`, parsed on the control thread.
+/// `notice <post|progress|done|ask|later|dismiss|act> …`, parsed on the control thread.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NoticeRequest {
     /// A record, or a failure row.
@@ -1031,6 +1189,8 @@ pub enum NoticeRequest {
     Done(DoneRequest),
     /// The owner is needed now: a standing ask.
     Ask(AskRequest),
+    /// The owner is needed, but not now: one entry of the digest.
+    Later(LaterRequest),
     /// Take a row down as a person could.
     Dismiss(MessageId),
     /// File every open exception into the log (`notice dismiss review`).
@@ -1052,8 +1212,8 @@ impl NoticeRequest {
     /// # Errors
     /// [`NOTICE_USAGE`] for a missing or unknown sub-form; each sub-form's
     /// own refusals ([`PostRequest::parse`], [`ProgressRequest::parse`],
-    /// [`DoneRequest::parse`], [`AskRequest::parse`], [`DISMISS_USAGE`],
-    /// [`ACT_USAGE`]).
+    /// [`DoneRequest::parse`], [`AskRequest::parse`], [`LaterRequest::parse`],
+    /// [`DISMISS_USAGE`], [`ACT_USAGE`]).
     pub fn parse(rest: &str) -> Result<Self, &'static str> {
         // A tab (or any whitespace the strip removes: a control, U+2028,
         // U+2029) on the line is a space: the strip would otherwise glue
@@ -1075,6 +1235,7 @@ impl NoticeRequest {
             "progress" => ProgressRequest::parse(rest).map(Self::Progress),
             "done" => DoneRequest::parse(rest).map(Self::Done),
             "ask" => AskRequest::parse(rest).map(Self::Ask),
+            "later" => LaterRequest::parse(rest).map(Self::Later),
             "dismiss" if rest.trim() == "review" => Ok(Self::DismissReview),
             "dismiss" => {
                 let mut words = rest.split_whitespace();
@@ -1357,6 +1518,7 @@ pub fn apply(
         NoticeRequest::Progress(p) => apply_progress(center, gate, &p, stamp, now),
         NoticeRequest::Done(d) => apply_done(center, gate, d, now),
         NoticeRequest::Ask(a) => post_row(center, gate, a.into_message().normalized(), stamp, now),
+        NoticeRequest::Later(l) => apply_later(center, gate, l, stamp, now),
         NoticeRequest::Dismiss(id) => apply_dismiss(center, gate, id, stamp, now),
         NoticeRequest::DismissReview => {
             let n = center.file_digest(stamp, now);
@@ -1443,6 +1605,74 @@ fn post_row(
     shown(center, gate, now, reply)
 }
 
+fn later_cap_refusal() -> Applied {
+    Applied::quiet(format!(
+        "ERR notice: {WIRE_LATER_CAP} wire entries are open for later; end one with notice done"
+    ))
+}
+
+fn digest_full_refusal() -> Applied {
+    Applied::quiet(format!(
+        "ERR notice: the owner has {DIGEST_CAP} entries to look at; aterm's own keep their place"
+    ))
+}
+
+/// File a `notice later` entry: the wire's cap on open entries and the digest's room
+/// for one more, then the mint budget, for a post that opens an entry or changes one's
+/// words (a repeat and a dismissed key's quiet spend nothing), then the post.
+/// `OK later=<id> how=<new|restated|duplicate|quiet>`; `quiet` names the filed record
+/// that keeps the key quiet. The digest repaints no window ([`Paint::None`]) unless the
+/// entry took over a live row's key; the host moves its menu-bar item and Settings on
+/// [`MessageCenter::digest_revision`].
+fn apply_later(
+    center: &mut MessageCenter,
+    gate: &mut WireGate,
+    l: LaterRequest,
+    stamp: WallStamp,
+    now: Instant,
+) -> Applied {
+    let msg = l.into_message().normalized();
+    let Some(how) = center.later_outcome(&msg, stamp, now) else {
+        return Applied::quiet(format!("ERR {LATER_USAGE}"));
+    };
+    let under_key = msg
+        .key
+        .as_deref()
+        .is_some_and(|k| center.live_by_key(k).is_some());
+    if how == PostOutcome::New {
+        if center.digest_keys_under(WIRE_KEY_PREFIX).len() >= WIRE_LATER_CAP {
+            return later_cap_refusal();
+        }
+        if center.digest_len() >= DIGEST_CAP {
+            return digest_full_refusal();
+        }
+    }
+    let spends = matches!(how, PostOutcome::New | PostOutcome::Restated);
+    if spends && let Err(busy) = gate.try_mint(now, words_bytes(&msg)) {
+        return busy_refusal(busy);
+    }
+    let posted = center.post(msg, stamp, now);
+    let word = match posted.outcome {
+        PostOutcome::New | PostOutcome::Superseded(_) => "new",
+        PostOutcome::Restated => "restated",
+        PostOutcome::Duplicate => "duplicate",
+        PostOutcome::Suppressed => "quiet",
+    };
+    if spends && !matches!(posted.outcome, PostOutcome::New | PostOutcome::Restated) {
+        gate.refund();
+    }
+    let reply = format!("OK later={} how={word}", posted.id);
+    if posted.outcome == PostOutcome::New && under_key {
+        // The entry retired the live row that told the fact: the band moved.
+        return shown(center, gate, now, reply);
+    }
+    Applied {
+        reply,
+        paint: Paint::None,
+        note: posted.outcome == PostOutcome::New,
+    }
+}
+
 fn apply_progress(
     center: &mut MessageCenter,
     gate: &mut WireGate,
@@ -1495,7 +1725,18 @@ fn apply_done(
     now: Instant,
 ) -> Applied {
     let Some(id) = center.live_by_key(&d.key).map(|l| l.id) else {
-        return Applied::quiet("OK done=- how=gone".to_string());
+        // No row under the key: an entry `notice later` filed ends with its cause,
+        // and the fact's next post is news (an end is not a filing).
+        let how = d.how.retired();
+        let word = how.as_word();
+        return match center.end_digest_key(&d.key, how, d.words, now) {
+            Some(id) => Applied {
+                reply: format!("OK done={id} how={word}"),
+                paint: Paint::None,
+                note: true,
+            },
+            None => Applied::quiet("OK done=- how=gone".to_string()),
+        };
     };
     if let Some(words) = d.words {
         // Delivered words are the finished words: `done build ok Built aterm`

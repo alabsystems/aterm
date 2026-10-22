@@ -100,6 +100,9 @@ fn spec_xref_closure() {
                 &aterm_restore::writer::WriteError,
                 &mut std::fmt::Formatter<'_>,
             ) -> std::fmt::Result,
+        // agh: the CLI reaches both anchored functions; the waivers' host keeps them linked.
+        agh::cli::main_entry as fn(Vec<std::ffi::OsString>) -> std::process::ExitCode,
+        agh::policy::route_wall_environment as fn(),
     ));
     // ---- Proof #1: the registry ACTUALLY collected the anchors, cross-crate. ----
     let refs: Vec<_> = xref::refinements().collect();

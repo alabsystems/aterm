@@ -57,9 +57,6 @@ pub const PROMPT_KEY_BYTES: usize = 256;
 /// what is in flight: the newest rows only ever hold a few.
 const MAX_RESULTS: usize = 64;
 
-/// The longest row read, as the footer's tail read caps it.
-const MAX_ROW_BYTES: usize = 256 * 1024;
-
 /// What the end of one transcript says, for the survey.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Excerpts {
@@ -256,20 +253,15 @@ impl Default for Flight {
 }
 
 impl Scan {
-    /// The rows of `body` (whole rows, `\n`-separated), newest first.
+    /// `rows`, newest first, as the footer's tail read splits them: whole,
+    /// UTF-8, none longer than the footer's longest row.
     #[must_use]
-    pub fn of(body: &[u8]) -> Self {
+    pub fn of(rows: &[&str]) -> Self {
         let mut scan = Self::default();
-        for raw in body.rsplit(|&b| b == b'\n') {
+        for &line in rows {
             if scan.settled() {
                 break;
             }
-            if raw.is_empty() || raw.len() > MAX_ROW_BYTES {
-                continue;
-            }
-            let Ok(line) = std::str::from_utf8(raw) else {
-                continue;
-            };
             // Cheap prefilter: only a user or an assistant row says anything.
             if !line.contains("\"user\"") && !line.contains("\"assistant\"") {
                 continue;

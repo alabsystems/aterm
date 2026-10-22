@@ -531,8 +531,16 @@ static GLYPHS: [(u32, [u8; 8]); 499] = [
 #[must_use]
 pub(crate) fn bitmap(c: char) -> Option<[u8; 8]> {
     let cp = c as u32;
-    let idx = GLYPHS.binary_search_by_key(&cp, |&(key, _)| key).ok()?;
-    GLYPHS.get(idx).map(|&(_, rows)| rows)
+    if (0x0021..=0x007E).contains(&cp) {
+        return Some(GLYPHS[(cp - 0x0021) as usize].1);
+    }
+    if !(0x00A1..=0x309E).contains(&cp) {
+        return None;
+    }
+    let idx = GLYPHS[94..]
+        .binary_search_by_key(&cp, |&(key, _)| key)
+        .ok()?;
+    Some(GLYPHS[94 + idx].1)
 }
 
 #[cfg(test)]

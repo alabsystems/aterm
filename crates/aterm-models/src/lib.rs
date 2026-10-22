@@ -18,7 +18,8 @@ type Domain = (&'static str, fn() -> Model);
 /// One model of each domain crate. The registry sees only object code the binary links, and a
 /// crate the binary never names is not linked at all, so naming one constructor per crate is what
 /// puts its models in the registry.
-const DOMAINS: [Domain; 11] = [
+const DOMAINS: [Domain; 12] = [
+    ("aterm-models-agh", aterm_models_agh::agh_route_wall_model),
     (
         "aterm-models-atpkg",
         aterm_models_atpkg::atpkg_contention_release_park_model,

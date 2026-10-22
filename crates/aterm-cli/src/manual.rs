@@ -25,20 +25,21 @@ use std::path::{Path, PathBuf};
 fn overview() -> String {
     format!(
         "aterm is a terminal an AI agent can read and drive, and the front door to the ALab\n\
-         toolchain: the Trust compiler and its verifiers, plus the claude, codex, agy and muse\n\
-         CLIs, installed and kept current by one signed package manager. {OVERVIEW_SELF_UPDATE}"
+         toolchain: the Trust compiler and its verifiers, plus the claude, codex, codex-old, agy\n\
+         and muse CLIs, installed and kept current by one signed package manager.\n\
+         {OVERVIEW_SELF_UPDATE}"
     )
 }
 
 /// How aterm itself stays current on this platform: macOS replaces its app
 /// bundle and Linux its executable, both from the signed appcast.
 #[cfg(not(windows))]
-const OVERVIEW_SELF_UPDATE: &str = "aterm updates itself\nthrough its own signed appcast.";
+const OVERVIEW_SELF_UPDATE: &str = "aterm updates itself through its own signed appcast.";
 /// Windows has no updater: the lane is `crate::WINDOWS_UPDATE_LANE`, which `aterm help update`
 /// spells out.
 #[cfg(windows)]
 const OVERVIEW_SELF_UPDATE: &str =
-    "aterm has no\nupdater on Windows yet: `aterm help update` says how to update it.";
+    "aterm has no updater on Windows yet: `aterm help update` says how to update it.";
 
 /// A manual page for one tool or topic.
 struct Topic {
@@ -88,7 +89,7 @@ macro_rules! aterm_page_shell {
 const TOPICS: &[Topic] = &[
     Topic {
         name: "doctor",
-        tagline: "health checks and the macOS fleet settings profile",
+        tagline: "health checks and Mac setup",
         body: Some(
             r#"aterm doctor — health, repairs and macOS setup
 
@@ -103,50 +104,52 @@ const TOPICS: &[Topic] = &[
   aterm doctor --restore       restore the preferences saved before setup
   Add --json for a structured report on stdout, including on failure.
 
-The first interactive aterm launch on macOS applies the profile automatically.
-Setup keeps retrying incomplete work in the background while aterm stays open;
-permission changes and transient failures need no manual rerun.
-Headless instances, commands run with -e, private lab homes and utility verbs
-do not configure the login user's Mac. Later launches preserve changes you make;
-run --apply to standardize the machine again, or --check to collect drift.
+The first Mac window opens System State with every setup choice checked.
+Apply starts immediately; otherwise checked items apply after 30 active seconds.
+Clicking, typing or scrolling stops the countdown until you press Apply.
+The timer pauses away from the tab or behind another dialog. Cancel closes the
+offer. System State remains available to rerun setup or restore preferences.
 
-Profile: System Settings, aterm and Safari pinned in the Dock, with recent apps
-and other pinned items removed; Caps Lock as Control; natural scrolling off
-(the reference Mac's setting), two-finger horizontal and momentum scrolling on;
-desktop and Stage Manager widgets hidden and Notification Center widgets cleared;
-clicking wallpaper does not reveal
-the desktop; desktop icons stay visible. Finder, Trash and running apps may
-still appear in the Dock because macOS owns those items.
+Setup choices:
+  Caps Lock as Control
+  Natural scrolling off
+  Vertical, horizontal and momentum trackpad scrolling on
+  Desktop icons visible; wallpaper clicks keep windows in place
+  Desktop and Stage Manager widgets hidden; Notification Center widgets cleared
+  Dock: only aterm, System Settings and Safari; no stacks or recent apps;
+    minimize windows into app icons
+  Sign out of Messages
+  Sign out of FaceTime
+  Keep Rust offline documentation out of Spotlight
+  Set up aterm's macOS permissions
+  Sync the secrets vault
+  Authenticate GitHub and clone accessible repositories
+Finder, Trash and running apps may still appear in the Dock.
 
-Only the affected preference keys are backed up before writing. Restore puts
-those keys back and stops automatic first-run setup from reapplying them.
-Backups do not contain account credentials; restoring preferences cannot sign
-an account back in. Init and doctor share the account automation: use each
-app's Sign Out controls and verify that its durable registration is gone.
-Already signed-out accounts need no app launch or permission request.
-Doctor never deletes account databases or keychain items. macOS may refuse UI
-automation until its Accessibility and Automation permissions are available;
-first run requests native Accessibility consent once when a signed-in account
-needs it. Apple Events use macOS's normal Automation consent. The report names
-any block and never declares the machine finished before sign-out verifies.
+The vault URL starts as http://alab-secrets.local:7484/v1/alab and is editable.
+Enter its join password, or leave it blank for approval from another Mac.
+Synced credentials handle GitHub authentication; no separate login is needed.
+Existing checkouts stay intact. macOS permission switches still need your clicks.
 
-Settings-only modes do not open the Developer Tools pane. Their exit 0 means
-the automatic settings and account operations verified (or no drift in
---check); exit 1 means drift, blocked automation or failure; exit 2 is invalid
-usage. The bare command and --read-only check no setting (`aterm init` applies
-them at the console): they report health and the packages (`aterm pkg
-doctor`'s view), the bare command repairs what aterm lays for this account
-(an install pass holding the store is a note, and nothing is repaired), and
-they exit 0 only when all selected checks are satisfied or explicitly not
-applicable. Plans, manual steps, blocked or deferred work, unknown state and
-failed changes remain NOT READY (exit 1). Changed settings that explicitly
-require login or restart stay pending activation. The readiness summary covers these
-doctor checks, not all OS configuration; --only scopes it and the shell is
-always checked. JSON includes readiness, scope and unresolved row ids alongside
-the individual evidence and remedies. For a shell-usability check alone, use
-`aterm doctor --read-only --only base.shell.starts`.
-The bare command may also move stale copies or bring up the Developer Tools
-pane, as its output says.
+Setup saves choices and retries unfinished stages while aterm stays open.
+Completed setup preserves later local changes. Nested terminal sessions, -e
+commands, headless runs, private lab homes and utilities do not initialize the Mac.
+A terminal-only launch accepts any key to cancel before starting its shell.
+
+Only changed preference keys are backed up. Restore preferences puts them back
+and stops automatic setup. It leaves cloned repos, credentials and account
+sign-outs in place. Sign-out uses Apple's controls and verifies registration;
+already signed-out accounts need no app launch. Backups contain no credentials.
+Doctor --apply applies the full Mac preference/account profile; System State
+also handles permissions, Spotlight, the vault and repositories.
+
+Settings modes exit 0 when verified, 1 for drift or incomplete work, and 2 for
+invalid usage. Bare doctor checks and repairs aterm's health, not the workstation
+profile; --read-only reports the same health without repairs. Health exits 0
+only when every selected check is satisfied or not applicable. Blocked, deferred,
+unknown and failed checks remain NOT READY (exit 1). --only scopes the checks;
+the shell is always included. JSON includes readiness and unresolved row ids.
+For shell usability alone: aterm doctor --read-only --only base.shell.starts.
 "#,
         ),
     },
@@ -184,7 +187,7 @@ KEY USAGE
                              aterm can (stale copies to the Trash; the Developer
                              Tools pane brought up for you, with the aterm window's
                              panel beside it when one runs; --read-only fixes
-                             nothing); exit 1 only when the shell cannot start.
+                             nothing); exit 1 when a selected check remains unresolved.
                              On macOS --apply applies the workstation settings
                              profile; see `aterm help doctor`."#,
             aterm_page_shell!(doctor),
@@ -344,6 +347,10 @@ GOTCHAS
              environment, cwd, descriptors and process group persist. The outer launcher\n\
              waits for the command itself. CPU and physical footprint are charged once\n\
              to the originating tab and aterm; unrelated shared-daemon work is excluded.\n\n\
+             In resources output, cpu_cores is a live sampled rate from the observed\n\
+             processes' own CPU time. CPU before a process's first sample and work that\n\
+             exits between sweeps can be absent. sample=complete means the current process\n\
+             readings were available; it does not promise full interval or job-lifetime coverage.\n\n\
              Query support without invoking this verb: aterm ctl @self resources capabilities.\n\
              Its version=1 reply names runner=<percent-encoded executable path> and the\n\
              observed AI/program default. Unsupported reporting is explicit. A command that\n\
@@ -462,9 +469,8 @@ WHEN TO REACH FOR IT
   aterm.app) — every DETECTED agent gets the current primer and skills, and nothing is
   written for an agent whose config dir does not exist (`agents_auto_prime = false` in
   aterm.toml turns the pass off). The start's pass is what an update's restored tabs
-  get, a tab under an agent identity (`spawn identity=`) included, whose agent reads that
-  identity's own copy (refreshed at the first start of each new version): the window an
-  update hands them to runs it once the old window has handed them over for good, so an
+  get: the window an update hands them to runs it once the old window has handed them
+  over for good, so an
   agent started or relaunched there (`--resume`) reads the new build's primer, not the
   old one's. Run `aterm agents install` to do the same on demand, `aterm agents` to
   check.
@@ -1894,6 +1900,12 @@ AUTOPILOT — how far the harness carries a session's work
     read saw that turn run, so nothing tells it from the harness's own
     continuation, and a misread would stall the work. `[harness] enabled = false` and back on is
     every session's off.
+  Each mode says what it does in one sentence, in the same words on the chip's
+  title (`autopilot: cruise — …`, below), the record its change leaves
+  (`Autopilot set to land`) and its button on Settings ▸ Harness: cruise
+  `keeps going for ever, finding more to do`, land `wrapping up: landing
+  everything on the remote main branch, then stopping`, off `hands off`; a
+  cruise until a time `keeps going until then, finding more to do`.
   NEEDS YOU — loud, never blocking (cruise and land). A report line whose first
   words are `NEEDS YOU:` (a list marker or `**` before them allowed, never in
   code) names one thing only a person can give: a credential, a decision,
@@ -1910,7 +1922,8 @@ AUTOPILOT — how far the harness carries a session's work
   clipped to the room the tab's name and its age leave, the age always kept; a
   fleet Mac's row too), the pill (`needs you: <need> (1 more need)`), the
   Overview's line (`needs you: <need> (+1 more)`), the tab's hover (`Needs you:
-  <need>`, then `Claude Code carries on meanwhile`), the banner, Settings ▸
+  <need>`, then `Claude Code carries on meanwhile`), the banner, the
+  Autopilot chip's title and its spoken description (below), Settings ▸
   Harness (STATUS `· 2 need you`, and the session's state line led by `needs
   you: …; carrying on`) and `status needs_n=` (how many). A long need is cut to
   the room the frame leaves, so the entry always ends with its count and
@@ -1948,7 +1961,7 @@ AUTOPILOT — how far the harness carries a session's work
     seamless update of aterm keep the landing and its time; one from before
     aterm itself was relaunched shows the relaunch's.
   * theirs (`⤓ quiet`, `task=theirs`; under cruise the chip keeps `∞`, and the
-    harness keeps the work moving after it) — the turn was a person's own
+    harness keeps going after it) — the turn was a person's own
     exchange (`LEFT …`).
   Landed and theirs type nothing until someone else's turn; that turn's first
   live read opens the face again. A landed face's time from another day names
@@ -2170,7 +2183,8 @@ AUTOPILOT — how far the harness carries a session's work
   does.
   THE CHIP AS DRAWN, OVER THE SOCKET. `aterm ctl chrome` prints one line per
   supervised pane, in every window: `autopilot sid=<sid> window=<id>
-  program=<name> face=<word> drawn="<cells>" spoken="<label>"`. `window=`
+  program=<name> face=<word> drawn="<cells>" spoken="<label>"
+  description="<words>"`. `window=`
   is the window's id as `ls` prints it, so a session shown in two windows
   has a line in each. `face=` is the chip's face now (`cruise`,
   `cruise-until`, `land`, `landed`, `theirs`, `off`, `master-off`,
@@ -2181,8 +2195,11 @@ AUTOPILOT — how far the harness carries a session's work
   (so does every pane of a `--headless` instance until a capture such as
   `aterm ctl image` composes a frame), and a rule with no room for the chip
   says `why=no-room`. `spoken=` is what a screen reader says of the drawn
-  chip, `spoken=-` where none is drawn. Gemini CLI and codex-alab, which
-  have no composer footer, say `face=- drawn=- why=no-footer spoken=-`.
+  chip, `spoken=-` where none is drawn, and `description=` its description
+  (the chip's, above: why a landing holds, a harness's need, the pause, the
+  newest act), `description=-` where it has none or none is drawn. Gemini
+  CLI and codex-alab, which have no composer footer, say `face=- drawn=-
+  why=no-footer spoken=- description=-`.
 
 THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   Every default is full power except limit_reset (no limit reset is taken),
@@ -3096,13 +3113,24 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   right-click menu and the View menu). It shows the session's mode (above) —
   `∞` for cruise, drawn alone; `⤓ land`, or under land `✓ landed` once the work
   landed and `⤓ quiet` after a person's own exchange; `○ off`; `⊘ off` while the harness is
-  off in Settings — and its title says what the mode does, what a click does
-  and that a right-click opens its menu (`· right-click: more`, below). A rule
-  too narrow for the whole title beside the facts gives its parts up in turn:
-  the acts it lists (below), then `· right-click: more`; narrower still, what
-  the mode does goes and both clicks stand again (`autopilot: land, landed
-  14:38 · click: off · right-click: more`), then `· right-click: more`, then
-  everything but the mode (`autopilot: land`). The title never cuts a
+  off in Settings — and its title says what the mode does (its sentence,
+  above), what a click does and that a right-click opens its menu (`·
+  right-click: more`, below). Under `⤓ land` it says why the landing still
+  holds: before a land act's reply is read, the sentence then `· landing
+  since 14:02`; after one that did not land, the reasons instead
+  (`autopilot: land — not landed yet: needs you: rotate the deploy key; 2
+  unpushed commits · landing since 14:02, 3 nudges`). On every face a
+  harness runs, a harness's need follows (`· needs you: <the need> (+1
+  more); carrying on`; said once where the landing's reasons name it), the
+  worker's own ` · ` and ` — ` written `, `. These words are read only
+  while the title is: the chip at rest draws the same cells, and a hold or
+  a need that moves while nobody points at it costs no frame. A rule too
+  narrow for the whole title beside the facts gives its parts up in turn:
+  the acts it lists (below), then the pause and `· right-click: more`;
+  narrower still, what the mode does goes, with the hold and the need, and
+  both clicks stand again (`autopilot: land, landed 14:38 · click: off ·
+  right-click: more`), then `· right-click: more`, then everything but the
+  mode (`autopilot: land`). The title never cuts a
   fact; it stands beside the facts as the rule fits them, so a split pane
   whose long path is cut to `…/<dir>` shows it in the room that leaves. A
   click steps it cruise → land → off → cruise, writing the session's word
@@ -3145,11 +3173,15 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   it lists the last three with the clock time of each (`last: ✓ approved
   14:05, ↻ kept going 14:02`; an act from another day with its weekday, none
   older than a day). `[claude_footer] acts = false` withholds the label, and
-  so does serious mode; the title and Settings ▸ Harness keep the acts. On
-  Linux, where the accessibility tree is built, each chip is a button named
-  in words (`Autopilot: cruise.`), its newest act its
-  description (`Last: approved at 14:05.`; `on Thursday` from another day,
-  none older than a day).
+  so does serious mode; the title and Settings ▸ Harness keep the acts.
+  Where the accessibility tree is built (a screen reader attached), each chip
+  is a button named in words (`Autopilot: cruise.`, the painted word in it),
+  and Autopilot's description says the rest in sentences: why a landing
+  holds (`Not landed yet. Needs you: rotate the deploy key. 2 unpushed
+  commits. Landing since 14:02, 3 nudges.`), a harness's need (`Needs you:
+  <the need>. And 1 more. Carrying on.`), the pause, and the newest act
+  (`Last: approved at 14:05.`; `on Thursday` from another day, none older
+  than a day).
   THE PAUSE. Where the harness backs off after short turns (the back-off
   `continue` below doubles, 2 min to an hour; the first idle point it meets is
   one short turn), the chip's face stays as it is and its title says so after
@@ -3545,9 +3577,9 @@ KEY USAGE (spelled as you type them — daily verbs first)
   aterm pkg update [program] [--retry]
                              update everything (or one program); the Trust
                              toolchain's parts move together. The agent programs
-                             (claude, codex, agy, muse) move to their vendor's
-                             latest. --retry tries a held-back download again
-                             now. A network install is
+                             (claude, codex, codex-old, agy, muse) move to their
+                             vendor's latest. --retry tries a held-back download
+                             again now. A network install is
                              announced in aterm's log before a byte moves, with
                              its signed sizes and how to stop it.
                              `install.sh --no-toolchain` writes
@@ -3556,11 +3588,11 @@ KEY USAGE (spelled as you type them — daily verbs first)
                              nothing
   aterm pkg install <program>
                              one program: verify the signed index, then install the
-                             pinned build — claude, codex, agy and muse: the
-                             vendor's latest, fetched from the vendor's own release
-                             channel and verified on this machine with the vendor's
-                             own anchors (Anthropic's signing key; OpenAI's and
-                             Google's two hosts agreeing; the Apple Developer ID
+                             pinned build — claude, codex, codex-old, agy and muse:
+                             the vendor's latest, fetched from the vendor's own
+                             release channel and verified on this machine with the
+                             vendor's own anchors (Anthropic's signing key; OpenAI's
+                             and Google's two hosts agreeing; the Apple Developer ID
                              team on macOS, which is muse's only anchor, so muse
                              installs on macOS alone), never through the ALab
                              index. atpkg never elevates and installs nothing
@@ -3718,7 +3750,7 @@ WHEN TO REACH FOR IT
 
 GOTCHAS (in the order they bite)
   * PATH: ~/.aterm/shell.d/00-atpkg.* puts <prefix>/agents FIRST (it carries ONLY the
-    agent programs' shims — claude, codex, agy, muse — so the aterm-managed agent is
+    agent programs' shims — claude, codex, codex-old, agy, muse — so the managed agent is
     what those names run, the one exception) and the managed bin/ LAST (never shadowing
     system sudo/ssh/git). FIRST means moved there: the hook removes every earlier
     mention of <prefix>/agents before prepending it, because a macOS login shell's
@@ -3797,9 +3829,10 @@ GOTCHAS (in the order they bite)
     the padding and returns with the agent's own exit code, never running it twice; each
     .cmd ends its batch on the line that runs the program (unverified on a Windows host:
     the text is pinned by tests, but no Windows machine has run it).
-  * VENDOR PROGRAMS (claude, codex, agy, muse): aterm keeps each at its VENDOR'S latest,
-    straight from the vendor's own release channel — Anthropic's for Claude Code,
-    OpenAI's for Codex CLI, Google's for Antigravity CLI (agy), Meta's for Muse Code
+  * VENDOR PROGRAMS (claude, codex, codex-old, agy, muse): aterm keeps each at its
+    VENDOR'S latest, straight from the vendor's own release channel — Anthropic's for
+    Claude Code, OpenAI's for Codex CLI (codex-old is always OpenAI's own build; codex is
+    codex-alab where ALab has one), Google's for Antigravity CLI (agy), Meta's for Muse Code
     (muse) — and never waits on the ALab index; none of them is mirrored or shipped
     inside aterm. Every build is verified on this machine with the vendor's own anchors
     before it is activated: Anthropic's signing key over the release manifest, OpenAI's
@@ -3828,8 +3861,8 @@ GOTCHAS (in the order they bite)
     from your home directory, signed in as the program itself keeps you
     signed in (the variables aterm strips from its shells — an ANTHROPIC_API_KEY, a
     parent Claude session's — are not passed on, but your own CLAUDE_CONFIG_DIR,
-    CODEX_HOME, ANTHROPIC_BASE_URL and Bedrock/Vertex choice are, an identity session's
-    too), and is stopped after 30 s. It does not run claude when you have set
+    CODEX_HOME, ANTHROPIC_BASE_URL and Bedrock/Vertex choice are), and is stopped after
+    30 s. It does not run claude when you have set
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, a program that has never run on this
     account (no ~/.claude, ~/.claude.json or ~/.codex, or none where your config
     variable points), or anything as root. A warm the window starts reads your setup
@@ -4064,6 +4097,11 @@ GOTCHAS (in the order they bite)
         ),
     },
     Topic {
+        name: "agh",
+        tagline: "the GitHub client — reads, routed identities, JSON, typed exits",
+        body: None, // generated — see `agh::cli::help::manual()`
+    },
+    Topic {
         name: "reroute",
         tagline: "cargo/rustc inside a session — rerouted, announced, escapable (aterm --no-reroute)",
         body: Some(
@@ -4104,7 +4142,7 @@ THE TABLE (one row per name)
   never looks the tool up on PATH. Neither is `rust-analyzer` (a long-lived LSP an editor
   spawns: a stderr line is invisible there and a refusal breaks the editor).
 
-THE AGENT PROGRAMS (claude, codex, agy, muse)
+THE AGENT PROGRAMS (claude, codex, codex-old, agy, muse)
   The same directory carries a stub for each agent program whose managed agents/ twin is
   installed, and it decides which copy runs WHEN THE PROGRAM RUNS, never when the shell
   started: a shell's PATH is fixed at its start, and a session shell outlives many
@@ -4125,7 +4163,8 @@ THE AGENT PROGRAMS (claude, codex, agy, muse)
   `claude → <prefix>/reroute/claude → <prefix>/agents/claude → <store path>`.
   The twin uses the vendor's own login (~/.claude, ~/.codex, and agy's and muse's
   own): log in again with that vendor's tool; for codex that is `codex login`, then
-  `codex app-server daemon restart` (0.157+).
+  `codex app-server daemon restart` (0.157+). codex-old reads the same ~/.codex as codex
+  (its login, config and sessions).
 
 WHAT YOU SEE — `cargo build --release` in a session prints this on stderr, and then your
 build runs (here rustup's default is the Trust seal 7d5533b2):
@@ -4718,10 +4757,7 @@ ONE TAB'S OWN THEME
   follows the window's theme. View ▸ Choose Tab Theme… picks one (the palette
   scoped to the tab: Enter keeps, Esc reverts) and View ▸ Clear Tab Theme
   hands the tab back. A split from a themed pane inherits it; it survives an
-  update and a restore; a theme preview does not reach it. A theme per agent
-  identity, for sessions spawned with `spawn identity=<name>`:
-    identity_themes = { worker = "Hearth", reviewer = "dark:Nord,light:Linen" }
-  A session's own theme beats its identity's. A name that stops drawing (a
+  update and a restore; a theme preview does not reach it. A name that stops drawing (a
   deleted file) draws the window's theme and says why (`miss=`).
 
 YOUR CONFIG WINS
@@ -5008,6 +5044,7 @@ fn overview_page() -> String {
                 "run a command with authenticated per-tab resource ownership"
             }
             crate::Verb::Pkg => "install / update / verify the toolchain",
+            crate::Verb::Agh => "GitHub reads for agents: routed identities, JSON, typed exits",
             crate::Verb::Fleet => {
                 "a LAN fleet's membership (init | join | peers | allow | leave); `ctl --host` \
                  drives where allowed"
@@ -5691,7 +5728,8 @@ const WORKERS_PAGE: &str = r#"workers — Claude Code in other tabs on tasks you
 
 WHAT IT IS
   A WORKER is another aterm tab running Claude Code on a task: a whole Claude Code
-  session with its own context, tools and login, not an in-process helper of yours. The
+  session with its own context, tools and login, not an in-process helper of yours
+  (Gemini CLI, agy and Muse Code workers work the same way: AGENTS below). The
   window harness supervises it (answers its boxes, continues its turns, waits out its
   walls) under Autopilot Land, so it works unattended until all of its work is landed on
   the remote main branch, and its pane outlives it. Every step is an `aterm ctl` verb;
@@ -5704,7 +5742,7 @@ KEY USAGE
                              start one in this folder: `OK <sid>`, a background tab of
                              your window. The task is its first prompt, never typed or
                              pasted; `cwd=<path>` names another folder, `model=<m>` its
-                             model, `identity=<name>` gives it its own login. Its
+                             model. Its
                              Autopilot word is `land` (its done is its landing);
                              `autopilot=cruise` carries it for ever instead, and a
                              Cruise worker is never done
@@ -5746,12 +5784,42 @@ KEY USAGE
   aterm ctl @<sid> signal term
                              stop it; its pane stays until `aterm ctl @<sid> close`
 
+AGENTS
+  `agent=` names the worker's agent; each starts interactive, the task its first
+  prompt read from its task file, never typed (T below is
+  "$(command cat -- "$ATERM_TASK_FILE")"):
+  agent=claude   Claude Code      claude [--model <m>] -- T
+  agent=gemini   Gemini CLI       GEMINI_CLI_TRUSTED_FOLDERS_PATH=<f> gemini
+                                    [--model <m>] --session-id <new uuid>
+                                    --prompt-interactive=T
+  agent=agy      Antigravity CLI  agy [--gemini_dir/--app_data_dir] [--model <m>]
+                                    --prompt-interactive=T
+  agent=muse     Muse Code        muse [--provider/--preset/--base-url/-c]
+                                    [--trust-workspace] [--model <m>] -- T
+  `model=<m>` is each one's `--model`, never one opening with `-`. The folder the
+  spawn names (cwd=) is trusted for that worker alone: Claude Code's and agy's
+  folder-trust dialog for it is answered by the harness; Muse Code's
+  `--trust-workspace` trusts it for that run (never saved) where the shell stands
+  there; Gemini CLI's <f> is a trusted-folders file of the worker's own naming it
+  alone (`<state>/tasks/<sid>-1.trust.json`, gone with the worker; `--skip-trust`
+  would trust every folder for every Gemini CLI the worker's tools start). Where the
+  shell stands elsewhere (an rc file's `cd`), nothing trusts that folder: the
+  agent's trust dialog waits for you. A Gemini CLI worker's is never pressed (its
+  `Trust folder` restarts it with the task, sent again), and its new session id makes
+  any restart of its own exit instead. The program is the one a starter of the same
+  agent runs (atpkg's managed link for a store build) with its config and provider
+  flags, else the word on the worker's PATH.
+  Their conversation is read off the screen alone: `result` is the words their
+  screen showed where the harness typed its Land instruction (the report), then
+  those of the landing turn (`source=screen program=<agent>`), and `result full`
+  has no transcript to read. `agent=codex` is not yet a worker.
+
 ON ANOTHER MAC (the step-in)
   The same recipe with a host named, where that Mac's person lets this one drive it
   (`aterm fleet allow drive --from <this Mac>` there, `aterm help fleet`). Each worker
   goes by its sid there (`aterm ctl survey --host <h>` shows them), and only these
   verbs cross:
-  aterm ctl --host <h> spawn agent=claude [model=<m>] [cwd=<absolute path there>] - < task
+  aterm ctl --host <h> spawn agent=<word> [model=<m>] [cwd=<absolute path there>] - < task
                              a worker there, `raise=false`: no folder of this Mac is
                              named, so give cwd= (else that Mac's aterm picks)
   aterm ctl --host <h> await task @<w>,… since=0 [all] [timeout=<ms>]
@@ -5830,13 +5898,17 @@ GOTCHAS
     (`why=held`); `aterm ctl @<sid> text tail=40 trim` shows it.
   * `ERR unsupervised: <switch>`: the window harness would not carry the worker, so
     nothing would see the task through, and nothing was spawned: `[harness] enabled =
-    false` (or `headless = false` in a headless instance), `[harness.claude] enabled =
-    false`, or `[harness] autopilot = "off"`.
-  * The worker's folder: the window harness answers Claude Code's folder-trust dialog
-    there Yes for that worker alone, but the Yes is Claude Code's own and it keeps it
-    (`hasTrustDialogAccepted` for the folder in its `.claude.json`), so every later
-    Claude Code started in that folder under the same login is trusted with no dialog.
+    false` (or `headless = false` in a headless instance), `[harness.<agent>] enabled =
+    false` for the worker's agent (`[harness.claude]`, `[harness.gemini]`,
+    `[harness.agy]`, `[harness.muse]`), or `[harness] autopilot = "off"`.
+  * The worker's folder: the window harness answers Claude Code's and agy's
+    folder-trust dialog there Yes for that worker alone, but the Yes is the agent's own
+    and it may keep it (Claude Code does: `hasTrustDialogAccepted` for the folder in its
+    `.claude.json`), so a later one started in that folder under the same login can be
+    trusted with no dialog. Muse Code's flag and Gemini CLI's own file keep nothing.
     Spawn into a folder you would trust yourself.
+  * A Gemini CLI worker's folder-trust dialog (its shell stood elsewhere) is yours:
+    the harness never presses it, at any `approve=`.
   * A result is the worker's claim: run the ground truth (the tests, the build, the diff)
     yourself.
   * Claude Code has this page at more depth as the supervise-agent skill, which `aterm
@@ -6375,7 +6447,7 @@ SLOW FIRST RUNS (macOS's first-run check, not a wall)
   programs fills syspolicyd's thread pool (`sysctl kern.wq_max_constrained_threads`).
   Then no new program starts on the Mac, for days, and the window server can die at a
   privacy check, logging the person out (once, after 4.5 days). Only a restart of the
-  Mac ends it; logging out did not. An aterm window reads the pool once a minute:
+  Mac ends it; logging out did not. aterm reads the pool once a minute (headless too):
   `aterm ctl @self status` says `syspolicyd=stuck` once the kernel has held it at its
   limit five minutes, the window shows the person the restart, and the harness types
   no carry-on, takes no upgrade step and ends no frozen agent until it ends. `aterm
@@ -6597,7 +6669,7 @@ LEVELS (--allow, [fleet] allow)
 DRIVE (the step-in)
   Off unless this Mac's person names who: `aterm fleet allow drive --from
   <host|node>` here, for each Mac that may. A named Mac then runs the worker's
-  verbs here with a host named — `aterm ctl --host <this Mac> spawn agent=claude …
+  verbs here with a host named — `aterm ctl --host <this Mac> spawn agent=<word> …
   - < task`, `await task`, `@<sid> result|status|text|screen|turn|key|send`, `hold
   <sid> on|off`, `@<sid> close` of a worker it spawned (`aterm help workers`) — and
   nothing else. It is admitted only when it proves the node key this Mac's book
@@ -8196,8 +8268,8 @@ fn agent_page(sid: Option<&str>) -> String {
          cure for a bottom-pinned TUI); `text trim` / `turn trim=1` drop the trailing blank rows\n  \
          (`OK <n> trimmed=<k>`). Place work: `spawn window=<id>` opens a tab behind that window's\n  \
          active one, never raising it (ids from `windows`); `@<sid> spawn`, <sid>'s. WORKERS:\n  \
-         `@self spawn agent=claude -` starts Claude Code behind your tab on the task on stdin,\n  \
-         under Autopilot Land; `await task @<sid>,… since=0` in the background wakes you when\n  \
+         `@self spawn agent=claude -` starts Claude Code behind your tab on the task on stdin\n  \
+         (agent=gemini|agy|muse: that agent), under Autopilot Land; `await task @<sid>,… since=0` in the background wakes you when\n  \
          one is done (its work landed) or needs a person; a later wait\n  \
          names the rev its row printed (`@<sid>:<rev>`). Its report is `@<sid> result`; a follow-up\n  \
          `@<sid> turn typed=1 settle=submitted '<line>'`, then `await task @<sid>:<task_rev>`\n  \
@@ -8248,10 +8320,7 @@ fn agent_page(sid: Option<&str>) -> String {
          ANTHROPIC_*, COPILOT_*, CODEX_*, ANTIGRAVITY_*, GEMINI_*, CURSOR_*, AI_*, and\n  \
          _DEVTOOL_* var is removed before exec, so they never leak into your session. If an\n  \
          inner tool reports its context vars went missing, aterm removed them on purpose —\n  \
-         re-export what it needs, or run it outside aterm to keep the originals. The one\n  \
-         exception: a session spawned with `aterm ctl spawn identity=<name>` gets each agent's\n  \
-         home variable (CLAUDE_CONFIG_DIR, CODEX_HOME) pointed into <state>/identities/<name>/\n  \
-         — set AFTER the strip, so neither your login nor the identity's leaks into the other.\n",
+         re-export what it needs, or run it outside aterm to keep the originals.\n",
     );
     s.push_str(
         "\nTHE TOOLS AT HAND (run `aterm help <name>` for how to use each)\n\
@@ -8936,6 +9005,7 @@ fn page_of(t: &str) -> &str {
         "cargo" | "targo" | "rustc" | "trustc" | "toolchain" => "rust",
         "trust-mc" | "trust-ir" | "trust-cg" | "trust-vc" => "trust-backends",
         "pkg" => "atpkg",
+        "gh" | "github" => "agh",
         "askpass" | "root" => "sudo",
         "new-tab" | "new-window" | "split-pane" => "windowing",
         "settings" => "config",
@@ -8994,6 +9064,7 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         Some("rust") => (rust_page(), 0),
         Some("sys") => (sys_page(), 0),
         Some("theme") => (theme_page(), 0),
+        Some("agh") => (agh::cli::help::manual(), 0),
         Some("config") => (CONFIG_PAGE.to_string(), 0),
         Some("ship") => (SHIP_PAGE.to_string(), 0),
         Some("update") => (update_page(), 0),
@@ -9006,11 +9077,11 @@ pub fn render(topic: Option<&str>, session: Option<&str>) -> (String, i32) {
         Some("kitty") => (kitty_page(), 0),
         Some(name) => match TOPICS.iter().find(|t| t.name == name) {
             Some(t) => {
-                // `introspection`, `rust`, `sys` and `theme` have generated
+                // `introspection`, `rust`, `sys`, `theme` and `agh` have generated
                 // bodies, all handled above, so every remaining TOPICS entry
                 // carries an authored body.
                 let body = t.body.unwrap_or_else(|| {
-                    unreachable!("only introspection, rust, sys and theme are generated")
+                    unreachable!("introspection, rust, sys, theme and agh are generated")
                 });
                 (format!("{body}\n"), 0)
             }

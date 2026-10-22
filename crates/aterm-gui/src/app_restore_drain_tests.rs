@@ -33,7 +33,6 @@ fn leaf(title: &str) -> restore::RestoredSplitTree {
             autopilot: None,
             land_at: None,
             autopilot_by: None,
-            identity: None,
             theme: None,
             agent: None,
             supervised: None,

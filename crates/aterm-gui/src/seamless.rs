@@ -8029,9 +8029,6 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                     frozen_path: crate::session_store::predates_path_self_heal(
                         manifest.outgoing_build,
                     ) || rec.frozen_path,
-                    // IDENTITY (session identities, 2026-09-17): the label rides the
-                    // record; the shell keeps the identity's env across the exec.
-                    identity: rec.identity.clone(),
                     // BROADCAST OPT-INS (round 23): the topic set rides the record,
                     // validated on the way onto the fabric (`fabric::parse_topics`).
                     topics: rec.topics.clone(),

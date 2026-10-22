@@ -198,6 +198,32 @@ fn a_versioned_muse_executable_keeps_its_permission_custody() {
     assert_eq!(asker(&build, &|| None).agent(), Some(("muse", Level::Yolo)));
 }
 
+/// atpkg's `codex-old` (OpenAI's own Codex beside codex-alab) runs as that name, and a
+/// review it asks for inherits its own launch's sandbox: a read-only one plans, never
+/// the person's Yolo the walk past an unknown name would prove.
+///
+/// NEGATIVE CONTROL: a name that only begins so is no CLI, so the walk reaches the root.
+#[test]
+fn a_codex_old_keeps_codexs_permission_custody() {
+    let store = "/x/pkg/store/codex-old/1000000000163000000/bin/codex-old";
+    assert_eq!(cli_of_path(store).map(|c| c.id), Some("codex"));
+    let read_only = Tree(vec![
+        (40, 30, "/bin/zsh", argv(&["zsh", "-c", "aterm ai review"])),
+        (30, 1, store, argv(&["codex-old", "-s", "read-only"])),
+    ]);
+    assert_eq!(
+        asker(&read_only, &|| None).agent(),
+        Some(("codex", Level::Plan))
+    );
+    let lookalike = Tree(vec![(
+        40,
+        1,
+        "/x/codex-older",
+        argv(&["codex-older", "-s", "read-only"]),
+    )]);
+    assert_eq!(asker(&lookalike, &|| None), Asker::Person);
+}
+
 /// The kernel's conventional interpreter argv has the script at argv[1].
 #[test]
 fn a_script_runtime_keeps_its_agents_script_and_permission_arguments() {

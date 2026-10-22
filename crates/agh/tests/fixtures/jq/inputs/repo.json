@@ -1,0 +1,16 @@
+{
+  "id": 800000001,
+  "name": "packs",
+  "full_name": "fixture-dev/packs",
+  "owner": {"login": "fixture-dev", "id": 9000010, "type": "Organization"},
+  "private": true,
+  "fork": true,
+  "visibility": "private",
+  "default_branch": "main",
+  "pushed_at": "2026-10-18T12:05:00Z",
+  "created_at": "2025-01-02T03:04:05Z",
+  "description": "Fixture packs for agh's tests",
+  "size": 4096,
+  "parent": {"full_name": "fixture-ext/packs", "id": 800000002},
+  "permissions": {"admin": false, "maintain": false, "push": true, "triage": true, "pull": true}
+}

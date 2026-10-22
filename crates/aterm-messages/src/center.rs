@@ -763,6 +763,20 @@ struct Unfixed {
 /// families any reporter keys (`config.` has ten).
 const UNFIXED_CAP: usize = 64;
 
+/// What a post of an exception does ([`MessageCenter::later_verdict`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaterVerdict {
+    /// The owner filed the fact inside its quiet span: this record keeps it quiet.
+    Quiet(MessageId),
+    /// The entry at this index already says it (or only its moving words changed,
+    /// inside [`RESTATE_QUIET`]): a repeat.
+    Repeat(usize),
+    /// The entry at this index takes the new words in place.
+    Restate(usize),
+    /// A new entry.
+    New,
+}
+
 impl MessageCenter {
     /// A center over a (possibly replayed) log; ids continue from
     /// `log.next_id()`. `now` anchors the motion frame grid.
@@ -3066,23 +3080,14 @@ impl MessageCenter {
         let Need::Later(ask) = msg.need.clone() else {
             unreachable!("post_later is called with a Later");
         };
-        let key = ask.fingerprint().as_str().to_string();
-        if let Some(filed) = self.quiet_record(&key, &ask, stamp) {
-            return Posted {
-                id: filed,
-                outcome: PostOutcome::Suppressed,
-            };
-        }
-        if let Some(i) = self.digest.find_key(&key) {
-            let same = {
-                let e = self.digest.get(i);
-                e.msg.title == msg.title
-                    && e.msg.detail == msg.detail
-                    && e.msg.actions == msg.actions
-                    && e.msg.severity == msg.severity
-            };
-            let id = self.digest.get(i).id;
-            if same {
+        match self.later_verdict(&msg, &ask, stamp, now) {
+            LaterVerdict::Quiet(filed) => {
+                return Posted {
+                    id: filed,
+                    outcome: PostOutcome::Suppressed,
+                };
+            }
+            LaterVerdict::Repeat(i) => {
                 let e = self.digest.get_mut(i);
                 e.repeats = e.repeats.saturating_add(1);
                 // An entry adopted after a restart carries a stand-in action (no
@@ -3090,37 +3095,23 @@ impl MessageCenter {
                 // the owner's press must file the entry `Answered` on it.
                 e.ask.take_action_of(&ask);
                 return Posted {
-                    id,
+                    id: e.id,
                     outcome: PostOutcome::Duplicate,
                 };
             }
-            let e = self.digest.get_mut(i);
-            // Words that move every look (a holder count, an age) restate an
-            // entry at most once per RESTATE_QUIET; a new severity or capsule
-            // is news at once, and so is a new step (the one thing to do: an
-            // entry never tells the owner to do what no longer helps), and
-            // words that move only with their fact
-            // (`LaterAsk::restated_at_once`).
-            let words_only = e.msg.severity == msg.severity
-                && e.msg.actions == msg.actions
-                && e.ask.then().words() == ask.then().words()
-                && !ask.restates_at_once();
-            if words_only && now.saturating_duration_since(e.restated_at) < RESTATE_QUIET {
-                e.repeats = e.repeats.saturating_add(1);
-                e.ask.take_action_of(&ask);
+            LaterVerdict::Restate(i) => {
+                let e = self.digest.get_mut(i);
+                let id = e.id;
+                e.msg = msg;
+                e.ask = ask;
+                e.restated_at = now;
+                self.digest.bump();
                 return Posted {
                     id,
-                    outcome: PostOutcome::Duplicate,
+                    outcome: PostOutcome::Restated,
                 };
             }
-            e.msg = msg;
-            e.ask = ask;
-            e.restated_at = now;
-            self.digest.bump();
-            return Posted {
-                id,
-                outcome: PostOutcome::Restated,
-            };
+            LaterVerdict::New => {}
         }
         let id = self.log.mint();
         self.log
@@ -3149,6 +3140,71 @@ impl MessageCenter {
             id,
             outcome: PostOutcome::New,
         }
+    }
+
+    /// What posting the exception `msg` (whose ask is `ask`) at `stamp` would do, decided
+    /// without doing it: [`Self::post_later`] acts on it, and the wire reads it first
+    /// ([`Self::later_outcome`]) to spend its budgets and caps only on what a post opens or
+    /// changes.
+    fn later_verdict(
+        &self,
+        msg: &Message,
+        ask: &LaterAsk,
+        stamp: WallStamp,
+        now: Instant,
+    ) -> LaterVerdict {
+        let key = ask.fingerprint().as_str();
+        if let Some(filed) = self.quiet_record(key, ask, stamp) {
+            return LaterVerdict::Quiet(filed);
+        }
+        let Some(i) = self.digest.find_key(key) else {
+            return LaterVerdict::New;
+        };
+        let e = self.digest.get(i);
+        let same = e.msg.title == msg.title
+            && e.msg.detail == msg.detail
+            && e.msg.actions == msg.actions
+            && e.msg.severity == msg.severity;
+        // Words that move every look (a holder count, an age) restate an
+        // entry at most once per RESTATE_QUIET; a new severity or capsule
+        // is news at once, and so is a new step (the one thing to do: an
+        // entry never tells the owner to do what no longer helps), and
+        // words that move only with their fact
+        // (`LaterAsk::restated_at_once`).
+        let words_only = e.msg.severity == msg.severity
+            && e.msg.actions == msg.actions
+            && e.ask.then().words() == ask.then().words()
+            && !ask.restates_at_once();
+        if same || (words_only && now.saturating_duration_since(e.restated_at) < RESTATE_QUIET) {
+            LaterVerdict::Repeat(i)
+        } else {
+            LaterVerdict::Restate(i)
+        }
+    }
+
+    /// How [`Self::post`] would land the exception `msg` (normalized, as `post` makes it),
+    /// without posting it: `New`, `Restated`, `Duplicate` or `Suppressed`. `None` for a
+    /// message that is not an exception.
+    pub(crate) fn later_outcome(
+        &self,
+        msg: &Message,
+        stamp: WallStamp,
+        now: Instant,
+    ) -> Option<PostOutcome> {
+        let Need::Later(ask) = &msg.need else {
+            return None;
+        };
+        Some(match self.later_verdict(msg, ask, stamp, now) {
+            LaterVerdict::Quiet(_) => PostOutcome::Suppressed,
+            LaterVerdict::Repeat(_) => PostOutcome::Duplicate,
+            LaterVerdict::Restate(_) => PostOutcome::Restated,
+            LaterVerdict::New => PostOutcome::New,
+        })
+    }
+
+    /// How many exceptions are open.
+    pub(crate) fn digest_len(&self) -> usize {
+        self.digest.len()
     }
 
     fn index_by_key(&self, key: &str) -> Option<usize> {
@@ -3465,12 +3521,30 @@ impl MessageCenter {
     /// turned off): the entry under exactly `key` ends `Resolved` at once.
     /// `true` when there was one.
     pub fn clear_digest(&mut self, key: &str, now: Instant) -> bool {
-        let Some(i) = self.digest.find_key(key) else {
-            return false;
-        };
+        self.end_digest_key(key, Retired::Resolved(Outcome::Ok), None, now)
+            .is_some()
+    }
+
+    /// The entry under exactly `key` ends `how` (an end: `Resolved` or `Withdrawn`, never
+    /// a filing, so the fact's next post is news) at once, its record titled `words` when
+    /// the reporter said how it ended (`notice done <key> ok <words>`). The id it had, or
+    /// `None` with nothing open under the key.
+    pub(crate) fn end_digest_key(
+        &mut self,
+        key: &str,
+        how: Retired,
+        words: Option<String>,
+        now: Instant,
+    ) -> Option<MessageId> {
+        let i = self.digest.find_key(key)?;
+        let e = self.digest.get_mut(i);
+        let id = e.id;
+        if let Some(words) = words {
+            e.msg.title = words;
+        }
         let wall = self.digest.get(i).wall_at(now);
-        self.file_digest_at(i, Retired::Resolved(Outcome::Ok), wall, now);
-        true
+        self.file_digest_at(i, how, wall, now);
+        Some(id)
     }
 
     /// The cause ended and nothing is open under `key`: when the latest word on

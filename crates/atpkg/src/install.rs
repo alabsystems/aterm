@@ -126,6 +126,15 @@ pub struct StageHooks<'a> {
     /// sidecar exists. A suffix outside [`crate::store::STAGE_SIDECAR_SUFFIXES`] refuses
     /// the stage before the swap.
     pub sidecars: Option<SidecarHook<'a>>,
+    /// `(name, target)` tool names laid in the verified `.incoming` tree before
+    /// [`Self::pre_swap`] sees it: `bin/<name>` a REGULAR-FILE clone of the payload's own
+    /// `bin/<target>` (executable spellings, [`crate::store::ToolName::exe_file`]), declared
+    /// at the target's mode ([`lay_aliases`]). The gate then judges each clone as a file of
+    /// its own, and the root the stage folds after the hook — the one the sidecars get and
+    /// the stage returns — names it, as every later walk of the build does
+    /// ([`crate::vendor_direct::VendorSpec::aliases`]). Empty: the tree is laid as the
+    /// payload made it, and its root is the one folded while extracting.
+    pub aliases: &'a [(&'a str, &'a str)],
 }
 
 impl StageHooks<'_> {
@@ -133,6 +142,7 @@ impl StageHooks<'_> {
     pub const NONE: StageHooks<'static> = StageHooks {
         pre_swap: None,
         sidecars: None,
+        aliases: &[],
     };
 }
 
@@ -243,7 +253,7 @@ pub fn verify_and_stage(
     //    the one pass over the uncompressed payload (the `dmg` lane walks once, since
     //    `ditto` wrote its bytes), and the modes it declared per regular file, which step 4c
     //    records for a filesystem with no POSIX bits.
-    let (extracted_root, modes) = match stage_payload_modes(artifact, archive, &incoming) {
+    let (extracted_root, mut modes) = match stage_payload_modes(artifact, archive, &incoming) {
         Ok(staged) => staged,
         Err(e) => {
             let _ = crate::store::remove_tree(&incoming);
@@ -284,15 +294,33 @@ pub fn verify_and_stage(
         got
     };
 
-    // 3a. The caller's gate and records, on the verified tree before anything publishes it:
-    //     a refusal leaves no build, no marker and no sidecar. The sidecars are rendered now
-    //     so a bad suffix refuses before the swap too; they are written after it.
+    // 3a. The caller's aliases, its gate and its records, on the verified tree before
+    //     anything publishes it: a refusal leaves no build, no marker and no sidecar. The
+    //     aliases come first, so the gate judges each clone as a file of its own; the root
+    //     is then folded again over the tree as the gate left it, so the record and every
+    //     later walk name them. The sidecars are rendered now so a bad suffix refuses before
+    //     the swap too; they are written after it.
+    if let Err(e) = lay_aliases(&incoming, hooks.aliases, &mut modes) {
+        let _ = crate::store::remove_tree(&incoming);
+        return Err(e);
+    }
     if let Some(pre_swap) = hooks.pre_swap
         && let Err(e) = pre_swap(&incoming)
     {
         let _ = crate::store::remove_tree(&incoming);
         return Err(e);
     }
+    let root = if hooks.aliases.is_empty() {
+        root
+    } else {
+        match tree_root_declared(&incoming, &modes) {
+            Ok(root) => root,
+            Err(e) => {
+                let _ = crate::store::remove_tree(&incoming);
+                return Err(io_step("fold the tree its aliases joined", e));
+            }
+        }
+    };
     let sidecars = match hooks.sidecars.map(|render| render(&root)).transpose() {
         Ok(sidecars) => sidecars.unwrap_or_default(),
         Err(e) => {
@@ -384,6 +412,61 @@ pub fn verify_and_stage(
         crate::store::sync_dir_ordered(parent);
     }
     Ok(root)
+}
+
+/// Lay `aliases` ([`StageHooks::aliases`]) in the staged tree `incoming`: each `bin/<name>`
+/// a regular file holding exactly the bytes of the payload's own `bin/<target>`, declared at
+/// its mode. A clone where the filesystem can (APFS, a reflink on Linux:
+/// [`crate::clone::clone_file`]), a byte copy where it cannot (Windows). Never a symlink: a
+/// link to a Mach-O is a shape the Developer ID gate refuses
+/// ([`crate::macho::find_macho`]: only a regular file is verified), and a link's argv0 would
+/// still resolve to the target's name.
+///
+/// # Errors
+/// [`StageError::Payload`] when a name is no tool name, the target is not a regular file of
+/// the payload (missing, a directory, a link), or the payload ships the alias's name itself;
+/// [`StageError::Io`] when the clone fails.
+fn lay_aliases(
+    incoming: &Path,
+    aliases: &[(&str, &str)],
+    modes: &mut DeclaredModes,
+) -> Result<(), StageError> {
+    for &(name, target) in aliases {
+        let (Some(alias), Some(of)) = (
+            crate::store::ToolName::new(name),
+            crate::store::ToolName::new(target),
+        ) else {
+            return Err(payload2(
+                "alias: not a tool name pair: ",
+                &format!("{name} = {target}"),
+            ));
+        };
+        let from = Path::new("bin").join(of.exe_file());
+        let to = Path::new("bin").join(alias.exe_file());
+        let shown = |rel: &Path| rel.to_string_lossy().replace('\\', "/");
+        if !std::fs::symlink_metadata(incoming.join(&from)).is_ok_and(|m| m.file_type().is_file()) {
+            return Err(StageError::Payload(format!(
+                "alias {}: {} is not a regular file in the vendor's tree",
+                shown(&to),
+                shown(&from)
+            )));
+        }
+        if std::fs::symlink_metadata(incoming.join(&to)).is_ok() {
+            return Err(StageError::Payload(format!(
+                "alias {}: the vendor's tree already has one",
+                shown(&to)
+            )));
+        }
+        #[cfg(unix)]
+        let laid = crate::clone::clone_file(&incoming.join(&from), &incoming.join(&to));
+        #[cfg(not(unix))]
+        let laid = std::fs::copy(incoming.join(&from), incoming.join(&to)).map(drop);
+        laid.map_err(|e| io_step("lay an alias", e))?;
+        if let Some(mode) = modes.get(&crate::tree::rel_line_bytes(&from)).copied() {
+            modes.insert(crate::tree::rel_line_bytes(&to), mode);
+        }
+    }
+    Ok(())
 }
 
 /// How long [`developer_id_gate`] may spend on one tree, across every Mach-O: each codesign
@@ -1803,18 +1886,22 @@ mod tests {
         let watched = StageHooks {
             pre_swap: Some(&watch),
             sidecars: None,
+            aliases: &[],
         };
         let gate = StageHooks {
             pre_swap: Some(&refuse),
             sidecars: None,
+            aliases: &[],
         };
         let render = StageHooks {
             pre_swap: None,
             sidecars: Some(&unrenderable),
+            aliases: &[],
         };
         let suffix = StageHooks {
             pre_swap: None,
             sidecars: Some(&bogus_suffix),
+            aliases: &[],
         };
         let cases: [(&str, &Artifact, &Path, &StageHooks<'_>, Want); 7] = [
             ("digest", &bad_digest, &b.archive, &watched, |e| {
@@ -2539,6 +2626,7 @@ mod tests {
             let hooks = StageHooks {
                 pre_swap: Some(&gate),
                 sidecars: None,
+                aliases: &[],
             };
             let build = d.join(format!("store/agy-{member_mode:o}/1000001000003000006"));
             let root = verify_and_stage(&art, &gz, &build, &hooks).unwrap();
@@ -3393,6 +3481,7 @@ image-alias     : /tmp/stage/bar.dmg
         let hooks = StageHooks {
             pre_swap: Some(&pre_swap),
             sidecars: None,
+            aliases: &[],
         };
         verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
         assert_eq!(
@@ -3435,6 +3524,7 @@ image-alias     : /tmp/stage/bar.dmg
         let hooks = StageHooks {
             pre_swap: Some(&pre_swap),
             sidecars: Some(&sidecars),
+            aliases: &[],
         };
         // aterm-durable's counting seam: the stage's three directory flushes are only
         // ordered (the tree's and each file's own flush is a plain `fsync(2)`, which the
@@ -3485,6 +3575,7 @@ image-alias     : /tmp/stage/bar.dmg
         let hooks = StageHooks {
             pre_swap: None,
             sidecars: Some(&sidecars),
+            aliases: &[],
         };
         let err = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap_err();
         assert!(matches!(err, StageError::Io(_)), "{err:?}");
@@ -3616,6 +3707,155 @@ image-alias     : /tmp/stage/bar.dmg
 
         lay(&d, "codex-path/rg", b"#!/bin/sh\nexec evil\n", 0o755);
         refused_as(&d, &["codex"], "codex-path/rg ");
+    }
+
+    /// AN ALIAS IS A REGULAR FILE THE GATE JUDGES ON ITS OWN ([`lay_aliases`]): laid as a
+    /// clone of the vendor's own entry, `bin/codex-old` is a Mach-O the gate asks about by
+    /// its own path and binds as the exposed tool's entry, and a refusal of it alone refuses
+    /// the tree.
+    ///
+    /// NEGATIVE CONTROL: the same name laid as a symlink to the entry is refused by the gate
+    /// (`macho::find_macho`: only a regular file is verified) — why an alias is never one.
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_is_a_clone_the_gate_judges_and_a_symlinked_one_is_refused() {
+        let pass = |_: &str| -> Result<(), aterm_update_core::codesign::CodesignError> { Ok(()) };
+        let d = tmp("devid-alias");
+        lay(&d, "bin/codex", &thin_macho(), 0o755);
+        lay_link(&d, "bin/codex-old", "codex");
+        match gate_with(&d, &["codex-old"], &pass).0 {
+            Err(StageError::SignerRefused(m)) => {
+                assert!(m.contains("is a symlink to a Mach-O"), "{m}");
+            }
+            other => panic!("a symlinked alias passed the gate: {other:?}"),
+        }
+        std::fs::remove_file(d.join("bin/codex-old")).unwrap();
+        let mut modes = DeclaredModes::new();
+        lay_aliases(&d, &[("codex-old", "codex")], &mut modes).unwrap();
+        let alias = std::fs::symlink_metadata(d.join("bin/codex-old")).unwrap();
+        assert!(alias.file_type().is_file(), "a regular file, never a link");
+        assert_eq!(
+            std::fs::read(d.join("bin/codex-old")).unwrap(),
+            thin_macho()
+        );
+        let (result, asked) = gate_with(&d, &["codex-old"], &pass);
+        result.expect("the clone is a verified Mach-O and the entry its shim runs");
+        assert_eq!(asked, ["bin/codex", "bin/codex-old"]);
+        let refuse_alias = |rel: &str| {
+            if rel == "bin/codex-old" {
+                Err(unsigned())
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            gate_with(&d, &["codex-old"], &refuse_alias).0,
+            Err(StageError::SignerRefused(_))
+        ));
+    }
+
+    /// What [`lay_aliases`] refuses, each a payload refusal that lays nothing: a target that
+    /// is not a regular file of the vendor's tree (missing, a directory, a symlink), a name
+    /// the vendor's tree already has, and a pair that is not two tool names.
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_of_nothing_a_link_or_a_taken_name_is_refused() {
+        let d = tmp("alias-refusals");
+        lay(&d, "real", &thin_macho(), 0o755);
+        let refused = |aliases: &[(&str, &str)], want: &str| match lay_aliases(
+            &d,
+            aliases,
+            &mut DeclaredModes::new(),
+        ) {
+            Err(StageError::Payload(m)) => assert!(m.contains(want), "{want}: {m}"),
+            other => panic!("{aliases:?}: {other:?}"),
+        };
+        refused(&[("codex-old", "codex")], "bin/codex is not a regular file");
+        std::fs::create_dir_all(d.join("bin/codex")).unwrap();
+        refused(&[("codex-old", "codex")], "bin/codex is not a regular file");
+        std::fs::remove_dir(d.join("bin/codex")).unwrap();
+        lay_link(&d, "bin/codex", "../real");
+        refused(&[("codex-old", "codex")], "bin/codex is not a regular file");
+        std::fs::remove_file(d.join("bin/codex")).unwrap();
+        lay(&d, "bin/codex", &thin_macho(), 0o755);
+        lay(&d, "bin/codex-old", b"the vendor's own\n", 0o644);
+        refused(&[("codex-old", "codex")], "already has one");
+        assert_eq!(
+            std::fs::read(d.join("bin/codex-old")).unwrap(),
+            b"the vendor's own\n",
+            "a refusal lays nothing over the vendor's file"
+        );
+        refused(&[("../codex-old", "codex")], "not a tool name");
+        refused(&[("codex-old", "")], "not a tool name");
+    }
+
+    /// THE STAGE LAYS ITS ALIASES AND FOLDS THEM ([`StageHooks::aliases`]): before the gate
+    /// runs, `bin/<name>` stands in the verified tree as a regular file with the target's
+    /// bytes and mode; the root the sidecars get and the stage returns is the walk of the
+    /// tree as built, alias and all, so a later `atpkg verify` finds no drift. A target the
+    /// payload does not carry refuses the stage before anything is swapped.
+    ///
+    /// NEGATIVE CONTROL: the same stage with no aliases returns the extractor's root.
+    /// (Unix: the fixture's entry is `bin/ay`, not the `bin/ay.exe` a Windows alias clones.)
+    #[cfg(unix)]
+    #[test]
+    fn the_stage_lays_its_aliases_before_the_gate_and_folds_them_into_its_root() {
+        let b = bundle("alias-stage");
+        let build = b.build();
+        let gated = std::cell::Cell::new(false);
+        let pre_swap = |incoming: &Path| -> Result<(), StageError> {
+            let alias = std::fs::symlink_metadata(incoming.join("bin/ay-old"));
+            gated.set(alias.is_ok_and(|m| m.file_type().is_file()));
+            Ok(())
+        };
+        let handed = std::cell::RefCell::new(String::new());
+        let sidecars = |root: &str| -> Result<Vec<(&'static str, Vec<u8>)>, StageError> {
+            root.clone_into(&mut handed.borrow_mut());
+            Ok(Vec::new())
+        };
+        let hooks = StageHooks {
+            pre_swap: Some(&pre_swap),
+            sidecars: Some(&sidecars),
+            aliases: &[("ay-old", "ay")],
+        };
+        let root = verify_and_stage(&b.art, &b.archive, &build, &hooks).unwrap();
+        assert!(gated.get(), "the gate saw the alias as a regular file");
+        let (alias, entry) = (build.join("bin/ay-old"), build.join("bin/ay"));
+        let meta = |p: &Path| std::fs::symlink_metadata(p).unwrap();
+        assert!(meta(&alias).file_type().is_file());
+        assert_eq!(meta(&alias).permissions(), meta(&entry).permissions());
+        assert_eq!(
+            std::fs::read(&alias).unwrap(),
+            std::fs::read(&entry).unwrap()
+        );
+        assert_eq!(
+            root,
+            tree_root(&build).unwrap(),
+            "the root is the tree as built"
+        );
+        assert_eq!(*handed.borrow(), root, "and the sidecars were handed it");
+        assert_ne!(root, b.art.tree_root, "the alias joined the root");
+
+        let plain = bundle("alias-stage-control");
+        let root = verify_and_stage(
+            &plain.art,
+            &plain.archive,
+            &plain.build(),
+            &StageHooks::NONE,
+        )
+        .unwrap();
+        assert_eq!(root, plain.art.tree_root);
+
+        let missing = bundle("alias-stage-missing");
+        let hooks = StageHooks {
+            aliases: &[("ay-old", "nope")],
+            ..StageHooks::NONE
+        };
+        let err =
+            verify_and_stage(&missing.art, &missing.archive, &missing.build(), &hooks).unwrap_err();
+        assert!(matches!(&err, StageError::Payload(m) if m.contains("is not a regular file")));
+        assert!(!missing.build().exists(), "nothing was swapped in");
+        assert!(!crate::store::build_is_complete(&missing.build()));
     }
 
     /// No execute bit off a verified Mach-O: a data file at 0755 beside Mach-Os that all

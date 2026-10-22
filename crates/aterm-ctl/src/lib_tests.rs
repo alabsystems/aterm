@@ -3866,9 +3866,8 @@ fn a_sid_two_instances_both_serve_is_reported_as_ambiguous() {
 #[test]
 fn windows_rows_fold_sessions_per_window_and_keep_unknown_apart_from_none() {
     let lines: Vec<String> = [
-        // A server with the identity column (session identities): one more
-        // key=value after detail=, read by key like the rest.
-        "0 s-a - alive sh meta=0 window=1 active=1 wfocus=1 detail=claude identity=worker",
+        // Unknown additive columns are read by key like the rest.
+        "0 s-a - alive sh meta=0 window=1 active=1 wfocus=1 detail=claude future=value",
         "1 s-b s-a alive sh meta=1 window=1 active=0 wfocus=1 detail=-",
         "2 s-c - alive sh meta=0 window=0 active=1 wfocus=0 detail=codex",
         "3 s-d - alive sh meta=0 window=none active=0 wfocus=0 detail=-",

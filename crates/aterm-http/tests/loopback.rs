@@ -208,7 +208,11 @@ fn authority_revoked_before_the_write_stops_the_body_leaving_the_process() {
         .expect_err("revoked authority must fail the request");
     assert!(error.is_revoked(), "{error:?}");
 
-    let seen = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+    // The connector connects before the guard is checked, and the client drops
+    // the socket once the write is refused, so the stub always reports.
+    let seen = rx
+        .recv_timeout(HANG_DETECTOR)
+        .expect("the stub reports what it read");
     assert!(
         !seen.windows(26).any(|w| w == b"SENSITIVE-TERMINAL-CONTEXT"),
         "revoked request still leaked its body: {:?}",
@@ -220,12 +224,12 @@ fn authority_revoked_before_the_write_stops_the_body_leaving_the_process() {
 fn a_silent_server_hits_the_deadline_instead_of_hanging() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    // Accept and never reply for five minutes, so the minute's hang detector
-    // tells a client that waited for the server from one that hit its 250 ms
-    // deadline.
+    // Accept and never reply, holding the connection for the hang detector: a
+    // client that ignored its 250 ms deadline sees the close a minute later as
+    // UnexpectedEof, which fails the TimedOut assert below.
     std::thread::spawn(move || {
         if let Ok((stream, _)) = listener.accept() {
-            std::thread::sleep(Duration::from_secs(300));
+            std::thread::sleep(HANG_DETECTOR);
             drop(stream);
         }
     });
@@ -234,18 +238,15 @@ fn a_silent_server_hits_the_deadline_instead_of_hanging() {
         ProxyMode::Direct,
         Duration::from_millis(250),
     );
-    let started = std::time::Instant::now();
     let error = client
         .post(&format!("http://127.0.0.1:{port}/api/chat"))
         .limit(4096)
         .send(b"{}")
         .expect_err("a silent server must time out");
     assert!(
-        started.elapsed() < HANG_DETECTOR,
-        "took {:?}",
-        started.elapsed()
+        matches!(&error, Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut),
+        "{error:?}"
     );
-    let _ = error;
 }
 
 /// A stub that captures every byte it is sent, to EOF, and never replies.

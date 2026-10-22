@@ -156,6 +156,7 @@ impl CursorPhaser {
     /// Whether the host must keep arming the animation tick: only while the
     /// emitter is charged (typing or cooling). Once settled the idle glow rides
     /// the blink cadence.
+    #[inline]
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.energy > SETTLED_ENERGY

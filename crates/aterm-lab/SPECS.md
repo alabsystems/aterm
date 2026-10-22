@@ -64,7 +64,7 @@ codex-config-text	contract	codex::config_text, codex::q	∀ mode, port, proj, pr
 codex-auth-json-lab-jwt	round-trip	codex::auth_json, stub::lab_claims, stub::auth_label, util::b64url, util::b64url_decode, util::utc_stamp, pyjson::J::dump, pyjson::J::parse	∀ label, account, plan, now: i64 (now + 30·86400 not overflowing): j = J::parse(auth_json(label,account,plan,now)) is Ok; tokens.refresh_token = "lab-refresh-" ++ label; last_refresh = utc_stamp(now); access = tokens.access_token has the shape H.P."bGFiLW5vdC1zaWduZWQ"; lab_claims("Bearer " ++ access) = Some(c) with c.lab = label, c.iat = now, c.exp = now+2592000, c["https://api.openai.com/auth"].chatgpt_plan_type = plan and .chatgpt_account_id = account; auth_label(Some("Bearer " ++ access)) = "jwt:" ++ take(24, filter([A-Za-z0-9_-], label)). The same holds for id_token, which also carries email = "user@example.com". Composes stub-auth-label, util-b64url-roundtrip, util-utc-stamp, pyjson-dumps-refines-python.	codex.rs::the_composed_login_is_a_jwt_the_stub_reads_by_its_label_only	closures, J tree construction, JSON print then parse (cross-crate aterm_json), base64url, split, Option chaining	1,3,5,7,12,13
 stub-auth-label	contract	stub::auth_label, stub::lab_claims	∀ a: Option<&str>: let v = a.unwrap_or(""), tok = trim(v[7..]) if v[..7] case-insensitively = "bearer " else trim(v). auth_label(a) = "none" if v = ""; else "key" if tok = LAB_CODEX_KEY; else "jwt:" ++ take(24, filter([A-Za-z0-9_-], c.lab)) if lab_claims(v) = Some(c); else "other(" ++ |chars(tok)| ++ " chars)". The output never contains tok unless tok is the fixed LAB_CODEX_KEY (a credential is never echoed). lab_claims(v) = Some(j) ⇔ tok splits on '.' into exactly 3 parts and the middle b64url-decodes to a JSON object j with a string field lab.	(secondary only; see §2)	Option<&str>, str::get char-boundary slicing, eq_ignore_ascii_case, filter/take/collect, JSON parse	1,3,5,7,12
 codex-ratelimit-headers	contract	codex::ratelimit_headers, pyjson::py_float	∀ args: (a) args = [] ∨ args[0] = "off" ⇒ Ok(Obj[]). (b) else |args| < 2 ⇒ Err. (c) else for (slot,used,window,reset) ∈ [(primary,args[0],300,3600),(secondary,args[1],10080,432000)]: used = "-" adds nothing; used parses as f64 v ⇒ adds x-codex-<slot>-used-percent = py_float(v), -window-minutes = window, -reset-at = "@NOW+"++reset++"@" in that order; otherwise Err. Then each args[i≥2] = k=v adds headers by k ∈ {credits (has-credits = v∈{yes,unlimited}, unlimited = v=unlimited), balance, reached, promo, active}; any other k ⇒ Err. Header order = argument order.	codex.rs::ratelimits_name_each_window_and_the_credits	&[String], f64 parse, Vec<(String,J)>, for over an array literal, match on &str, Result	1,3,5,7
-launcher-argv	refinement	codex::launcher, lab::launcher, util::shell_quote	∀ run, tab, mode, envs, args (codex) and ∀ run, l: Launch (claude), provided the fields interpolated WITHOUT shell_quote (run.run/shim, run.proxy, run.port) hold no shell metacharacter, quote, '$' or whitespace: the script is "#!/bin/sh\n" ++ ("clear\n" iff tab; always for claude) ++ one exec command whose word expansion under the Shell model is exactly the argv. codex: [env, -u, OPENAI_API_KEY, -u, CODEX_API_KEY, -u, OPENAI_BASE_URL, PATH=<run>/shim:$PATH, HOME=<w>/home, CODEX_HOME=<w>/codex-home, the six proxy vars = proxy, NO_PROXY/no_proxy, LAB_SECURITY_LOG, LAB_OPEN_LOG, BROWSER, the two token-URL overrides, LAB_CODEX_KEY=lab-not-a-key iff mode = "lab"] ++ envs ++ [codex_bin, --no-daemon] ++ args. claude: ([<run>/relay/node, --log, <w>/relay.log, --] iff l.relay) ++ [env, PATH=…, CLAUDE_CONFIG_DIR=<w>/home/.claude, ANTHROPIC_BASE_URL=http://127.0.0.1:<port>, proxies, NO_PROXY…, DISABLE_AUTOUPDATER=1, LAB_SECURITY_LOG=…] ++ l.envs ++ [CLAUDE_CODE_NO_FLICKER=1 iff relay] ++ [CLAUDE_CODE_OAUTH_TOKEN=<fake> iff subscriber] ++ [claude_bin] ++ l.args. So the executed program is the binary by path and every user word survives as one argv element. Uses util-shell-quote-unquote-roundtrip.	codex.rs::the_launcher_execs_codex_by_path_with_no_daemon, lab.rs::claude_options_parse_and_the_launcher_execs_the_binary_by_path	format! string building, PathBuf join/display/to_string_lossy, for over &[String], a Shell model	1,3,5,7,10
+launcher-argv	refinement	codex::launcher, lab::launcher, util::shell_quote	∀ run, tab, mode, envs, args (codex) and ∀ run, l: Launch (claude), provided the fields interpolated WITHOUT shell_quote (run.run/shim, run.proxy, run.port) hold no shell metacharacter, quote, '$' or whitespace: the script is "#!/bin/sh\n" ++ ("clear\n" iff tab; always for claude) ++ one exec command whose word expansion under the Shell model is exactly the argv. codex: [env, -u, OPENAI_API_KEY, -u, CODEX_API_KEY, -u, OPENAI_BASE_URL, PATH=<run>/shim:$PATH, HOME=<w>/home, CODEX_HOME=<w>/codex-home, the six proxy vars = proxy, NO_PROXY/no_proxy, LAB_SECURITY_LOG, LAB_OPEN_LOG, BROWSER, the two token-URL overrides, LAB_CODEX_KEY=lab-not-a-key iff mode = "lab"] ++ envs ++ [codex_bin, --no-daemon] ++ args. claude: ([<run>/relay/node, --log, <w>/relay.log, --] iff l.relay) ++ [env, PATH=…, CLAUDE_CONFIG_DIR=<w>/home/.claude, ANTHROPIC_BASE_URL=http://127.0.0.1:<port>, proxies, NO_PROXY…, DISABLE_AUTOUPDATER=1, LAB_SECURITY_LOG=<w>/security.log, LAB_OPEN_LOG=<w>/open.log, BROWSER=<run>/shim/open] ++ l.envs ++ [CLAUDE_CODE_NO_FLICKER=1 iff relay] ++ [CLAUDE_CODE_OAUTH_TOKEN=<fake> iff subscriber] ++ [claude_bin] ++ l.args. So the executed program is the binary by path and every user word survives as one argv element; and for both, LAB_OPEN_LOG and BROWSER are env's assignments (before the program), so every open the agent makes (`$BROWSER <url>`, or a bare-name `open` that the shim leading PATH answers) is the recorder's and goes to <w>/open.log. NEGATIVE CONTROL (claude): a line without LAB_OPEN_LOG or BROWSER, or with LAB_OPEN_LOG as an argument after the program, fails it. Uses util-shell-quote-unquote-roundtrip.	codex.rs::the_launcher_execs_codex_by_path_with_no_daemon, lab.rs::claude_options_parse_and_the_launcher_execs_the_binary_by_path	format! string building, PathBuf join/display/to_string_lossy, for over &[String], a Shell model	1,3,5,7,10
 lab-parse-launch	contract	lab::parse_launch	∀ args: parse_launch(args) = Ok(l) ⇔ args matches ("-e" V | "--no-wait" | "--relay" | "--subscriber")* ["--" R*]; then l.envs = the V's in order, l.no_wait/relay/subscriber = whether each flag occurs, l.args = R* (everything after the first "--", verbatim, including further flags). Err when a token outside the grammar appears before "--" or "-e" is last.	(secondary only; see §2)	slice iterator with by_ref, match on &str, Vec push/extend, Result<_, String>	1,3,7
 lexical-validators	contract	door::lab_socket_shape, paths::valid_tag	∀ s: lab_socket_shape(s) ⇔ ∃ n: s = "/tmp/at." ++ n ++ "/a.sock" ∧ n ≠ "" ∧ '/' ∉ n. ∀ t: valid_tag(t) ⇔ t ≠ "" ∧ |t|_bytes ≤ 24 ∧ ∀ c ∈ t: c ∈ [A-Za-z0-9_-].	door.rs::only_a_lab_shaped_socket_passes, paths.rs::tags_are_short_plain_words	strip_prefix/strip_suffix, Option::is_some_and, chars().all	1,5,7
 door-wire-pattern	contract	door::wire_pattern	∀ p: wire_pattern(p) = concatMap(f, chars(p)) with f(c) = "\\x" ++ hex2(c) if c is ASCII whitespace or '=', else c. So the output holds no ASCII whitespace and no '=', and |out| = |p| + 3·#{escaped chars}. Semantic clause (restricted, §5.9): for every p in which no escaped char follows an odd run of backslashes, Regex(wire_pattern(p)) and Regex(p) denote the same language.	door.rs::a_pattern_crosses_the_wire_as_one_token	chars loop, String push/push_str, format!("{:02x}"), char as u32; regex semantics for the restricted clause	1,5,7,12
@@ -442,3 +442,94 @@ specs.
 `a_mode_name_is_judged_as_the_volume_names_its_file`), `restore.rs`
 (`the_lift_is_read_off_the_held_tabs_record`) and `sys.rs`
 (`scratch_dir_lists_files_and_dirs_through_no_link`).
+
+## 8. Added 2026-10-21: the open recorder's verdict
+
+The four proofs that run an agent in a lab (`selftest`, `codex-selftest`, `gemini-selftest` and
+`agy-selftest`, `muse-selftest`) judge the open recorder through one function. `selftest` (Claude Code)
+judges it for the first time: Claude Code's launch line now names `LAB_OPEN_LOG` and `BROWSER`
+(`launcher-argv`). One new test, read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+recorder-nothing-opened	contract	recorder::nothing_opened, recorder::Witness::ok	∀ opened, control: nothing_opened(opened, control) ⇔ trim(opened) = "" ∧ ∃ l ∈ lines(control): l ends with " open " ++ CONTROL_URL (CONTROL_URL = "x-lab-control://selftest"); Witness{opened, control}.ok() = nothing_opened(opened, control). So any line an agent's open logged fails the check, and so does a control that was not logged (the empty log of a recorder that logs nothing) or one that logged another URL.	recorder.rs::nothing_opened_needs_an_empty_log_and_the_control_logged	str trim/lines/ends_with, format!, a struct of two Strings	1,5,7
+```
+
+```tsv
+file	test	primary	also
+src/recorder.rs	nothing_opened_needs_an_empty_log_and_the_control_logged	recorder-nothing-opened	
+```
+
+## 9. Added 2026-10-21: the settings witness
+
+The selftest's forced survey card did not show in 3 runs out of 3 on a loaded machine. The flag
+was written 3 s before the turn, and the lab assumed Claude Code had read it. Every lab's scratch
+settings now carry a `ConfigChange` hook (`settings_witness`), and `scn::Ctx::arm` writes the flag
+until Claude Code reports that it re-read the file. Five new tests, read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+witness-rereads	contract	settings_witness::rereads	∀ log, settings: rereads(log, settings) = |{l ∈ lines(log): J::parse(l) = Ok(j) ∧ j.hook_event_name = "ConfigChange" ∧ j.file_path = settings}|. So a change to another file, another hook event, a line that is not JSON and an object with no file_path count nothing.	settings_witness.rs::a_reread_is_a_config_change_line_naming_the_settings_file	lines filter count, JSON parse (cross-crate aterm_json), Option chaining	1,5,7,12
+witness-until-reread	contract	settings_witness::until_reread	∀ write, seen, every, hang, wait: until_reread returns Ok(Reread{writes: k, after}) only when a read of seen made after the k-th call of write returned and before any later call exceeds the read of seen made once, just after the first call returned (the baseline); while no read exceeds the baseline, write is called again once every has passed on wait's clock since the last call returned, and wait pauses between reads otherwise; once hang has passed on that clock since the first call the result is Err ("no re-read"). Every call is the same write, so a line that lands during the first write (an older change's) is never the answer, a line that lands while a rewrite is made is, and a log that never grows ends at the hang detector after more than one write where every < hang.	settings_witness.rs::an_unanswered_write_is_made_again_until_a_line_answers, settings_witness.rs::a_line_from_before_the_write_ends_or_none_at_all_is_no_reread	closures (FnMut, Fn), a trait-generic clock (Wait: WallWait's Instant and interruptible sleep (effects), SteppedWait in tests), Duration arithmetic, a loop with early returns	1,3,7,8,13
+witness-hook-script	refinement	settings_witness::script, settings_witness::hooks, util::shell_quote	∀ script path p, log path g: hooks(p).ConfigChange = [{hooks: [{type: "command", command: shell_quote(p)}]}]; run by /bin/sh with input x on stdin, script(g) appends x ++ "\n" to g when g's directory exists and leaves the file system unchanged otherwise, and exits 0 in both cases (exit 2 would block the change and any other failure would draw an error in the tab). Uses util-shell-quote-unquote-roundtrip.	settings_witness.rs::the_hook_runs_the_script_which_appends_its_input_and_never_fails	format!, J tree construction, a Shell model and a process (effects)	1,3,5,8,10
+witness-in-every-lab	contract	lab::scratch_claude_config	∀ run, helper, proj, o: J::parse(scratch_claude_config(run, helper, proj, o).0).hooks has exactly one ConfigChange command hook, and it runs shell_quote(run.run/config-change.sh), never another run's; apiKeyHelper = helper.	lab.rs::a_lab_ups_claude_settings_carry_the_settings_witness_hook	J tree construction, JSON print then parse (cross-crate aterm_json)	1,3,5,12
+```
+
+```tsv
+file	test	primary	also
+src/settings_witness.rs	a_reread_is_a_config_change_line_naming_the_settings_file	witness-rereads	
+src/settings_witness.rs	an_unanswered_write_is_made_again_until_a_line_answers	witness-until-reread	
+src/settings_witness.rs	a_line_from_before_the_write_ends_or_none_at_all_is_no_reread	witness-until-reread	
+src/settings_witness.rs	the_hook_runs_the_script_which_appends_its_input_and_never_fails	witness-hook-script	witness-rereads
+src/lab.rs	a_lab_ups_claude_settings_carry_the_settings_witness_hook	witness-in-every-lab	witness-hook-script
+```
+
+## 10. Added 2026-10-21: the windowed lab and L13's keys
+
+L13 (a person's own exchange) passed live only through the development seam `send|key as=person`.
+`forever --window` opens the lab's instance as a window, in the same jail, and types `land-p`'s first
+prompt through `hwkey`, the path a key press takes. A windowed aterm also adds Claude Code's defaults to
+the lab's scratch settings, so Claude Code labels its top rule and the composer reader takes a labelled
+rule. Five new tests, read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+lab-windowed-argv	contract	lab::instance_argv, lab::windowed	∀ run, aterm, lifeline: windowed(run) ⇔ run.window = "1". If windowed(run): instance_argv(run, aterm, None, lifeline) = (if lifeline then [run.run/bin/aterm-lab, "keeper", "--"] else []) ++ [aterm, "--no-reroute", "--control-sock", run.sock, "-d", run.proj, "--columns", run.cols, "--lines", run.rows], with no "--headless" and no "--lifeline-fd" (a window refuses both). Otherwise the line starts [aterm, "--headless"] and holds the lifeline flag when lifeline.	lab.rs::a_windowed_lab_s_instance_opens_a_window_its_keeper_holding_the_lifeline	Vec<String> building, PathBuf join, a bool branch	1,5
+crash-refuses-window	contract	crash::crash	∀ run with windowed(run), a, ops: crash(run, a, ops) = Err(usage, code 2) and ops records no event (nothing killed, nothing relaunched). So a SIGKILL never hits a window's keeper and leaves its aterm running.	crash.rs::a_windowed_lab_is_never_crashed	an early return before an Ops trait's effects (fakes)	1,3,8
+l13-keys-account	contract	forever::cover::judge_theirs, forever::cover::keys_unaccounted, forever::cover::keyed_line	∀ seen with seen.cover.keyed = Some(k) and a numeric person_stamp: keys_unaccounted(k) = None ⇔ k.seq_after = Some(a) ∧ a ≥ k.seq_before ∧ a − k.seq_before = k.posted ∧ k.posted > 0; where it is Some(why), judge_theirs(seen, t0) = Unobserved(why …), whatever the harness did in the exchange. Where it is None, judge_theirs judges the exchange exactly as for the seam (an act in it is a FAIL), and a PASS opens with keyed_line(k). With keyed = None a PASS opens with "typed through the `as=person` seam".	forever_tests.rs::land_p_typed_through_hwkey_passes_only_where_the_keys_account_for_the_stamp, forever_tests.rs::land_p_s_prompt_is_typed_key_by_key_through_hwkey	Option/checked_sub arithmetic, format!, a judge over journal, ledger and status records	1,5,7
+composer-labelled-rule	contract	screen::is_rule, screen::composer_row, screen::composer_of	∀ row r: is_rule(r) ⇔ count(trim(r)) ≥ 40 ∧ (every char of trim(r) ∈ {─, ━} ∨ aterm_phase::phase::is_rule(trim(r))). So Claude Code's top rule with the top-effort mode's label inside it (`──── <name> ─`, which a windowed aterm's defaults turn on) frames the composer as a bare rule does, while a short labelled run, a rule with a table's joint (┬) and a row of words frame nothing.	screen.rs::claude_code_s_labelled_top_rule_frames_its_composer	char counting, a delegated predicate	1
+```
+
+```tsv
+file	test	primary	also
+src/lab.rs	a_windowed_lab_s_instance_opens_a_window_its_keeper_holding_the_lifeline	lab-windowed-argv	
+src/crash.rs	a_windowed_lab_is_never_crashed	crash-refuses-window	
+src/forever_tests.rs	land_p_typed_through_hwkey_passes_only_where_the_keys_account_for_the_stamp	l13-keys-account	
+src/forever_tests.rs	land_p_s_prompt_is_typed_key_by_key_through_hwkey	l13-keys-account	
+src/screen.rs	claude_code_s_labelled_top_rule_frames_its_composer	composer-labelled-rule	
+```
+
+## 11. Added 2026-10-21: the review's gaps, closed
+
+A review of `b9/lab-hygiene` found behaviour no test held: the refusal of a windowed lab under
+`LAB_RESTORE=1`, the windowed launch's readiness wait, the survey arm's use of the settings witness
+(an arm that wrote and slept 3 s passed every test), and the 40-column floor of a labelled rule.
+`survey --reread` is new: the arm's write, from the command line. Five new tests, read the same way as
+§1; `claude_code_s_labelled_top_rule_frames_its_composer` (§10) now also holds the floor.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+lab-opts-refused	contract	lab::opts_refused, lab::up, forever::lab_opts	∀ o: opts_refused(o) = Some(why) ⇔ o.window ∧ o.restore. up(tag, o) with opts_refused(o) = Some(why) returns Err(Fail{code: 2, msg: why}) before it judges tag or makes anything; lab_opts(base, mode, keep, (surfaces, window)) returns Err(Fail{code: 2, msg: "forever: " ++ why}) where the options it builds are refused, so `forever --window` under LAB_RESTORE=1 is a usage error, never a harness's COULD NOT RUN; otherwise it returns base with trust, lifeline = ¬keep, window, the person's seam iff surfaces, and the cap's rate iff mode = Cap.	lab.rs::a_windowed_lab_under_the_restore_seam_is_refused_before_anything_is_made, forever_tests.rs::forever_window_under_the_restore_seam_is_a_usage_error_not_could_not_run	a bool conjunction, early returns, struct update	1,5
+lab-window-ready	contract	lab::until_answered	∀ answers, alive, hang, pause: until_answered returns Ok(()) iff some ask of answers returns true; each round asks answers, then alive, then the clock: Err("… ended before its control socket answered") when alive is false first, Err("… hang detector") once hang has passed, and pause's Err unchanged (an interrupt). So an answer stands even when the child has ended since.	lab.rs::a_window_is_ready_once_its_socket_answers_and_never_on_a_dead_child_or_a_hang	closures (FnMut), Instant arithmetic, a loop with early returns	1,3,7,8
+arm-awaits-witness	contract	scn::Ctx::arm, scn::Ctx::arm_with_wait, settings_witness::set_env_reread_with_wait	∀ ctx: ctx.arm() returns Ok only after the witness's log holds a ConfigChange line naming ctx.run.settings() that was appended after a write of CLAUDE_FORCE_DISPLAY_SURVEY = "1"; the flag stands in the settings' env, and sumd.arm_writes counts the writes made (more than one where the first went unanswered). Where no such line comes within ctx.witness_pace.1 the result is Err(Failed("the survey flag was not armed: …no re-read…")) and arm_writes is not set. Uses witness-until-reread and witness-rereads.	scn.rs::the_survey_arm_returns_only_once_claude_code_reported_a_reread	a SteppedWait whose pauses step the clock and stand in for the watcher on the arm's thread, the file system (effects), J summary	1,3,8,13
+survey-words	contract	verbs::survey_words	∀ words: survey_words(words) = Ok((Some("1"), r)) ⇔ words = ["on"] ++ (r ? ["--reread"] : []); Ok((None, r)) likewise for "off"; every other list of words is Err("survey: on|off [--reread]").	verbs.rs::survey_takes_on_or_off_and_reread_after_it	slice patterns	1
+```
+
+```tsv
+file	test	primary	also
+src/lab.rs	a_windowed_lab_under_the_restore_seam_is_refused_before_anything_is_made	lab-opts-refused	
+src/forever_tests.rs	forever_window_under_the_restore_seam_is_a_usage_error_not_could_not_run	lab-opts-refused	
+src/lab.rs	a_window_is_ready_once_its_socket_answers_and_never_on_a_dead_child_or_a_hang	lab-window-ready	
+src/scn.rs	the_survey_arm_returns_only_once_claude_code_reported_a_reread	arm-awaits-witness	witness-until-reread
+src/verbs.rs	survey_takes_on_or_off_and_reread_after_it	survey-words	
+```

@@ -325,19 +325,6 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         def_file: "crates/aterm-gui/src/askpass.rs",
     },
     GuardHelper {
-        // Agent identity directory admission/forget refcount table (`HOLDS`).
-        // Named `identity_holds` because a bare `holds(` matches predicates across the tree.
-        symbol: "identity_holds",
-        identity: "HOLDS",
-        def_file: "crates/aterm-gui/src/agent_identity.rs",
-    },
-    GuardHelper {
-        // Tombstone set currently being emptied by `identities forget` (`EMPTYING`).
-        symbol: "emptying",
-        identity: "EMPTYING",
-        def_file: "crates/aterm-gui/src/agent_identity.rs",
-    },
-    GuardHelper {
         // The secrets server's vaults and join queues (`Shared.server_state`). Named for
         // its own lock: as a bare `lock()` on `shared` it took the identity `shared`, the
         // harness host's and the retire worker's, and a by-name hop into the server's

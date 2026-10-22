@@ -100,7 +100,7 @@ fn a_config_snapshot_names_the_keys_it_moved_and_never_a_value() {
     let h = host();
     app.node_log = h;
     let text = format!(
-        "[harness]\nanswer_text = \"{PLANTED}\"\n\n[identity_themes]\nzebra-person = \"x\"\n\n\
+        "[harness]\nanswer_text = \"{PLANTED}\"\n\n[palette_overrides]\nzebra-person = \"x\"\n\n\
          [zebra_unknown_table]\nquartz = 1\n"
     );
     let snapshot = crate::native_config_service::VersionedConfigService::new(text)
@@ -120,7 +120,7 @@ fn a_config_snapshot_names_the_keys_it_moved_and_never_a_value() {
         marks,
         [
             "2 mark n config key=harness.answer_text",
-            "3 mark n config key=identity_themes",
+            "3 mark n config key=palette_overrides",
             "4 mark n config n=1",
         ]
     );
@@ -146,14 +146,14 @@ fn changed_config_keys_name_schema_rows_only() {
     let after = values(&[
         ("harness", "t2"),
         ("harness.answer_text", PLANTED),
-        ("identity_themes", "t"),
-        ("identity_themes.someone", "x"),
+        ("palette_overrides", "t"),
+        ("palette_overrides.someone", "x"),
         ("no_such_key", "1"),
     ]);
     let (names, unnamed) = changed_config_keys(&before, &after);
     assert_eq!(
         names.into_iter().collect::<Vec<_>>(),
-        ["font_px", "harness.answer_text", "identity_themes"],
+        ["font_px", "harness.answer_text", "palette_overrides"],
         "font_px removed, the text changed, the map added; `harness` is a parent"
     );
     assert_eq!(unnamed, 1, "no_such_key");

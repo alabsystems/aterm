@@ -24,7 +24,7 @@ use crate::app_launch_successor::{LaunchError, LaunchInFlight};
 use crate::app_native::{HandoffFailureLane, PhysicalFailureShape};
 use crate::handoff_rendezvous::{
     CodeRefusal, CodeRefusedDialer, CodeRefusedEnd, DialerCode, Rendezvous, RendezvousError,
-    dial_for_test, held_for_trustd, trustd_silent,
+    dial_for_test, held_for_trustd, holds_for_test, set_io_clock_for_test, trustd_silent,
 };
 use crate::native_updater_service::{ApplyAttemptTicket, ApplyMode};
 use aterm_models_update::native_update_rendezvous_admission_model;
@@ -823,8 +823,9 @@ fn a_code_check_trustd_does_not_answer_holds_the_dialer_until_it_does() {
             let _ = held_up.recv();
         },
     );
+    // Unanswered only at its 50 ms deadline, so the stuck check is past its 1 ms suspect age:
+    // from here the gate refuses every check at once, until `release`.
     assert_eq!(stuck, Err(aterm_uds::deadline::Refused::Unanswered));
-    std::thread::sleep(Duration::from_millis(5));
     let holding = Admission::holding(true, true, true, false);
     let silent = Admission {
         answered: false,
@@ -838,19 +839,26 @@ fn a_code_check_trustd_does_not_answer_holds_the_dialer_until_it_does() {
     );
 
     // 1. No answer by the deadline: the wait ends on it, typed and naming the service, after
-    //    holding the dialer the whole time.
+    //    holding the dialer the whole time. The deadline comes at the hold, on this thread's
+    //    clock, however late the thread got there.
     {
         let rendezvous = bind();
         let dialer = dial_for_test(rendezvous.path(), rendezvous.claim()).expect("dial and claim");
         let turned_away = RefCell::new(Vec::new());
-        let budget = Duration::from_millis(600);
-        let ended = rendezvous.accept_claim_observed(
-            None,
-            &code,
-            Instant::now() + budget,
-            &|| false,
-            &|dialer| turned_away.borrow_mut().push(dialer.clone()),
-        );
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let held = holds_for_test();
+        set_io_clock_for_test(Some(Box::new(move || {
+            if holds_for_test() > held {
+                deadline
+            } else {
+                Instant::now()
+            }
+        })));
+        let ended = rendezvous.accept_claim_observed(None, &code, deadline, &|| false, &|dialer| {
+            turned_away.borrow_mut().push(dialer.clone())
+        });
+        set_io_clock_for_test(None);
+        assert_eq!(holds_for_test(), held + 1, "held until the deadline");
         match &ended {
             Err(RendezvousError::PeerCode {
                 pid,
@@ -886,24 +894,25 @@ fn a_code_check_trustd_does_not_answer_holds_the_dialer_until_it_does() {
     }
 
     // 2. Trustd answers while the dialer is held: the same connection is admitted and granted.
+    //    Trustd answers at the hold's first abort poll.
     {
         let rendezvous = bind();
         let dialer = dial_for_test(rendezvous.path(), rendezvous.claim()).expect("dial and claim");
-        let answers_after = Duration::from_millis(400);
-        let accepted = std::thread::scope(|scope| {
-            let release = &release;
-            scope.spawn(move || {
-                std::thread::sleep(answers_after);
-                release.send(()).expect("the stuck check is waiting");
-            });
-            rendezvous.accept_claim_observed(
-                None,
-                &code,
-                Instant::now() + aterm_spec::wait::MUST_HAPPEN,
-                &|| false,
-                &|dialer| panic!("turned away while trustd was silent: {dialer:?}"),
-            )
-        });
+        let held = holds_for_test();
+        let released = std::cell::Cell::new(false);
+        let accepted = rendezvous.accept_claim_observed(
+            None,
+            &code,
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            &|| {
+                if holds_for_test() > held && !released.replace(true) {
+                    release.send(()).expect("the stuck check is waiting");
+                }
+                false
+            },
+            &|dialer| panic!("turned away while trustd was silent: {dialer:?}"),
+        );
+        assert_eq!(holds_for_test(), held + 1, "held once, then admitted");
         let peer = accepted.expect("admitted once trustd answers");
         assert_eq!(peer.pid(), own_pid());
         crate::conformance_support::assert_transition(
@@ -965,9 +974,8 @@ fn a_successor_turned_away_at_the_code_gate_is_filed_by_the_refusal() {
         aterm_spec::xref::reset_entered_anchors(),
         "the evidence window must open"
     );
-    let dir = std::env::temp_dir().join(format!("atrzcode-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("a scratch dir");
-    let unsigned = dir.join("unsigned");
+    let dir = aterm_tempfile::TempDir::new().expect("a scratch dir");
+    let unsigned = dir.path().join("unsigned");
     std::fs::write(&unsigned, "#!/bin/sh\nexit 0\n").expect("an unsigned file");
     for (code, verdict) in [
         (DialerCode::code_at(PathBuf::from("/usr/bin/true")), true),
@@ -1068,7 +1076,7 @@ fn a_successor_turned_away_at_the_code_gate_is_filed_by_the_refusal() {
             HandoffFailureLane::Physical(PhysicalFailureShape::Unexplained)
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(dir);
     let entered = aterm_spec::xref::entered_anchor_ids();
     aterm_spec::xref::disarm_entered_anchors();
     let file_anchor = aterm_spec::xref::refinements()

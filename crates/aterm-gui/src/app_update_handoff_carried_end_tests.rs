@@ -171,6 +171,7 @@ fn chip_title(app: &App, session: u64) -> String {
         &app.chip_glass(session),
         "",
         today,
+        crate::claude_lights::TitleWords::default(),
     )
     .0
 }

@@ -33,6 +33,7 @@ impl StrokeDetector {
     ///
     /// `None` (leave, hidden, reduced motion, or work) forgets contact and partial travel but
     /// keeps the earned stroke's cooldown, so reentry cannot bypass the rate limit.
+    #[inline]
     pub(crate) fn sample(
         &mut self,
         now: Instant,

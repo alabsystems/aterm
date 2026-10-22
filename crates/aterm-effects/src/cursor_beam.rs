@@ -155,6 +155,8 @@ pub struct CursorBeamRod {
     last: Option<Instant>,
     /// Latched blaze at the last tick (so [`Self::is_active`] needs no clock).
     blaze: f32,
+    /// Cached `((color, theme_fg, theme_bg), ink)` for [`Self::emit_rod_light`].
+    light_ink_memo: Option<((u32, u32, u32), u32)>,
 }
 
 impl CursorBeamRod {
@@ -251,7 +253,7 @@ impl CursorBeamRod {
             match (cfg.dark_theme, cfg.bar) {
                 (true, true) => self.emit_rod(cr, cc, e, breathe, geom, cfg, out),
                 (true, false) => self.emit_aura(cr, cc, e, breathe, geom, cfg, out),
-                (false, true) => Self::emit_rod_light(cr, cc, e, breathe, geom, cfg, under),
+                (false, true) => self.emit_rod_light(cr, cc, e, breathe, geom, cfg, under),
                 // The opaque block carries the caret on paper; an aura of ink
                 // beside it would only stand over the letter just typed.
                 (false, false) => {}
@@ -346,7 +348,12 @@ impl CursorBeamRod {
     /// deeper core on the bar's own x, under the letters and held inside the
     /// cursor's row, charging with the blaze and breathing as the light rod
     /// does. Bounded: two rects.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "cursor cell + blaze/breathe + geometry/config; one internal call site"
+    )]
     fn emit_rod_light(
+        &mut self,
         cr: u16,
         cc: u16,
         e: f32,
@@ -362,12 +369,24 @@ impl CursorBeamRod {
         let strength = (COV_IDLE + (COV_MAX - COV_IDLE) * e) / COV_MAX
             * cfg.intensity.clamp(0.0, 1.0)
             * (0.90 + 0.10 * breathe);
-        let ink = light_body_ink(
-            cfg.color,
-            cfg.theme_fg,
-            cfg.theme_bg,
-            LIGHT_BODY_ALPHA_CAP as u8,
+        let key = (
+            cfg.color & 0x00FF_FFFF,
+            cfg.theme_fg & 0x00FF_FFFF,
+            cfg.theme_bg & 0x00FF_FFFF,
         );
+        let ink = match self.light_ink_memo {
+            Some((k, ink)) if k == key => ink,
+            _ => {
+                let ink = light_body_ink(
+                    cfg.color,
+                    cfg.theme_fg,
+                    cfg.theme_bg,
+                    LIGHT_BODY_ALPHA_CAP as u8,
+                );
+                self.light_ink_memo = Some((key, ink));
+                ink
+            }
+        };
         // (half-width in cell-widths, share of the body ceiling), sleeve first
         // so the core composites over it.
         for (hw, share) in [(0.30, 0.45), (0.11, 1.0)] {

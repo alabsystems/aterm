@@ -221,9 +221,18 @@ pub(crate) struct EpState {
     /// How many torn state files the bridges said they set aside
     /// (`link set-aside files=<n>`).
     pub(crate) set_aside_told: u64,
+    /// The newest count of torn files a bridge said its quarantine still
+    /// holds (`link quarantine torn=<k>`); `None` before any said.
+    pub(crate) held_said: Option<u64>,
     /// What the newest bridge said of its mirror (`link mirror <words>`):
     /// `on`, `stopped reason=<why>`, `capped`; empty before any said.
     pub(crate) mirror_said: String,
+    /// How many times a bridge said its mirror stopped for its pin (`link
+    /// mirror stopped reason=pin`), whichever bridge, in whichever boot.
+    pub(crate) pin_stops: u64,
+    /// Every alias key a take named (`log-take … key=<hex>`; empty: none),
+    /// across the node's whole life: ruling Q6 says one.
+    pub(crate) take_keys: std::collections::BTreeSet<String>,
     /// The world's clock as the sessions last stamped a record: a take's
     /// snapshot is stamped with it.
     stamp: aterm_slog::Stamp,
@@ -486,10 +495,30 @@ impl Endpoint {
                     }
                 }
                 Some("set-aside") => "ERR usage\n".to_string(),
+                // How many torn files the quarantine still holds, said at a
+                // bridge's start, for the oracle (lane 5, as the real
+                // endpoint reads it).
+                Some("quarantine") if s.rules.lane >= 5 => {
+                    let torn = words
+                        .next()
+                        .and_then(|w| w.strip_prefix("torn="))
+                        .and_then(|n| n.parse::<u64>().ok());
+                    match (torn, words.next()) {
+                        (Some(n), None) => {
+                            s.held_said = Some(n);
+                            "OK\n".to_string()
+                        }
+                        _ => "ERR usage\n".to_string(),
+                    }
+                }
+                Some("quarantine") => "ERR usage\n".to_string(),
                 // The mirror's own word for the oracle: `on`, or why it
                 // stopped (`stopped reason=pin`: a pin that does not read).
                 Some("mirror") => {
                     s.mirror_said = words.collect::<Vec<_>>().join(" ");
+                    if s.mirror_said == "stopped reason=pin" {
+                        s.pin_stops += 1;
+                    }
                     "OK\n".to_string()
                 }
                 _ => "OK\n".to_string(),
@@ -645,11 +674,18 @@ impl EpState {
     /// bridge's own tests' endpoint, `FakeMirror`, answers the same way: the
     /// REAL log's take, as aterm-gui's `cmd_log_take` answers it).
     fn log_take<'a>(&mut self, words: impl Iterator<Item = &'a str>) -> String {
+        let words: Vec<&str> = words.collect();
         let n: usize = words
-            .into_iter()
+            .iter()
             .find_map(|t| t.strip_prefix("n="))
             .and_then(|n| n.parse().ok())
             .unwrap_or(aterm_slog::TAKE_MAX);
+        // The alias key the take names (ruling Q6), for the oracle.
+        let key = words
+            .iter()
+            .find_map(|t| t.strip_prefix("key="))
+            .unwrap_or_default();
+        self.take_keys.insert(key.to_string());
         let at = self.stamp;
         let mut logs: Vec<(&String, &mut aterm_slog::Log)> = self
             .sessions

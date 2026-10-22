@@ -1,0 +1,28 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "agh-fake"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "A loopback GitHub (api, uploads, web and CDN origins over plain HTTP on 127.0.0.1) for agh's tests"
+# The fake's own tests are modules of one `fake_suite` binary (declared below).
+autotests = false
+
+[dependencies]
+# Every JSON body the fake writes, and the request bodies it reads.
+aterm-json = { workspace = true }
+# ETags (sha256 of a body), asset digests, and `token`.
+aterm-digest = { workspace = true }
+# Hex (ETags, digests, tokens) and base64 (contents answers).
+aterm-codec = { workspace = true }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "fake_suite"
+path = "tests/fake_suite.rs"

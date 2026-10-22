@@ -181,9 +181,15 @@ fn marker_matches(marker: &str, token: &str) -> bool {
 /// Unknown (including variable) arity preserves the launch instead of guessing.
 /// Codex's single values follow its CLI's shared options; Muse's `--model`
 /// follows the existing `upgrade_muse` one-value reader. A posture marker still
-/// preserves the launch independently of whether its arity is known here.
+/// preserves the launch independently of whether its arity is known here. A
+/// program whose build runs the vendor's own executable under its name
+/// ([`crate::vendor_direct::VendorSpec::aliases`]: `codex-old` is OpenAI's
+/// `codex`) is that executable's CLI and takes its options.
 pub(crate) fn word_options(program: &str) -> (&'static [&'static str], &'static [&'static str]) {
-    match program {
+    let cli = crate::vendor_direct::spec(program)
+        .and_then(|row| row.aliases.iter().find(|(name, _)| *name == program))
+        .map_or(program, |(_, target)| *target);
+    match cli {
         "codex" => (
             &[
                 "--model",
@@ -551,6 +557,38 @@ mod tests {
                 "--dangerously-bypass-approvals-and-sandbox"
             ]))
         );
+    }
+
+    /// `codex-old` is OpenAI's `codex` under its own name (its row's alias):
+    /// it takes codex's options, so every launch decides exactly as codex's —
+    /// a known option's value is stepped over to the word behind it.
+    ///
+    /// NEGATIVE CONTROL: a name with no row knows no options.
+    #[test]
+    fn an_aliased_program_decides_as_the_cli_it_runs() {
+        assert_eq!(word_options("codex-old"), word_options("codex"));
+        for args in [
+            argv(&[]),
+            argv(&["exec", "fix it"]),
+            argv(&["--model", "opus", "exec", "x"]),
+            argv(&["-m", "opus", "resume", "thread-id"]),
+            argv(&["--oss", "exec", "x"]),
+            argv(&["-s", "read-only"]),
+            argv(&["--yolo", "exec", "x"]),
+            argv(&["resume", "thread-id"]),
+        ] {
+            assert_eq!(
+                decide("codex-old", &args),
+                decide("codex", &args),
+                "{args:?}"
+            );
+        }
+        let stepped = argv(&["--model", "opus", "exec", "x"]);
+        assert!(
+            matches!(decide("codex-old", &stepped), Launch::Default(_)),
+            "PRECONDITION: the value is stepped over"
+        );
+        assert_eq!(word_options("codex-older"), (&[][..], &[][..]));
     }
 
     /// By default: injected at the front (behind muse's session words), and

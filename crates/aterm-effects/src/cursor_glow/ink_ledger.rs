@@ -165,6 +165,7 @@ impl InkLedger {
     /// The account index of band 0 of text cell `(row, col)`, or `None` for a
     /// cell the account does not hold (off every line, past the grid, or the
     /// caret's own).
+    #[inline]
     fn slot(&self, row: i32, col: i32) -> Option<usize> {
         if self.caret == Some((row, col)) || col < 0 || col as usize >= self.stride {
             return None;
@@ -177,6 +178,7 @@ impl InkLedger {
 
     /// The text cell at `(row, col)`'s index into `under`, as
     /// [`Self::slot`] finds it.
+    #[inline]
     fn cell(&self, row: i32, col: i32) -> Option<usize> {
         self.slot(row, col).map(|at| at / Self::BANDS)
     }
@@ -184,12 +186,14 @@ impl InkLedger {
     /// Close the account: an idle ledger admits everything. Every tick does
     /// this first, so a frame that never opens one (a light ground, a dark
     /// tick) leaves no stale account for the caret's bodies to spend.
+    #[inline]
     pub(super) fn close(&mut self) {
         self.on = false;
         self.print = 0;
     }
 
     /// Fold one cut into the frame's print.
+    #[inline]
     fn note_cut(&mut self, cell: usize, share: f32) {
         self.print = aterm_hash::fnv_mix_u64(
             self.print | 1,
@@ -217,6 +221,7 @@ impl InkLedger {
 
     /// How far band `band` of a cell `ch` px tall lies from the cell's middle
     /// row of pixels (a streak sample's axis), at its nearest point.
+    #[inline]
     pub(super) fn band_reach(ch: f32, band: usize) -> f32 {
         let h = ch / Self::BANDS as f32;
         let (y0, y1) = (band as f32 * h, (band + 1) as f32 * h);
@@ -227,6 +232,7 @@ impl InkLedger {
     /// Whether the account's ink keeps `floor` over `ground` under `lift`,
     /// with ink and ground lifted together and clipped at 255 as `add_sat`
     /// does.
+    #[inline]
     fn reads_with(
         table: &crate::color_math::RelativeLuminanceTable,
         ink: [f32; 3],
@@ -245,17 +251,18 @@ impl InkLedger {
     /// The largest share `0..=1` of `add` account `at` can still take while
     /// the account's ink keeps `floor` over what lies under that cell.
     fn room(&self, at: usize, add: [f32; 3], floor: f32) -> f32 {
+        if add == [0.0; 3] {
+            return 1.0;
+        }
         let table = crate::color_math::relative_luminance_table();
         let laid = self.laid[at];
         let unpack = |rgb: u32| [16u32, 8, 0].map(|sh| ((rgb >> sh) & 0xff) as f32);
-        let (ink, ground) = (
-            unpack(self.ink[at / Self::BANDS]),
-            unpack(self.under[at / Self::BANDS]),
-        );
+        let cell = at / Self::BANDS;
+        let (ink, ground) = (unpack(self.ink[cell]), unpack(self.under[cell]));
         // A line other than the caret's (earlier output, a selection, the
         // prompt above) holds the text bar: the lights only wash the letters
         // being typed down to their tier's floor.
-        let slot = at / (Self::BANDS * self.stride.max(1));
+        let slot = cell / self.stride.max(1);
         let off_caret = self.lines[slot]
             .zip(self.caret)
             .is_some_and(|((row, _, _), (caret_row, _))| row != caret_row);
@@ -459,6 +466,7 @@ impl InkLedger {
                 let b = ((q.color2 >> sh) & 0xff) as f32;
                 (a, b - a)
             });
+            let cwi_u = cwi as usize;
             for (k, &cell) in reached.iter().enumerate() {
                 let (cx0, cy0) = self.cell_origin(cell);
                 let (x0, x1) = (qx0.max(cx0), qx1.min(cx0 + cwi));
@@ -466,17 +474,19 @@ impl InkLedger {
                 if x0 >= x1 || y0 >= y1 {
                     continue;
                 }
+                let k_base = k * area + ((y0 - cy0) * cwi) as usize;
+                let y_span = (y1 - y0) as usize;
                 for x in x0..x1 {
                     // The renderer's column law for a gradient quad.
                     let m = (2 * (x - qx0) + 1) as f32;
                     let t = m / denom;
                     let c = ends.map(|(a, da)| a + da * t);
-                    let col_base = k * area + (x - cx0) as usize;
-                    for y in y0..y1 {
-                        let at = col_base + ((y - cy0) * cwi) as usize;
+                    let mut at = k_base + (x - cx0) as usize;
+                    for _ in 0..y_span {
                         for (p, v) in px[at].iter_mut().zip(c) {
                             *p += v;
                         }
+                        at += cwi_u;
                     }
                 }
             }
@@ -509,6 +519,7 @@ impl InkLedger {
 
     /// Window px of the top-left corner of text cell `cell` (an index into
     /// `under`).
+    #[inline]
     fn cell_origin(&self, cell: usize) -> (i32, i32) {
         let (ox, oy, cw, ch) = self.grid;
         let stride = self.stride.max(1);
@@ -611,6 +622,7 @@ impl InkLedger {
     }
 
     /// The pixel box of text cell `cell` and the share it keeps.
+    #[inline]
     fn dim_of(&self, cell: usize, share: f32) -> Dim {
         let (x0, y0) = self.cell_origin(cell);
         let (_, _, cw, ch) = self.grid;
@@ -627,6 +639,7 @@ impl InkLedger {
     /// cell's share inside it, rising to the whole light over the feather's
     /// reach off its box (a smoothstep of the normalised distance), the
     /// least of every dimmed cell's.
+    #[inline]
     fn mask_at(&self, x: f32, y: f32) -> f32 {
         let (_, _, cw, ch) = self.grid;
         let (fx, fy) = (
@@ -634,6 +647,9 @@ impl InkLedger {
             (ch * Self::FEATHER_Y).max(1.0),
         );
         self.dims.iter().fold(1.0f32, |m, d| {
+            if d.share >= m {
+                return m;
+            }
             let dx = (d.x0 - x).max(x - d.x1).max(0.0) / fx;
             let dy = (d.y0 - y).max(y - d.y1).max(0.0) / fy;
             if dx >= 1.0 || dy >= 1.0 {
@@ -891,6 +907,7 @@ impl InkLedger {
 }
 
 /// Grow `v`'s capacity to at least `want`, once.
+#[inline]
 fn reserve_to<T>(v: &mut Vec<T>, want: usize) {
     if v.capacity() < want {
         v.reserve(want - v.len());
@@ -898,6 +915,7 @@ fn reserve_to<T>(v: &mut Vec<T>, want: usize) {
 }
 
 /// `rgb` scaled by `share`, per channel (truncating), its top byte kept.
+#[inline]
 fn scale_rgb(c: u32, share: f32) -> u32 {
     let share = share.clamp(0.0, 1.0);
     let ch = |sh: u32| (((c >> sh) & 0xff) as f32 * share) as u32;
@@ -906,6 +924,7 @@ fn scale_rgb(c: u32, share: f32) -> u32 {
 
 /// Scale every additive quad of `quads` (`alpha == 0`) by `share`, colour
 /// and gradient end alike: the light [`InkLedger::admit_quads`] admitted.
+#[inline]
 pub(super) fn scale_additive(quads: &mut [GlowQuad], share: f32) {
     if share >= 1.0 {
         return;
@@ -1076,6 +1095,7 @@ impl CursorGlow {
     /// The pair a dark bed is solved for and its account kept on: the live
     /// theme's ink and page, or the reference pair when the host handed no
     /// coherent one (`fg == bg` reads as unknown).
+    #[inline]
     pub(crate) fn bed_pair(cfg: &GlowConfig) -> (u32, u32) {
         let (fg, bg) = (cfg.theme_fg & 0x00FF_FFFF, cfg.theme_bg & 0x00FF_FFFF);
         if fg == bg {
@@ -1088,6 +1108,7 @@ impl CursorGlow {
     /// Whether `style`'s streak lies under the letters on a dark ground: the
     /// beam family's bed ([`Self::emit_comet`]) and water's wake. Their
     /// over-text lights spend the over-ink account ([`InkLedger`]).
+    #[inline]
     pub(super) fn streak_lies_under(style: GlowStyle) -> bool {
         matches!(
             style,
@@ -1105,6 +1126,7 @@ impl CursorGlow {
     /// light ([`InkLedger::admit_masked`]): which letters held a light back
     /// and by how much, so a host folding it into its frame fingerprint
     /// repaints when only the cuts change. `0` with no cut.
+    #[inline]
     #[must_use]
     pub fn over_ink_print(&self) -> u64 {
         self.ink_ledger.print
@@ -1120,12 +1142,16 @@ impl CursorGlow {
     /// does not reach the letters) it changes nothing. Returns the least
     /// share any letter kept (`1.0` for the whole light), which the host
     /// folds into its frame fingerprint when it bound.
+    #[inline]
     pub fn admit_over_ink(
         &mut self,
         quads: &mut Vec<GlowQuad>,
         range: std::ops::Range<usize>,
         tier: OverInkTier,
     ) -> f32 {
+        if range.is_empty() {
+            return 1.0;
+        }
         let floor = match tier {
             OverInkTier::Body => InkLedger::BODY_FLOOR,
             OverInkTier::Momentum => InkLedger::MOMENTUM_FLOOR,

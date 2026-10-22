@@ -42,12 +42,14 @@ pub struct AnimalBakeKey {
 impl AnimalBakeKey {
     /// Resolve the local palette into bake fills; the coat/iris ramp indices are
     /// pinned to 0 (no animal layer reads them).
+    #[inline]
     #[must_use]
     pub fn fills(&self) -> ResolvedFills {
         ResolvedFills::from_context(0, 0, self.colors)
     }
 
     /// Bake the tile this key describes (the cache-miss path).
+    #[inline]
     #[must_use]
     pub fn bake(&self) -> Tile {
         bake_species(
@@ -61,6 +63,7 @@ impl AnimalBakeKey {
     /// A stable `u64` id for [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile):
     /// FNV-1a over the key's fields, so it survives restarts and std releases. The
     /// salt separates it from pet tiles.
+    #[inline]
     #[must_use]
     pub fn host_id(&self) -> u64 {
         const ANIMAL_SALT: u64 = 0xA111_3A15;
@@ -108,10 +111,12 @@ pub fn bake_species(species: AnimalGlyphId, fills: &ResolvedFills, w: u32, h: u3
 }
 
 impl ExactTileKey for AnimalBakeKey {
+    #[inline]
     fn size(&self) -> (u16, u16) {
         (self.w, self.h)
     }
 
+    #[inline]
     fn bake_tile(&self) -> Tile {
         self.bake()
     }
@@ -125,6 +130,7 @@ impl AnimalBaker {
     /// viewbox; callers size the destination box from it so each head keeps
     /// its drawn shape. Clamped away from zero so a degenerate asset cannot
     /// produce a NaN/∞ destination rect.
+    #[inline]
     #[must_use]
     pub fn aspect(species: AnimalGlyphId) -> f32 {
         (f32::from(ANIMAL_GLYPHS[species as usize].aspect_x1000) / 1000.0).max(0.001)

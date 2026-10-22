@@ -16,7 +16,7 @@ fn repo() -> PathBuf {
 }
 
 fn git(args: &[&str]) -> String {
-    let o = aterm_uds::spawnfd::command("git")
+    let o = crate::ledger::testing::git()
         .arg("-C")
         .arg(repo())
         .args(args)
@@ -178,6 +178,12 @@ fn the_public_clone_command_reads_as_one_line_and_admits_only_a_public_version()
         .split(" && ")
         .find(|c| c.contains("aterm --version"))
         .expect("a version clause");
+    // One `sh -c '…'` step: the known-red baseline needs a plain `&&` chain, which
+    // may pipe only inside single quotes.
+    let clause = clause
+        .strip_prefix("sh -c '")
+        .and_then(|c| c.strip_suffix('\''))
+        .expect("the version clause is one sh -c step");
     let (_, grep) = clause
         .split_once(" | ")
         .expect("the clause pipes the version into grep");

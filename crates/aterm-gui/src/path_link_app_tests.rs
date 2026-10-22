@@ -497,8 +497,11 @@ fn a_citation_resolves_only_while_the_session_runs_here() {
     // Seen by the sweep under the shell itself: it still stands.
     sweep_sees_cwd(&app, wid, SHELL);
     assert_eq!(press(&app), None, "reported under the shell in front");
+    // Only a name an OSC string can carry: the parser acts on a control
+    // inside one (a machine whose kernel name holds a backspace), so no
+    // shell's report could name it.
     let me = crate::tab_label::this_machine_name();
-    if !me.is_empty() {
+    if !me.is_empty() && !me.chars().any(char::is_control) {
         feed(&app, wid, osc7(me).as_bytes());
         assert_eq!(press(&app), Some(local.clone()), "this machine by name");
     }

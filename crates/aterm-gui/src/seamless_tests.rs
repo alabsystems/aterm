@@ -106,19 +106,19 @@ fn carried_empty_title_slots_survive_the_handoff_wire() {
     assert_eq!(titles(&terminal), ("caller".to_string(), "".to_string()));
 }
 
-/// Serializes ALL env mutation in this module. `set_var`/`remove_var` are
-/// process-global and the test binary runs hundreds of tests on parallel
-/// threads, so "single-threaded test" is NEVER a true claim here — every
-/// env-touching test must hold this lock for its WHOLE body. Acquire via
-/// `unwrap_or_else(PoisonError::into_inner)`: a failed (panicked) test must
-/// not poison the lock for the other.
+/// Held by a test that writes the handoff variables, `HOME` or `XDG_RUNTIME_DIR`, in its own
+/// child ([`env_alone`]): the lib-test process writes none of them.
 pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// RAII save/RESTORE of one env var: captures the prior value on creation
-/// and puts it BACK (not merely removes it) on drop — including the unwind
-/// of an early failed assert — so unrelated tests that resolve the runtime
-/// dir keep the environment they started with. Must only live while
-/// `ENV_LOCK` is held: declare it AFTER the lock guard so it drops FIRST.
+/// For a test that writes the process environment: runs it alone in a child
+/// ([`crate::test_alone::alone`]), where it holds [`ENV_LOCK`], so the lib-test
+/// process's environment is never written. `None` in the lib-test process.
+pub(crate) fn env_alone() -> Option<std::sync::MutexGuard<'static, ()>> {
+    crate::test_alone::alone().then(|| ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// RAII save/RESTORE of one env var: puts the prior value BACK on drop, unwind included.
+/// Only in a test's own child ([`env_alone`]), which `new` asserts.
 pub(super) struct RestoreVar {
     key: &'static str,
     prior: Option<std::ffi::OsString>,
@@ -126,6 +126,10 @@ pub(super) struct RestoreVar {
 impl RestoreVar {
     pub(super) fn new(key: impl Into<&'static str>) -> Self {
         let key = key.into();
+        assert!(
+            crate::test_alone::in_child(),
+            "{key}: a test that writes the environment runs alone in a child (`env_alone`)"
+        );
         Self {
             key,
             prior: std::env::var_os(key),
@@ -134,11 +138,6 @@ impl RestoreVar {
 }
 impl Drop for RestoreVar {
     fn drop(&mut self) {
-        // Mutation is serialized by ENV_LOCK, which the enclosing test holds
-        // for our whole lifetime, AND by the helper's own process-global lock.
-        // Readers elsewhere in the process may still observe the transient
-        // value — acceptable because no non-seamless test depends on these
-        // vars and the prior value is what we reinstate here.
         match &self.prior {
             Some(v) => aterm_log::env::set(self.key, v),
             None => aterm_log::env::unset(self.key),
@@ -146,8 +145,8 @@ impl Drop for RestoreVar {
     }
 }
 
-/// Every variable a handoff test sets, restored when the test ends. Must
-/// only live while `ENV_LOCK` is held, as for [`RestoreVar`].
+/// Every variable a handoff test sets, restored when the test ends. In a test's own child, as
+/// for [`RestoreVar`].
 #[cfg(unix)]
 pub(super) fn restore_env() -> [RestoreVar; 11] {
     [
@@ -168,23 +167,12 @@ pub(super) fn restore_env() -> [RestoreVar; 11] {
 /// A handoff test's private runtime dir — and, for [`ScratchEnv::home`],
 /// its HOME: `<this process's handoff scratch root>/<label>`, named by the
 /// process-wide variables until the guard drops. The drop puts the
-/// variables BACK FIRST and only then removes the directory.
+/// variables BACK FIRST and only then removes the directory, which lives in
+/// [`crate::test_scratch::process_root`] so a thread that re-creates under it
+/// after the removal is taken back when the process exits.
 ///
-/// Both halves matter, because the variables are the PROCESS's (measured
-/// 2026-09-30/10-01): while they name a scratch, another test's thread
-/// resolving the control dir re-creates `<scratch>/aterm`, and a child any
-/// thread spawns takes the scratch for its HOME (a cargo fetched its
-/// registry into `<scratch>/.cargo`; a `ty` put its compiled cache under
-/// it). Removing the directory first left them naming a dead path until the
-/// test put them back — and a test that put back nothing
-/// (`the_render_debt_crosses_…`) left them naming its last scratch for the
-/// rest of the process. A thread that read them just before the restore
-/// can still create under the path after the removal, so the directory
-/// lives in [`crate::test_scratch::process_root`], which takes such a
-/// straggler back when the process exits.
-///
-/// Only while [`ENV_LOCK`] is held, as for [`RestoreVar`], and one at a
-/// time: the guard restores what it found.
+/// In a test's own child, as for [`RestoreVar`], and one at a time: the guard
+/// restores what it found.
 #[cfg(unix)]
 pub(crate) struct ScratchEnv {
     path: std::path::PathBuf,
@@ -230,33 +218,18 @@ impl Drop for ScratchEnv {
     }
 }
 
-/// Run the calling test in `children` child processes of this test
-/// binary ([`crate::test_alone::StandIn::this_test`]), `marker` naming each
-/// child's index (0-based) in its environment, and return every child's
-/// stdout — after asserting each exited 0 having run exactly that one test.
-///
-/// For a test whose work holds [`ENV_LOCK`] for seconds: in a child it holds
-/// the CHILD's lock, over an environment of its own, and this process's lock
-/// is free for the module's other tests. A child inherits the environment as
-/// it stands at the spawn, so the spawns happen under the lock: no sibling's
-/// scratch HOME or published handoff can be in it. The waits are not, and
-/// several children run side by side. A child's output is said only when it
-/// failed: its own `test result:` line in the parent's would read, to
-/// `verify test`'s reading of the log, as a binary of its own.
+/// Run the calling test alone in `children` side-by-side children ([`env_alone`]'s kind),
+/// `marker` naming each child's index (0-based), and return each passed child's stdout.
 #[cfg(unix)]
 pub(crate) fn run_in_children(marker: &str, children: usize) -> Vec<String> {
-    let spawned: Vec<crate::test_alone::Running> = {
-        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        // A failed spawn panics here; the children already running are
-        // dropped with it, and so killed and reaped.
-        (0..children)
-            .map(|index| {
-                let mut child = crate::test_alone::StandIn::this_test();
-                child.command().env(marker, index.to_string());
-                child.spawn()
-            })
-            .collect()
-    };
+    // A failed spawn panics here; the children already running are dropped with it, and so
+    // killed and reaped.
+    let spawned: Vec<crate::test_alone::Running> = (0..children)
+        .map(|index| {
+            let index = std::ffi::OsString::from(index.to_string());
+            crate::test_alone::spawn_alone_with(&[(marker, &index)])
+        })
+        .collect();
     spawned
         .into_iter()
         .map(|child| child.passed().stdout)
@@ -339,7 +312,7 @@ fn a_target_refused_after_a_passing_deferral_exits_75() {
 #[test]
 #[cfg(unix)]
 fn a_refused_intake_of_an_offered_handoff_exits_instead_of_booting_fresh() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore_fds = RestoreVar::new(ENV_FDS);
     let _restore_manifest = RestoreVar::new(ENV_MANIFEST);
     let _restore_nonce = RestoreVar::new(ENV_NONCE);
@@ -606,7 +579,7 @@ fn a_refused_intake_of_the_producers_content_gives_back_its_counted_trial_launch
     // A build number no other test arms or runs as.
     const BUILD: u64 = 9_800_000_000_018;
     crate::prime_test_update_root();
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     // The intake: a manifest whose nonce line names another attempt.
     let staged = stage_outgoing_handoff("r8nonce", 2, None);
@@ -884,7 +857,6 @@ fn zsh_record(local_id: u64, sid: &str) -> SessionRecord {
         attention: None,
         control: None,
         frozen_path: false,
-        identity: None,
         topics: Vec::new(),
         fg_holder: None,
         rekey: false,
@@ -1026,7 +998,6 @@ fn exact_legacy_layout(ids: &[u64]) -> RestoreManifest {
                     autopilot: None,
                     land_at: None,
                     autopilot_by: None,
-                    identity: None,
                     theme: None,
                     agent: None,
                     supervised: None,
@@ -1921,23 +1892,10 @@ fn metas_past_every_shed_lower_screens_instead_of_refusing() {
 ///
 /// RED before the fix: the self-check had no meta budget, and the writer,
 /// with no held pane left to drop, wrote the oversized manifest anyway.
-///
-/// IN A CHILD PROCESS ([`run_in_children`], test-run speed). The
-/// forty tabs' manifest is written and settled under [`ENV_LOCK`] (its
-/// control dir is the scratch HOME's): 3.7 s alone, every test of this
-/// module the runner starts meanwhile parks on the lock — in the
-/// `-p aterm-gui --lib` binary at `RUST_TEST_THREADS=7`, three siblings
-/// took 3.0 to 3.8 s there against 0.001 to 0.003 s alone. The child runs
-/// this body unchanged, over an environment of its own.
 #[test]
 #[cfg(unix)]
 fn an_oversized_manifest_degrades_sessions_instead_of_being_written() {
-    const CHILD: &str = "ATERM_OVERSIZED_MANIFEST_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        run_in_children(CHILD, 1);
-        return;
-    }
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _scratch = ScratchEnv::home("metas");
     let dir = crate::control_auth::socket_dir().expect("scratch control dir");
 
@@ -2067,7 +2025,7 @@ fn an_oversized_manifest_degrades_sessions_instead_of_being_written() {
 #[test]
 #[cfg(unix)]
 fn a_refused_grid_write_carries_its_io_error_kind_out() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _scratch = ScratchEnv::home("kind");
     let dir = crate::control_auth::socket_dir().expect("scratch control dir");
     let nonce = mint_outgoing_nonce();
@@ -2115,21 +2073,10 @@ fn a_refused_grid_write_carries_its_io_error_kind_out() {
 /// review): the Commit audits each as dropped
 /// (`App::audit_connections_left_out`); a drop written with the manifest was
 /// false for every attempt that then stood down, and repeated at each retry.
-///
-/// IN A CHILD PROCESS ([`run_in_children`]), as
-/// `an_oversized_manifest_degrades_sessions_instead_of_being_written` is: the
-/// 50,000 rows' manifests are written and measured under [`ENV_LOCK`] (0.8 s
-/// alone, 5.2 s in the `-p aterm-gui --lib` binary), and every test of this
-/// module the runner started meanwhile parked on the lock.
 #[test]
 #[cfg(unix)]
 fn connections_give_way_before_held_panes_and_the_mailbox() {
-    const CHILD: &str = "ATERM_CONNECTIONS_GIVE_WAY_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        run_in_children(CHILD, 1);
-        return;
-    }
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _scratch = ScratchEnv::home("conns-first");
     let sid = "s-00000000010000050505";
     let (controller, peer) = ("s-00000000010000030303", "s-00000000010000040404");
@@ -2275,19 +2222,10 @@ fn connections_give_way_before_held_panes_and_the_mailbox() {
 ///
 /// CONTROL, the same desk over by exactly the rows' measured bytes: the
 /// connections alone bring it under, so they go and the pane crosses.
-///
-/// IN A CHILD PROCESS ([`run_in_children`]), as
-/// `connections_give_way_before_held_panes_and_the_mailbox` is (0.6 s alone,
-/// under [`ENV_LOCK`] throughout).
 #[test]
 #[cfg(unix)]
 fn connections_that_cannot_cover_the_excess_measured_are_kept() {
-    const CHILD: &str = "ATERM_CONNECTIONS_MEASURED_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        run_in_children(CHILD, 1);
-        return;
-    }
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _scratch = ScratchEnv::home("conns-measured");
     // Session ids as `SessionId::generate` spells them: the rows' real shape.
     let sid = "s-00000000010000050505";
@@ -2436,7 +2374,7 @@ fn the_fds_wire_round_trips_and_one_bad_entry_refuses_it_whole() {
 #[test]
 #[cfg(unix)]
 fn malformed_named_fd_is_closed_on_authority_rejection() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore_fds = RestoreVar::new(ENV_FDS);
     let _restore_manifest = RestoreVar::new(ENV_MANIFEST);
     let _restore_nonce = RestoreVar::new(ENV_NONCE);
@@ -2463,7 +2401,7 @@ fn malformed_named_fd_is_closed_on_authority_rejection() {
 #[test]
 #[cfg(unix)]
 fn invalid_prearm_alias_closes_once_clears_authority_and_cannot_close_reused_fd() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore_manifest = RestoreVar::new(ENV_MANIFEST);
     let _restore_fds = RestoreVar::new(ENV_FDS);
     let _restore_nonce = RestoreVar::new(ENV_NONCE);
@@ -2868,7 +2806,7 @@ fn the_exit_wait_ends_at_the_attested_exit_and_not_before() {
 #[test]
 #[cfg(unix)]
 fn valid_overlap_prearm_scrubs_ambient_parent_but_restores_it_for_exec() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore_manifest = RestoreVar::new(ENV_MANIFEST);
     let _restore_fds = RestoreVar::new(ENV_FDS);
     let _restore_nonce = RestoreVar::new(ENV_NONCE);
@@ -2960,7 +2898,7 @@ fn valid_overlap_prearm_scrubs_ambient_parent_but_restores_it_for_exec() {
 #[test]
 #[cfg(unix)]
 fn take_ready_fd_fails_closed() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = RestoreVar::new("ATERM_HANDOFF_READY_FD");
     // All set/unset below: serialized by ENV_LOCK for the whole body.
     let take = || {
@@ -3035,7 +2973,7 @@ fn take_ready_fd_fails_closed() {
 #[test]
 #[cfg(unix)]
 fn a_refused_target_identity_closes_the_readiness_channel_as_child_death() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = RestoreVar::new("ATERM_HANDOFF_READY_FD");
     let mut fds = [0i32; 2];
     // SAFETY: plain pipe(2) into a valid 2-slot out-array.
@@ -3077,7 +3015,7 @@ fn a_refused_target_identity_closes_the_readiness_channel_as_child_death() {
 #[test]
 #[cfg(unix)]
 fn take_ready_fd_adopts_a_pipe_and_rearms_cloexec() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = RestoreVar::new("ATERM_HANDOFF_READY_FD");
     let mut fds = [0i32; 2];
     // SAFETY: plain pipe(2) into a valid 2-slot out-array.
@@ -3113,7 +3051,7 @@ fn take_ready_fd_adopts_a_pipe_and_rearms_cloexec() {
 /// every other file — another attempt's manifest, unrelated files — alone.
 #[test]
 fn discard_outgoing_removes_only_this_attempts_artifacts() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     // Bound before `_restore_xdg`, so the variable is restored before the
     // directory it names is removed.
     let tmp = aterm_tempfile::Builder::new()
@@ -4235,7 +4173,7 @@ pub(super) fn child_proof_from(
 #[test]
 #[cfg(unix)]
 fn a_full_seamless_handoff_completes_and_commits() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("ok", 3, None);
     let (ready_read, ready_write) = pipe_pair("ready");
@@ -4288,7 +4226,7 @@ fn a_full_seamless_handoff_completes_and_commits() {
 #[test]
 #[cfg(unix)]
 fn take_incoming_carries_the_tokenless_connection_triples() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("conncarry", 2, None);
     // §1.4#3 on the PUBLISHED wire: an `EdgeToken` is 64 hex chars; no run
@@ -4341,7 +4279,7 @@ fn take_incoming_carries_the_tokenless_connection_triples() {
 #[test]
 #[cfg(unix)]
 fn a_handoff_across_a_version_boundary_still_completes() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let older_codec = |wire: &str| {
         assert!(wire.contains("schema = 2"), "today's wire: {wire}");
@@ -4395,7 +4333,7 @@ fn a_handoff_across_a_version_boundary_still_completes() {
 #[test]
 #[cfg(unix)]
 fn a_handoff_across_a_screen_meta_version_boundary_still_completes() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     // One additive key, exactly as a newer build's meta codec would emit it.
     let newer_meta_codec = |meta: &str| {
@@ -4525,7 +4463,7 @@ pub(super) fn restage_session(
 #[cfg(unix)]
 fn a_hold_and_the_titles_cross_the_real_wire() {
     use aterm_core::terminal::TitleRepr;
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let mut staged = stage_outgoing_handoff("haltwire", 3, None);
     // The producer's meta names an untitled engine as `"title":{}` — the
@@ -4676,7 +4614,7 @@ fn a_hold_and_the_titles_cross_the_real_wire() {
 #[cfg(unix)]
 fn a_workers_task_record_crosses_the_real_wire() {
     use crate::task_record::TaskState;
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("taskwire", 2, None);
     // The park draws the record onto its session's manifest row
@@ -4761,7 +4699,7 @@ fn a_workers_task_record_crosses_the_real_wire() {
 #[test]
 #[cfg(unix)]
 fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let before_the_carry = |meta: &str| meta.replace(",\"title\":{}", "");
     // The copies v0.98.0's store held for the two sessions.
@@ -4894,7 +4832,6 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
                 autopilot: None,
                 land_at: None,
                 autopilot_by: None,
-                identity: None,
                 theme: None,
                 agent: None,
                 supervised: None,
@@ -4982,19 +4919,10 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
 /// only, 4 MiB + 64 KiB and more. Every session is adopted, and the screen
 /// commitment equals the parent's. The negative control: a manifest past the
 /// consumer's own bound is still refused whole, before it is parsed.
-///
-/// IN A CHILD PROCESS ([`run_in_children`]), as
-/// `an_oversized_manifest_degrades_sessions_instead_of_being_written` is: the
-/// manifest is written and read under [`ENV_LOCK`].
 #[test]
 #[cfg(unix)]
 fn a_manifest_an_older_producer_wrote_past_the_write_cap_is_still_adopted() {
-    const CHILD: &str = "ATERM_OLDER_OVERCAP_MANIFEST_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        run_in_children(CHILD, 1);
-        return;
-    }
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     /// v0.98.0's build number: the producer of the next release's handoff.
     const V0_98_0: u64 = 1_790_607_299;
@@ -5102,7 +5030,7 @@ fn a_manifest_an_older_producer_wrote_past_the_write_cap_is_still_adopted() {
 #[test]
 #[cfg(unix)]
 fn a_semantically_refused_session_adopts_blank_and_the_proof_still_matches() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let mut staged = stage_outgoing_handoff("degrade", 3, None);
     let hostile_meta = |meta: &str| {
@@ -5191,7 +5119,7 @@ fn a_semantically_refused_session_adopts_blank_and_the_proof_still_matches() {
 #[test]
 #[cfg(unix)]
 fn an_unparseable_layout_still_adopts_every_session_and_proves() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let future_schema = |wire: &str| {
         assert!(wire.contains("schema = 2"), "today's wire: {wire}");
@@ -5242,7 +5170,7 @@ fn an_unparseable_layout_still_adopts_every_session_and_proves() {
 #[test]
 #[cfg(unix)]
 fn a_layout_naming_an_exited_pane_is_still_placed() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     // The outgoing desk: the two handed sessions, plus a tab whose pane
     // exited (id 9, never handed) and a Settings tab holding a draft.
@@ -5306,7 +5234,7 @@ fn a_layout_naming_an_exited_pane_is_still_placed() {
 #[test]
 #[cfg(unix)]
 fn an_unplaced_layout_hands_over_the_drafts_it_carried() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let missing_one = |wire: &str| {
         let mut layout = RestoreManifest::from_toml(wire).expect("today's wire parses");
@@ -5470,7 +5398,7 @@ fn a_held_panes_sid_crosses_unless_it_names_another_session() {
 #[test]
 #[cfg(unix)]
 fn a_descriptor_list_that_misses_a_session_is_the_producers_refusal() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("missingfd", 2, None);
     let (ready_read, ready_write) = pipe_pair("ready");
@@ -5516,7 +5444,7 @@ fn a_descriptor_list_that_misses_a_session_is_the_producers_refusal() {
 #[cfg(unix)]
 fn a_refused_handoff_closes_every_master_it_was_handed() {
     use aterm_spec::verify::validate_transition_tiered;
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("refusedmasters", 2, None);
     // Session 1 names a sidecar that is not its own, so it is refused only
@@ -5753,7 +5681,7 @@ fn a_repaint_checkpoint_owes_no_rows_back() {
 #[test]
 #[cfg(unix)]
 fn a_wrong_build_child_refuses_the_handoff() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("wrongbuild", 1, None);
     let (ready_read, ready_write) = pipe_pair("ready");
@@ -5783,7 +5711,7 @@ fn a_wrong_build_child_refuses_the_handoff() {
 #[test]
 #[cfg(unix)]
 fn a_wrong_session_set_cannot_match_the_parent_expectation() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("wrongset", 3, None);
     let (ready_read, ready_write) = pipe_pair("ready");
@@ -5824,7 +5752,7 @@ fn a_wrong_session_set_cannot_match_the_parent_expectation() {
 #[test]
 #[cfg(unix)]
 fn a_missing_or_foreign_commit_never_releases_the_readers() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("nocommit", 2, None);
     let (ready_read, ready_write) = pipe_pair("ready");

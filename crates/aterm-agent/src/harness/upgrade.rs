@@ -1057,11 +1057,23 @@ pub(super) fn relaunch_line_env_clear(
 /// a `cat` function) would hand the agent its decorations instead of the task.
 pub const TASK_OPERAND: &str = r#"-- "$(command cat -- "$ATERM_TASK_FILE")""#;
 
-/// [`relaunch_line_env`] for a WORKER's first line (`spawn agent=claude`):
-/// `env` and the quoted `exe` and `args` as a fresh start writes them, then
-/// [`TASK_OPERAND`] unquoted — the one text on any line this module writes
-/// that [`quote`] does not wrap, because it is a constant. Held to the same
-/// bound as every relaunch line, the operand included.
+/// [`TASK_OPERAND`]'s text as ONE `--prompt-interactive=<task>` argument,
+/// for a CLI whose interactive first prompt is that flag's value and takes
+/// no operand (Gemini CLI's yargs, agy's flag set: `super::worker`). The
+/// value is ATTACHED: each parser splits `--name=value` at its first `=` and
+/// keeps the rest whole, newlines included, where a value given as the next
+/// word is refused by yargs when it opens with `-` (`Not enough arguments
+/// following`). The same quoting as [`TASK_OPERAND`], so the same three
+/// shells hand the same bytes over.
+pub const TASK_PROMPT_INTERACTIVE: &str =
+    r#""--prompt-interactive=$(command cat -- "$ATERM_TASK_FILE")""#;
+
+/// [`relaunch_line_env`] for a WORKER's first line (`spawn agent=<word>`,
+/// `super::worker`): `env` and the quoted `exe` and `args` as a fresh start
+/// writes them, then the fixed `operand` unquoted ([`TASK_OPERAND`] or
+/// [`TASK_PROMPT_INTERACTIVE`]) — the one text on any line this module
+/// writes that [`quote`] does not wrap, because it is a constant. Held to
+/// the same bound as every relaunch line, the operand included.
 ///
 /// # Errors
 /// As [`relaunch_line_env`], and a line the operand takes past the bound.
@@ -1070,10 +1082,11 @@ pub fn task_line_env(
     env: &[(&str, &str)],
     exe: &Path,
     args: &[String],
+    operand: &str,
 ) -> Result<String, String> {
     let tty = LineDiscipline::HOST;
     let line = relaunch_line_on(tty, dialect, None, None, env, exe, args)?;
-    let line = format!("{line} {TASK_OPERAND}");
+    let line = format!("{line} {operand}");
     let max = tty.max_line();
     if line.len() > max {
         return Err(format!(

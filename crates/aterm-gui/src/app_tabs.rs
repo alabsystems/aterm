@@ -480,10 +480,6 @@ struct ConnectedPlan {
     origin_local: u64,
     /// The window a TAB lands in (`None` for a window).
     host: Option<WindowId>,
-    /// The identity the newborn wears, checked on the spawner.
-    identity: Option<String>,
-    /// Whether `identity` is the origin's, passed down (`identity=` absent).
-    inherited: bool,
     /// The folder the caller named (`cwd=`).
     cwd: Option<String>,
     /// Without `cwd=`, the origin's folder, unjudged: a held origin's is
@@ -913,59 +909,73 @@ impl App {
         tabs
     }
 
-    /// Refold ONE tab's indicator bits from its leaves, leaving the rest of its
-    /// presentation untouched. Returns whether the stored bits moved.
-    ///
-    /// The status path deliberately does not reuse
-    /// [`Self::refresh_aggregate_tab_presentation`]: that replaces the whole
-    /// presentation, which would drop the composed tooltip `tab_chrome_ext`
-    /// writes back until the next chrome pass. Bits only, and change-gated —
-    /// this runs at status-change rate, and a steady prompt must not dirty the
-    /// tab model.
+    /// Read leaf-owned indicator bits without touching terminal grids or titles.
+    fn tab_leaf_indicators(
+        &self,
+        wid: WindowId,
+        tab_id: crate::tab_model::TabId,
+    ) -> Option<crate::tab_model::TabIndicators> {
+        let tab = self.windows.get(&wid)?.tab_set.get(tab_id)?;
+        Some(
+            tab.root
+                .leaves()
+                .into_iter()
+                .filter_map(|view| match self.view_store.get(view)? {
+                    crate::tab_model::View::Terminal(terminal) => {
+                        Some(self.session_status_indicators(terminal.session))
+                    }
+                    crate::tab_model::View::Native(native) => self
+                        .native_runtime
+                        .presentation(native.instance, view)
+                        .ok()
+                        .map(|presentation| crate::tab_model::TabIndicators {
+                            dirty: presentation.indicators.dirty,
+                            busy: presentation.indicators.busy,
+                            attention: presentation.indicators.attention
+                                || self.edit_view_attention(view),
+                            status_attention: false,
+                        }),
+                })
+                .fold(crate::tab_model::TabIndicators::default(), |acc, bits| {
+                    crate::tab_model::TabIndicators {
+                        dirty: acc.dirty || bits.dirty,
+                        busy: acc.busy || bits.busy,
+                        attention: acc.attention || bits.attention,
+                        status_attention: acc.status_attention || bits.status_attention,
+                    }
+                }),
+        )
+    }
+
+    /// Refresh the native owners' indicators and the terminal classifier's
+    /// contribution together, preserving the composed title and tooltip.
+    pub(crate) fn refresh_native_tab_indicators(
+        &mut self,
+        wid: WindowId,
+        tab_id: crate::tab_model::TabId,
+    ) -> bool {
+        self.refresh_tab_indicators(wid, tab_id, true)
+    }
+
+    /// A terminal status update owns busy/status_attention, including native
+    /// siblings' current busy state. Native dirty/attention stay owner-managed.
     pub(crate) fn refresh_tab_status_indicators(
         &mut self,
         wid: WindowId,
         tab_id: crate::tab_model::TabId,
     ) -> bool {
-        // Fold the leaves' OWN status bits directly. Deliberately NOT via
-        // `aggregated_tab_presentation`: that path resolves a live title through
-        // a BLOCKING `term_lock` per leaf, and this runs on the output path — a
-        // pane flooding inside `process()` would park the UI thread on exactly
-        // the tab it is trying to light up. That regression is already fixed and
-        // regression-tested for tab titles (`tab_titles_keep_stale_on_contention_
-        // and_never_block`); it must not come back through the status path. No
-        // lock is needed anyway: indicators come from the classifier, not the
-        // grid.
-        let Some(sessions) = self.windows.get(&wid).and_then(|window| {
-            let tab = window.tab_set.get(tab_id)?;
-            let mut sessions = Vec::new();
-            tab.root.any_leaf(&mut |view| {
-                if let Some(crate::tab_model::View::Terminal(terminal)) = self.view_store.get(*view)
-                {
-                    sessions.push(terminal.session);
-                }
-                false
-            });
-            Some(sessions)
-        }) else {
+        self.refresh_tab_indicators(wid, tab_id, false)
+    }
+
+    fn refresh_tab_indicators(
+        &mut self,
+        wid: WindowId,
+        tab_id: crate::tab_model::TabId,
+        native_owner: bool,
+    ) -> bool {
+        let Some(folded) = self.tab_leaf_indicators(wid, tab_id) else {
             return false;
         };
-        if sessions.is_empty() {
-            return false;
-        }
-        // OR across leaves so one pane never hides another (the invariant
-        // `TabIndicators` exists for).
-        let folded = sessions
-            .into_iter()
-            .map(|session| self.session_status_indicators(session))
-            .fold(crate::tab_model::TabIndicators::default(), |acc, bits| {
-                crate::tab_model::TabIndicators {
-                    dirty: acc.dirty,
-                    busy: acc.busy || bits.busy,
-                    attention: acc.attention,
-                    status_attention: acc.status_attention || bits.status_attention,
-                }
-            });
         let Some(tab) = self.windows.get_mut(&wid).and_then(|window| {
             let index = window
                 .tab_set
@@ -976,18 +986,18 @@ impl App {
         }) else {
             return false;
         };
-        // The two RECOMPUTED bits are written wholesale; the two bits terminals
-        // do not own pass through untouched. `dirty` means unsaved editor state,
-        // and `attention` belongs to whichever native leaf raised it out of band
-        // (a failed document shutdown, an update announcement) — neither is
-        // derivable from a classifier, and neither may be erased by this pass.
-        // Because `status_attention` is its own field, this can be a plain
-        // assignment: the read-modify-write that used to latch a failure onto
-        // the tab for the process lifetime is simply gone.
         let indicators = crate::tab_model::TabIndicators {
-            dirty: tab.presentation.indicators.dirty,
+            dirty: if native_owner {
+                folded.dirty
+            } else {
+                tab.presentation.indicators.dirty
+            },
             busy: folded.busy,
-            attention: tab.presentation.indicators.attention,
+            attention: if native_owner {
+                folded.attention
+            } else {
+                tab.presentation.indicators.attention
+            },
             status_attention: folded.status_attention,
         };
         let changed = tab.presentation.indicators != indicators;
@@ -1068,6 +1078,96 @@ impl App {
         window.tabs = TabIndex::new(active, window.layouts.len());
         if window.tab_set.active_id() == Some(tab_id) {
             window.tabs.active = projection;
+        }
+    }
+
+    /// Open the singleton System State controller in the frontmost window.
+    /// Other windows keep independent view state and their current focus.
+    pub(crate) fn open_system_state_tab(&mut self) -> bool {
+        let Some(wid) = self.frontmost_window else {
+            return false;
+        };
+        self.open_system_state_tab_in_window(wid)
+    }
+
+    pub(crate) fn open_system_state_tab_in_window(&mut self, wid: WindowId) -> bool {
+        let existing = self.windows.get(&wid).and_then(|window| {
+            window.tab_set.tabs().iter().find_map(|tab| {
+                tab.root.leaves().into_iter().find_map(|view| {
+                    let crate::tab_model::View::Native(native) = self.view_store.get(view)? else {
+                        return None;
+                    };
+                    (self.native_runtime.app(native.instance)?.kind()
+                        == crate::native_app::AppKind::SystemState)
+                        .then_some((tab.id, view))
+                })
+            })
+        });
+        let (tab, view) = match existing {
+            Some(existing) => existing,
+            None => match self.stage_system_state_tab(wid) {
+                Ok((tab, view)) => (tab, view),
+                Err(_) => return false,
+            },
+        };
+        let Some(window) = self.windows.get_mut(&wid) else {
+            return false;
+        };
+        if !window.tab_set.switch_to(tab)
+            || !window
+                .tab_set
+                .active_mut()
+                .is_some_and(|tab| tab.set_focus(view))
+        {
+            return false;
+        }
+        cancel_pending_close(window);
+        window.last_present = None;
+        self.resync_active_or_window(wid);
+        self.sync_active_session();
+        if let Some(window) = self
+            .windows
+            .get(&wid)
+            .and_then(|window| window.os_window.as_ref())
+        {
+            window.focus_window();
+            window.request_redraw();
+        }
+        true
+    }
+
+    /// Always mint a view for restore; sharing a controller must not alias an
+    /// existing view when a saved split tree is rebuilt in the same window.
+    pub(crate) fn stage_system_state_tab(
+        &mut self,
+        wid: WindowId,
+    ) -> Result<(crate::tab_model::TabId, crate::tab_model::ViewId), NativeTabInstallError> {
+        let state = crate::native_app::AppViewState::SystemState(Box::default());
+        let presentation = crate::tab_model::TabPresentation {
+            title: "System State".into(),
+            icon: Some(crate::tab_model::TabIconKind::Settings),
+            indicators: crate::tab_model::TabIndicators::default(),
+            conn: None,
+            closable: true,
+            tooltip: Some("System State".into()),
+        };
+        if let Some(instance) = self
+            .native_runtime
+            .instance_by_kind(crate::native_app::AppKind::SystemState)
+        {
+            self.install_native_tab(wid, instance, state, presentation)
+        } else {
+            self.install_new_native_tab(
+                wid,
+                crate::native_app::NativeApp::SystemState(Box::new(
+                    crate::system_state::SystemStateApp::new(
+                        aterm_types::macos_setup::Plan::default(),
+                    ),
+                )),
+                state,
+                presentation,
+            )
+            .map(|(_, tab, view)| (tab, view))
         }
     }
 
@@ -1271,6 +1371,14 @@ impl App {
         &mut self,
         view: crate::tab_model::ViewId,
     ) -> Option<crate::tab_model::View> {
+        self.remove_view_link_for_close(view, crate::native_app::CloseScope::Window)
+    }
+
+    fn remove_view_link_for_close(
+        &mut self,
+        view: crate::tab_model::ViewId,
+        scope: crate::native_app::CloseScope,
+    ) -> Option<crate::tab_model::View> {
         let linked = self.view_store.get(view).copied()?;
         if let crate::tab_model::View::Native(native) = linked
             && let Some(document) = self.native_runtime.document_id(native.instance)
@@ -1301,6 +1409,8 @@ impl App {
                 )
             });
             if !still_referenced {
+                self.native_runtime
+                    .finish_system_state_close(native.instance, scope);
                 self.native_runtime.remove_instance(native.instance);
                 self.refresh_disambiguated_document_titles();
             }
@@ -2805,8 +2915,8 @@ impl App {
     /// spawned with; the window is built around it then.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the connected spawn's birth facts — kind, place, origin, cwd, the \
-                  agent identity and the theme — are each a per-spawn datum, and `done` \
+        reason = "the connected spawn's birth facts — kind, place, origin, cwd and the \
+                  theme — are each a per-spawn datum, and `done` \
                   is its answer; a wrapper struct would relocate the list, not simplify it"
     )]
     pub(crate) fn spawn_connected_session(
@@ -2815,7 +2925,6 @@ impl App {
         place: crate::connections::ConnectedSpawnPlace,
         origin: &aterm_session::SessionId,
         cwd: Option<String>,
-        identity: Option<crate::control::IdentitySpec>,
         theme: Option<crate::session_theme::SessionTheme>,
         done: crate::tab_spawn::SpawnDone,
     ) {
@@ -2823,18 +2932,16 @@ impl App {
         let ConnectedPlan {
             origin_local,
             host,
-            identity,
-            inherited,
             cwd,
             origin_folder,
-        } = match self.connected_spawn_plan(place, origin, cwd, identity) {
+        } = match self.connected_spawn_plan(place, origin, cwd) {
             Ok(plan) => plan,
             Err(why) => return done(self, Err(why)),
         };
         let lineage_parent = matches!(kind, Kind::Controlled).then(|| origin.clone());
         let observe = matches!(kind, Kind::Controller).then(|| origin.clone());
         // The origin's folder is judged on the spawner, as the focused pane's
-        // is for any tab or window, and so is the identity.
+        // is for any tab or window.
         let ask = crate::tab_spawn::SpawnAsk {
             admission: crate::tab_spawn::SpawnAdmission::Connected {
                 origin: origin.clone(),
@@ -2843,7 +2950,7 @@ impl App {
             folder_of: origin_folder,
             observe,
             theme,
-            ..crate::tab_spawn::SpawnAsk::requested(cwd, identity, inherited)
+            ..crate::tab_spawn::SpawnAsk::requested(cwd)
         };
         let then = Self::connected_landing(kind, origin.clone(), done);
         match place {
@@ -2875,28 +2982,14 @@ impl App {
     }
 
     /// A connected spawn's checks and inputs, before anything is created:
-    /// [`Self::connected_spawn_precheck`], the identity the newborn wears (the
-    /// spawner checks it), and its folder.
+    /// [`Self::connected_spawn_precheck`] and its folder.
     fn connected_spawn_plan(
         &self,
         place: crate::connections::ConnectedSpawnPlace,
         origin: &aterm_session::SessionId,
         cwd: Option<String>,
-        identity: Option<crate::control::IdentitySpec>,
     ) -> Result<ConnectedPlan, String> {
         let (origin_local, host) = self.connected_spawn_precheck(place, origin)?;
-        // IDENTITY (session identities, 2026-09-17): the ORIGIN is the aimed
-        // session of a connected spawn (the selector is discarded), so the
-        // newborn inherits its identity unless `identity=` says otherwise —
-        // the same rule as `@<sid> spawn`, the same only-create path: the
-        // spawner makes a named one, before the fork, once this precheck has
-        // admitted the spawn, and checks an inherited one
-        // ([`crate::tab_spawn::IdentityPrep::Admit`]), never this turn.
-        let inherited = identity.is_none();
-        let identity = crate::control::resolve_spawn_identity(
-            identity,
-            self.identity_of_local(origin_local).as_deref(),
-        );
         // Default the newborn's cwd to the ORIGIN's (design §6): the `of=`
         // target need not be the front pane the plain-spawn default would read.
         let origin_folder = if cwd.is_none() {
@@ -2907,8 +3000,6 @@ impl App {
         Ok(ConnectedPlan {
             origin_local,
             host,
-            identity,
-            inherited,
             cwd,
             origin_folder,
         })
@@ -5547,7 +5638,7 @@ impl App {
             return Err("focused view topology changed during close".to_string());
         }
         let removed_link = self
-            .remove_view_link(view)
+            .remove_view_link_for_close(view, crate::native_app::CloseScope::View)
             .ok_or_else(|| "focused view ownership could not detach".to_string())?;
         if let crate::tab_model::View::Terminal(terminal) = removed_link
             && self.detach_session_view(terminal.session)
@@ -5676,7 +5767,9 @@ impl App {
             // gesture's attribution for the later `close_window` teardown.
             self.stash_deferred_close_attribution(wid);
         }
-        self.remove_tab_views(&tab);
+        for view in tab.root.leaves() {
+            self.remove_view_link_for_close(view, crate::native_app::CloseScope::Tab);
+        }
         for session in terminal_sessions {
             self.teardown_session(session);
         }
@@ -7508,6 +7601,264 @@ impl App {
             // chip and arrows until the next unrelated authority act.
             self.overview_refresh_all();
         }
+    }
+}
+
+#[cfg(test)]
+mod system_state_runtime_tests {
+    use super::*;
+
+    fn edit_review(app: &mut App, wid: WindowId, view: crate::tab_model::ViewId) {
+        use crate::native_app::{ActionInvocation, AppEvent, SemanticInput};
+        for (key, value) in [
+            ("system-state/setting/0", SemanticInput::Bool(false)),
+            (
+                "system-state/url",
+                SemanticInput::Text("http://draft.local/v1/team".into()),
+            ),
+            (
+                "system-state/password",
+                SemanticInput::Text("inert-password".into()),
+            ),
+        ] {
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: crate::native_ui::ActionId::new(key),
+                    value: Some(value),
+                }),
+            )
+            .unwrap();
+        }
+    }
+
+    fn assert_review(app: &mut App, wid: WindowId) {
+        use crate::native_ui::{SemanticValue, UiKey};
+        assert!(app.open_system_state_tab_in_window(wid));
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        assert!(app.commit_glassless_native_frame(wid));
+        let ui = &app.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .unwrap()
+            .compiled;
+        for (key, value) in [
+            ("system-state/setting/0", SemanticValue::Bool(false)),
+            (
+                "system-state/url",
+                SemanticValue::Text("http://draft.local/v1/team".into()),
+            ),
+            ("system-state/password", SemanticValue::Text("•".repeat(14))),
+        ] {
+            assert_eq!(ui.semantic(&UiKey::new(key)).unwrap().value, value);
+        }
+        assert!(
+            app.native_runtime
+                .presentation(instance, view)
+                .unwrap()
+                .indicators
+                .dirty
+        );
+    }
+
+    #[test]
+    fn system_state_failed_window_close_preflight_keeps_the_shared_review() {
+        use crate::native_app::{ActionInvocation, AppEvent, CloseScope, TextInputEvent};
+        use crate::workstation_setup::Request;
+        use aterm_types::macos_setup::Plan;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.rows = 90;
+        window.cols = 160;
+        assert!(app.open_system_state_tab());
+        let (_, review) = app.active_native_view(wid).unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let request = Request::new(Plan::default(), send);
+        assert!(app.native_runtime.offer_system_state(request.clone()));
+        edit_review(&mut app, wid, review);
+        // A later Settings reducer refuses this same close transaction. The
+        // earlier System State preflight must not discard any reviewed input.
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        let (_, settings) = app.active_native_view(wid).unwrap();
+        for event in [
+            AppEvent::Action(ActionInvocation {
+                id: crate::native_ui::ActionId::new(format!(
+                    "settings/set/{}",
+                    crate::prefs::EDIT_FONT_FAMILY
+                )),
+                value: None,
+            }),
+            AppEvent::TextInput(TextInputEvent::SelectAll),
+            AppEvent::TextInput(TextInputEvent::Commit("Inert Draft Mono".into())),
+        ] {
+            app.dispatch_native_view_event(wid, settings, event)
+                .unwrap();
+        }
+        assert!(
+            !app.prepare_window_native_shutdown(wid, CloseScope::Window)
+                .unwrap()
+        );
+        assert!(!app.prepare_quit_native_shutdown().unwrap());
+        assert!(request.pending());
+        assert!(receive.try_recv().is_err());
+        assert_review(&mut app, wid);
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn system_state_second_window_close_preserves_review_until_its_final_view_closes() {
+        use crate::native_app::CloseScope;
+        use crate::workstation_setup::{Request, WorkstationSetupDecision};
+        use aterm_types::macos_setup::Plan;
+        for window_close in [false, true] {
+            let mut app = App::headless_for_test();
+            let first_window = WindowId(0);
+            let window = app.windows.get_mut(&first_window).unwrap();
+            window.rows = 90;
+            window.cols = 160;
+            assert!(app.open_system_state_tab());
+            let (instance, first) = app.active_native_view(first_window).unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            let request = Request::new(Plan::default(), send);
+            assert!(app.native_runtime.offer_system_state(request.clone()));
+            edit_review(&mut app, first_window, first);
+            app.stage_system_state_tab(first_window).unwrap();
+            let second_window = app.detach_active_tab_logical().unwrap();
+            assert_eq!(app.active_native_view(second_window).unwrap().0, instance);
+            assert!(
+                app.prepare_window_native_shutdown(second_window, CloseScope::Window)
+                    .unwrap()
+            );
+            if !window_close {
+                app.close_active_native_tab(second_window).unwrap();
+            }
+            app.close_window_logical(second_window);
+            assert!(request.pending());
+            assert!(receive.try_recv().is_err());
+            assert_review(&mut app, first_window);
+            assert!(app.structural_invariants_ok());
+            let expected = if window_close {
+                assert!(
+                    app.prepare_window_native_shutdown(first_window, CloseScope::Window)
+                        .unwrap()
+                );
+                app.close_window_logical(first_window);
+                WorkstationSetupDecision::Unavailable
+            } else {
+                app.close_active_native_tab(first_window).unwrap();
+                WorkstationSetupDecision::Cancel
+            };
+            assert_eq!(receive.try_recv().unwrap().decision, expected);
+            assert!(!request.pending());
+            assert!(app.native_runtime.app(instance).is_none());
+        }
+    }
+
+    #[test]
+    fn system_state_opens_from_control_reuses_singleton_and_reopens_without_pty_churn() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert_eq!(
+            app.open_app(crate::app_control::parse_open("app system-state").unwrap())
+                .unwrap(),
+            "app system-state"
+        );
+        let original = app.active_native_view(wid).unwrap();
+        let tab_count = app.windows[&wid].tab_set.len();
+        assert_eq!(
+            app.native_runtime
+                .app(original.0)
+                .unwrap()
+                .vtable()
+                .restore_tag,
+            "system-state"
+        );
+        assert!(matches!(
+            app.native_runtime.view_state(original.1),
+            Some(crate::native_app::AppViewState::SystemState(_))
+        ));
+        assert!(app.open_system_state_tab());
+        assert_eq!(app.active_native_view(wid), Some(original));
+        assert_eq!(app.windows[&wid].tab_set.len(), tab_count);
+        let descriptor = app
+            .native_restore_descriptor(app.windows[&wid].tab_set.active().unwrap())
+            .unwrap();
+        assert_eq!(descriptor, crate::restore::NativeTabRestore::SystemState);
+        app.close_active_native_tab(wid).unwrap();
+        app.reopen_last_closed_tab().unwrap();
+        let reopened = app.active_native_view(wid).unwrap();
+        assert_ne!(original, reopened, "closed runtime identities are retired");
+        assert_eq!(
+            app.pool.views(0),
+            Some(1),
+            "native opens and restore never create a PTY"
+        );
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn system_state_restore_mints_a_view_and_shares_the_existing_controller() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_system_state_tab());
+        let existing = app.active_native_view(wid).unwrap();
+        let descriptor = crate::restore::NativeTabRestore::SystemState;
+        app.closed_recovery.tabs.push(
+            crate::closed_recovery::ClosedTab {
+                original_window: wid,
+                original_index: 0,
+                tab: crate::restore::RestoredTab::from_legacy_native(&descriptor).unwrap(),
+            },
+            0,
+        );
+        app.reopen_last_closed_tab().unwrap();
+        let reopened = app.active_native_view(wid).unwrap();
+        assert_eq!(
+            existing.0, reopened.0,
+            "one System State controller across restored views"
+        );
+        assert_ne!(existing.1, reopened.1, "restore must never alias a view");
+        assert!(app.view_store.get(existing.1).is_some());
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn system_state_copies_the_url_selection_and_never_the_password() {
+        use crate::native_app::{ActionInvocation, AppEvent, SemanticInput, TextInputEvent};
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_system_state_tab());
+        let (_, view) = app.active_native_view(wid).unwrap();
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            AppEvent::FocusChanged(Some(crate::native_ui::UiKey::new("system-state/url"))),
+        )
+        .unwrap();
+        app.dispatch_native_view_event(wid, view, AppEvent::TextInput(TextInputEvent::SelectAll))
+            .unwrap();
+        assert_eq!(
+            app.native_selection_text(wid),
+            Some(aterm_types::macos_setup::Plan::default().vault_url)
+        );
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: crate::native_ui::ActionId::new("system-state/password"),
+                value: Some(SemanticInput::Text("synthetic_password_only".into())),
+            }),
+        )
+        .unwrap();
+        app.dispatch_native_view_event(wid, view, AppEvent::TextInput(TextInputEvent::SelectAll))
+            .unwrap();
+        assert_eq!(
+            app.native_selection_text(wid),
+            None,
+            "password selection never grants clipboard text"
+        );
     }
 }
 

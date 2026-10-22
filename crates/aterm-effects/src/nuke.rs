@@ -86,6 +86,7 @@ const NUKE_SKIRT: [PathCmd; 4] = [
 const NUKE_HOST_SALT: u64 = 0xB0FF_1E5E_D0D0_CA57;
 
 /// Cache key for one baked part at one size.
+#[inline]
 #[must_use]
 pub fn nuke_host_id(part: NukePart, w: u16, h: u16) -> u64 {
     let k = match part {
@@ -102,6 +103,7 @@ pub fn nuke_host_id(part: NukePart, w: u16, h: u16) -> u64 {
 /// Natural tile size for a cell. Width follows `cell_w` (the cloud is measured in columns) but
 /// is clamped to the baker's slot (`4 * cell_h` wide, `2 * cell_h` tall), which
 /// `CatBaker::host_tile` refuses to exceed.
+#[inline]
 #[must_use]
 pub fn nuke_nat_size(part: NukePart, cell_w: u16, cell_h: u16) -> (u16, u16) {
     let (cw, ch) = (f32::from(cell_w.max(1)), f32::from(cell_h.max(1)));
@@ -231,12 +233,14 @@ const CORE_HOT: u32 = 0x00FF_E9B0;
 
 /// Heat -> dust, on one clock for the whole cloud. Cooling starts once the bloom is well
 /// underway, so the cap first appears fire-lit.
+#[inline]
 fn cool(t_ms: u64) -> f32 {
     aterm_scene::smoothstep((t_ms.saturating_sub(1500) as f32 / 1600.0).clamp(0.0, 1.0))
 }
 
 /// Resolve one part at `t_ms`, or `None` when that part is not on screen yet
 /// (or any more). Pure: same input, same bytes.
+#[inline]
 #[must_use]
 pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
     let fade = |from: u64, span: u64| -> f32 {
@@ -308,6 +312,7 @@ pub fn nuke_draw(t_ms: u64, part: NukePart) -> Option<NukeDraw> {
 /// The molten core: the baked cap tile drawn again, smaller and hotter, at the foot of the head.
 /// One tint per sprite, so hue contrast inside the cloud takes a second sprite on the same tile.
 /// It dies while the dust cap is still spreading.
+#[inline]
 #[must_use]
 pub fn nuke_core_draw(t_ms: u64) -> Option<NukeDraw> {
     const CORE_END_MS: u64 = 2_900;

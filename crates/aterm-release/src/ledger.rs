@@ -203,6 +203,18 @@ impl GitRunner for GitCli {
     }
 }
 
+/// The `-c` pairs on every git that writes a tree (a checkout, an archive; a clone's config
+/// keeps them), so it writes the commit's bytes whatever the releaser's `core.autocrlf`,
+/// `core.eol` or global attributes file says. The repository's `.gitattributes` still apply.
+pub(crate) const BYTE_EXACT: [&str; 6] = [
+    "-c",
+    "core.autocrlf=false",
+    "-c",
+    "core.eol=lf",
+    "-c",
+    "core.attributesFile=/dev/null",
+];
+
 /// `git -C <repo>` that answers for that repository's objects as recorded and nothing
 /// else: every inherited `GIT_*` variable is removed (`GIT_DIR`, `GIT_OBJECT_DIRECTORY`,
 /// `GIT_GRAFT_FILE` … would answer for another repository or rewrite this one), no system
@@ -594,8 +606,8 @@ pub fn claim(
     }
     // The cut tree onto the release commit, where everything after the claim reads; the
     // reservation's ref goes, since main keeps the commit now.
-    git_ok(git, &["checkout", "-q", "--detach", release])
-        .map_err(|e| unjournaled(e.to_string()))?;
+    let checkout = ["checkout", "-q", "--detach", release];
+    git_ok(git, &[&BYTE_EXACT[..], &checkout].concat()).map_err(|e| unjournaled(e.to_string()))?;
     let head = rev_parse(git, "HEAD").map_err(|e| unjournaled(e.to_string()))?;
     if head != release {
         return Err(unjournaled(format!(
@@ -698,7 +710,7 @@ fn reservation_is_the_claims(
 /// each top-level `files` entry's bytes replaced (each must already be a blob there),
 /// committed with `parents` and `message` under the repository's configured identity. The
 /// blobs are hashed at their paths (`--path`), so the bytes match a commit made in a
-/// checkout.
+/// checkout under [`BYTE_EXACT`] (a releaser's `core.autocrlf` plus `core.safecrlf` would refuse it).
 ///
 /// # Errors
 /// A `base` with no such top-level blob, and any git failure.
@@ -717,10 +729,8 @@ pub fn commit_with(
         .collect();
     for (name, text) in files {
         let path = format!("--path={name}");
-        let blob = git.git_input(
-            &["hash-object", "-w", "--stdin", path.as_str()],
-            text.as_bytes(),
-        )?;
+        let hash = ["hash-object", "-w", "--stdin", path.as_str()];
+        let blob = git.git_input(&[&BYTE_EXACT[..], &hash].concat(), text.as_bytes())?;
         if !blob.success() {
             return Err(Error::new(format!(
                 "git hash-object {name} failed (exit {}): {}",
@@ -816,51 +826,15 @@ pub fn check_version_shape(version: &str) -> Result<()> {
 /// runner tests hand the code under test, and a fresh repository with its config.
 #[cfg(test)]
 pub(crate) mod testing {
-    use aterm_uds::spawnfd::{Command, command};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::OnceLock;
 
-    /// The executable a `git` from PATH ends up running, resolved once per process.
-    ///
-    /// macOS's `/usr/bin/git` is xcode-select's trampoline, which execs the developer
-    /// directory's git on every call (8.3 ms of CPU per `rev-parse HEAD` against 2.7 ms
-    /// direct) with the same argv, adding only SDK variables (`SDKROOT`, `CPATH`, …) git
-    /// does not read. Where the `git` on PATH is no trampoline this is that git.
-    pub(crate) fn git_path() -> &'static Path {
-        static GIT: OnceLock<PathBuf> = OnceLock::new();
-        GIT.get_or_init(|| {
-            let on_path = std::env::var_os("PATH")
-                .and_then(|path| {
-                    std::env::split_paths(&path)
-                        .map(|dir| dir.join("git"))
-                        .find(|candidate| candidate.is_file())
-                })
-                .unwrap_or_else(|| PathBuf::from("git"));
-            if !cfg!(target_os = "macos") || on_path != Path::new("/usr/bin/git") {
-                return on_path;
-            }
-            // What the trampoline asks (`xcrun --find`), so the same git.
-            command("/usr/bin/xcrun")
-                .args(["--find", "git"])
-                .output()
-                .ok()
-                .filter(|out| out.status.success())
-                .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
-                .filter(|found| found.is_file())
-                .unwrap_or(on_path)
-        })
-    }
-
-    /// `git`, for a fixture's own setup and reads ([`git_path`]).
-    pub(crate) fn git() -> Command {
-        command(git_path())
-    }
+    pub(crate) use aterm_uds::fixture_git::git;
 
     /// The [`GitRunner`](super::GitRunner) a test hands the code under test:
-    /// [`GitCli`](super::GitCli)'s `git -C <repo> <args…>`, run by [`git_path`] rather than
-    /// the trampolined `git` on PATH. `GitCli` still runs wherever the code under test
-    /// builds its own.
+    /// [`GitCli`](super::GitCli)'s `git -C <repo> <args…>`, run by [`git`] (the direct git,
+    /// isolated from this machine) rather than the trampolined `git` on PATH. `GitCli` still
+    /// runs wherever the code under test builds its own.
     pub(crate) struct Git {
         repo: PathBuf,
     }

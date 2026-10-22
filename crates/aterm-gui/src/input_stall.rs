@@ -2389,7 +2389,7 @@ pub(crate) mod tests {
 
     /// A yielding turn asks the gate again before its first byte: the dispatch asks once, when
     /// the turn arrives, and its yield (parked until the human's ribbon exhales, τ = 2 s; here
-    /// 0.40 against a 0.20 floor, a crossing at 2·ln 2 ≈ 1.39 s) can outlast the moment the
+    /// 0.201 against a 0.20 floor, a crossing at 2·ln 1.005 ≈ 10 ms) can outlast the moment the
     /// watch publishes a stall. Unpublished, the second ask warns and the turn types and
     /// presses behind the Enter. Published during the yield, it refuses `ERR busy input-unread`
     /// and the turn types nothing: the slave reads exactly the human's `\r`.
@@ -2448,7 +2448,7 @@ pub(crate) mod tests {
             Admission::Open,
             "the turn arrives while the Enter is young: the dispatch lets it in"
         );
-        let reply = turn(0.40, false, request);
+        let reply = turn(0.201, false, request);
         assert!(reply.starts_with("OK "), "{reply}");
         assert_eq!(slave_read_all(slave), b"\rhi\r", "typed behind a slow read");
 
@@ -2458,7 +2458,7 @@ pub(crate) mod tests {
             .write_frame_nonparking(b"\r")
             .expect("the human's Enter");
         assert_eq!(admission(&h.ctx, "turn", "", false), Admission::Open);
-        let reply = turn(0.40, true, request);
+        let reply = turn(0.201, true, request);
         assert!(
             reply.starts_with("ERR busy input-unread bytes=1 "),
             "{reply}"

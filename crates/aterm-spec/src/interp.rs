@@ -21,8 +21,8 @@
 //! TLA+-generation-only, since the integer interpreter cannot evaluate them (`Expr` panics by
 //! design). Callers gate on `m.fn_vars.is_empty()`; the tiered helpers in [`crate::verify`] do.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::compiled::Compiled;
 use crate::derive::{Liveness, Model, Value};
@@ -30,51 +30,99 @@ use crate::derive::{Liveness, Model, Value};
 /// One concrete interpreter state: every scalar variable's value.
 pub type State = BTreeMap<&'static str, i64>;
 
-/// A reached state's identity in a `seen` set: its values, in sorted-name order. Every state of
-/// one model binds the same variables, so the names add nothing to the identity but a string
-/// compare per probe.
-fn state_key(s: &State) -> Vec<i64> {
-    s.values().copied().collect()
-}
-
-/// A walk's reached states, by [`state_key`], each numbered in the order first seen. Only
-/// membership and that number are asked, so it is a hash table keyed by [`key_hash`] (cheaper
-/// than `[i64]`'s byte-fed `Hash`). Keys sharing a hash are chained through `next` and told
-/// apart by comparing the keys, so a collision costs a comparison, never a wrong answer.
+/// A compiled walk's reached states, each numbered in the order first seen. Only membership
+/// and that number are asked, so it is an open-addressed hash table of numbers, placed by
+/// [`key_hash`] and probed linearly. Each entry carries its key's hash's top half beside the
+/// number, so a probe compares keys only when those agree: a collision costs a comparison,
+/// never a wrong answer.
+///
+/// Every state of one compiled model is as wide as the next, so the states sit back to back in
+/// one buffer and state `i` is its `i`-th run of that width: numbering a state copies its
+/// values in and allocates nothing once the buffers have grown, and the state IS its key
+/// ([`Reached`]).
 #[derive(Default)]
 struct Seen {
-    /// Hash -> the most recently numbered key with that hash.
-    head: HashMap<u64, usize, BuildHasherDefault<PassThrough>>,
-    /// Number -> key.
-    keys: Vec<Vec<i64>>,
-    /// Number -> the previously numbered key with the same hash, if any.
-    next: Vec<Option<usize>>,
+    /// Slot -> the top half of a key's hash, above 1 + that key's number (0 for an empty
+    /// slot): a power of two long (or empty), at most half full.
+    table: Vec<u64>,
+    /// Every state's values, in number order.
+    values: Vec<i64>,
+    /// How many values each state has (the first state's).
+    width: usize,
+    /// How many states are numbered.
+    len: usize,
 }
 
+/// A [`Seen`] entry's hash half.
+const TAG: u64 = !0 << 32;
+
 impl Seen {
-    /// The number `key` was given, if it has been seen.
-    // Skip: hash-table probe and chain indexing over the walk's own keys (absent std bodies).
+    /// State number `i`.
+    // Skip: slice indexing over the table's own buffer (absent std bodies).
     #[cfg_attr(trust_verify, trust::skip)]
-    fn find(&self, key: &[i64]) -> Option<usize> {
-        let mut at = self.head.get(&key_hash(key)).copied();
-        while let Some(i) = at {
-            if self.keys[i] == key {
-                return Some(i);
-            }
-            at = self.next[i];
-        }
-        None
+    fn key(&self, i: usize) -> &[i64] {
+        &self.values[i * self.width..(i + 1) * self.width]
     }
 
-    /// Number `key`, which must not have been seen; returns its number.
-    // Skip: same class as `find`.
+    /// Where a key whose hash's top half is `tag` starts its probe: the hash's top bits,
+    /// which its last multiply mixed from every value.
+    fn home(&self, tag: u64) -> usize {
+        // A power-of-two length of at least 16 and below 2^32 slots: `tag >> shift` is a
+        // slot.
+        (tag >> (64 - self.table.len().trailing_zeros())) as usize
+    }
+
+    /// `key`'s number, and whether this call gave it (`false`: it had been seen).
+    // Skip: hash-table probe, growth and indexing over the walk's own keys (absent std bodies).
     #[cfg_attr(trust_verify, trust::skip)]
-    fn add(&mut self, key: Vec<i64>) -> usize {
-        let id = self.keys.len();
-        let h = key_hash(&key);
-        self.next.push(self.head.insert(h, id));
-        self.keys.push(key);
-        id
+    fn number(&mut self, key: &[i64]) -> (usize, bool) {
+        let id = self.len;
+        if id == 0 {
+            self.width = key.len();
+        }
+        debug_assert_eq!(key.len(), self.width, "one walk's states are equally wide");
+        if (id + 1) * 2 > self.table.len() {
+            self.grow();
+        }
+        let tag = key_hash(key) & TAG;
+        let mask = self.table.len() - 1;
+        let mut at = self.home(tag);
+        loop {
+            let entry = self.table[at];
+            if entry == 0 {
+                break;
+            }
+            if entry & TAG == tag {
+                let i = (entry & !TAG) as usize - 1;
+                if self.key(i) == key {
+                    return (i, false);
+                }
+            }
+            at = (at + 1) & mask;
+        }
+        self.table[at] = tag | (id as u64 + 1);
+        self.values.extend_from_slice(key);
+        self.len += 1;
+        (id, true)
+    }
+
+    /// Double the table (16 slots at first) and place every entry again.
+    // Skip: same class as `number`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn grow(&mut self) {
+        let len = (self.table.len() * 2).max(16);
+        let old = std::mem::replace(&mut self.table, vec![0; len]);
+        let mask = len - 1;
+        for entry in old {
+            if entry == 0 {
+                continue;
+            }
+            let mut at = self.home(entry & TAG);
+            while self.table[at] != 0 {
+                at = (at + 1) & mask;
+            }
+            self.table[at] = entry;
+        }
     }
 }
 
@@ -90,22 +138,82 @@ fn key_hash(key: &[i64]) -> u64 {
     h
 }
 
-/// The [`Seen`] table's hasher: its keys are already [`key_hash`]es.
-#[derive(Default)]
-struct PassThrough(u64);
+/// `0..n`, counted by a type of this crate's own. The walks loop over actions and successors
+/// once per state; a `Range<usize>` loop there runs a dependency's unoptimized copy of
+/// `Range::next` (an opt-level-1 crate links the generic copies its dependencies export rather
+/// than inlining its own), which took about a tenth of the non-vacuity sweep.
+struct Upto {
+    at: usize,
+    end: usize,
+}
 
-impl Hasher for PassThrough {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        // Only `u64` keys reach this table; any other input is still hashed.
-        for &byte in bytes {
-            self.0 = (self.0.rotate_left(8) ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+fn upto(end: usize) -> Upto {
+    Upto { at: 0, end }
+}
+
+impl Iterator for Upto {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        if self.at < self.end {
+            self.at += 1;
+            Some(self.at - 1)
+        } else {
+            None
         }
     }
-    fn write_u64(&mut self, n: u64) {
-        self.0 = n;
+}
+
+/// A walk's reached states, numbered in the order first seen. Every walk here is breadth-first
+/// and queues a state exactly when it numbers it, so the numbers ARE the queue: the state to
+/// expand next is the lowest number not yet expanded, and no state is held twice.
+trait Reached<S: ?Sized>: Default {
+    /// How many states are numbered.
+    fn len(&self) -> usize;
+    /// State number `i`.
+    fn get(&self, i: usize) -> &S;
+    /// `s`'s number, and whether this call gave it (`false`: it had been seen).
+    fn number(&mut self, s: &S) -> (usize, bool);
+}
+
+/// A compiled walk's states: each is its key, so the table holds them.
+impl Reached<[i64]> for Seen {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn get(&self, i: usize) -> &[i64] {
+        self.key(i)
+    }
+    fn number(&mut self, s: &[i64]) -> (usize, bool) {
+        Seen::number(self, s)
+    }
+}
+
+/// A by-name walk's states, each kept as written and numbered by the whole state, its names
+/// with its values: a model walked by name may grow a state by a key, so two states can hold
+/// the same values under different names (`{a: 0, b: 1}` and `{a: 0, c: 1}`).
+#[derive(Default)]
+struct Kept {
+    numbers: HashMap<State, usize>,
+    states: Vec<State>,
+}
+
+impl Reached<State> for Kept {
+    fn len(&self) -> usize {
+        self.states.len()
+    }
+    fn get(&self, i: usize) -> &State {
+        &self.states[i]
+    }
+    // Skip: a hash-map probe and insert over the walk's own states (absent std bodies).
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn number(&mut self, s: &State) -> (usize, bool) {
+        if let Some(&id) = self.numbers.get(s) {
+            return (id, false);
+        }
+        let id = self.states.len();
+        self.numbers.insert(s.clone(), id);
+        self.states.push(s.clone());
+        (id, true)
     }
 }
 
@@ -116,30 +224,35 @@ impl Hasher for PassThrough {
 /// expressions resolved once to slice indices (its module docs say why they agree). Every walk
 /// below is written once over this trait and runs compiled whenever the model can be, which is
 /// every model whose updates write only declared variables.
+///
+/// A walk allocates per state only what its own form needs: the compiled form writes each
+/// step's successors into one reused buffer ([`Walker::Next`]), copies the state it expands
+/// into another ([`Walker::Held`]), and numbers a new state by copying its values into the
+/// [`Seen`] table, so a step that revisits a state allocates nothing.
 trait Walker {
-    /// A state as the walk holds it.
-    type S: Clone + PartialEq;
+    /// A state as the walk reads it.
+    type S: ?Sized + PartialEq;
+    /// The states a walk has numbered ([`Reached`]).
+    type Reached: Reached<Self::S>;
+    /// The state being expanded, copied out of [`Walker::Reached`] (which grows meanwhile) into
+    /// a holder reused for every state of the walk.
+    type Held: Default + std::borrow::Borrow<Self::S>;
+    /// One step's successors, in a buffer reused for every step of the walk.
+    type Next: Default;
     /// What every action and invariant at one state reads (loop-invariant
-    /// across them, so built once per popped state — see `bmc`).
+    /// across them, so built once per expanded state — see `bmc`).
     type Env;
-    fn init(&self) -> Self::S;
+    fn init(&self) -> Self::Held;
+    /// Copy `s` into `held`.
+    fn hold(&self, s: &Self::S, held: &mut Self::Held);
     fn env(&self, s: &Self::S) -> Self::Env;
     /// Whether invariant `i` holds at `s`.
     fn holds(&self, env: &Self::Env, s: &Self::S, i: usize) -> bool;
-    /// Every successor of `s` under action `a`, in [`Model::successors_in`]'s order.
-    fn successors(&self, env: &Self::Env, s: &Self::S, a: usize) -> Vec<Self::S>;
-    /// `s`'s number in `seen`, if it has been seen.
-    fn lookup(&self, seen: &Seen, s: &Self::S) -> Option<usize>;
-    /// `s`'s [`state_key`].
-    fn key(&self, s: &Self::S) -> Vec<i64>;
-    /// Record `s` in `seen`; `true` if it is new.
-    fn first_sight(&self, seen: &mut Seen, s: &Self::S) -> bool {
-        if self.lookup(seen, s).is_some() {
-            return false;
-        }
-        seen.add(self.key(s));
-        true
-    }
+    /// Every successor of `s` under action `a`, in [`Model::successors_in`]'s order, into
+    /// `next` (replacing what it held); returns how many.
+    fn successors(&self, env: &Self::Env, s: &Self::S, a: usize, next: &mut Self::Next) -> usize;
+    /// Successor `k` of the last [`Walker::successors`] into `next`.
+    fn nth<'n>(&self, next: &'n Self::Next, k: usize) -> &'n Self::S;
     /// `s` as the public [`State`].
     fn state(&self, s: &Self::S) -> State;
 }
@@ -149,9 +262,15 @@ struct ByName<'m>(&'m Model);
 
 impl Walker for ByName<'_> {
     type S = State;
+    type Reached = Kept;
+    type Held = State;
+    type Next = Vec<State>;
     type Env = BTreeMap<&'static str, i64>;
     fn init(&self) -> State {
         self.0.init_state()
+    }
+    fn hold(&self, s: &State, held: &mut State) {
+        held.clone_from(s);
     }
     fn env(&self, s: &State) -> Self::Env {
         self.0.eval_env(s)
@@ -164,44 +283,82 @@ impl Walker for ByName<'_> {
     }
     // Skip: same class as `holds` above.
     #[cfg_attr(trust_verify, trust::skip)]
-    fn successors(&self, env: &Self::Env, s: &State, a: usize) -> Vec<State> {
-        self.0.successors_in(&self.0.actions[a], env, s)
+    fn successors(&self, env: &Self::Env, s: &State, a: usize, next: &mut Vec<State>) -> usize {
+        *next = self.0.successors_in(&self.0.actions[a], env, s);
+        next.len()
     }
-    fn lookup(&self, seen: &Seen, s: &State) -> Option<usize> {
-        seen.find(&state_key(s))
-    }
-    fn key(&self, s: &State) -> Vec<i64> {
-        state_key(s)
+    fn nth<'n>(&self, next: &'n Vec<State>, k: usize) -> &'n State {
+        &next[k]
     }
     fn state(&self, s: &State) -> State {
         s.clone()
     }
 }
 
-/// The model resolved once: [`Walker`] over value slices in sorted-name order,
-/// which is exactly the [`state_key`] identity.
+/// The model resolved once: [`Walker`] over value slices in sorted-name order. Every state of
+/// a compiled model binds the same names, so its values are its identity.
 impl Walker for Compiled {
-    type S = Vec<i64>;
+    type S = [i64];
+    type Reached = Seen;
+    type Held = Vec<i64>;
+    type Next = Vec<i64>;
     type Env = ();
     fn init(&self) -> Vec<i64> {
         Compiled::init(self)
     }
-    fn env(&self, _: &Vec<i64>) {}
-    fn holds(&self, (): &(), s: &Vec<i64>, i: usize) -> bool {
+    fn hold(&self, s: &[i64], held: &mut Vec<i64>) {
+        held.clear();
+        held.extend_from_slice(s);
+    }
+    fn env(&self, _: &[i64]) {}
+    fn holds(&self, (): &(), s: &[i64], i: usize) -> bool {
         Compiled::holds(self, i, s)
     }
-    fn successors(&self, (): &(), s: &Vec<i64>, a: usize) -> Vec<Vec<i64>> {
-        Compiled::successors(self, a, s)
+    fn successors(&self, (): &(), s: &[i64], a: usize, next: &mut Vec<i64>) -> usize {
+        Compiled::successors_into(self, a, s, next)
     }
-    fn lookup(&self, seen: &Seen, s: &Vec<i64>) -> Option<usize> {
-        // By borrow: a revisit, the common case, allocates nothing.
-        seen.find(s)
+    fn nth<'n>(&self, next: &'n Vec<i64>, k: usize) -> &'n [i64] {
+        let width = self.width();
+        &next[k * width..(k + 1) * width]
     }
-    fn key(&self, s: &Vec<i64>) -> Vec<i64> {
-        s.clone()
-    }
-    fn state(&self, s: &Vec<i64>) -> State {
+    fn state(&self, s: &[i64]) -> State {
         Compiled::state(self, s)
+    }
+}
+
+/// One breadth-first walk's working set, each part reused for the whole walk: the states
+/// numbered so far (which are also the queue, [`Reached`]), the state being expanded, and one
+/// step's successors.
+struct Walk<W: Walker> {
+    reached: W::Reached,
+    held: W::Held,
+    next: W::Next,
+    /// How many states have been expanded: the next to expand is this number.
+    expanded: usize,
+}
+
+impl<W: Walker> Walk<W> {
+    /// A walk with `w`'s initial state numbered (0) and nothing expanded.
+    fn new(w: &W) -> Self {
+        let mut reached = W::Reached::default();
+        reached.number(w.init().borrow());
+        Self {
+            reached,
+            held: W::Held::default(),
+            next: W::Next::default(),
+            expanded: 0,
+        }
+    }
+
+    /// Hold the next state to expand, in the order numbered; `false` once every numbered state
+    /// has been expanded.
+    fn pop(&mut self, w: &W) -> bool {
+        if self.expanded == self.reached.len() {
+            return false;
+        }
+        w.hold(self.reached.get(self.expanded), &mut self.held);
+        self.expanded += 1;
+        true
     }
 }
 
@@ -363,37 +520,31 @@ pub fn bmc_fired(m: &Model) -> BmcFired {
 fn bmc_on<W: Walker>(m: &Model, w: &W) -> (Result<usize, (State, &'static str)>, Vec<bool>) {
     // Per action: a successor from some state checked so far.
     let mut fired = vec![false; m.actions.len()];
-    let mut seen = Seen::default();
-    let mut q: VecDeque<W::S> = VecDeque::new();
-    let init = w.init();
-    w.first_sight(&mut seen, &init);
-    q.push_back(init);
-    let mut n = 0usize;
-    while let Some(st) = q.pop_front() {
-        n += 1;
+    let mut walk = Walk::new(w);
+    while walk.pop(w) {
         assert!(
-            n < MAX_STATES,
+            walk.expanded < MAX_STATES,
             "{} state space unexpectedly large — tighten bounds",
             m.name
         );
+        let st = walk.held.borrow();
         // The env is a pure function of (consts, pre-state), so it is built once per state
         // rather than once per invariant and per action.
-        let env = w.env(&st);
+        let env = w.env(st);
         for (i, inv) in m.invariants.iter().enumerate() {
-            if !w.holds(&env, &st, i) {
-                return (Err((w.state(&st), inv.name)), fired);
+            if !w.holds(&env, st, i) {
+                return (Err((w.state(st), inv.name)), fired);
             }
         }
         for (a, fired) in fired.iter_mut().enumerate() {
-            for ns in w.successors(&env, &st, a) {
-                *fired = true;
-                if w.first_sight(&mut seen, &ns) {
-                    q.push_back(ns);
-                }
+            let made = w.successors(&env, st, a, &mut walk.next);
+            *fired |= made > 0;
+            for k in upto(made) {
+                walk.reached.number(w.nth(&walk.next, k));
             }
         }
     }
-    (Ok(n), fired)
+    (Ok(walk.expanded), fired)
 }
 
 /// The prove-and-catch protocol (the `Buggy` convention), interpreter tier: the invariants hold
@@ -500,14 +651,9 @@ fn violated_invariants_on<W: Walker>(
 ) -> BTreeSet<&'static str> {
     let mut violated: BTreeSet<&'static str> = BTreeSet::new();
     let mut live: Vec<usize> = (0..m.invariants.len()).collect();
-    let mut seen = Seen::default();
-    let mut q: VecDeque<W::S> = VecDeque::new();
-    let init = w.init();
-    w.first_sight(&mut seen, &init);
-    q.push_back(init);
-    let mut n = 0usize;
-    while let Some(st) = q.pop_front() {
-        n += 1;
+    let mut walk = Walk::new(w);
+    while walk.pop(w) {
+        let n = walk.expanded;
         if stop_at_budget && n >= MAX_STATES {
             return violated;
         }
@@ -516,14 +662,13 @@ fn violated_invariants_on<W: Walker>(
             "{} state space unexpectedly large — tighten bounds",
             m.name
         );
-        let env = w.env(&st);
-        // Evaluate every live invariant here before dropping any: each one's isolated run
-        // reaches this state, so a panic in one is a panic its isolated run hits.
-        let failed: Vec<bool> = live.iter().map(|&i| !w.holds(&env, &st, i)).collect();
-        let mut k = 0;
+        let st = walk.held.borrow();
+        let env = w.env(st);
+        // Every live invariant is evaluated here, in model order, before the walk goes on
+        // (`retain` visits each once): each one's isolated run reaches this state, so a panic
+        // in one is a panic its isolated run hits.
         live.retain(|&i| {
-            let keep = !failed[k];
-            k += 1;
+            let keep = w.holds(&env, st, i);
             if !keep {
                 violated.insert(m.invariants[i].name);
             }
@@ -532,11 +677,10 @@ fn violated_invariants_on<W: Walker>(
         if live.is_empty() {
             return violated;
         }
-        for a in 0..m.actions.len() {
-            for ns in w.successors(&env, &st, a) {
-                if w.first_sight(&mut seen, &ns) {
-                    q.push_back(ns);
-                }
+        for a in upto(m.actions.len()) {
+            let made = w.successors(&env, st, a, &mut walk.next);
+            for k in upto(made) {
+                walk.reached.number(w.nth(&walk.next, k));
             }
         }
     }
@@ -567,32 +711,30 @@ pub fn fired_actions(m: &Model) -> BTreeSet<&'static str> {
 // Skip: same BFS driver class as `bmc`; the body of `fired_actions`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn fired_actions_on<W: Walker>(m: &Model, w: &W) -> BTreeSet<&'static str> {
-    let mut seen = Seen::default();
-    let mut fired: BTreeSet<&'static str> = BTreeSet::new();
-    let mut q: VecDeque<W::S> = VecDeque::new();
-    let init = w.init();
-    w.first_sight(&mut seen, &init);
-    q.push_back(init);
-    let mut n = 0usize;
-    while let Some(st) = q.pop_front() {
-        n += 1;
+    let mut fired = vec![false; m.actions.len()];
+    let mut walk = Walk::new(w);
+    while walk.pop(w) {
         assert!(
-            n < MAX_STATES,
+            walk.expanded < MAX_STATES,
             "{} state space unexpectedly large — tighten bounds",
             m.name
         );
-        // One env per popped state, shared by every action — see `bmc`.
-        let env = w.env(&st);
-        for (a, act) in m.actions.iter().enumerate() {
-            for ns in w.successors(&env, &st, a) {
-                fired.insert(act.name);
-                if w.first_sight(&mut seen, &ns) {
-                    q.push_back(ns);
-                }
+        let st = walk.held.borrow();
+        // One env per expanded state, shared by every action — see `bmc`.
+        let env = w.env(st);
+        for (a, fired) in fired.iter_mut().enumerate() {
+            let made = w.successors(&env, st, a, &mut walk.next);
+            *fired |= made > 0;
+            for k in upto(made) {
+                walk.reached.number(w.nth(&walk.next, k));
             }
         }
     }
-    fired
+    m.actions
+        .iter()
+        .zip(fired)
+        .filter_map(|(a, f)| f.then_some(a.name))
+        .collect()
 }
 
 /// Whether each of `actions` is a VIOLATION STEP of `m`: it fires from some
@@ -633,7 +775,7 @@ pub fn violation_steps(m: &Model, actions: &[&str]) -> Vec<Option<bool>> {
 // Skip: same BFS driver class as `bmc`; the body of `violation_steps`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn violation_steps_on<W: Walker>(m: &Model, w: &W, watched: &[usize]) -> Vec<Option<bool>> {
-    let lawful = |env: &W::Env, s: &W::S| (0..m.invariants.len()).all(|i| w.holds(env, s, i));
+    let lawful = |env: &W::Env, s: &W::S| upto(m.invariants.len()).all(|i| w.holds(env, s, i));
     // Per watched action: fired from a lawful state; one such firing landed lawful.
     let mut fired = vec![false; watched.len()];
     let mut landed_lawful = vec![false; watched.len()];
@@ -645,31 +787,28 @@ fn violation_steps_on<W: Walker>(m: &Model, w: &W, watched: &[usize]) -> Vec<Opt
             .collect()
     };
     let mut open = watched.len();
-    let mut seen = Seen::default();
-    let mut q: VecDeque<W::S> = VecDeque::new();
-    let init = w.init();
-    w.first_sight(&mut seen, &init);
-    q.push_back(init);
-    let mut n = 0usize;
-    while let Some(st) = q.pop_front() {
-        n += 1;
+    let mut walk = Walk::new(w);
+    while walk.pop(w) {
         assert!(
-            n < MAX_STATES,
+            walk.expanded < MAX_STATES,
             "{} state space unexpectedly large — tighten bounds",
             m.name
         );
-        let env = w.env(&st);
-        let from_lawful = lawful(&env, &st);
-        for a in 0..m.actions.len() {
+        let st = walk.held.borrow();
+        let env = w.env(st);
+        let from_lawful = lawful(&env, st);
+        for a in upto(m.actions.len()) {
             let watching = from_lawful && watched.contains(&a);
-            for ns in w.successors(&env, &st, a) {
+            let made = w.successors(&env, st, a, &mut walk.next);
+            for j in upto(made) {
+                let ns = w.nth(&walk.next, j);
                 if watching {
                     // Judged once per successor, and only while it can still decide something.
                     let mut lands_lawful = None;
                     for (k, _) in watched.iter().enumerate().filter(|&(_, &x)| x == a) {
                         fired[k] = true;
                         if !landed_lawful[k]
-                            && *lands_lawful.get_or_insert_with(|| lawful(&w.env(&ns), &ns))
+                            && *lands_lawful.get_or_insert_with(|| lawful(&w.env(ns), ns))
                         {
                             landed_lawful[k] = true;
                             open -= 1;
@@ -679,9 +818,7 @@ fn violation_steps_on<W: Walker>(m: &Model, w: &W, watched: &[usize]) -> Vec<Opt
                         return verdicts(&fired, &landed_lawful);
                     }
                 }
-                if w.first_sight(&mut seen, &ns) {
-                    q.push_back(ns);
-                }
+                walk.reached.number(ns);
             }
         }
     }
@@ -711,27 +848,23 @@ pub fn reachable_states(m: &Model) -> Vec<State> {
 // Skip: same BFS driver class as `bmc`; the body of `reachable_states`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn reachable_on<W: Walker>(m: &Model, w: &W) -> Vec<State> {
-    let mut seen = Seen::default();
-    let mut q: VecDeque<W::S> = VecDeque::new();
     let mut all = Vec::new();
-    let init = w.init();
-    w.first_sight(&mut seen, &init);
-    q.push_back(init);
-    while let Some(st) = q.pop_front() {
+    let mut walk = Walk::new(w);
+    while walk.pop(w) {
         assert!(
-            all.len() + 1 < MAX_STATES,
+            walk.expanded < MAX_STATES,
             "{} state space unexpectedly large — tighten bounds",
             m.name
         );
-        let env = w.env(&st);
-        for a in 0..m.actions.len() {
-            for ns in w.successors(&env, &st, a) {
-                if w.first_sight(&mut seen, &ns) {
-                    q.push_back(ns);
-                }
+        let st = walk.held.borrow();
+        let env = w.env(st);
+        for a in upto(m.actions.len()) {
+            let made = w.successors(&env, st, a, &mut walk.next);
+            for k in upto(made) {
+                walk.reached.number(w.nth(&walk.next, k));
             }
         }
-        all.push(w.state(&st));
+        all.push(w.state(st));
     }
     all
 }
@@ -757,25 +890,21 @@ fn find_deadlock_on<W: Walker>(
     w: &W,
     is_final: &dyn Fn(&State) -> bool,
 ) -> Option<State> {
-    let mut seen = Seen::default();
-    let mut q: VecDeque<W::S> = VecDeque::new();
-    let init = w.init();
-    w.first_sight(&mut seen, &init);
-    q.push_back(init);
-    while let Some(st) = q.pop_front() {
+    let mut walk = Walk::new(w);
+    while walk.pop(w) {
         let mut any_succ = false;
-        // One env per popped state, shared by every action — see `bmc`.
-        let env = w.env(&st);
-        for a in 0..m.actions.len() {
-            for ns in w.successors(&env, &st, a) {
-                any_succ = true;
-                if w.first_sight(&mut seen, &ns) {
-                    q.push_back(ns);
-                }
+        let st = walk.held.borrow();
+        // One env per expanded state, shared by every action — see `bmc`.
+        let env = w.env(st);
+        for a in upto(m.actions.len()) {
+            let made = w.successors(&env, st, a, &mut walk.next);
+            any_succ |= made > 0;
+            for k in upto(made) {
+                walk.reached.number(w.nth(&walk.next, k));
             }
         }
         if !any_succ {
-            let st = w.state(&st);
+            let st = w.state(st);
             if !is_final(&st) {
                 return Some(st); // stuck, and not a legitimate work-complete terminal
             }
@@ -1020,55 +1149,53 @@ impl StateGraph {
 // Skip: keyed BFS over caller-built models (the `bmc` driver class) plus the deliberate
 // bounds-regression assert.
 #[cfg_attr(trust_verify, trust::skip)]
-fn explore_on<W: Walker>(m: &Model, w: &W) -> (StateGraph, Vec<W::S>) {
-    let init = w.init();
-    let mut ids = Seen::default();
-    ids.add(w.key(&init));
+fn explore_on<W: Walker>(m: &Model, w: &W) -> (StateGraph, W::Reached) {
     let mut graph = StateGraph {
         steps: vec![Vec::new()],
         parent: vec![None],
         fired: BTreeSet::new(),
     };
-    let mut walked: Vec<W::S> = vec![init];
-    let mut next = 0;
-    while next < walked.len() {
-        let st = walked[next].clone();
-        // One env per popped state, shared by every action — see `bmc`.
-        let env = w.env(&st);
+    let mut walk = Walk::new(w);
+    while walk.pop(w) {
+        let at = walk.expanded - 1;
+        let st = walk.held.borrow();
+        // One env per expanded state, shared by every action — see `bmc`.
+        let env = w.env(st);
         let mut out: Vec<(usize, usize)> = Vec::new();
         for (a, act) in m.actions.iter().enumerate() {
-            for ns in w.successors(&env, &st, a) {
+            let made = w.successors(&env, st, a, &mut walk.next);
+            if made > 0 {
                 // Before the stutter drop: a stutter still fires.
                 graph.fired.insert(act.name);
+            }
+            for k in upto(made) {
+                let ns = w.nth(&walk.next, k);
                 if ns == st {
                     continue; // a stutter: fairness neither demands nor credits it
                 }
-                let id = match w.lookup(&ids, &ns) {
-                    Some(id) => id,
-                    None => {
-                        let id = walked.len();
-                        assert!(
-                            id < MAX_STATES,
-                            "{} state space unexpectedly large — tighten bounds",
-                            m.name
-                        );
-                        let numbered = ids.add(w.key(&ns));
-                        debug_assert_eq!(numbered, id, "the graph numbers states as first seen");
-                        graph.steps.push(Vec::new());
-                        graph.parent.push(Some((a, next)));
-                        walked.push(ns);
-                        id
-                    }
-                };
+                let (id, new) = walk.reached.number(ns);
+                if new {
+                    assert!(
+                        id < MAX_STATES,
+                        "{} state space unexpectedly large — tighten bounds",
+                        m.name
+                    );
+                    debug_assert_eq!(
+                        id,
+                        graph.steps.len(),
+                        "the graph numbers states as first seen"
+                    );
+                    graph.steps.push(Vec::new());
+                    graph.parent.push(Some((a, at)));
+                }
                 if !out.contains(&(a, id)) {
                     out.push((a, id));
                 }
             }
         }
-        graph.steps[next] = out;
-        next += 1;
+        graph.steps[at] = out;
     }
-    (graph, walked)
+    (graph, walk.reached)
 }
 
 /// The action indices a fairness list names. An undeclared name panics: dropping a typo
@@ -1146,25 +1273,25 @@ enum Walked {
     /// The model resolved once and each state as its value slice: a liveness
     /// goal is evaluated without building an environment map per state, and a
     /// map is built only for a state a caller asks to see.
-    Compiled(Compiled, Vec<Vec<i64>>),
+    Compiled(Compiled, Seen),
     /// A model with no compiled form: each state as written.
-    ByName(Vec<State>),
+    ByName(Kept),
 }
 
 impl Walked {
     /// Graph state `i` as the public [`State`].
     fn state(&self, i: usize) -> State {
         match self {
-            Walked::Compiled(c, walked) => c.state(&walked[i]),
-            Walked::ByName(states) => states[i].clone(),
+            Walked::Compiled(c, walked) => c.state(walked.key(i)),
+            Walked::ByName(states) => states.get(i).clone(),
         }
     }
 
     /// `f` of graph state `i`, borrowed where the walk holds it as a [`State`].
     fn with_state<R>(&self, i: usize, f: impl FnOnce(&State) -> R) -> R {
         match self {
-            Walked::Compiled(c, walked) => f(&c.state(&walked[i])),
-            Walked::ByName(states) => f(&states[i]),
+            Walked::Compiled(c, walked) => f(&c.state(walked.key(i))),
+            Walked::ByName(states) => f(states.get(i)),
         }
     }
 }
@@ -1227,7 +1354,7 @@ impl Space {
             Walked::Compiled(c, walked) => {
                 let goal = c.expr(&self.model, &live.goal);
                 self.nonprogress_by_index(
-                    |i| match goal.eval(&walked[i]) {
+                    |i| match goal.eval(walked.key(i)) {
                         Value::Bool(holds) => holds,
                         Value::Int(_) => panic!(
                             "liveness goal `{}` of `{}` is an integer — model type error",
@@ -1522,6 +1649,37 @@ mod tests {
             !cycle.cycle.is_empty() && cycle.cycle.iter().all(|(a, _)| *a == "Retry"),
             "a real loop of retries, not a stall: {cycle}"
         );
+    }
+
+    /// A loop reached only through several steps is reported with the run that reaches it:
+    /// the stem retraces, from `Init`, how the walk first reached each state on the way.
+    #[test]
+    fn a_loop_several_steps_from_init_is_reported_with_the_run_that_reaches_it() {
+        let m = crate::ty_model! {
+            Approach {
+                const Buggy = 0;
+                var phase = 0;
+                var spin = 0;
+                var done = 0;
+                action Walk when (phase <= 1) { phase = phase + 1; }
+                action Spin when (phase == 2 && done == 0) {
+                    spin = if spin == 0 { 1 } else { 0 };
+                }
+                action Finish when (Buggy == 0 && phase == 2 && done == 0) { done = 1; }
+                invariant SpinIsAFlag: spin <= 1;
+            }
+        };
+        let done = |s: &State| s["done"] == 1;
+        let fair = Fairness {
+            weak: &["Walk", "Spin", "Finish"],
+            strong: &[],
+        };
+        assert_eq!(find_nonprogress_cycle(&m, done, &fair), None);
+        let buggy = with_buggy(&m, 1);
+        let cycle = find_nonprogress_cycle(&buggy, done, &fair).expect("the spin never finishes");
+        assert_lasso(&buggy, &cycle, done);
+        let stem: Vec<(&str, i64)> = cycle.stem.iter().map(|(a, s)| (*a, s["phase"])).collect();
+        assert_eq!(stem, [("Init", 0), ("Walk", 1), ("Walk", 2)]);
     }
 
     /// A lane that always reaches its goal is clean — and only because of the
@@ -1944,8 +2102,9 @@ mod tests {
             m.name
         );
         let ((gc, walked), (gb, by_name)) = (explore_on(m, &c), explore_on(m, &by));
+        let walked: Vec<&[i64]> = (0..walked.len()).map(|i| walked.key(i)).collect();
         let graph_states: Vec<State> = walked.iter().map(|s| c.state(s)).collect();
-        assert_eq!(graph_states, by_name, "{}: graph states", m.name);
+        assert_eq!(graph_states, by_name.states, "{}: graph states", m.name);
         assert_eq!(gc.steps, gb.steps, "{}: graph steps", m.name);
         assert_eq!(gc.parent, gb.parent, "{}: graph parents", m.name);
         assert_eq!(gc.fired, gb.fired, "{}: graph fired", m.name);
@@ -1958,9 +2117,9 @@ mod tests {
         for (i, name) in m.init_state().keys().enumerate() {
             assert_eq!(r.slot(name), i, "{}: slot of {name}", m.name);
         }
-        for (st, compact) in states.iter().zip(&walked) {
+        for (st, &compact) in states.iter().zip(&walked) {
             assert_eq!(&c.state(compact), st);
-            assert_eq!(&st.values().copied().collect::<Vec<_>>(), compact);
+            assert_eq!(st.values().copied().collect::<Vec<_>>(), compact);
             let env = m.eval_env(st);
             for (a, act) in m.actions.iter().enumerate() {
                 let compiled: Vec<State> = c
@@ -2160,6 +2319,133 @@ mod tests {
         let _ = c.holds(0, &[0]);
     }
 
+    /// Every read the model as written makes, the compiled form makes in the same order with
+    /// the same outcome: the same value, or the same panic at the same operand. The cases are
+    /// the ones a typed, flattened form could get wrong: a boolean where an integer is read and
+    /// the reverse, an operand a short circuit never reads, an `IF` arm not taken (in a boolean
+    /// and in an integer position), a `/\` chain whose atom
+    /// comparisons run as one step before an operand that panics, a constant `IF`, a
+    /// whole-expression read (a liveness goal) whose type its taken arm decides, and `\A`s
+    /// nested deeper than the evaluator keeps index slots on the stack for.
+    #[test]
+    fn the_compiled_form_reads_what_eval_reads_and_fails_where_eval_fails() {
+        use crate::derive::{
+            Expr, Invariant, StateVar, add, and_, bool_lit, eq, forall, gt, if_, iff, int, le, neq,
+            or_, sub, var,
+        };
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let outcome = |f: &dyn Fn() -> Value| match catch_unwind(AssertUnwindSafe(f)) {
+            Ok(v) => Ok(v),
+            Err(p) => Err(p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|m| (*m).to_string()))
+                .unwrap_or_default()),
+        };
+        let x0 = || le(var("x"), int(0));
+        let y1 = || eq(var("y"), int(1));
+        let cases: Vec<Expr> = vec![
+            and_(bool_lit(true), int(1)),
+            le(add(var("x"), bool_lit(true)), int(3)),
+            if_(gt(var("x"), int(0)), and_(int(1), bool_lit(true)), x0()),
+            if_(le(var("x"), int(0)), and_(int(1), bool_lit(true)), x0()),
+            le(bool_lit(true), var("nope")),
+            le(var("nope"), bool_lit(true)),
+            or_(bool_lit(true), int(5)),
+            or_(bool_lit(false), int(5)),
+            or_(gt(var("x"), int(0)), or_(y1(), var("nope"))),
+            and_(and_(x0(), y1()), gt(var("nope"), int(0))),
+            and_(and_(x0(), neq(var("y"), int(1))), gt(var("nope"), int(0))),
+            and_(x0(), and_(bool_lit(false), var("nope"))),
+            and_(var("x"), x0()),
+            iff(int(1), bool_lit(true)),
+            iff(x0(), y1()),
+            forall("k", bool_lit(true), int(2), x0()),
+            forall("k", int(0), var("y"), and_(le(var("k"), int(1)), int(3))),
+            if_(int(1), x0(), y1()),
+            if_(bool_lit(true), add(var("x"), int(1)), bool_lit(false)),
+            if_(gt(var("x"), int(0)), int(1), bool_lit(true)),
+            // An `IF` read as an integer reads the arm it takes and never the other.
+            le(if_(gt(var("x"), int(0)), var("nope"), int(1)), int(3)),
+            le(if_(le(var("x"), int(0)), int(1), var("nope")), int(3)),
+            add(var("y"), le(var("x"), int(0))),
+            add(var("x"), var("y")),
+            var("y"),
+            // Index `i<k>` is `k`, so only nine distinct slots make the innermost read hold.
+            ["i0", "i1", "i2", "i3", "i4", "i5", "i6", "i7", "i8"]
+                .iter()
+                .zip(0..9_i32)
+                .rev()
+                .fold(eq(sub(var("i8"), var("i0")), int(8)), |body, (&i, k)| {
+                    forall(i, int(k.into()), int(k.into()), body)
+                }),
+        ];
+        let m = Model {
+            name: "Reads",
+            consts: vec![],
+            vars: vec![
+                StateVar { name: "x", init: 0 },
+                StateVar { name: "y", init: 1 },
+            ],
+            fn_vars: vec![],
+            actions: vec![],
+            invariants: cases
+                .iter()
+                .map(|e| Invariant {
+                    name: "Case",
+                    kind: crate::derive::InvariantKind::Claim,
+                    expr: e.clone(),
+                })
+                .collect(),
+        };
+        let c = Compiled::new(&m).expect("compiles");
+        let env = m.eval_env(&m.init_state());
+        let s = c.init();
+        let mut panics = 0;
+        for (i, e) in cases.iter().enumerate() {
+            // Read whole, as a liveness goal is.
+            let written = outcome(&|| e.eval(&env));
+            let compiled = outcome(&|| c.expr(&m, e).eval(&s));
+            assert_eq!(compiled, written, "case {i} read whole: {e:?}");
+            panics += usize::from(written.is_err());
+            // Read as a boolean, as a guard or an invariant is.
+            let written = outcome(&|| Value::Bool(m.check_invariant_in(&m.invariants[i], &env)));
+            let compiled = outcome(&|| Value::Bool(c.holds(i, &s)));
+            assert_eq!(compiled, written, "case {i} read as a boolean: {e:?}");
+        }
+        // The cases do reach every kind of failure, not only values.
+        assert!(panics >= 8, "only {panics} cases panic");
+    }
+
+    /// Two keys whose hashes agree in their top half (found by search) share a tag and a home
+    /// slot, and each still gets its own number: the table compares the keys behind a matching
+    /// tag. Numbers survive the table's growth.
+    #[test]
+    fn seen_numbers_keys_whose_tags_collide_apart_and_keeps_numbers_as_it_grows() {
+        let (a, b) = (
+            [9_031_110_522_149_646_314_i64],
+            [5_280_068_066_879_230_317_i64],
+        );
+        assert_eq!(
+            key_hash(&a) & TAG,
+            key_hash(&b) & TAG,
+            "the keys' tags collide"
+        );
+        let mut seen = Seen::default();
+        assert_eq!(seen.number(&a), (0, true));
+        assert_eq!(seen.number(&b), (1, true));
+        for i in 2..1000 {
+            assert_eq!(seen.number(&[i]), (usize::try_from(i).unwrap(), true));
+        }
+        assert_eq!(seen.number(&b), (1, false));
+        assert_eq!(seen.number(&a), (0, false));
+        for i in 2..1000 {
+            assert_eq!(seen.number(&[i]), (usize::try_from(i).unwrap(), false));
+            assert_eq!(seen.key(usize::try_from(i).unwrap()), [i]);
+        }
+        assert_eq!((seen.key(0), seen.key(1)), (&a[..], &b[..]));
+    }
+
     /// An update writing a name the initial state does not bind grows a
     /// `BTreeMap` state by a key, which a slice cannot: such a model is walked
     /// as written, never compiled into a different identity.
@@ -2184,6 +2470,37 @@ mod tests {
         assert!(Compiled::new(&m).is_none());
         assert_eq!(bmc(&m), bmc_on(&m, &ByName(&m)).0);
         assert_eq!(reachable_states(&m), reachable_on(&m, &ByName(&m)));
+    }
+
+    /// A state grown by an undeclared name is told apart by its names as well as its values:
+    /// `{a: 0, b: 1}` and `{a: 0, c: 1}` are two states, and the walk expands both.
+    #[test]
+    fn states_grown_by_different_names_are_different_states() {
+        use crate::derive::{Action, StateVar, Update, int};
+        let writes = |name: &'static str, var: &'static str| Action {
+            name,
+            guard: None,
+            updates: vec![Update { var, expr: int(1) }],
+        };
+        let m = Model {
+            name: "Forks",
+            consts: vec![],
+            vars: vec![StateVar { name: "a", init: 0 }],
+            fn_vars: vec![],
+            actions: vec![writes("SetB", "b"), writes("SetC", "c")],
+            invariants: vec![],
+        };
+        let state = |pairs: &[(&'static str, i64)]| pairs.iter().copied().collect::<State>();
+        assert_eq!(
+            reachable_states(&m),
+            [
+                state(&[("a", 0)]),
+                state(&[("a", 0), ("b", 1)]),
+                state(&[("a", 0), ("c", 1)]),
+                state(&[("a", 0), ("b", 1), ("c", 1)]),
+            ]
+        );
+        assert_eq!(bmc(&m), Ok(4));
     }
 
     /// A fairness assumption about an action the model does not have is a typo,

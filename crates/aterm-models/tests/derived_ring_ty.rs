@@ -199,14 +199,14 @@ fn assert_every_invariant_breaks_first(m: &Model) {
     );
 }
 
-/// The committed-dead actions of `m` are exactly `expected`, and each is an
-/// independently caught mutant (`verify::audit_dead_negative_controls`: the
-/// all-live `Buggy=1` baseline is safe, and each dead action, added back ALONE,
-/// fires and is caught). This is the interpreter half of the `aterm-gui` gate's
-/// `ty --strict-vacuity` audit, pinned where the mutants are written, so a mutant
-/// folded back into a live action — which masks its neighbours and removes a
-/// healthy path from the `Buggy=1` world — fails here by name.
-fn assert_committed_dead_are_caught_mutants(m: &Model, expected: &[&str]) {
+/// The committed-dead actions of `m` are exactly `expected`, pinned where the
+/// mutants are written, so a mutant folded back into a live action — which masks
+/// its neighbours and removes a healthy path from the `Buggy=1` world — fails
+/// here by name. That each one is an independently caught mutant (the all-live
+/// `Buggy=1` baseline is safe, and each dead action, added back ALONE, fires and
+/// is caught) is `verify::sweep_faults`' audit of every registered model, the
+/// `non_vacuity` test's, over these same configurations.
+fn assert_committed_dead_actions(m: &Model, expected: &[&str]) {
     let healthy_fired = aterm_spec::interp::fired_actions(&aterm_spec::interp::with_buggy(m, 0));
     let dead: Vec<_> = m
         .actions
@@ -215,12 +215,6 @@ fn assert_committed_dead_are_caught_mutants(m: &Model, expected: &[&str]) {
         .filter(|name| !healthy_fired.contains(name))
         .collect();
     assert_eq!(dead, expected, "{}: committed-dead actions", m.name);
-    assert_eq!(
-        verify::audit_dead_negative_controls(std::slice::from_ref(m)),
-        Ok(expected.len()),
-        "{}: every committed-dead action must remain an independently caught mutant",
-        m.name
-    );
 }
 
 #[test]
@@ -373,7 +367,7 @@ fn derived_session_log_ring_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_ring_model();
     assert_proves_and_catches(&model);
     assert_every_invariant_breaks_first(&model);
-    assert_committed_dead_are_caught_mutants(
+    assert_committed_dead_actions(
         &model,
         &[
             "AppendNoEvict",
@@ -579,7 +573,7 @@ fn derived_log_mirror_proves_and_catches_each_law() {
     let model = aterm_models_session::log_mirror_model();
     assert_proves_and_catches(&model);
     assert_every_invariant_breaks_first(&model);
-    assert_committed_dead_are_caught_mutants(
+    assert_committed_dead_actions(
         &model,
         &[
             "DropUnadopted",
@@ -725,7 +719,7 @@ fn derived_session_log_cursor_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_cursor_model();
     assert_proves_and_catches(&model);
     assert_every_invariant_breaks_first(&model);
-    assert_committed_dead_are_caught_mutants(
+    assert_committed_dead_actions(
         &model,
         &[
             "ReadSkipsEvicted",
@@ -784,7 +778,7 @@ fn derived_session_log_journal_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_journal_model();
     assert_proves_and_catches(&model);
     assert_every_invariant_breaks_first(&model);
-    assert_committed_dead_are_caught_mutants(
+    assert_committed_dead_actions(
         &model,
         &[
             "ReadNoDedupe",
@@ -864,7 +858,7 @@ fn derived_session_log_mark_quota_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_mark_quota_model();
     assert_proves_and_catches(&model);
     assert_every_invariant_breaks_first(&model);
-    assert_committed_dead_are_caught_mutants(
+    assert_committed_dead_actions(
         &model,
         &[
             "AppendMarkUnquotaed",
@@ -912,7 +906,7 @@ fn derived_session_log_program_share_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_program_share_model();
     assert_proves_and_catches(&model);
     assert_every_invariant_breaks_first(&model);
-    assert_committed_dead_are_caught_mutants(
+    assert_committed_dead_actions(
         &model,
         &[
             "AppendAUnshared",
@@ -966,7 +960,7 @@ fn derived_session_log_claims_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_claims_model();
     assert_proves_and_catches(&model);
     assert_every_invariant_breaks_first(&model);
-    assert_committed_dead_are_caught_mutants(
+    assert_committed_dead_actions(
         &model,
         &[
             "ClaimClearLiftsObserved",
@@ -1043,7 +1037,7 @@ fn derived_transcript_join_proves_and_catches_each_law() {
     let model = aterm_models_session::transcript_join_model();
     assert_proves_and_catches(&model);
     assert_every_invariant_breaks_first(&model);
-    assert_committed_dead_are_caught_mutants(
+    assert_committed_dead_actions(
         &model,
         &[
             "PromptOpensBeside",
@@ -1207,7 +1201,7 @@ fn derived_turn_tracker_proves_and_catches_each_law() {
     let model = aterm_models_session::turn_tracker_model();
     assert_proves_and_catches(&model);
     assert_every_invariant_breaks_first(&model);
-    assert_committed_dead_are_caught_mutants(
+    assert_committed_dead_actions(
         &model,
         &[
             "SecondTurn",
@@ -1378,7 +1372,7 @@ fn derived_session_log_fold_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_fold_model();
     assert_proves_and_catches(&model);
     assert_every_invariant_breaks_first(&model);
-    assert_committed_dead_are_caught_mutants(
+    assert_committed_dead_actions(
         &model,
         &[
             "ReplayApplies",
@@ -1463,7 +1457,7 @@ fn derived_session_log_mail_link_proves_and_catches_each_law() {
     let model = aterm_models_session::session_log_mail_link_model();
     assert_proves_and_catches(&model);
     assert_every_invariant_breaks_first(&model);
-    assert_committed_dead_are_caught_mutants(
+    assert_committed_dead_actions(
         &model,
         &[
             "LinkAtTurnConf",

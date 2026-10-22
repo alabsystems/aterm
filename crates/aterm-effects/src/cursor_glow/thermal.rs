@@ -11,6 +11,7 @@ impl CursorGlow {
     /// cool typing is a whisper (~0.28×), sustained fast typing overdrives
     /// past the configured intensity (~1.2×). Jump comets and landing rings
     /// are navigation feedback, so they stay at 1×.
+    #[inline]
     pub(super) fn typing_boost(&self) -> f32 {
         0.28 + 0.92 * self.heat
     }
@@ -21,6 +22,7 @@ impl CursorGlow {
     /// surge to the signature cursors (e.g.
     /// [`crate::cursor_droplet::CursorDroplet`]); read it after
     /// [`Self::tick`], which applies the lazy heat/flare decay.
+    #[inline]
     #[must_use]
     pub fn blaze(&self) -> f32 {
         self.heat.max(self.flare).clamp(0.0, 1.0)
@@ -30,6 +32,7 @@ impl CursorGlow {
     /// ≤ [`Self::HEAT_GAP_FULL`], none at ≥ [`Self::HEAT_GAP_ZERO`]. Shared
     /// with the key-time click's timbre prediction so the click matches the
     /// light it is the twin of.
+    #[inline]
     pub(super) fn heat_cadence(gap: f32) -> f32 {
         1.0 - ((gap - Self::HEAT_GAP_FULL) / (Self::HEAT_GAP_ZERO - Self::HEAT_GAP_FULL))
             .clamp(0.0, 1.0)
@@ -37,6 +40,7 @@ impl CursorGlow {
 
     /// The per-keystroke heat gain this style charges. Fire earns its blaze
     /// over ~30-40 keys; every other style keeps the shared [`Self::HEAT_GAIN`].
+    #[inline]
     pub(super) fn heat_gain(fire: bool) -> f32 {
         if fire {
             Self::FIRE_HEAT_GAIN
@@ -48,6 +52,7 @@ impl CursorGlow {
     /// The heat cooling τ this style runs. Fire cools on its own slower τ
     /// (momentum survives a short thought); every other style keeps
     /// [`Self::HEAT_DECAY_TAU`].
+    #[inline]
     pub(super) fn heat_tau(cfg: &GlowConfig) -> f32 {
         if matches!(cfg.style, GlowStyle::Fire) {
             Self::FIRE_HEAT_TAU
@@ -61,6 +66,7 @@ impl CursorGlow {
     /// quench-damped (deleting douses it), attack/release-eased (the whole
     /// look ramps as one body). Evolved once per tick in the lazy-decay block,
     /// before any spawn, so every consumer in one frame agrees.
+    #[inline]
     pub(super) fn fire_t(&self) -> f32 {
         self.disp_t.clamp(0.0, 1.0)
     }
@@ -362,6 +368,7 @@ impl ForgeBand {
     /// rest at `lo`, full heat at `hi`, never below the rest point and never
     /// past what the page allows (on the bright side the breath may ride up
     /// to [`Self::TOP`]).
+    #[inline]
     pub(super) fn at(self, t: f32, breathe: f32) -> f32 {
         let ceiling = if self.bright { Self::TOP } else { self.hi };
         (self.lo + (self.hi - self.lo) * t + breathe).clamp(self.lo, ceiling.max(self.lo))

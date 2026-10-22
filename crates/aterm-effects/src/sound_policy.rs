@@ -80,6 +80,7 @@ pub struct VoiceTerms {
 /// focus gate every voice (a background window may animate but never
 /// speak); a reduced motion policy silences only a voice with a
 /// [`Voice::motion_twin`].
+#[inline]
 #[must_use]
 pub fn voice_gain(voice: Voice, terms: &VoiceTerms) -> Option<f32> {
     if terms.reduced_motion && voice.motion_twin().is_some() {
@@ -91,6 +92,7 @@ pub fn voice_gain(voice: Voice, terms: &VoiceTerms) -> Option<f32> {
 /// Resolve trail-audio policy from real window focus, never the synthetic
 /// `motion_focus` bit that recordings use to keep visual effects moving. A
 /// background recording may animate; it must never make the Mac speak.
+#[inline]
 pub fn trail_sound_gain(raw_focused: bool, configured: bool, volume: f32) -> Option<f32> {
     (raw_focused && configured && volume > 0.0).then_some(volume)
 }
@@ -105,6 +107,7 @@ pub fn trail_sound_gain(raw_focused: bool, configured: bool, volume: f32) -> Opt
 /// a gain rather than suppressing the celebration. Both riff seams (the
 /// single-pane present and the split-pane compose) use it, so a split pane
 /// never sings a song a single pane suppresses.
+#[inline]
 pub fn sing_riff_gain(
     raw_focused: bool,
     trail_sounds: bool,
@@ -127,6 +130,7 @@ pub fn sing_riff_gain(
 /// knob (`cursor_trail_intensity`, or a style pack that resolves to zero),
 /// read before any policy fold. Zero is their explicit off: it silences the
 /// key seam, and the verb calls it `trail-off` rather than `engine-silent`.
+#[inline]
 pub fn user_lit(resolved: &crate::cursor_glow::GlowConfig) -> bool {
     resolved.intensity > 0.0
 }
@@ -139,6 +143,7 @@ pub fn user_lit(resolved: &crate::cursor_glow::GlowConfig) -> bool {
 /// whose window the key landed in and whether the person asked for any
 /// aurora at all, so a shed frame or Reduce Motion never silences keystrokes.
 /// The `TrailSoundSeam` conformance drives this function directly.
+#[inline]
 pub fn fold_window_audibility(
     cfg: &mut crate::cursor_glow::GlowConfig,
     motion_amplitude: f32,

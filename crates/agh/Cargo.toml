@@ -1,0 +1,67 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "agh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "aterm's GitHub client: the library aterm's Rust calls and the `aterm agh` CLI (docs/DESIGN-agh-2026-10-19.md)"
+# Every test file is a module of the one `agh_suite` binary (declared below); with
+# autotests off, a `tests/*.rs` file listed nowhere never compiles.
+autotests = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "agh"
+path = "src/main.rs"
+# A dev shim over `agh::cli::main_entry`; the shipped form is `aterm agh` and argv0 `agh`.
+test = false
+
+[dependencies]
+# The one HTTPS client: methods, streaming, phases, idle deadlines, secret headers (§5).
+aterm-http = { workspace = true }
+# Every JSON value agh reads or prints; sorted keys are its rendering.
+aterm-json = { workspace = true }
+# The REST models and agh.toml's rows.
+serde = { workspace = true, features = ["derive"] }
+# agh.toml: parse, and the comment-preserving edit `auth add` and `auth remove` make.
+aterm-toml = { workspace = true }
+# base64 (contents, jq @base64/@base64d), hex (fingerprints, digests), tty::safe.
+aterm-codec = { workspace = true }
+# sha256: fingerprints, download digests, ETag-free page comparison.
+aterm-digest = { workspace = true }
+# Secret, private_file, atomic_file and the stdout door.
+aterm-uds = { workspace = true }
+# dirs (config, state, home), channel::PUBLIC_OWNER (the release floor), rfc3339.
+aterm-types = { workspace = true }
+# THE effect seam (`fx`): every clock read, sleep, GitHub round trip and stdout write crosses
+# its EffectSeam, so a run is taped (--record) and replayed offline (--replay); design §21.
+# Zero dependencies; a path dependency, as aterm-agent's astream crates are.
+astream-effects = { path = "../../vendor/astream/crates/astream-effects" }
+# --tag-regex, --match and jq test(): linear time, no backtracking.
+aterm-regex = { workspace = true }
+# durable and durable_dir: a finished download survives a power loss.
+aterm-durable = { workspace = true }
+# The refines/spec_unmodeled anchors binding Router::decide and hop::rebuild to AghRouteWall.
+# build.rs mounts its anchor_rules.rs, which picks the attributes' arm for each lane.
+aterm-spec-anchor = { workspace = true }
+
+[dev-dependencies]
+# The loopback GitHub the loopback, resource and CLI tests drive.
+agh-fake = { workspace = true }
+# StepEvidence, interp and xref for the route-wall conformance.
+aterm-spec = { workspace = true }
+aterm-models-agh = { workspace = true }
+# Scratch directories (0700, random names).
+aterm-tempfile = { workspace = true }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "agh_suite"
+path = "tests/agh_suite.rs"

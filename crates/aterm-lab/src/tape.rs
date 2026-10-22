@@ -294,22 +294,30 @@ fn hostnames() -> Vec<String> {
 
 /// THE RECORDING MACHINE'S NAMES, each as the corpus's fixed token
 /// ([`corpus::token`]): the lab's state directory, the checkout (as built
-/// and through every link), the owner's home, the user's temporary
-/// directory, the login name and the host's names; and the home, which
-/// the lint looks for besides.
+/// and through every link), the owner's homes (the account's and the
+/// caller's `HOME`, [`crate::paths::Paths::guarded_homes`]: a lab run under a
+/// scratch HOME still names the account's store, and the scratch home), the
+/// user's temporary directory, the login name and the host's names; and the
+/// account's home, which the lint looks for besides.
 ///
 /// # Errors
 /// No home, or a name the scrub refuses (a home at the root, a login name of
 /// two letters): a promote that cannot take it must not keep the tape.
 pub fn machine_scrub() -> Result<(Scrub, PathBuf), String> {
-    let p = paths();
+    machine_scrub_of(paths())
+}
+
+/// [`machine_scrub`] for the paths `p`.
+fn machine_scrub_of(p: &crate::paths::Paths) -> Result<(Scrub, PathBuf), String> {
     let home = PathBuf::from(p.need_home()?);
     let mut scrub = Scrub::new();
     scrub.path(&p.state, token::STATE)?;
     for repo in [p.repo.clone(), physical(&p.repo)] {
         scrub.path(&repo, token::CHECKOUT)?;
     }
-    scrub.path(&home, token::HOME)?;
+    for owner in p.guarded_homes() {
+        scrub.path(Path::new(&owner), token::HOME)?;
+    }
     if let Some(tmp) = crate::sys::user_temp_dir() {
         scrub.path(Path::new(&tmp), token::TMP)?;
     }
@@ -955,6 +963,56 @@ mod corpus_tests {
             ..again
         };
         assert_eq!(lost(&wall, &no_retry), ["wall(s)", "act(s)"]);
+    }
+}
+
+#[cfg(test)]
+mod scrub_tests {
+    use super::*;
+
+    /// A tape recorded under a scratch HOME takes the account's home as the home (its
+    /// store's paths name it), and the scratch HOME's too. Negative control: the facts of a
+    /// run from the account's own HOME leave the scratch home in the text.
+    #[test]
+    fn under_a_scratch_home_the_account_home_is_scrubbed_too() {
+        let top = aterm_tempfile::Builder::new()
+            .prefix("lab-scrub-")
+            .tempdir()
+            .expect("scratch");
+        let real = std::fs::canonicalize(top.path()).expect("physical");
+        let (account, scratch) = (real.join("account"), real.join("scratch"));
+        for d in [&account, &scratch] {
+            std::fs::create_dir_all(d).expect("home");
+        }
+        let text = format!(
+            "{}/Library/Application Support/aterm/pkg/bin/claude HOME={}/x",
+            account.display(),
+            scratch.display()
+        );
+        let p =
+            crate::paths::Paths::resolve_with(Some(account.clone()), Some(scratch.clone().into()));
+        let (scrub, home) = machine_scrub_of(&p).expect("scrub");
+        assert_eq!(home, account);
+        assert_eq!(
+            scrub.text(&text),
+            format!(
+                "{h}/Library/Application Support/aterm/pkg/bin/claude HOME={h}/x",
+                h = token::HOME
+            )
+        );
+        // NEGATIVE CONTROL: the account's own HOME leaves the scratch home unnamed as the home
+        // (a test's fake one sits in the temporary directory, which the scrub takes as that).
+        let own = crate::paths::Paths::resolve_with(Some(account.clone()), Some(account.into()));
+        let (scrub, _) = machine_scrub_of(&own).expect("scrub");
+        let left = scrub.text(&text);
+        assert!(
+            left.starts_with(&format!("{}/Library", token::HOME)),
+            "{left}"
+        );
+        assert!(
+            !left.ends_with(&format!("HOME={}/x", token::HOME)),
+            "{left}"
+        );
     }
 }
 

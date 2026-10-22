@@ -33,5 +33,7 @@ pub mod lane;
 pub mod pins;
 pub mod programs;
 pub mod quad;
+/// Test fixtures: never in a release build, which the lane's snapshot is.
+#[cfg(any(test, debug_assertions))]
 pub mod testkit;
 pub mod triple;

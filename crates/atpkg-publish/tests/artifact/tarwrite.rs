@@ -126,21 +126,30 @@ fn a_symlink_or_an_empty_tree_is_refused() {
     assert!(err.to_string().contains("no file"), "{err}");
 }
 
-/// 1,500 × 100 B is 150 kB of content in a ~1.5 MB stream: content alone would sign a
-/// 1 MiB cap (the floor), under the structure the client must read.
+/// 500 × 100 B is 50 kB of content in a ~1.3 MB stream: content alone would sign a
+/// 1 MiB cap (the floor), under the structure the client must read. Each file's 561-byte
+/// path is a two-block PAX record, so a file carries 2,560 stream bytes where a short
+/// name carries 1,024: the same structure from a third as many files, each of which is a
+/// create, a read, an extract and an unlink.
 #[test]
 fn a_small_file_tree_is_signed_by_its_stream_and_an_ordinary_one_by_its_content() {
     crate::shared::need_compressor();
     let tmp = scratch("tar-size");
     let small = tmp.path().join("small");
-    for i in 0..1500 {
-        put(&small.join(format!("share/f{i}")), &[0u8; 100]);
+    let dir = small
+        .join("share")
+        .join("d".repeat(200))
+        .join("e".repeat(200));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    for i in 0..500 {
+        let name = format!("{i:03}{}", "f".repeat(150));
+        std::fs::write(dir.join(name), [0u8; 100]).expect("write fixture");
     }
     let packed = tarwrite::write(&small, &tmp.path().join("small.tar.zst")).expect("pack");
-    assert_eq!(packed.content_bytes, 150_000);
+    assert_eq!(packed.content_bytes, 50_000);
     assert!(
-        packed.stream_bytes > 1 << 20,
-        "the fixture no longer outweighs its content ({} B)",
+        packed.stream_bytes - packed.content_bytes > 1 << 20,
+        "the fixture's structure no longer outweighs the client's 1 MiB floor ({} B)",
         packed.stream_bytes
     );
     assert!(2 * packed.disk_installed >= packed.stream_bytes);

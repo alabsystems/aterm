@@ -76,10 +76,14 @@
 //! * NO ALARM: the bridge never raised `cap-compromised` (a sequence it
 //!   reused) nor refused its own mail as `forged-self`.
 //! * PRESENCE, once settled: every hosted session's row on the bus says
-//!   `live`; no row of a session that left still does, unless the bridge's
-//!   contract leaves that ghost to the operator (finding F4,
-//!   [`World::presence_gaps`]). A post to a session that left before it was
-//!   routed may be retired `unroutable`.
+//!   `live`; no row of a session that left still does when its writer is this
+//!   incarnation, its exact witnessed predecessor, or an earlier bridge of
+//!   this state dir in this kernel boot, proved by its mark
+//!   (finding F4, decided: [`World::presence_gaps`]). A SIBLING's row
+//!   ([`Opts::sibling`], [`Opts::race`]) carries a copy's mark, and is retired
+//!   only by an attach that witnessed its will, and by the running one once it
+//!   did. A post to a session that left before it was routed may be retired
+//!   `unroutable`.
 //! * THE MIRROR (`LogMirror`'s laws, read off the bus as a reader reads it):
 //!   at every step no `ms` of a session log is two records in the reader's
 //!   view; once settled every hosted session's log landed through its `ms`
@@ -87,10 +91,15 @@
 //!   every move of the log, whose cuts the mirror must say again; and in a
 //!   world whose log never moved, no record is on the bus twice even before
 //!   the reader's dedup (a killed batch is republished at its pinned
-//!   sequences). Completeness, not the rest, ends where a power cut tore the
-//!   mirror's pin: the bridge keeps it, the mirror stops for good (its key
-//!   and lifetime total, rulings Q6 and Q13, have no other copy), and a stop
-//!   for the pin with no tear behind it is a violation.
+//!   sequences). A power cut that tears the mirror's pin ends none of it: the
+//!   pin's key and total have durable copies (`logkey`, `logfloor`), the next
+//!   boot's first bridge sets the torn pin aside, and the mirror resumes, so a
+//!   bridge that ever stops for its pin is a violation
+//!   ([`World::mirror_stopped_for_its_pin`]).
+//! * THE MIRROR'S KEY AND TOTAL, at every step and across every boot
+//!   (rulings Q6, Q13): the node's takes name one alias key over its life,
+//!   and an engaged mirror never counts fewer bytes than a pin of the node
+//!   was written with ([`World::mirror_key_and_total`]).
 //! * THE BROKER'S LAW: every restart is held to astream's P2-P7
 //!   ([`bus::law_check`]; P1 holds by construction, P8 is not modelled).
 //! * LIVENESS: the settle phase ends, the bridge never panics — after a power
@@ -100,7 +109,9 @@
 //!   aterm (`link set-aside`) of no more torn files than the state dir's
 //!   quarantine holds — counting none of the whole in-flight entries an
 //!   earlier boot left, which the next boot's first bridge retired there
-//!   (`retired.`, finding F2) and tells nobody of.
+//!   (`retired.`, finding F2) and tells nobody of. And the newest bridge told
+//!   aterm the count it holds (`link quarantine torn=<k>`, sim item S6: what
+//!   ends aterm's entry once the owner empties it).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::panic::AssertUnwindSafe;
@@ -158,9 +169,23 @@ pub(crate) enum Mutant {
     /// A relaunched bridge does not recover the mirror's pinned batch: it
     /// takes the same records afresh, at fresh sequences.
     FreshMirrorTake,
-    /// The attach records no witnessed will: only its own incarnation's rows
-    /// are its to retire, and a predecessor's ghosts stand.
+    /// The attach records no witnessed will: a row under another state dir's
+    /// mark whose will it read — a dead sibling's ([`Opts::sibling`]) — is not
+    /// its to retire, and that incarnation's ghost stands.
     IgnoreWitnessedWill,
+    /// A will's incarnation is trusted without matching its writer's mark.
+    WitnessByIncarnationAlone,
+    /// The sweep reads no row's state-dir mark, as before finding F4's
+    /// decision (`crate::state::StateDir::mark`): only its own incarnation and
+    /// the will it witnessed are its to retire, and a ghost whose writer's
+    /// successors all died inside the five minutes stands.
+    ReadNoMark,
+    /// The sweep takes every incarnation below its own for an earlier bridge
+    /// of its state dir, whatever mark the row carries — `inc < self_inc`, the
+    /// generous reading `adoptable`'s doc refuses — and a live sibling's under
+    /// a shared node id ([`Opts::sibling`], [`Opts::race`]) has its row
+    /// retired.
+    RetireEveryEarlierIncarnation,
     /// The inbox group is committed through a record BEFORE it is delivered
     /// (`FabricExactlyOnce`'s `Buggy = 2`, `CommitEarly`).
     CommitBeforeDelivery,
@@ -192,6 +217,26 @@ pub(crate) enum Mutant {
     /// runs): an entry a power cut brought back after its record landed, and
     /// the log on its own then lost, lands behind its sender's later posts.
     RepublishInFlightOfAnEarlierBoot,
+    /// The first bridge of a boot after an unclean stop leaves a torn mirror
+    /// pin where it is, as before its durable copies (`PinRules::set_aside_torn`
+    /// off): the mirror stops on it, for good.
+    KeepTornPin,
+    /// The alias key has no durable copy, as before `logkey`: it rides the
+    /// pin alone, neither written to `logkey` nor read from it, and a torn pin
+    /// is set aside with no key on the media (`PinRules::need_key` off) — so a
+    /// mirror that resumes after it mints a second key.
+    KeyInThePinAlone,
+    /// The total is read off the pin alone, as before `logfloor`: the floor
+    /// is still raised (so a torn pin is still set aside), but the hello
+    /// reads none, a pin a power cut rolled back keeps its lower total and
+    /// the pin written in a torn one's place counts from zero
+    /// (`PinRules::total_from_floor` off).
+    TotalInThePinAlone,
+    /// A bridge tells aterm what its start moved into the quarantine in place
+    /// of what the quarantine holds (`Bridge::tell_quarantine`, sim item S6):
+    /// a later boot that moves fewer understates what an earlier one left
+    /// there, and at 0 would end the owner's entry over bytes still held.
+    TellMovedNotHeld,
 }
 
 /// What one run is.
@@ -229,7 +274,30 @@ pub(crate) struct Opts {
     /// loop, which reads an ack only once it has arrived wherever nothing must
     /// be judged, meets every order of a delivery and its own post's ack.
     pub(crate) hold_acks: bool,
+    /// A SIBLING under this node's id: a copy of the state dir, run by another
+    /// aterm on this machine — another state dir, writing the copy's own mark
+    /// on its rows ([`World::sibling_mark`]). Its bridge
+    /// attaches in the fault phase's last eighth ([`World::sibling_attaches`]),
+    /// outranking every incarnation then on the bus, carries one session
+    /// ([`SIBLING_SID`]) and, three seeds in four, dies before the phase ends:
+    /// its will fires, unless one of this world's incarnations outranked it
+    /// since, whose higher sequences fence it, and then it is gone with nobody
+    /// to say so ([`World::sibling_dies`]). Its rows are flushed when they
+    /// land, so no restart of the log takes them. No power cut of the whole
+    /// machine, which would end the sibling too: [`Opts::with_a_sibling`].
+    pub(crate) sibling: bool,
+    /// A SIBLING THAT RACES AN ATTACH ([`bus::Race`]): the broker refuses the
+    /// node's third will request, and inside a later one the sibling attaches
+    /// at the refused incarnation — one this node's state dir took and never
+    /// presented — and lives on: [`Opts::with_a_racing_sibling`].
+    pub(crate) race: bool,
+    /// The sibling takes the CURRENT attach's incarnation, making its node
+    /// publish collide and its own aliased will fire over the live sibling.
+    pub(crate) alias: bool,
 }
+
+/// The sibling's one session ([`Opts::sibling`]).
+pub(crate) const SIBLING_SID: &str = "s-sibling";
 
 impl Opts {
     /// The committed configuration for `seed`.
@@ -266,6 +334,12 @@ impl Opts {
             // serves, and one that answers some acks after their records are
             // readable.
             hold_acks: (seed / 4) % 2 == 1,
+            // NO SIBLING in the committed worlds: a node id two state dirs
+            // share is a copy's hazard, held by a sweep of its own
+            // (`super::tests`' `a_siblings_row_is_retired_only_by_the_attach_that_witnessed_its_will`).
+            sibling: false,
+            race: false,
+            alias: false,
         }
     }
 
@@ -273,6 +347,42 @@ impl Opts {
     pub(crate) fn with(mut self, m: Mutant) -> Self {
         self.mutants.insert(m);
         self
+    }
+
+    /// The committed configuration for `seed`, with a SIBLING under the node's
+    /// id ([`Opts::sibling`]) and no power cut of the whole machine: the log
+    /// alone loses power, on either layout.
+    pub(crate) fn with_a_sibling(seed: u64) -> Self {
+        Self {
+            sibling: true,
+            power_cuts: false,
+            bus_losses: true,
+            ..Self::seed(seed)
+        }
+    }
+
+    /// The committed configuration for `seed`, with a SIBLING THAT RACES AN
+    /// ATTACH ([`Opts::race`]) in place of the scheduled one, and, as with
+    /// it, no power cut of the whole machine.
+    pub(crate) fn with_a_racing_sibling(seed: u64) -> Self {
+        Self {
+            sibling: false,
+            race: true,
+            ..Self::with_a_sibling(seed)
+        }
+    }
+
+    pub(crate) fn with_an_aliasing_sibling(seed: u64) -> Self {
+        Self {
+            alias: true,
+            // One finite interleaving, followed by the normal settle: no
+            // unrelated fault can kill the live sibling or obscure its will.
+            steps: 0,
+            tier: Some(Tier::Strict),
+            hold_acks: false,
+            mirror: false,
+            ..Self::with_a_racing_sibling(seed)
+        }
     }
 }
 
@@ -309,8 +419,27 @@ pub(crate) struct Stats {
     pub(crate) log_records: u64,
     /// Ghost rows the bridge retired (`presence-retired … reason=unhosted`).
     pub(crate) ghosts_retired: u64,
-    /// Ghost rows the bridge's contract leaves to the operator (finding F4).
+    /// Ghost rows no running bridge may retire, left to the operator: once
+    /// settled, a row still `live` of a session that left that the running
+    /// bridge cannot prove its own ([`World::running_bridge`]). Older boots can
+    /// leave unwitnessed ghosts; same-boot worlds leave none.
     pub(crate) ghosts_left: u64,
+    /// THE SIBLING ([`Opts::sibling`]), once settled, 1 or 0 each: its row
+    /// still `live` under a bridge of this node that outranks it (the row a
+    /// sweep that took every lower incarnation for its own would retire); and
+    /// its row retired — its will witnessed by an attach here.
+    pub(crate) sibling_kept: u64,
+    pub(crate) sibling_retired: u64,
+    /// THE RACING SIBLING ([`Opts::race`]), 1 or 0: it attached, at an
+    /// incarnation this node's state dir took for an attach the broker
+    /// refused.
+    pub(crate) sibling_raced: u64,
+    /// The alias injected a live sibling at the current incarnation and the
+    /// real bridge's first node publish actually collided with its row.
+    pub(crate) sibling_alias_collided: u64,
+    /// The specific same-dir session observed live before the first bridge
+    /// died, closed while it was down, and retired by the later real sweep.
+    pub(crate) alias_ghost_retired: u64,
     /// `ms` of the live sessions' logs the bus held once settled.
     pub(crate) mirrored: u64,
     /// Torn state files a bridge moved into the state dir's quarantine after a
@@ -321,6 +450,12 @@ pub(crate) struct Stats {
     /// more than were set aside (a bridge killed between the move and the
     /// telling tells fewer).
     pub(crate) set_aside_told: u64,
+    /// Power cuts that tore `logpin`, the mirror's pin: each one's next boot
+    /// sets it aside, and the mirror resumes from `logkey` and `logfloor`.
+    pub(crate) pins_torn: u64,
+    /// Of the torn files set aside, the mirror's pins (`quarantine/logpin`,
+    /// a `.<n>` past the first), counted once settled.
+    pub(crate) pins_set_aside: u64,
     /// Whole in-flight entries the first bridge of a boot retired into the
     /// quarantine after an unclean stop, never published again
     /// (`crate::state::StateDir::retire_in_flight_of_an_earlier_boot`, finding
@@ -385,11 +520,6 @@ struct World {
     next_pid: u64,
     /// Which boot this is (a power cut starts the next).
     boot: u8,
-    /// Whether a power cut tore `logpin`, the mirror's pin: the one tear the
-    /// bridge keeps where it is (it holds the node's alias key and lifetime
-    /// total, rulings Q6 and Q13), so the mirror stops for good
-    /// ([`World::mirror_stopped_by_its_torn_pin`]).
-    logpin_torn: bool,
     /// The next local id and sid generation aterm mints.
     next_local: u64,
     epoch: u64,
@@ -404,6 +534,21 @@ struct World {
     /// The lowest offset a broker restart cut back to: an offset at or above
     /// it may name another record now than when it was handed out.
     lost_floor: Option<u64>,
+    /// What a SIBLING's rows carry past the fields every row has
+    /// ([`Opts::sibling`], [`Opts::race`]): the mark of a copy of the state dir
+    /// (`statedir=`, `crate::state::StateDir::mark`), another directory.
+    sibling_mark: String,
+    /// This directory's mark under the injected current boot, for the oracle.
+    mark: Option<String>,
+    /// THE SIBLING ([`Opts::sibling`]): the incarnation it attached under, once
+    /// it has; the fault step it dies at, if it does; and whether it has died.
+    sibling_inc: Option<u64>,
+    sibling_attaches_at: Option<usize>,
+    sibling_dies_at: Option<usize>,
+    sibling_dead: bool,
+    /// The finite alias fixture's actual departed B1 session, admitted only
+    /// after observing its live row under B1's own incarnation and mark.
+    alias_ghost: Option<String>,
     /// TIER-1 OF `FabricExactlyOnce`: every inbox offset the world's messages
     /// took, followed through the model after every step ([`super::conform`]).
     tap: conform::Tap,
@@ -412,6 +557,16 @@ struct World {
 /// The producer id of `principal` (astream's derivation).
 fn producer(principal: &str) -> u64 {
     astream_cap::producer_id_of(principal)
+}
+
+/// A real directory's mark under the WORLD'S kernel boot, never the test host's.
+fn boot_mark(path: &std::path::Path, boot: u8) -> Option<String> {
+    let state = crate::state::StateDir::open(path).expect("the world's state dir");
+    state.set_inc_seam(crate::state::IncSeam {
+        boot: Some(Some(crate::durability::test_boot(boot))),
+        ..crate::state::IncSeam::default()
+    });
+    state.mark(NODE)
 }
 
 impl World {
@@ -428,6 +583,14 @@ impl World {
             .expect("a scratch dir");
         let state_dir = dir.path().join("state");
         std::fs::create_dir_all(&state_dir).expect("the state dir");
+        // A COPY OF THE STATE DIR, for a sibling's rows: another directory, so
+        // another mark (`crate::state::StateDir::mark`).
+        let copy = dir.path().join("copy");
+        std::fs::create_dir_all(&copy).expect("the copy's dir");
+        let sibling_mark = boot_mark(&copy, if opts.alias { 2 } else { 1 })
+            .map(|mark| format!(" {}={mark}", crate::state::PRESENCE_MARK))
+            .unwrap_or_default();
+        let mark = boot_mark(&state_dir, 1);
         let mut device = Device::new(&state_dir);
         device.lossless = opts.lossless_device;
         device.tears = opts.torn_device;
@@ -435,6 +598,16 @@ impl World {
         device.seed(&state_dir.join("node"), format!("{NODE}\n").as_bytes());
         let broker = bus::Broker::new(tier, opts.table.clone());
         lock(&broker.state).mutant = opts.arm;
+        if opts.race {
+            lock(&broker.state).race = Some(bus::Race {
+                refuse_will: if opts.alias { 2 } else { 3 },
+                node_face: crate::subject::node_face(FLEET, NODE, "presence"),
+                session_face: crate::subject::session_face(FLEET, NODE, SIBLING_SID, "presence"),
+                extra: sibling_mark.clone(),
+                alias: opts.alias,
+                ..bus::Race::default()
+            });
+        }
         if opts.hold_acks {
             // A stream of its own, so the holds shift no other draw.
             broker.hold_acks(Rng::new(opts.seed ^ 0x0a0c_4e1d_ac45));
@@ -472,7 +645,6 @@ impl World {
             live: None,
             next_pid: 1,
             boot: 1,
-            logpin_torn: false,
             next_local: 1,
             epoch: 1,
             marker: 0,
@@ -482,12 +654,133 @@ impl World {
             person_seq: 0,
             violations: Vec::new(),
             lost_floor: None,
+            sibling_mark,
+            mark,
+            sibling_inc: None,
+            sibling_attaches_at: None,
+            sibling_dies_at: None,
+            sibling_dead: false,
+            alias_ghost: None,
             tap: conform::Tap::new(aterm_models_session::fabric_exactly_once_model()),
             stats: Stats::default(),
         };
+        if w.opts.sibling {
+            // A stream of its own, so the sibling's fate shifts no other draw:
+            // it attaches in the fault phase's last eighth and, three seeds in
+            // four, dies before the phase ends.
+            let mut fate = Rng::new(w.opts.seed ^ 0x5b1b_11e6_dead_0001);
+            let steps = w.opts.steps.max(16) as u64;
+            let at = steps - steps / 8 + fate.below(steps / 16);
+            w.sibling_attaches_at = usize::try_from(at).ok();
+            if !fate.chance(1, 4) {
+                w.sibling_dies_at = usize::try_from(at + 1 + fate.below(steps / 16)).ok();
+            }
+        }
         w.note(format!("world seed={} tier={tier:?}", w.opts.seed));
         w.open_sessions();
         w
+    }
+
+    /// THE SIBLING ATTACHES ([`Opts::sibling`]), at its step of the fault
+    /// phase, at the incarnation above every one the node put anything on the
+    /// bus under, as its bridge takes it: its node row `live` and its session's
+    /// row, under the node's own producer id — a copy of the state dir's — at
+    /// sequences of that incarnation, flushed (as a broker's flush lands what
+    /// it holds) so no restart of the log takes them. Its will's registration
+    /// is the world's to fire ([`World::sibling_dies`]). While the broker is
+    /// down, it waits a step.
+    fn sibling_attaches(&mut self) {
+        if self.sibling_inc.is_some() {
+            return;
+        }
+        if !lock(&self.core.broker.state).up {
+            self.sibling_attaches_at = self.sibling_attaches_at.map(|at| at + 1);
+            self.sibling_dies_at = self.sibling_dies_at.map(|at| at + 1);
+            return;
+        }
+        let inc = self.core.broker.max_incarnation(producer(NODE)) + 1;
+        let Some(base) = astream_broker::incarnation_base(inc) else {
+            return;
+        };
+        let node_face = crate::subject::node_face(FLEET, NODE, "presence");
+        let session_face = crate::subject::session_face(FLEET, NODE, SIBLING_SID, "presence");
+        let rows = [
+            (
+                node_face,
+                format!(
+                    "v=1 t=1 state=live inc={inc} fabric=connected{}",
+                    self.sibling_mark
+                ),
+            ),
+            (
+                session_face,
+                format!(
+                    "v=1 t=1 inc={inc} epoch=- gen=- state=live hold=0 attention=-{}",
+                    self.sibling_mark
+                ),
+            ),
+        ];
+        for (n, (subject, body)) in rows.iter().enumerate() {
+            let seq = base + 1 + n as u64;
+            if self
+                .core
+                .broker
+                .publish_as(producer(NODE), seq, subject, body.as_bytes())
+                .is_none()
+            {
+                return;
+            }
+        }
+        let mut s = lock(&self.core.broker.state);
+        s.durable = s.log.len() as u64;
+        drop(s);
+        self.sibling_inc = Some(inc);
+        self.note(format!("sibling attaches inc={inc} {SIBLING_SID}"));
+    }
+
+    /// THE SIBLING DIES ([`Opts::sibling`]): its connection ends, and its will
+    /// — `away` at its incarnation, at that incarnation's will sequence — fires
+    /// as the broker fires one: unless the node has put anything on the log
+    /// under a higher incarnation since, whose higher sequences FENCE it, and
+    /// then the sibling is gone with its rows still `live` and nobody to say
+    /// so. Flushed, as its other rows are. Nothing while the broker is down:
+    /// the death waits for it.
+    fn sibling_dies(&mut self) {
+        if self.sibling_dead {
+            return;
+        }
+        let Some(inc) = self.sibling_inc else {
+            self.sibling_dies_at = self.sibling_dies_at.map(|at| at + 1);
+            return;
+        };
+        if !lock(&self.core.broker.state).up {
+            self.sibling_dies_at = self.sibling_dies_at.map(|at| at + 1);
+            return;
+        }
+        self.sibling_dead = true;
+        let Some(seq) = astream_broker::will_seq(inc) else {
+            return;
+        };
+        if self.core.broker.fences(producer(NODE), seq) {
+            self.note(format!("sibling dies inc={inc}, its will fenced"));
+            return;
+        }
+        let face = crate::subject::node_face(FLEET, NODE, "presence");
+        let body = format!(
+            "v=1 t=1 state={} inc={inc} fabric=disconnected{}",
+            crate::glance::AWAY,
+            self.sibling_mark
+        );
+        if self
+            .core
+            .broker
+            .publish_as(producer(NODE), seq, &face, body.as_bytes())
+            .is_some()
+        {
+            let mut s = lock(&self.core.broker.state);
+            s.durable = s.log.len() as u64;
+        }
+        self.note(format!("sibling dies inc={inc}, its will fired"));
     }
 
     fn note(&self, line: impl Into<String>) {
@@ -838,13 +1131,14 @@ impl World {
         let mut rng = self.rng.fork(0xdc);
         for n in self.core.device.power_cut(&mut rng) {
             if n.starts_with("power-cut logpin ") && n.ends_with(" torn") {
-                self.logpin_torn = true;
+                self.stats.pins_torn += 1;
             }
             self.note(n);
         }
         // aterm is gone with its sessions; the relaunch mints new ones.
         self.ep.power_cut();
         self.boot = self.boot.wrapping_add(1).max(1);
+        self.mark = boot_mark(std::path::Path::new(&self.cfg.state_dir), self.boot);
         self.epoch += 1;
         self.core.broker.start();
         self.open_sessions();
@@ -1125,9 +1419,9 @@ impl World {
     }
 
     /// The last presence row of every session face under this node, `sid ->
-    /// (state=, inc=)`: the face is a last-value one, so the row at the
+    /// (state=, inc=, statedir=)`: the face is a last-value one, so the row at the
     /// highest offset is what every reader takes for the session.
-    fn presence_rows(&self) -> BTreeMap<String, (String, Option<u64>)> {
+    fn presence_rows(&self) -> BTreeMap<String, (String, Option<u64>, Option<String>)> {
         let prefix = format!("/f/{FLEET}/pub/{NODE}/");
         let mut out = BTreeMap::new();
         for (_, subject, body, _) in self.core.broker.records() {
@@ -1141,26 +1435,62 @@ impl World {
             let (b, _) = Body::decode(&body);
             let state = b.unknown.get("state").cloned().unwrap_or_default();
             let inc = b.unknown.get("inc").and_then(|i| i.parse().ok());
-            out.insert(sid.to_string(), (state, inc));
+            let mark = b.unknown.get(crate::state::PRESENCE_MARK).cloned();
+            out.insert(sid.to_string(), (state, inc, mark));
         }
         out
     }
 
-    /// THE INCARNATIONS WHOSE ROWS THE RUNNING BRIDGE MAY RETIRE, by the
-    /// contract (`adoptable`'s doc) and read off the BUS, never asked of the
-    /// bridge, so a bridge that narrows its own rule or loses its bookkeeping
-    /// is judged by the rule it was meant to keep: its own incarnation — the
-    /// newest node row, `live`, since every attach takes a fresh one — and the
-    /// incarnation whose WILL was the newest node row when that attach read the
-    /// face, the row just before the attach's first.
-    fn retirable_incarnations(&self) -> BTreeSet<u64> {
-        let mut out = BTreeSet::new();
-        if self.live.is_none() {
-            return out;
-        }
+    /// THE RUNNING BRIDGE, AS THE BUS SHOWS IT, and what it must be able to
+    /// retire, by the contract (`adoptable`'s doc) and read off the BUS, never
+    /// asked of the bridge, so a bridge that narrows its own rule or loses its
+    /// bookkeeping is judged by the rule it was meant to keep: `(me,
+    /// witnessed)`, its own incarnation — this state dir's newest node row,
+    /// `live`, since every attach takes a fresh one — and the incarnation whose
+    /// WILL was the newest node row when that attach read the face, the row
+    /// just before its first. `None` while no bridge runs, or its attach has
+    /// not presented.
+    ///
+    /// Every row of THIS state dir in THIS BOOT at or below `me` is the running bridge's to
+    /// retire: each carries the dir's mark (`crate::state::StateDir::mark`),
+    /// read off the directory, so whichever earlier bridge of the dir wrote it,
+    /// in this boot, it is the dir's (finding F4). A sibling's, under a
+    /// copy's mark ([`Opts::sibling`], [`Opts::race`]), only when its
+    /// incarnation AND writer mark are `witnessed`. The dir's live node rows
+    /// are told from the sibling's by their writer mark, including aliases
+    /// that took the same current incarnation.
+    fn running_bridge(&self) -> Option<(u64, Option<(u64, u64)>)> {
+        self.live.as_ref()?;
+        let rows = self.node_rows();
+        let owner = self
+            .mark
+            .as_deref()
+            .and_then(|mark| u64::from_str_radix(mark, 16).ok())?;
+        let (state, me, _) = rows
+            .iter()
+            .rev()
+            .find(|(_, _, mark)| *mark == Some(owner))
+            .cloned()?;
+        let me = me?;
+        (state == "live").then(|| (me, witnessed_by(&rows, me)))
+    }
+
+    /// THE SIBLING'S INCARNATION, once it attached: the scheduled one's
+    /// ([`Opts::sibling`]) or the racing one's ([`Opts::race`]).
+    fn sibling(&self) -> Option<u64> {
+        self.sibling_inc.or_else(|| {
+            lock(&self.core.broker.state)
+                .race
+                .as_ref()
+                .and_then(|race| race.raced)
+        })
+    }
+
+    /// Every row of this node's own presence face, in log order: `(state=,
+    /// inc=)`.
+    fn node_rows(&self) -> Vec<(String, Option<u64>, Option<u64>)> {
         let face = crate::subject::node_face(FLEET, NODE, "presence");
-        let rows: Vec<(String, Option<u64>)> = self
-            .core
+        self.core
             .broker
             .records()
             .into_iter()
@@ -1168,46 +1498,73 @@ impl World {
             .map(|(_, _, body, _)| {
                 let (b, _) = Body::decode(&body);
                 let state = b.unknown.get("state").cloned().unwrap_or_default();
-                (state, b.unknown.get("inc").and_then(|i| i.parse().ok()))
+                let inc = b.unknown.get("inc").and_then(|i| i.parse().ok());
+                let mark = b
+                    .unknown
+                    .get(crate::state::PRESENCE_MARK)
+                    .and_then(|mark| u64::from_str_radix(mark, 16).ok());
+                (state, inc, mark)
             })
-            .collect();
-        let Some((state, Some(me))) = rows.last().cloned() else {
-            return out;
-        };
-        if state != "live" {
-            return out;
-        }
-        out.insert(me);
-        let first = rows.iter().position(|(_, inc)| *inc == Some(me));
-        if let Some((state, Some(dead))) = first
-            .and_then(|i| i.checked_sub(1))
-            .and_then(|i| rows.get(i))
-        {
-            if crate::glance::is_will(state) {
-                out.insert(*dead);
-            }
-        }
-        out
+            .collect()
     }
 
     /// PRESENCE, once settled: every hosted session's row says `live`, and no
-    /// row of a session that left — its tab closed, or its instance gone in a
-    /// power cut with nobody to say so — still does, unless the bridge's own
-    /// contract leaves it to the operator: a ghost row is retired only by the
-    /// incarnation that wrote it or the one that witnessed that incarnation's
-    /// will ([`World::retirable_incarnations`], the contract `adoptable`
-    /// keeps, so a live sibling sharing the node id is never touched), and one
-    /// whose witnesses all died inside the five-minute patience is `aterm
-    /// fabric doctor --retire-ghosts`'s (finding F4). The second list is those,
-    /// by sid.
+    /// departed session's row the running bridge can prove its own still does.
+    /// A lower incarnation with this dir's boot-bound mark is its own; an
+    /// exact witnessed will grants retirement from any boot. A live sibling's
+    /// row is never retired. The second list is the ghosts no running bridge
+    /// may retire, by sid, which is `aterm fabric doctor --retire-ghosts`'s:
+    /// older boots can leave ghosts with no remaining witnessed will.
     fn presence_gaps(&self) -> (Vec<String>, Vec<String>) {
         let rows = self.presence_rows();
-        let retirable = self.retirable_incarnations();
+        let running = self.running_bridge();
         let s = lock(&self.ep.state);
         let mut bad = Vec::new();
         let mut left = Vec::new();
+        // THE SIBLING'S ROW ([`Opts::sibling`], [`Opts::race`]): another state
+        // dir's, under its mark. Retired only by an attach that witnessed its
+        // will, and `exited` once settled when the running bridge's attach
+        // did.
+        if let (Some(sibling), Some((state, inc, _))) = (self.sibling(), rows.get(SIBLING_SID)) {
+            // The fixture's ORIGINAL writer, not the current row's mark:
+            // a mistaken retirement overwrites the row with this bridge's.
+            let owner = self
+                .sibling_mark
+                .strip_prefix(" statedir=")
+                .and_then(|mark| u64::from_str_radix(mark, 16).ok());
+            let node = self.node_rows();
+            let own_mark = self
+                .mark
+                .as_deref()
+                .and_then(|mark| u64::from_str_radix(mark, 16).ok());
+            let ours = node
+                .iter()
+                .filter(|(state, _, mark)| {
+                    state == "live" && own_mark.is_some() && *mark == own_mark
+                })
+                .filter_map(|(_, i, _)| *i)
+                .collect::<BTreeSet<u64>>();
+            let witnessed = ours.iter().any(|i| {
+                owner.is_some_and(|mark| witnessed_by(&node, *i) == Some((sibling, mark)))
+            });
+            if state != "live" && !witnessed {
+                bad.push(format!(
+                    "presence: the sibling's {SIBLING_SID} (inc={inc:?}) was retired, and no \
+                     attach here witnessed its will: its row says {state:?}"
+                ));
+            }
+            if state == "live"
+                && running
+                    .is_some_and(|(_, w)| owner.is_some_and(|mark| w == Some((sibling, mark))))
+            {
+                bad.push(format!(
+                    "presence: the sibling's {SIBLING_SID} is dead and its row (inc={inc:?}) \
+                     still says live, a ghost the running bridge may retire"
+                ));
+            }
+        }
         for session in s.sessions.values() {
-            let row = rows.get(&session.sid).map(|(state, _)| state.as_str());
+            let row = rows.get(&session.sid).map(|(state, _, _)| state.as_str());
             if row != Some("live") {
                 bad.push(format!(
                     "presence: {} is hosted and its row says {row:?}",
@@ -1216,13 +1573,21 @@ impl World {
             }
         }
         for session in &s.gone {
-            let Some((state, inc)) = rows.get(&session.sid) else {
+            let Some((state, inc, mark)) = rows.get(&session.sid) else {
                 continue;
             };
             if state != "live" {
                 continue;
             }
-            if inc.is_some_and(|inc| retirable.contains(&inc)) {
+            if inc.is_some_and(|inc| {
+                running.is_some_and(|(me, witnessed)| {
+                    (inc <= me && self.mark.is_some() && mark == &self.mark)
+                        || mark
+                            .as_deref()
+                            .and_then(|mark| u64::from_str_radix(mark, 16).ok())
+                            .is_some_and(|mark| witnessed == Some((inc, mark)))
+                })
+            }) {
                 bad.push(format!(
                     "presence: {} is gone and its row (inc={inc:?}) still says live, a ghost \
                      the running bridge may retire",
@@ -1283,37 +1648,58 @@ impl World {
         bad
     }
 
-    /// Whether the mirror stopped FOR GOOD, as the rulings have it, because a
-    /// power cut tore its pin: the newest bridge said `link mirror stopped
-    /// reason=pin`, and a power cut tore `logpin`. The pin holds the node's
-    /// alias key and lifetime total (rulings Q6, Q13), which no reboot ends
-    /// and nothing else holds, so the bridge keeps a torn one where it is and
-    /// the mirror refuses it rather than mint a fresh key and count from zero
-    /// (`crate::state::StateDir::set_aside_torn` never moves it). Completeness
-    /// is then not the mirror's law; its at-most-once laws still are. A stop
-    /// for the pin with no tear behind it is a violation
-    /// ([`World::mirror_stop_unexplained`]).
-    fn mirror_stopped_by_its_torn_pin(&self) -> bool {
-        self.logpin_torn && lock(&self.ep.state).mirror_said == "stopped reason=pin"
+    /// THE MIRROR NEVER STOPS FOR ITS PIN. Every atomic batch pin or send
+    /// has its durable copies on the media first — the alias key in
+    /// `logkey`, a floor at or above its total and its batch in `logfloor` —
+    /// while the first version fence (and each open's admission) is durable
+    /// before those copies. So a pin a power cut tore is set aside by the
+    /// next boot's first bridge, and the mirror resumes from them
+    /// (`crate::state::StateDir::reconcile_logpin`); a pin it wrote whole is
+    /// never refused. A bridge that said `link mirror stopped reason=pin`, at
+    /// any step and in any boot, broke the rule (`Mutant::KeepTornPin` is the
+    /// old one: the torn pin kept, the mirror stopped for good).
+    fn mirror_stopped_for_its_pin(&self) -> Option<String> {
+        let n = lock(&self.ep.state).pin_stops;
+        (n > 0).then(|| format!("mirror: stopped for its pin {n} times"))
     }
 
-    /// A mirror stopped for its pin when no power cut tore the pin: the bridge
-    /// refused one it wrote whole.
-    fn mirror_stop_unexplained(&self) -> Option<String> {
-        let said = lock(&self.ep.state).mirror_said.clone();
-        (said == "stopped reason=pin" && !self.logpin_torn)
-            .then(|| "mirror: stopped for its pin, which no power cut tore".to_string())
+    /// RULINGS Q6 AND Q13 ACROSS EVERY BOOT, at every step: the node's takes
+    /// named ONE alias key over its whole life, so an edge has one alias on
+    /// the bus; and an engaged mirror's total is never below the highest
+    /// total any pin of the node was written with ([`Device::pin_total`]) —
+    /// whatever a power cut tore or rolled back. A total resumed at the floor
+    /// may be above it (the lease's unused rest is counted), never below.
+    fn mirror_key_and_total(&self) -> Vec<String> {
+        let mut bad = Vec::new();
+        let keys = lock(&self.ep.state).take_keys.clone();
+        if keys.len() > 1 {
+            bad.push(format!(
+                "mirror: the node's takes named {} alias keys {keys:?}",
+                keys.len()
+            ));
+        }
+        if let Some(total) = self
+            .live
+            .as_ref()
+            .and_then(|live| live.bridge.mirror_engaged_total())
+        {
+            let counted = self.core.device.pin_total();
+            if total < counted {
+                bad.push(format!(
+                    "mirror total: the running bridge counts {total} bytes, below the {counted} \
+                     a pin of the node was written with"
+                ));
+            }
+        }
+        bad
     }
 
     /// THE MIRROR, once settled (`LogMirror`'s `QuiescentMirrorComplete`):
     /// every hosted session's log landed through its `ms` head, and every
     /// `ms` up to it is a record in the reader's view or covered by a gap —
-    /// across every move of the log, whose cuts the mirror must say again.
-    /// Not once a torn pin stopped it ([`World::mirror_stopped_by_its_torn_pin`]).
+    /// across every move of the log, whose cuts the mirror must say again,
+    /// and across every power cut, a torn pin's included.
     fn mirror_gaps(&mut self) -> Vec<String> {
-        if self.mirror_stopped_by_its_torn_pin() {
-            return Vec::new();
-        }
         let faces = self.mirror_faces();
         let s = lock(&self.ep.state);
         let mut bad = Vec::new();
@@ -1372,9 +1758,13 @@ impl World {
     }
 
     /// Whether what settles slowly has: presence (a ghost waits out the
-    /// bridge's patience) and the mirror.
+    /// bridge's patience) and the mirror. EVERY ghost, the ones the oracle
+    /// leaves to the operator too: a bridge that may retire one is given the
+    /// patience to, so [`Stats::ghosts_left`] counts only rows no bridge may
+    /// retire, never ones the settle ended too soon for.
     fn converged(&mut self) -> bool {
-        self.presence_gaps().0.is_empty() && self.mirror_gaps().is_empty()
+        let (bad, left) = self.presence_gaps();
+        bad.is_empty() && left.is_empty() && self.mirror_gaps().is_empty()
     }
 
     /// One step of the world, through the model's tap.
@@ -1416,6 +1806,7 @@ impl World {
         }
         if self.opts.mirror {
             bad.extend(self.mirror_twice());
+            bad.extend(self.mirror_key_and_total());
         }
         for (marker, records) in self.bus_markers() {
             if self.sent.get(&marker).is_some_and(|s| s.post.is_some()) && records.len() > 1 {
@@ -1608,7 +1999,13 @@ impl World {
             }
         }
         drop(s);
-        // NO ALARM.
+        // NO ALARM, except the exact first-send collision this alias fixture
+        // deliberately caused. Other cap/forgery alarms remain violations.
+        let alias_collision = lock(&self.core.broker.state)
+            .race
+            .as_ref()
+            .filter(|race| race.alias)
+            .and_then(|race| race.collision);
         for (_, subject, body, _) in self.core.broker.records() {
             if !subject.starts_with(&format!("/f/{FLEET}/pub/{NODE}/")) {
                 continue;
@@ -1616,6 +2013,17 @@ impl World {
             let text = crate::pct::decode(&String::from_utf8_lossy(&body));
             for alarm in ["cap-compromised", "forged-self"] {
                 if text.contains(alarm) {
+                    let (parsed, _) = Body::decode(&body);
+                    if alias_collision.is_some_and(|(seq, off)| {
+                        alarm == "cap-compromised"
+                            && subject == crate::subject::node_face(FLEET, NODE, "ev")
+                            && parsed.unknown.get("ev").map(|ev| crate::pct::decode(ev))
+                                == Some(format!(
+                                    "cap-compromised seq={seq} off={off} reason=deduped"
+                                ))
+                    }) {
+                        continue;
+                    }
                     bad.push(format!("alarm: {subject}: {text}"));
                 }
             }
@@ -1623,8 +2031,26 @@ impl World {
         let (presence, left) = self.presence_gaps();
         bad.extend(presence);
         self.stats.ghosts_left = left.len() as u64;
+        let sibling = self.sibling();
+        let sibling_row = sibling
+            .and_then(|_| self.presence_rows().remove(SIBLING_SID))
+            .map(|(state, _, _)| state);
+        let outranked = sibling.is_some_and(|sibling| {
+            self.node_rows()
+                .iter()
+                .any(|(_, inc, _)| *inc > Some(sibling))
+        });
+        self.stats.sibling_kept = u64::from(outranked && sibling_row.as_deref() == Some("live"));
+        self.stats.sibling_retired = u64::from(sibling_row.is_some_and(|state| state != "live"));
+        self.stats.sibling_raced = u64::from(self.opts.race && sibling.is_some());
+        self.stats.sibling_alias_collided = u64::from(self.core.broker.alias_collision_completed());
+        self.stats.alias_ghost_retired = u64::from(self.alias_ghost.as_ref().is_some_and(|sid| {
+            self.presence_rows()
+                .get(sid)
+                .is_some_and(|(state, _, _)| state == "exited")
+        }));
         bad.extend(self.mirror_gaps());
-        bad.extend(self.mirror_stop_unexplained());
+        bad.extend(self.mirror_stopped_for_its_pin());
         if self.stats.moves == 0 {
             bad.extend(self.mirror_twice_raw());
         }
@@ -1655,11 +2081,27 @@ impl World {
             .filter(|n| n.starts_with(crate::state::RETIRED_PREFIX))
             .count() as u64;
         self.stats.set_aside = quarantined.len() as u64 - self.stats.retired;
+        self.stats.pins_set_aside = quarantined
+            .iter()
+            .filter(|n| *n == crate::state::LOGPIN || n.starts_with("logpin."))
+            .count() as u64;
         self.stats.set_aside_told = lock(&self.ep.state).set_aside_told;
         if self.stats.set_aside_told > self.stats.set_aside {
             bad.push(format!(
                 "set-aside: the bridges told aterm of {} torn files, and the quarantine holds {}",
                 self.stats.set_aside_told, self.stats.set_aside
+            ));
+        }
+        // AND WHAT IT STILL HOLDS IS TOLD AS IT IS (sim item S6): the newest
+        // bridge, whose start said it to an endpoint that reads the line,
+        // said the count the quarantine holds — nobody empties it here, so
+        // nothing moved it since — and said it at all.
+        let held_said = lock(&self.ep.state).held_said;
+        if lock(&self.ep.state).rules.lane >= 5 && held_said != Some(self.stats.set_aside) {
+            bad.push(format!(
+                "quarantine: the newest bridge told aterm it holds {held_said:?} torn files, and \
+                 it holds {}",
+                self.stats.set_aside
             ));
         }
         self.stats.delivered = {
@@ -1681,8 +2123,39 @@ impl World {
 /// RUN ONE SEED: the fault phase, the settle phase, the oracle.
 pub(crate) fn run(opts: &Opts) -> Outcome {
     let mut w = World::new(opts.clone());
+    if opts.alias {
+        // exit_one preserves two sessions, so give the real first bridge a
+        // third to carry and then lose while it is down.
+        w.open_one();
+    }
     w.launch();
-    for _ in 0..opts.steps {
+    if opts.alias {
+        w.settle();
+        let before = w.presence_rows();
+        let first_inc = w.running_bridge().map(|(inc, _)| inc);
+        w.kill();
+        w.exit_one();
+        let departed = lock(&w.ep.state)
+            .gone
+            .last()
+            .map(|session| session.sid.clone());
+        w.alias_ghost = departed.filter(|sid| {
+            before.get(sid).is_some_and(|(state, inc, mark)| {
+                state == "live" && inc.is_some() && *inc == first_inc && mark == &w.mark
+            })
+        });
+        // The second bridge now races the copied writer. Its real earlier
+        // ghost keeps the final settle from ending before a post-patience
+        // sweep; a correct oracle otherwise considers the live sibling quiet.
+        w.launch();
+    }
+    for step in 0..opts.steps {
+        if w.sibling_attaches_at == Some(step) {
+            w.sibling_attaches();
+        }
+        if w.sibling_dies_at == Some(step) {
+            w.sibling_dies();
+        }
         w.fault_step();
         if w.violations
             .iter()
@@ -1724,4 +2197,15 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
 fn is_marker(text: &str) -> bool {
     text.strip_prefix('m')
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The incarnation and writer mark whose WILL was the newest node row when `inc`'s attach read
+/// the face — the row just before `inc`'s first in `rows` (a node face's rows
+/// in log order, [`World::node_rows`]) — if that row is a will.
+fn witnessed_by(rows: &[(String, Option<u64>, Option<u64>)], inc: u64) -> Option<(u64, u64)> {
+    let first = rows.iter().position(|(_, i, _)| *i == Some(inc))?;
+    let (state, dead, mark) = rows.get(first.checked_sub(1)?)?;
+    crate::glance::is_will(state)
+        .then(|| dead.zip(*mark))
+        .flatten()
 }

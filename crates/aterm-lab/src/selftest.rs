@@ -3,15 +3,20 @@
 
 //! `selftest [tag] [--keep]`: the whole proof in one command (about 25 s). It
 //! brings a lab up, launches Claude Code in the first tab (the harness answers
-//! the folder-trust dialog), takes one `hi` turn the stub answers, forces the
-//! session-survey card, lets the harness dismiss it, then checks eight things,
-//! takes the lab down and checks a ninth and a tenth: the TUI drew its composer; the stub
+//! the folder-trust dialog), arms the session-survey card live (the flag
+//! written until Claude Code's `ConfigChange` hook reports it re-read its
+//! settings: [`crate::settings_witness`]), takes one `hi` turn the stub
+//! answers, lets the harness dismiss the card, then checks nine things,
+//! takes the lab down and checks a tenth and an eleventh: the TUI drew its composer; the stub
 //! answered and the TUI shows the reply; the card showed, went, `DISMISSED
 //! survey` was journaled and the composer was left empty (the harness's `0` is
 //! timed and printed, not required); no non-loopback socket was seen, and the
 //! egress witness did see Claude Code talk to the stub (a witness that saw
 //! nothing proves nothing); the keychain tripwire was reached by Claude Code
-//! and never saw the owner's un-suffixed items; the isolation probes pass on a
+//! and never saw the owner's un-suffixed items; nothing was opened on the
+//! desktop (the open recorder, which Claude Code's launch line makes its
+//! `BROWSER` and its log, logged nothing; its control, a bare-name `open` in
+//! the jail, was logged: [`crate::recorder`]); the isolation probes pass on a
 //! replica home (nothing of the owner's is touched); `twin` refuses the
 //! scratch's `home/Library` made a link to a decoy from inside the jail and
 //! writes nothing through it; an orphan in the jail (a jailed shell's child
@@ -333,32 +338,74 @@ pub fn observe_open_files(pid: i32) -> OpenFiles {
     )
 }
 
-/// The roots of the owner's home `real_home` an agent of `run` may hold files
-/// under: the run directory (its scratch HOME, its launcher) and, for a binary
-/// `bin` in aterm's package store (which keeps the managed agents in the
-/// owner's home, and of which the jail re-allows only that build), the build
-/// it sits in (the directory above `bin/`). A binary anywhere else adds only
-/// itself: the directory two above `~/bin/muse` is the home.
+/// The owner's homes a witness watches: every home the lab guards (the
+/// account's, whatever `HOME` says, and the caller's `HOME` when it names
+/// another: [`crate::paths::Paths::guarded_homes`]). Made only from the lab's
+/// facts ([`Watched::of`]), so no witness picks its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Watched(Vec<String>);
+
+impl Watched {
+    /// The homes `p` guards.
+    #[must_use]
+    pub fn of(p: &crate::paths::Paths) -> Watched {
+        Watched(p.guarded_homes())
+    }
+
+    /// Each watched home.
+    #[must_use]
+    pub fn homes(&self) -> &[String] {
+        &self.0
+    }
+
+    /// `<home>/<rel>` in each watched home ([`owner_dirs`]).
+    #[must_use]
+    pub fn dirs(&self, rel: &str) -> Vec<String> {
+        owner_dirs(&self.0, rel)
+    }
+}
+
+/// `<home>/<rel>` in each of the owner's `homes` (the account's, and `$HOME`'s
+/// when it names another: [`crate::paths::Paths::guarded_homes`]): where a
+/// witness looks for the owner's own copy of a directory (`.codex`,
+/// `.gemini`, Muse Code's) that the lab's agents must never touch.
 #[must_use]
-pub fn lab_roots(run: &Run, bin: &str, real_home: &str) -> Vec<String> {
-    let store = format!("{real_home}/Library/Application Support/aterm/pkg/store/");
+pub fn owner_dirs(homes: &[String], rel: &str) -> Vec<String> {
+    homes.iter().map(|h| format!("{h}/{rel}")).collect()
+}
+
+/// The roots of the owner's homes `homes` (every home the lab guards:
+/// [`crate::paths::Paths::guarded_homes`]) an agent of `run` may hold files
+/// under: the run directory (its scratch HOME, its launcher) and, for a binary
+/// `bin` in aterm's package store of one of them (which keeps the managed
+/// agents in the owner's home, and of which the jail re-allows only that
+/// build), the build it sits in (the directory above `bin/`). A binary
+/// anywhere else adds only itself: the directory two above `~/bin/muse` is
+/// the home.
+#[must_use]
+pub fn lab_roots(run: &Run, bin: &str, homes: &[String]) -> Vec<String> {
     let build = std::path::Path::new(bin)
         .parent()
         .and_then(std::path::Path::parent)
         .map(|b| b.to_string_lossy().into_owned())
-        .filter(|b| b.starts_with(&store));
+        .filter(|b| {
+            homes.iter().any(|h| {
+                b.starts_with(&format!("{h}/Library/Application Support/aterm/pkg/store/"))
+            })
+        });
     std::iter::once(run.run.to_string_lossy().into_owned())
         .chain(build.or_else(|| (!bin.is_empty()).then(|| bin.to_string())))
         .collect()
 }
 
-/// The files an `lsof -Fn` report names in the owner's home `real_home` that
-/// lie under none of `allowed` ([`lab_roots`]): what an agent holds of the
-/// owner's that the lab never handed it, each once. The jail denies writes
-/// there but reads only of what is on its protected list, so a file named here
-/// is a gap in that list.
+/// The files an `lsof -Fn` report names in any of the owner's homes `homes`
+/// (the account's, and `$HOME`'s when it names another:
+/// [`crate::paths::Paths::guarded_homes`]) that lie under none of `allowed`
+/// ([`lab_roots`]): what an agent holds of the owner's that the lab never
+/// handed it, each once. The jail denies writes there but reads only of what
+/// is on its protected list, so a file named here is a gap in that list.
 #[must_use]
-pub fn owner_strays(lsof_fn: &str, real_home: &str, allowed: &[String]) -> Vec<String> {
+pub fn owner_strays(lsof_fn: &str, homes: &[String], allowed: &[String]) -> Vec<String> {
     let below = |path: &str, root: &str| {
         !root.is_empty()
             && path
@@ -368,7 +415,7 @@ pub fn owner_strays(lsof_fn: &str, real_home: &str, allowed: &[String]) -> Vec<S
     let mut out: Vec<String> = lsof_fn
         .lines()
         .filter_map(|l| l.strip_prefix('n'))
-        .filter(|p| below(p, real_home) && !allowed.iter().any(|a| below(p, a)))
+        .filter(|p| homes.iter().any(|h| below(p, h)) && !allowed.iter().any(|a| below(p, a)))
         .map(str::to_string)
         .collect();
     out.sort();
@@ -393,6 +440,8 @@ pub fn strays_verdict(strays: &[String], pids: &[i32], observed: bool) -> Verdic
 
 /// Run the cycle and the witnesses.
 fn checks(run: &Run) -> Result<Checks, Fail> {
+    // the recorder's control first: a bare-name open in the jail, the shim leading its PATH, is logged
+    let open_control = crate::recorder::control(run);
     // The cycle is the scenario runner's: it attaches to this lab, launches Claude Code, takes the "hi" turn,
     // forces the survey card live and judges it from the frame stream. 0 held, 1 not, 2 no composer.
     println!("== survey cycle (aterm-lab scn's selftest cycle)");
@@ -422,6 +471,9 @@ fn checks(run: &Run) -> Result<Checks, Fail> {
     }
     println!("== keychain tripwire (the account is masked)");
     print!("{}", crate::verbs::security_masked(run));
+    // Claude Code's launch line names the recorder's log and makes it its BROWSER
+    let opened = crate::recorder::Witness::read(run, &open_control);
+    opened.print();
     println!(
         "== isolation probes (this lab's rules on a replica home: nothing of the owner's is touched)"
     );
@@ -491,6 +543,7 @@ fn checks(run: &Run) -> Result<Checks, Fail> {
         "the keychain tripwire was reached by Claude Code and never saw the owner's un-suffixed items",
         !sec.is_empty() && !unsuffixed,
     );
+    check(crate::recorder::NOTHING_OPENED, opened.ok());
     check("the isolation probes passed", iso == 0);
     check(
         "twin refused the scratch's home/Library made a link to a decoy from inside the jail, and wrote nothing through it",
@@ -519,7 +572,7 @@ mod tests {
     /// the directory two above it (the home).
     #[test]
     fn a_file_of_the_owners_home_outside_the_lab_is_a_stray() {
-        let home = "/Users//o";
+        let home = &["/Users//o".to_string()];
         let run = Run {
             run: "/Users//o/Developer/lab/runs/t".into(),
             ..Run::default()
@@ -589,6 +642,120 @@ mod tests {
         );
     }
 
+    /// UNDER A SCRATCH `HOME` THE ACCOUNT'S HOME IS WATCHED TOO: a file of the
+    /// account's own home (the account database's) an agent holds is a stray
+    /// whatever `HOME` said, as is one of the scratch home's, and an agent in
+    /// the account's package store keeps its own build. NEGATIVE CONTROL: the
+    /// witness of `$HOME` alone (the lab before this) sees nothing of the
+    /// account's.
+    #[test]
+    fn under_a_scratch_home_a_file_of_the_account_home_is_a_stray() {
+        let account = "/Users//o".to_string();
+        let scratch = "/private/tmp/s/home".to_string();
+        let homes = crate::paths::guarded(&account, &scratch);
+        assert_eq!(homes, [account.clone(), scratch.clone()]);
+        let run = Run {
+            run: "/Users//o/Developer/lab/runs/t".into(),
+            ..Run::default()
+        };
+        let bin = "/Users//o/Library/Application Support/aterm/pkg/store/claude/1/bin/claude";
+        let roots = lab_roots(&run, bin, &homes);
+        assert_eq!(
+            roots,
+            [
+                "/Users//o/Developer/lab/runs/t",
+                "/Users//o/Library/Application Support/aterm/pkg/store/claude/1",
+            ]
+        );
+        let lsof = format!(
+            "p7\nftxt\nn{bin}\nf3\nn/Users//o/.gemini/settings.json\nf4\nn/private/tmp/s/home/.zsh_history\n\
+             f5\nn/Users//o/Developer/lab/runs/t/scratch/home/x\n"
+        );
+        assert_eq!(
+            owner_strays(&lsof, &homes, &roots),
+            [
+                "/Users//o/.gemini/settings.json",
+                "/private/tmp/s/home/.zsh_history"
+            ]
+        );
+        // NEGATIVE CONTROL: $HOME's witness alone misses the account's file, and its roots miss the store's build
+        let env_only = crate::paths::guarded("", &scratch);
+        assert_eq!(
+            owner_strays(&lsof, &env_only, &lab_roots(&run, bin, &env_only)),
+            ["/private/tmp/s/home/.zsh_history"]
+        );
+        assert_eq!(
+            lab_roots(&run, bin, &env_only),
+            ["/Users//o/Developer/lab/runs/t", bin]
+        );
+    }
+
+    /// EVERY WITNESS WATCHES EVERY HOME THE LAB GUARDS: [`Watched::of`] the
+    /// lab's facts under a scratch `HOME` (a fake account home handed in
+    /// through [`crate::paths::Paths::resolve_with`]) is the account's home
+    /// and the scratch one, so the Codex, Gemini and agy witnesses look for
+    /// `.codex` and `.gemini` in both, the Muse Code witness looks for its
+    /// directories in both, and a file of either an agent holds is a stray.
+    /// NEGATIVE CONTROL: the facts of a run from the account's own `HOME`
+    /// watch that one home, and the scratch's files are nothing of the owner's.
+    #[test]
+    fn the_witnesses_watch_every_home_the_lab_guards() {
+        let top = aterm_tempfile::Builder::new()
+            .prefix("lab-watched-")
+            .tempdir()
+            .unwrap();
+        let real = std::fs::canonicalize(top.path()).unwrap();
+        let (account, scratch) = (real.join("account"), real.join("scratch"));
+        for d in [&account, &scratch] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (a, s) = (account.display().to_string(), scratch.display().to_string());
+        let p = crate::paths::Paths::resolve_with(Some(account.clone()), Some(scratch.into()));
+        let w = Watched::of(&p);
+        assert_eq!(w.homes(), [a.clone(), s.clone()]);
+        for rel in [".codex", ".gemini"] {
+            assert_eq!(w.dirs(rel), [format!("{a}/{rel}"), format!("{s}/{rel}")]);
+        }
+        let run = Run {
+            run: format!("{a}/lab/runs/t").into(),
+            ..Run::default()
+        };
+        let roots = lab_roots(&run, "", w.homes());
+        let lsof = format!(
+            "p7\nf3\nn{a}/.gemini/settings.json\nf4\nn{s}/.codex/auth.json\nf5\nn{a}/lab/runs/t/scratch/x\n"
+        );
+        assert_eq!(
+            owner_strays(&lsof, w.homes(), &roots),
+            [
+                format!("{a}/.gemini/settings.json"),
+                format!("{s}/.codex/auth.json")
+            ]
+        );
+        let muse = format!("p7\nf3\nn{a}/.local/share/muse/db\nf4\nn{s}/.config/muse/auth.json\n");
+        assert_eq!(
+            crate::muse_proof::held_under(&muse, w.homes()),
+            [
+                format!("{a}/.local/share/muse/db"),
+                format!("{s}/.config/muse/auth.json")
+            ]
+        );
+        // NEGATIVE CONTROL: a run from the account's own HOME
+        let own = Watched::of(&crate::paths::Paths::resolve_with(
+            Some(account.clone()),
+            Some(account.into()),
+        ));
+        assert_eq!(own.homes(), std::slice::from_ref(&a));
+        assert_eq!(own.dirs(".codex"), [format!("{a}/.codex")]);
+        assert_eq!(
+            owner_strays(&lsof, own.homes(), &roots),
+            [format!("{a}/.gemini/settings.json")]
+        );
+        assert_eq!(
+            crate::muse_proof::held_under(&muse, own.homes()),
+            [format!("{a}/.local/share/muse/db")]
+        );
+    }
+
     /// THE STRAYS CHECK FAILS ON A STRAY whatever else it saw, holds on a
     /// complete report of every agent process with none, and is UNPROVEN with
     /// no agent process or an incomplete report. NEGATIVE CONTROL: those two
@@ -618,7 +785,7 @@ mod tests {
         assert!(seen.complete);
         assert_eq!(
             strays_verdict(
-                &owner_strays(&seen.text, "/Users//owner", &[]),
+                &owner_strays(&seen.text, &["/Users//owner".to_string()], &[]),
                 &[7],
                 seen.complete
             ),
@@ -640,7 +807,7 @@ mod tests {
         let held = open_files(7, Ok(out(b"p7\nn/Users//owner/private.txt\n")));
         assert_eq!(
             strays_verdict(
-                &owner_strays(&held.text, "/Users//owner", &[]),
+                &owner_strays(&held.text, &["/Users//owner".to_string()], &[]),
                 &[7],
                 held.complete
             ),

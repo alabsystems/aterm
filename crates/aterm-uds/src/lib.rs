@@ -74,6 +74,10 @@ pub mod elevation;
 /// `aterm ctl subscribe`'s redial).
 pub mod exitwatch;
 pub mod fdpass;
+/// Test support (test and debug builds): the `git` a fixture runs, isolated from this
+/// machine. See [`fixture_git`].
+#[cfg(all(any(test, debug_assertions), not(target_arch = "wasm32")))]
+pub mod fixture_git;
 /// Another program's live SQLite database (agy's summaries, tccd's `TCC.db`), read with
 /// no lock on it: the file itself as an immutable URI, or a private copy of it and its
 /// `-wal`, kept only when nothing changed meanwhile. See [`foreign_db`].
@@ -102,6 +106,11 @@ pub mod output;
 pub mod ownerlock;
 /// The kernel's record of a socket peer: its uid and (Darwin) audit token.
 pub mod peer;
+/// Unix-only: strict private files, the user's own regular file directly in the user's
+/// own 0700 directory, with no second link, no symlink and no ACL grant (lifted from
+/// aterm-net's `fleet_member`). See [`private_file`].
+#[cfg(unix)]
+pub mod private_file;
 /// `KERN_PROCARGS2`, a process's exec path, argument words and initial environment: the one
 /// reader ([`procargs::read`], macOS) and the one parser ([`procargs::parse`]) every crate
 /// reads it through, aterm-sysprobe's (its `kproc` reads a process with it, and this crate
@@ -126,6 +135,9 @@ pub mod rand;
 /// [`reaper`].
 #[cfg(unix)]
 pub mod reaper;
+/// Secret bytes: scrubbed on drop, a redacted `Debug`, no `Clone`; and the process's
+/// no-core-dump switch. See [`secret`].
+pub mod secret;
 /// Unix-only: whether an account other than this one can write a file or directory (its
 /// mode bits, its owner, its access ACL, its filesystem and the user-private-group rule).
 /// See [`shared_write`].

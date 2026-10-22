@@ -4,11 +4,17 @@
 //! A first-party HTTP/1.1 client for aterm: one bounded request at a time to
 //! an endpoint the caller names, over TCP or TLS the platform verifies.
 //!
-//! Two callers use it. The supervisor's network probe (`aterm-gui`'s
+//! Three callers use it. The supervisor's network probe (`aterm-gui`'s
 //! `harness_netprobe`) opens a [`stream::Stream`] and completes a
 //! platform-verified TLS handshake under one [`Deadline`]. The dev-only
 //! real-Claude lab (`aterm-lab`'s stub) drives its loopback API stand-in with
-//! [`Client`] over plain HTTP. The request/response half was written for the
+//! [`Client`] over plain HTTP. agh, aterm's GitHub client, sends its requests
+//! through [`Client::request`] and reads each answer as an [`Exchange`] whose
+//! [`BodyReader`] streams the body. A failed exchange carries a [`Phase`]
+//! telling a request that never left from one that may have been acted on,
+//! and from one whose head was answered; a body read error comes after the
+//! answer by construction. The
+//! request/response half was written for the
 //! LLM title-summary worker, retired with Smart Titles on 2026-10-15; its docs
 //! say what a caller gets, not who calls it.
 //!
@@ -57,7 +63,9 @@ pub mod tls;
 pub mod uri;
 pub mod verifier;
 
-pub use client::{Client, Error, RequestBuilder, Response};
+pub use client::{
+    Body, BodyReader, Client, Error, Exchange, Method, Phase, RequestBuilder, Response, SendError,
+};
 pub use proxy::ProxyMode;
 pub use stream::{AlwaysAuthorized, Connect, Deadline, Guard, TcpConnector};
 pub use tls::Trust;

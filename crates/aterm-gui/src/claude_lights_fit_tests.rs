@@ -231,10 +231,18 @@ fn land(w: &mut World) {
     w.session().autopilot = Some(AutopilotView::Land);
 }
 
+/// Cruise's title as `autopilot_title` composes it with a trail of `last`,
+/// its explanation read from the one table, so the fit is fed the length
+/// and the shape the app draws.
+fn cruise_title(last: &str) -> String {
+    format!(
+        "autopilot: cruise \u{2014} {} \u{b7} last: {last}",
+        crate::autopilot::mode_words(Autopilot::Cruise).chip
+    )
+}
+
 fn titled(w: &mut World) {
-    w.title(
-        "autopilot: cruise \u{2014} keeps the work moving \u{b7} last: \u{2713} approved 14:05",
-    );
+    w.title(&cruise_title("\u{2713} approved 14:05"));
 }
 
 fn refusing(w: &mut World) {
@@ -265,7 +273,7 @@ fn cases() -> Vec<Case> {
         }),
         ("the room", nothing, |w| w.room = 0),
         ("Autopilot's title built anew", titled, |w| {
-            w.title("autopilot: cruise \u{2014} keeps the work moving \u{b7} last: \u{21bb} kept going 14:07");
+            w.title(&cruise_title("\u{21bb} kept going 14:07"));
         }),
         ("Claude's mode", nothing, |w| {
             w.session().shown = Reading {
@@ -483,7 +491,7 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
         Some(stamp(17 * 60 + 42)),
     );
     let make = |built: (AutopilotView, ChipGlass), today| {
-        let (whole, short) = autopilot_title(built.0, &built.1, "", today);
+        let (whole, short) = autopilot_title(built.0, &built.1, "", today, TitleWords::default());
         TitleReading {
             session: S,
             generation: 0,
@@ -499,11 +507,16 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
     // the actual title formatter names the historical stamp's weekday.
     let mut ordinary = make(empty, None);
     let reads = Cell::new(0);
-    assert!(ordinary.refresh(1, landed, |stamped| {
-        assert!(stamped);
-        reads.set(reads.get() + 1);
-        (String::new(), Some(TODAY))
-    }));
+    assert!(ordinary.refresh(
+        1,
+        landed,
+        || (None, None),
+        |stamped| {
+            assert!(stamped);
+            reads.set(reads.get() + 1);
+            (String::new(), Some(TODAY))
+        }
+    ));
     assert_eq!(reads.get(), 1);
     assert!(ordinary.short.ends_with("landed Fri 17:42"));
     let kept = (
@@ -512,7 +525,12 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
         ordinary.laid,
     );
     for _ in 0..3 {
-        assert!(!ordinary.refresh(1, landed, |_| panic!("a kept title read a clock")));
+        assert!(!ordinary.refresh(
+            1,
+            landed,
+            || panic!("a kept title read its words"),
+            |_| panic!("a kept title read a clock")
+        ));
         assert_eq!(
             (&ordinary.whole, &ordinary.short, ordinary.laid),
             (&kept.0, &kept.1, kept.2),
@@ -520,12 +538,22 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
     }
     // CONTROL: a trail without a face clock is still read at its event.
     let mut trail = make(empty, None);
-    assert!(trail.refresh(1, empty, |stamped| {
-        assert!(!stamped);
-        ("approved 14:05".to_owned(), Some(TODAY))
-    }));
+    assert!(trail.refresh(
+        1,
+        empty,
+        || (None, None),
+        |stamped| {
+            assert!(!stamped);
+            ("approved 14:05".to_owned(), Some(TODAY))
+        }
+    ));
     assert!(trail.whole.contains("approved 14:05"));
-    assert!(!trail.refresh(1, empty, |_| panic!("an unchanged trail was read again")));
+    assert!(!trail.refresh(
+        1,
+        empty,
+        || panic!("a kept title read its words"),
+        |_| panic!("an unchanged trail was read again")
+    ));
 
     // The generation may stand while any part of the built face changes.
     // A first/restated stamp must not inherit None, or a previous day's
@@ -545,12 +573,17 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
     ] {
         let mut reading = make(from, day);
         let reads = Cell::new(0);
-        let rebuilt = reading.refresh(0, to, |stamped| {
-            assert!(stamped);
-            reads.set(reads.get() + 1);
-            (String::new(), Some(TODAY))
-        });
-        let expected = autopilot_title(to.0, &to.1, "", Some(TODAY));
+        let rebuilt = reading.refresh(
+            0,
+            to,
+            || (None, None),
+            |stamped| {
+                assert!(stamped);
+                reads.set(reads.get() + 1);
+                (String::new(), Some(TODAY))
+            },
+        );
+        let expected = autopilot_title(to.0, &to.1, "", Some(TODAY), TitleWords::default());
         outcomes.push(
             rebuilt
                 && reads.get() == 1
@@ -560,18 +593,28 @@ fn a_title_rebuild_reads_its_day_for_each_changed_face_and_not_for_a_kept_one() 
     }
     let mut restated = make(landed, Some(FRI));
     let clear_reads = Cell::new(0);
-    let cleared = restated.refresh(0, empty, |stamped| {
-        assert!(!stamped);
-        clear_reads.set(clear_reads.get() + 1);
-        (String::new(), None)
-    });
+    let cleared = restated.refresh(
+        0,
+        empty,
+        || (None, None),
+        |stamped| {
+            assert!(!stamped);
+            clear_reads.set(clear_reads.get() + 1);
+            (String::new(), None)
+        },
+    );
     outcomes.push(cleared && clear_reads.get() == 1 && restated.today.is_none());
     let restore_reads = Cell::new(0);
-    let restored = restated.refresh(0, landed, |stamped| {
-        assert!(stamped);
-        restore_reads.set(restore_reads.get() + 1);
-        (String::new(), Some(TODAY))
-    });
+    let restored = restated.refresh(
+        0,
+        landed,
+        || (None, None),
+        |stamped| {
+            assert!(stamped);
+            restore_reads.set(restore_reads.get() + 1);
+            (String::new(), Some(TODAY))
+        },
+    );
     outcomes.push(
         restored
             && restore_reads.get() == 1

@@ -8,7 +8,8 @@
 //! clock at queue time and posted into the message center at the next park
 //! (`App::drain_message_inbox`), so it keeps the instant it happened. An exceptions entry raised
 //! there (the fabric endpoint's torn state files) has a lane of its own ([`queue_exception`]),
-//! handed to `App::except` at the same park.
+//! handed to `App::except` at the same park, and so has its end ([`queue_exception_clear`],
+//! `App::except_clear`).
 //!
 //! A `Mutex<Vec<_>>` behind an `AtomicBool`, so the drain — which runs on
 //! every park — is one atomic load (`Acquire`, pairing with the producer's
@@ -46,39 +47,79 @@ static INBOX_PENDING: AtomicBool = AtomicBool::new(false);
 static WORKSTATION_SETUP_FINISHED: AtomicBool = AtomicBool::new(false);
 
 /// THE EXCEPTIONS LANE: a fact for the owner's later look
-/// ([`aterm_messages::exceptions::Entry`], an event family's) raised on a
-/// thread with no `App` — the fabric endpoint's, when the bridge says it set
-/// torn state files aside — and handed to `App::except` at the next park,
-/// with the lane it was queued in. Its own flag, so a drain of the message
-/// lane never lowers it. Bounded at [`INBOX_CAP`], and an entry already
-/// queued under the same key is replaced by the later words.
-static EXCEPTIONS: Mutex<Vec<(u64, aterm_messages::exceptions::Entry)>> = Mutex::new(Vec::new());
+/// ([`aterm_messages::exceptions::Entry`], an event family's) raised, or
+/// ended, on a thread with no `App` — the fabric endpoint's, when the bridge
+/// says it set torn state files aside and when it says its quarantine holds
+/// none of them any more — and handed to `App::except` or `App::except_clear`
+/// at the next park, with the lane it was queued in. Its own flag, so a
+/// drain of the message lane never lowers it. Bounded at [`INBOX_CAP`], and a
+/// word already queued under the same key is replaced by the later one, so
+/// the last word on a fact is the one the park acts on.
+static EXCEPTIONS: Mutex<Vec<(u64, ExceptionWord)>> = Mutex::new(Vec::new());
 static EXCEPTIONS_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// One word the exceptions lane carries ([`EXCEPTIONS`]).
+#[derive(Clone, Debug)]
+pub(crate) enum ExceptionWord {
+    /// The fact holds: `App::except` (a later raise restates it).
+    Raise(Box<aterm_messages::exceptions::Entry>),
+    /// The fact's cause ended, and its reporter says so: `App::except_clear`
+    /// of the entry's key.
+    Clear(String),
+}
+
+impl ExceptionWord {
+    /// The key of the fact it is about.
+    fn key(&self) -> String {
+        match self {
+            Self::Raise(entry) => entry.key(),
+            Self::Clear(key) => key.clone(),
+        }
+    }
+}
+
+/// Queue `word` for the next park ([`EXCEPTIONS`]): the later word on a key
+/// replaces the earlier one in its place. Safe from any thread and from
+/// before `App` exists.
+#[cfg(any(unix, test))]
+fn queue_exception_word(word: ExceptionWord) {
+    let lane = current_lane();
+    let Ok(mut q) = EXCEPTIONS.lock() else {
+        return; // a poisoned lane must never take the app down
+    };
+    let key = word.key();
+    if let Some(slot) = q
+        .iter_mut()
+        .find(|(at, queued)| *at == lane && queued.key() == key)
+    {
+        slot.1 = word;
+    } else if q.iter().filter(|(at, _)| *at == lane).count() < INBOX_CAP {
+        q.push((lane, word));
+    }
+    EXCEPTIONS_PENDING.store(true, Ordering::Release);
+}
 
 /// Queue `entry` for `App::except` at the next park ([`EXCEPTIONS`]). Safe
 /// from any thread and from before `App` exists. Built where its one caller
 /// is (`fabric_bind`'s torn-state report, unix and tests).
 #[cfg(any(unix, test))]
 pub(crate) fn queue_exception(entry: aterm_messages::exceptions::Entry) {
-    let lane = current_lane();
-    let Ok(mut q) = EXCEPTIONS.lock() else {
-        return; // a poisoned lane must never take the app down
-    };
-    let key = entry.key();
-    if let Some(slot) = q
-        .iter_mut()
-        .find(|(at, queued)| *at == lane && queued.key() == key)
-    {
-        slot.1 = entry;
-    } else if q.iter().filter(|(at, _)| *at == lane).count() < INBOX_CAP {
-        q.push((lane, entry));
-    }
-    EXCEPTIONS_PENDING.store(true, Ordering::Release);
+    queue_exception_word(ExceptionWord::Raise(Box::new(entry)));
 }
 
-/// Take every entry queued in the calling thread's lane ([`queue_exception`]),
-/// as [`take_queued`] takes messages.
-pub(crate) fn take_queued_exceptions() -> Vec<aterm_messages::exceptions::Entry> {
+/// Queue the end of the fact under `key` for `App::except_clear` at the next
+/// park ([`EXCEPTIONS`]): its cause ended (the owner emptied the fabric's
+/// quarantine). Built where its one caller is (`fabric_bind`, unix and
+/// tests).
+#[cfg(any(unix, test))]
+pub(crate) fn queue_exception_clear(key: String) {
+    queue_exception_word(ExceptionWord::Clear(key));
+}
+
+/// Take every word queued in the calling thread's lane ([`queue_exception`],
+/// [`queue_exception_clear`]), oldest first, as [`take_queued`] takes
+/// messages.
+pub(crate) fn take_queued_exceptions() -> Vec<ExceptionWord> {
     if !EXCEPTIONS_PENDING.load(Ordering::Acquire) {
         return Vec::new();
     }
@@ -94,7 +135,7 @@ pub(crate) fn take_queued_exceptions() -> Vec<aterm_messages::exceptions::Entry>
     if q.is_empty() {
         EXCEPTIONS_PENDING.store(false, Ordering::Relaxed);
     }
-    mine.into_iter().map(|(_, entry)| entry).collect()
+    mine.into_iter().map(|(_, word)| word).collect()
 }
 
 /// A setup worker verified completion or restore. Its earlier queued failures

@@ -48,7 +48,7 @@ use crate::lab::UpOpts;
 use crate::procs::JailOut;
 use crate::run::Run;
 use crate::selftest::{
-    jail_left, jail_orphan, lab_roots, members_table, observe_open_files, orphan_seen,
+    Watched, jail_left, jail_orphan, lab_roots, members_table, observe_open_files, orphan_seen,
     owner_strays, strays_verdict,
 };
 use crate::sys::{PutSrc, put};
@@ -387,7 +387,8 @@ struct Before {
 fn checks(agent: Agent, run: &Run) -> Result<Before, Fail> {
     let verb = format!("{}-selftest", agent.name());
     crate::gemini::need(run, agent)?;
-    let real_home = crate::paths::paths().real_home.clone();
+    // the owner's homes: the account's, whatever HOME says, and HOME's when it names another
+    let watched = Watched::of(crate::paths::paths());
     let decoy0 = decoy_state(run);
     // The refusals' control: a jailed write into the run directory, which the jail refuses; the unified log keeps
     // such a report or drops it (on macOS 27 it kept no file refusal), so its silence about ~/.gemini counts only
@@ -405,18 +406,7 @@ fn checks(agent: Agent, run: &Run) -> Result<Before, Fail> {
         &["/usr/bin/touch", &run.run.join(&ctlname).to_string_lossy()],
         JailOut::Capture,
     );
-    let shim_path = format!("{}:/usr/bin:/bin", run.run.join("shim").display());
-    let open_control = run.w.join("open-control.log");
-    let _ = crate::procs::jailed(
-        run,
-        &run.w,
-        &[
-            ("PATH", &shim_path),
-            ("LAB_OPEN_LOG", &open_control.to_string_lossy()),
-        ],
-        &["open", "x-lab-control://selftest"],
-        JailOut::Capture,
-    );
+    let open_control = crate::recorder::control(run);
     println!(
         "== {} {} in lab '{}' (the stub's Gemini API at http://127.0.0.1:{}, a fake GEMINI_API_KEY{})",
         agent.name(),
@@ -490,20 +480,8 @@ fn checks(agent: Agent, run: &Run) -> Result<Before, Fail> {
     {
         println!("  {l}");
     }
-    let opened = scratch_text(&run.w.join("open.log"));
-    let ctl_open = scratch_text(&open_control);
-    println!(
-        "== the open recorder (a URL or app something tried to open; its control: {})",
-        ctl_open.chars().take(80).collect::<String>().trim_end()
-    );
-    println!(
-        "  {}",
-        if opened.trim().is_empty() {
-            "(nothing)"
-        } else {
-            opened.trim_end()
-        }
-    );
+    let opened = crate::recorder::Witness::read(run, &open_control);
+    opened.print();
     // ~/.gemini: what the kernel refused naming it, what the agent holds open, the decoy, and the agent's own writes
     let mut klog = String::new();
     let mut control = false;
@@ -519,17 +497,17 @@ fn checks(agent: Agent, run: &Run) -> Result<Before, Fail> {
         .iter()
         .map(ToString::to_string)
         .collect();
-    let owner_gemini = format!("{real_home}/.gemini");
+    let owner_gemini = watched.dirs(".gemini");
     let denied: Vec<String> = klog
         .lines()
         .filter_map(|l| crate::verbs::refusal_of(l, &pat))
-        .filter(|l| l.contains(&owner_gemini))
+        .filter(|l| owner_gemini.iter().any(|g| l.contains(g.as_str())))
         .take(5)
         .collect();
     // each agent process's open files, once: what it holds under ~/.gemini, and anywhere else in the owner's home
     // outside the run directory and its own build
     // (a file a failed or partial report names is still held; only complete reports prove that none is)
-    let roots = lab_roots(run, agent.bin(run), &real_home);
+    let roots = lab_roots(run, agent.bin(run), watched.homes());
     let (mut held, mut strays, mut observed) = (Vec::new(), Vec::new(), true);
     for &p in &pids {
         let seen = observe_open_files(p);
@@ -537,11 +515,11 @@ fn checks(agent: Agent, run: &Run) -> Result<Before, Fail> {
         held.extend(
             seen.text
                 .lines()
-                .filter(|l| l.starts_with(&format!("n{owner_gemini}")))
+                .filter(|l| owner_gemini.iter().any(|g| l.starts_with(&format!("n{g}"))))
                 .map(str::to_string),
         );
         held.truncate(5);
-        strays.extend(owner_strays(&seen.text, &real_home, &roots));
+        strays.extend(owner_strays(&seen.text, watched.homes(), &roots));
         strays.truncate(5);
     }
     let decoy1 = decoy_state(run);
@@ -621,10 +599,7 @@ fn checks(agent: Agent, run: &Run) -> Result<Before, Fail> {
     let (requests, other_auth) = gemini_auths(&stub_log);
     let refused = proxy_refused(&stub_log);
     let refusals = refusals_verdict(&denied, control);
-    let open_ok = opened.trim().is_empty()
-        && ctl_open
-            .lines()
-            .any(|l| l.ends_with(" open x-lab-control://selftest"));
+    let open_ok = opened.ok();
     println!("== checks");
     let mut t = Tally::default();
     t.check(
@@ -699,11 +674,7 @@ fn checks(agent: Agent, run: &Run) -> Result<Before, Fail> {
         ),
         refusals,
     );
-    t.check(
-        "nothing was opened on the desktop: the open recorder logged nothing from the lab (its control, a bare-name \
-         open in the jail, was logged)",
-        ok(open_ok),
-    );
+    t.check(crate::recorder::NOTHING_OPENED, ok(open_ok));
     t.check(
         "the isolation probes passed on a replica home with this lab's rules (loopback only, ~/.gemini and the \
          owner's data denied, the desktop, the store, the scratch's directories, the lab's state dir)",

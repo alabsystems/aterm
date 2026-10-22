@@ -117,11 +117,6 @@ pub(crate) struct SessionRecord {
     /// second handoff, where [`SessionHandoff::outgoing_build`] alone would count it as covered.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub frozen_path: bool,
-    /// The agent identity this session was spawned under (`spawn identity=<name>`). The adopted
-    /// shell keeps that identity's env; this carries the label, so the successor's `sessions` and
-    /// `identities forget` still see it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<String>,
     /// This session's `topic add` set, one `"<topic> <since>"` row each (`fabric::render_topics`).
     /// A topic set is consent (the only way a `post to=say:<topic>` reaches the session), so it
     /// rides every handoff; each row is re-validated on the way in (`fabric::parse_topics`), so a
@@ -1471,8 +1466,6 @@ impl SessionHandoff {
                         // Attached by the seamless writer with its sidecar.
                         control: None,
                         frozen_path: store.has_frozen_path(h.local_id),
-                        // The label from the spawn, or the record it was adopted from.
-                        identity: h.identity.as_deref().map(str::to_owned),
                         topics,
                         // Stamped by the handoff's park capture, once the readers
                         // that write `Session::fg_holder` are parked
@@ -1606,10 +1599,6 @@ pub(crate) struct SessionHandle {
     pub master: i32,
     /// The per-session fabric context (sink + edge table + identity).
     pub ctx: Arc<SessionCtx>,
-    /// The agent identity the session was spawned under, `None` for the human's own agent
-    /// config. A handle field because every roster reads handles and the label is fixed for
-    /// the session's life.
-    pub identity: Option<Arc<str>>,
 }
 
 impl SessionHandle {
@@ -2742,7 +2731,6 @@ fn handle_over(
         term,
         master,
         ctx,
-        identity: None,
     }
 }
 
@@ -3669,10 +3657,10 @@ title = \"zsh\"
         assert_eq!(driven, 8, "every pre-Commit configuration of the machine");
     }
 
-    /// The handle's identity label rides its record: `None` stays off the wire, absent
-    /// reads `None`, and it round-trips.
+    /// Retired named identities follow the normal unknown-field policy: old
+    /// handoffs remain readable without carrying the removed field forward.
     #[test]
-    fn the_identity_carry_rides_per_record_and_absent_reads_none() {
+    fn a_retired_identity_field_is_read_past() {
         let old_wire = "schema = 1
 
 [[sessions]]
@@ -3680,40 +3668,16 @@ local_id = 3
 sid = \"s-old\"
 state = \"alive\"
 title = \"zsh\"
+identity = \"worker\"
 ";
         let read = SessionHandoff::from_toml(old_wire).expect("this build reads an old manifest");
-        assert_eq!(read.sessions[0].identity, None, "absent reads None");
-
-        let mut store = SessionStore::default();
-        store.register(handle(0, None));
-        let mut worker = handle(1, None);
-        worker.identity = Some(Arc::from("worker"));
-        store.register(worker);
-        let manifest = SessionHandoff::from_store(&store);
-        assert_eq!(
-            manifest
-                .sessions
-                .iter()
-                .map(|r| r.identity.as_deref())
-                .collect::<Vec<_>>(),
-            vec![None, Some("worker")],
-            "the handle's label projects into its record"
-        );
-        let wire = manifest.to_toml().expect("serializes");
-        assert_eq!(wire.matches("identity = \"worker\"").count(), 1, "{wire}");
-        assert_eq!(
-            wire.matches("identity").count(),
-            1,
-            "None stays off the wire: {wire}"
-        );
-        assert!(manifest.roundtrips());
+        assert_eq!(read.sessions.len(), 1);
+        assert_eq!(read.sessions[0].local_id, 3);
+        assert_eq!(read.sessions[0].sid, "s-old");
+        let wire = read.to_toml().expect("serializes");
+        assert!(!wire.contains("identity ="), "{wire}");
         let back = SessionHandoff::from_toml(&wire).expect("round-trips");
-        assert_eq!(back.sessions[1].identity.as_deref(), Some("worker"));
-        assert_eq!(
-            store.by_local(1).and_then(|h| h.identity.as_deref()),
-            Some("worker"),
-            "and the registry answers the label by local id — what `@<sid> spawn` inherits"
-        );
+        assert_eq!(back, read);
     }
 
     /// THE TASK RECORD rides per record (the worker pillar, 2026-10-15): a
@@ -3721,9 +3685,10 @@ title = \"zsh\"
     /// wrong type; a worker's record projects as its one row and only its,
     /// crosses the wire, is in the draw the Commit compares — a mark between
     /// the park and the Commit stands the Commit down — and seeds the adopting
-    /// session's timeline with the same rev, state, facts and since. A row that
-    /// does not read seeds nothing. Unix's: the Commit's draw
-    /// ([`CarriedClaims`]) is.
+    /// session's timeline with the same rev, state, facts, since and the agent
+    /// its spawn started (whose reader the startup deadline reads it by, and
+    /// whose product its stall names). A row that does not read seeds
+    /// nothing. Unix's: the Commit's draw ([`CarriedClaims`]) is.
     #[cfg(unix)]
     #[test]
     fn the_task_record_rides_per_record_and_absent_reads_none() {
@@ -3756,6 +3721,12 @@ title = \"zsh\"
         store.register(handle(0, None));
         let worker = handle(1, None);
         mark_session_task(&worker.ctx, 1, &TaskMark::new(TaskState::Working)).expect("unfenced");
+        worker
+            .ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .set_task_agent(aterm_phase::Program::Gemini);
         let mut done = TaskMark::new(TaskState::Done);
         done.why = Some("marker");
         done.result_bytes = 5;
@@ -3765,6 +3736,11 @@ title = \"zsh\"
         assert_eq!(manifest.sessions[0].task, None);
         let row = manifest.sessions[1].task.clone().expect("the worker's row");
         assert!(row.starts_with("rev=2 state=done from=ctl since="), "{row}");
+        assert!(
+            row.ends_with(" agent=gemini"),
+            "a mark keeps the agent: {row}"
+        );
+        assert_eq!(record.agent, Some(aterm_phase::Program::Gemini));
         let wire = manifest.to_toml().expect("serializes");
         assert_eq!(
             wire.matches("\ntask = ").count(),

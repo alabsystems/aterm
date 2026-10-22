@@ -73,7 +73,11 @@ impl App {
         let (instance, view) = self.active_native_view(wid)?;
         let generation = self.native_runtime.view_generation(view)?;
         let app = self.native_runtime.app(instance)?;
-        let commands = self.native_runtime.commands(instance, view).ok()?;
+        let mut commands = self.native_runtime.commands(instance, view).ok()?;
+        // Edit > Find stays the shared contextual row. Keep Save metadata so the
+        // File row carries the exact native window, view and generation target.
+        commands
+            .retain(|command| !matches!(command.id.as_str(), "editor/find" | "settings/search"));
         Some(NativeCommandScope {
             window: wid,
             instance,
@@ -454,13 +458,16 @@ impl App {
         let menu_accels = {
             let mut hints: Vec<(crate::menu::MenuAction, String)> = Vec::new();
             for section in crate::menu::MENU_MODEL {
-                for entry in section.entries {
-                    if let crate::menu::MenuEntry::Item { action, .. } = entry
-                        && !hints.iter().any(|(a, _)| a == action)
-                        && let Some(binding) = menu_binding(*action)
+                for (_, action, _, _) in section
+                    .entries
+                    .iter()
+                    .flat_map(crate::menu::MenuEntry::items)
+                {
+                    if !hints.iter().any(|(a, _)| *a == action)
+                        && let Some(binding) = menu_binding(action)
                         && let Some(chord) = self.keybindings.display_chord_for(binding)
                     {
-                        hints.push((*action, chord));
+                        hints.push((action, chord));
                     }
                 }
             }
@@ -473,6 +480,13 @@ impl App {
             .is_some_and(|terminal| self.pool.theme(terminal.session).is_some());
         PaletteLive {
             has_selection,
+            can_save: self
+                .frontmost_window
+                .is_some_and(|wid| self.can_save_document(wid)),
+            can_find: self.frontmost_window.is_some_and(|wid| self.can_find(wid)),
+            can_find_again: self
+                .frontmost_window
+                .is_some_and(|wid| self.can_find_again(wid)),
             can_rename,
             tab_theme,
             rain_on,
@@ -545,6 +559,9 @@ impl App {
         let promotable = front.map_or(self.launch_kitty, |wid| self.promotable_kitty(wid));
         crate::menu::set_menu_live(crate::menu::MenuLive {
             has_selection,
+            can_save: front.is_some_and(|wid| self.can_save_document(wid)),
+            can_find: front.is_some_and(|wid| self.can_find(wid)),
+            can_find_again: front.is_some_and(|wid| self.can_find_again(wid)),
             multi_tab: self.front().is_some_and(|ws| ws.tab_set.len() >= 2),
             can_reopen_closed_tab: self.can_reopen_closed_tab(),
             can_reopen_closed_view: self.can_reopen_closed_view(),
@@ -812,7 +829,7 @@ impl App {
     /// Dispatch a native target only while its window, view and generation are current and the
     /// command is enabled now: an open palette can outlive an async reducer update, so its
     /// painted snapshot is not trusted for dispatch.
-    fn activate_native_palette_target(
+    pub(crate) fn activate_native_palette_target(
         &mut self,
         target: &NativeCommandTarget,
     ) -> Result<(), String> {
@@ -1050,6 +1067,228 @@ mod tests {
         }
     }
 
+    #[test]
+    fn one_shared_find_row_opens_the_active_native_search() {
+        use crate::menu::MenuAction;
+        use crate::native_app::{AppEvent, AppKind, AppViewState};
+        use crate::native_editor::Minibuffer;
+        use crate::palette::PaletteTarget;
+
+        fn choose_find(app: &mut App, wid: WindowId) {
+            let snapshot = app.palette_snapshot(wid);
+            let rows: Vec<_> = snapshot
+                .rows()
+                .iter()
+                .filter(|row| match &row.action {
+                    PaletteTarget::Menu(MenuAction::Find) => true,
+                    PaletteTarget::Native(target) => {
+                        matches!(target.action.as_str(), "editor/find" | "settings/search")
+                    }
+                    _ => false,
+                })
+                .collect();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].action, MenuAction::Find);
+            assert!(rows[0].enabled);
+            app.palette_enter();
+            filter(app, "find");
+            let chosen = app.windows[&wid]
+                .palette()
+                .unwrap()
+                .selected_action()
+                .expect("selected shared Find action");
+            assert_eq!(chosen, MenuAction::Find);
+            app.palette_activate();
+            assert!(app.windows[&wid].palette().is_none());
+            // Headless has no event-loop proxy. Deliver the selected menu
+            // action through its ordinary contextual command reducer.
+            app.dispatch_action(wid, crate::keybinding::Action::Find);
+        }
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        choose_find(&mut app, wid);
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        assert!(matches!(
+            app.native_runtime.view_state(view),
+            Some(AppViewState::Settings(state)) if state.common.last_focus.as_ref()
+                .is_some_and(|key| key.as_str() == "settings/search")
+        ));
+        assert!(
+            app.native_runtime
+                .commands(instance, view)
+                .unwrap()
+                .iter()
+                .any(|command| command.id.as_str() == "settings/search")
+        );
+        assert!(app.windows[&wid].search.is_none());
+
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("find.txt");
+        let source = "one needle two needle";
+        std::fs::write(&path, source).unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        app.open_document_tab(AppKind::Editor, &uri).unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let original = app.document_store.snapshot(document).unwrap();
+        choose_find(&mut app, wid);
+        assert!(matches!(
+            app.native_runtime.view_state(view),
+            Some(AppViewState::Editor(state)) if state.buffer.as_ref()
+                .is_some_and(|buffer| matches!(buffer.minibuffer, Minibuffer::Search { .. }))
+        ));
+        assert!(
+            app.native_runtime
+                .commands(instance, view)
+                .unwrap()
+                .iter()
+                .any(|command| command.id.as_str() == "editor/find")
+        );
+        app.dispatch_native_event(
+            wid,
+            AppEvent::EditorInput(amacs::input::EditorInput::Text("needle".to_string())),
+        )
+        .unwrap();
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+            panic!("editor view");
+        };
+        let at = source.find("needle").unwrap();
+        assert_eq!(
+            state.buffer.as_ref().unwrap().primary_selection().range(),
+            at..at + "needle".len()
+        );
+        let after = app.document_store.snapshot(document).unwrap();
+        assert_eq!(after.seq, original.seq);
+        assert_eq!(after.text, original.text);
+        assert!(app.windows[&wid].search.is_none());
+    }
+
+    fn assert_find_availability(app: &App, wid: WindowId, open: bool, again: bool) {
+        use crate::menu::{MenuAction, menu_live};
+
+        app.publish_menu_live();
+        let native = menu_live();
+        let live = app.palette_live();
+        assert_eq!((native.can_find, native.can_find_again), (open, again));
+        assert_eq!((live.can_find, live.can_find_again), (open, again));
+        let palette = app.palette_snapshot(wid);
+        for (action, enabled) in [
+            (MenuAction::Find, open),
+            (MenuAction::FindNext, again),
+            (MenuAction::FindPrev, again),
+        ] {
+            let row = palette
+                .rows()
+                .iter()
+                .find(|row| row.action == action)
+                .expect("Find command row");
+            assert_eq!(row.enabled, enabled, "{action:?}");
+            assert_eq!(
+                palette.action_by_name(&format!("{action:?}")).is_ok(),
+                enabled,
+                "{action:?}: disabled rows cannot activate"
+            );
+        }
+    }
+
+    /// Find availability follows the focused content and its own query through
+    /// editing, acceptance and tab switches. Menu, palette and dispatch agree;
+    /// an older terminal query never enables another app's navigation.
+    #[test]
+    fn find_availability_tracks_content_and_query_without_changing_documents() {
+        use crate::app_search::SearchEdit;
+        use crate::native_app::{AppEvent, AppKind, AppViewState};
+        use amacs::input::EditorInput;
+        use aterm_types::keyboard::{Key, Modifiers, NamedKey};
+
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("aterm-find-availability")
+            .tempdir()
+            .unwrap();
+        let first = scratch.path().join("first.md");
+        let second = scratch.path().join("second.txt");
+        std::fs::write(&first, "needle then needle\n").unwrap();
+        std::fs::write(&second, "another needle\n").unwrap();
+        let uri =
+            |path: &std::path::Path| crate::native_document_host::path_to_file_uri(path).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert_find_availability(&app, wid, true, false);
+        app.search_last_query = "remembered".to_string();
+        assert_find_availability(&app, wid, true, true);
+        app.search_enter();
+        assert_find_availability(&app, wid, true, false);
+        app.search_edit_in(wid, SearchEdit::Insert("needle".to_string()));
+        assert_find_availability(&app, wid, true, true);
+        app.search_accept_in(wid);
+        assert_find_availability(&app, wid, true, true);
+
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        assert_find_availability(&app, wid, true, false);
+        app.find_requested();
+        let (_, settings) = app.active_native_view(wid).unwrap();
+        assert_eq!(
+            app.native_runtime
+                .view_state(settings)
+                .unwrap()
+                .common()
+                .last_focus
+                .as_ref()
+                .map(crate::native_ui::UiKey::as_str),
+            Some("settings/search")
+        );
+        assert!(app.search_find_again(true).is_err());
+
+        app.open_document_tab(AppKind::Markdown, &uri(&first))
+            .unwrap();
+        assert_find_availability(&app, wid, false, false);
+        assert!(app.search_find_again(false).is_err());
+
+        app.open_document_tab(AppKind::Editor, &uri(&first))
+            .unwrap();
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let original = app.document_store.snapshot(document).unwrap();
+        assert_find_availability(&app, wid, true, false);
+        assert!(app.search_find_again(true).is_err());
+        app.find_requested();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::EditorInput(EditorInput::Text("needle".to_string())),
+        )
+        .unwrap();
+        assert_find_availability(&app, wid, true, true);
+        app.search_find_again(true).unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::EditorInput(EditorInput::Key {
+                key: Key::Named(NamedKey::Enter),
+                mods: Modifiers::empty(),
+                text: None,
+            }),
+        )
+        .unwrap();
+        assert_find_availability(&app, wid, true, true);
+        app.search_find_again(false).unwrap();
+        let after = app.document_store.snapshot(document).unwrap();
+        assert_eq!(after.seq, original.seq);
+        assert_eq!(after.text, original.text);
+
+        app.open_document_tab(AppKind::Editor, &uri(&second))
+            .unwrap();
+        assert_find_availability(&app, wid, true, false);
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state_mut(view) else {
+            panic!("editor view");
+        };
+        state.buffer = None;
+        assert_find_availability(&app, wid, false, false);
+        app.frontmost_window = None;
+        assert_find_availability(&app, wid, false, false);
+    }
+
     /// `publish_menu_live` (what `validateMenuItem:` reads) derives each bit from the same fact
     /// as `palette_live`: one tab greys the tab cycle, no selection greys Copy, serious mode
     /// checks its row, and a split front tab titles ⌘W's row Close Pane.
@@ -1065,6 +1304,9 @@ mod tests {
             let bar = menu_live();
             let palette = app.palette_live();
             assert_eq!(bar.has_selection, palette.has_selection);
+            assert_eq!(bar.can_save, palette.can_save);
+            assert_eq!(bar.can_find, palette.can_find);
+            assert_eq!(bar.can_find_again, palette.can_find_again);
             assert_eq!(bar.multi_tab, palette.multi_tab);
             assert_eq!(bar.can_reopen_closed_tab, palette.can_reopen_closed_tab);
             assert_eq!(bar.can_reopen_closed_view, palette.can_reopen_closed_view);
@@ -1281,13 +1523,13 @@ mod tests {
             .expect("live Settings generation");
 
         app.palette_enter();
-        filter(&mut app, "Settings: Search");
+        filter(&mut app, "Settings: Go to Themes");
         let target = app
             .windows
             .get(&wid)
             .and_then(|window| window.palette())
             .and_then(crate::palette::PaletteState::selected_target)
-            .expect("native search command");
+            .expect("native route command");
         assert!(matches!(
             &target,
             crate::palette::PaletteTarget::Native(target)
@@ -1295,17 +1537,18 @@ mod tests {
                     && target.instance == instance
                     && target.view == view
                     && target.generation == generation
-                    && target.action.as_str() == "settings/search"
+                    && target.action == crate::native_settings::route_action(
+                        crate::native_settings::SettingsRoute::Themes
+                    )
         ));
 
         app.palette_activate();
         assert!(app.windows.get(&wid).unwrap().palette().is_none());
-        let focus = app
-            .native_runtime
-            .view_state(view)
-            .and_then(|state| state.common().last_focus.as_ref())
-            .map(crate::native_ui::UiKey::as_str);
-        assert_eq!(focus, Some("settings/search"));
+        assert!(matches!(
+            app.native_runtime.view_state(view),
+            Some(crate::native_app::AppViewState::Settings(state))
+                if state.route == crate::native_settings::SettingsRoute::Themes
+        ));
     }
 
     #[test]
@@ -1314,12 +1557,12 @@ mod tests {
         let wid = WindowId(0);
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
         let (_, settings_view) = app.active_native_view(wid).expect("Settings active");
-        let before_focus = app
-            .native_runtime
-            .view_state(settings_view)
-            .and_then(|state| state.common().last_focus.clone());
+        let before = match app.native_runtime.view_state(settings_view).unwrap() {
+            crate::native_app::AppViewState::Settings(state) => state.route,
+            _ => panic!("Settings view"),
+        };
         app.palette_enter();
-        filter(&mut app, "Settings: Search");
+        filter(&mut app, "Settings: Go to Themes");
         let target = match app
             .windows
             .get(&wid)
@@ -1345,12 +1588,11 @@ mod tests {
             app.activate_native_palette_target(&target).is_err(),
             "the captured Settings target is stale"
         );
-        let after_focus = app
-            .native_runtime
-            .view_state(settings_view)
-            .and_then(|state| state.common().last_focus.clone());
-        assert_eq!(
-            after_focus, before_focus,
+        assert!(
+            matches!(
+                app.native_runtime.view_state(settings_view),
+                Some(crate::native_app::AppViewState::Settings(state)) if state.route == before
+            ),
             "no action reaches the parked native view"
         );
     }
@@ -1373,17 +1615,9 @@ mod tests {
 
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
         let closed = app.read_aux_controls(crate::app_introspect::AuxTarget::Menu);
-        // The advertised chord is the platform's: ⌘F on macOS, the seeded Ctrl+Shift+F
-        // elsewhere.
-        let accel = if cfg!(target_os = "macos") {
-            "accel=\"Cmd-F\""
-        } else {
-            "accel=\"Ctrl-Shift-F\""
-        };
         assert!(closed.iter().any(|line| {
             line.contains("section=\"Settings App\"")
-                && line.contains("action=settings/search")
-                && line.contains(accel)
+                && line.contains("action=settings/route/themes")
         }));
         app.palette_enter();
         assert_eq!(

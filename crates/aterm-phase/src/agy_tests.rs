@@ -1391,6 +1391,7 @@ fn lab_readings() -> Vec<Lab> {
         lab(lab::BUSY_THINKING, "busy", true),
         lab(lab::BUSY_STREAMING, "busy", true),
         lab(lab::END_OF_TURN, "idle", true),
+        lab(lab::WORKER_FIRST_PROMPT, "idle", true),
         lab(lab::REPLY_WRAPPED_50, "question", true),
         lab(lab::INTERRUPTED, "idle", true),
         lab(lab::SLASH_MENU, "idle", false),

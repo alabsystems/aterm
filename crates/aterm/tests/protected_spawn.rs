@@ -44,7 +44,7 @@ const CLI_EXIT_DEADLINE: Duration = Duration::from_secs(60);
 /// session has exited.
 fn session_command(test: &str) -> (Command, aterm_tempfile::TempDir) {
     let root = launch_isolation::scratch_root(&format!("aterm-protected-spawn-{test}"));
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+    let mut cmd = Command::new(launch_isolation::aterm_executable());
     launch_isolation::apply(&mut cmd, root.path());
     cmd.args(["--session", launch_isolation::NO_REROUTE]);
     (cmd, root)

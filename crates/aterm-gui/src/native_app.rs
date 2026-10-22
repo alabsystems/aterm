@@ -39,6 +39,7 @@ impl OperationId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum AppKind {
     Settings,
+    SystemState,
     Markdown,
     Editor,
     Recovery,
@@ -48,6 +49,7 @@ impl AppKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Settings => "settings",
+            Self::SystemState => "system-state",
             Self::Markdown => "markdown",
             Self::Editor => "editor",
             Self::Recovery => "recovery",
@@ -59,6 +61,7 @@ impl AppKind {
     pub(crate) const fn display_name(self) -> &'static str {
         match self {
             Self::Settings => "Settings",
+            Self::SystemState => "System State",
             Self::Markdown => "Markdown",
             Self::Editor => "Editor",
             Self::Recovery => "Recovery",
@@ -69,6 +72,7 @@ impl AppKind {
     pub(crate) const fn icon(self) -> AppIcon {
         match self {
             Self::Settings => AppIcon::Settings,
+            Self::SystemState => AppIcon::Settings,
             Self::Markdown => AppIcon::Markdown,
             Self::Editor => AppIcon::Editor,
             Self::Recovery => AppIcon::Recovery,
@@ -135,6 +139,7 @@ impl Default for CommonViewState {
 
 pub(crate) enum AppViewState {
     Settings(Box<crate::native_settings::SettingsViewState>),
+    SystemState(Box<crate::system_state::SystemStateViewState>),
     Markdown(MarkdownViewState),
     Editor(Box<EditorViewState>),
     Recovery(RecoveryViewState),
@@ -144,6 +149,7 @@ impl AppViewState {
     pub(crate) const fn kind(&self) -> AppKind {
         match self {
             Self::Settings(_) => AppKind::Settings,
+            Self::SystemState(_) => AppKind::SystemState,
             Self::Markdown(_) => AppKind::Markdown,
             Self::Editor(_) => AppKind::Editor,
             Self::Recovery(_) => AppKind::Recovery,
@@ -153,6 +159,7 @@ impl AppViewState {
     pub(crate) fn common(&self) -> &CommonViewState {
         match self {
             Self::Settings(view) => &view.common,
+            Self::SystemState(view) => &view.common,
             Self::Markdown(view) => &view.common,
             Self::Editor(view) => &view.common,
             Self::Recovery(view) => &view.common,
@@ -169,6 +176,7 @@ impl AppViewState {
     pub(crate) fn common_mut(&mut self) -> &mut CommonViewState {
         match self {
             Self::Settings(view) => &mut view.common,
+            Self::SystemState(view) => &mut view.common,
             Self::Markdown(view) => &mut view.common,
             Self::Editor(view) => &mut view.common,
             Self::Recovery(view) => &mut view.common,
@@ -410,6 +418,7 @@ pub(crate) struct RecoveryPending {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryCapability {
+    SystemState,
     Settings {
         route: String,
     },
@@ -453,6 +462,7 @@ pub(crate) enum NativeApp {
     /// dwarfs the document apps, which are the many instances (as its view
     /// state is boxed in [`AppViewState::Settings`]).
     Settings(Box<crate::native_settings::SettingsApp>),
+    SystemState(Box<crate::system_state::SystemStateApp>),
     Markdown(MarkdownApp),
     Editor(EditorApp),
     Recovery(RecoveryApp),
@@ -489,6 +499,7 @@ impl NativeApp {
     pub(crate) const fn vtable(&self) -> &'static AppVTable {
         match self {
             Self::Settings(_) => &settings_vtable::VTABLE,
+            Self::SystemState(_) => &system_state_vtable::VTABLE,
             Self::Markdown(_) => &markdown_vtable::VTABLE,
             Self::Editor(_) => &editor_vtable::VTABLE,
             Self::Recovery(_) => &recovery_vtable::VTABLE,
@@ -501,7 +512,7 @@ impl NativeApp {
 
     pub(crate) const fn document_id(&self) -> Option<DocumentId> {
         match self {
-            Self::Settings(_) => None,
+            Self::Settings(_) | Self::SystemState(_) => None,
             Self::Markdown(app) => Some(app.document),
             Self::Editor(app) => Some(app.document),
             Self::Recovery(_) => None,
@@ -670,6 +681,13 @@ define_app_vtable!(
     "settings"
 );
 define_app_vtable!(
+    system_state_vtable,
+    SystemState,
+    SystemState,
+    AppKind::SystemState,
+    "system-state"
+);
+define_app_vtable!(
     markdown_vtable,
     Markdown,
     Markdown,
@@ -788,6 +806,7 @@ fn recovery_page_projection_at_scale(
         scale,
     );
     let capability = match &app.capability {
+        Some(RecoveryCapability::SystemState) => "Retry reopens System State.",
         Some(RecoveryCapability::Settings { .. }) => "Retry reopens this Settings page.",
         Some(RecoveryCapability::Document { .. }) => {
             "Retry reopens the document; Open Original opens the file in the editor."
@@ -1358,6 +1377,7 @@ impl NativeAppModel for RecoveryApp {
 impl RecoveryApp {
     fn diagnostics_text(&self) -> String {
         let capability = match &self.capability {
+            Some(RecoveryCapability::SystemState) => "system-state".to_string(),
             Some(RecoveryCapability::Settings { route }) => format!("settings-route={route}"),
             Some(RecoveryCapability::Document {
                 kind,
@@ -1832,9 +1852,9 @@ pub(crate) enum AppEvent {
         viewport_width: f32,
         viewport_height: f32,
     },
-    /// One viewport-relative Markdown move. Page keys remain distinct from
-    /// wheel rows all the way through the reducer, so compact and landscape
-    /// surfaces advance by their real visible capacity after every resize.
+    /// One Markdown page move, with the whole native viewport. The reader
+    /// derives its body geometry exactly as it does for the rendered page
+    /// controls, including after a resize or mode change.
     MarkdownPage {
         direction: i32,
         viewport_width: f32,
@@ -2830,7 +2850,10 @@ impl NativeRuntime {
             {
                 editor.config_watch_status.clone_from(&watch_status);
             }
-            AppViewState::Markdown(_) | AppViewState::Editor(_) | AppViewState::Recovery(_) => {}
+            AppViewState::SystemState(_)
+            | AppViewState::Markdown(_)
+            | AppViewState::Editor(_)
+            | AppViewState::Recovery(_) => {}
         }
         self.views.insert(view, state);
         self.view_generations.insert(view, 1);
@@ -2867,6 +2890,12 @@ impl NativeRuntime {
         Some(app)
     }
 
+    pub(crate) fn finish_system_state_close(&mut self, instance: AppInstanceId, scope: CloseScope) {
+        if let Some(NativeApp::SystemState(state)) = self.instances.get_mut(&instance) {
+            state.closed(scope);
+        }
+    }
+
     pub(crate) fn app(&self, instance: AppInstanceId) -> Option<&NativeApp> {
         self.instances.get(&instance)
     }
@@ -2885,6 +2914,90 @@ impl NativeRuntime {
         self.instances.iter().find_map(|(instance, app)| {
             (app.kind() == kind && app.document_id() == Some(document)).then_some(*instance)
         })
+    }
+
+    /// Test setup can mutate the projection directly; production mutations use
+    /// the change-aware publications below.
+    #[cfg(test)]
+    pub(crate) fn system_state_mut(&mut self) -> Option<&mut crate::system_state::SystemStateApp> {
+        self.touch_system_state_views();
+        self.instances.values_mut().find_map(|app| match app {
+            NativeApp::SystemState(state) => Some(state.as_mut()),
+            _ => None,
+        })
+    }
+
+    fn touch_system_state_views(&mut self) {
+        for state in self.views.values_mut() {
+            if matches!(state, AppViewState::SystemState(_)) {
+                state.touch();
+                let common = state.common_mut();
+                common.presentation_revision = common.presentation_revision.wrapping_add(1);
+            }
+        }
+    }
+
+    fn update_system_state(
+        &mut self,
+        update: impl FnOnce(&mut crate::system_state::SystemStateApp) -> bool,
+    ) -> bool {
+        let Some(state) = self.instances.values_mut().find_map(|app| match app {
+            NativeApp::SystemState(state) => Some(state.as_mut()),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let changed = update(state);
+        if changed {
+            self.touch_system_state_views();
+        }
+        changed
+    }
+
+    pub(crate) fn tick_system_state(&mut self, now: std::time::Instant, active: bool) -> bool {
+        self.update_system_state(|state| state.tick(now, active))
+    }
+
+    pub(crate) fn offer_system_state(
+        &mut self,
+        request: crate::workstation_setup::Request,
+    ) -> bool {
+        self.update_system_state(|state| state.offer(request))
+    }
+
+    pub(crate) fn publish_system_state(
+        &mut self,
+        status: crate::system_state::SetupStatus,
+    ) -> bool {
+        self.update_system_state(|state| state.publish(status))
+    }
+
+    pub(crate) fn accept_system_state_apply(&mut self, plan: aterm_types::macos_setup::Plan) {
+        self.update_system_state(|state| state.apply_accepted(plan));
+    }
+
+    /// Removing an already-dispatched action changes no visible controls.
+    pub(crate) fn take_system_state_action(
+        &mut self,
+    ) -> Option<crate::system_state::SystemStateAction> {
+        self.instances.values_mut().find_map(|app| match app {
+            NativeApp::SystemState(state) => state.take_action(),
+            _ => None,
+        })
+    }
+
+    /// Stop an automatic offer immediately without replacing the presented
+    /// pointer target between a mouse press and its release. The host's next
+    /// normal tick publishes the changed countdown label.
+    pub(crate) fn system_state_interact(&mut self) -> bool {
+        let Some(state) = self.instances.values_mut().find_map(|app| match app {
+            NativeApp::SystemState(state) => Some(state.as_mut()),
+            _ => None,
+        }) else {
+            return false;
+        };
+        state.interact();
+        true
     }
 
     pub(crate) fn document_id(&self, instance: AppInstanceId) -> Option<DocumentId> {
@@ -2907,7 +3020,10 @@ impl NativeRuntime {
     ) -> bool {
         let Some(settings) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::Settings(settings) => Some(settings),
-            NativeApp::Markdown(_) | NativeApp::Editor(_) | NativeApp::Recovery(_) => None,
+            NativeApp::SystemState(_)
+            | NativeApp::Markdown(_)
+            | NativeApp::Editor(_)
+            | NativeApp::Recovery(_) => None,
         }) else {
             return false;
         };
@@ -2935,7 +3051,10 @@ impl NativeRuntime {
     ) -> bool {
         let Some(settings) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::Settings(settings) => Some(settings),
-            NativeApp::Markdown(_) | NativeApp::Editor(_) | NativeApp::Recovery(_) => None,
+            NativeApp::SystemState(_)
+            | NativeApp::Markdown(_)
+            | NativeApp::Editor(_)
+            | NativeApp::Recovery(_) => None,
         }) else {
             return false;
         };
@@ -2953,7 +3072,10 @@ impl NativeRuntime {
     ) -> bool {
         let Some(settings) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::Settings(settings) => Some(settings),
-            NativeApp::Markdown(_) | NativeApp::Editor(_) | NativeApp::Recovery(_) => None,
+            NativeApp::SystemState(_)
+            | NativeApp::Markdown(_)
+            | NativeApp::Editor(_)
+            | NativeApp::Recovery(_) => None,
         }) else {
             return false;
         };
@@ -2971,7 +3093,10 @@ impl NativeRuntime {
     ) -> bool {
         let Some(settings) = self.instances.values_mut().find_map(|app| match app {
             NativeApp::Settings(settings) => Some(settings),
-            NativeApp::Markdown(_) | NativeApp::Editor(_) | NativeApp::Recovery(_) => None,
+            NativeApp::SystemState(_)
+            | NativeApp::Markdown(_)
+            | NativeApp::Editor(_)
+            | NativeApp::Recovery(_) => None,
         }) else {
             return false;
         };
@@ -3116,7 +3241,10 @@ impl NativeRuntime {
                 {
                     &mut editor.config_watch_status
                 }
-                AppViewState::Markdown(_) | AppViewState::Editor(_) | AppViewState::Recovery(_) => {
+                AppViewState::SystemState(_)
+                | AppViewState::Markdown(_)
+                | AppViewState::Editor(_)
+                | AppViewState::Recovery(_) => {
                     continue;
                 }
             };
@@ -3134,7 +3262,9 @@ impl NativeRuntime {
                     editor.common.presentation_revision =
                         editor.common.presentation_revision.saturating_add(1);
                 }
-                AppViewState::Markdown(_) | AppViewState::Recovery(_) => {}
+                AppViewState::SystemState(_)
+                | AppViewState::Markdown(_)
+                | AppViewState::Recovery(_) => {}
             }
         }
     }
@@ -3239,6 +3369,7 @@ impl NativeRuntime {
         match self.instances.get(&instance)? {
             NativeApp::Editor(editor) if editor.config_editor => editor.config_analysis.as_ref(),
             NativeApp::Settings(_)
+            | NativeApp::SystemState(_)
             | NativeApp::Markdown(_)
             | NativeApp::Editor(_)
             | NativeApp::Recovery(_) => None,
@@ -3261,7 +3392,10 @@ impl NativeRuntime {
     )> {
         match self.instances.get(&instance)? {
             NativeApp::Editor(editor) => editor.config_assist(snapshot, caret),
-            NativeApp::Settings(_) | NativeApp::Markdown(_) | NativeApp::Recovery(_) => None,
+            NativeApp::Settings(_)
+            | NativeApp::SystemState(_)
+            | NativeApp::Markdown(_)
+            | NativeApp::Recovery(_) => None,
         }
     }
 
@@ -3378,7 +3512,7 @@ impl NativeRuntime {
                     editor.title.clone(),
                     editor.canonical_uri.clone(),
                 )),
-                NativeApp::Settings(_) | NativeApp::Recovery(_) => None,
+                NativeApp::Settings(_) | NativeApp::SystemState(_) | NativeApp::Recovery(_) => None,
             })
             .collect()
     }
@@ -3398,7 +3532,7 @@ impl NativeRuntime {
                 NativeApp::Editor(app) => {
                     Some((*instance, app.base_title.clone(), app.canonical_uri.clone()))
                 }
-                NativeApp::Settings(_) | NativeApp::Recovery(_) => None,
+                NativeApp::Settings(_) | NativeApp::SystemState(_) | NativeApp::Recovery(_) => None,
             })
             .collect::<Vec<_>>();
         let mut by_basename = BTreeMap::<String, Vec<(AppInstanceId, String)>>::new();
@@ -3857,6 +3991,79 @@ fn bounded_document_parent_label(label: &str, uri: &str) -> String {
     )
 }
 
+/// The reader body after its outline, toolbar, padding and split gutter.
+/// Rendering and page navigation must use the same measure: the whole native
+/// viewport includes chrome that cannot show document rows.
+#[derive(Clone, Copy)]
+struct MarkdownReaderGeometry {
+    wide_outline: bool,
+    outline_width: f32,
+    main_width: f32,
+    compact: bool,
+    horizontal_padding: f32,
+    content_width: f32,
+    header_height: f32,
+    main_vertical_padding: f32,
+    main_gap: f32,
+    preview_horizontal_inset: f32,
+    preview_vertical_inset: f32,
+    split_gap: f32,
+    preview_content_width: f32,
+    preview_viewport_height: f32,
+}
+
+impl MarkdownReaderGeometry {
+    fn new(mode: MarkdownViewMode, viewport_width: f32, viewport_height: f32) -> Self {
+        let wide_outline = mode == MarkdownViewMode::Preview
+            && viewport_width >= 920.0
+            && viewport_height >= 380.0;
+        let outline_width = if wide_outline { 220.0 } else { 0.0 };
+        let main_width = (viewport_width - outline_width).max(280.0);
+        let compact = main_width < 590.0 || viewport_height < 440.0;
+        let horizontal_padding = if compact {
+            14.0
+        } else if mode == MarkdownViewMode::Split {
+            ((main_width - 1_240.0) / 2.0).max(28.0)
+        } else {
+            ((main_width - 760.0) / 2.0).max(28.0)
+        };
+        let content_width = (main_width - horizontal_padding * 2.0).max(252.0);
+        let header_height = if compact { 92.0 } else { 102.0 };
+        let main_vertical_padding = if compact { 12.0 } else { 20.0 };
+        let main_gap = if compact { 8.0 } else { 10.0 };
+        let preview_horizontal_inset = if compact { 10.0 } else { 14.0 };
+        let preview_vertical_inset = if compact { 8.0 } else { 10.0 };
+        let split_gap = 16.0;
+        let preview_content_width = if mode == MarkdownViewMode::Split {
+            ((content_width - split_gap) / 2.0 - preview_horizontal_inset * 2.0).max(180.0)
+        } else {
+            (content_width - preview_horizontal_inset * 2.0).max(180.0)
+        };
+        let preview_viewport_height = (viewport_height
+            - header_height
+            - main_vertical_padding * 2.0
+            - main_gap
+            - preview_vertical_inset * 2.0)
+            .max(120.0);
+        Self {
+            wide_outline,
+            outline_width,
+            main_width,
+            compact,
+            horizontal_padding,
+            content_width,
+            header_height,
+            main_vertical_padding,
+            main_gap,
+            preview_horizontal_inset,
+            preview_vertical_inset,
+            split_gap,
+            preview_content_width,
+            preview_viewport_height,
+        }
+    }
+}
+
 /// Compact Markdown controller. It references one canonical document and keeps
 /// only the parsed projection required to build the current semantic tree.
 #[derive(Debug)]
@@ -3930,6 +4137,31 @@ impl MarkdownApp {
             view,
             crate::native_markdown::MarkdownLocation::new(anchor, 0),
         );
+    }
+
+    fn page_target(
+        &self,
+        view: &MarkdownViewState,
+        geometry: &MarkdownReaderGeometry,
+        direction: i32,
+    ) -> crate::native_markdown::MarkdownLocation {
+        let rows = (geometry.preview_viewport_height / 22.0 * 0.82)
+            .floor()
+            .max(1.0) as isize;
+        let delta = rows.saturating_mul(direction.signum() as isize);
+        if view.mode == MarkdownViewMode::Source {
+            crate::native_markdown::MarkdownLocation::new(
+                crate::native_markdown::move_source_lines(&self.parsed, view.source_anchor, delta),
+                0,
+            )
+        } else {
+            crate::native_markdown::move_visual_rows(
+                &self.parsed,
+                Self::location(view),
+                geometry.preview_content_width,
+                delta,
+            )
+        }
     }
 
     fn outline_target(&self, view: &MarkdownViewState, delta: isize) -> Option<usize> {
@@ -4060,27 +4292,10 @@ impl NativeAppModel for MarkdownApp {
                 viewport_width,
                 viewport_height,
             } => {
-                let page_rows = (viewport_height.max(22.0) / 22.0 * 0.82).floor().max(1.0) as isize;
-                let delta = page_rows.saturating_mul(direction.signum() as isize);
-                match view.mode {
-                    MarkdownViewMode::Source => {
-                        let next = crate::native_markdown::move_source_lines(
-                            &self.parsed,
-                            view.source_anchor,
-                            delta,
-                        );
-                        Self::navigate_source(view, next);
-                    }
-                    MarkdownViewMode::Preview | MarkdownViewMode::Split => {
-                        let next = crate::native_markdown::move_visual_rows(
-                            &self.parsed,
-                            Self::location(view),
-                            viewport_width.max(1.0),
-                            delta,
-                        );
-                        Self::navigate(view, next);
-                    }
-                }
+                let geometry =
+                    MarkdownReaderGeometry::new(view.mode, viewport_width, viewport_height);
+                let next = self.page_target(view, &geometry, direction);
+                Self::navigate(view, next);
                 EventResult::Handled
             }
             AppEvent::Action(invocation) if invocation.id.as_str() == "markdown/back" => {
@@ -4338,37 +4553,24 @@ impl NativeAppModel for MarkdownApp {
             UiNode,
         };
 
-        let wide_outline = view.mode == MarkdownViewMode::Preview
-            && cx.viewport.width >= 920.0
-            && cx.viewport.height >= 380.0;
-        let outline_width = if wide_outline { 220.0 } else { 0.0 };
-        let main_width = (cx.viewport.width - outline_width).max(280.0);
-        let compact = main_width < 590.0 || cx.viewport.height < 440.0;
-        let horizontal_padding = if compact {
-            14.0
-        } else if view.mode == MarkdownViewMode::Split {
-            ((main_width - 1_240.0) / 2.0).max(28.0)
-        } else {
-            ((main_width - 760.0) / 2.0).max(28.0)
-        };
-        let content_width = (main_width - horizontal_padding * 2.0).max(252.0);
-        let header_height = if compact { 92.0 } else { 102.0 };
-        let main_vertical_padding = if compact { 12.0 } else { 20.0 };
-        let main_gap = if compact { 8.0 } else { 10.0 };
-        let preview_horizontal_inset = if compact { 10.0 } else { 14.0 };
-        let preview_vertical_inset = if compact { 8.0 } else { 10.0 };
-        let split_gap = 16.0;
-        let preview_content_width = if view.mode == MarkdownViewMode::Split {
-            ((content_width - split_gap) / 2.0 - preview_horizontal_inset * 2.0).max(180.0)
-        } else {
-            (content_width - preview_horizontal_inset * 2.0).max(180.0)
-        };
-        let preview_viewport_height = (cx.viewport.height
-            - header_height
-            - main_vertical_padding * 2.0
-            - main_gap
-            - preview_vertical_inset * 2.0)
-            .max(120.0);
+        let geometry =
+            MarkdownReaderGeometry::new(view.mode, cx.viewport.width, cx.viewport.height);
+        let MarkdownReaderGeometry {
+            wide_outline,
+            outline_width,
+            main_width,
+            compact,
+            horizontal_padding,
+            content_width,
+            header_height,
+            main_vertical_padding,
+            main_gap,
+            preview_horizontal_inset,
+            preview_vertical_inset,
+            split_gap,
+            preview_content_width,
+            preview_viewport_height,
+        } = geometry;
         let visible = crate::native_markdown::layout_visible_blocks(
             &self.parsed,
             view.source_anchor,
@@ -4381,43 +4583,9 @@ impl NativeAppModel for MarkdownApp {
         // Both directions use the same bounded, width-aware height estimator as
         // the visible layout, so inspect/act and a pointer click advance by the
         // same reading band without smuggling pixel offsets into the reducer.
-        let page_rows = (preview_viewport_height / 22.0 * 0.82).floor().max(1.0) as isize;
         let current_location = Self::location(view);
-        let (previous_page, next_page) = if view.mode == MarkdownViewMode::Source {
-            (
-                crate::native_markdown::MarkdownLocation::new(
-                    crate::native_markdown::move_source_lines(
-                        &self.parsed,
-                        view.source_anchor,
-                        -page_rows,
-                    ),
-                    0,
-                ),
-                crate::native_markdown::MarkdownLocation::new(
-                    crate::native_markdown::move_source_lines(
-                        &self.parsed,
-                        view.source_anchor,
-                        page_rows,
-                    ),
-                    0,
-                ),
-            )
-        } else {
-            (
-                crate::native_markdown::move_visual_rows(
-                    &self.parsed,
-                    current_location,
-                    preview_content_width,
-                    -page_rows,
-                ),
-                crate::native_markdown::move_visual_rows(
-                    &self.parsed,
-                    current_location,
-                    preview_content_width,
-                    page_rows,
-                ),
-            )
-        };
+        let previous_page = self.page_target(view, &geometry, -1);
+        let next_page = self.page_target(view, &geometry, 1);
         let can_page_back = previous_page != current_location;
         let can_page_forward = next_page != current_location;
         let current_heading =
@@ -5769,6 +5937,17 @@ impl EditorApp {
         }
     }
 
+    /// Whether the editor's existing file can accept its current changes.
+    /// Shared by its toolbar, command metadata and the native File menu.
+    pub(crate) fn can_save(&self) -> bool {
+        let config_valid = !self.config_editor
+            || self
+                .config_analysis
+                .as_ref()
+                .is_some_and(|analysis| !analysis.has_errors());
+        self.dirty && !self.checkpoint_pending && !self.disk_conflict && config_valid
+    }
+
     /// Line-start index for `snapshot`, built once per document revision.
     ///
     /// `view` runs every frame and keystroke and needs line structure for the viewport
@@ -6109,11 +6288,6 @@ impl NativeAppModel for EditorApp {
         let focused = view.common.focus_visible
             && view.common.last_focus.as_ref() == Some(&UiKey::new("editor/buffer"));
         let buffer_ready = view.buffer.is_some();
-        let config_valid = !self.config_editor
-            || self
-                .config_analysis
-                .as_ref()
-                .is_some_and(|analysis| !analysis.has_errors());
         let config_diagnostic_count = if self.config_editor {
             self.config_analysis.as_ref().map_or(
                 0,
@@ -6158,7 +6332,7 @@ impl NativeAppModel for EditorApp {
                 "editor/save-button" => (
                     "Save buffer (Cmd-S or C-x C-s)",
                     "editor/save",
-                    self.dirty && !self.checkpoint_pending && !self.disk_conflict && config_valid,
+                    self.can_save(),
                 ),
                 "editor/undo-button" => (
                     "Undo (Cmd-Z or C-/)",
@@ -6756,11 +6930,6 @@ impl NativeAppModel for EditorApp {
 
     fn commands(&self, view: &Self::ViewState, out: &mut Vec<Command>) {
         let buffer_ready = view.buffer.is_some();
-        let config_valid = !self.config_editor
-            || self
-                .config_analysis
-                .as_ref()
-                .is_some_and(|analysis| !analysis.has_errors());
         out.extend([
             Command {
                 id: ActionId::new("editor/save"),
@@ -6775,10 +6944,7 @@ impl NativeAppModel for EditorApp {
                     }
                     .to_string(),
                 ),
-                enabled: self.dirty
-                    && !self.checkpoint_pending
-                    && !self.disk_conflict
-                    && config_valid,
+                enabled: self.can_save(),
             },
             Command {
                 id: ActionId::new("editor/undo"),
@@ -7028,7 +7194,11 @@ fn editor_status_message(
         .and_then(|analysis| analysis.summary_at(view.config_diagnostic_selected))
     {
         summary
-    } else if let Some(status) = view.status.as_deref().filter(|status| !status.is_empty()) {
+    } else if let Some(status) = view.status.as_deref().filter(|status| {
+        // Command feedback may outlive its command, but a clean-buffer notice
+        // cannot describe edits made after that save or checkpoint.
+        !status.is_empty() && !(app.dirty && matches!(*status, "Saved" | "No unsaved changes"))
+    }) {
         status.to_string()
     } else if app.dirty {
         format!("Modified · Cmd-S to save · {lines} {line_noun}")
@@ -7290,7 +7460,7 @@ mod markdown_reader_tests {
             let state = match kind {
                 AppKind::Markdown => AppViewState::Markdown(MarkdownViewState::default()),
                 AppKind::Editor => AppViewState::Editor(Box::default()),
-                AppKind::Settings | AppKind::Recovery => unreachable!(),
+                AppKind::Settings | AppKind::SystemState | AppKind::Recovery => unreachable!(),
             };
             runtime.attach_view(view, instance, state).unwrap();
         }
@@ -8000,6 +8170,89 @@ mod markdown_reader_tests {
         advanced.validate_parity().unwrap();
     }
 
+    /// Page keys and the visible buttons move through the same reading body,
+    /// not the whole tab. Narrow and split bodies also change wrapped rows.
+    #[test]
+    fn markdown_page_keys_reach_the_rendered_button_targets_in_every_mode() {
+        let paragraph = "A paragraph with enough words to wrap differently in a narrow reader, \
+            a split preview and a wide reader with an outline. "
+            .repeat(5);
+        let source = (0..12)
+            .map(|section| {
+                format!(
+                    "## Section {section}\n\n{paragraph}\n\n```text\nfirst line\nsecond line\n\
+                     third line\n```\n\n| View | Purpose |\n| --- | --- |\n\
+                     | Preview | Read formatted Markdown |\n| Source | Read the source |\n\n"
+                )
+            })
+            .collect::<String>();
+        for mode in [
+            MarkdownViewMode::Preview,
+            MarkdownViewMode::Source,
+            MarkdownViewMode::Split,
+        ] {
+            for (width, height) in [
+                (849.0, 460.0),
+                (1_280.0, 800.0),
+                (640.0, 320.0),
+                (390.0, 568.0),
+            ] {
+                if mode == MarkdownViewMode::Split && width < 620.0 {
+                    continue; // The reader does not offer Split at this width.
+                }
+                let (mut runtime, instance, view) = markdown_runtime(&source);
+                runtime
+                    .dispatch(
+                        instance,
+                        view,
+                        AppEvent::Action(ActionInvocation {
+                            id: ActionId::new(match mode {
+                                MarkdownViewMode::Preview => "markdown/mode/preview",
+                                MarkdownViewMode::Source => "markdown/mode/source",
+                                MarkdownViewMode::Split => "markdown/mode/split",
+                            }),
+                            value: None,
+                        }),
+                    )
+                    .unwrap();
+                let viewport = LogicalRect::new(0.0, 0.0, width, height);
+                for (direction, button) in [
+                    (1, "markdown/next-page-button"),
+                    (-1, "markdown/previous-page-button"),
+                ] {
+                    let rendered = runtime
+                        .render(instance, view, &cx(viewport, None))
+                        .unwrap()
+                        .compile(viewport)
+                        .unwrap();
+                    let control = rendered.semantic(&UiKey::new(button)).unwrap();
+                    assert!(control.state.is_some_and(|state| state.enabled));
+                    let expected =
+                        markdown_page_location(control.action.as_ref().unwrap().as_str()).unwrap();
+                    runtime
+                        .dispatch(
+                            instance,
+                            view,
+                            AppEvent::MarkdownPage {
+                                direction,
+                                viewport_width: width,
+                                viewport_height: height,
+                            },
+                        )
+                        .unwrap();
+                    let actual = match runtime.view_state(view).unwrap() {
+                        AppViewState::Markdown(state) => MarkdownApp::location(state),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(
+                        actual, expected,
+                        "{mode:?}, {width}×{height}, direction {direction}"
+                    );
+                }
+            }
+        }
+    }
+
     fn editor_fixture(
         text: &str,
         title: &str,
@@ -8059,6 +8312,39 @@ mod markdown_reader_tests {
                 _ => None,
             })
             .expect("editor viewport paint node")
+    }
+
+    #[test]
+    fn dirty_editor_uses_current_state_instead_of_stale_clean_feedback() {
+        let (mut app, mut view, snapshot) = editor_fixture("draft\n", "draft.txt");
+        let render = |app: &EditorApp, view: &EditorViewState| {
+            let viewport = LogicalRect::new(0.0, 0.0, 1_200.0, 700.0);
+            let compiled = app
+                .view(view, &cx(viewport, Some(&snapshot)))
+                .compile(viewport)
+                .unwrap();
+            let spec = editor_spec(&compiled);
+            (spec.status.clone(), spec.semantic_status.clone())
+        };
+        app.dirty = true;
+        let current = render(&app, &view);
+        assert!(current.0.is_some() && current.1.is_some());
+        for status in ["Saved", "No unsaved changes"] {
+            view.status = Some(status.to_string());
+            assert_eq!(render(&app, &view), current);
+            app.dirty = false;
+            assert_eq!(render(&app, &view).1.as_deref(), Some(status));
+            app.dirty = true;
+        }
+        for status in [
+            "Save failed: test write failure",
+            "Independent command feedback",
+        ] {
+            view.status = Some(status.to_string());
+            let shown = render(&app, &view);
+            assert_eq!(shown.0.as_deref(), Some(status));
+            assert_eq!(shown.1.as_deref(), Some(status));
+        }
     }
 
     #[test]

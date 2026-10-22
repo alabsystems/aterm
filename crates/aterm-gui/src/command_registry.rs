@@ -96,6 +96,7 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         M::NewTab => spec("tab.new_terminal", S::Window, A::LocalUi, C::Any),
         M::OpenMarkdown => spec("document.open_markdown", S::Window, A::DocumentRead, C::Any),
         M::OpenEditor => spec("document.open_editor", S::Window, A::DocumentRead, C::Any),
+        M::Save => spec("document.save", S::Document, A::DocumentWrite, C::Native),
         M::ReopenClosedTab => spec("tab.reopen_closed", S::Window, A::LocalUi, C::Any),
         M::ReopenClosedView => spec("view.reopen_closed", S::View, A::LocalUi, C::Any),
         M::MoveTabToNewWindow => spec("tab.move_new_window", S::Tab, A::LocalUi, C::Any),
@@ -168,12 +169,6 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         // Same identity as the pin's face, one field over: the role is session
         // metadata written through the same typed API (`meta set role`).
         M::SetRole => spec("session.set_role", S::Tab, A::LocalUi, C::Terminal),
-        // Identity rows: showing a session's identity discloses the roster row the `identities`
-        // verb does (Owner-only on the wire); the two spawns may create an identity, which only
-        // `spawn identity=` (Owner) may do. Neither spawn needs a focused session.
-        M::ShowIdentity => spec("session.identity.show", S::Tab, A::Owner, C::Terminal),
-        M::NewWindowWithIdentity => spec("window.new_with_identity", S::App, A::Owner, C::Any),
-        M::NewTabWithIdentity => spec("tab.new_with_identity", S::Window, A::Owner, C::Any),
         M::Help => spec("app.help.open", S::App, A::ExternalOpen, C::Any),
         // The Agents menu. Next That Needs You moves focus (a local act).
         M::NextNeed => spec("agents.next_need", S::App, A::LocalUi, C::Any),

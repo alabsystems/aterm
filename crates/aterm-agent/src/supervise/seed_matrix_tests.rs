@@ -4899,6 +4899,85 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                 person_on_screen: false,
             });
         }
+        // A 529 cuts Land's act and the wall's retry is answered with a clean defense: the
+        // retry delivers the act again and lands the task, unless a person's turn came between.
+        let land = crate::supervise::policy::turn_end::LAND;
+        let retry = crate::supervise::policy::turn_end::wall_retry_text(
+            crate::supervise::policy::turn_end::RULE_API_RETRY,
+            aterm_phase::WallKind::Overloaded,
+            aterm_phase::Program::Claude,
+        );
+        let defense = [
+            "⏺ Merged the parser into main and pushed it; every suite passes.",
+            "",
+            "  Nothing left: all of it is merged into the remote main branch.",
+        ];
+        let p0 = cc(&with(&w0, &turn(None, &[report], 0, T0 + 2 * MIN)), &[], "");
+        let cut = with(&w0, &api_turn(Some(land), 5 * MIN, 0));
+        for person in [false, true] {
+            let mut beats = vec![
+                start(),
+                beat(
+                    At::Start(2 * MIN),
+                    "the worker's progress",
+                    Ev::Point(p0.clone()),
+                ),
+                taken(0, &w0, land),
+                beat(
+                    At::Act(0, 5 * MIN),
+                    "the act's turn meets a 529",
+                    Ev::Point(cc(&cut, &[], "")),
+                ),
+            ];
+            let mut h = cut.clone();
+            if person {
+                let said = "please also look at the docs";
+                h = with(&cut, &api_turn(Some(said), 4 * MIN, 0));
+                beats.extend([
+                    beat(At::Act(0, 5 * MIN + 20), "a person's keystroke", Ev::Key),
+                    beat(
+                        At::Act(0, 5 * MIN + 25),
+                        "a person's turn runs",
+                        Ev::Busy(live(&cut, said)),
+                    ),
+                    beat(
+                        At::Act(0, 9 * MIN + 30),
+                        "the person's turn meets a 529",
+                        Ev::Point(cc(&h, &[], "")),
+                    ),
+                ]);
+            }
+            let answered = with(&h, &turn(Some(&retry), &defense, 3 * MIN, 0));
+            beats.extend([
+                taken(1, &h, &retry),
+                beat(
+                    At::Act(1, 3 * MIN),
+                    "the retry's turn ends: a clean defense",
+                    Ev::Point(cc(&answered, &[], "")),
+                ),
+            ]);
+            // The first loop lands the task, or, a person's turn between, nudges the landing.
+            beats.push(if person {
+                taken(2, &answered, crate::supervise::policy::turn_end::LAND_NUDGE)
+            } else {
+                beat(At::Act(1, 3 * MIN + 90), "(a handoff instant)", Ev::Mark)
+            });
+            let between = if person {
+                ", a person's turn meets one too"
+            } else {
+                ""
+            };
+            out.push(Scenario {
+                name: format!("API 529 cuts Land's act{between}, its retry defended{window}"),
+                t0: T0,
+                policy: land_policy(),
+                host: None,
+                beats,
+                tail_s: 3 * HOUR,
+                take,
+                person_on_screen: false,
+            });
+        }
     }
     out
 }

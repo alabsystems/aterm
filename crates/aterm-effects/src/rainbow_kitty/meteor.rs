@@ -191,6 +191,7 @@ pub struct LandingWalk {
 
 impl LandingWalk {
     /// A walk off any band: `d/16` from the landing ([`landing_field`]).
+    #[inline]
     #[must_use]
     pub const fn free(t_land: f32) -> Self {
         Self { t_land, band: None }
@@ -225,6 +226,7 @@ impl LandingWalk {
 /// Solved once per process into [`BED_INK_LUT_LEN`] entries (the same entries
 /// `BedInkLut::hot` holds) and read with one lerp, since `hot_edge_ink` is a
 /// bisection over `powf`.
+#[inline]
 #[must_use]
 pub fn landing_ink(t: f32) -> u32 {
     static LUT: OnceLock<[u32; BED_INK_LUT_LEN]> = OnceLock::new();
@@ -247,6 +249,7 @@ pub fn landing_ink(t: f32) -> u32 {
 /// mark's ink on the page `bg` ([`paper_mark_ink`]), hue intact. The light arm
 /// buys "bigger" as area, never as brightness, so there is no heat to equalize
 /// onto.
+#[inline]
 #[must_use]
 fn landing_ink_light(t: f32, bg: u32) -> u32 {
     paper_mark_ink(spectrum(walk_pace(clamp01(t))), bg)
@@ -256,6 +259,7 @@ fn landing_ink_light(t: f32, bg: u32) -> u32 {
 /// ([`spectrum_stop`]), for the landing's point marks (the sparks; C1: a point
 /// mark snaps). Seven entries, solved once per process; out-of-range indices
 /// clamp to violet.
+#[inline]
 #[must_use]
 pub fn landing_stop_ink(i: usize) -> u32 {
     static LUT: OnceLock<[u32; SPECTRUM_STOPS]> = OnceLock::new();
@@ -950,6 +954,7 @@ fn burst_step(ch: f32, share: f32, floor: usize) -> usize {
 
 /// The largest spike count for a landing of `cells` (the grade that survives
 /// dense text): `min(9 + 1.2·(impact − 1), 12)`.
+#[inline]
 #[must_use]
 pub fn burst_n(cells: f32) -> usize {
     let n = (BURST_N_BASE + BURST_N_PER_IMPACT * (impact(cells) - 1.0)).min(BURST_N_CEIL);
@@ -1078,6 +1083,7 @@ pub enum Axis {
 
 impl Axis {
     /// The axis of a pixel-space delta, per D15's rule exactly.
+    #[inline]
     #[must_use]
     pub fn of(dx: f32, dy: f32) -> Self {
         if dx.abs() >= dy.abs() {
@@ -1159,18 +1165,21 @@ pub struct Meteor {
 impl Meteor {
     /// The arrival edge (§6.7, §8.1 no. 3): the single `Instant` every landing
     /// mark and the audio bell share.
+    #[inline]
     #[must_use]
     pub fn arrival(&self) -> Instant {
         self.t0 + self.t_flight
     }
 
     /// The path vector in px.
+    #[inline]
     #[must_use]
     pub fn delta(&self) -> (f32, f32) {
         (self.x1 - self.x0, self.y1 - self.y0)
     }
 
     /// Path length `L` in px.
+    #[inline]
     #[must_use]
     pub fn length(&self) -> f32 {
         let (dx, dy) = self.delta();
@@ -1187,6 +1196,7 @@ impl Meteor {
     }
 
     /// Which rasterizer this flight takes (D15).
+    #[inline]
     #[must_use]
     pub fn axis(&self) -> Axis {
         let (dx, dy) = self.delta();
@@ -1204,6 +1214,7 @@ impl Meteor {
     /// Whether the head left the glass in flight (§6.9): chained, or retired before
     /// the arrival edge. Such a train draws no nucleus or coma; a train retired at or
     /// after its arrival keeps its afterglow, decaying with the train.
+    #[inline]
     #[must_use]
     pub fn handed_over(&self) -> bool {
         self.chained
@@ -1215,6 +1226,7 @@ impl Meteor {
     /// Whether this train has a head in the air at `at`. §6.9's live cap evicts
     /// trains that answer false first, so a finishing remnant never costs another
     /// row's flight its head.
+    #[inline]
     #[must_use]
     pub fn in_flight_at(&self, at: Instant) -> bool {
         self.retired_at.is_none() && !self.chained && !self.landed && at < self.arrival()
@@ -1236,6 +1248,7 @@ impl Meteor {
     }
 
     /// The retire decay alone (§6.9) — `1` while the meteor is live.
+    #[inline]
     fn retire_alpha(&self, now: Instant) -> f32 {
         match self.retired_at {
             None => 1.0,
@@ -1248,6 +1261,7 @@ impl Meteor {
 
     /// The instant this meteor's last pixel leaves the glass: `T + 600`, or
     /// §6.9's `R = 60 ms` for a retired one.
+    #[inline]
     #[must_use]
     pub fn end(&self) -> Instant {
         match self.retired_at {
@@ -1427,6 +1441,7 @@ impl SkyMask {
 
     /// Is the landing row's cell `k` columns from the caret proven blank? The
     /// jets' gate.
+    #[inline]
     #[must_use]
     fn row_blank(self, k: i32) -> bool {
         if !(-JET_PROBE_CELLS..=JET_PROBE_CELLS).contains(&k) {
@@ -1436,6 +1451,7 @@ impl SkyMask {
     }
 
     /// The flash's own three cells of the same row.
+    #[inline]
     #[must_use]
     fn flash_blank(self, k: i32) -> bool {
         self.row_blank(k)
@@ -1488,6 +1504,7 @@ impl Landing {
     /// When the last landing pixel leaves the glass: the latest of the pin, the
     /// flash's colour, the burst's graded life and the longest spark (the fan is the
     /// sky's). The reduced-motion form ends at `static_end` instead.
+    #[inline]
     #[must_use]
     pub fn end(&self) -> Instant {
         let burst_ms = self.burst.map_or(0.0, |b| b.ms);
@@ -1539,6 +1556,7 @@ impl Landing {
 
     /// The landing's end under reduced motion: the pool's own horizon, so
     /// the static form is on glass exactly as long as the static train is.
+    #[inline]
     #[must_use]
     fn static_end(&self) -> Instant {
         self.pin.at + Duration::from_secs_f32(FLIGHT_OFF_GLASS_MS / 1000.0)
@@ -1547,6 +1565,7 @@ impl Landing {
     /// The reduced-motion form's alpha at `now`: `1`, then the theme's one
     /// linear fade over [`REDUCED_MOTION_FADE_MS`] to [`Landing::static_end`]
     /// (§6.11, §2.5's single exception).
+    #[inline]
     #[must_use]
     fn static_alpha(&self, now: Instant) -> f32 {
         let left = self
@@ -1579,6 +1598,7 @@ impl Landing {
 /// The share of a spark's life at which its `spend` falls under
 /// [`CHROMA_CULL_ALPHA`] and [`spark_at`] stops drawing it (≈ 0.861), solved so
 /// the cadence law and the frame path agree.
+#[inline]
 #[must_use]
 fn spark_cull_u() -> f32 {
     SPARK_HOLD_U + (1.0 - SPARK_HOLD_U) * (1.0 - CHROMA_CULL_ALPHA.sqrt())
@@ -1689,6 +1709,7 @@ impl Meteors {
     /// Set the hand's floor; `Engine::tick` passes the ribbon's `hand_floor_cell`
     /// before the frame's events, so a landing minted this frame sees the floor as
     /// it stands now. `None` bounds nothing.
+    #[inline]
     pub fn set_hand_floor(&mut self, floor: Option<(u16, u16)>) {
         self.hand_floor = floor;
     }
@@ -1859,6 +1880,7 @@ impl Meteors {
 
     /// Meteors not on the 60 ms retire (`trail status`'s `meteors=`), at most
     /// [`FLIGHT_MAX_LIVE`] by §6.9's cap; landed trains and chained stubs count.
+    #[inline]
     #[must_use]
     pub fn live(&self) -> usize {
         self.live.iter().filter(|m| m.retired_at.is_none()).count()
@@ -2423,22 +2445,26 @@ impl Flight {
     }
 
     /// The station stride as the rasterizer's own slab step (§18).
+    #[inline]
     fn step(&self) -> usize {
         (self.stride.round().max(1.0) as usize).max(1)
     }
 
     /// How many stations this span earns, `≤ STATIONS_MAX` (§18).
+    #[inline]
     fn stations(&self, span: f32) -> usize {
         (((span / self.stride).ceil() as usize) + 1).clamp(2, STATIONS_MAX)
     }
 
     /// How far along the path the head has travelled, as a share of `L` — the
     /// quantity a shed station is compared against (§6.5 layer 5).
+    #[inline]
     fn head_travel_share(&self) -> f32 {
         clamp01(enter_at_speed(self.u))
     }
 
     /// §6.5 layer 1's `w(s) = w·(0.22 + 0.78·exp(−s/(0.5·L)))`.
+    #[inline]
     fn width_at(&self, s: f32) -> f32 {
         self.w
             * (WIDTH_FLOOR_SHARE + WIDTH_SPAN_SHARE * (-s / (WIDTH_FALLOFF_SHARE * self.l)).exp())
@@ -2496,6 +2522,7 @@ fn draw_train(
 /// D15's axis rule, spent. Neither rasterizer is a fallback for the other:
 /// each is degenerate on the axis its twin owns, and a producer that guesses
 /// wrong draws nothing rather than drawing badly.
+#[inline]
 fn rasterize(
     out: &mut Vec<GlowQuad>,
     clip: BeamClip,
@@ -2765,6 +2792,7 @@ fn draw_head(m: &Meteor, f: &Flight, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
 /// §6.5 layer 8: the terminal flash's radius multiplier, eased out to
 /// [`FLASH_OVERSHOOT`] over [`FLASH_MS`] on the theme's own exponent
 /// ([`FLIGHT_ENTER_EXP`]), relaxed to ×1.0 by [`FLASH_RELAX_MS`].
+#[inline]
 #[must_use]
 fn flash_scale(after_ms: f32) -> f32 {
     if after_ms <= 0.0 {
@@ -3262,6 +3290,7 @@ fn mint_spark(seed: u32, k: usize, ch: f32) -> Spark {
 /// One spark's displacement and alpha at `age_ms`, a pure function of throw and
 /// age (§18): full for [`SPARK_HOLD_U`] of its life, then spent; `None` once
 /// under the chroma cull.
+#[inline]
 #[must_use]
 fn spark_at(spark: Spark, age_ms: f32, ch: f32) -> Option<((f32, f32), f32)> {
     let u = age_ms / spark.life.max(1.0);
@@ -3527,12 +3556,14 @@ fn ms_since(a: Instant, b: Instant) -> f32 {
 /// Is a window pixel inside the effects box (the sky's glass test)? A mark minted
 /// at a pixel a scroll may have moved is dropped outside it, never clamped (seam
 /// point 12).
+#[inline]
 fn on_glass(geom: Geom, x: f32, y: f32) -> bool {
     super::stardust::on_glass((x.round() as i32, y.round() as i32), geom)
 }
 
 /// The head's position at an arbitrary instant — §6.9's chain test needs it,
 /// and it must be the same curve the emit draws.
+#[inline]
 fn head_at(m: &Meteor, now: Instant) -> (f32, f32) {
     let t = (m.t_flight.as_secs_f32() * 1000.0).max(1.0);
     let p = enter_at_speed(ms_since(m.t0, now) / t);
@@ -3543,6 +3574,7 @@ fn head_at(m: &Meteor, now: Instant) -> (f32, f32) {
 /// The head's speed in px/ms at `u`, `enter-at-speed`'s derivative
 /// `(1 − p₀)·2.2·(1 − u)^1.2 / T`: analytic, so a frame stays a function of `now`
 /// (§18) while the shoulder spans the true per-frame travel (T7).
+#[inline]
 fn head_speed(l: f32, t_ms: f32, u: f32) -> f32 {
     if t_ms <= 0.0 {
         return 0.0;
@@ -3554,6 +3586,7 @@ fn head_speed(l: f32, t_ms: f32, u: f32) -> f32 {
 /// The shortest distance between two segments (§6.9's corridor test): zero when
 /// they cross, else the least of the four endpoint-to-segment distances (exact,
 /// parallel case included).
+#[inline]
 fn seg_gap(a0: (f32, f32), a1: (f32, f32), b0: (f32, f32), b1: (f32, f32)) -> f32 {
     if segments_cross(a0, a1, b0, b1) {
         return 0.0;
@@ -3565,6 +3598,7 @@ fn seg_gap(a0: (f32, f32), a1: (f32, f32), b0: (f32, f32), b1: (f32, f32)) -> f3
 }
 
 /// Distance from a point to a segment.
+#[inline]
 fn point_seg(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     let (vx, vy) = (b.0 - a.0, b.1 - a.1);
     let len2 = vx * vx + vy * vy;
@@ -3577,6 +3611,7 @@ fn point_seg(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
 }
 
 /// Do two segments properly cross? Four orientation signs, no division.
+#[inline]
 fn segments_cross(a0: (f32, f32), a1: (f32, f32), b0: (f32, f32), b1: (f32, f32)) -> bool {
     let cross = |o: (f32, f32), p: (f32, f32), q: (f32, f32)| {
         (p.0 - o.0) * (q.1 - o.1) - (p.1 - o.1) * (q.0 - o.0)
@@ -3604,6 +3639,7 @@ fn unit01(seed: u32, salt: u32) -> f32 {
 /// nucleus): the sky's [`push_halo_quads`] on the rounded centre and radii. The
 /// centre is never clamped into the box, which would paint an off-grid sliver at
 /// a fraction of peak instead of its true ~0.
+#[inline]
 fn push_halo_add(
     out: &mut Vec<RainHalo>,
     geom: Geom,
@@ -3622,6 +3658,7 @@ fn push_halo_add(
 /// `peak` is the centre opacity, riding the colour's high byte as
 /// `aterm_render::halo_over_cap`'s ceiling; the colour is straight, since under
 /// `HaloMode::Over` the falloff scales opacity. Under [`LIGHT_HALO_MIN_PEAK`] it is dropped.
+#[inline]
 fn push_halo_veil(
     out: &mut Vec<RainHalo>,
     geom: Geom,
@@ -3649,6 +3686,7 @@ const LIGHT_HALO_MIN_PEAK: u8 = 96;
 /// `push_fx_rect`'s light twin: a rect of source-over ink, clamped to the effects
 /// box, whose coverage is the quad's opacity, so the destination is attenuated
 /// rather than added to.
+#[inline]
 fn push_ink_rect(
     out: &mut Vec<GlowQuad>,
     geom: Geom,

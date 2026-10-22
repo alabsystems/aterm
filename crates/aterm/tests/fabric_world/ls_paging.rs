@@ -78,16 +78,20 @@ fn aterm_link() -> (Command, aterm_tempfile::TempDir) {
     (c, runtime)
 }
 
-/// A socket path short enough for `sockaddr_un.sun_path` on macOS.
-fn sock_path(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!("atl-{tag}-{}.sock", std::process::id()));
+/// A socket path short enough for `sockaddr_un.sun_path` whatever `$TMPDIR` is, in a
+/// private directory under `/tmp` that goes when the guard drops.
+fn sock_path(tag: &str) -> (aterm_tempfile::TempDir, PathBuf) {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("atl-")
+        .tempdir_in("/tmp")
+        .expect("a scratch dir under /tmp");
+    let p = dir.path().join(format!("{tag}.sock"));
     assert!(
         p.as_os_str().len() < 100,
         "socket path too long for sun_path: {}",
         p.display()
     );
-    let _ = std::fs::remove_file(&p);
-    p
+    (dir, p)
 }
 
 /// Answer every `Last` on one connection from `pages`, in order, repeating the
@@ -127,7 +131,7 @@ fn answer(mut s: UnixStream, pages: &[Page]) {
 /// Run the real `aterm link ls` against a stub broker speaking `pages`.
 /// Answers `(stdout, stderr, success)`.
 fn ls(tag: &str, pages: Vec<Page>, extra: &[&str]) -> (String, String, bool) {
-    let path = sock_path(tag);
+    let (_dir, path) = sock_path(tag);
     let listener = UnixListener::bind(&path).expect("bind the stub broker");
     let server = std::thread::spawn(move || {
         if let Ok((s, _)) = listener.accept() {
@@ -147,7 +151,6 @@ fn ls(tag: &str, pages: Vec<Page>, extra: &[&str]) -> (String, String, bool) {
     // `ls` did connect.
     let _ = UnixStream::connect(&path);
     server.join().expect("the stub broker thread");
-    let _ = std::fs::remove_file(&path);
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),

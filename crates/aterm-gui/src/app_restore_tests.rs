@@ -1408,7 +1408,6 @@ fn bare_leaf() -> restore::TerminalLeafRestore {
         autopilot: None,
         land_at: None,
         autopilot_by: None,
-        identity: None,
         theme: None,
         agent: None,
         supervised: None,
@@ -1910,28 +1909,21 @@ fn a_graft_carries_a_leaf_only_onto_the_shell_that_leaf_names() {
 /// a frozen shell still pending adoption: the atpkg launch pass can report
 /// before the restore adopts the shells, and counted from the registry alone
 /// that note claimed every tab (review, 2026-09-16).
-///
-/// THE IDENTITY LABEL (2026-09-17) rides the same two paths: the shell keeps
-/// the identity's env, and the label reaches the session and its registry
-/// handle. (Across a quit, a leaf naming a forgotten identity comes back as a
-/// default shell: `a_cold_restore_keeps_the_identity_of_the_windows_first_leaf`.)
 #[test]
-fn a_handed_shells_frozen_flag_and_identity_ride_both_adoption_paths() {
+fn a_handed_shells_frozen_flag_reaches_both_adoption_paths() {
     let state = std::env::temp_dir().join(format!(
-        "aterm-restore-identity-{}-{}",
+        "aterm-restore-frozen-{}-{}",
         std::process::id(),
         aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
     ));
     std::fs::create_dir_all(&state).unwrap();
-    let shell = |local_id: u64, identity: &str| {
+    let shell = |local_id: u64| {
         let mut shell = handed_off_shell(local_id);
         shell.frozen_path = true;
-        shell.identity = Some(identity.to_string());
         shell
     };
-    // (the parent's id, frozen on the session, frozen on the registry, the
-    // session's label, the registry handle's label), sorted.
-    type Row = (Option<u64>, bool, bool, Option<String>, Option<String>);
+    // (the parent's id, frozen on the session, frozen on the registry), sorted.
+    type Row = (Option<u64>, bool, bool);
     let rows = |app: &App| -> Vec<Row> {
         let store = app.store.read().unwrap();
         let mut rows: Vec<Row> = app
@@ -1943,46 +1935,36 @@ fn a_handed_shells_frozen_flag_and_identity_ride_both_adoption_paths() {
                     pooled.session.handoff_local_id,
                     pooled.session.frozen_path,
                     store.has_frozen_path(session),
-                    pooled.session.identity.clone(),
-                    store
-                        .by_local(session)
-                        .and_then(|h| h.identity.as_deref().map(str::to_owned)),
                 )
             })
             .collect();
         rows.sort_unstable();
         rows
     };
-    let carried = |id: u64, label: &str| -> Row {
-        let label = Some(label.to_string());
-        (Some(id), true, true, label.clone(), label)
-    };
-    let plain = |id: Option<u64>| -> Row { (id, false, false, None, None) };
+    let carried = |id: u64| -> Row { (Some(id), true, true) };
+    let plain = |id: Option<u64>| -> Row { (id, false, false) };
     crate::test_env::scoped("ATERM_STATE_HOME", &state, || {
-        // The leaf path: tab B's leaf names shell 3, handed across frozen as
-        // `worker`; tab A is a stand-in (no shell adopted).
+        // The leaf path: tab B's leaf names shell 3, handed across frozen;
+        // tab A is a stand-in (no shell adopted).
         let mut new = App::headless_for_test();
         new.handoff_successor = true;
-        new.seamless_adopt = vec![shell(3, "worker")];
+        new.seamless_adopt = vec![shell(3)];
         assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 0);
         assert_eq!(new.frozen_path_tabs(), 1, "the pending adoptee is counted");
         new.restore_into_window(WindowId(0), window_of(vec![leaf_naming(0), leaf_naming(3)]));
         assert!(new.seamless_adopt.is_empty(), "the leaf adopted shell 3");
-        assert_eq!(rows(&new), vec![plain(None), carried(3, "worker")]);
+        assert_eq!(rows(&new), vec![plain(None), carried(3)]);
         assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 1);
         assert_eq!(new.frozen_path_tabs(), 1, "registered now, counted once");
 
-        // The orphan net: shell 1 frozen as `reviewer`, shell 2 neither.
+        // The orphan net: shell 1 frozen, shell 2 not frozen.
         let mut new = App::headless_for_test();
         new.handoff_successor = true;
         new.restore_into_window(WindowId(0), window_of(vec![leaf_naming(0)]));
-        new.seamless_adopt = vec![shell(1, "reviewer"), handed_off_shell(2)];
+        new.seamless_adopt = vec![shell(1), handed_off_shell(2)];
         new.adopt_orphan_shells_as_tabs(&[]);
         assert!(new.seamless_adopt.is_empty(), "the net placed every orphan");
-        assert_eq!(
-            rows(&new),
-            vec![plain(None), carried(1, "reviewer"), plain(Some(2))]
-        );
+        assert_eq!(rows(&new), vec![plain(None), carried(1), plain(Some(2))]);
         assert_eq!(new.store.read().unwrap().frozen_path_tabs(), 1);
     });
     let _ = std::fs::remove_dir_all(&state);
@@ -4133,159 +4115,6 @@ fn a_shell_the_keeper_gave_back_keeps_its_own_hold() {
     );
 }
 
-/// REVIEW (separation lens, 2026-09-17): ON A COLD RESTORE, THE WINDOW'S
-/// FIRST LEAF KEEPS ITS IDENTITY. The window's bootstrap shell is grafted
-/// onto its first terminal leaf, and the graft carried only the USER meta:
-/// a tab that was `identity=worker` in window 0's first leaf came back as
-/// `identity=-`, its bootstrap forked under the human's login — measured
-/// `[(None, None), (Some("worker"), Some("worker"))]` for two leaves both
-/// naming `worker`. The agent identity is the SHELL's: the graft now
-/// takes the bootstrap only when it wears what the pane names
-/// (`main_entry` forks it under `first_leaf_identity` so it does), a
-/// bootstrap wearing something else fills a later pane that names its
-/// identity or is retired, and the pane forks its own shell under the
-/// identity — in every case each pane's shell wears what its leaf names.
-#[test]
-fn a_cold_restore_keeps_the_identity_of_the_windows_first_leaf() {
-    let state = std::env::temp_dir().join(format!(
-        "aterm-restore-first-leaf-identity-{}-{}",
-        std::process::id(),
-        aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
-    ));
-    std::fs::create_dir_all(&state).unwrap();
-    // `(local id, the session's label, the registry handle's label)`, by id.
-    let rows = |app: &App| -> Vec<(u64, Option<String>, Option<String>)> {
-        let store = app.store.read().unwrap();
-        let mut rows: Vec<_> = app
-            .pool
-            .sessions
-            .iter()
-            .map(|(&session, pooled)| {
-                (
-                    session,
-                    pooled.session.identity.clone(),
-                    store
-                        .by_local(session)
-                        .and_then(|h| h.identity.as_deref().map(str::to_owned)),
-                )
-            })
-            .collect();
-        rows.sort_unstable();
-        rows
-    };
-    let worker = || Some("worker".to_string());
-    crate::test_env::scoped("ATERM_STATE_HOME", &state, || {
-        crate::agent_identity::ensure("worker", true).expect("the verb's create");
-        // The reviewer's shape: both leaves name `worker`; the bootstrap (a
-        // stub, the human's own) wears none. Neither pane takes it — each
-        // forks its own shell under `worker` — and it is retired unconsumed.
-        let mut cold = App::headless_for_test();
-        cold.restore_into_window(
-            WindowId(0),
-            window_of(vec![
-                leaf_under(7, Some("worker")),
-                leaf_under(8, Some("worker")),
-            ]),
-        );
-        assert_eq!(
-            rows(&cold),
-            vec![(1, worker(), worker()), (2, worker(), worker())],
-            "both panes under `worker`; the bootstrap that wore none is gone"
-        );
-        // A later pane names what the bootstrap wears: it fills THAT pane.
-        let mut cold = App::headless_for_test();
-        cold.restore_into_window(
-            WindowId(0),
-            window_of(vec![leaf_under(7, Some("worker")), leaf_under(8, None)]),
-        );
-        assert_eq!(
-            rows(&cold),
-            vec![(0, None, None), (1, worker(), worker())],
-            "the bootstrap (session 0) fills the second pane; the first forked its own"
-        );
-        // A bootstrap already under `worker` — what `main_entry` forks for
-        // this layout, by `first_leaf_identity` — is grafted: no extra fork.
-        let mut cold = App::headless_for_test();
-        cold.pool
-            .sessions
-            .get_mut(&0)
-            .expect("the headless bootstrap")
-            .session
-            .identity = worker();
-        cold.restore_into_window(
-            WindowId(0),
-            window_of(vec![
-                leaf_under(7, Some("worker")),
-                leaf_under(8, Some("worker")),
-            ]),
-        );
-        let mut ids: Vec<u64> = cold.pool.sessions.keys().copied().collect();
-        ids.sort_unstable();
-        assert_eq!(
-            ids,
-            vec![0, 1],
-            "session 0 was grafted, one fork for the second pane"
-        );
-        assert!(
-            cold.pool
-                .sessions
-                .values()
-                .all(|p| p.session.identity == worker()),
-            "every pane's shell wears `worker`"
-        );
-        // A forgotten identity is a default shell on both sides: the leaf
-        // naming `ghost` takes the bootstrap that wears none.
-        let mut cold = App::headless_for_test();
-        cold.restore_into_window(
-            WindowId(0),
-            window_of(vec![
-                leaf_under(7, Some("ghost")),
-                leaf_under(8, Some("worker")),
-            ]),
-        );
-        assert_eq!(rows(&cold), vec![(0, None, None), (1, worker(), worker())]);
-        assert!(!state.join("identities").join("ghost").exists());
-    });
-    let _ = std::fs::remove_dir_all(&state);
-}
-
-/// THE BOOTSTRAP IS FORKED UNDER THE IDENTITY OF THE PANE IT FILLS. The
-/// pick is `bootstrap_local_id`'s — the canonical tree's first terminal
-/// leaf in rebuild order, behind native and placeholder leaves — so
-/// `main_entry` (`first_leaf_identity`) and `apply_restore_manifest`
-/// (`bootstrap_identity`) fork each window's bootstrap under exactly the
-/// identity the graft will look for. The legacy mirror names none.
-#[test]
-fn the_bootstrap_identity_is_the_identity_of_the_leaf_the_bootstrap_fills() {
-    let layout = window_of(vec![
-        settings_leaf(),
-        split_of(placeholder_leaf(), leaf_under(4, Some("worker"))),
-        leaf_under(5, Some("reviewer")),
-    ]);
-    assert_eq!(
-        (layout.bootstrap_local_id(), layout.bootstrap_identity()),
-        (Some(4), Some("worker")),
-        "the same leaf, behind the settings tab and the placeholder"
-    );
-    let mut manifest = App::headless_for_test().capture_restore_manifest();
-    manifest.windows = vec![layout];
-    assert_eq!(manifest.first_leaf_identity(), Some("worker"));
-    // A pane naming no identity, and a legacy (mirror-only) layout — a
-    // capture with its canonical tabs dropped, so only the `tabs` mirror
-    // names the bootstrap's pane: none.
-    let plain = window_of(vec![leaf_naming(0)]);
-    assert_eq!(plain.bootstrap_identity(), None);
-    let mut legacy = App::headless_for_test()
-        .capture_restore_manifest()
-        .windows
-        .remove(0);
-    legacy.restored_tabs.clear();
-    assert_eq!(
-        (legacy.bootstrap_local_id(), legacy.bootstrap_identity()),
-        (Some(0), None)
-    );
-}
-
 /// CONFORMANCE (Tier-1) of the REAL incoming side to
 /// `aterm_models_session::fd_handoff_no_leak_model` (`FdHandoffNoLeak`,
 /// proof-carrying DSU Rung 1b): every PTY master handed across a seamless
@@ -4454,7 +4283,6 @@ fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
         checkpoint: None,
         control: None,
         frozen_path: false,
-        identity: None,
         topics: Vec::new(),
         fg_holder: 0,
         rekey: false,
@@ -5243,18 +5071,6 @@ fn leaf_naming(shell: u64) -> restore::RestoredSplitTree {
             role: identity.role,
             attention: identity.attention,
             questions: identity.questions,
-            ..bare_leaf()
-        },
-    ))
-}
-
-/// A terminal leaf naming shell `shell`, spawned under agent identity
-/// `identity`.
-fn leaf_under(shell: u64, identity: Option<&str>) -> restore::RestoredSplitTree {
-    restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
-        restore::TerminalLeafRestore {
-            local_id: Some(shell),
-            identity: identity.map(str::to_owned),
             ..bare_leaf()
         },
     ))

@@ -8,7 +8,10 @@
 //!
 //! OFF IS NOTHING. With `[fabric] log = "off"` (the default) [`Bridge::mirror`]
 //! is `None`: the `hello` carries no `log=`, no `log-take` or `log-landed` is
-//! ever sent, no `logpin` is read or written, no `ev` body of the mirror's is
+//! ever sent, no `logpin`, `logkey` or `logfloor` is read or written (save the
+//! state dir's own reconciling of a pin a mirror left, by the first bridge
+//! after an unclean stop in an earlier boot, [`StateDir::reconcile_logpin`]:
+//! a dir no mirror ran in holds none), no `ev` body of the mirror's is
 //! published, and the loop's wait is what it was: judged before the round
 //! settles what the items before left owed ([`Bridge::mirror_then_round`]).
 //! So is a bridge whose endpoint did not acknowledge `log=turns`, and one
@@ -41,6 +44,24 @@
 //! offers them again, after [`REFUSED_WAIT`] when nothing else of the batch
 //! landed. So its face, once room comes back, opens at the first `ms` the
 //! bus does not hold, never mid-stream past a hole nobody said.
+//!
+//! WHAT A REBOOT DOES NOT END IS ON THE MEDIA FIRST (rulings Q6, Q13). The
+//! alias key is written durably to `logkey` before the first take that names
+//! it ([`Bridge::mirror_key_on_the_media`]), and `logfloor` is raised past a
+//! batch's bytes before any byte of it is sent ([`Bridge::mirror_floor_covers`]):
+//! a durable write once per [`mirror::FLOOR_LEASE_BYTES`] of bodies. Either
+//! write refused sends nothing, and is tried again after
+//! [`super::DEADLINE_RETRY`]. So a pin a power cut tore has its copies: the
+//! state dir sets it aside and writes a whole one from them in its place
+//! ([`StateDir::reconcile_logpin`]), and the hello resumes at the same key
+//! with the floor as the total. The copies hold only while no older build
+//! writes the pin, and none does: this build's pin is `v=2`, which an older
+//! build refuses ([`Pin`]). A recovered `v=1` is upgraded durably before
+//! copies or sends, without waiting for its batch to land. Every StateDir
+//! open reestablishes that fence before copying or sending, including a
+//! recovered v=2 left by a failed flush. A pin that does not read and that
+//! the copies cannot be shown to cover stops the mirror, and the stop says what a
+//! person does and what it costs ([`Bridge::mirror_hello_answered`]).
 
 use std::collections::BTreeSet;
 use std::io;
@@ -128,6 +149,14 @@ pub(super) struct MirrorRun {
     /// The alias key (ruling Q6), in hex for the take (empty: none, every
     /// edge `-`); the pin carries it ([`Pin::key`]).
     key: String,
+    /// Whether `logkey` holds [`Pin::key`] on the media (or there is no key
+    /// to hold): no take names the key, and no slot is sent, before it does.
+    key_durable: bool,
+    /// What `logfloor` holds on the media, as this run knows it (ruling Q13):
+    /// at or above every body byte the node sent.
+    floor: u64,
+    /// Whether `floor` covers the batch's bytes, so its slots may be sent.
+    floored: bool,
     /// Sessions whose `ev` face the budget refused, said once.
     noticed: BTreeSet<String>,
     /// Recovery counts (§12 M6): slots republished from a pin this process
@@ -140,11 +169,12 @@ pub(super) struct MirrorRun {
 
 impl MirrorRun {
     /// The state a bridge starts with: `None` with the mirror off. THE ALIAS
-    /// KEY (ruling Q6) is the one the state dir's pin holds, else a fresh one
-    /// that the first pin written keeps from then on: never derived from the
-    /// node's caps, so a renewed cap or a changed grant set aliases every
-    /// edge as before. A pin that does not read is the hello's to judge (the
-    /// mirror stops); its key is not trusted meanwhile.
+    /// KEY (ruling Q6) is, until the hello judges the state dir, the one the
+    /// pin holds, else a fresh one that `logkey` keeps from the first take on:
+    /// never derived from the node's caps, so a renewed cap or a changed grant
+    /// set aliases every edge as before. The hello takes `logkey`'s where it
+    /// holds one, and judges a pin that does not read
+    /// ([`Bridge::mirror_hello_answered`]); its key is not trusted meanwhile.
     ///
     /// `mint` draws a fresh key: [`mirror::mint_alias_key`] live, through the
     /// bridge's door ([`crate::fx::Fx::alias_key`]).
@@ -179,6 +209,9 @@ impl MirrorRun {
                 bucket: Bucket::full(0),
                 clock: now,
                 key: key.map_or_else(String::new, |k| aterm_codec::hex::encode_lower(&k)),
+                key_durable: false,
+                floor: 0,
+                floored: false,
                 noticed: BTreeSet::new(),
                 recovered: 0,
                 recovered_deduped: 0,
@@ -262,6 +295,7 @@ impl MirrorRun {
         self.sent = vec![sent; k];
         self.unread = vec![None; k];
         self.outcome = vec![Outcome::Owed; k];
+        self.floored = false;
     }
 
     /// No batch: the pin's slots and every per-slot record of them.
@@ -270,7 +304,28 @@ impl MirrorRun {
         self.sent.clear();
         self.unread.clear();
         self.outcome.clear();
+        self.floored = false;
     }
+
+    /// Set the key in hex and in the pin.
+    fn set_key(&mut self, key: Option<[u8; 16]>) {
+        self.pin.key = key;
+        self.key = key.map_or_else(String::new, |k| aterm_codec::hex::encode_lower(&k));
+    }
+}
+
+/// Why the hello stopped the mirror on its pin, for what a person does
+/// ([`Bridge::mirror_pin_remedy`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinRemedy {
+    /// The pin does not read; which durable copies the dir holds, and
+    /// whether it begins as an older build's (`v=1`,
+    /// [`Pin::by_an_older_build`]), which the copies need not cover.
+    Pin { key: bool, floor: bool, older: bool },
+    /// `logkey` and the pin's `key=` name two keys.
+    Disagree,
+    /// A durable copy (`logkey` or `logfloor`) does not read.
+    Copy(&'static str),
 }
 
 /// What the read-back of a deduped answer at `off` found on the slot's face.
@@ -300,6 +355,16 @@ impl Bridge {
     /// reads it past and answers nothing: the mirror stays off, said once).
     /// On, the pin a predecessor left is read: a batch in it is recovered
     /// before any new take.
+    ///
+    /// AND HELD TO ITS DURABLE COPIES (rulings Q6, Q13): the key is
+    /// `logkey`'s where it holds one, and a pin whose `key=` names another
+    /// stops the mirror; a pin that is not there (never written, or one a
+    /// person moved aside) resumes at `logfloor`'s total, and where a copy is
+    /// on the media a whole pin is written from them at once, so an older
+    /// build that runs here next refuses it ([`Pin`]'s `v=2`) rather than
+    /// find none and mint a second key. A pin that does not read, and a copy
+    /// that does not, stop the mirror, kept as they are, and the stop says on
+    /// stderr exactly what a person does ([`Bridge::mirror_pin_remedy`]).
     pub(super) fn mirror_hello_answered(&mut self, header: &str) {
         let Some(m) = self.mirror.as_deref_mut() else {
             return;
@@ -313,6 +378,9 @@ impl Bridge {
             return;
         }
         let pinned = self.state.logpin().map(|t| t.map(|t| Pin::parse(&t)));
+        let absent = matches!(pinned, Ok(None));
+        let key_copy = self.state.logkey();
+        let floor = self.state.logfloor();
         // NEGATIVE CONTROL (`crate::sim`): the predecessor's batch not
         // recovered, so its records are taken again at fresh sequences.
         #[cfg(test)]
@@ -321,38 +389,221 @@ impl Bridge {
         } else {
             pinned
         };
-        match pinned {
-            Ok(None) => {}
-            Ok(Some(Ok(mut pin))) => {
-                let k = pin.slots.len();
-                if k > 0 {
-                    eprintln!("aterm-link: mirror: recovering a pinned batch of {k} slots");
-                }
-                // Not known to be unsent: each is a republish, and a deduped
-                // answer is read back before it counts.
-                m.arm_batch(k, true);
-                m.recovered = k as u64;
-                m.owed = k > 0;
-                // The pin's key is the node's (ruling Q6); one written before
-                // the key keeps the one this bridge minted from now on.
-                match pin.key {
-                    Some(key) => m.key = aterm_codec::hex::encode_lower(&key),
-                    None => pin.key = m.pin.key,
-                }
-                m.pin = pin;
+        // NEGATIVE CONTROLS (`crate::sim`): the key, or the total, read off
+        // the pin alone, as before their durable copies.
+        #[cfg(test)]
+        let key_copy = if self.fx.mutant(crate::sim::world::Mutant::KeyInThePinAlone) {
+            Ok(None)
+        } else {
+            key_copy
+        };
+        #[cfg(test)]
+        let floor = if self
+            .fx
+            .mutant(crate::sim::world::Mutant::TotalInThePinAlone)
+        {
+            Ok(None)
+        } else {
+            floor
+        };
+        let pinned = pinned
+            .map_err(|e| e.to_string())
+            .and_then(Option::transpose);
+        let mut remedy = None;
+        match (key_copy, floor) {
+            (Err(e), _) => {
+                m.stopped = Some(format!("key-unreadable: {e}"));
+                remedy = Some(PinRemedy::Copy(crate::state::LOGKEY));
             }
-            Ok(Some(Err(e))) => m.stopped = Some(format!("pin-unreadable: {e}")),
-            Err(e) => m.stopped = Some(format!("pin-unreadable: {e}")),
+            (_, Err(e)) => {
+                m.stopped = Some(format!("floor-unreadable: {e}"));
+                remedy = Some(PinRemedy::Copy(crate::state::LOGFLOOR));
+            }
+            (Ok(key_copy), Ok(floor)) => {
+                m.floor = floor.unwrap_or(0);
+                if let Some(key) = key_copy {
+                    m.set_key(Some(key));
+                    m.key_durable = true;
+                }
+                match pinned {
+                    // No pin: never mirrored here, or moved aside by a person.
+                    // The floor is at or above every byte sent.
+                    Ok(None) => {
+                        m.pin.total = m.floor;
+                        if absent && (key_copy.is_some() || floor.is_some()) {
+                            if let Err(e) = self.state.set_logpin(&m.pin.render()) {
+                                eprintln!(
+                                    "aterm-link: mirror: no logpin, and one could not be \
+                                     written from logkey and logfloor ({e}); the next take \
+                                     writes it"
+                                );
+                            }
+                        }
+                    }
+                    Ok(Some(mut pin)) => match (key_copy, pin.key) {
+                        (Some(copy), Some(pinned)) if copy != pinned => {
+                            m.stopped = Some(
+                                "key-disagrees: logkey and logpin's key= name two \
+                                              alias keys"
+                                    .to_string(),
+                            );
+                            remedy = Some(PinRemedy::Disagree);
+                        }
+                        (copy, pinned) => {
+                            let k = pin.slots.len();
+                            if k > 0 {
+                                eprintln!(
+                                    "aterm-link: mirror: recovering a pinned batch of {k} slots"
+                                );
+                            }
+                            // Not known to be unsent: each is a republish, and a
+                            // deduped answer is read back before it counts.
+                            m.arm_batch(k, true);
+                            m.recovered = k as u64;
+                            // The node's key (ruling Q6): `logkey`'s, else the
+                            // one an older build kept in the pin (written to
+                            // `logkey` before the next take), else the one this
+                            // bridge minted.
+                            pin.key = copy.or(pinned).or(m.pin.key);
+                            m.pin = pin;
+                            let key = m.pin.key;
+                            m.set_key(key);
+                        }
+                    },
+                    Err(e) => {
+                        m.stopped = Some(format!("pin-unreadable: {e}"));
+                        remedy = Some(PinRemedy::Pin {
+                            key: key_copy.is_some(),
+                            floor: floor.is_some(),
+                            older: self.state.logpin_by_an_older_build(),
+                        });
+                    }
+                }
+            }
         }
         m.owed = true;
-        let report = match &m.stopped {
-            Some(why) => {
-                eprintln!("aterm-link: mirror stopped: {why}; logpin is kept as it is");
-                "link mirror stopped reason=pin".to_string()
+        // The stop's reason carries what a person does, said once on stderr.
+        if let Some(remedy) = remedy.map(|r| self.mirror_pin_remedy(r)) {
+            if let Some(why) = self.mirror.as_deref_mut().and_then(|m| m.stopped.as_mut()) {
+                why.push_str("; kept as it is.");
+                why.push_str(&remedy);
             }
-            None => "link mirror on".to_string(),
+        }
+        let report = match self.mirror.as_deref().and_then(|m| m.stopped.as_deref()) {
+            Some(why) => {
+                eprintln!("aterm-link: mirror stopped: {why}");
+                "link mirror stopped reason=pin"
+            }
+            None => "link mirror on",
         };
-        let _ = self.ctl_request(&report);
+        let _ = self.ctl_request(report);
+    }
+
+    /// WHAT A PERSON DOES about a mirror the pin or its copies stopped: one
+    /// sentence a reader can act on, naming the file, what each choice costs
+    /// — a second alias for every edge on the bus where a fresh key would be
+    /// minted (ruling Q6), a total below what was mirrored where the copies
+    /// cannot say it (ruling Q13) — and claiming no cause it cannot show
+    /// (`mirror stopped: …` on stderr, which aterm keeps in its log).
+    fn mirror_pin_remedy(&self, remedy: PinRemedy) -> String {
+        let at = |name: &str| self.state.root().join(name).display().to_string();
+        let pin = at(crate::state::LOGPIN);
+        let logkey = at(crate::state::LOGKEY);
+        let logfloor = at(crate::state::LOGFLOOR);
+        match remedy {
+            PinRemedy::Pin {
+                key: true,
+                floor: true,
+                older: false,
+            } => {
+                let why = match &self.pin_unreconciled {
+                    Some(e) => format!(
+                        " This bridge, the first after the last one stopped uncleanly in an \
+                         earlier boot, could not set it aside ({e})."
+                    ),
+                    None => " Its durable copies are on disk, but this bridge cannot show a \
+                             power cut tore it: the first bridge after a reboot sets such a \
+                             pin aside, and within one boot, or after a clean stop (which \
+                             flushed it), damage is a bug's — unless that first bridge could \
+                             not move it (aterm's log says why), or no boot here can be told \
+                             from another."
+                        .to_string(),
+                };
+                format!(
+                    "{why} To resume, move {pin} aside; the next bridge resumes with the same \
+                     alias key ({logkey}) and the total at its floor ({logfloor}), and a batch \
+                     the pin held is taken again, a copy each reader dedupes."
+                )
+            }
+            PinRemedy::Pin {
+                key: false,
+                floor: true,
+                older: false,
+            } => format!(
+                " {logkey} holds no alias key, though {logfloor} holds the total: either none \
+                 could be minted here (every edge named `-`), or the file was removed or lost. \
+                 To resume, move {pin} aside — the next bridge then mirrors under a FRESH key, \
+                 its total from the floor, and if a key was named before, every edge takes a \
+                 second alias on the bus: put {logkey} back first where a copy of the key \
+                 survives (the key= word in a logpin's first line, here or in the quarantine)."
+            ),
+            PinRemedy::Pin {
+                key,
+                floor: true,
+                older: true,
+            } => format!(
+                " It begins as an older aterm's pin (v=1), written after this build's by one \
+                 that keeps neither copy, so {logfloor} may count less than that build \
+                 mirrored. To resume, move {pin} aside — the next bridge then mirrors under {}, \
+                 its total at the floor, below what that build counted by what it mirrored — \
+                 or put back a whole logpin to keep its total.",
+                if key {
+                    format!("the same alias key ({logkey})")
+                } else {
+                    "a FRESH key, so every edge takes a second alias on the bus if one was named"
+                        .to_string()
+                }
+            ),
+            PinRemedy::Pin {
+                key: true,
+                floor: false,
+                ..
+            } => format!(
+                " It holds the node's only copy of its lifetime total: to resume, move {pin} \
+                 aside — the next bridge then mirrors under the same alias key ({logkey}), its \
+                 total counted from zero — or put back a whole logpin to keep the total."
+            ),
+            PinRemedy::Pin {
+                key: false,
+                floor: false,
+                ..
+            } => format!(
+                " It holds the node's only copy of its alias key and its lifetime total (an \
+                 older aterm's pin): to resume, move {pin} aside — the next bridge then mirrors \
+                 under a FRESH alias key, so every edge takes a second alias on the bus, its \
+                 total counted from zero — or put back a whole logpin to keep both."
+            ),
+            PinRemedy::Disagree => format!(
+                " Two keys mean an older build minted a second one, or a file was edited: \
+                 decide which stands and remove the other ({logkey} or the key= word in {pin}); \
+                 the next bridge mirrors under the one left."
+            ),
+            PinRemedy::Copy(crate::state::LOGKEY) => format!(
+                " {logkey} is written durably, so a bug or a hand damaged it: put its whole \
+                 bytes back (32 hex digits and a newline; a logpin that reads names the same key \
+                 in its key= word). Removed, the next bridge takes the key= word of {pin} where \
+                 that pin reads, and otherwise mirrors under a FRESH key, every edge then \
+                 taking a second alias on the bus."
+            ),
+            PinRemedy::Copy(name) => format!(
+                " {} is written durably, so a bug or a hand damaged it: put its whole bytes \
+                 back (one number and a newline, at or above the total= word of {pin}). \
+                 Removed, the next bridge counts from that pin's total where it reads, which a \
+                 power cut may have rolled back below what was mirrored; a torn logpin then \
+                 stops the mirror, and with no logpin the total counts from zero.",
+                at(name)
+            ),
+        }
     }
 
     /// Something may have been appended to a session log: a take is owed.
@@ -369,6 +620,17 @@ impl Bridge {
         self.mirror
             .as_deref()
             .is_some_and(|m| m.acked && m.stopped.is_none())
+    }
+
+    /// TEST-ONLY: the node's total of mirrored bytes as an engaged mirror
+    /// holds it (`None`: off, not acknowledged, or stopped) — the simulation's
+    /// ruling Q13 oracle (`crate::sim::world`).
+    #[cfg(test)]
+    pub(crate) fn mirror_engaged_total(&self) -> Option<u64> {
+        if !self.mirror_engaged() {
+            return None;
+        }
+        self.mirror.as_deref().map(|m| m.pin.total)
     }
 
     /// When the loop owes the mirror a pass: `Some(now)` for work it can do
@@ -475,6 +737,10 @@ impl Bridge {
             self.mirror_retry_in(BUSY_WAIT);
             return;
         }
+        // The key on the media before a take names it (ruling Q6).
+        if !self.mirror_key_on_the_media() {
+            return;
+        }
         let tier = if self.cfg.presence == crate::presence::Mode::Meta {
             "meta"
         } else {
@@ -564,6 +830,19 @@ impl Bridge {
         m.recovered = 0;
         m.recovered_deduped = 0;
         m.owed = true;
+        // THE FLOOR BEFORE THE PIN (ruling Q13): every pin this build writes
+        // has its floor, at or above its total and its batch, on the media
+        // first, so a power cut that tears it leaves what its set-aside needs
+        // (`StateDir::reconcile_logpin`). Refused, nothing is pinned or sent.
+        if !self.mirror_floor_covers() {
+            if let Some(m) = self.mirror.as_deref_mut() {
+                m.clear_batch();
+            }
+            return;
+        }
+        let Some(m) = self.mirror.as_deref_mut() else {
+            return;
+        };
         m.bucket.spend(k as u64);
         if let Err(e) = self.state.set_logpin(&m.pin.render()) {
             eprintln!("aterm-link: mirror: the pin could not be written ({e}); nothing sent");
@@ -576,6 +855,105 @@ impl Bridge {
         let now = self.fx.now();
         if let Some(m) = self.mirror.as_deref_mut() {
             m.retry_at = Some(now + wait);
+        }
+    }
+
+    /// RULING Q6 ON THE MEDIA FIRST: whether `logkey` holds the key this
+    /// mirror names, written durably now if it does not yet — before the first
+    /// take that names the key, and before any slot of a recovered batch an
+    /// older build's pin aliased with it is sent, so a power cut that tears or
+    /// rolls back the pin can never leave the bus holding aliases of a key the
+    /// next bridge does not know. No key (none could be minted: every edge
+    /// `-`) has nothing to keep. A write refused takes and sends nothing, and
+    /// is tried again after [`DEADLINE_RETRY`].
+    pub(super) fn mirror_key_on_the_media(&mut self) -> bool {
+        let Some(m) = self.mirror.as_deref() else {
+            return false;
+        };
+        // Admission belongs to this StateDir open, not an on-disk header:
+        // even a recovered v=2 may be a renamed but unflushed first pin.
+        // Reestablish the fence before copies or sends, including when the
+        // key's copy already exists. Its old batch stays outstanding.
+        if let Err(e) = self.state.ensure_logpin_durable(|| m.pin.render()) {
+            eprintln!(
+                "aterm-link: mirror: the pin's version fence could not be made durable \
+                 ({e}); nothing taken or sent, tried again"
+            );
+            self.mirror_retry_in(DEADLINE_RETRY);
+            return false;
+        }
+        if m.key_durable {
+            return true;
+        }
+        let key = m.pin.key;
+        // NEGATIVE CONTROL (`crate::sim`): no durable copy of the key, as
+        // before it; the key rides the pin alone.
+        #[cfg(test)]
+        let key = if self.fx.mutant(crate::sim::world::Mutant::KeyInThePinAlone) {
+            None
+        } else {
+            key
+        };
+        let written = key.map_or(Ok(()), |key| self.state.set_logkey(&key));
+        match written {
+            Ok(()) => {
+                if let Some(m) = self.mirror.as_deref_mut() {
+                    m.key_durable = true;
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "aterm-link: mirror: the alias key could not be written to logkey ({e}); \
+                     nothing taken or sent, tried again"
+                );
+                self.mirror_retry_in(DEADLINE_RETRY);
+                false
+            }
+        }
+    }
+
+    /// RULING Q13 ON THE MEDIA FIRST: whether `logfloor` covers the batch —
+    /// the node's total plus every slot's body bytes — raised now, durably,
+    /// [`mirror::FLOOR_LEASE_BYTES`] past it if it does not, before any slot
+    /// is sent. So the floor is at or above every byte the node's mirror ever
+    /// sent, and a total a later bridge resumes at it, after a power cut tore
+    /// or rolled back the pin, is never below what was counted. A raise
+    /// refused sends nothing, and is tried again after [`DEADLINE_RETRY`].
+    pub(super) fn mirror_floor_covers(&mut self) -> bool {
+        let Some(m) = self.mirror.as_deref() else {
+            return false;
+        };
+        if m.floored || m.pin.slots.is_empty() {
+            return true;
+        }
+        let bytes: u64 = m.pin.slots.iter().map(|s| s.body.len() as u64).sum();
+        let need = m.pin.total.saturating_add(bytes);
+        if need <= m.floor {
+            if let Some(m) = self.mirror.as_deref_mut() {
+                m.floored = true;
+            }
+            return true;
+        }
+        match self
+            .state
+            .raise_logfloor(need.saturating_add(mirror::FLOOR_LEASE_BYTES))
+        {
+            Ok(floor) => {
+                if let Some(m) = self.mirror.as_deref_mut() {
+                    m.floor = floor;
+                    m.floored = true;
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!(
+                    "aterm-link: mirror: the floor of the node's total could not be raised \
+                     ({e}); nothing sent, tried again"
+                );
+                self.mirror_retry_in(DEADLINE_RETRY);
+                false
+            }
         }
     }
 
@@ -594,6 +972,11 @@ impl Bridge {
     /// its re-pin gives it ([`Bridge::mirror_repin`]).
     pub(super) fn mirror_send(&mut self) {
         let k = self.mirror.as_deref().map_or(0, |m| m.pin.slots.len());
+        // The key and the floor on the media before any slot is sent (rulings
+        // Q6, Q13): a recovered batch an older build pinned included.
+        if k > 0 && !(self.mirror_key_on_the_media() && self.mirror_floor_covers()) {
+            return;
+        }
         let mut judged: std::collections::BTreeMap<String, bool> =
             std::collections::BTreeMap::new();
         for i in 0..k {

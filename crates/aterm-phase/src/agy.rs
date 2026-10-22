@@ -25,6 +25,13 @@
 //! ? for shortcuts  Gemini 4 Argon · medium  rule and the FOOTER
 //! ```
 //!
+//! **A MESSAGE'S BLANK LINE** is drawn as a blank row, the message's rows
+//! under it two columns in, as a reply's (measured in the lab 2026-10-21,
+//! [`fixtures::lab::WORKER_FIRST_PROMPT`]): nothing on the screen tells it
+//! from the blank row that ends a message, so the rows past it read as the
+//! reply ([`said_tail`]). A worker's first prompt holds none
+//! (`aterm_agent::harness::worker::WorkerCli::blank_lines`).
+//!
 //! **THE EMPTY COMPOSER** draws no placeholder (measured) — but while a
 //! permission mode is on (shift+tab cycles them) it draws the mode's hint
 //! after its caret: `Plan mode: research & plan only (shift+tab to cycle)`,
@@ -2110,6 +2117,15 @@ pub mod fixtures {
         pub const BUSY_STREAMING: &str = include_str!("fixtures/agy-1.4.0-lab-busy-streaming.txt");
         /// The end of a turn.
         pub const END_OF_TURN: &str = include_str!("fixtures/agy-1.4.0-lab-end-of-turn.txt");
+        /// A spawned worker's first prompt holding a blank line (the task,
+        /// a blank line, the spawn's fact line), its reply, then the
+        /// harness's Land act and the landing (`lab forever`'s L15, before
+        /// a worker's task file dropped agy's blank lines): the message's
+        /// blank line is a blank row, and the rows under it sit two columns
+        /// in, as the reply's (the module header's A MESSAGE'S BLANK
+        /// LINE).
+        pub const WORKER_FIRST_PROMPT: &str =
+            include_str!("fixtures/agy-1.4.0-lab-worker-first-prompt.txt");
         /// The pane at 50 columns: a reply of two paragraphs, the second
         /// wrapped over three rows at column two, two cells short of the
         /// pane's edge, its last `or 2)?`.

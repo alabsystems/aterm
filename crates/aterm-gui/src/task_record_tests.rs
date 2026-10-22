@@ -272,6 +272,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         since_unix_ms: 10_000,
         since: t0,
         entered: 7,
+        agent: Some(aterm_phase::Program::Agy),
     };
     let row = record.carry_row();
     // The path rides in this platform's own spelling, pct-encoded.
@@ -284,7 +285,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         row,
         format!(
             "rev=7 state=exited from={SID} since=10000 result_bytes=9 attention=1 why=exit \
-             exit=-2 result_path={wire}"
+             exit=-2 result_path={wire} agent=agy"
         )
     );
     // Read back five seconds of wall clock later: the same record, and its
@@ -299,6 +300,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         exit: None,
         result_path: None,
         attention: false,
+        agent: None,
         ..record.clone()
     };
     let back = TaskRecord::from_carry_row(&bare.carry_row(), Some(&tasks()), t0, 10_000).unwrap();
@@ -318,6 +320,32 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
     let newer = format!("{} model=opus pinned", bare.carry_row());
     assert_eq!(
         TaskRecord::from_carry_row(&newer, Some(&tasks()), t0, 10_000),
+        Some(bare.clone())
+    );
+    // THE WORKER'S AGENT CROSSES (each one a spawn starts), and one this
+    // build does not know (a newer build's agent, or no worker's: `codex`)
+    // costs the agent alone, never the record.
+    for agent in aterm_phase::Program::ALL {
+        let with = TaskRecord {
+            agent: Some(agent),
+            ..bare.clone()
+        };
+        let back = TaskRecord::from_carry_row(&with.carry_row(), Some(&tasks()), t0, 10_000)
+            .expect("reads");
+        let spawned = aterm_agent::harness::worker::worker_cli(agent).is_some();
+        assert_eq!(back.agent, spawned.then_some(agent), "{agent:?}");
+        assert_eq!(
+            TaskRecord {
+                agent: None,
+                ..back
+            },
+            bare,
+            "{agent:?}"
+        );
+    }
+    let unknown = format!("{} agent=a-later-cli", bare.carry_row());
+    assert_eq!(
+        TaskRecord::from_carry_row(&unknown, Some(&tasks()), t0, 10_000),
         Some(bare.clone())
     );
 
@@ -355,6 +383,7 @@ fn the_reply_event_and_status_spellings() {
         since_unix_ms: 0,
         since: Instant::now(),
         entered: 3,
+        agent: Some(aterm_phase::Program::Gemini),
     };
     let fields = record.wire_fields();
     assert!(

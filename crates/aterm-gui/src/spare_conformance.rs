@@ -311,7 +311,7 @@ impl Rig {
                 let grid = self.app.spawn_grid(wid);
                 match self
                     .app
-                    .try_adopt_spare(wid, Some(wid), grid, &SpawnAsk::new(None, None))
+                    .try_adopt_spare(wid, Some(wid), grid, &SpawnAsk::new(None))
                 {
                     Ok((slot, session)) => {
                         // `book_off_loop`'s bookkeeping for an adopted spare.

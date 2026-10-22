@@ -60,6 +60,10 @@ aterm-types = { workspace = true }
 # The body's informational `t=` (`now_ms`).
 aterm-time = { workspace = true }
 aterm-uds = { workspace = true }
+# How a state-dir write is finished: a clean stop flushes each file where it
+# is by the barrier (`aterm_durable::ordered`) and ends with one full flush. Std plus
+# astream-sys, already in this graph through aterm-types.
+aterm-durable = { workspace = true }
 # The one hex codec (the roster nonce) and the control wire's percent
 # escape (`pct`, shared by the fabric body).
 aterm-codec = { workspace = true }

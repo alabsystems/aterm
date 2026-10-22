@@ -324,13 +324,12 @@ fn typing_instances(g: &mut GpuRenderer, prompt: &str, keys: &[&str]) -> Vec<usi
         .collect()
 }
 
-/// The first px of the sweep at which `glyph` on row 1 inks into row 0's band in this
-/// host's face, by the CPU renderer over the same face: px 13 for `Å` in macOS's,
-/// another in the Linux lane's DejaVu Sans Mono.
+/// The first px of the sweep at which `glyph` on row 1 inks into row 0's band, by the
+/// CPU renderer over the GPU's own face (the JetBrains Mono fixture, [`common::cpu`]):
+/// px 13 for `Å` as macOS rasters it; where it overshoots is the host's rasterizer's.
 fn an_overshooting_px(glyph: &str) -> f32 {
     let inks_above = |px: f32| {
-        let mut r = aterm_render::Renderer::from_system(px, Theme::default())
-            .expect("the CPU renderer over the host's face");
+        let mut r = common::cpu(px, Theme::default());
         let (_, ch) = r.cell_size();
         let top = r.grid_top();
         let mut t = Terminal::new(3, COLS as u16);

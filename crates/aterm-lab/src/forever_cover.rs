@@ -324,21 +324,40 @@ pub(super) fn judge_answer(seen: &Seen, t0: i64) -> Verdict {
 /// acted on ([`judged_resumption`]: its reply read, its back-off decided
 /// there, Land's act at that due). Judged only where a person's hand reached the session
 /// ([`Cover::person_stamp`] a stamp, not `-`): the lab's person types through
-/// the development seam `send|key as=person`, and a write that left no stamp
-/// is nobody's by the product's rule, so what the harness did after it says
-/// nothing of a person's exchange.
+/// the development seam `send|key as=person`, or (`forever --window`) through
+/// `hwkey`, the key press's own path ([`Cover::keyed`]), and a write that left
+/// no stamp is nobody's by the product's rule, so what the harness did after
+/// it says nothing of a person's exchange. Typed through `hwkey`, the stamp
+/// must be the keys' and theirs alone ([`keys_unaccounted`]): `status
+/// human_seq=` moved by exactly the keys posted, else UNOBSERVED.
 pub(super) fn judge_theirs(seen: &Seen, t0: i64) -> Verdict {
     let Some(p) = seen.cover.person_ms else {
         return Verdict::Unobserved("the person's prompt was never typed".into());
     };
     let stamp = seen.cover.person_stamp.as_deref().unwrap_or("?");
+    let path = if seen.cover.keyed.is_some() {
+        "hwkey's keys"
+    } else {
+        "the `as=person` seam"
+    };
     if stamp.parse::<u64>().is_err() {
         return Verdict::Unobserved(format!(
             "no person's hand reached the session: status human_ms={stamp} after the Enter at +{} \
-             (the `as=person` seam did not stamp it), so the prompt was nobody's",
+             ({path} did not stamp it), so the prompt was nobody's",
             at(t0, p)
         ));
     }
+    if let Some(why) = seen.cover.keyed.as_ref().and_then(keys_unaccounted) {
+        return Verdict::Unobserved(format!(
+            "{why} (the Enter at +{}), so whose hand the prompt was is not known",
+            at(t0, p)
+        ));
+    }
+    let typed = seen
+        .cover
+        .keyed
+        .as_ref()
+        .map_or_else(|| format!("typed through {path}"), keyed_line);
     let until = seen.cover.turn_ms.unwrap_or(seen.end_ms);
     let inside = |t: i64| t > p && t < until;
     let left_rule = format!("rule={}", turn_end::RULE_LEFT);
@@ -393,7 +412,7 @@ pub(super) fn judge_theirs(seen: &Seen, t0: i64) -> Verdict {
         bad.push(format!("a need was raised, though no reply named one: {n}"));
     }
     let said = format!(
-        "the person's Enter at +{}; {}; {}; {} for {} after it; the stub {}; the orchestrator's turn {}",
+        "{typed}; the person's Enter at +{}; {}; {}; {} for {} after it; the stub {}; the orchestrator's turn {}",
         at(t0, p),
         left.map_or_else(
             || "NO LEFT".to_string(),
@@ -449,6 +468,49 @@ pub(super) fn judge_theirs(seen: &Seen, t0: i64) -> Verdict {
         }
         Err(v) => said_before(&format!("{said}; the orchestrator's turn"), v),
     }
+}
+
+/// Why `hwkey`'s keys do not account for the person's stamp, if they do
+/// not: `status human_seq=` (a person's gestures, which no control verb
+/// moves) went from its count before the first key to its count after the
+/// Enter by exactly the presses `hwkey` posted. Fewer: some key the real key
+/// path took was not counted as a person's. More: another hand (a person at
+/// the desk) reached the session too. Unread after: not known.
+#[must_use]
+pub fn keys_unaccounted(k: &Keyed) -> Option<String> {
+    let Some(after) = k.seq_after else {
+        return Some(format!(
+            "hwkey posted {} key(s), and status human_seq= was not read after the Enter",
+            k.posted
+        ));
+    };
+    let moved = after.checked_sub(k.seq_before);
+    if moved == Some(k.posted) && k.posted > 0 {
+        return None;
+    }
+    let what = match moved {
+        Some(n) if n < k.posted => "not every key the real key path took was counted as a person's",
+        Some(n) if n > k.posted => "another hand reached the session beside hwkey's keys",
+        Some(_) => "no key was posted",
+        None => "the person's count went back",
+    };
+    Some(format!(
+        "hwkey posted {} key(s), and status human_seq= went {} -> {after}: {what}",
+        k.posted, k.seq_before
+    ))
+}
+
+/// The line that says how `hwkey` typed the person's prompt.
+#[must_use]
+pub fn keyed_line(k: &Keyed) -> String {
+    format!(
+        "typed through hwkey: {} key(s) posted to the window's event queue ({} to the key window of the active app), status human_seq= {} -> {}",
+        k.posted,
+        k.key_window,
+        k.seq_before,
+        k.seq_after
+            .map_or_else(|| "?".to_string(), |n| n.to_string())
+    )
 }
 
 /// L14: P2 LIVE UNDER LAND — the work reply opening `Wrote the parser
@@ -678,15 +740,34 @@ pub(super) fn judge_startup(seen: &Seen, t0: i64) -> Verdict {
     }
 }
 
-/// L15: a worker given by `spawn agent=claude` from a manager tab's Claude
-/// Code ([`Cover::starter`]): its record `working from=<mgr>` at its first
-/// read, `autopilot=land` (a spawn's default), Land's landing as L7's (the
-/// record `done why=landed`, `TASK … done why=landed`, quiet after it as a
-/// managed worker's: [`judge_tasked`]); the manager's `await task @<w>
-/// since=0` RETURNED at the landing (not before it), exit 0, the worker's
-/// row `state=done`; and `result` its report, a blank line and its defense
-/// byte for byte.
-pub(super) fn judge_spawned(seen: &Seen, land: Option<&(i64, String)>, t0: i64) -> Verdict {
+/// Where a worker of `program` takes its result from, as `result`'s header
+/// names it: Claude Code's transcript (`source=transcript`), every other
+/// harness's screen (`source=screen program=<program>`).
+fn result_source(program: &str) -> (&'static str, Option<&str>) {
+    if program == Harness::Claude.name() {
+        ("transcript", None)
+    } else {
+        ("screen", Some(program))
+    }
+}
+
+/// L15: a worker of the harness under test (`program`), given by `spawn
+/// agent=<program>` aimed at a manager tab running it ([`Cover::starter`]):
+/// the spawn named that agent ([`Cover::agent`]) and `meta worker=` names it
+/// ([`Cover::worker`]); its record `working from=<mgr>` at its first read,
+/// `autopilot=land` (a spawn's default) at the first `status` naming one
+/// (`-` until the agent runs), Land's landing as L7's (the record
+/// `done why=landed`, `TASK … done why=landed`, quiet after it as a managed
+/// worker's: [`judge_tasked`]); the manager's `await task @<w> since=0`
+/// RETURNED at the landing (not before it), exit 0, the worker's row
+/// `state=done`; and `result` its report, a blank line and its defense byte
+/// for byte, from the source its harness has ([`result_source`]).
+pub(super) fn judge_spawned(
+    seen: &Seen,
+    land: Option<&(i64, String)>,
+    program: &str,
+    t0: i64,
+) -> Verdict {
     let (Some(mgr), Some(spawn)) = (&seen.cover.starter, &seen.cover.spawn) else {
         return Verdict::Unobserved("no worker was spawned".into());
     };
@@ -695,6 +776,26 @@ pub(super) fn judge_spawned(seen: &Seen, land: Option<&(i64, String)>, t0: i64) 
         .and_then(|l| l.split_whitespace().next())
         .unwrap_or("?");
     let mut bad = Vec::new();
+    if seen.cover.agent.as_deref() != Some(program) {
+        bad.push(format!(
+            "the spawn named agent={}, not the harness under test's {program}",
+            seen.cover.agent.as_deref().unwrap_or("-")
+        ));
+    }
+    if seen.cover.worker.as_deref() != Some(program) {
+        bad.push(format!(
+            "meta names worker={}, not {program}",
+            seen.cover.worker.as_deref().unwrap_or("(not read)")
+        ));
+    }
+    let (source, by) = result_source(program);
+    let head = seen.cover.result_head.as_deref().unwrap_or("");
+    if word(head, "source").as_deref() != Some(source) || word(head, "program").as_deref() != by {
+        bad.push(format!(
+            "result's header is not source={source}{}: {head:?}",
+            by.map_or_else(String::new, |p| format!(" program={p}"))
+        ));
+    }
     let first = seen.task.iter().find(|(_, r)| r.contains("state="));
     let from_mgr = first.is_some_and(|(_, r)| {
         word(r, "state").as_deref() == Some("working")
@@ -706,14 +807,18 @@ pub(super) fn judge_spawned(seen: &Seen, land: Option<&(i64, String)>, t0: i64) 
             first.map_or("not read", |(_, r)| r.as_str())
         ));
     }
-    if !seen
+    // The spawn's default Autopilot, as `status` names it once the tab runs
+    // an agent the harness supervises: `autopilot=-` before that (a read
+    // racing the agent's start: Gemini CLI 0.46.0's, measured, is `node`
+    // until the status sweep publishes it), the first word after it `land`.
+    let named = seen
         .status
-        .first()
-        .is_some_and(|(_, s)| word(s, "autopilot").as_deref() == Some("land"))
-    {
+        .iter()
+        .find(|(_, s)| word(s, "autopilot").is_some_and(|w| w != "-"));
+    if !named.is_some_and(|(_, s)| word(s, "autopilot").as_deref() == Some("land")) {
         bad.push(format!(
-            "its first status is not autopilot=land: {}",
-            seen.status.first().map_or("not read", |(_, s)| s.as_str())
+            "its first status naming an Autopilot is not autopilot=land: {}",
+            named.map_or("none named one", |(_, s)| s.as_str())
         ));
     }
     let done = seen.first_after("DONE ", t0).map(|(t, _)| *t);
@@ -759,12 +864,15 @@ pub(super) fn judge_spawned(seen: &Seen, land: Option<&(i64, String)>, t0: i64) 
         None => bad.push("its result was never read".into()),
     }
     let said = format!(
-        "spawned from @{mgr} ({spawn}); the manager's await task {waited}; result {}",
+        "spawned agent={} from @{mgr} ({spawn}); the manager's await task {waited}; result {} \
+         ({})",
+        seen.cover.agent.as_deref().unwrap_or("-"),
         if seen.cover.result.as_deref() == Some(want.as_str()) {
             "byte for byte"
         } else {
             "NOT as stubbed"
-        }
+        },
+        crate::util::one_line(head, 100)
     );
     let l7 = judge_tasked(seen, land, t0);
     if bad.is_empty() {

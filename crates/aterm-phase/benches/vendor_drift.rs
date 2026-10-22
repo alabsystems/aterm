@@ -315,7 +315,10 @@ fn every_reset_template_is_whole_in_the_store_claude() -> Outcome {
     );
     let planted = [(
         "planted",
-        format!("{} planted-by-no-build reset?", anchor("reset.row")),
+        vec![format!(
+            "{} planted-by-no-build reset?",
+            anchor("reset.row")
+        )],
     )];
     assert_eq!(
         missing_templates(&bytes, &planted),

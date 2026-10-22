@@ -9,6 +9,7 @@ use crate::items::defaults::{self, Target};
 use crate::items::{Ctx, Item, keyboard};
 use crate::model::{Effect, PValue, Probe, Read, User};
 use crate::port::{Cmd, System};
+use aterm_types::macos_setup::{Selection, Setting};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
@@ -30,38 +31,47 @@ const DOCK_APPS: [(&str, &str, &str); 3] = [
 /// # Errors
 /// An absent or ambiguous user, or an invalid keyboard model.
 pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
+    selected_items(ctx, Selection::all())
+}
+
+/// Build only the selected preferences, before reading any preference domain.
+///
+/// # Errors
+/// An absent or ambiguous user, or an invalid selected keyboard model.
+pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item>>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init preferences require exactly one local user".into());
     };
-    let mut items = keyboard::expand(
-        &keyboard::Table {
-            caps_lock: Some("control".into()),
-            // Apple silicon's internal keyboard uses this model even when no HID
-            // service currently advertises it. It is harmless on desktop Macs.
-            models: if ctx.facts.arch == "arm64" {
-                vec!["0-0".into()]
-            } else {
-                Vec::new()
+    let mut items = Vec::new();
+    if selected.contains(Setting::CapsLock) {
+        items.extend(keyboard::expand(
+            &keyboard::Table {
+                caps_lock: Some("control".into()),
+                // Apple silicon's internal keyboard uses this model even when no HID
+                // service currently advertises it. It is harmless on desktop Macs.
+                models: if ctx.facts.arch == "arm64" {
+                    vec!["0-0".into()]
+                } else {
+                    Vec::new()
+                },
             },
-        },
-        ctx,
-    )?;
-    items.extend(attached_keyboard_items(ctx)?);
-    items.push(Box::new(Desktop {
-        user: user.clone(),
-        kind: DesktopKind::Widgets,
-        before: Mutex::new(Vec::new()),
-    }));
-    items.push(Box::new(Desktop {
-        user: user.clone(),
-        kind: DesktopKind::Desktop,
-        before: Mutex::new(Vec::new()),
-    }));
-    items.push(Box::new(Desktop {
-        user: user.clone(),
-        kind: DesktopKind::Dock,
-        before: Mutex::new(Vec::new()),
-    }));
+            ctx,
+        )?);
+        items.extend(attached_keyboard_items(ctx)?);
+    }
+    for (setting, kind) in [
+        (Setting::Widgets, DesktopKind::Widgets),
+        (Setting::Desktop, DesktopKind::Desktop),
+        (Setting::Dock, DesktopKind::Dock),
+    ] {
+        if selected.contains(setting) {
+            items.push(Box::new(Desktop {
+                user: user.clone(),
+                kind,
+                before: Mutex::new(Vec::new()),
+            }));
+        }
+    }
     Ok(items)
 }
 

@@ -713,7 +713,6 @@ pub fn read_rows_checked(path: &Path) -> std::io::Result<Vec<Row>> {
 }
 
 fn read_text(path: &Path) -> std::io::Result<String> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
@@ -724,7 +723,19 @@ fn read_text(path: &Path) -> std::io::Result<String> {
             "recovery ledger is not a regular file",
         ));
     }
-    let mut file = open_for_read(path)?;
+    read_opened_text(open_for_read(path)?)
+}
+
+/// Admission and the tail bound belong to the descriptor actually read. The
+/// path can name a different object by the time its nonblocking open completes.
+fn read_opened_text(mut file: std::fs::File) -> std::io::Result<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::other(
+            "recovery ledger is not a regular file",
+        ));
+    }
     let skip = meta.len().saturating_sub(MAX_READ_BYTES);
     if skip > 0 {
         file.seek(SeekFrom::Start(skip))?;
@@ -1365,6 +1376,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn checked_history_distinguishes_absence_and_empty_from_unreadable_or_malformed() {
+        use std::os::unix::ffi::OsStrExt as _;
         let dir = scratch("checked");
         let path = ledger_path(&dir);
         assert!(
@@ -1390,9 +1402,42 @@ mod tests {
         assert!(read_rows_checked(&path).is_err());
         assert_eq!(
             read_rows(&path),
-            vec![expected],
+            vec![expected.clone()],
             "legacy parsing is unchanged"
         );
+
+        // A nonblocking open after the path's regular-file observation may
+        // actually yield a FIFO. Reject the opened object even with no writer,
+        // where a read would otherwise return EOF and invent empty history.
+        let fifo = dir.join("replacement.fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: an owned scratch pathname, a NUL-terminated name and mode only.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_opened_text(open_for_read(&fifo).unwrap()).is_err());
+        assert!(read_rows_checked(&fifo).is_err());
+
+        // The same opened inode can shrink after a caller's earlier metadata
+        // observation. Its current length, not that old bound, must decide the
+        // tail offset; seeking past this malformed row would falsely look empty.
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_READ_BYTES + 4096)
+            .unwrap();
+        let opened = open_for_read(&path).unwrap();
+        assert!(opened.metadata().unwrap().len() > MAX_READ_BYTES);
+        std::fs::write(&path, "unreadable row\n").unwrap();
+        assert_eq!(read_opened_text(opened).unwrap(), "unreadable row\n");
+        assert!(read_rows_checked(&path).is_err());
+
+        // A later rename does not change the identity being admitted/read.
+        // Read the retained valid handle, while the new pathname is malformed.
+        let valid = format!("{}\n", expected.to_line());
+        std::fs::write(&path, &valid).unwrap();
+        let opened = open_for_read(&path).unwrap();
+        std::fs::rename(&path, dir.join("retired.log")).unwrap();
+        std::fs::write(&path, "unreadable row\n").unwrap();
+        assert_eq!(read_opened_text(opened).unwrap(), valid);
+        assert!(read_rows_checked(&path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

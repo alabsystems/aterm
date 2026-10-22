@@ -68,6 +68,13 @@
 //! `FAILED` after a wall, `CANCELLED` after a person's Esc; measured
 //! 2026-10-21); a `/usage` card names none, only the turns the session
 //! counts (`0` before any, and after a first turn a person stopped).
+//! Signed in with a Meta account (1.4.11, measured 2026-10-21,
+//! [`fixtures::USAGE_SIGNED_IN`]) the `/status` card gains `ACCOUNT
+//! Name (address)` and `BILLING Subscription · <tier>` rows and the
+//! `/usage` card a subscription block (`Current NN% used · Resets …`,
+//! `Weekly NN% used · Resets …`, `as of …`): what
+//! [`status_card_account`] and [`usage_card_weekly`] read for the
+//! window's footer, as agy's launch card is read for its account.
 //! Entered while a turn runs, the card goes ABOVE the turn's status row,
 //! which stays over the composer, and the turn's reply is drawn whole under
 //! the card once it ends. So a screen of cards alone above the open
@@ -2679,6 +2686,111 @@ pub fn launch_card_words<'a>(rows: &'a [String], place: &CardPlace) -> Option<[&
     (!w.is_empty()).then_some([w, w, w])
 }
 
+/// Whether `row` is the composer's top rule at rest: the idle voice label
+/// (`── Voice input (⌥ + v to start) ──…`) and no other voice state
+/// (`Recording`, `Transcribing`, … are Muse Code's news, not its rest).
+/// The window's harness branding replaces this label on the glass; the
+/// grid keeps Muse Code's row for its readers.
+#[must_use]
+pub fn is_idle_voice_rule(row: &str) -> bool {
+    is_rule(row) && crate::text::contains(row, const { anchor_text("muse.composer.voice") })
+}
+
+/// The newest card of each kind over the composer (`/status`'s `MUSE CODE`
+/// card, `/usage`'s `Session usage` card): the ranges of their body rows,
+/// newest last. A reply merely quoting a card's words has no `┌`/`└` frame
+/// of its own to be read as one.
+fn newest_cards(rows: &[String]) -> Vec<std::ops::Range<usize>> {
+    let Some(f) = frame(rows) else {
+        return Vec::new();
+    };
+    let mut cards = Vec::new();
+    let mut i = 0;
+    while i < f.top {
+        if rows[i].starts_with('┌')
+            && let Some(end) = (i + 1..f.top).find(|&j| rows[j].starts_with('└'))
+        {
+            let head = rows.get(i + 1).map_or("", String::as_str);
+            if crate::text::contains(head, const { anchor_text("muse.card.status") })
+                || crate::text::contains(head, const { anchor_text("muse.card.session_usage") })
+            {
+                cards.push(i + 1..end);
+            }
+            i = end + 1;
+            continue;
+        }
+        i += 1;
+    }
+    cards
+}
+
+/// The newest labelled value over the cards ([`newest_cards`]): a row of
+/// `label` at the label column, its value after the run of spaces.
+fn card_value<'a>(rows: &'a [String], label: &str) -> Option<&'a str> {
+    newest_cards(rows).into_iter().rev().find_map(|body| {
+        body.rev().find_map(|j| {
+            let t = card_text(&rows[j])?;
+            let rest = t.strip_prefix(label)?;
+            if !rest.starts_with(|c: char| c.is_whitespace()) {
+                return None;
+            }
+            let value = crate::text::trim(rest);
+            (!value.is_empty()).then_some(value)
+        })
+    })
+}
+
+/// The subscription tier a card names (`Subscription · Muse Code Max
+/// Usage`): the words after the `·`.
+fn card_plan(rows: &[String]) -> Option<String> {
+    let billing = card_value(rows, const { anchor_text("muse.card.billing") });
+    let line = billing.or_else(|| {
+        newest_cards(rows).into_iter().rev().find_map(|body| {
+            body.rev().find_map(|j| {
+                let t = card_text(&rows[j])?;
+                t.starts_with(const { anchor_text("muse.card.subscription") })
+                    .then_some(t)
+            })
+        })
+    })?;
+    let (_, tier) = line.rsplit_once(" · ")?;
+    let tier = crate::text::trim(tier);
+    (!tier.is_empty()).then(|| tier.to_owned())
+}
+
+/// The signed-in address and subscription tier on Muse Code's `/status`
+/// card (`ACCOUNT  Name (address)`, `BILLING  Subscription · <tier>`;
+/// MEASURED signed in, [`fixtures::USAGE_SIGNED_IN`]). An API-key session
+/// draws no `ACCOUNT` row: `None`, never a guess. The tier may also be
+/// read off a `/usage` card's own subscription line.
+#[must_use]
+pub fn status_card_account(rows: &[String]) -> Option<(String, Option<String>)> {
+    let account = card_value(rows, const { anchor_text("muse.card.account") })?;
+    let email = account
+        .strip_suffix(')')
+        .and_then(|s| s.rsplit_once(" ("))
+        .map(|(_, email)| crate::text::trim(email))?;
+    if !email.contains('@') || email.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some((email.to_owned(), card_plan(rows)))
+}
+
+/// The weekly subscription quota on Muse Code's `/usage` card (`Weekly
+/// 71% used · Resets …`; MEASURED signed in,
+/// [`fixtures::USAGE_SIGNED_IN`]), as the footer's words (`weekly 29%
+/// left`). Past 100% used the quota left is none: `weekly 0% left`.
+#[must_use]
+pub fn usage_card_weekly(rows: &[String]) -> Option<String> {
+    let weekly = card_value(rows, const { anchor_text("muse.card.weekly") })?;
+    let (used, rest) = weekly.split_once('%')?;
+    if !crate::text::trim(rest).starts_with("used") {
+        return None;
+    }
+    let used: u32 = crate::text::trim(used).parse().ok()?;
+    Some(format!("weekly {}% left", 100u32.saturating_sub(used)))
+}
+
 fn parse_muse_footer_model(row: &str) -> Option<(String, Option<String>)> {
     if leading_spaces(row) != 2 {
         return None;
@@ -2879,6 +2991,14 @@ pub mod fixtures {
     pub const USAGE_CARD: &str = include_str!("fixtures/muse-1.4.10-R6427.1-usage.txt");
     /// `/status` after that: its card under the `/usage` card.
     pub const STATUS_CARD: &str = include_str!("fixtures/muse-1.4.10-R6427.1-status.txt");
+
+    // 1.4.11-R6667.1, signed in with a Meta account.
+
+    /// `/status` and `/usage` at an idle composer, signed in: the status
+    /// card's `ACCOUNT` and `BILLING` rows and the usage card's
+    /// subscription rows (`Current`, `Weekly`, `as of`).
+    pub const USAGE_SIGNED_IN: &str =
+        include_str!("fixtures/muse-1.4.11-R6667.1-usage-signed-in.txt");
     /// The usage wall, its time wrapped onto `  AM`, and one `/rules` under
     /// it: three indented rows, a block of their own under a blank row (the
     /// W2 lab of 2026-10-21, the harness's own 40-row read).

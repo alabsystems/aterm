@@ -12,8 +12,11 @@
 //! thread that read them just before the fixture put them back can re-create it
 //! after its removal, `seamless::tests::ScratchEnv`).
 //!
-//! [`process_root`] names such a directory `<prefix><pid>-<stamp>` and takes
-//! back the ones no live process owns:
+//! [`process_root`] puts such a directory in the test binary's own root
+//! ([`aterm_uds::test_binary::scratch_root`]), which goes with it. Where there is
+//! none (a `bench-support` build), and for [`short_process_root`]'s under `/tmp`,
+//! it names `<base>/<prefix><pid>-<stamp>` and takes back the ones no live process
+//! owns:
 //!
 //! - At exit (`exit(3)`, unix): this process's own roots, and those of every
 //!   process that has died since, its child test processes among them.
@@ -29,15 +32,66 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
-/// The roots this process has named, by prefix: what [`process_root`] answers
-/// again for a prefix it has seen, and what the exit handler sweeps.
+/// The roots this process has named under a shared base, by prefix: what
+/// [`root_under`] answers again for a prefix it has seen, and what the exit handler
+/// sweeps.
 static ROOTS: Mutex<Vec<(&'static str, PathBuf)>> = Mutex::new(Vec::new());
 
-/// This process's scratch root for `prefix`, under the system temp dir: the
-/// same path for every call with the same prefix, not created (its first user
-/// creates it, with the mode it needs), and removed when the process exits.
-/// The first call for a prefix sweeps the roots dead processes left under it.
+/// This process's scratch root for `prefix`: the same path for every call with the
+/// same prefix, not created (its first user creates it, with the mode it needs), and
+/// removed when the process exits (module docs).
 pub(crate) fn process_root(prefix: &'static str) -> PathBuf {
+    match aterm_uds::test_binary::scratch_root() {
+        Some(root) => root.join(prefix),
+        None => root_under(std::env::temp_dir(), prefix),
+    }
+}
+
+/// [`process_root`] under `/tmp`: for a directory the process holds that a unix
+/// socket is bound in, short whatever `$TMPDIR` is.
+#[cfg(test)]
+pub(crate) fn short_process_root(prefix: &'static str) -> PathBuf {
+    root_under(short_base(), prefix)
+}
+
+/// A directory for ONE test under [`process_root`], removed when the guard drops: a
+/// thread the test cannot join may re-create it after that, and the root goes at exit.
+#[cfg(test)]
+pub(crate) fn outlived_dir(prefix: &'static str) -> aterm_tempfile::TempDir {
+    let root = process_root(prefix);
+    std::fs::create_dir_all(&root).expect("a process root");
+    aterm_tempfile::TempDir::new_in(&root).expect("a scratch directory")
+}
+
+/// A fresh private directory for ONE test under `/tmp`, removed when the guard drops:
+/// short enough for a unix socket's `sun_path` whatever `$TMPDIR` is.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn short_dir(for_what: &str) -> aterm_tempfile::TempDir {
+    aterm_tempfile::TempDir::new_in(short_base()).unwrap_or_else(|error| {
+        aterm_spec::host::could_not_run(format!(
+            "no directory for {for_what} could be made under {}: {error}",
+            short_base().display()
+        ))
+    })
+}
+
+/// Where [`short_dir`] and [`short_process_root`] make their directories.
+#[cfg(test)]
+fn short_base() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp")
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir()
+    }
+}
+
+/// `<temp>/<prefix><pid>-<stamp>`, after taking back the ones dead processes left
+/// there; the exit handler takes it back too.
+fn root_under(temp: PathBuf, prefix: &'static str) -> PathBuf {
     let mut roots = ROOTS.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some((_, root)) = roots.iter().find(|(known, _)| *known == prefix) {
         return root.clone();
@@ -45,7 +99,6 @@ pub(crate) fn process_root(prefix: &'static str) -> PathBuf {
     if roots.is_empty() {
         register_exit_sweep();
     }
-    let temp = std::env::temp_dir();
     sweep(&temp, prefix);
     // The stamp makes the name unique per process instance: a recycled pid
     // never resolves to a dead run's root even if its sweep failed part-way.

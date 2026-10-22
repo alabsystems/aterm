@@ -292,6 +292,40 @@ pub(crate) fn try_change_lock(config_path: &Path) -> LockTry {
 /// hours and reads `Busy`.
 pub(crate) const CHANGE_LOCK_PATIENCE: Duration = Duration::from_secs(1);
 
+/// The patience every taker gives a busy change lock: [`CHANGE_LOCK_PATIENCE`], or a test
+/// thread's own ([`patience_for_test`]) when it holds the lock itself across the read.
+fn change_lock_patience() -> Duration {
+    #[cfg(test)]
+    if let Some(patience) = PATIENCE_FOR_TEST.with(std::cell::Cell::get) {
+        return patience;
+    }
+    CHANGE_LOCK_PATIENCE
+}
+
+#[cfg(test)]
+thread_local! {
+    static PATIENCE_FOR_TEST: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// This test thread's change-lock patience until the guard drops.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct PatienceForTest(Option<Duration>);
+
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn patience_for_test(patience: Duration) -> PatienceForTest {
+    PatienceForTest(PATIENCE_FOR_TEST.with(|slot| slot.replace(Some(patience))))
+}
+
+#[cfg(test)]
+impl Drop for PatienceForTest {
+    fn drop(&mut self) {
+        PATIENCE_FOR_TEST.with(|slot| slot.set(self.0));
+    }
+}
+
 /// Take the change lock beside `config_path`, waiting out a busy lock for up to
 /// `patience` ([`acquire_advisory_lock_within`]). Worker threads only: it sleeps.
 /// The file is opened owner-only and never through a final-component link.
@@ -355,7 +389,7 @@ pub(crate) fn settle_markers(
     observed: Option<ObservedMarker>,
     release: Option<&DevtoolsChild>,
 ) {
-    let lock = release.map(|_| take_change_lock(config_path, CHANGE_LOCK_PATIENCE));
+    let lock = release.map(|_| take_change_lock(config_path, change_lock_patience()));
     // Ordered: the next probe observes the mode again and the drift watch tells the
     // person of any change; the marker only has to be whole or absent.
     if let Some(marker) = observed
@@ -466,7 +500,7 @@ pub(crate) fn read_records(config_path: &Path, alive: fn(&DevtoolsChild) -> bool
         {
             None
         }
-        None => match take_change_lock(config_path, CHANGE_LOCK_PATIENCE) {
+        None => match take_change_lock(config_path, change_lock_patience()) {
             // A marker written between the read above and the lock was written
             // by a worker that has let go since: judge it like any other.
             LockTry::Held(_lock) => read_debugger_marker(config_path, CHANGE_MARKER),
@@ -483,7 +517,7 @@ pub(crate) fn read_records(config_path: &Path, alive: fn(&DevtoolsChild) -> bool
         match ChangeMarker::parse(&text) {
             Some(marker) if alive(&marker.child) => read.inherited = Some(marker),
             Some(marker) => read.stale = Some(marker),
-            None => match take_change_lock(config_path, CHANGE_LOCK_PATIENCE) {
+            None => match take_change_lock(config_path, change_lock_patience()) {
                 LockTry::Held(_lock) => {
                     if read_debugger_marker(config_path, CHANGE_MARKER).as_deref()
                         == Some(text.as_str())
@@ -1232,7 +1266,7 @@ where
     // result is published: the park that takes the result removes the change
     // marker after its re-probe and must find the lock free, or the stale marker
     // outlives the change.
-    let lock = match config_path.map(|path| take_change_lock(path, CHANGE_LOCK_PATIENCE)) {
+    let lock = match config_path.map(|path| take_change_lock(path, change_lock_patience())) {
         None => None,
         Some(LockTry::Held(lock)) => Some(lock),
         Some(LockTry::Busy) => {
@@ -3280,6 +3314,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_records_reader_keeps_a_live_child_names_a_stale_one_and_drops_an_unreadable_one() {
+        // A lock this thread holds is never let go mid-read: `Busy` at once.
+        let _patience = patience_for_test(Duration::ZERO);
         let dir = scratch("records");
         let config = dir.join("aterm.toml");
         let marker = ChangeMarker::new(DebuggerChange::On, child(4242), 7).unwrap();
@@ -3373,6 +3409,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_change_lock_held_before_its_marker_is_written_is_read_again() {
+        // A lock this thread holds is never let go mid-read: `Busy` at once.
+        let _patience = patience_for_test(Duration::ZERO);
         let dir = scratch("unsettled");
         let config = dir.join("aterm.toml");
         assert_eq!(read_records(&config, |_| true), RecordsRead::default());
@@ -3505,6 +3543,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_worker_holds_the_lock_publishes_the_child_then_the_result_and_leaves_the_marker() {
+        // A lock this thread holds is never let go mid-read: `Busy` at once.
+        let _patience = patience_for_test(Duration::ZERO);
         let dir = scratch("worker");
         let config = dir.join("aterm.toml");
         let slot = Arc::new(ChangeSlot::default());
@@ -6170,9 +6210,12 @@ pub(crate) mod conformance {
             );
             let fault = self.fault;
             let shared = Arc::clone(&env);
+            // The worker inherits this thread's patience: this thread holds what it waits on.
+            let patience = PATIENCE_FOR_TEST.with(std::cell::Cell::get);
             let handle = std::thread::Builder::new()
                 .name("rig-consent-devtools".into())
                 .spawn(move || {
+                    let _patience = patience.map(patience_for_test);
                     let env = shared;
                     run_devtools_job(job, |change, _gate, on_spawn| {
                         let recheck = || {
@@ -6903,6 +6946,8 @@ pub(crate) mod conformance {
     #[cfg(unix)]
     #[test]
     fn debugger_access_conforms_to_the_model() {
+        // A lock this thread holds is never let go mid-read: `Busy` at once.
+        let _patience = patience_for_test(Duration::ZERO);
         scenarios(Fault::None);
     }
 
@@ -6911,6 +6956,8 @@ pub(crate) mod conformance {
     #[cfg(unix)]
     #[test]
     fn the_harness_fails_every_faulty_composition() {
+        // A lock this thread holds is never let go mid-read: `Busy` at once.
+        let _patience = patience_for_test(Duration::ZERO);
         for fault in [
             Fault::SkipRecheck,
             Fault::IgnorePeerLock,

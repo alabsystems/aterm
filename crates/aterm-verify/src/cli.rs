@@ -282,7 +282,7 @@ Options:
       --test-threads <n>  RUST_TEST_THREADS for every test binary
       --test-jobs <n>     test binaries at once (default 8)
       --timeout <s|off>   hang ceiling for each child (default 3h)
-      --log <path>        where the full log goes (default <target>/verify/logs)
+      --log <path>        where the full log goes (default <target>/verify/logs.noindex)
   -h, --help
 
 Exit: 0 every check that ran passed, 1 a check failed, 2 usage, 3 could not run.

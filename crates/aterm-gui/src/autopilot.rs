@@ -138,6 +138,70 @@ pub(crate) const fn agent_switch_off(agent: aterm_phase::Program) -> &'static st
     }
 }
 
+/// ONE MODE'S SENTENCE (`docs/DESIGN-harness-autopilot-2026-10-15.md`
+/// §12.4.1, slice 4d), in the form each surface says it: the owner's own
+/// words ("keep finding more to do", "wrap it up") around the engine's
+/// truth, the remote main branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModeWords {
+    /// The mode the sentence says.
+    pub(crate) mode: Autopilot,
+    /// The Autopilot chip's title, after `autopilot: <mode> — `
+    /// (`claude_lights::ChipFace::explanation`).
+    pub(crate) chip: &'static str,
+    /// The `Autopilot set to <mode>` record's line, after its tab
+    /// (`message_reporters::autopilot_set`).
+    pub(crate) record: &'static str,
+    /// Settings ▸ Harness's mode button, as its description says what a
+    /// press does (`native_settings_harness`'s `mode_description`).
+    pub(crate) button: &'static str,
+}
+
+/// EVERY MODE'S SENTENCE, ONE TABLE (§12.4.1, slice 4d): the chip's title,
+/// the records, Settings ▸ Harness and the manual (`aterm help harness`'s
+/// AUTOPILOT) read it, so a mode is never said two ways. In
+/// [`Autopilot::ALL`]'s order; [`mode_words`] looks one up.
+pub(crate) const MODE_WORDS: [ModeWords; 3] = [
+    ModeWords {
+        mode: Autopilot::Cruise,
+        chip: "keeps going for ever, finding more to do",
+        record: "the harness keeps going for ever, finding more to do",
+        button: "keep going for ever, finding more to do: nothing the agent says ends it",
+    },
+    ModeWords {
+        mode: Autopilot::Land,
+        chip: "wrapping up: landing everything on the remote main branch, then stopping",
+        record: "the harness wraps it up: it lands everything on the remote main branch, then \
+                 stops",
+        button: "wrap it up: land everything on the remote main branch, then stop",
+    },
+    ModeWords {
+        mode: Autopilot::Off,
+        chip: "hands off",
+        record: "the harness keeps its hands off",
+        button: "the harness keeps its hands off this session",
+    },
+];
+
+/// A TIMED CRUISE'S SENTENCES (§12.4.1's third row): Cruise until a time,
+/// then Land. The chip's title follows its phrase (`autopilot: cruise until
+/// 18:00, then land — `), which already names the time, so it keeps going
+/// until then rather than for ever; the record set it says the same.
+pub(crate) const TIMED_CRUISE_CHIP: &str = "keeps going until then, finding more to do";
+/// The record of a timed Cruise set (`message_reporters::autopilot_timer_set`).
+pub(crate) const TIMED_CRUISE_RECORD: &str =
+    "the harness keeps going until that time, then wraps it up on the remote main branch";
+
+/// `mode`'s sentences from [`MODE_WORDS`].
+#[must_use]
+pub(crate) const fn mode_words(mode: Autopilot) -> &'static ModeWords {
+    match mode {
+        Autopilot::Cruise => &MODE_WORDS[0],
+        Autopilot::Land => &MODE_WORDS[1],
+        Autopilot::Off => &MODE_WORDS[2],
+    }
+}
+
 /// A session's EFFECTIVE Autopilot as the window shows it: the mode it runs
 /// under, or why the harness runs none at all. What the chip draws (§2.3);
 /// the session's own word is beside it ([`App::session_autopilot`]).
@@ -342,20 +406,30 @@ impl AutopilotView {
     /// does. The window composes it from the face table
     /// (`claude_lights::autopilot_title`), which gives exactly this for the
     /// default glass with no trail, then v2's ` · right-click: more` (the
-    /// chip's menu, §9.3.2); kept here as v1's words, the face table's tests
-    /// hold it to them.
+    /// chip's menu, §9.3.2); kept here in v1's form, each mode's sentence
+    /// read from [`MODE_WORDS`], and the face table's tests hold it to it.
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn title(self) -> &'static str {
+    pub(crate) fn title(self) -> String {
+        let mode = |mode: Autopilot, click: &str| {
+            format!(
+                "autopilot: {} \u{2014} {} \u{b7} click: {click}",
+                mode.word(),
+                mode_words(mode).chip
+            )
+        };
         match self {
-            Self::Cruise => "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land",
-            Self::Land => "autopilot: land \u{2014} wrapping up \u{b7} click: off",
-            Self::Off => "autopilot: off \u{2014} hands off \u{b7} click: cruise",
-            Self::MasterOff => concat!("harness off in Settings \u{b7} ", harness_on_click!()),
+            Self::Cruise => mode(Autopilot::Cruise, "land"),
+            Self::Land => mode(Autopilot::Land, "off"),
+            Self::Off => mode(Autopilot::Off, "cruise"),
+            Self::MasterOff => {
+                concat!("harness off in Settings \u{b7} ", harness_on_click!()).into()
+            }
             Self::Unhosted => concat!(
                 "no harness: this aterm has no control socket \u{b7} ",
                 open_harness_click!()
-            ),
+            )
+            .into(),
             Self::AgentOff(agent) => {
                 use aterm_phase::Program;
                 macro_rules! agent_off {
@@ -363,14 +437,15 @@ impl AutopilotView {
                         concat!($switch, " is off \u{b7} ", harness_on_click!())
                     };
                 }
-                match agent {
+                let off: &str = match agent {
                     Program::Claude => agent_off!("Supervise Claude Code sessions"),
                     Program::Codex => agent_off!("Watch codex-alab sessions"),
                     Program::Agy => agent_off!("Supervise Antigravity CLI sessions"),
                     Program::Muse => agent_off!("Supervise Muse Code sessions"),
                     Program::Gemini => agent_off!("Supervise Gemini CLI sessions"),
                     Program::Generic => agent_off!("Supervise the program sessions"),
-                }
+                };
+                off.into()
             }
         }
     }
@@ -1520,10 +1595,6 @@ mod tests {
             assert!(view.title().contains("click: "), "{view:?}");
         }
         assert_eq!(
-            AutopilotView::Cruise.title(),
-            "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land"
-        );
-        assert_eq!(
             AutopilotView::MasterOff.title(),
             "harness off in Settings \u{b7} click: turn the harness on"
         );
@@ -1739,7 +1810,7 @@ mod tests {
             [(
                 "Autopilot set to land".to_string(),
                 vec![
-                    "Tab 1: the harness wraps the work up, then stops".to_string(),
+                    format!("Tab 1: {}", mode_words(Autopilot::Land).record),
                     "this session's own setting".to_string(),
                     "set from the chip".to_string()
                 ]

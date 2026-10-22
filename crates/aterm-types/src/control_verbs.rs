@@ -14,7 +14,7 @@
 /// before sending it. One constant for both ends.
 pub const MAX_REQUEST_LINE: usize = 64 * 1024;
 
-/// The longest task a WORKER is given (`spawn agent=claude … len=<n>`, its
+/// The longest task a WORKER is given (`spawn agent=<word> … len=<n>`, its
 /// task the n raw bytes after the line): the server refuses a longer frame
 /// unread and closes, and the client refuses one before sending it. One
 /// constant for both ends.
@@ -28,7 +28,7 @@ pub const MAX_TASK_BYTES: usize = 64 * 1024;
 /// constant for both ends.
 pub const DRIVE_TURN_MAX_MS: u64 = 22_000;
 
-/// The line a server answers a worker's spawn head (`spawn … agent=claude
+/// The line a server answers a worker's spawn head (`spawn … agent=<word>
 /// len=<n>`) with when it will read the n bytes of task that follow, its
 /// newline included. The client sends the task only after this line: a server
 /// that does not know the frame answers the head with an `ERR` and never sees
@@ -601,10 +601,7 @@ aux_targets! {
         /// The native Settings `/updates` route, projected from its compiled
         /// semantic frame while that route is open.
         Update = "update" | "software-update";
-    gestures:
-        /// The session picker (`invoke NewTabWithIdentity`); `controls
-        /// session-picker` reads its intent and filtered rows.
-        SessionPicker = "session-picker";
+    gestures: ;
 }
 
 /// The aux targets `open` opens, ` | `-separated ([`AuxTarget::opens`]).
@@ -1046,7 +1043,8 @@ pub const VERBS: &[VerbSpec] = &[
          a connection from a node `aterm fleet allow drive --from` named, proved by that \
          node's own key, also runs the worker's verbs as the Owner's: `@<sid> \
          status|text|screen|result|turn|key|send` on a session this instance hosts, `hold \
-         <sid> on|off`, `spawn agent=claude` with its task frame, `await task` and `@<sid> \
+         <sid> on|off`, `spawn agent=<claude|gemini|agy|muse>` with its task frame, `await \
+         task` and `@<sid> \
          close` of a worker it spawned (`aterm help fleet`, DRIVE).",
     )
     // Outside the halt: a build-provenance string.
@@ -1594,10 +1592,10 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "theme session [status] | set <name> | clear: this session's own theme",
-        "`OK session=<sid> theme=\"<selector>\"|- origin=ctl|spawn|split|restored|identity|instance \
+        "`OK session=<sid> theme=\"<selector>\"|- origin=ctl|spawn|split|restored|instance \
          asked=<origin>|- id=\"<drawn id>\" source=builtin|file|default side=dark|light \
          reported=dark|light miss=\"<why>\"|- generate=on|off fg=#rrggbb bg=#rrggbb`. A session \
-         draws its own theme, else its identity's `identity_themes` entry, else the instance's; \
+         draws its own theme, else the instance's; \
          the config's colour keys still apply. It recolours the session's cells, background, \
          cursor, selection and palette and what DSR 996 / mode 2031 report to its program; the \
          window chrome follows the instance theme. A split from a themed pane inherits it; it \
@@ -1659,7 +1657,7 @@ pub const VERBS: &[VerbSpec] = &[
         "- the bar ⌘F opens on macOS and Ctrl+Shift+F opens elsewhere, which no other verb \
          reaches: `key` and `send` land beneath the window's shortcuts (`key ctrl+f` types ^F \
          into the shell), and find mode diverts keystrokes AWAY from the PTY. Forms: `find \
-         open` = the Edit ▸ Find… path itself; `find type <text>` inserts at the caret; `find \
+         open` = the Edit ▸ Find ▸ Find… path itself; `find type <text>` inserts at the caret; `find \
          key <name>` runs one field edit, `<name>` one of back, delete, left, right, word-left, \
          word-right, home, end, kill-start, kill-end, kill-word-back, kill-word-forward; `find \
          next`/`find prev` step matches (^S/^R, wrapping); `find case`/`find regex` TOGGLE the \
@@ -1786,8 +1784,7 @@ pub const VERBS: &[VerbSpec] = &[
          front is photographed in the front window, so one it is not showing (a closed \
          overlay, Settings in a background tab, about or update while Settings shows another \
          page) is refused, never answered with a plain front frame: `ERR <target> is not open \
-         in the front window; …` and the step that opens it: `open <target>`, or `invoke \
-         NewTabWithIdentity` for session-picker. Compositor visibility and scanout are not \
+         in the front window; …` and the step that opens it: `open <target>`. Compositor visibility and scanout are not \
          observed"
         ),
     )
@@ -1875,7 +1872,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         OwnerOnly,
-        "notice <post|progress|done|ask|dismiss|act> \u{2026}: record, show work, ask, end or press a message",
+        "notice <post|progress|done|ask|later|dismiss|act> \u{2026}: record, show work, ask, file, end or press",
         "Owner-only. `notice post <tag> [sev=<sev>] [key=<key>] [hold=<1..120>] <title>[ -- \
          <detail>]`: sev=success or info (the default) is a RECORD in the message log, never a \
          row (`OK recorded message=<id>`); sev=warn or error is a row on the band (`OK \
@@ -1893,7 +1890,18 @@ pub const VERBS: &[VerbSpec] = &[
          the owner can close (the reason says why, at most 90 characters, never that \
          something is pending; the step is the one action, at most 90, never a snooze or \
          two), shown until `notice done <key> ok` or read, then not raised again for a \
-         day (`OK message=<id>`). `notice dismiss <id>` takes a row down (`notice dismiss review` files every open exception into the log); `notice \
+         day (`OK message=<id>`). `notice later <key> [tag=<tag>] [url=<https-url>] <title> \
+         -- <reason> -- <step>[ -- <detail>]` files a fact that needs the owner but not now \
+         as one entry of the exceptions list (the menu-bar item and Settings \u{25b8} \
+         Messages), never a row: one entry per key however often it is said, so every tab \
+         and launch of a tool may send it (`OK later=<id> how=<new|restated|duplicate|quiet>`; \
+         quiet: the owner dismissed it, and the dismissal holds a week, then four weeks, then \
+         three months); the reason and the step obey ask's rules and are at most 90 characters, \
+         the detail at most 3 lines (split by \\n) of 240; url= is https://<host>/<path> \
+         with no user or port, and becomes the entry's one button, Open in browser, with \
+         the host named in its detail; at most 4 wire entries are open, none into a full \
+         list; `notice done <key>` ends it, and it files itself after 14 days. An aterm \
+         without it answers `ERR usage: notice <post|\u{2026}`. `notice dismiss <id>` takes a row down (`notice dismiss review` files every open exception into the log); `notice \
          act <id> <label|index|details>` presses its button as a person would (`OK \
          acted=<label> performed=<1|0>`). A band title is at most 6 words and 48 characters with \
          no clause; a key is 1-40 of a-z 0-9 . _ - and lives as wire.<key>; a tag is `script` \
@@ -2065,14 +2073,14 @@ pub const VERBS: &[VerbSpec] = &[
         "program-check [full|live]: the stuck check's reading of macOS's program check",
         "Answers `OK reading=<live|full> syspolicyd=<-|ok|full|stuck> \
          syspolicyd_workers=<n>/<limit|->|- syspolicyd_full_ms=<ms|->`: the board each tab's \
-         `status` carries (`aterm help permissions`, SLOW FIRST RUNS), read once a minute in \
-         a window on macOS; `-` before the first reading and in a headless instance, which \
-         runs no stuck check. `program-check full` makes each later reading of `syspolicyd` \
+         `status` carries (`aterm help permissions`, SLOW FIRST RUNS), read once a minute on \
+         macOS, headless too; `-` before the first reading and off macOS, which runs no stuck \
+         check. `program-check full` makes each later reading of `syspolicyd` \
          stand at the kernel's thread limit, its threads raised to the limit: five minutes of \
          it read `stuck`, which raises the restart alert and holds the harness's \
          continuations, as a real wedge does. `program-check live` reads the pool as it is \
          again, and the next reading ends both. Each answers the same line; both need a \
-         development build (`dev-seams`) and a window that runs the stuck check, and are \
+         development build (`dev-seams`) and an instance that runs the stuck check, and are \
          refused otherwise.",
     )
     // Outside the halt: reads, and in a development build stands in, the program check's
@@ -2211,7 +2219,8 @@ pub const VERBS: &[VerbSpec] = &[
          sid=<sid> window=<id> program=<claude|agy|muse|gemini|codex> \
          face=<cruise|cruise-until|land|landed|theirs|off|master-off|agent-off|unhosted|-> \
          drawn=\"<cells>\"|drawn=- why=<not-drawn|no-room|no-host|no-footer> \
-         spoken=\"<label>\"|spoken=-` line per supervised pane, in every window, its tabs \
+         spoken=\"<label>\"|spoken=- description=\"<words>\"|description=-` line per \
+         supervised pane, in every window, its tabs \
          and panes in order (`window=` the window's id as `ls` prints it: a session shown \
          in two windows has a line in each): `face=` the Autopilot chip's face now, the \
          pane in front or not; `drawn=` the chip's cells exactly as the last frame drew \
@@ -2220,8 +2229,11 @@ pub const VERBS: &[VerbSpec] = &[
          covers, never older cells, and on a `--headless` instance until a capture such \
          as `image` composes a frame; `no-room` for a rule with no room for the chip; \
          `no-host` where no harness host drew one); `spoken=` the drawn chip's \
-         accessibility label, `-` where none is drawn; a program with no composer footer \
-         (Gemini CLI, codex-alab) prints `face=- drawn=- why=no-footer spoken=-`. Before \
+         accessibility label, `-` where none is drawn; `description=` its accessibility \
+         description (why a landing holds, a harness's need, the pause, the newest act), \
+         `-` where it has none or none is drawn; a program with no composer footer \
+         (Gemini CLI, codex-alab) prints `face=- drawn=- why=no-footer spoken=- \
+         description=-`. Before \
          the presence line comes `statusitem title=<❯|❯•|❯N> needs=<n> stuck=<n> \
          exceptions=<n> done=<n> fleet=<off|unread|reading|failed|as_of:<unix ms>>`: the menu-bar item's \
          mark (`❯N` counts the needs: this aterm's, a sibling aterm's from a scan under 45 s \
@@ -2418,10 +2430,10 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "meta -> OK title= user_title= description= icon= role= attention= cwd= state=",
         "attention_owner= attention_owners= attention_kinds= supervisor= supervisor_proven= \
-         questions= agent_cwd= trusted_cwd= autopilot= land_at= autopilot_by= autopilot_since= \
-         (pct-encoded; '-' = unset; read \
-         fields by key; trusted_cwd= is the one folder a worker's `spawn agent=claude` trusted \
-         for it, which no `meta set` writes). `meta set \
+         questions= agent_cwd= trusted_cwd= worker= autopilot= land_at= autopilot_by= \
+         autopilot_since= (pct-encoded; '-' = unset; read \
+         fields by key; trusted_cwd= is the one folder a worker's `spawn agent=<word>` trusted \
+         for it, and worker= the agent that spawn started, which no `meta set` writes). `meta set \
          <title|description|icon|role|attention|questions|autopilot> <text...>` / `meta unset \
          <field>` set or clear the USER metadata (write-gated; user title outranks the OSC \
          title in tab labels; a `role` is a label, the first the menu-bar status item names a \
@@ -2484,12 +2496,24 @@ pub const VERBS: &[VerbSpec] = &[
          foreground group: it replaces the window harness's claim and a proven claim whose \
          process is gone, is renewed only by a proven request, is never carried across an \
          update, and is cleared when its process leaves the foreground or exits; the \
-         spelling alone proves nothing. HARNESS_ACT: `meta set harness_act <act>` (<act>: one token like an owner \
+         spelling alone proves nothing. HARNESS_ACT: `meta set harness_act <act> [until_us=<n>]` (<act>: one token like an owner \
          key) records an act the holder of the session's live PROVEN self-claim took (`status \
          supervisor_proven=1`): only that holder, on the claim's own connection or one the \
          kernel proves is its process again, may (anyone else: `ERR denied`); it is one \
          `harness-act` row on the `timeline` (`act=<act> holder=<holder>`) and `status \
-         last_act=<act>`. QUESTIONS: `meta set questions ask|recommended|long-term|short-term` / \
+         last_act=<act>`. `meta prepare harness_act` uses the same proof and records nothing; \
+         its `OK until_us=<n> lease_ms=5000` grants an opaque server-clock deadline for a \
+         conditional set. At or after that deadline the set answers `ERR expired harness_act` \
+         without recording anything. The holder keeps native startup behind the set's OK, \
+         or, on an unanswered set, behind the full lease measured from prepare's reply. \
+         The server captures the landing's turn counts before its final guarded expiry \
+         check, so a late commit retains the earlier mark; later counted turns reopen it. \
+         Conditional `left-to-person@v1` also requires an explicit idle/done/error report \
+         in that same snapshot; working, blocked or unknown answers `ERR busy harness_act` \
+         without recording a face. A pending submission can already report working before \
+         its native turn starts, so its own count cannot be used as the earlier mark. \
+         An older server that refuses prepare grants no conditional publication. \
+         QUESTIONS: `meta set questions ask|recommended|long-term|short-term` / \
          `meta unset questions` (Owner-only; an edge gets `ERR denied`) set how the in-window \
          supervisor treats this session's questions, over the `[harness] answer_questions` \
          switch and `question_priority`: `ask` leaves its Claude Code question DIALOG to a \
@@ -2595,6 +2619,10 @@ pub const VERBS: &[VerbSpec] = &[
         "resources [capabilities|register]: delegated job ownership and current usage.",
         "A read lists this session's explicitly registered jobs, their kernel PID/start \
          identities, AI/job labels, current cores, physical bytes and sample age. \
+         cpu_cores is a live sampled rate from the observed processes' own CPU time. \
+         CPU before a process's first sample and work that exits between sweeps can be absent. \
+         sample=complete means the current process readings were available, not that the \
+         full interval or job lifetime was covered. \
          capabilities is read-only: OK resources version=1 available= runner= ai= session=. \
          register start=<kernel-start> [ai=<word>] job=<percent-encoded-label> is local and Owner-only: \
          its root is the kernel peer PID, never a named parent or daemon. The optional AI \
@@ -2624,7 +2652,6 @@ pub const VERBS: &[VerbSpec] = &[
          hold_advisory=<fabric-lost|-> \
          fabric=<connected|stale|stalled|disconnected|absent> fabric_rtt_ms=<n|-> \
          fabric_link_age_ms=<n|-> fleet=<off|listening|retrying|refused:<why>> \
-         identity=<name|-> \
          hand=<-|turn:<id>[:<holder>]|lease:<holder>|driving:<sid>> hand_pid=<pid|-> \
          level=<quiet|note|story|driving|driven|attention|limited|hold> story=<n> \
          why=<-|prompt,question,escalation,mail> \
@@ -2681,8 +2708,8 @@ pub const VERBS: &[VerbSpec] = &[
          limit, stuck once full for five minutes (a deadlock with tccd: no new program starts \
          on the Mac until it restarts, and the window server can die at its next privacy \
          check); `syspolicyd_workers=` its pool threads over that limit and \
-         `syspolicyd_full_ms=` how long it has been full; `-` while unread (not macOS, a \
-         headless instance). \
+         `syspolicyd_full_ms=` how long it has been full; `-` while unread (not macOS, or \
+         before the first reading). \
          `log_seq=`/`log_ep=` are the session log's head and epoch as a reader is shown them \
          (`log since=<log_seq> ep=<log_ep>` and `await log … since= ep=` read what comes after), \
          `run=`/`turn=`/`step=` its open path, `need=` the most urgent need it OBSERVED \
@@ -2800,10 +2827,6 @@ pub const VERBS: &[VerbSpec] = &[
          a quiet link, not a dead one, and only the next exchange can tell. That is why `stale` \
          is NOT read off this number: it is read off an exchange that was asked for and never \
          came. \
-         `identity=<name|->` is the agent identity the session was spawned under (`spawn \
-         identity=<name>`), `-` for the human's own agent config - the same word the \
-         `sessions` roster carries, so a driver polling one session need not re-read the \
-         fleet to learn whose login it is driving. \
          `hand=` is whose hand is on the keyboard: `turn:<id>` \
          a peer's open `turn` (`:<holder>` names the driver by its `meta role` or short sid \
          when the turn came over an edge — the edge's source; an Owner-token turn names \
@@ -3380,9 +3403,7 @@ pub const VERBS: &[VerbSpec] = &[
          a moment while its reader winds down, and a lead that STAYS is a closed tab's master \
          nothing will close — and pty_kits= (the masters opened ahead for the next spawns, \
          which no session owns yet; the process's open /dev/ptmx descriptors number \
-         pty_masters + pty_kits + spare_ptys), then identity_primes_running= (the identity \
-         re-prime passes, a spawn's or the window launch's, still writing an identity's \
-         primer files; 0 after a spawn's reply means none is). IT NAMES WHO OWES THE TIME: echo_* high with input_* low means the PROGRAM \
+         pty_masters + pty_kits + spare_ptys). IT NAMES WHO OWES THE TIME: echo_* high with input_* low means the PROGRAM \
          is behind (a TUI sharing its scheduling band with a build has been measured echoing at \
          p99 150ms while aterm wrote every key at p99 6.29ms), the reverse means aterm is — \
          unless input_predicted is a large share of n_input: those keys' input_* ends at their \
@@ -4175,8 +4196,7 @@ pub const VERBS: &[VerbSpec] = &[
             " (",
             open_aliases!(),
             "); reply `OK opened \
-             <target>` (`OK closed <target>`). `front` is always open; session-picker \
-             opens only from its gesture (`invoke NewTabWithIdentity`); `window <target>` \
+             <target>` (`OK closed <target>`). `front` is always open; `window <target>` \
              photographs and `controls <target>` reads each one. While any session is held, \
              opening `menu`, `tab-menu`, `overview` or `autopilot-menu` answers `ERR halted` \
              as `invoke` does (see `hold`)"
@@ -4698,7 +4718,7 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "spawn [window=] [raise=<t|f>] [cwd=] [split=<v|h>] [identity=] [connected=…|agent=…]: OK <sid>",
+        "spawn [window=] [raise=<t|f>] [cwd=] [split=<v|h>] [connected=…|agent=…]: OK <sid>",
         "mints a session: a tab, or `split=v|h` divides the focused pane; the sid is immediately \
          addressable. `theme=<name>` gives the newborn its own theme (`theme session`), checked \
          first: one that does not draw is `ERR theme \"<name>\": <why>` and nothing is spawned. AIM it with window=<id> (an id from `inspect app/v1 tabs`) or `@<sid> \
@@ -4718,19 +4738,11 @@ pub const VERBS: &[VerbSpec] = &[
          `both` session connection with of=<sid> (controlled: of= drives the newborn; \
          controller: the newborn drives of=, its shell gets ATERM_OBSERVE_SESSION_ID) - \
          Owner-only, of= mandatory, no window=/raise=/split= beside it, place=window is `ERR \
-         headless` with no GUI. `identity=<name>` (session identities): the newborn's agents \
-         keep their login, settings and skills in `<state>/identities/<name>/` instead of the \
-         human's `$HOME` - `CLAUDE_CONFIG_DIR`/`CODEX_HOME` point into it, set AFTER the env \
-         strip, so neither login leaks into the other. The name folds to lowercase \
-         (`[a-z0-9][a-z0-9._-]{0,63}`); the directory is created ONCE on first use (0700, \
-         primed with the aterm skills) - this verb is the \
-         only create path, and a create failure is the reply (`ERR identity <name>: <why>`). \
-         `@<sid> spawn` (and the connected form's of=) INHERITS the aimed session's identity; \
-         `identity=-` opts out; a plain spawn has none. Spawn-time and immutable: `meta set \
-         identity` is refused. Owner-only like connected= (an identity is a directory of \
-         credentials). `identities` lists and forgets them. A WORKER: `spawn … agent=claude \
-         [model=<m>] [autopilot=<land|cruise>] [from=<sid>] len=<n>`, answered `GO <n>`, then <n> raw bytes, its task \
-         (`aterm ctl spawn agent=claude [model=<m>] [cwd=<p>] -` reads the task from stdin, \
+         headless` with no GUI. A WORKER: `spawn … \
+         agent=<claude|gemini|agy|muse> [model=<m>] [autopilot=<land|cruise>] [from=<sid>] \
+         len=<n>` - Claude Code, Gemini CLI, Antigravity CLI (agy) or Muse Code - answered \
+         `GO <n>`, then <n> raw bytes, its task \
+         (`aterm ctl spawn agent=<word> [model=<m>] [cwd=<p>] -` reads the task from stdin, \
          names the folder it runs in as cwd=, or makes a relative cwd= absolute against it \
          (a folder with a space goes quoted), and - run in a session - names that session \
          from= and, with no \
@@ -4738,42 +4750,65 @@ pub const VERBS: &[VerbSpec] = &[
          behind the GO, so an instance that predates workers never reads it; one aimed at a \
          session another instance hosts is refused, unsent. The newborn runs the ordinary \
          login shell (zsh, bash or fish; another is refused by name). The task \
-         - 1 byte to 64 KiB, no NUL; past that the reply is `ERR spawn agent=claude: the task \
+         - 1 byte to 64 KiB, no NUL; past that the reply is `ERR spawn agent=<word>: the task \
          is <n> bytes (max 65536)` and the connection closes - is written with one line of \
-         fact appended to a 0600 file under `<state>/tasks/` that the shell's ATERM_TASK_FILE \
-         names, and at the shell's first prompt aterm types ONE line, `claude [--model <m>] \
-         -- \"$(command cat -- \"$ATERM_TASK_FILE\")\"`: the task is the agent's first prompt, \
-         no byte of it is typed, and the shell stays under the agent (the pane outlives it). \
+         fact appended under a blank line (agy's task with its blank lines dropped and the fact \
+         on the next line: agy draws a message's blank line as the gap under a message, so the \
+         rows past it would read as its reply) to a 0600 file under `<state>/tasks/` that the \
+         shell's ATERM_TASK_FILE names, and at the shell's first prompt aterm types ONE line that starts the agent \
+         interactive, the task its first prompt, by each one's own flags (T is \
+         `\"$(command cat -- \"$ATERM_TASK_FILE\")\"`): `claude [--model <m>] -- T`; \
+         `GEMINI_CLI_TRUSTED_FOLDERS_PATH=<f> gemini [--model <m>] --session-id <uuid> \
+         --prompt-interactive=T`; `agy [<its config flags>] [--model <m>] \
+         --prompt-interactive=T`; `muse [<its provider flags>] [--trust-workspace] [--model \
+         <m>] -- T`. `--trust-workspace` trusts the folder for that run alone (never saved), \
+         and rides only where the shell, read at that prompt, stands in exactly the cwd= \
+         named; Gemini CLI's <f> is a trusted-folders file of the worker's own \
+         (`<state>/tasks/<sid>-1.trust.json`, removed with the worker) naming that cwd= alone, \
+         never `--skip-trust` (which trusts every folder for every Gemini CLI the worker's \
+         tools start), and its `--session-id` is new, so its own restart (a settings change \
+         that relaunches it) exits rather than send the task twice. A Gemini CLI worker's \
+         folder-trust dialog (the shell standing elsewhere) is the person's: the window \
+         harness never presses it. agy's `--gemini_dir`/`--app_data_dir` and Muse Code's \
+         `--provider`/`--preset`/`--base-url`/`-c`/`--config` follow the starter's own agent \
+         of its kind; a Muse Code argv with a flag \
+         aterm cannot read refuses the line. model= opens with no `-`. No byte of the task is \
+         typed, and the shell stays under the agent (the pane outlives it). \
          Before the reply the newborn's `task` record reads `working`, from= the session that \
          started it, however it is aimed (none: `ctl`); a shell that ends or draws no first \
          prompt within 20 s, or a fish older than 3.4 (spawned, then checked), is `stalled \
          why=shell`, with nothing typed (an update during that wait leaves it `working`, \
          nothing typed, for the startup deadline below). A worker whose record still reads \
-         `working` as its starter left it and that shows no Claude Code composer within 120 s \
+         `working` as its starter left it and that shows no composer of its agent's within 120 s \
          of its since_ms= (counted, after a seamless update or with supervision back on, from \
          no sooner than the harness's first look since) is `stalled why=startup` by the window \
-         harness, what holds its screen named in the supervisor's attention in the same move (a \
-         folder-trust dialog, a box, a login or onboarding screen, no agent at all); one that \
+         harness, its screen read by that agent's reader, what holds it named in the \
+         supervisor's attention in the same move (a folder-trust dialog, a box, a login or \
+         onboarding screen, no agent at all); one that \
          starts after all is marked `working` again, and that attention goes when it starts or \
          another mark (its done, its exit) ends the stall. A started worker held 120 s (the same \
          clock) at a screen the harness has no act for, nothing moving, is `stalled why=held` \
          likewise (`task` says when). When the starter is a session here running \
-         Claude Code, its claude program rides the line, and so do its Claude home and login \
+         the worker's agent, its program rides the line (an atpkg store build as atpkg's \
+         managed link), and so do its homes: Claude Code's Claude home and login \
          (CLAUDE_CONFIG_DIR, CLAUDE_SECURESTORAGE_CONFIG_DIR; aterm strips them from every \
-         shell it spawns) when the worker runs under the starter's own identity; under another \
-         (identity=<name>, identity=-, or an aimed session's) only the program rides, and the \
-         home in the worker's own shell stands (that identity's, or the default one). The \
+         shell it spawns), Gemini \
+         CLI's HOME and GEMINI_CLI_HOME, agy's HOME, Muse Code's XDG_DATA_HOME, XDG_CONFIG_HOME \
+         and HOME. The \
          window harness answers Claude Code's folder-trust dialog Yes in the cwd= named, for \
          this worker alone (its canonical form; one not read within 250 ms — or not read at \
          all while four folder checks, shells starting on a hung mount among them, are still \
          waiting — trusts nothing), but that Yes is Claude Code's own answer and Claude Code \
          keeps it for the folder (`hasTrustDialogAccepted` in its `.claude.json`, `~/` or the \
          worker's CLAUDE_CONFIG_DIR): every later Claude Code started there under that login \
-         is trusted with no dialog; \
+         is trusted with no dialog; agy's and Muse Code's trust boxes are answered the same \
+         way, in that folder alone (Gemini CLI's never: its own trusted-folders file trusts \
+         that folder); \
          `[harness] trust_roots` is not widened. `ERR unsupervised: <switch>` \
          when the window harness would not carry the worker, so nothing would finish the \
          task, and nothing is spawned: `[harness] enabled = false` (or `headless = false` in a \
-         headless instance), `[harness.claude] enabled = false`, or `[harness] autopilot = \
+         headless instance), the agent's own `[harness.<word>] enabled = false`, or `[harness] \
+         autopilot = \
          \"off\"` (the owner's default keeps the harness's hands off). A worker's session \
          gets the Autopilot word `land` (`autopilot=cruise` names cruise): Land carries it \
          until all of its work is on the remote main branch and a reply defends that in a \
@@ -4786,8 +4821,8 @@ pub const VERBS: &[VerbSpec] = &[
          closes or aterm quits (a seamless update keeps it, and so does an update's candidate \
          that quits before its Commit, for the parent it hands back to; a crash, and an update that \
          relaunches the new build in place — its tabs back as fresh shells — leave it under \
-         `<state>/tasks/`); `agent=codex` is `ERR agent codex: not yet`; model= is \
-         [A-Za-z0-9._-]{1,64}",
+         `<state>/tasks/`); `agent=codex` is `ERR agent codex: not yet` (its screen harness is \
+         retired); model= is [A-Za-z0-9._-]{1,64}, carried as each agent's own `--model`",
     )
     // Outside the halt: MINTS a session rather than driving or retiring one. The new session
     // is held the moment the bridge attaches it (`apply_fleet_halts`), and halting `spawn`
@@ -4930,8 +4965,15 @@ pub const VERBS: &[VerbSpec] = &[
          `stalled`, `exited`); why the harness read none (`no-transcript`, `no-reply`, \
          `no-marker`, `empty`, `no-check`, `no-report`), or none was written (`no-snapshot`); \
          a result file that cannot be read (`unreadable`); for `full`, a transcript that holds \
-         no prompt (`no-prompt`) — never a screen read in its place. `aterm ctl` prints the \
-         header on stderr and the text on stdout",
+         no prompt (`no-prompt`) — never a screen read in its place. A Gemini CLI, agy or Muse \
+         Code worker, whose conversation aterm reads off its screen alone, gets the words its \
+         agent's reader read of the turn its done was read on (its earlier messages, a blank \
+         line, then its last, whole; none where the screen cut it) — landed, led by its \
+         report: the words read where the harness typed its Land instruction, then a blank \
+         line: `OK <n> source=screen program=<agent> bytes=<n>`, cut as a transcript's is; \
+         words that are only blanks are `no-words`, and `result full` is `ERR result \
+         unavailable why=no-transcript`. `aterm ctl` prints the header on stderr and the text \
+         on stdout",
     ),
     // waits
     v(
@@ -5629,7 +5671,10 @@ pub const VERBS: &[VerbSpec] = &[
          files=<n>` (lane 4) says the bridge moved `<n>` state files it found torn after an \
          unclean shutdown into its state dir's quarantine, rather than refuse them at every \
          attach: the instance files it for the owner's later look (`fabric.state.torn`), \
-         answered like a report. `ERR usage` for anything else.",
+         answered like a report. `quarantine torn=<k>` (lane 5) says how many of those files \
+         the quarantine still holds, at the bridge's start and as the owner empties it: at 0 \
+         the instance ends `fabric.state.torn` (the owner has taken them away), and any other \
+         count changes nothing; answered like a report. `ERR usage` for anything else.",
     )
     // Outside the halt: the bridge reporting its own broker link; it puts no bytes on a PTY,
     // and a halt that silenced it would hide the one fact that says why mail is not moving.
@@ -5951,7 +5996,7 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         OwnerOnly,
-        "OK <n> local sid parent state title meta= nonce= window= active= wfocus= detail= identity= path=",
+        "OK <n> local sid parent state title meta= nonce= window= active= wfocus= detail= path=",
         "Owner-only. `nonce=<hex32>` is the session's PUBLIC launch nonce — the freshness fence \
          an edge binds to and the fabric's `epoch=` verbatim; it is here because `whoami` reports \
          only the connection's own session, so a bridge could not read any other's. \
@@ -5974,10 +6019,7 @@ pub const VERBS: &[VerbSpec] = &[
          a keyword opening a LATER segment reads the same way (`cd x && for ...; done` is \
          `for`, never its closer `done`). The \
          same value `status` carries; `-` when idle or the engine lock was contended. \
-         `identity=<name|->`: the agent identity the session was spawned under (`spawn \
-         identity=<name>` - the directory its agents keep their login in; `identities` lists \
-         them), `-` for the human's own agent config - and for a shell adopted from a build \
-         without the field, which keeps its env and drops the label. `path=<frozen|live>`: \
+         `path=<frozen|live>`: \
          whether the session's shell fronts aterm's managed `agents/` on PATH, so \
          `claude`/`codex` typed at its prompt run the managed build - `frozen` = they \
          resolve to a FOREIGN copy (a native install, a brew cask). MEASURED where it can \
@@ -6195,56 +6237,6 @@ pub const VERBS: &[VerbSpec] = &[
          that write can still read it)",
     )
     // Outside the halt: the exit ledger; a read in Owner clothing.
-    .input(Input::NONE),
-    // `identities` is the on-disk roster of agent identities (`spawn identity=`):
-    // Owner-gated like `sessions`, whose `identity=` column it explains, and
-    // Lines-framed from the table so the client is untouched.
-    va(
-        "identities",
-        Owner,
-        Lines,
-        Meta,
-        OwnerOnly,
-        "identities [<name>|forget <name> [confirm=<name>]]: the agent identities on disk. Owner-only",
-        "- an identity is `<state>/identities/<name>/`, the directory a session spawned with \
-         `spawn identity=<name>` points its agents' home variables into (`CLAUDE_CONFIG_DIR`, \
-         `CODEX_HOME`), so its login, settings and skills are its own and never the human's. \
-         `identities` -> `OK <n>` then one `<name> dir=<pct> sessions=<n> \
-         agents=<prog>:present|absent,...` line per identity, sorted by name: `sessions=` \
-         counts the LIVE sessions carrying it, and `present` means the agent's subdirectory \
-         is NON-EMPTY - a `read_dir` name listing, bytes never opened; a primed identity \
-         reads `present` for every agent aterm knows, and aterm never reads, names or claims \
-         a login. `identities <name>` -> `OK <n>` (the row plus one line per agent, so the \
-         client's line framing carries them all): that row, then one `agent=<prog> var=<VAR> \
-         home=<pct> files=present|absent` line per agent. The `forget` form answers ONE status \
-         line (no row count): `identities forget <name>` -> `ERR \
-         confirm: identities forget <name> confirm=<name> removes <pct>` (nothing removed); \
-         with `confirm=<name>` -> `ERR identity in use sessions=<sid>,...` while any live \
-         session carries it, `ERR identity in use spawning=<k>` while k holds stand on it: \
-         a spawn holds its identity from its admission, and a shell adopted with the label \
-         from its adoption, until its tab is closed, so a tab not yet live counts and so \
-         does one still closing, and k counts holds, not spawns (one spawn holds it twice \
-         while its shell starts); a spawn asked for while the forget runs waits until the \
-         identity is gone, and a named one then makes it anew, empty. Else `OK \
-         removed=<pct> left=keychain` - the tree is gone, and with it the credentials the \
-         agents keep as files (a reply that adds `tombstone=<pct> why=<pct>` names the \
-         folder the tree was renamed to and could not be emptied: the identity is gone all \
-         the same, and the next `forget` in that aterm, or once it has exited any aterm's \
-         next `forget` or launch, sweeps it), but a login an agent keeps in the macOS \
-         keychain is NOT: sign out in the agent first (`/logout`); aterm never reads, names \
-         or deletes a keychain item it did not create. Names fold to lowercase. Unknown: \
-         `ERR no such identity <name>`; anything else: `ERR usage: identities \
-         [<name>|forget <name> [confirm=<name>]]`. A read except `forget`, which removes a \
-         directory and never a session; a shell adopted from a build without the label \
-         reads as no user of its identity (`sessions=0`), and a process that outlives its \
-         tab (an agent still exiting, a disowned job) holds nothing: close the tab and let \
-         what it ran exit before forgetting",
-    )
-    // One status line (`OK removed=…`, or the confirm/in-use `ERR`), not rows.
-    .forms(&[form(Word("forget")).framing(Status)])
-    // Outside the halt: lists the agent identities on disk, and `forget` removes one such
-    // directory, refused while any live session carries it or a spawn holds it: never a
-    // session.
     .input(Input::NONE),
     va(
         "whoami",
@@ -6527,7 +6519,18 @@ pub fn is_any_scope_meta(verb: &str) -> bool {
 /// bridge moved into its state dir's quarantine after an unclean shutdown, for the owner's later
 /// look),
 /// which an instance at lane 3 answers `ERR usage`; a bridge says it only to a lane-4 instance.
-pub const BRIDGE_LANE: u32 = 4;
+/// 5, `link quarantine torn=<k>` (how many torn files the state dir's quarantine still holds,
+/// said at the bridge's start and as the owner empties it, which at 0 ends the instance's entry
+/// for the owner's look), which an instance at lane 4 answers `ERR usage`; a bridge says it only
+/// to a lane-5 instance.
+pub const BRIDGE_LANE: u32 = 5;
+
+/// The lane that added `link quarantine torn=<k>` (5 in [`BRIDGE_LANE`]'s list), for both
+/// sides: a bridge says it only to an instance at this lane or later, and an instance reads off a
+/// bridge's `hello lane=` whether that bridge will ever say it. A bridge below it never does, so
+/// the entry its `link set-aside` raises does not end when the owner empties the quarantine,
+/// and the instance does not say it will.
+pub const LINK_QUARANTINE_LANE: u32 = 5;
 
 /// Whether `verb` is bridge-only per the table: no token unlocks it, Owner included. The
 /// dispatch reads this; unknown verbs are not bridge-only (`ERR unknown verb`).
@@ -6893,14 +6896,6 @@ mod tests {
         assert_eq!(framing_of("video", "video 3 full"), Status);
         assert_eq!(framing_of("video", "video status"), Status);
         assert_eq!(framing_of("temporal", "temporal status"), Status);
-        assert_eq!(framing_of("identities", "identities"), Lines);
-        assert_eq!(framing_of("identities", "identities worker"), Lines);
-        assert_eq!(spec("identities").map(|s| s.target), Some(Target::Meta));
-        assert_eq!(framing_of("identities", "identities forget worker"), Status);
-        assert_eq!(
-            framing_of("identities", "identities forget worker confirm=worker"),
-            Status
-        );
         assert_eq!(framing_of("temporal", "temporal"), Bytes);
         assert_eq!(framing_of("temporal", "temporal 1200"), Bytes);
         assert_eq!(framing_of("temporal", "@s-a temporal status"), Status);

@@ -114,6 +114,16 @@ impl<C: Ctl> Session<'_, C> {
         // The folder an Owner's `spawn agent=claude` trusted for this session
         // (`ApprovalCtx::trusted_cwd`); an older host prints no such key.
         self.trusted_cwd = field("trusted_cwd=");
+        // The agent a worker's spawn started here (`ApprovalCtx::worker_agent`),
+        // by its word; an older host prints no such key, and `-` is none.
+        self.worker_agent = line
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("worker="))
+            .and_then(|w| {
+                aterm_phase::Program::ALL
+                    .into_iter()
+                    .find(|p| p.name() == w && *p != aterm_phase::Program::Generic)
+            });
     }
 
     /// A press or a dismissal the server did not take: parked on the hold (`halted`), else

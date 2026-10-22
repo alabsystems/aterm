@@ -242,7 +242,8 @@ impl Drop for Session {
 /// beside the window's session id), which also edits in the terminal and dials no window.
 #[test]
 fn amacs_edits_a_file_under_a_real_pty() {
-    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+    let aterm = launch_isolation::aterm_executable();
+    let aterm = aterm.as_path();
     // A fresh build's first exec can wait out the system's code-policy check: run it once,
     // unclocked, before the hang detector starts.
     aterm_spec::wait::first_exec(aterm, &["--help"]);
@@ -288,7 +289,8 @@ fn amacs_edits_a_file_under_a_real_pty() {
 fn sigterm_puts_the_terminal_back() {
     use std::os::unix::process::ExitStatusExt as _;
 
-    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+    let aterm = launch_isolation::aterm_executable();
+    let aterm = aterm.as_path();
     aterm_spec::wait::first_exec(aterm, &["--help"]);
     let label = "SIGTERM";
     let mut session = Session::start(aterm, &[]);
@@ -315,7 +317,8 @@ fn sigterm_puts_the_terminal_back() {
 /// panic does (101), and the file was never written.
 #[test]
 fn a_panic_puts_the_terminal_back() {
-    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+    let aterm = launch_isolation::aterm_executable();
+    let aterm = aterm.as_path();
     aterm_spec::wait::first_exec(aterm, &["--help"]);
     let label = "panic";
     let mut session = Session::start(aterm, &[("ATERM_AMACS_INJECT_PANIC", "~")]);

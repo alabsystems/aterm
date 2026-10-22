@@ -6,7 +6,7 @@
 //! byte-prefix gate, the lineage gate on new rows only, the READY partition and its
 //! phases, and the downgrade refusals.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
@@ -24,7 +24,8 @@ use atpkg_publish::triple::{
     X86_64_UNKNOWN_LINUX_GNU as X86,
 };
 
-use super::fixture::{Fx, manifest, row};
+use super::super::shared::{Made, made_once, scratch};
+use super::fixture::{Fx, Held, manifest, row};
 
 /// What this fixture builder can cross-build.
 struct FakeBuilder(Mutex<BTreeSet<Triple>>);
@@ -72,7 +73,12 @@ const DARWIN: [Triple; 2] = [AARCH64_APPLE_DARWIN, X86_64_APPLE_DARWIN];
 
 impl World {
     fn new(label: &str) -> Self {
-        let fx = Fx::new(label);
+        Self::new_at(scratch(label))
+    }
+
+    /// [`World::new`] in `tmp`.
+    fn new_at(tmp: aterm_tempfile::TempDir) -> Self {
+        let fx = Fx::at(tmp);
         for (p, b) in [("ay", 10), ("clean", 20), ("trust", 30), ("trust-ir", 40)] {
             let _ = fx.dev_repo(p, b);
         }
@@ -84,12 +90,37 @@ impl World {
             7,
             &[("ay", 10), ("clean", 20), ("trust", 30), ("trust-ir", 40)],
         );
+        Self::of(fx)
+    }
+
+    fn of(fx: Fx) -> Self {
         Self {
             fx,
             host: X86,
             builder: FakeBuilder::can(&[ARM]),
             switch: Mutex::new(None),
         }
+    }
+
+    /// [`World::new`], keyless, after (i)'s staging run of every program (`unproven`: its
+    /// rows packed by a compiler with no lineage receipt). A run of the lane (about 30 git
+    /// processes), so each is made once per process, by the first caller in its own
+    /// directory, and laid down for every caller after ([`Fx::laid`]).
+    fn after_staging(label: &str, unproven: bool) -> Self {
+        static MADE: Made<bool, Held> = Mutex::new(BTreeMap::new());
+        let mut tmp = Some(scratch(label));
+        let dir = tmp.as_ref().expect("a scratch dir").path().to_path_buf();
+        let mut made = None;
+        let held = made_once(&MADE, &unproven, &dir, |_| {
+            let w = Self::new_at(tmp.take().expect("a scratch dir"));
+            w.keyless();
+            w.fx.packer.unproven.store(unproven, Ordering::SeqCst);
+            ok(w.run(false));
+            let held = w.fx.held();
+            made = Some(w);
+            held
+        });
+        made.unwrap_or_else(|| Self::of(Fx::laid(tmp.take().expect("a scratch dir"), &held)))
     }
 
     fn keyless(&self) {
@@ -475,9 +506,7 @@ fn a_keyed_box_with_no_channel_token_signs_nothing() {
 
 #[test]
 fn a_staged_merge_that_no_longer_extends_the_published_bytes_takes_the_ceremony_with_it() {
-    let w = World::new("linux-prefix");
-    w.keyless();
-    ok(w.run(false));
+    let w = World::after_staging("linux-prefix", false);
     let m = linux::staged_manifest(&w.staged(), "clean", 20);
     let text = std::fs::read_to_string(&m).expect("staged");
     std::fs::write(
@@ -505,10 +534,7 @@ fn a_staged_merge_that_no_longer_extends_the_published_bytes_takes_the_ceremony_
 /// A keyless staging run whose rows carry no lineage receipt, then a keyed run with the
 /// receipt switch reading `switch`.
 fn unproven(label: &str, switch: Option<Switch>) -> (World, Result<Outcome>) {
-    let w = World::new(label);
-    w.keyless();
-    w.fx.packer.unproven.store(true, Ordering::SeqCst);
-    ok(w.run(false));
+    let w = World::after_staging(label, true);
     w.rekey();
     *w.switch.lock().expect("switch") = switch;
     let (r, _) = w.run(false);
@@ -588,9 +614,7 @@ fn an_unfetchable_manifest_is_an_error_row_that_says_why() {
 
 #[test]
 fn an_index_or_pin_downgrade_refuses_the_linux_run() {
-    let w = World::new("linux-downgrade");
-    w.keyless();
-    ok(w.run(false));
+    let w = World::after_staging("linux-downgrade", false);
     let state = LaneState::of(LaneKind::Linux, &w.fx.ctx.state_dir);
     std::fs::write(&state.index_seen, "9\n").expect("floor");
     let (r, _) = w.run(true);
@@ -655,9 +679,7 @@ fn uploads_of(w: &World, tag: &str) -> Vec<String> {
 /// owner and the staging release of clean stops verifying (no manifest, or a signature the
 /// client refuses); then a keyed run.
 fn unverifiable(label: &str, tamper: bool) -> (World, Result<Outcome>, Vec<u8>) {
-    let w = World::new(label);
-    w.keyless();
-    ok(w.run(false));
+    let w = World::after_staging(label, false);
     let mut theirs = manifest("clean", 20, &DARWIN);
     theirs.push_str(&row("clean", 20, X86, false));
     publish_public_only(&w, "clean", 20, &theirs);
@@ -716,9 +738,7 @@ fn a_manifest_that_cannot_be_verified_is_never_signed_over_on_either_owner() {
 
 #[test]
 fn a_public_manifest_another_machine_extended_refuses_the_signing() {
-    let w = World::new("linux-public-extended");
-    w.keyless();
-    ok(w.run(false));
+    let w = World::after_staging("linux-public-extended", false);
     // The staging copy still matches what the run read; only the public owner moved, to
     // another machine's aarch64 row.
     let mut theirs = manifest("clean", 20, &DARWIN);
@@ -868,9 +888,7 @@ fn a_real_run_needs_the_staging_token_and_a_dry_run_does_not() {
 
 #[test]
 fn a_scratch_clone_is_fetched_as_the_staging_identity_never_by_its_origin() {
-    let w = World::new("linux-fetch");
-    w.keyless();
-    ok(w.run(false));
+    let w = World::after_staging("linux-fetch", false);
     let clone = w.fx.ctx.state_dir.join("progs/clean");
     // A bare `git fetch origin` would now fail and latch clean.
     super::fixture::git(
@@ -934,9 +952,7 @@ fn the_lane_plans_the_build_its_targets_resolve_not_the_bare_pin() {
 
 #[test]
 fn a_signed_manifest_the_client_would_refuse_is_never_uploaded() {
-    let w = World::new("linux-client-refuses");
-    w.keyless();
-    ok(w.run(false));
+    let w = World::after_staging("linux-client-refuses", false);
     // Still a byte-prefix extension, and still the lane's own type — but a row of a kind
     // the client's parser refuses outright.
     let m = linux::staged_manifest(&w.staged(), "clean", 20);

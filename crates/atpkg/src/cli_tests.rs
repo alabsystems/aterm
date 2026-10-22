@@ -4,6 +4,58 @@
 #[path = "vendor_plan_effects_tests.rs"]
 mod vendor_plan_effects;
 
+#[test]
+fn conditional_link_options_are_parsed_without_becoming_bin_paths() {
+    let args: Vec<String> = [
+        "codex",
+        "/new",
+        "bin/codex",
+        "--if-checkout",
+        "/old",
+        "--if-prefix",
+        "/pkg",
+        "--wait-lock",
+        "1800",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    let request = super::link_args(&args).unwrap();
+    assert_eq!(request.bins, [std::path::PathBuf::from("bin/codex")]);
+    assert_eq!(request.if_checkout, Some(std::path::Path::new("/old")));
+    assert_eq!(request.if_prefix, Some(std::path::Path::new("/pkg")));
+    assert_eq!(
+        request.wait_lock,
+        Some(std::time::Duration::from_secs(1800))
+    );
+    for tail in [
+        vec!["--if-checkout"],
+        vec!["--if-checkout", "/old"],
+        vec!["--if-prefix", "/pkg"],
+        vec!["--if-prefix", "--if-checkout", "/old"],
+        vec!["--if-checkout", "/old", "--if-checkout", "/other"],
+        vec!["--unknown", "/old"],
+        vec!["--wait-lock"],
+        vec!["--wait-lock", "soon"],
+        vec!["--wait-lock", "--if-prefix", "/pkg"],
+        vec!["--wait-lock", "1", "--wait-lock", "2"],
+    ] {
+        let bad: Vec<String> = ["codex", "/new", "bin/codex"]
+            .into_iter()
+            .chain(tail)
+            .map(str::to_owned)
+            .collect();
+        assert!(super::link_args(&bad).is_err());
+    }
+    let plain: Vec<String> = ["codex", "/new", "--wait-lock", "60"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let plain = super::link_args(&plain).unwrap();
+    assert!(plain.if_checkout.is_none() && plain.if_prefix.is_none());
+    assert_eq!(plain.wait_lock, Some(std::time::Duration::from_secs(60)));
+}
+
 /// EVERY FIXTURE PASS RUNS AGAINST AN EMPTY `PATH`.
 ///
 /// One wrapper over [`super::install_default_set_with_path`] for the whole test
@@ -9761,9 +9813,20 @@ impl crate::flow::Fetcher for SetBesideVendors {
 /// vendor world does not publish, left out).
 fn claude_and_codex_wanted() -> crate::config::PackagesConfig {
     crate::config::PackagesConfig {
-        exclude: Some(vec!["agy".to_string(), "muse".to_string()]),
+        exclude: Some(agents_except(&["claude", "codex"])),
         ..Default::default()
     }
+}
+
+/// Every agent program of the table but `keep`: what a test wanting only those excludes, so
+/// a row the table gains (`codex-old`) never joins a test that did not ask for it.
+fn agents_except(keep: &[&str]) -> Vec<String> {
+    crate::vendor_direct::VENDORS
+        .iter()
+        .map(|spec| spec.program)
+        .filter(|program| !keep.contains(program))
+        .map(String::from)
+        .collect()
 }
 
 /// A first run lands its agents beside its set under one announcement. On an empty store
@@ -10551,11 +10614,7 @@ fn an_update_pass_does_not_hold_its_apply_lane_behind_the_sets_manifests() {
     let mut f = SetBesideVendors::new(&dir, &layout, false);
     f.prefetch_waits_for = Some("download:trust");
     let cfg = crate::config::PackagesConfig {
-        exclude: Some(
-            ["claude", "codex", "agy", "muse"]
-                .map(String::from)
-                .to_vec(),
-        ),
+        exclude: Some(agents_except(&[])),
         ..Default::default()
     };
     let trust = crate::vendor_direct::lane::world::trust();

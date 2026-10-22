@@ -52,6 +52,7 @@ pub struct TypedHit {
 impl TypedHit {
     /// Fold a second outcome in, keeping the strongest of each independent
     /// axis. Used across the chars of one IME commit.
+    #[inline]
     pub fn merge(self, other: Self) -> Self {
         Self {
             feline: self.feline || other.feline,
@@ -107,6 +108,7 @@ pub struct TypedKittySummon {
 
 impl TypedKittySummon {
     /// Bind the window to `session`, clearing it on a switch.
+    #[inline]
     fn rekey(&mut self, session: u64) {
         if self.session != Some(session) {
             self.buf.clear();
@@ -116,6 +118,7 @@ impl TypedKittySummon {
 
     /// Drop leading chars until the window holds at most [`BUF_CAP`]. Trimming
     /// on a char boundary keeps the buffer valid UTF-8.
+    #[inline]
     fn trim(&mut self) {
         if self.buf.len() <= BUF_CAP {
             return;
@@ -269,6 +272,7 @@ impl TypedKittySummon {
     /// A plain Backspace pops the most recent char (typo tolerance, bounded
     /// by [`BUF_CAP`] of history). Popping never fires — deletion cannot
     /// complete a word here, only [`Self::note_char`] checks for completion.
+    #[inline]
     pub fn note_backspace(&mut self, session: u64) {
         self.rekey(session);
         self.buf.pop();
@@ -276,6 +280,7 @@ impl TypedKittySummon {
 
     /// A word-breaking key (Enter/Tab/Escape/Delete/nav/kill chords, raw byte
     /// sequences) clears the window: the run must be typed as one word.
+    #[inline]
     pub fn note_break(&mut self) {
         self.buf.clear();
     }
@@ -283,6 +288,7 @@ impl TypedKittySummon {
     /// Serious Mode's drain: clear the live typing window without dropping the
     /// warmed-up scan buffers, the Kitty Log cooldown (`last_summon`), or the
     /// canine keystroke odometer (`keys_typed`). Idempotent.
+    #[inline]
     pub fn drain_serious(&mut self) {
         self.buf.clear();
         self.session = None;

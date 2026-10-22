@@ -370,6 +370,15 @@ pub enum Intent {
         /// The pane's name.
         pane: String,
     },
+    /// Open a web page in the browser: the one button of an entry a tool filed with
+    /// `notice later … url=` (the page where the fix is made). Only an address
+    /// [`link_host`] admits — `https`, no user, no port — decodes, and the host checks
+    /// again before it opens. The label is fixed words, never the sender's; the entry
+    /// names the page's host in its detail.
+    OpenLink {
+        /// The address.
+        url: String,
+    },
     /// Install a staged update now.
     ApplyUpdate {
         /// The staged build number.
@@ -490,6 +499,7 @@ impl Intent {
             Self::OpenConfigEditor { .. } => "Open aterm.toml",
             Self::OpenPath { .. } => "Open log",
             Self::OpenSystemPane { .. } => "Open Settings",
+            Self::OpenLink { .. } => "Open in browser",
             Self::ApplyUpdate { .. } => "Install now",
             Self::NotNow { .. } => "Not now",
             Self::NewWindow => "New window",
@@ -519,6 +529,7 @@ impl Intent {
             Self::OpenConfigEditor { .. } => "Edit",
             Self::OpenPath { .. } => "Log",
             Self::OpenSystemPane { .. } => "Settings",
+            Self::OpenLink { .. } => "Open",
             // One install verb on every surface.
             Self::ApplyUpdate { .. } => "Install",
             Self::NotNow { .. } => "Not now",
@@ -615,7 +626,7 @@ impl Intent {
 
     /// The log/carry form: `details`, `open-settings:/packages`,
     /// `open-config-editor:<line|->`, `open-path:<esc>`, `open-system-pane:<pane>`,
-    /// `apply-update:<build>`, `not-now:file-access`, `new-window`, `stop-paste:<session>`,
+    /// `open-link:<esc>`, `apply-update:<build>`, `not-now:file-access`, `new-window`, `stop-paste:<session>`,
     /// `show-tab:<tab>:<window>`, `agent-upgrade:<word>:<to>:<tab>`,
     /// `agent-upgrades:<word>(:<to>:<tab>)+` (`:` escaped in the fields), `end-recovered`.
     #[must_use]
@@ -629,6 +640,7 @@ impl Intent {
             },
             Self::OpenPath { path } => format!("open-path:{}", escape_payload(path)),
             Self::OpenSystemPane { pane } => format!("open-system-pane:{}", escape_payload(pane)),
+            Self::OpenLink { url } => format!("open-link:{}", escape_payload(url)),
             Self::ApplyUpdate { build } => format!("apply-update:{build}"),
             Self::NotNow { decision } => match decision {
                 Decision::FileAccess => "not-now:file-access".to_string(),
@@ -679,6 +691,13 @@ impl Intent {
             "open-system-pane" => Some(Self::OpenSystemPane {
                 pane: unescape_payload(payload),
             }),
+            // Checked again here: a log line or a carry is text anybody with the
+            // file could have written, and the button opens what it names.
+            "open-link" => {
+                let url = unescape_payload(payload);
+                link_host(&url)?;
+                Some(Self::OpenLink { url })
+            }
             "apply-update" => Some(Self::ApplyUpdate {
                 build: payload.parse().ok()?,
             }),
@@ -733,6 +752,35 @@ fn escape_field(s: &str) -> String {
     escape_payload(s).replace(':', "%3A")
 }
 
+/// The longest address an [`Intent::OpenLink`] carries, in bytes.
+pub const LINK_URL_CAP: usize = 512;
+
+/// The host an [`Intent::OpenLink`] names, when `url` is an address it may carry: exactly
+/// `https://`, then a host of two or more dot-separated labels of ASCII letters, digits and
+/// inner `-` (no user, no port, no IP literal in brackets), then nothing or a path, query
+/// or fragment; at most [`LINK_URL_CAP`] printable ASCII bytes with no `\`, `"`, `<`, `>`
+/// or `` ` ``. `None` for anything else. The one rule the wire's `url=` and the log's
+/// decoder hold, so what a press opens is always a web page on the host the entry named.
+#[must_use]
+pub fn link_host(url: &str) -> Option<&str> {
+    let printable = url
+        .bytes()
+        .all(|b| b.is_ascii_graphic() && !matches!(b, b'\\' | b'"' | b'<' | b'>' | b'`'));
+    if url.len() > LINK_URL_CAP || !printable {
+        return None;
+    }
+    let rest = url.strip_prefix("https://")?;
+    let host = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    let ok = host.len() <= 253 && host.contains('.') && host.split('.').all(label_ok);
+    ok.then_some(host)
+}
+
 /// Every intent variant once, with a representative payload — the label
 /// table's test walks it, and so does the codec's.
 #[must_use]
@@ -768,6 +816,9 @@ pub(crate) fn every_intent() -> Vec<Intent> {
         },
         Intent::OpenSystemPane {
             pane: "full-disk-access".into(),
+        },
+        Intent::OpenLink {
+            url: "https://chatgpt.com/security/setup?from=codex%3Aa#top".into(),
         },
         Intent::ApplyUpdate { build: 1234 },
         Intent::NotNow {
@@ -2093,6 +2144,65 @@ mod tests {
         }
         assert_eq!(Hold::decode("forever"), None);
         assert_eq!(Hold::decode("for:x"), None);
+    }
+
+    /// `Open in browser` round-trips a web page's address, and the decoder drops every
+    /// address the wire's `url=` would refuse: a log line or a carry is text, and the
+    /// button opens what it names.
+    #[test]
+    fn an_open_link_decodes_only_an_https_page() {
+        for url in [
+            "https://chatgpt.com",
+            "https://chatgpt.com/",
+            "https://auth.openai.com/setup?step=2&x=a:b#mfa",
+            "https://xn--bcher-kva.example/%7Euser",
+        ] {
+            let link = Intent::OpenLink { url: url.into() };
+            assert_eq!(Intent::decode(&link.encode()), Some(link), "{url}");
+        }
+        assert_eq!(
+            link_host("https://Auth.OpenAI.com/x"),
+            Some("Auth.OpenAI.com")
+        );
+        let long = format!("https://example.com/{}", "a".repeat(LINK_URL_CAP));
+        let refused = [
+            "http://chatgpt.com/",
+            "HTTPS://chatgpt.com/",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "mailto:someone@example.com",
+            "https:chatgpt.com",
+            "https:///path",
+            "https://chatgpt.com:443/",
+            "https://user@chatgpt.com/",
+            "https://user:pw@chatgpt.com/",
+            "https://good.com\\@evil.com/",
+            "https://[::1]/",
+            "https://localhost/",
+            "https://chatgpt.com./",
+            "https://.chatgpt.com/",
+            "https://chat..gpt.com/",
+            "https://-chatgpt.com/",
+            "https://chat_gpt.com/",
+            "https://chatgpt.com/a b",
+            "https://chatgpt.com/\u{7f}",
+            "https://chatgpt.com/\u{e9}",
+            "https://chatgpt.com/\"x",
+            long.as_str(),
+        ];
+        for url in refused {
+            assert_eq!(link_host(url), None, "{url:?}");
+            let forged = format!("open-link:{}", escape_payload(url));
+            assert_eq!(Intent::decode(&forged), None, "{forged:?}");
+        }
+        assert_eq!(Intent::decode("open-link:"), None);
+        assert_eq!(Intent::decode("open-link"), None);
+        // Fixed words, never the sender's: every address wears the one label.
+        let link = Intent::OpenLink {
+            url: "https://chatgpt.com/".into(),
+        };
+        assert_eq!((link.label(), link.short()), ("Open in browser", "Open"));
+        assert!(!link.is_consequential() && !link.is_snooze() && !link.ends_with_row());
     }
 
     /// A busy meter never carries a fill (`normalized` clears the flag where one arrives),

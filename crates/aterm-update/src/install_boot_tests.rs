@@ -688,7 +688,10 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
     count(&kept, launcher(&crash));
     stop(&mut crash);
     let model = aterm_models_update::native_update_trial_give_back_model();
-    for buggy in [0, 1, 2, 3] {
+    // One rule's replay of every trace, and the invariants it broke. Each trace runs in a
+    // scratch staging of its own (a copy of `kept`) with stand-ins of its own, so the four
+    // rules' replays share nothing and run at once, a thread each.
+    let replay = |buggy: i64| {
         let model = aterm_spec::interp::with_buggy(&model, buggy);
         let mut broken = Vec::new();
         for (label, trace) in traces {
@@ -830,6 +833,22 @@ fn overlapping_launches_of_one_trial_are_given_back_by_name() {
             }
             let _ = std::fs::remove_dir_all(&s.root);
         }
+        broken
+    };
+    let replays: Vec<Vec<(&str, &str)>> = std::thread::scope(|scope| {
+        let replay = &replay;
+        let running: Vec<_> = (0..4)
+            .map(|buggy| scope.spawn(move || replay(buggy)))
+            .collect();
+        running
+            .into_iter()
+            .map(|ran| {
+                ran.join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+    for (buggy, mut broken) in (0..).zip(replays) {
         broken.sort_unstable();
         broken.dedup();
         let erased = |trace| {

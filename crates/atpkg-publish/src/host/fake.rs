@@ -4,8 +4,9 @@
 //! [`FakeHost`]: an in-memory [`ReleaseHost`] for the producer's tests, with the failure
 //! modes seen in the field: a draft (invisible to the download host), a one-shot HTTP 500
 //! on one asset, an unreachable owner, a private repo the download host serves nothing
-//! for, and a create that races another publisher. Every call is logged, so a test can
-//! say "a dry run made no host call".
+//! for, a repo this identity cannot see, the draft a lost two-publisher race leaves beside
+//! a published release, and a create that races another publisher. Every call is logged,
+//! so a test can say "a dry run made no host call".
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -24,13 +25,15 @@ pub struct FakeRelease {
     pub assets: BTreeMap<String, Vec<u8>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct State {
     repos: BTreeMap<Slug, BTreeMap<String, FakeRelease>>,
     clone_sources: BTreeMap<Slug, PathBuf>,
     fail_once: Vec<(Slug, String, String)>,
     unreachable_owners: BTreeSet<String>,
     private: BTreeSet<Slug>,
+    not_visible: BTreeSet<Slug>,
+    stray_drafts: BTreeMap<Slug, BTreeMap<String, usize>>,
     anonymous: bool,
     calls: Vec<String>,
 }
@@ -132,6 +135,43 @@ impl FakeHost {
         }
     }
 
+    /// Every authenticated read of `slug` answers unreachable, as a 404 does to an identity that cannot see the repository.
+    ///
+    /// The download host serves nothing for it either: a repository an identity cannot see
+    /// is private or gone on GitHub, and its download host answers 404 to everyone.
+    pub fn set_not_visible(&self, slug: &Slug, not_visible: bool) {
+        let mut s = self.state();
+        if not_visible {
+            s.not_visible.insert(slug.clone());
+        } else {
+            s.not_visible.remove(slug);
+        }
+    }
+
+    /// A draft beside the published release `tag`, as the loser of a two-publisher race leaves it (`channel/index.rs`); `release` and `download` still answer the published release.
+    ///
+    /// # Panics
+    ///
+    /// Unless `slug` holds a published release `tag`, so the mistake fails the test at its own
+    /// line: a stray anywhere else is a state FakeHost would answer otherwise than GitHub.
+    pub fn put_stray_draft(&self, slug: &Slug, tag: &str) {
+        let mut s = self.state();
+        let published = s
+            .repos
+            .get(slug)
+            .and_then(|tags| tags.get(tag))
+            .is_some_and(|r| !r.draft);
+        assert!(
+            published,
+            "put_stray_draft: {slug} holds no published release {tag}"
+        );
+        *s.stray_drafts
+            .entry(slug.clone())
+            .or_default()
+            .entry(tag.to_string())
+            .or_default() += 1;
+    }
+
     /// A keyless builder: no token and no `gh` login, so every authenticated read
     /// (`releases`, `release`, `download`) is unreachable and only the anonymous download
     /// host answers ([`ReleaseHost::reads_anonymously`]).
@@ -146,6 +186,22 @@ impl FakeHost {
             .insert(slug.clone(), path.to_path_buf());
     }
 
+    /// A host holding everything this one holds (its releases, clone sources, armed
+    /// failures and call log), with each clone source under `from` moved under `to`: a
+    /// world made once and laid down again at another root.
+    #[must_use]
+    pub fn forked(&self, from: &Path, to: &Path) -> Self {
+        let mut state = self.state().clone();
+        for path in state.clone_sources.values_mut() {
+            if let Ok(rel) = path.strip_prefix(from) {
+                *path = to.join(rel);
+            }
+        }
+        Self {
+            state: Mutex::new(state),
+        }
+    }
+
     /// Every call so far, one line each (`<op> <owner>/<repo> [<tag> [<assets>]]`).
     #[must_use]
     pub fn calls(&self) -> Vec<String> {
@@ -157,6 +213,11 @@ impl FakeHost {
     }
 
     fn reachable(&self, slug: &Slug) -> Result<(), HostError> {
+        if self.state().not_visible.contains(slug) {
+            return Err(HostError::Unreachable(format!(
+                "{slug} is not visible to this identity (HTTP 404)"
+            )));
+        }
         if self.state().anonymous {
             return Err(HostError::Unreachable(
                 "gh has no login and there is no token file on this keyless builder".into(),
@@ -192,7 +253,7 @@ impl FakeHost {
 
     fn public(&self, slug: &Slug, tag: &str, asset: &str) -> Option<Vec<u8>> {
         let s = self.state();
-        if s.private.contains(slug) {
+        if s.private.contains(slug) || s.not_visible.contains(slug) {
             return None;
         }
         s.repos
@@ -200,6 +261,32 @@ impl FakeHost {
             .and_then(|tags| tags.get(tag))
             .filter(|r| !r.draft)
             .and_then(|r| r.assets.get(asset).cloned())
+    }
+
+    /// `fetch_public`'s answer, before a `dest` it does not answer present is removed.
+    fn fetch_public_into(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        asset: &str,
+        dest: &Path,
+        cap: u64,
+    ) -> Probe {
+        let Some(bytes) = self.public(slug, tag, asset) else {
+            return Probe::Absent;
+        };
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > cap {
+            return Probe::Unknown(format!("{asset} is over the {cap}-byte cap"));
+        }
+        if let Some(parent) = dest.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return Probe::Unknown(format!("mkdir {}: {e}", parent.display()));
+        }
+        match std::fs::write(dest, bytes) {
+            Ok(()) => Probe::Present,
+            Err(e) => Probe::Unknown(format!("write {}: {e}", dest.display())),
+        }
     }
 }
 
@@ -209,15 +296,24 @@ impl ReleaseHost for FakeHost {
         self.reachable(slug)?;
         let s = self.state();
         let tags = s.repos.get(slug).ok_or(HostError::NotFound)?;
-        Ok(tags
-            .iter()
-            .map(|(tag, r)| Release {
+        let strays = s.stray_drafts.get(slug);
+        let mut out = Vec::new();
+        for (tag, r) in tags {
+            out.push(Release {
                 tag: tag.clone(),
                 draft: r.draft,
                 prerelease: r.prerelease,
                 assets: r.assets.keys().cloned().collect(),
-            })
-            .collect())
+            });
+            let n = strays.and_then(|t| t.get(tag)).copied().unwrap_or(0);
+            out.extend((0..n).map(|_| Release {
+                tag: tag.clone(),
+                draft: true,
+                prerelease: true,
+                assets: Vec::new(),
+            }));
+        }
+        Ok(out)
     }
 
     fn release(&self, slug: &Slug, tag: &str) -> Result<Release, HostError> {
@@ -337,21 +433,12 @@ impl ReleaseHost for FakeHost {
 
     fn fetch_public(&self, slug: &Slug, tag: &str, asset: &str, dest: &Path, cap: u64) -> Probe {
         self.log(format!("fetch {slug} {tag} {asset}"));
-        let Some(bytes) = self.public(slug, tag, asset) else {
-            return Probe::Absent;
-        };
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > cap {
-            return Probe::Unknown(format!("{asset} is over the {cap}-byte cap"));
+        let answer = self.fetch_public_into(slug, tag, asset, dest, cap);
+        // As the trait says and GhCli does: `dest` holds a file only when it is present.
+        if answer != Probe::Present {
+            let _ = std::fs::remove_file(dest);
         }
-        if let Some(parent) = dest.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            return Probe::Unknown(format!("mkdir {}: {e}", parent.display()));
-        }
-        match std::fs::write(dest, bytes) {
-            Ok(()) => Probe::Present,
-            Err(e) => Probe::Unknown(format!("write {}: {e}", dest.display())),
-        }
+        answer
     }
 
     fn reads_anonymously(&self) -> bool {

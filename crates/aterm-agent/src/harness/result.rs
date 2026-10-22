@@ -1028,6 +1028,11 @@ pub enum Source {
         transcript: Option<PathBuf>,
         turn: Option<String>,
     },
+    /// THE SCREEN of a harness whose reader alone reads its turns (agy,
+    /// Muse Code, Gemini CLI: no transcript aterm reads): the landing's own
+    /// words as `program`'s reader read them off the screen at the done
+    /// point ([`snapshot_screen`]).
+    Screen { program: String },
 }
 
 impl Source {
@@ -1037,6 +1042,7 @@ impl Source {
     #[must_use]
     pub fn line(&self) -> String {
         let pct = aterm_codec::pct::encode;
+        let none = None;
         let (mut out, transcript) = match self {
             Source::Transcript {
                 session,
@@ -1061,6 +1067,9 @@ impl Source {
                     line.push_str(&pct(turn));
                 }
                 (line, transcript)
+            }
+            Source::Screen { program } => {
+                (format!("source=screen program={}", pct(program)), &none)
             }
         };
         if let Some(path) = transcript {
@@ -1089,6 +1098,9 @@ impl Source {
                 why: field("why").filter(|w| is_word(w))?,
                 transcript,
                 turn: field("turn"),
+            }),
+            "screen" => Some(Source::Screen {
+                program: field("program").filter(|w| is_word(w))?,
             }),
             _ => None,
         }
@@ -1176,16 +1188,7 @@ pub fn snapshot(
     transcript: Option<(&Path, &str)>,
     by: DoneBy,
 ) -> std::io::Result<Snapshot> {
-    if stem.is_empty()
-        || !stem
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("{stem:?} is no result file's stem"),
-        ));
-    }
+    check_stem(stem)?;
     let (by, got) = match transcript {
         None => (by, None),
         Some((file, jsonl)) => {
@@ -1222,6 +1225,96 @@ pub fn snapshot(
             Some(why),
         ),
     };
+    write_snapshot(tasks, stem, &text, &source, unavailable, by)
+}
+
+/// SNAPSHOT A SCREEN'S RESULT, at the done edge of a harness aterm reads no
+/// transcript of (agy, Muse Code, Gemini CLI): `said`, the worker's report
+/// and the landing's words ([`with_report`]) as `program`'s screen reader
+/// read them (each turn's earlier messages and its last,
+/// `TurnEndReading::turn_said` and `said_tail`), written as [`snapshot`]
+/// writes a transcript's, its source
+/// [`Source::Screen`]. Empty words are no result: `no-words`.
+///
+/// # Errors
+/// As [`snapshot`].
+pub fn snapshot_screen(
+    tasks: &Path,
+    stem: &str,
+    program: &str,
+    said: &str,
+    by: DoneBy,
+) -> std::io::Result<Snapshot> {
+    check_stem(stem)?;
+    let said = said.trim();
+    if said.is_empty() || !is_word(program) {
+        let why = "no-words";
+        let source = Source::Unavailable {
+            why: why.to_string(),
+            transcript: None,
+            turn: None,
+        };
+        return write_snapshot(tasks, stem, "", &source, Some(why), by);
+    }
+    let source = Source::Screen {
+        program: program.to_string(),
+    };
+    write_snapshot(tasks, stem, said, &source, None, by)
+}
+
+/// The words a screen's reader read of a turn, as [`snapshot_screen`] keeps
+/// them: its earlier messages (`turn_said`, where any), a blank line, then
+/// its last (`said_tail`).
+#[must_use]
+pub fn screen_said(turn_said: Option<&str>, said_tail: &str) -> String {
+    match turn_said.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(before) => format!("{before}\n\n{}", said_tail.trim()),
+        None => said_tail.trim().to_string(),
+    }
+}
+
+/// A SCREEN-READ LANDING'S RESULT ([`snapshot_screen`]): the worker's
+/// `report` — the words of the turn before the Land episode's acts, as the
+/// LANDING rule reads a transcript's — a blank line, then the landing's own
+/// `said`, its defense; `said` alone where no report was read, or the report
+/// is blank or the landing's own words.
+#[must_use]
+pub fn with_report(report: Option<&str>, said: &str) -> String {
+    match report
+        .map(str::trim)
+        .filter(|r| !r.is_empty() && *r != said.trim())
+    {
+        Some(report) => format!("{report}\n\n{}", said.trim()),
+        None => said.to_string(),
+    }
+}
+
+/// A `stem` that is one file name's stem (`[A-Za-z0-9_-]`, not empty).
+fn check_stem(stem: &str) -> std::io::Result<()> {
+    if stem.is_empty()
+        || !stem
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{stem:?} is no result file's stem"),
+        ));
+    }
+    Ok(())
+}
+
+/// The result's `text` and its `source` written under `tasks` (0700, made
+/// where missing) as `<stem>.result.md` and its sidecar, each 0600 through a
+/// rename, the text first.
+fn write_snapshot(
+    tasks: &Path,
+    stem: &str,
+    text: &str,
+    source: &Source,
+    unavailable: Option<&'static str>,
+    by: DoneBy,
+) -> std::io::Result<Snapshot> {
     if !tasks.is_dir() {
         let mut dir = std::fs::DirBuilder::new();
         dir.recursive(true);
@@ -1234,7 +1327,7 @@ pub fn snapshot(
     }
     let path = tasks.join(format!("{stem}.result.md"));
     // The text first: a sidecar never names a result that is not there.
-    super::upgrade_models::write_atomic(&path, &text)?;
+    super::upgrade_models::write_atomic(&path, text)?;
     super::upgrade_models::write_atomic(&sidecar_of(&path), &format!("{}\n", source.line()))?;
     Ok(Snapshot {
         path,
@@ -1338,6 +1431,23 @@ pub fn answer(path: &Path, full: bool) -> String {
     match source_of(path) {
         None => unavailable("no-snapshot"),
         Some(Source::Unavailable { why, .. }) => unavailable(&why),
+        // The screen's words are all there is: `result full` has no
+        // transcript to read the exchange from.
+        Some(Source::Screen { .. }) if full => unavailable("no-transcript"),
+        Some(Source::Screen { program }) => {
+            let Some(text) = super::footer::read_small(path, RESULT_READ_BYTES) else {
+                return unavailable("unreadable");
+            };
+            framed(
+                &format!(
+                    "source=screen program={}",
+                    aterm_codec::pct::encode(&program)
+                ),
+                text.len(),
+                "",
+                &head_lines(&text, RESULT_MAX_CHARS, path),
+            )
+        }
         Some(Source::Transcript {
             session,
             uuid,

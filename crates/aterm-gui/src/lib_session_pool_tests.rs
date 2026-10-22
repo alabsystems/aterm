@@ -60,8 +60,6 @@ fn test_session(id: u64) -> Session {
         rekey_channel: false,
         body_loader: false,
         integration_frozen: false,
-        identity: None,
-        _identity_admission: None,
         ctx,
         child_proxy: None,
         output_wake_pending: Arc::new(AtomicU64::new(0)),

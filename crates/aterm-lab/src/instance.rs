@@ -19,7 +19,7 @@
 //!
 //! `instance [--window] [--band app|agent] [--columns N] [--lines N]
 //! [--font-px N] [--scale N] [--toml LINE]… [--pre VERB]… [--image PNG]
-//! [--post VERB]… [--keep] [-- PROGRAM ARGS…]` starts one headless (windowed
+//! [--post VERB]… [--env NAME=VALUE]… [--keep] [-- PROGRAM ARGS…]` starts one headless (windowed
 //! with `--window`) and prints its socket and band; drive it with
 //! `aterm ctl --sock <sock> <verb>` (`image`, `text`, `send --stdin`,
 //! `metrics percentiles`, …) until this command ends
@@ -669,6 +669,10 @@ pub fn cmd_instance(args: &[String]) -> Res {
     let image = take_value(&mut a, "--image")?.map(|p| from_caller(&p));
     let toml = take_values(&mut a, "--toml")?;
     let toml_after = take_values(&mut a, "--toml-after")?;
+    // Use the same restricted seam grammar as lab up. In particular, this
+    // cannot replace HOME or the private state root to reach the owner's Mac.
+    let extra_env =
+        crate::lab::instance_env(&take_values(&mut a, "--env")?.join(" ")).map_err(Fail::usage)?;
     let home = take_value(&mut a, "--home")?.map(|p| from_caller(&p));
     let harness = take_flag(&mut a, "--harness");
     let pre = take_values(&mut a, "--pre")?;
@@ -725,13 +729,15 @@ pub fn cmd_instance(args: &[String]) -> Res {
         flags.push("-e".to_string());
         flags.extend(program);
     }
+    let mut env = world.env();
+    env.extend(extra_env);
     let mut inst = Instance::start_in(
         &world,
         Launch {
             aterm,
             headless: !window,
             args: flags,
-            env: world.env(),
+            env,
             cwd: world.home.clone(),
             sandbox: None,
         },

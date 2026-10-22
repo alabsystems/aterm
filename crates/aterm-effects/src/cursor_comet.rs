@@ -376,12 +376,14 @@ impl CursorComet {
             let mut dy = -r_i;
             while dy < r_i {
                 let h = slab.min(r_i - dy);
-                let ym = dy as f32 + h as f32 * 0.5;
-                let hw = ((r2 - ym * ym).max(0.0).sqrt() * wobble(ym)) as i32;
-                let (x0, x1) = ((cxi - hw).max(cell_x0), (cxi + hw).min(cell_x1));
                 let (y0, y1) = ((cyi + dy).max(cell_y0), (cyi + dy + h).min(cell_y1));
-                if hw >= 1 && x1 > x0 && y1 > y0 {
-                    push_rect(out, geom, x0, y0, x1 - x0, y1 - y0, premul);
+                if y1 > y0 {
+                    let ym = dy as f32 + h as f32 * 0.5;
+                    let hw = ((r2 - ym * ym).max(0.0).sqrt() * wobble(ym)) as i32;
+                    let (x0, x1) = ((cxi - hw).max(cell_x0), (cxi + hw).min(cell_x1));
+                    if hw >= 1 && x1 > x0 {
+                        push_rect(out, geom, x0, y0, x1 - x0, y1 - y0, premul);
+                    }
                 }
                 dy += h;
             }
@@ -391,6 +393,24 @@ impl CursorComet {
         // cell's top edge so no slab straddles the cell.
         let outer = discs[0].0;
         if outer >= 1.0 {
+            let mut ring_premul = [0u32; 4];
+            let (mut sum, mut acc) = (0.0f32, [0.0f32; 3]);
+            for i in 0..discs.len() {
+                let (_, cov, color) = discs[i];
+                sum += cov;
+                for (k, sh) in [16u32, 8, 0].into_iter().enumerate() {
+                    acc[k] += ((color >> sh) & 0xff) as f32 * cov;
+                }
+                if sum <= 0.0 {
+                    continue;
+                }
+                let cov = (sum * COMA_OUTSIDE_SCALE) as u8;
+                if cov == 0 {
+                    continue;
+                }
+                let avg = |k: usize| ((acc[k] / sum).round() as u32).min(255);
+                ring_premul[i] = premul_rgb((avg(0) << 16) | (avg(1) << 8) | avg(2), cov);
+            }
             let top = (cy - outer).floor() as i32;
             let bot = (cy + outer).ceil() as i32;
             let mut y = cell_y0 - (cell_y0 - top).div_euclid(slab) * slab - slab;
@@ -403,6 +423,7 @@ impl CursorComet {
                     let in_band = y >= cell_y0 && y < cell_y1;
                     ring_row(
                         &discs,
+                        &ring_premul,
                         (cx, cy),
                         (y, h),
                         wobble,
@@ -457,6 +478,7 @@ impl CursorComet {
 )]
 fn ring_row(
     discs: &[(f32, f32, u32); 4],
+    ring_premul: &[u32; 4],
     (cx, cy): (f32, f32),
     (y, h): (i32, i32),
     wobble: impl Fn(f32) -> f32,
@@ -471,23 +493,11 @@ fn ring_row(
     let hw = discs.map(|(r, _, _)| (r * r - ym2).max(0.0).sqrt() * wob);
     let x_edges = hw.map(|w| ((cx - w).round() as i32, (cx + w).round() as i32));
     let cx_round = cx.round() as i32;
-    let (mut sum, mut acc) = (0.0f32, [0.0f32; 3]);
     for i in 0..discs.len() {
-        let (_, cov, color) = discs[i];
-        sum += cov;
-        for (k, sh) in [16u32, 8, 0].into_iter().enumerate() {
-            acc[k] += ((color >> sh) & 0xff) as f32 * cov;
-        }
-        let outer = hw[i];
-        if outer < 1.0 || sum <= 0.0 {
+        let premul = ring_premul[i];
+        if hw[i] < 1.0 || premul == 0 {
             continue;
         }
-        let cov = (sum * COMA_OUTSIDE_SCALE) as u8;
-        if cov == 0 {
-            continue;
-        }
-        let avg = |k: usize| ((acc[k] / sum).round() as u32).min(255);
-        let premul = premul_rgb((avg(0) << 16) | (avg(1) << 8) | avg(2), cov);
         let (xo0, xo1) = x_edges[i];
         let (xi0, xi1) = x_edges.get(i + 1).copied().unwrap_or((cx_round, cx_round));
         let spans: [(i32, i32); 2] = if xi1 > xi0 {

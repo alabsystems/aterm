@@ -163,7 +163,6 @@ mod app_presence;
 mod app_rename;
 mod app_render;
 mod app_search;
-mod app_session_picker;
 mod app_settings;
 mod app_tabs;
 mod app_take_over;
@@ -430,8 +429,20 @@ mod secrets_join;
 /// askpass sheet is.
 #[cfg(target_os = "macos")]
 mod secrets_sheet;
+mod system_state;
+mod system_state_host;
+mod workstation_setup;
 #[cfg(target_os = "macos")]
 pub use devtools_helper_drive::run_devtools_helper_drive;
+pub use system_state::{InitialSetupPermissionPolicy, SetupStatus, SetupStatusRow};
+pub use system_state_host::{
+    InitialSetupApplyReceipt, InitialSetupHandlers, publish_initial_setup_status,
+    set_initial_setup_handlers,
+};
+pub use workstation_setup::{
+    SetupAnswer, WorkstationSetupDecision, await_initial_setup_countdown_while,
+    await_workstation_setup_countdown, await_workstation_setup_countdown_while,
+};
 /// The Developer Tools list, handled by the window (owner ruling 2026-10-14):
 /// read at launch and while the owner is wanted, one digest line, and the pane
 /// brought up for the owner once per version, at a quiet moment
@@ -720,8 +731,6 @@ use aterm_effects::{cursor_beam, cursor_comet, cursor_droplet, cursor_phaser, cu
 use aterm_effects::{
     cursor_glow, cursor_trail, kitty_cursor, matrix_rain, output_streak, word_decorations,
 };
-/// Session identities: a session can carry its own agent identity.
-mod agent_identity;
 mod app_control;
 mod app_doc;
 mod app_documents;
@@ -982,8 +991,6 @@ mod session_log_mirror;
 /// THE INSTANCE'S NODE LOG (session log 5J): node `n`'s start, fabric link
 /// and config facts, RAM only, read by `log n`.
 mod session_log_node;
-/// The session picker overlay (design §2.3/§2.5 — the picker slice).
-mod session_picker;
 /// Pure, GUI-free status classifier for a session.
 mod session_status;
 mod session_store;
@@ -3899,19 +3906,38 @@ pub(crate) struct PausePlan {
 // `Option<Sender>`. Every variant is moved into `send_event` and matched by value.
 #[derive(Debug)]
 enum Wake {
+    /// A worker asks for the first-launch countdown on the next visible window.
+    WorkstationSetup(workstation_setup::Request),
+    #[cfg(target_os = "macos")]
+    OpenSystemState,
+    InitialSetupStatus {
+        generation: Option<u64>,
+        status: system_state::SetupStatus,
+    },
+    InitialSetupApplyResolved,
     /// A session's PTY produced output; `on_output_wake` redraws every window whose active tab
     /// shows [`Session::id`] `session`. `window` (the owning tab's) is not read for routing.
-    Output { session: u64, window: WindowId },
+    Output {
+        session: u64,
+        window: WindowId,
+    },
     /// A key queued behind this session's paste reached the sink (accepted presses only), so a
     /// queued key whose 50 ms priority expired still gets its echo on the next half-refresh.
-    QueuedKeyDelivered { session: u64, at: Instant },
+    QueuedKeyDelivered {
+        session: u64,
+        at: Instant,
+    },
     /// `meta set`/`meta unset` changed a session's user metadata (posted only on a change); the
     /// user title outranks the OSC title, so labeling windows re-read their strips.
-    MetaChanged { session: u64 },
+    MetaChanged {
+        session: u64,
+    },
     /// A session's task record moved, or the supervisor's attention a task
     /// mark carried did (`presence::post_task_changed`): its need verdict is
     /// published again (`App::on_task_changed`).
-    TaskChanged { session: u64 },
+    TaskChanged {
+        session: u64,
+    },
     /// The crash journal owes a capture or a write NOW
     /// (`crash_journal::Durable`): a control verb that moved a word about
     /// typing waits for the image that carries it, or the writer's last image
@@ -3922,9 +3948,13 @@ enum Wake {
     /// once per episode by the sink's input hook), or a reader saw unread input no
     /// write announced. The main thread probes whether the program reads it
     /// (`App::observe_input_stalls`).
-    InputWatch { session: u64 },
+    InputWatch {
+        session: u64,
+    },
     /// A Claude Code session's footer facts (model, effort, repository, branch) changed.
-    ClaudeFooter { session: u64 },
+    ClaudeFooter {
+        session: u64,
+    },
     /// A session's log moved off the loop in a way the loop follows (session
     /// log Phase 3B, `claude_footer::LogWake`): the footer thread applied a
     /// transcript's steps that armed the turn tracker's settle, whose tick
@@ -3933,15 +3963,21 @@ enum Wake {
     /// (the launch card's amend, addendum A28). The move rang the session's
     /// watchers where it took the owed wake; the arm notes the settle and
     /// refreshes the chrome (`App::on_session_log_moved`).
-    SessionLogMoved { session: u64 },
+    SessionLogMoved {
+        session: u64,
+    },
     /// A process-name lookup changed the current foreground group's name.
     /// The worker posts only on an applied change, so a late answer after
     /// the observer's one follow-up still gets a status observation.
-    ProgramResolved { session: u64 },
+    ProgramResolved {
+        session: u64,
+    },
     /// A session's drive lease changed hands (`turn` begin/settle, `lease`
     /// acquire/release), posted beside the lease writes in `control_session.rs` and
     /// keyed by the fabric sid (the control thread has no local id).
-    LeaseChanged { session: aterm_session::SessionId },
+    LeaseChanged {
+        session: aterm_session::SessionId,
+    },
     /// A click on window `window`'s needs pill (§5) landed on `hit`, the pill
     /// naming `session` when it was drawn ([`App::on_pill_act`]): posted by the
     /// macOS `NeedsPill` view (the in-grid strip's press calls it directly).
@@ -3959,11 +3995,15 @@ enum Wake {
     /// landing, `inbox seen`, a link report), posted beside every
     /// `changed.notify_all()` in `fabric.rs`, so the need and the level move
     /// exactly when a parked `await inbox` would.
-    FabricChanged { session: aterm_session::SessionId },
+    FabricChanged {
+        session: aterm_session::SessionId,
+    },
     /// A control client typed into a session and what its hover says of that
     /// moved, a new typist or a new minute (`typed_by::stamp`): the typist is
     /// named and the tab's chrome pushed again (`App::on_typed`).
-    Typed { session: aterm_session::SessionId },
+    Typed {
+        session: aterm_session::SessionId,
+    },
     /// Another Mac's node acted on a session over the fleet's drive op
     /// (`presence::post_driven`): the act, in words, is a record in the
     /// Messages log naming the host and the tab (`App::on_driven`).
@@ -3984,18 +4024,27 @@ enum Wake {
     /// [`spawn::register_session`]); the transition is keyed by `session` alone.
     /// An unknown, already-`Alive` or `Exited` session is a no-op
     /// (`SessionStore::mark_alive`).
-    Ready { session: u64, window: WindowId },
+    Ready {
+        session: u64,
+        window: WindowId,
+    },
     /// A session's PTY hit EOF. `session` is the tab to close and `window` its owner; the app
     /// exits only after the last tab (`--hold` keeps the last window), and an interactive shell
     /// that failed at start keeps its pane (`App::shell_failed_at_start`).
-    Exit { session: u64, window: WindowId },
+    Exit {
+        session: u64,
+        window: WindowId,
+    },
     /// The SIGUSR1 listener asked for a live-screen snapshot (PNG + txt); elsewhere the `image`
     /// verb serves.
     #[cfg(unix)]
     Snapshot,
     /// The engine saw BEL: flash the frame, beep (rate-limited), and request attention when the
     /// window is unfocused; a background tab's bell still flashes its window.
-    Bell { session: u64, window: WindowId },
+    Bell {
+        session: u64,
+        window: WindowId,
+    },
     /// XTWINOPS (`CSI t`): an authorized window manipulation, posted from the reader under the
     /// Terminal lock and applied by [`App::on_window_op`]; `window` is the owner fallback.
     #[cfg(target_os = "linux")]
@@ -4140,7 +4189,10 @@ enum Wake {
     },
     /// One demanded drawable acquisition completed; the identity keeps a replaced surface's late
     /// completion from waking another target.
-    GpuSurfaceReady { window: WindowId, surface: u64 },
+    GpuSurfaceReady {
+        window: WindowId,
+        surface: u64,
+    },
     /// The access card's worker half finished (identity warm, `marker` read); the main thread
     /// decides against the cached Full Disk Access probe.
     MacosAccessCardDecided {
@@ -4268,7 +4320,9 @@ enum Wake {
     NativeDocumentQueueSlotAvailable,
     /// Boot-health proof/disarm completed: a transient failure keeps rollback authority and
     /// re-arms one retry; success closes the latch for this process.
-    NativeBootHealthConfirmationFinished { confirmed: bool },
+    NativeBootHealthConfirmationFinished {
+        confirmed: bool,
+    },
     /// The retire of a latched installed activation for a newer verified release finished, with
     /// the disk read after it. Boxed (large); tests call `App::finish_activation_supersede`.
     #[cfg_attr(test, allow(dead_code))]
@@ -4281,7 +4335,9 @@ enum Wake {
     /// The incoming child received the parent's Commit while readerless: activate every adopted
     /// reader (the parent is already past its destructor-free exit point).
     #[cfg(unix)]
-    ActivateCommittedHandoff { expected: Vec<(u64, i32, i32)> },
+    ActivateCommittedHandoff {
+        expected: Vec<(u64, i32, i32)>,
+    },
     /// The history carry's import worker settled every adopted sidecar after Commit
     /// (`crate::handoff_history`); what could not cross counts onto `history_lost`.
     #[cfg(unix)]
@@ -4301,7 +4357,9 @@ enum Wake {
     /// gate and resumes a landed park's readers, so the stand-down never shows as a frozen
     /// terminal.
     #[cfg(any(target_os = "macos", all(test, unix)))]
-    UpdateHandoffStandingDown { attempt_id: u64 },
+    UpdateHandoffStandingDown {
+        attempt_id: u64,
+    },
     /// Control startup reserved its resources; this can unblock ProofReady but never releases
     /// the Commit reader gate.
     ControlPrepared,
@@ -4401,7 +4459,10 @@ enum Wake {
     },
     /// The background update thread's health ledger crossed a threshold (persistent
     /// pipeline failure), shown as an OS notification from the main thread.
-    UpdateHealth { title: String, body: String },
+    UpdateHealth {
+        title: String,
+        body: String,
+    },
     /// A dev build's standing against the public channel changed
     /// (`aterm_update::dev_channel::spawn_watch`).
     DevBuildStanding {
@@ -4416,7 +4477,10 @@ enum Wake {
     /// exceptions digest ([`update_words::launch_unregistered_entry`]), booked against
     /// attempt `attempt_id` (`App::book_launch_unregistered`).
     #[cfg(target_os = "macos")]
-    UpdateLaunchUnregistered { attempt_id: u64, pid: i32 },
+    UpdateLaunchUnregistered {
+        attempt_id: u64,
+        pid: i32,
+    },
     /// This process's own measure of LaunchServices' record of it, taken once a few
     /// seconds into a windowed launch ([`app_launch_successor::own_launch_record`]):
     /// a stale one is renewed by a handoff to a fresh launch, or opens the digest's entry
@@ -4431,7 +4495,10 @@ enum Wake {
     ApplyStagedUpdate,
     /// The update thread staged a strictly newer build: reconcile, arm the in-session apply
     /// lane, and show the update-ready nudge (`App.relaunch`).
-    UpdateStaged { build: u64, version: String },
+    UpdateStaged {
+        build: u64,
+        version: String,
+    },
     /// `settings set|unset`: enqueue one field in the versioned config lane (headless too). The
     /// worker completion replies; conflicts and post-publication uncertainty are ERR.
     SetSettingsField {
@@ -4561,13 +4628,10 @@ enum Wake {
         /// Raise the hosting window after the spawn (`raise_after_spawn`: an explicit `raise=`
         /// wins, else only an un-aimed spawn raises).
         raise: bool,
-        /// `identity=<name>|-`: the agent identity to spawn under; `Some(Default)` opts an aimed
-        /// spawn out of inheriting, `None` inherits the aimed session's (none when un-aimed).
-        identity: Option<control::IdentitySpec>,
         /// `theme=<name>`: the newborn's own theme, checked on the main thread
         /// before the spawner is asked (`App::spawn_theme`).
         theme: Option<String>,
-        /// `agent=claude` (a WORKER, `task_launch`): its task, checked; `None`
+        /// `agent=<word>` (a WORKER, `task_launch`): its task, checked; `None`
         /// for every other spawn.
         task: Option<task_launch::TaskOrder>,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
@@ -4580,8 +4644,6 @@ enum Wake {
         origin: aterm_session::SessionId,
         /// Optional cwd override; `None` defaults to the origin session's cwd.
         cwd: Option<String>,
-        /// As on `SpawnSession`; `None` inherits the origin's (the `of=` session).
-        identity: Option<control::IdentitySpec>,
         /// `theme=<name>`: as on `SpawnSession`.
         theme: Option<String>,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
@@ -4595,7 +4657,10 @@ enum Wake {
     /// What a warm spare's reader, or the `aterm-spare` thread, reports about it
     /// before anyone owns it (`spare::SpareNote`); `id` is its reserved local id
     /// (0 for the gate).
-    SpareNote { id: u64, note: spare::SpareNote },
+    SpareNote {
+        id: u64,
+        note: spare::SpareNote,
+    },
     /// `@<sid> close` (control socket): retire a session by id — the death half of
     /// `spawn`. Closes the tab hosting the resolved session; replies Ok(()) when the
     /// session is gone, Err(msg) when the target is unknown or the close was refused.
@@ -4677,7 +4742,10 @@ enum Wake {
     },
     /// The same X11 hand-off for a paste into the open find bar (`App::search_paste_in`).
     #[cfg(target_os = "linux")]
-    FindPasteReady { wid: WindowId, text: String },
+    FindPasteReady {
+        wid: WindowId,
+        text: String,
+    },
     /// A document open's blocking half finished (resolve, bounded read, UTF-8);
     /// `App::complete_document_admission` installs the tab if its ticket still matches.
     DocumentAdmitted(Box<app_documents::DocumentAdmissionOutcome>),
@@ -4698,10 +4766,15 @@ enum Wake {
     /// sheet). The App reads its secure field and replies on the stored
     /// channel; `proceed` is false on Cancel. `id` names the sheet.
     #[cfg(target_os = "macos")]
-    AskpassAnswered { id: u64, proceed: bool },
+    AskpassAnswered {
+        id: u64,
+        proceed: bool,
+    },
     /// The request's caller went away or its answer deadline elapsed.
     #[cfg(target_os = "macos")]
-    AskpassWithdraw { id: u64 },
+    AskpassWithdraw {
+        id: u64,
+    },
     /// The ALab secrets vault's join (`secrets_join`): the probe lane found the vault
     /// or read this Mac's configuration, the sheet was answered, or a join ended. No
     /// secret rides it: the typed password is read off the sheet's field on this
@@ -4710,11 +4783,15 @@ enum Wake {
     /// `edit`: open a fresh Editor view beside a session's tab (`App::begin_edit`).
     EditRequest(Box<control_edit::EditCall>),
     /// `edit` stopped waiting (its deadline, or a hangup): a late admission is dropped.
-    EditCancel { ticket: app_edit::EditTicketId },
+    EditCancel {
+        ticket: app_edit::EditTicketId,
+    },
     /// `await edit`: park a waiter on an edit ticket or file (`App::await_edit`).
     EditAwait(Box<control_edit::AwaitCall>),
     /// An `await edit` returned, however it ended: withdraw its waiter.
-    EditAwaitWithdraw { waiter: control_edit::WaiterId },
+    EditAwaitWithdraw {
+        waiter: control_edit::WaiterId,
+    },
     /// The multi-line paste sheet was answered (macOS window sheet, so it cannot
     /// block the loop; [`alert_keys`] routes its keys). Delivery finishes in
     /// [`App::deliver_paste_confirmed`]; `proceed` is false on cancel. `id` names the
@@ -4747,7 +4824,9 @@ enum Wake {
     /// whose reply leaves before the close runs. Handled in one turn with `el`: the
     /// gesture replays under the `Programmatic` close policy, restored before the
     /// turn ends so no other close slips through (`App::replay_confirmed_close`).
-    ConfirmedClose { replay: close_confirm::CloseReplay },
+    ConfirmedClose {
+        replay: close_confirm::CloseReplay,
+    },
     /// `confirm yes|no`: answer the close/quit question a control client raised
     /// (`App::answer_close_confirm_from_wire`); `Ok` follows `OK `, `Err` follows `ERR `.
     AnswerCloseConfirm {
@@ -4758,7 +4837,9 @@ enum Wake {
     /// AppKit action target and dispatched on `App` like `MenuAction`
     /// (`App::dispatch_status_action`).
     #[cfg(target_os = "macos")]
-    StatusAction { action: status_item::StatusAction },
+    StatusAction {
+        action: status_item::StatusAction,
+    },
     /// The status-item menu is opening (its `NSMenuDelegate` relay):
     /// `painted` is the glance its `menuNeedsUpdate:` just painted it from,
     /// which the App keeps until the next open so every click in this one
@@ -4775,7 +4856,9 @@ enum Wake {
     /// A sibling's `raise <sid>` was dialled (`sibling_scan::raise_sibling`):
     /// bring that sibling's process forward.
     #[cfg(target_os = "macos")]
-    SiblingRaised { pid: u32 },
+    SiblingRaised {
+        pid: u32,
+    },
     /// The fleet glance wrote its slot (fleet_glance.rs): a read began or
     /// ended, or the book moved (`App::on_fleet_read`).
     FleetRead,
@@ -4788,13 +4871,17 @@ enum Wake {
     /// aterm's own macOS notice through `notice_center`'s delegate): take
     /// them there, as the ❯ menu's Go does (`App::go_to_session`).
     #[cfg(any(target_os = "macos", windows))]
-    NoticeClicked { session: u64 },
+    NoticeClicked {
+        session: u64,
+    },
     /// AppKit asked to terminate by a path that bypasses the menu (Dock,
     /// AppleScript, logout/restart). The delegate vetoed it and posted this
     /// generation so `App` can run the normal confirmation and proof-gated document
     /// shutdown; stale generations are ignored by the menu arbiter.
     #[cfg(target_os = "macos")]
-    NativeTerminateRequested { generation: u64 },
+    NativeTerminateRequested {
+        generation: u64,
+    },
     /// The `--lifeline-fd` lifeline read EOF: the process that started this headless instance is
     /// gone, so it quits.
     #[cfg(unix)]
@@ -4804,7 +4891,9 @@ enum Wake {
     /// dies of that signal. Posted once, from the quit-signal watcher, and only
     /// in a headless instance.
     #[cfg(unix)]
-    ExitSignal { sig: i32 },
+    ExitSignal {
+        sig: i32,
+    },
     /// Open a new in-process window from the GPU-lost remedy's row;
     /// `user_event` books it (`App::open_new_window`). Ignored under headless.
     /// Cmd-N, its keybinding action and the menu book directly.
@@ -4821,11 +4910,17 @@ enum Wake {
     /// A native tab was selected (toolbar segment `index` of `window`, or `tab <N>`): switch via
     /// [`App::switch_tab_in`] and re-mirror.
     #[cfg(target_os = "macos")]
-    SelectTab { window: WindowId, index: usize },
+    SelectTab {
+        window: WindowId,
+        index: usize,
+    },
     /// A toolbar tab's close × was clicked: [`App::close_tab_at`], escalating through
     /// `escalate_pending_close` for the window's last tab.
     #[cfg(target_os = "macos")]
-    CloseTab { window: WindowId, index: usize },
+    CloseTab {
+        window: WindowId,
+        index: usize,
+    },
     /// A tab context-menu item was chosen ([`App::dispatch_tab_menu_action`]). It carries the
     /// stable [`tab_model::TabId`], since wakes queued mid-menu may reorder tabs.
     TabMenuAction {
@@ -4836,7 +4931,9 @@ enum Wake {
     /// A native tab context menu began tracking. It may close without a choice, so the opening
     /// gesture carries the candidate-only fence; the action wake repeats it.
     #[cfg(target_os = "macos")]
-    TabContextMenuOpening { window: WindowId },
+    TabContextMenuOpening {
+        window: WindowId,
+    },
     /// A session-argument row of a tab's context menu was clicked (the AGENT
     /// section's Go to <manager>, a worker row, Stop Worker… on `peer_sid`);
     /// `tab` is the pop-time identity. Runs [`App::dispatch_tab_menu_connection`].
@@ -4875,7 +4972,10 @@ enum Wake {
     },
     /// The pin editor ended with no write (Escape, or the tab is gone); metadata untouched.
     #[cfg(target_os = "macos")]
-    CancelSessionRename { window: WindowId, session: u64 },
+    CancelSessionRename {
+        window: WindowId,
+        session: u64,
+    },
     /// The control socket's `tab` verb (`new`/`<N>`/`next`/`prev`) on the front
     /// window's tabs. Unlike [`Wake::SelectTab`], only the main thread can resolve
     /// the front window, and the verb replies `(active_index, tab_count)` for
@@ -4976,7 +5076,9 @@ enum Wake {
     },
     /// `net-installed: <name>, …`: the programs a pass installed ([`parse_seed_line`]), recorded
     /// as the roster (`toolchain_words::installed`); no install authority crosses.
-    PkgSeed { installed: Vec<String> },
+    PkgSeed {
+        installed: Vec<String>,
+    },
     /// The live agent upgrade's rows for this instance's tabs, sent by the harness
     /// host's thread whenever they change (`harness_host`, over
     /// `aterm_agent::harness::upgrade_drive::View`): each tab's `upgrade=`, the
@@ -5011,7 +5113,10 @@ enum Wake {
     /// ("unknown" after each run of a loop, and at a worker's end). The window
     /// keeps it for the session's Autopilot chip and `status task=`
     /// (`App::apply_harness_fact`). A fact only; no authority crosses it.
-    HarnessFact { sid: String, fact: HarnessFact },
+    HarnessFact {
+        sid: String,
+        fact: HarnessFact,
+    },
     /// THE WALL CLOCK MOVED UNDER THE MONOTONIC ONE: the watchdog's sampler
     /// read a wake whose wall clock ran far ahead of `Instant`, which stops
     /// while the Mac sleeps (a sleep, or the clock set forward:
@@ -5029,10 +5134,15 @@ enum Wake {
     UpdateProgress(aterm_update::Progress),
     /// A person's `update check` began or ended, bracketing its reports so its downloads take
     /// the animated row.
-    UpdateCheckAsked { begun: bool },
+    UpdateCheckAsked {
+        begun: bool,
+    },
     /// `net-starting:`: an install pass started. `first_run` is the lane's verdict
     /// ([`pass_is_first_run`]; `false` from every other reader): only a first run opens the bar.
-    PkgSeedStarted { detail: String, first_run: bool },
+    PkgSeedStarted {
+        detail: String,
+        first_run: bool,
+    },
     /// The lane's own hold on the first-run row, AHEAD of the child that announces it
     /// ([`first_run_ahead`]): `open` right before a launch seed on a first run this
     /// machine consents to — the row opens at once, unsized, and outlives that seed's
@@ -5040,26 +5150,43 @@ enum Wake {
     /// folds it — and again before the exit of an update that stood aside at the lock,
     /// which is carried the same way; not `open` when no such update follows (the lane
     /// parks or stands by instead), which withdraws a row no child took over.
-    PkgFirstRunAhead { open: bool },
+    PkgFirstRunAhead {
+        open: bool,
+    },
     /// The bundled toolchain has no build this machine can run (the streamed
     /// `seed-unusable:` marker), so the notice [`Wake::PkgSeedStarted`] raised is
     /// always answered.
-    PkgSeedUnusable { detail: String },
+    PkgSeedUnusable {
+        detail: String,
+    },
     /// `seed-failed:`: every member failed, retiring "Installing…"; retryable.
-    PkgSeedFailed { detail: String },
+    PkgSeedFailed {
+        detail: String,
+    },
     /// `seed-done:` ([`atpkg::cli::SEED_DONE_MARKER`]): a pass that ended well with no roster to
     /// name says so. Display only.
-    PkgSeedDone { detail: String },
+    PkgSeedDone {
+        detail: String,
+    },
     /// An announced pass exited zero with the store empty: neither failure nor success is true.
-    PkgSeedNothing { detail: String },
+    PkgSeedNothing {
+        detail: String,
+    },
     /// `lock-waiting:`: this child is queued behind another atpkg at the store lock; a log line.
-    PkgLockWaiting { detail: String },
+    PkgLockWaiting {
+        detail: String,
+    },
     /// The wait ended holding the lock. One INFO log line.
-    PkgLockAcquired { detail: String },
+    PkgLockAcquired {
+        detail: String,
+    },
     /// The waited-on sibling outlasted the child's bound (exit 75): deferred, retried on a short
     /// backoff (`toolchain_words::deferred`). `stands_down`: this launch will not retry, and
     /// `detail` names the command to run.
-    PkgLockTimedOut { detail: String, stands_down: bool },
+    PkgLockTimedOut {
+        detail: String,
+        stands_down: bool,
+    },
     /// `managed-current:`: every agent program at its vendor's latest. A log line and a
     /// [`aterm_messages::Hold::LogOnly`] record, re-recorded only when its words change
     /// (`App::post_managed_current`).
@@ -5081,7 +5208,9 @@ enum Wake {
     PkgMachineRecordMissing,
     /// `group-aborted:` ([`atpkg::cli::GROUP_ABORTED_MARKER`]): a coherence group's transaction
     /// aborted; a Warn ledger row and the Packages badge. Display only.
-    PkgGroupAborted { detail: String },
+    PkgGroupAborted {
+        detail: String,
+    },
     /// A pass refused the `[machine]` settings or its write failed: the sentence to show,
     /// prefixed `not applied — ` / `failed — `.
     PkgMachineRefused(String),
@@ -5092,7 +5221,7 @@ enum Wake {
         text: String,
         reply: std::sync::mpsc::Sender<Result<AppNoticeTaken, &'static str>>,
     },
-    /// `notice <post|progress|done|ask|dismiss|act> …` (Owner-only): the message band's write
+    /// `notice <post|progress|done|ask|later|dismiss|act> …` (Owner-only): the message band's write
     /// face (`aterm_messages::wire::NoticeRequest::parse`, `App::take_notice`).
     Notice {
         request: aterm_messages::wire::NoticeRequest,
@@ -5117,7 +5246,9 @@ enum Wake {
     },
     /// A toolchain launch child exited ([`PkgLane::run`]). `clean` marks a whole pass that exited
     /// 0 with no failure marker, which clears the Packages badge's trouble.
-    PkgPassEnded { clean: bool },
+    PkgPassEnded {
+        clean: bool,
+    },
     /// A person's Settings ▸ Packages verb began, queued, took the lock or ended; it takes the
     /// band's row (`App::person_pass`). Only the packages worker sends it.
     PkgPersonPass(messages_host::PersonPass),
@@ -7313,23 +7444,6 @@ struct Session {
     /// Adopted with an integration from before loaders (`shell_body`): mirrored
     /// onto the registry, where `status integration_rev=` reads it as `frozen`.
     integration_frozen: bool,
-    /// The agent identity this session was spawned under (`spawn identity=<name>`;
-    /// `agent_identity`), or `None` for the human's own agent config. Immutable
-    /// (`meta set identity` is refused); mirrored onto the registry handle and
-    /// carried by the handoff record across an update and the restore leaf across a
-    /// quit.
-    identity: Option<String>,
-    /// The shell's admission under `identity`
-    /// ([`crate::agent_identity::Admission`]), held for the session's life and
-    /// given back as it drops: while it stands `identities forget` refuses that
-    /// identity, so the folder the shell's agent homes name stays. It is given
-    /// back before the shell is reaped (in the background, [`Drop`]), so a
-    /// process that outlives the session holds nothing. An adopted shell's is
-    /// taken from its label at adoption without waiting or failing
-    /// (`agent_identity::hold_adopted`), since the process that admitted it may
-    /// have exited. `None` with no identity, for a label a forget was taking at
-    /// adoption, and for stubs.
-    _identity_admission: Option<crate::agent_identity::Admission>,
     ctx: Arc<SessionCtx>,
     /// The provisioned child aterm's 0600 edge-token file, removed on `Drop`.
     /// `None` for `-e` sessions and adopted shells.
@@ -7632,8 +7746,7 @@ struct PooledSession {
     /// `[matrix_rain] enabled`; `Some(on)` wins until cleared or the session ends. Not persisted.
     rain_override: Option<bool>,
     /// The session's own theme (`theme session set`, `spawn theme=`, a split
-    /// from a themed pane, a restore); `None` draws the instance's, or the
-    /// session identity's `identity_themes` entry
+    /// from a themed pane, a restore); `None` draws the instance's
     /// ([`crate::session_theme`]). Carried by a seamless update and a
     /// restore.
     theme: Option<session_theme::SessionTheme>,
@@ -11030,22 +11143,6 @@ impl WindowState {
         }
     }
 
-    /// The session picker for this window, if it is the open variant.
-    fn session_picker(&self) -> Option<&crate::session_picker::SessionPickerState> {
-        match &self.overlay {
-            Some(crate::overlay::Overlay::SessionPicker(p)) => Some(p),
-            _ => None,
-        }
-    }
-
-    /// Mutable [`Self::session_picker`].
-    fn session_picker_mut(&mut self) -> Option<&mut crate::session_picker::SessionPickerState> {
-        match &mut self.overlay {
-            Some(crate::overlay::Overlay::SessionPicker(p)) => Some(p),
-            _ => None,
-        }
-    }
-
     /// Rows the active overlay (Settings, About or the command Palette, mutually
     /// exclusive) occupies in the composed frame: the one source the shared splice
     /// consults; `0` when none is open. Dispatches through the exhaustive
@@ -12267,6 +12364,8 @@ fn update_handoff_wake_class(ev: &Wake) -> UpdateHandoffEventClass {
         | Wake::CreateWindow
         | Wake::DetachActiveTab
         | Wake::ViewActiveSessionInNewWindow
+        | Wake::WorkstationSetup(_)
+        | Wake::InitialSetupApplyResolved
         // A tab spawned off the loop that lands after an overlap began is a
         // session the park never saw: left to the Commit, it would close with
         // this process (`tab_spawn`).
@@ -12276,6 +12375,7 @@ fn update_handoff_wake_class(ev: &Wake) -> UpdateHandoffEventClass {
         | Wake::WorkerLaunch { .. } => UpdateHandoffEventClass::Revoking,
         #[cfg(target_os = "macos")]
         Wake::StatusAction { .. }
+        | Wake::OpenSystemState
         | Wake::Askpass(_)
         | Wake::AskpassAnswered { .. }
         | Wake::AskpassWithdraw { .. } => UpdateHandoffEventClass::Revoking,
@@ -13152,6 +13252,9 @@ fn resample_wants_repair_frame(cause: ResampleCause) -> bool {
 type HostResumeProbe = Box<dyn FnOnce(&App)>;
 
 struct App {
+    /// First-launch setup starts only after this window is painted and committed.
+    workstation_setup: workstation_setup::Host,
+    system_state_host: system_state_host::Host,
     /// The native application-runtime seam backing every OS integration (chrome,
     /// menu bar, toolbar strip, notifications): [`platform::AppRtMacOS`] on macOS,
     /// `AppRtWindows` on Windows, [`platform::AppRtLinux`] elsewhere. Unit tests
@@ -15585,8 +15688,14 @@ impl App {
     ///   ([`Self::look_for_debugger_moment`]). Nothing waiting, no panel and no
     ///   ask queued: a few `bool` tests; headless and off-macOS nothing at all.
     fn tick_consent_lanes(&mut self, now: Instant) {
-        self.tick_macos_access_card(now);
         self.tick_debugger_access();
+        if self.workstation_setup.suppresses_permissions() {
+            // An owner's Security/ctl request still owns its panel and worker.
+            // The helper fences its automatic origins individually below.
+            self.tick_devtools_hand_over(now);
+            return;
+        }
+        self.tick_macos_access_card(now);
         self.tick_devtools_hand_over(now);
         #[expect(
             clippy::disallowed_methods,
@@ -15612,6 +15721,33 @@ impl App {
         deadline: &mut Option<Instant>,
         owner: &mut metrics::DeadlineOwner,
     ) {
+        // Setup owns the decision to release the permission lanes. Its timer
+        // and progress polling must keep waking while those lanes are held.
+        if let Some(wake) = self.workstation_setup.deadline(now) {
+            fold_owned_deadline(deadline, owner, wake, metrics::DeadlineOwner::ConsentCard);
+        }
+        if let Some(wake) = self.system_state_host.deadline(now) {
+            fold_owned_deadline(deadline, owner, wake, metrics::DeadlineOwner::ConsentCard);
+        }
+        if self.workstation_setup.suppresses_permissions() {
+            if let Some(wake) = self.next_devtools_hand_over_deadline(now) {
+                fold_owned_deadline(
+                    deadline,
+                    owner,
+                    wake,
+                    metrics::DeadlineOwner::DevToolsHandOver,
+                );
+            }
+            if let Some(wake) = self.next_debugger_change_deadline(now) {
+                fold_owned_deadline(
+                    deadline,
+                    owner,
+                    wake,
+                    metrics::DeadlineOwner::DebuggerChange,
+                );
+            }
+            return;
+        }
         if let Some(wake) = self.next_macos_access_card_deadline(now) {
             fold_owned_deadline(deadline, owner, wake, metrics::DeadlineOwner::ConsentCard);
         }
@@ -15709,6 +15845,9 @@ impl App {
     /// waiting hand-over and turns the helper panel to its done words. Never on
     /// a headless instance.
     fn on_devtools_probe_ready(&mut self) {
+        if self.workstation_setup.suppresses_permissions() {
+            return;
+        }
         if !cfg!(target_os = "macos") || self.headless {
             return;
         }
@@ -15877,6 +16016,17 @@ impl App {
             return HandOver::Headless;
         }
         let now = Instant::now();
+        if origin == devtools_helper::Origin::Automatic
+            && self.workstation_setup.suppresses_permissions()
+        {
+            match carried {
+                Some(listed) => self
+                    .devtools_helper
+                    .queue_after_listing(origin, now, listed),
+                None => self.devtools_helper.queue(origin, now),
+            }
+            return HandOver::Queued;
+        }
         let (reading, facts) = self.devtools_admit_facts(origin, now);
         let answer = match devtools_helper::admit(origin, moment, &facts) {
             Admit::Refuse(why) => HandOver::Refused(why),
@@ -16182,7 +16332,9 @@ impl App {
         // After both launch pages: the debugger-access launch ask's look.
         self.look_for_debugger_moment(now, Self::devtools_moment_is_quiet);
         // And after that: the ALab secrets vault's join, once the vault answered.
-        self.look_for_secrets_moment(now, Self::devtools_moment_is_quiet);
+        if !self.workstation_setup.suppresses_permissions() {
+            self.look_for_secrets_moment(now, Self::devtools_moment_is_quiet);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -16207,6 +16359,9 @@ impl App {
     /// instance never queues it.
     fn look_for_debugger_moment(&mut self, now: Instant, quiet: fn(&Self, Instant) -> bool) {
         use debugger_access::{AskWait, HostAsked, LaunchAsk, LaunchAskFacts, admit_launch_ask};
+        if self.workstation_setup.suppresses_permissions() {
+            return;
+        }
         if !self.debugger_launch.due(now) {
             return;
         }
@@ -16544,6 +16699,16 @@ impl App {
             return HandOver::Headless;
         }
         let now = Instant::now();
+        if origin == devtools_helper::Origin::Automatic
+            && self.workstation_setup.suppresses_permissions()
+        {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "automatic Full Disk Access guidance waits for the current setup consent"
+            )]
+            self.devtools_helper.queue_fda(origin, now);
+            return HandOver::Queued;
+        }
         let (facts, gap_left) = self.fda_admit_facts(origin, fda);
         let answer = match devtools_helper::admit_fda(origin, moment, &facts) {
             Admit::Refuse(why) => HandOver::Refused(why),
@@ -16875,6 +17040,9 @@ impl App {
     /// ([`Self::devtools_moment_is_quiet`]; a test's stand-in).
     fn launch_warmup_look(&mut self, now: Instant, quiet: fn(&Self, Instant) -> bool) {
         use consent_launch::{FdaLaunch, Skip, WarmupStep};
+        if self.workstation_setup.suppresses_permissions() {
+            return;
+        }
         if !cfg!(target_os = "macos")
             || !self.consent_launch.live()
             || self.consent_launch.settled()
@@ -17066,6 +17234,13 @@ impl App {
         now: Instant,
     ) -> devtools_helper::HandOver {
         use devtools_helper::HandOver;
+        if origin == devtools_helper::Origin::Automatic
+            && self.workstation_setup.suppresses_permissions()
+        {
+            self.devtools_helper
+                .queue_after_listing(origin, now, listed);
+            return HandOver::Queued;
+        }
         let (_, facts) = self.devtools_admit_facts(origin, now);
         let answer = match devtools_helper::admit(origin, devtools_helper::Moment::Quiet, &facts) {
             devtools_helper::Admit::Refuse(why) => HandOver::Refused(why),
@@ -17214,6 +17389,9 @@ impl App {
     /// * `Watching` → one cached probe per `probe_interval_ms` for at most
     ///   `consent_card::WATCH_FOR`, so a switch flipped in Settings is noticed.
     fn tick_macos_access_card(&mut self, now: Instant) {
+        if self.workstation_setup.suppresses_permissions() {
+            return;
+        }
         if !cfg!(target_os = "macos") || self.headless {
             return;
         }
@@ -17412,6 +17590,7 @@ impl App {
             return;
         }
         if granted {
+            self.recover_consent_tab_attention();
             self.stamp_fda_verified_host();
             self.clear_fda_entries();
             self.show_macos_access_granted(now);
@@ -17660,6 +17839,10 @@ impl App {
     ///   verdict tells the launch warm-up where it stands.
     /// * `Need`: [`consent_card::decide_need`]. An `Ask` makes the card due.
     fn decide_macos_access_card(&mut self, decision: consent_card::PendingDecision) {
+        if self.workstation_setup.suppresses_permissions() {
+            self.consent_card_host.pending = Some(decision);
+            return;
+        }
         if !self.consent_card.admit_current_policy(
             self.config.privacy_probe_gate().permits(),
             self.config.privacy_notice(),
@@ -17990,11 +18173,18 @@ impl App {
     pub(crate) fn reconcile_consent_observer(&mut self) -> Option<consent_observer::StartOutcome> {
         let proxy = self.proxy.clone();
         let mode = self.effective_observer_mode();
-        self.consent_observer.reconcile(mode, move || {
+        let outcome = self.consent_observer.reconcile(mode, move || {
             if let Some(proxy) = &proxy {
                 let _ = proxy.send_event(Wake::ConsentObserver);
             }
-        })
+        });
+        // A policy change can hide the denial contribution too, without
+        // answering it or touching another owner's attention.
+        if outcome.is_some() {
+            let _ = self.consent_observer.take_attention_changed();
+            self.refresh_consent_tab_attention();
+        }
+        outcome
     }
 
     /// Fold what the observer queued and act on it: drain the stream's events
@@ -18015,6 +18205,9 @@ impl App {
         self.note_observed_prompts(signing_identity::running_bundle_id_if_warm(), now);
         if self.announces_observed_prompts() {
             self.announce_observed_consent_prompts(now);
+        }
+        if self.consent_observer.take_attention_changed() {
+            self.refresh_consent_tab_attention();
         }
     }
 
@@ -18122,7 +18315,6 @@ impl App {
             return;
         }
         for prompt in &fresh {
-            self.raise_consent_tab_attention(prompt.session);
             self.post_consent_notification(&self.consent_prompt_notice(prompt));
         }
         self.mark_status_dirty();
@@ -18174,8 +18366,13 @@ impl App {
             .consent_attention
             .note(event)
             .for_mode(self.effective_observer_mode());
-        if let Some(session) = outcome.raise_tab {
-            self.raise_consent_tab_attention(session);
+        // Only a live session can own this mark; its retirement removes
+        // it from the gate. Never write the shared native indication bit.
+        if let Some(session) = outcome.raise_tab
+            && self.pool.get(session).is_some()
+            && self.consent_attention.mark_session(session, Instant::now())
+        {
+            self.refresh_consent_tab_attention();
         }
         if let Some(notice) = &outcome.notice {
             self.post_consent_notification(notice);
@@ -18235,39 +18432,36 @@ impl App {
         }
     }
 
-    /// Raise the out-of-band tab attention mark for one session's tab.
-    ///
-    /// The `attention` field, not `status_attention`: this is a fact the status
-    /// classifier cannot see and must not be able to erase (`TabIndicators`
-    /// states the rule).
-    fn raise_consent_tab_attention(&mut self, session: u64) {
-        let mut targets: Vec<(WindowId, usize)> = Vec::new();
-        for (wid, ws) in &self.windows {
-            for (index, tab) in ws.tab_set.tabs().iter().enumerate() {
-                let shows = tab.root.any_leaf(&mut |view| {
-                    self.view_store
-                        .get(*view)
-                        .copied()
-                        .and_then(tab_model::View::terminal_session)
-                        == Some(session)
-                });
-                if shows {
-                    targets.push((*wid, index));
-                }
-            }
+    /// Consent's owners moved: push their current contributions to both tab
+    /// strips. The generic native indication belongs to its own producer.
+    fn refresh_consent_tab_attention(&mut self) {
+        self.refresh_tab_chrome_windows(self.windows.keys().copied().collect());
+        self.mark_status_dirty();
+    }
+
+    /// Only an observation at or after a session's latest refusal can answer
+    /// it. Read the existing cache, never dispatch a probe or touch native bits.
+    fn recover_consent_tab_attention(&mut self) {
+        if !self.consent_attention.has_denials() {
+            return;
         }
-        for (wid, index) in targets {
-            if let Some(tab) = self
-                .windows
-                .get_mut(&wid)
-                .and_then(|ws| ws.tab_set.tab_at_mut(index))
-            {
-                tab.presentation.indicators.attention = true;
-            }
-            if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-                w.request_redraw();
-            }
+        let observed = self.consent.fda_grant_observed_at(
+            self.config.privacy_probe_gate(),
+            Duration::from_millis(self.config.privacy_probe_interval_ms()),
+        );
+        if let Some(observed) = observed
+            && self.consent.window_reads_own_grant()
+            && self.consent_attention.recover(observed)
+        {
+            self.refresh_consent_tab_attention();
         }
+    }
+
+    /// A completed probe also answers denials while the access card is disabled
+    /// or settled. An older queued completion leaves newer refusals standing.
+    fn on_consent_probe_ready(&mut self, now: Instant) {
+        self.recover_consent_tab_attention();
+        self.tick_macos_access_card(now);
     }
 
     /// Post one native notification through `notify.rs`'s bounded queue (drops on
@@ -19762,6 +19956,8 @@ impl App {
             harness_policy_cell::HarnessPolicyCell::new(startup_config.harness.clone());
         let node_log_values = native_config_service.snapshot().semantic_values;
         App {
+            workstation_setup: workstation_setup::Host::default(),
+            system_state_host: system_state_host::Host::default(),
             apprt,
             system_reduce_motion: false,
             _reduce_motion: None,
@@ -20427,7 +20623,7 @@ impl App {
         self.split_focused_pane_in_window(
             owner,
             dir,
-            tab_spawn::SpawnAsk::new(cwd_override.as_deref(), None),
+            tab_spawn::SpawnAsk::new(cwd_override.as_deref()),
             tab_spawn::TabSpawnThen::Nothing,
         )
     }
@@ -20435,8 +20631,7 @@ impl App {
     /// [`Self::split_focused_pane_in`] on an explicit owner window (`spawn window=<id>
     /// split=…` / `@<sid> spawn split=…`), front or not; the grid is read from `owner`.
     /// The new pane's shell spawns off the event loop ([`Self::open_split_off_loop`])
-    /// as `ask` says: the folder the caller named, the agent identity the newborn
-    /// pane spawns under (`spawn split=… identity=<name>`) and a worker's task file
+    /// as `ask` says: the folder the caller named and a worker's task file
     /// (`spawn split=… agent=claude`), each `None` for every chord and menu split.
     /// `Ok` means the split is booked, and `then` hears when the pane lands, or
     /// why it did not. A refusal here answers `then` too.
@@ -20444,8 +20639,7 @@ impl App {
         &mut self,
         owner: WindowId,
         dir: pane::SplitDir,
-        // The new pane's folder and agent identity (`spawn split=… cwd=…
-        // identity=<name>`); a plain ask for every chord and menu split.
+        // The new pane's folder and task; a plain ask for every chord and menu split.
         ask: tab_spawn::SpawnAsk,
         then: tab_spawn::TabSpawnThen,
     ) -> Result<(), String> {
@@ -23056,6 +23250,7 @@ impl ApplicationHandler<Wake> for App {
         // Apply the carried window stack once every restored window is on glass. On the
         // update lane `maybe_signal_handoff_ready` applies it instead.
         let _ = self.settle_carried_window_show();
+        self.tick_workstation_setup(park_now);
         // The cold lane's "updated" row waits for the first frame on glass; this process
         // adopted no shells, so none was repainted.
         if self.first_present_done
@@ -24896,10 +25091,19 @@ impl App {
             // The ALab secrets vault's join: the vault found (the ask looks at the
             // park), a configured Mac's read, the sheet's answer, a join's end.
             Wake::SecretsVault(wake) => self.on_secrets_vault(wake),
+            Wake::WorkstationSetup(request) => self.offer_workstation_setup(request),
+            #[cfg(target_os = "macos")]
+            Wake::OpenSystemState => {
+                self.open_system_state_tab();
+            }
+            Wake::InitialSetupStatus { generation, status } => {
+                self.receive_system_state_status(generation, status)
+            }
+            Wake::InitialSetupApplyResolved => self.resolve_system_state_apply(),
             // The Full Disk Access answer is in its slot: the card acts on it
             // here, and the park's `sync_settings_consent_posture` republishes
             // the Security page, equality-gated.
-            Wake::ConsentProbeReady => self.tick_macos_access_card(Instant::now()),
+            Wake::ConsentProbeReady => self.on_consent_probe_ready(Instant::now()),
             // A nudge only: the census answer is in its slot, and the park's
             // `sync_settings_consent_posture` republishes the Security page.
             Wake::ConsentCensusReady => {}
@@ -25832,11 +26036,10 @@ impl App {
                 cwd,
                 split,
                 raise,
-                identity,
                 theme,
                 task,
                 reply,
-            } => self.spawn_session_aimed(aim, cwd, split, raise, identity, theme, task, reply),
+            } => self.spawn_session_aimed(aim, cwd, split, raise, theme, task, reply),
             // A new tab's or split's shell, up (or not) on the spawner thread: install
             // the tab or pane, answer whoever waits, replay what was typed meanwhile
             // (`tab_spawn`).
@@ -25888,7 +26091,6 @@ impl App {
                 place,
                 origin,
                 cwd,
-                identity,
                 theme,
                 reply,
             } => match self.spawn_theme(theme) {
@@ -25897,7 +26099,6 @@ impl App {
                     place,
                     &origin,
                     cwd,
-                    identity,
                     theme,
                     Box::new(move |_, spawned| {
                         let _ = reply.send(spawned);
@@ -32548,8 +32749,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
 ///
 /// The one binary owns machine setup. Its action runs only after argument and
 /// inherited-handoff validation, logging, the boot updater and the environment
-/// mutation floor. Scripted, headless and successor launches never invoke it.
-pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Option<fn()>) {
+/// mutation floor. A real first frame and a committed handoff are required;
+/// scripted and headless launches never invoke it.
+pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Option<fn() -> bool>) {
     // The GUI-entry clock; the router anchors its own Rust-main boundary before dispatch.
     metrics::mark_process_start();
     // This process is the window or the headless engine (the front door answered every
@@ -32567,9 +32769,6 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     // Read and clear every `ATERM_SEAMLESS_*` / `ATERM_HANDOFF_*` variable once, while
     // single-threaded; everything below reads `handoff_env` (`HandoffName` fences the rest).
     let mut handoff_env = handoff_env::HandoffEnv::capture();
-    let inherited_handoff = handoff_env::HANDOFF_ENV_KEYS
-        .iter()
-        .any(|key| handoff_env.present(*key));
     // A descriptor limit named on a launch that is no update's is a stray an older
     // successor left in a shell: dropped before the boot apply's re-exec, which names
     // `ATERM_UPDATED_FROM` itself, could carry it on as an update's.
@@ -32852,11 +33051,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     // lanes set it): its first session skips the launch's `-e` command. Taken after the boot
     // apply, whose re-exec and revert inherit it, and before any session spawns.
     let relaunch_of_running = aterm_log::env::take(aterm_update::RELAUNCH_OF_RUNNING_ENV).is_some();
-    let first_run_eligible = !headless_flag
-        && exec_command.is_none()
-        && !inherited_handoff
-        && updated_from.is_none()
-        && !relaunch_of_running;
+    let first_run_commandless = exec_command.is_none();
     // …and whose launch-record renewal this run is (`launch_record_renewal`), taken for
     // the same reasons: a renewal's successor never renews again. A malformed value reads
     // as none, and a value can only stop a renewal, never grant one.
@@ -32942,9 +33137,6 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     // sessions a handoff hands over.
     #[cfg(unix)]
     descriptor_limit::settle_incoming_descriptor_limit(&handoff_env);
-    if first_run_eligible && let Some(first_run) = first_run {
-        first_run();
-    }
     // Where the warm prologue runs (`warm_order`): before the dial on the launched lane,
     // after the intake elsewhere; decided from the snapshot and flags alone.
     #[cfg(target_os = "macos")]
@@ -33239,6 +33431,12 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     };
     // Both halves admitted: an update's candidate, waiting for a Commit that can come.
     let overlap_admitted = handoff_commit.is_some();
+    let first_run_eligible = !headless_flag
+        && workstation_setup::eligible_launch_command(
+            first_run_commandless,
+            relaunch_of_running,
+            overlap_admitted,
+        );
     let handoff_reader_gate = handoff_ready
         .is_some()
         .then(crate::spawn::DeferredReaderGate::closed);
@@ -33501,12 +33699,18 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     // no vault configured asks at once, off the event loop, whether the ALab vault answers
     // on this LAN, so the window can offer the join at its quiet moment. Its posts wait in
     // `lane_sink` too.
-    secrets_join::spawn_probe_lane(headless, app_config::config_path(), {
-        let sink = lane_sink.clone();
-        Arc::new(move |wake| {
-            let _ = sink.send_event(Wake::SecretsVault(wake));
-        })
-    });
+    let unified_setup = (first_run.is_some() && first_run_eligible)
+        || (!headless
+            && aterm_types::dirs::runs_under_private_state_root()
+            && aterm_types::dev_seam!("ATERM_DEBUG_WORKSTATION_SETUP").is_some());
+    if !unified_setup {
+        secrets_join::spawn_probe_lane(headless, app_config::config_path(), {
+            let sink = lane_sink.clone();
+            Arc::new(move |wake| {
+                let _ = sink.send_event(Wake::SecretsVault(wake));
+            })
+        });
+    }
     // The coding-agent primer in THIS build's words, the human's and, at the first launch
     // of a build, every agent identity's, asked for before session 0 is spawned or adopted
     // (`spawn::PrimeCue::Launch`): a seamless update's successor adopts every tab and an
@@ -33915,16 +34119,6 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     let restore_cwd0: Option<String> = restore_manifest
         .as_ref()
         .and_then(restore::RestoreManifest::first_leaf_cwd);
-    // A forked session 0 runs under the agent identity of the pane it will fill, if it still
-    // exists: env cannot change after the fork, and the graft refuses a mismatch.
-    let restore_identity0: Option<String> = if adopt0.is_none() {
-        restore_manifest
-            .as_ref()
-            .and_then(|m| m.first_leaf_identity())
-            .and_then(agent_identity::restorable)
-    } else {
-        None
-    };
     // An update's relaunch withholds the `-e` command from its bootstrap (the window already
     // ran it), or a successor with no terminal pane to adopt would rerun it every update.
     // Later tabs and splits get it back.
@@ -33946,9 +34140,8 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         &session_factory,
         &session0_sink,
         restore_cwd0.as_deref(),
-        None,                         // not a connected controller spawn
-        restore_identity0.as_deref(), // the identity of the pane it fills, else the human's own
-        None,                         // no worker's task
+        None, // not a connected controller spawn
+        None, // no worker's task
         adopt0,
     )
     .unwrap_or_else(|e| fatal_launch_error(headless, &format!("spawn failed: {e}")));
@@ -34519,9 +34712,9 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     }
 
     // The program check watch (`program_check_watch`): whether macOS's program check
-    // still answers, on a thread of its own in a window on macOS, socket or not; its notes
-    // reach the window as the harness host's do.
-    program_check_watch::start(headless, {
+    // still answers, on a thread of its own on macOS, windowed or headless, socket or not;
+    // its notes reach the app as the harness host's do.
+    program_check_watch::start({
         let proxy = event_loop.create_proxy();
         std::sync::Arc::new(move |note| {
             let _ = proxy.send_event(Wake::HostNote(note));
@@ -34575,15 +34768,6 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     if !headless {
         harness_host::sweep_legacy_hooks();
     }
-    // The tombstones `identities forget` could not empty, left by aterms no
-    // longer running, still hold a forgotten identity's agent files: they go
-    // now, off-thread, and nothing else in the identities folder is touched.
-    // A headless instance sweeps too: the folder is under aterm's own state
-    // root, not the user's settings, a headless instance spawns and forgets
-    // identities there like any other, and its own next forget would sweep the
-    // same tombstones by the same rule.
-    agent_identity::sweep_tombstones_at_launch();
-
     // Kept for the graceful-exit cleanup.
     let root_sid = session0.ctx.self_id.clone();
 
@@ -34882,6 +35066,11 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     };
     let node_log_values = native_config_service.snapshot().semantic_values;
     let mut app = App {
+        workstation_setup: workstation_setup::Host::for_launch(
+            first_run.filter(|_| first_run_eligible),
+            headless,
+        ),
+        system_state_host: system_state_host::Host::default(),
         apprt,
         system_reduce_motion: false,
         _reduce_motion: None,
@@ -35949,8 +36138,6 @@ fn ptyless_session(id: u64, self_id: SessionId, term: Terminal, sink: Arc<SinkWr
         rekey_channel: false,
         body_loader: false,
         integration_frozen: false,
-        identity: None,
-        _identity_admission: None,
         ctx,
         child_proxy: None,
         output_wake_pending: Arc::new(AtomicU64::new(0)),

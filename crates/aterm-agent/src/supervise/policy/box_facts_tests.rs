@@ -59,6 +59,7 @@ fn every_fact() -> BoxFacts {
         login_back: true,
         login_renewed: true,
         login_method: Some(aterm_phase::LoginMethod::Subscription),
+        worker_agent: Some(aterm_phase::Program::Gemini),
     }
 }
 
@@ -88,6 +89,8 @@ fn facts_read_back_as_written() {
     assert_eq!(back.cwd, facts.cwd);
     assert_eq!(back.trusted_cwd, facts.trusted_cwd);
     assert_eq!(back.shell_cwds, facts.shell_cwds);
+    assert_eq!(back.worker_agent, Some(aterm_phase::Program::Gemini));
+    assert!(text.contains("\"worker_agent\":\"gemini\""), "{text}");
     let worker = back.worker.expect("read").expect("ok");
     assert_eq!(worker.pid(), Some(4242));
     assert_eq!(
@@ -151,6 +154,14 @@ fn facts_this_build_cannot_read_are_refused() {
         "{\"question\":{\"answer\":true,\"priority\":\"eventually\",\"own\":null,\"fell_back\":false}}"
     ));
     assert!(refuse("{\"cwd\":\"@nowhere/x\"}"));
+    assert!(
+        refuse("{\"worker_agent\":\"vim\"}"),
+        "an agent it does not know"
+    );
+    assert!(
+        !refuse("{\"worker_agent\":\"muse\"}"),
+        "the control: one it does"
+    );
 }
 
 /// THE CONTEXT IS THE FACTS' AND THE POLICY'S: what the loop learned lands
@@ -180,6 +191,7 @@ fn the_context_is_built_from_the_facts_and_the_policy() {
     );
     assert!(!ctx.cwd_known);
     assert_eq!(ctx.trusted_cwd, None);
+    assert_eq!(ctx.worker_agent, None, "no spawn's worker");
     assert!(ctx.limit_reset);
     assert!(!ctx.answer_questions);
     // `[harness] usage_credits` reaches the context as written, off by
@@ -214,4 +226,5 @@ fn the_context_is_built_from_the_facts_and_the_policy() {
     assert_eq!(ctx.python_allow, vec!["x*.py".to_string()]);
     assert_eq!(ctx.box_call.as_deref(), Some("Bash"));
     assert_eq!(ctx.shell_cwds, facts.shell_cwds);
+    assert_eq!(ctx.worker_agent, Some(aterm_phase::Program::Gemini));
 }

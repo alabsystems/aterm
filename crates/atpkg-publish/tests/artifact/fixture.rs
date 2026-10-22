@@ -5,9 +5,12 @@
 //! run on an x86_64 box, the Mach-O cases on Linux and the PE cases everywhere), trust
 //! checkouts with bare origins, and a compiler the client's lineage checker admits.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 pub use super::super::shared::scratch;
+use super::super::shared::{Made, Tree, made_once};
 
 /// `ELF64` header bytes: `e_machine`, `EI_CLASS`, `EI_DATA`, padded to 64 bytes.
 #[must_use]
@@ -136,20 +139,63 @@ pub const MINTED_LEDGER: &str =
 pub const LEDGER: &str = "bootstrap/trust-stage0/seed-ledger.toml";
 
 /// A trust checkout at `dir` whose origin (the bare `<dir>.git`) has `ledger` on main,
-/// fetched — the receipt switch's input.
+/// fetched — the receipt switch's input. Seven git processes and a push's receive-pack,
+/// so the pair is made once per process for each ledger, by the first caller, and laid
+/// down for every caller after: the checkout names its origin `<dir>.git`, which laying
+/// the checkout moves with it.
 pub fn trust_repo(dir: &Path, ledger: &str) -> PathBuf {
+    static MADE: Made<String, Arc<Tree>> = Mutex::new(BTreeMap::new());
     let bare = dir.with_extension("git");
-    std::fs::create_dir_all(&bare).expect("mkdir bare");
-    git(&bare, &["init", "-q", "--bare"]);
-    std::fs::create_dir_all(dir).expect("mkdir checkout");
-    git(dir, &["init", "-q", "."]);
-    git(dir, &["remote", "add", "origin", &bare.to_string_lossy()]);
-    put(&dir.join(LEDGER), ledger.as_bytes());
-    git(dir, &["add", "-A"]);
-    git(dir, &["commit", "-q", "-m", "ledger"]);
-    git(dir, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
-    git(dir, &["fetch", "-q", "origin"]);
+    let mut made_here = false;
+    let origin = made_once(&MADE, &ledger.to_string(), dir, |dir| {
+        made_here = true;
+        bare_origin(&bare);
+        std::fs::create_dir_all(dir).expect("mkdir checkout");
+        git(dir, &["init", "-q", "."]);
+        git(dir, &["remote", "add", "origin", &bare.to_string_lossy()]);
+        put(&dir.join(LEDGER), ledger.as_bytes());
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "ledger"]);
+        git(dir, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        git(dir, &["fetch", "-q", "origin"]);
+        Arc::new(Tree::read(&bare))
+    });
+    if !made_here {
+        origin.lay(&bare);
+    }
     bare
+}
+
+/// An empty bare repository at `bare` that a push starts no maintenance in: a push's
+/// receive-pack reads the bare's own config, never the pusher's `-c`, and would otherwise
+/// run `git maintenance run --auto` after every push to a repository this small.
+pub fn bare_origin(bare: &Path) {
+    use std::io::Write as _;
+    std::fs::create_dir_all(bare).expect("mkdir bare");
+    git(bare, &["init", "-q", "--bare"]);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(bare.join("config"))
+        .and_then(|mut config| config.write_all(b"[maintenance]\n\tauto = false\n"))
+        .expect("turn the bare's maintenance off");
+}
+
+/// A clean checkout at `dir` of one commit (`one`) holding `files`, made once per process
+/// for each set of files, by the first caller, and laid down for every caller after.
+pub fn checkout(dir: &Path, files: &[(&str, &[u8])]) {
+    static MADE: Made<Vec<(String, Vec<u8>)>, ()> = Mutex::new(BTreeMap::new());
+    let key = files
+        .iter()
+        .map(|(path, bytes)| ((*path).to_string(), bytes.to_vec()))
+        .collect();
+    made_once(&MADE, &key, dir, |dir| {
+        for (path, bytes) in files {
+            put(&dir.join(path), bytes);
+        }
+        git(dir, &["init", "-q", "."]);
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "one"]);
+    });
 }
 
 /// Push a commit to `bare`'s main from a scratch clone that writes `ledger` (or a
@@ -231,9 +277,6 @@ pub fn toolchain(root: &Path) -> PathBuf {
     );
     root.join("bin")
 }
-
-use std::collections::BTreeMap;
-use std::sync::Mutex;
 
 use atpkg_publish::artifact::tools::{Ran, Run, RunError, Tools};
 

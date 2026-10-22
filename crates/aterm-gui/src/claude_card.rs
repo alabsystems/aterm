@@ -1218,23 +1218,33 @@ impl LineEnd {
     }
 }
 
+/// The end whose words a slot of [`line_texts`] keeps for `view`: a landing is
+/// told under Land alone (its words are the face's), and every other end is
+/// the view's own words — a timer's time among them, which follows Cruise's
+/// words alone (§10.6, [`timed_line_texts`]). So a slot's words are the same
+/// whichever end first asked for them: Land's never wear a timer's time
+/// because a timed end was the first Land line asked for.
+const fn untimed_end(view: AutopilotView, end: LineEnd) -> LineEnd {
+    match (view, end) {
+        (AutopilotView::Land, LineEnd::Landed) => LineEnd::Landed,
+        _ => LineEnd::Mode,
+    }
+}
+
 /// The line's words for `view` and how it ends ([`make_line_texts`]), made
 /// once per pair: the build is the process's, so they never change while it
 /// runs, and a frame formats nothing — they are looked up only where the
 /// card is laid out, when its key moves or the cells its layout read do.
 fn line_texts(view: AutopilotView, end: LineEnd) -> &'static [String] {
     static TEXTS: [OnceLock<Vec<String>>; 6] = [const { OnceLock::new() }; 6];
-    // A landing is told under Land alone: its words are the face's; an
-    // armed timer's time follows Cruise's own words (§10.6).
     let end = match (view, end) {
         (AutopilotView::Cruise, LineEnd::CruiseUntil(at)) => return timed_line_texts(None, at),
-        (AutopilotView::Land, _) => end,
-        _ => LineEnd::Mode,
+        _ => untimed_end(view, end),
     };
     let slot = match (view, end) {
         (AutopilotView::Land, LineEnd::Landed) => &TEXTS[5],
         (AutopilotView::Cruise, _) => &TEXTS[0],
-        (AutopilotView::Land, LineEnd::Mode | LineEnd::CruiseUntil(_)) => &TEXTS[1],
+        (AutopilotView::Land, _) => &TEXTS[1],
         (AutopilotView::Off, _) => &TEXTS[2],
         // An agent's own switch off reads the master switch's words here.
         (AutopilotView::MasterOff | AutopilotView::AgentOff(_), _) => &TEXTS[3],
@@ -1288,13 +1298,12 @@ fn line_texts_for(rows_kind: usize, view: AutopilotView, end: LineEnd) -> &'stat
         (AutopilotView::Cruise, LineEnd::CruiseUntil(at)) => {
             return timed_line_texts(Some(agent), at);
         }
-        (AutopilotView::Land, _) => end,
-        _ => LineEnd::Mode,
+        _ => untimed_end(view, end),
     };
     let slot = match (view, end) {
         (AutopilotView::Land, LineEnd::Landed) => &table[5],
         (AutopilotView::Cruise, _) => &table[0],
-        (AutopilotView::Land, LineEnd::Mode | LineEnd::CruiseUntil(_)) => &table[1],
+        (AutopilotView::Land, _) => &table[1],
         (AutopilotView::Off, _) => &table[2],
         (AutopilotView::MasterOff | AutopilotView::AgentOff(_), _) => &table[3],
         (AutopilotView::Unhosted, _) => &table[4],

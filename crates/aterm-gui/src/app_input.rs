@@ -1048,7 +1048,6 @@ fn native_settings_route_for_aux(
         | AuxTarget::Menu
         | AuxTarget::TabMenu
         | AuxTarget::AutopilotMenu
-        | AuxTarget::SessionPicker
         | AuxTarget::Overview => None,
     }
 }
@@ -1072,6 +1071,8 @@ const fn native_binding_allowed(action: keybinding::Action) -> bool {
             | Action::Paste
             | Action::PasteSelection
             | Action::Find
+            | Action::FindNext
+            | Action::FindPrev
             | Action::FocusPaneLeft
             | Action::FocusPaneRight
             | Action::FocusPaneUp
@@ -1104,6 +1105,8 @@ const _: () = {
     assert!(native_binding_allowed(Action::SwitchTab(3)));
     assert!(native_binding_allowed(Action::Paste));
     assert!(native_binding_allowed(Action::Find));
+    assert!(native_binding_allowed(Action::FindNext));
+    assert!(native_binding_allowed(Action::FindPrev));
     assert!(native_binding_allowed(Action::ScrollPageDown));
     assert!(native_binding_allowed(Action::ToggleSettings));
     // Choosing a theme owes the terminal nothing.
@@ -1114,10 +1117,8 @@ const _: () = {
     assert!(!native_binding_allowed(Action::FontReset));
     assert!(!native_binding_allowed(Action::JumpPrevPrompt));
     assert!(!native_binding_allowed(Action::JumpNextPrompt));
-    // Find-again and Select All act on the TERMINAL's search/selection, which a
-    // native view does not own — consumed as no-ops there.
-    assert!(!native_binding_allowed(Action::FindNext));
-    assert!(!native_binding_allowed(Action::FindPrev));
+    // Select All is capability-routed separately to the native view's text
+    // model, never the parked terminal's selection.
     assert!(!native_binding_allowed(Action::SelectAll));
     // Copy is capability-routed separately so it can never consult the parked
     // terminal selection beneath a native tab.
@@ -5217,9 +5218,6 @@ impl App {
                         .map(|o| o.kind())
                     {
                         Some(OverlayKind::Palette) => app.palette_input_event(wid, &ev),
-                        Some(OverlayKind::SessionPicker) => {
-                            app.session_picker_input_event(wid, &ev);
-                        }
                         Some(OverlayKind::Overview) => {
                             app.overview_input_event(wid, &ev);
                         }
@@ -8814,9 +8812,19 @@ impl App {
     }
 
     fn native_preedit_active(&self, wid: WindowId) -> bool {
-        let Some((_, view)) = self.active_native_view(wid) else {
+        let Some((instance, view)) = self.active_native_view(wid) else {
             return false;
         };
+        // Platform composition belongs to the window even when a secret field
+        // deliberately omits marked text from its native projection. Its final
+        // IME commit owns the text; direct key lowering must not insert it too.
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|window| !window.preedit.is_empty())
+        {
+            return true;
+        }
         match self.native_runtime.view_state(view) {
             Some(crate::native_app::AppViewState::Editor(state)) => !state.preedit.is_empty(),
             Some(crate::native_app::AppViewState::Settings(state)) => state
@@ -8826,6 +8834,19 @@ impl App {
                 .unwrap_or(&state.search_input)
                 .preedit()
                 .is_some(),
+            Some(crate::native_app::AppViewState::SystemState(state)) => {
+                let Some(crate::native_app::NativeApp::SystemState(app)) =
+                    self.native_runtime.app(instance)
+                else {
+                    return false;
+                };
+                state
+                    .common
+                    .last_focus
+                    .as_ref()
+                    .and_then(|key| app.field_projection(key.as_str()))
+                    .is_some_and(|field| field.preedit.is_some())
+            }
             Some(
                 crate::native_app::AppViewState::Markdown(_)
                 | crate::native_app::AppViewState::Recovery(_),
@@ -8876,6 +8897,16 @@ impl App {
                     .and_then(|key| state.field_inputs.get(key))
                     .unwrap_or(&state.search_input);
                 input.selected_text().to_string()
+            }
+            Some(crate::native_app::AppViewState::SystemState(state)) => {
+                let crate::native_app::NativeApp::SystemState(app) =
+                    self.native_runtime.app(instance)?
+                else {
+                    return None;
+                };
+                let key = state.common.last_focus.as_ref()?;
+                // Password fields deliberately expose no plaintext input.
+                app.text_input(key.as_str())?.selected_text().to_string()
             }
             Some(crate::native_app::AppViewState::Recovery(_)) => return None,
             None => return None,
@@ -10076,8 +10107,8 @@ impl App {
     /// The modal-overlay key gate: if an overlay is open on `wid`, delegate to its
     /// handler and swallow the key (`true`); closed ⇒ `false`. A ⌘ chord is swallowed
     /// without reaching the overlay: a menu row the bar greys hands its key
-    /// equivalent to `on_key`, and the palette or picker would otherwise type it into
-    /// their search (⌘C as `c`).
+    /// equivalent to `on_key`, and the palette would otherwise type it into
+    /// its search (⌘C as `c`).
     fn on_key_overlay_mode(&mut self, wid: WindowId, mods: ModifiersState, ev: &KeyEvent) -> bool {
         use crate::overlay::OverlayKind;
         let kind = self
@@ -10090,7 +10121,6 @@ impl App {
         }
         match kind {
             Some(OverlayKind::Palette) => self.on_key_palette_mode(wid, mods, ev),
-            Some(OverlayKind::SessionPicker) => self.on_key_session_picker_mode(wid, ev),
             Some(OverlayKind::Overview) => self.on_key_overview_mode(wid, ev),
             None => false,
         }
@@ -10982,8 +11012,10 @@ impl App {
     fn choose_and_open_document(&mut self, kind: crate::native_app::AppKind) {
         let (title, prompt) = match kind {
             crate::native_app::AppKind::Markdown => ("Open Markdown", "Open as Markdown"),
-            crate::native_app::AppKind::Editor => ("Open File in Editor", "Open"),
-            crate::native_app::AppKind::Settings | crate::native_app::AppKind::Recovery => return,
+            crate::native_app::AppKind::Editor => ("Open File", "Open"),
+            crate::native_app::AppKind::Settings
+            | crate::native_app::AppKind::SystemState
+            | crate::native_app::AppKind::Recovery => return,
         };
         // A headless process has no application object to present the panel from, so
         // the modal would never return.
@@ -11119,6 +11151,11 @@ impl App {
             MenuAction::OpenEditor => {
                 self.choose_and_open_document(crate::native_app::AppKind::Editor);
             }
+            MenuAction::Save => {
+                if let Err(why) = self.save_front_document() {
+                    self.pending_action_refusal = Some(why);
+                }
+            }
             MenuAction::ReopenClosedTab => {
                 let _ = self.reopen_last_closed_tab();
             }
@@ -11208,24 +11245,6 @@ impl App {
             MenuAction::ResetTerminal => {
                 if let Some(wid) = self.frontmost_window {
                     self.menu_reset_terminal(wid);
-                }
-            }
-            // Show Identity (palette-only): the focused session's identity,
-            // read-only, as a Markdown tab.
-            MenuAction::ShowIdentity => {
-                if let Some(wid) = self.frontmost_window {
-                    self.open_session_identity_tab(wid);
-                }
-            }
-            // File ▸ New Window / New Tab With Identity…: the identity picker.
-            MenuAction::NewWindowWithIdentity | MenuAction::NewTabWithIdentity => {
-                if let Some(wid) = self.frontmost_window {
-                    let place = if action == MenuAction::NewWindowWithIdentity {
-                        crate::session_picker::PickerIntent::NewWindowWithIdentity
-                    } else {
-                        crate::session_picker::PickerIntent::NewTabWithIdentity
-                    };
-                    let _ = self.open_identity_picker(wid, place);
                 }
             }
             // View ▸ Show Needs in Windows: flip the live bit and persist it.
@@ -11680,13 +11699,6 @@ impl App {
             AuxTarget::Front => {
                 Err("the front terminal window is already open (use window/chrome)".to_string())
             }
-            // The picker needs a subject argument only its UI gesture (the
-            // menu row) carries; there is no wire `open` form, and `cmd_open`
-            // rejects it before this arm.
-            AuxTarget::SessionPicker => Err(format!(
-                "{} opens from its UI gesture, not the wire",
-                target.keyword()
-            )),
             AuxTarget::Prefs | AuxTarget::About | AuxTarget::Update => {
                 Err("native Settings alias routing failed".to_string())
             }
@@ -11716,13 +11728,6 @@ impl App {
             }
             AuxTarget::AutopilotMenu => {
                 self.close_autopilot_menu();
-                Ok(())
-            }
-            // Symmetric transient exits (idempotent like the tab menu's).
-            AuxTarget::SessionPicker => {
-                if let Some(wid) = self.frontmost_window {
-                    self.session_picker_exit(wid);
-                }
                 Ok(())
             }
             AuxTarget::Overview => {
@@ -11949,7 +11954,7 @@ mod menu_only_action_dispatch_tests {
             .current
     }
 
-    /// `find_next` / `find_prev` reach the same reducer Edit ▸ Find Next drives,
+    /// `find_next` / `find_prev` reach the same reducer Edit ▸ Find ▸ Find Next drives,
     /// in both states: stepping an open bar, and reopening the last accepted
     /// query after Enter closed it (the state a chord is for; with the bar open
     /// the arrow keys already work).
@@ -13127,6 +13132,93 @@ mod native_ime_selection_tests {
             "one commit is one undo frame"
         );
         assert_eq!(state.search_input.selection().range(), 1..3);
+
+        // The secret field intentionally has no marked-text projection. Drive
+        // real physical-key routing between platform preedit and commit, then
+        // verify ordinary input and an explicitly cleared composition still type.
+        use crate::native_app::{NativeApp, SemanticInput};
+        use aterm_window::keyboard::{KeyCode, KeyLocation, PhysicalKey, SmolStr};
+        let press = |app: &mut App| {
+            app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
+            for state in [ElementState::Pressed, ElementState::Released] {
+                app.on_key(
+                    wid,
+                    KeyEvent::synthetic_for_test(
+                        PhysicalKey::Code(KeyCode::KeyN),
+                        Key::Character(SmolStr::new("n")),
+                        Some(SmolStr::new("n")),
+                        KeyLocation::Standard,
+                        state,
+                        false,
+                    ),
+                );
+            }
+        };
+        assert!(app.open_system_state_tab());
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        for field in ["system-state/url", "system-state/password"] {
+            app.dispatch_native_event(
+                wid,
+                AppEvent::Action(ActionInvocation {
+                    id: crate::native_ui::ActionId::new(field),
+                    value: Some(SemanticInput::Text(String::new())),
+                }),
+            )
+            .unwrap();
+            let projection = |app: &App| {
+                let Some(NativeApp::SystemState(model)) = app.native_runtime.app(instance) else {
+                    panic!("System State app");
+                };
+                model.field_projection(field).unwrap()
+            };
+            app.on_ime_preedit(wid, "候補".into(), Some((0, 3)));
+            press(&mut app);
+            assert_eq!(
+                projection(&app).text,
+                if field.ends_with("password") {
+                    ""
+                } else {
+                    "候補"
+                },
+                "composing physical keys do not insert into {field}"
+            );
+            if field.ends_with("password") {
+                assert!(projection(&app).preedit.is_none());
+            }
+            app.on_ime_commit(wid, "語".into());
+            press(&mut app);
+            app.on_ime_preedit(wid, "候補".into(), Some((0, 3)));
+            app.on_ime_preedit(wid, String::new(), None);
+            press(&mut app);
+            assert_eq!(
+                projection(&app).text,
+                if field.ends_with("password") {
+                    "•••"
+                } else {
+                    "語nn"
+                },
+                "committed and non-composing input reaches {field} exactly once"
+            );
+        }
+        app.dispatch_native_event(
+            wid,
+            AppEvent::Action(ActionInvocation {
+                id: crate::native_ui::ActionId::new("system-state/apply"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        let Some(crate::system_state::SystemStateAction::Apply(answer)) =
+            app.native_runtime.take_system_state_action()
+        else {
+            panic!("reviewed form queues its one answer");
+        };
+        let crate::workstation_setup::WorkstationSetupDecision::Begin(plan) = answer.decision
+        else {
+            panic!("Apply carries the edited plan");
+        };
+        assert_eq!(plan.vault_url, "語nn");
+        assert_eq!(answer.password.unwrap().as_str(), Some("語nn"));
     }
 }
 

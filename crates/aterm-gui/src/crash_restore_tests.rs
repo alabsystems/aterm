@@ -16,7 +16,10 @@ use aterm_keeper::wire::COMPANION_JOURNAL;
 
 use super::*;
 
-/// One live session and its journal, as the reader holds them.
+/// One live session and its journal, as the reader holds them, the journal on a held clock
+/// (`SessionJournal::create_held`): only `pass_ms` moves it, so what the keyframe policy
+/// decides and what the ring's ticks stamp never depend on how long a loaded machine took
+/// between two of a test's steps.
 struct Rig {
     term: Arc<Mutex<Terminal>>,
     journal: Arc<SessionJournal>,
@@ -30,15 +33,6 @@ struct Rig {
 impl Rig {
     fn new(rows: u16, cols: u16) -> Self {
         Self::with_config(rows, cols, None)
-    }
-
-    /// [`Self::new`] on a held ring clock ([`SessionJournal::hold_ring_clock`]): for a
-    /// test that reads the ring's due stamps against its clock and runs the ticks itself,
-    /// so a step a loaded machine spends a tick on cannot make a stamp due early.
-    fn held(rows: u16, cols: u16) -> Self {
-        let rig = Self::new(rows, cols);
-        rig.journal.hold_ring_clock();
-        rig
     }
 
     /// A session built, journaled and restored under `cfg` (a theme of its own).
@@ -58,7 +52,7 @@ impl Rig {
             cfg.as_ref(),
             None,
         )));
-        let journal = SessionJournal::create(
+        let journal = SessionJournal::create_held(
             7,
             "s-1234",
             &term,
@@ -1970,12 +1964,33 @@ fn needle(token: &str) -> &[u8] {
     &token.as_bytes()[3..13]
 }
 
-/// Every ten-byte window of `bytes` holding no zero byte, for [`needle`] lookups: a needle
-/// holds none, and the zeroed and never-touched spans are most of a region, so one pass
-/// over the bytes replaces a scan per token.
+/// Every ten-byte window of `bytes` that is ASCII letters and digits alone, for [`needle`]
+/// lookups: a needle is nothing else, so it occurs in `bytes` exactly when it is one of
+/// these, and one pass over the bytes replaces a scan per token. Most of a region is zeroed
+/// or never written, and a zero block holds no letter or digit, so each 4 KiB block of
+/// zeros is passed over with one comparison; only the spans between them are walked byte by
+/// byte, and only their runs of letters and digits (in a region, the tokens' literals) are
+/// windowed.
 fn windows_of(bytes: &[u8]) -> std::collections::HashSet<&[u8]> {
-    bytes
-        .split(|&b| b == 0)
+    const BLOCK: usize = 4096;
+    const ZEROS: [u8; BLOCK] = [0; BLOCK];
+    let mut spans = Vec::new();
+    let mut span_from = None;
+    for (i, block) in bytes.chunks(BLOCK).enumerate() {
+        if block == &ZEROS[..block.len()] {
+            if let Some(from) = span_from.take() {
+                spans.push(&bytes[from..i * BLOCK]);
+            }
+        } else if span_from.is_none() {
+            span_from = Some(i * BLOCK);
+        }
+    }
+    if let Some(from) = span_from {
+        spans.push(&bytes[from..]);
+    }
+    spans
+        .into_iter()
+        .flat_map(|span| span.split(|b| !b.is_ascii_alphanumeric()))
         .flat_map(|run| run.windows(10))
         .collect()
 }
@@ -2214,9 +2229,10 @@ fn an_alternate_screen_session_s_history_joins_on_its_primary() {
 }
 
 /// The worker on its own thread: it wakes on a session's growth and exports until the ring
-/// has caught up, with no tick asked for (each wait a one-minute hang detector, never a
-/// latency budget). An adopted session's export waits for its import, and its settle
-/// starts it and forces a keyframe of the renumbered history.
+/// has caught up, with no tick asked for, a tick after its last (the journal's held clock
+/// moved on here, never slept; each wait a one-minute hang detector, never a latency
+/// budget). An adopted session's export waits for its import, and its settle starts it and
+/// forces a keyframe of the renumbered history.
 #[test]
 fn the_worker_exports_on_growth_and_a_held_export_on_its_import() {
     const HANG: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
@@ -2226,15 +2242,27 @@ fn the_worker_exports_on_growth_and_a_held_export_on_its_import() {
             self.0.stop_ring_worker();
         }
     }
-    let worker = Stop(HistoryWorker::start_ring_worker().expect("the worker's thread"));
+    let gap = std::time::Duration::from_millis(5);
+    let worker = Stop(HistoryWorker::start_held_ring_worker().expect("the worker's thread"));
     let rig = Rig::new(6, 40);
     rig.journal.start_export_with(&worker.0, &rig.term, false);
-    for i in 0..2000 {
-        rig.slice(format!("line {i}\r\n").as_bytes());
-    }
-    let caught_up = aterm_spec::wait::within(HANG, std::time::Duration::from_millis(5), || {
-        (rig.journal.ring_lag() == 0).then_some(())
+    let started = aterm_spec::wait::within(HANG, gap, || {
+        let ring = rig.journal.ring.lock().expect("the ring");
+        ring.as_ref().and_then(|ring| ring.last_tick)
     });
+    assert_eq!(
+        started,
+        Some(0),
+        "the start's nudged tick, at 0 on the held clock"
+    );
+    // A tick's worth of the clock, which wakes nobody: the worker sleeps with nothing due.
+    // Then one read grows the history by 2,000 lines, and only its own wake can bring the
+    // worker's next tick (a growth is due a tick after the last).
+    rig.journal.pass_ms(TICK_MS);
+    let lines: String = (0..2000).map(|i| format!("line {i}\r\n")).collect();
+    rig.slice(lines.as_bytes());
+    let caught_up =
+        aterm_spec::wait::within(HANG, gap, || (rig.journal.ring_lag() == 0).then_some(()));
     assert!(caught_up.is_some(), "the worker caught the ring up");
 
     let held = Rig::new(6, 40);
@@ -2255,9 +2283,8 @@ fn the_worker_exports_on_growth_and_a_held_export_on_its_import() {
         before + 1,
         "the renumbering's keyframe"
     );
-    let caught_up = aterm_spec::wait::within(HANG, std::time::Duration::from_millis(5), || {
-        (held.journal.ring_lag() == 0).then_some(())
-    });
+    let caught_up =
+        aterm_spec::wait::within(HANG, gap, || (held.journal.ring_lag() == 0).then_some(()));
     assert!(caught_up.is_some(), "the settled export caught the ring up");
 }
 
@@ -2559,30 +2586,22 @@ fn a_replacement_the_parser_defers_waits_for_the_programs_next_bytes() {
         rig.journal.ring_due(now()).is_some_and(|due| due <= now()),
         "the program wrote: due"
     );
-    // The last try reads the journal's clock (real time plus the skew `pass_ms` adds)
-    // between these two readings: no sooner than `last_try`, no later than `tried_by`.
     let last_try = now();
     rig.journal.export_tick(&rig.term);
-    let tried_by = now();
     assert_eq!(rig.journal.regions_replaced(), 0, "deferred again");
     assert!(rig.journal.spare_kept());
     assert_eq!(rig.journal.ring_due(now()), None, "parked again");
 
     rig.slice(b"\x1b\\done\r\n");
-    let due = rig
-        .journal
-        .ring_due(now())
-        .expect("due once the query ended");
-    // Against the last try, not the clock now: a loaded host can spend K1's
-    // 200 ms between the try and this read. The quiet is counted from that try's own
-    // clock reading, so the due time lies within the try's readings plus the quiet.
     let quiet = aterm_restore::policy::QUIET_MS;
-    assert!(
-        (last_try + quiet..=tried_by + quiet).contains(&due),
-        "no sooner than K1's quiet after the last try: due {due}, tried in \
-         {last_try}..={tried_by}"
+    assert_eq!(
+        rig.journal.ring_due(now()),
+        Some(last_try + quiet),
+        "due once the query ended, no sooner than K1's quiet after the last try"
     );
-    rig.journal.pass_ms(aterm_restore::policy::QUIET_MS);
+    rig.journal.export_tick(&rig.term);
+    assert_eq!(rig.journal.regions_replaced(), 0, "not before that quiet");
+    rig.journal.pass_ms(quiet);
     rig.journal.export_tick(&rig.term);
     assert_eq!(
         rig.journal.regions_replaced(),
@@ -2784,9 +2803,10 @@ fn the_shed_policy_sheds_the_largest_and_brings_rings_back_one_at_a_time() {
 }
 
 /// The worker on its own thread sheds on a reported level and answers once the regions it
-/// shed were replaced; after a NORMAL it brings the ring back when the hold has passed (its
-/// clock moved on here, never slept), and the ring catches the history up again. Each wait
-/// is a one-minute hang detector, never a latency budget.
+/// shed were replaced; after a NORMAL it brings the ring back when the hold has passed, and
+/// the ring catches the history up again. Its clocks, the journal's and the shed policy's,
+/// are held and moved on here, never slept; each wait is a one-minute hang detector, never
+/// a latency budget.
 #[test]
 fn the_worker_sheds_on_pressure_and_brings_the_ring_back_after_the_hold() {
     const HANG: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
@@ -2796,12 +2816,13 @@ fn the_worker_sheds_on_pressure_and_brings_the_ring_back_after_the_hold() {
             self.0.stop_ring_worker();
         }
     }
-    let worker = Stop(HistoryWorker::start_ring_worker().expect("the worker's thread"));
+    let worker = Stop(HistoryWorker::start_held_ring_worker().expect("the worker's thread"));
     let rig = Rig::new(8, 80);
-    rig.journal.start_export_with(&worker.0, &rig.term, false);
     for i in 0..2_000 {
         rig.slice(format!("{}\r\n", noisy_line(i, 76)).as_bytes());
     }
+    // The start's nudged tick exports the whole history.
+    rig.journal.start_export_with(&worker.0, &rig.term, false);
     let gap = std::time::Duration::from_millis(5);
     let caught_up =
         aterm_spec::wait::within(HANG, gap, || (rig.journal.ring_lag() == 0).then_some(()));
@@ -2831,11 +2852,16 @@ fn the_worker_sheds_on_pressure_and_brings_the_ring_back_after_the_hold() {
     assert!(rig.journal.ring_shed(), "the hold first");
     let (level, _, _, back_in) = worker.0.shed_view();
     assert_eq!(level, Some(PressureLevel::Normal));
-    assert!(
-        back_in.is_some_and(|ms| ms > 0 && ms <= RING_BACK_HOLD_MS),
-        "{back_in:?}"
+    assert_eq!(
+        back_in,
+        Some(RING_BACK_HOLD_MS),
+        "back once the hold has passed"
     );
-    worker.0.pass_shed_ms(RING_BACK_HOLD_MS);
+    // A pass a millisecond short of the hold (a repeated NORMAL keeps the first one's).
+    worker.0.pass_shed_ms(RING_BACK_HOLD_MS - 1);
+    apply(PressureLevel::Normal);
+    assert!(rig.journal.ring_shed(), "not before the hold has passed");
+    worker.0.pass_shed_ms(1);
     let back = aterm_spec::wait::within(HANG, gap, || {
         (!rig.journal.ring_shed() && rig.journal.ring_lag() == 0).then_some(())
     });
@@ -3069,9 +3095,6 @@ fn a_full_link_queue_keeps_the_fresh_regions_custody_and_offers_it_again() {
     use aterm_keeper::client::LinkOp;
     const RDEV: u64 = 0x5eed;
     let rig = deep_rig();
-    // Held from here: "offered again a tick later" is read against the clock, which a
-    // loaded machine could move a tick past the offer before the read.
-    rig.journal.hold_ring_clock();
     let link = Arc::new(crate::keeper_link::TestLink::stalled(rig.journal.id, RDEV));
     rig.journal.link_custody_to(Arc::clone(&link));
     let fresh_companions = |ops: Vec<LinkOp>| -> Vec<(OwnedFd, u64)> {
@@ -3093,10 +3116,9 @@ fn a_full_link_queue_keeps_the_fresh_regions_custody_and_offers_it_again() {
         "the custody a full queue refused is kept, not dropped"
     );
     let now = rig.journal.ring_now_ms();
-    assert!(
-        rig.journal
-            .ring_due(now)
-            .is_some_and(|due| due > now && due <= now + TICK_MS),
+    assert_eq!(
+        rig.journal.ring_due(now),
+        Some(now + TICK_MS),
         "offered again a tick later"
     );
     assert!(
@@ -3160,10 +3182,7 @@ fn a_full_link_queue_keeps_the_fresh_regions_custody_and_offers_it_again() {
 fn a_clear_while_the_custody_is_owed_erases_the_region_the_keeper_holds() {
     use aterm_keeper::client::LinkOp;
     const RDEV: u64 = 0x5eed;
-    // Held: the owed custody is due again a tick after the replacement, so a loaded
-    // machine that spends a tick before the clear would make the worker due for that, and
-    // the clear's own wake would go unseen.
-    let rig = Rig::held(4, 30);
+    let rig = Rig::new(4, 30);
     let found = exported_tokens(&rig, 3_000);
     let slot = JournalSlot::default();
     slot.install(Arc::clone(&rig.journal));
@@ -3187,8 +3206,7 @@ fn a_clear_while_the_custody_is_owed_erases_the_region_the_keeper_holds() {
     link.fill();
     rig.journal.request_shed();
     rig.journal.export_tick(&rig.term);
-    // Before the owed custody's own retry (a tick on): the clear must be due by then, at
-    // once, however long a loaded machine takes from here to the clear.
+    // The owed custody's own retry is a tick on; the clear must be due before it, at once.
     let owed_at = rig.journal.ring_now_ms();
     assert_eq!(rig.journal.regions_replaced(), 1, "premise: replaced");
     assert!(rig.journal.custody_owed(), "premise: the custody is owed");
@@ -3210,11 +3228,10 @@ fn a_clear_while_the_custody_is_owed_erases_the_region_the_keeper_holds() {
         (Rung::Screen, "superseded")
     );
 
-    let owed = rig.journal.ring_due(owed_at);
-    assert!(
-        owed.is_some_and(|due| due > owed_at),
-        "control: before the clear the worker is due only for the custody's retry, later: \
-         due {owed:?}, now {owed_at}"
+    assert_eq!(
+        rig.journal.ring_due(owed_at),
+        Some(owed_at + TICK_MS),
+        "control: before the clear the worker is due only for the custody's retry, a tick on"
     );
     rig.slice(b"\x1b[3Jcleared\r\n");
     assert_eq!(
@@ -3632,19 +3649,19 @@ fn a_pressure_level_reported_before_the_worker_starts_is_where_it_begins() {
     );
 
     // Control: a worker that starts and is never told runs its passes at no level.
-    let control = Stop(HistoryWorker::start_ring_worker().expect("a worker"));
+    let control = Stop(HistoryWorker::start_held_ring_worker().expect("a worker"));
     let unshed = Rig::new(8, 80);
+    grow(&unshed);
     unshed
         .journal
         .start_export_with(&control.0, &unshed.term, false);
-    grow(&unshed);
     let exported =
         aterm_spec::wait::within(HANG, gap, || (unshed.journal.ring_lag() == 0).then_some(()));
     assert!(exported.is_some(), "the control's worker exported the ring");
     assert!(!unshed.journal.ring_shed(), "control: nothing shed");
     assert_eq!(control.0.shed_view().0, None, "control: no level");
 
-    let worker = Stop(HistoryWorker::start_ring_worker().expect("a worker"));
+    let worker = Stop(HistoryWorker::start_held_ring_worker().expect("a worker"));
     seed_pressure_in(&cell, &worker.0);
     assert!(cell.lock().expect("the cell").1, "told");
     let rig = Rig::new(8, 80);
@@ -3790,11 +3807,14 @@ fn a_turn_ledger_rides_the_control_slot_across_a_crash() {
 
     // The next carry waits two seconds from the last one, then carries both records.
     turns.lock().expect("ledger").push(turn(42, "echo two"));
-    let due = rig.journal.control_due(0).expect("due");
-    assert!(due >= CONTROL_MS, "two seconds after the last carry: {due}");
+    assert_eq!(
+        rig.journal.control_due(now),
+        Some(now + CONTROL_MS),
+        "two seconds after the last carry"
+    );
     rig.journal.pass_ms(CONTROL_MS);
     let now = rig.journal.ring_now_ms();
-    assert!(rig.journal.control_due(now).is_some_and(|due| due <= now));
+    assert_eq!(rig.journal.control_due(now), Some(now), "due now");
     rig.journal.control_tick();
     assert_eq!(carried_ids(&rig.restoration()), [41, 42]);
 }
@@ -3939,7 +3959,9 @@ fn a_shed_region_s_replacement_carries_the_ledger() {
 }
 
 /// The worker on its own thread carries a record with no tick asked for: the ledger's
-/// watch wakes it (each wait a one-minute hang detector, never a latency budget).
+/// watch wakes it (each wait a one-minute hang detector, never a latency budget). The record
+/// lands once the worker has ticked the export's start and sleeps with nothing due, so only
+/// that wake can bring the carry.
 #[test]
 fn the_worker_carries_a_record_the_ledger_takes() {
     const HANG: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
@@ -3949,15 +3971,20 @@ fn the_worker_carries_a_record_the_ledger_takes() {
             self.0.stop_ring_worker();
         }
     }
-    let worker = Stop(HistoryWorker::start_ring_worker().expect("the worker's thread"));
+    let gap = std::time::Duration::from_millis(5);
+    let worker = Stop(HistoryWorker::start_held_ring_worker().expect("the worker's thread"));
     let rig = Rig::new(6, 40);
     let turns = ledger_of(Vec::new());
     rig.journal.carry_ledger(&turns);
     rig.journal.start_export_with(&worker.0, &rig.term, false);
-    turns.lock().expect("ledger").push(turn(3, "date"));
-    let carried = aterm_spec::wait::within(HANG, std::time::Duration::from_millis(5), || {
-        (rig.journal.ledger_lag() == 0).then_some(())
+    let started = aterm_spec::wait::within(HANG, gap, || {
+        let ring = rig.journal.ring.lock().expect("the ring");
+        ring.as_ref().and_then(|ring| ring.last_tick)
     });
+    assert_eq!(started, Some(0), "the start's nudged tick");
+    turns.lock().expect("ledger").push(turn(3, "date"));
+    let carried =
+        aterm_spec::wait::within(HANG, gap, || (rig.journal.ledger_lag() == 0).then_some(()));
     assert!(carried.is_some(), "the worker carried the record");
     assert_eq!(carried_ids(&rig.restoration()), [3]);
 }

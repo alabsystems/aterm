@@ -1351,10 +1351,7 @@ fn the_access_entry_is_raised_once_watches_the_probe_and_is_dismissed_once() {
     // The record learns that the question was asked: the cache at once (above),
     // the file off the UI thread.
     let mut app = access_card_windowed();
-    let record = aterm_tempfile::Builder::new()
-        .prefix("aterm-access-card")
-        .tempdir()
-        .expect("scratch");
+    let record = crate::test_scratch::outlived_dir("aterm-access-");
     app.consent_card_config = Some(record.path().join("aterm.toml"));
     access_card_posted(&mut app, t0);
     let asked = app.consent_card_host.record.asked_at;
@@ -1669,11 +1666,9 @@ fn a_refused_read_under_a_protected_root_marks_that_sessions_tab() {
             .session
     };
     let marked = |app: &App| {
-        app.windows[&WindowId(0)]
-            .tab_set
-            .tabs()
+        app.tab_strip_metadata(WindowId(0))
             .iter()
-            .any(|tab| tab.presentation.indicators.attention)
+            .any(|tab| tab.attention != crate::tab_bar::ChipLevel::Off)
     };
     let roots = |app: &App| app.consent.policy().protected_roots().to_vec();
 
@@ -2071,11 +2066,9 @@ fn set_shell_pid(app: &mut App, pid: i32) {
 
 /// Whether a tab of the headless window carries the attention mark.
 fn a_tab_is_marked(app: &App) -> bool {
-    app.windows[&WindowId(0)]
-        .tab_set
-        .tabs()
+    app.tab_strip_metadata(WindowId(0))
         .iter()
-        .any(|tab| tab.presentation.indicators.attention)
+        .any(|tab| tab.attention != crate::tab_bar::ChipLevel::Off)
 }
 
 /// Feed `app`'s observer a Documents request from [`OBSERVED_SHELL`] that
@@ -2112,6 +2105,239 @@ fn feed_request_opened_at(
         app.consent_observer
             .feed_for_test(ObserverEvent::Line(line), opened);
     }
+}
+
+fn observe_fda_grant(app: &mut App) {
+    use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
+    app.consent = super::consent_state::ConsentState::with_cached_probe_for_test(FdaProbe {
+        state: FdaState::Granted,
+        label: ProbeLabel::OpenOk,
+    });
+}
+
+/// Consent owns only its own mark: two prompts need two answers, and ending
+/// either cannot acknowledge an unrelated document/update indication.
+#[test]
+fn consent_marks_follow_prompt_answers_without_clearing_other_attention() {
+    use super::consent_observer::{ObserverEvent, ObserverMode, TccEvent};
+    use crate::app_colorscheme::install_resolved_colors::apply_config_text;
+    use crate::tab_bar::ChipLevel;
+    use std::time::Instant;
+    let _arm = OBSERVER_ARM_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    reset_observer_arm();
+    let dir = std::env::temp_dir().join(format!("aterm-consent-marks-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch config");
+    let mut app = app_with_observed_shell();
+    apply_config_text(&mut app, &dir, "[privacy]\nobserver = true\n");
+    await_observer_arm("Started", |log| log.posted == 1);
+    let now = Instant::now();
+    app.poll_consent_observer(now);
+    assert_eq!(app.consent_observer.running(), ObserverMode::Full);
+    let mark = |app: &App| app.tab_strip_metadata(WindowId(0))[0].attention;
+    let answer = |app: &mut App, id: &str| {
+        app.consent_observer.feed_for_test(
+            ObserverEvent::Line(TccEvent::Result { msg_id: id.into() }),
+            now,
+        );
+        app.poll_consent_observer(now);
+    };
+    feed_open_request(&mut app, "alert.1");
+    feed_open_request(&mut app, "alert.2");
+    app.poll_consent_observer(now);
+    assert_eq!(mark(&app), ChipLevel::Note);
+    answer(&mut app, "unrelated");
+    answer(&mut app, "alert.1");
+    assert_eq!(mark(&app), ChipLevel::Note, "the second prompt still waits");
+    answer(&mut app, "alert.2");
+    assert_eq!(mark(&app), ChipLevel::Off, "both prompts were answered");
+
+    feed_open_request(&mut app, "alert.3");
+    app.poll_consent_observer(now);
+    let session = app.front_terminal(WindowId(0)).unwrap().session;
+    app.note_consent_attention(super::consent_observer::AttentionEvent::ProtectedEperm {
+        session: Some(session),
+    });
+    observe_fda_grant(&mut app);
+    app.resolve_fda_need(true, now);
+    assert_eq!(
+        mark(&app),
+        ChipLevel::Note,
+        "the prompt still waits after FDA recovery"
+    );
+    app.windows
+        .get_mut(&WindowId(0))
+        .unwrap()
+        .tab_set
+        .tab_at_mut(0)
+        .unwrap()
+        .presentation
+        .indicators
+        .attention = true;
+    answer(&mut app, "alert.3");
+    assert_eq!(
+        mark(&app),
+        ChipLevel::Note,
+        "the independent indication remains"
+    );
+    assert!(
+        app.windows[&WindowId(0)].tab_set.tabs()[0]
+            .presentation
+            .indicators
+            .attention
+    );
+
+    app.windows
+        .get_mut(&WindowId(0))
+        .unwrap()
+        .tab_set
+        .tab_at_mut(0)
+        .unwrap()
+        .presentation
+        .indicators
+        .attention = false;
+    feed_open_request(&mut app, "alert.4");
+    app.poll_consent_observer(now);
+    assert_eq!(mark(&app), ChipLevel::Note);
+    app.retire_presence(session);
+    assert_eq!(
+        mark(&app),
+        ChipLevel::Off,
+        "a retired session owns no prompt mark"
+    );
+
+    app.consent_observer.stop();
+    release_observer_arm();
+    await_observer_arm("worker ended", |log| log.receiver_gone.len() == 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A dismissal is no observed recovery. A verified grant ends only the
+/// permission-denial owner, leaving independent tab indications intact.
+#[test]
+fn consent_marks_follow_verified_access_recovery_and_session_retirement() {
+    use crate::tab_bar::ChipLevel;
+    use std::time::Instant;
+    let mut app = App::headless_for_test();
+    app.config.privacy = Some(crate::app_config::PrivacyConfig {
+        observer: Some(true),
+        ..Default::default()
+    });
+    let session = app.front_terminal(WindowId(0)).unwrap().session;
+    let mark = |app: &App| app.tab_strip_metadata(WindowId(0))[0].attention;
+    let now = Instant::now();
+    app.note_consent_attention(super::consent_observer::AttentionEvent::ProtectedEperm {
+        session: Some(session),
+    });
+    assert_eq!(mark(&app), ChipLevel::Note);
+    app.resolve_fda_need(false, now);
+    assert_eq!(mark(&app), ChipLevel::Note, "no observed grant");
+    observe_fda_grant(&mut app);
+    app.resolve_fda_need(true, now);
+    assert_eq!(mark(&app), ChipLevel::Off, "verified access recovered");
+    app.note_consent_attention(super::consent_observer::AttentionEvent::ProtectedEperm {
+        session: Some(session),
+    });
+    app.windows
+        .get_mut(&WindowId(0))
+        .unwrap()
+        .tab_set
+        .tab_at_mut(0)
+        .unwrap()
+        .presentation
+        .indicators
+        .attention = true;
+    observe_fda_grant(&mut app);
+    app.resolve_fda_need(true, now);
+    assert_eq!(
+        mark(&app),
+        ChipLevel::Note,
+        "independent indication remains"
+    );
+    app.windows
+        .get_mut(&WindowId(0))
+        .unwrap()
+        .tab_set
+        .tab_at_mut(0)
+        .unwrap()
+        .presentation
+        .indicators
+        .attention = false;
+    app.note_consent_attention(super::consent_observer::AttentionEvent::ProtectedEperm {
+        session: Some(session),
+    });
+    app.retire_presence(session);
+    assert_eq!(
+        mark(&app),
+        ChipLevel::Off,
+        "retired sessions retain no consent mark"
+    );
+}
+
+/// The probe completion is also a recovery event while no access card is
+/// watching. Pending/unknown cache entries never claim a permission was granted.
+#[test]
+fn consent_marks_recover_from_the_probe_with_access_notices_disabled() {
+    use super::consent_state::ConsentState;
+    use aterm_containment::consent::{FdaProbe, FdaState, ProbeLabel};
+    let mut app = App::headless_for_test();
+    app.config.privacy = Some(crate::app_config::PrivacyConfig {
+        observer: Some(true),
+        notice: Some(false),
+        ..Default::default()
+    });
+    let session = app.front_terminal(WindowId(0)).unwrap().session;
+    app.note_consent_attention(super::consent_observer::AttentionEvent::ProtectedEperm {
+        session: Some(session),
+    });
+    assert!(a_tab_is_marked(&app));
+    app.on_consent_probe_ready(std::time::Instant::now());
+    assert!(a_tab_is_marked(&app), "an unknown probe is no grant");
+    app.consent = ConsentState::with_cached_probe_for_test(FdaProbe {
+        state: FdaState::Granted,
+        label: ProbeLabel::OpenOk,
+    });
+    app.on_consent_probe_ready(std::time::Instant::now());
+    assert!(
+        !a_tab_is_marked(&app),
+        "fresh verified grant clears the denial"
+    );
+}
+
+/// An older completion can be queued behind a newer refusal. Even while
+/// that cache entry is fresh, it cannot answer the newer permission need.
+#[test]
+fn consent_marks_ignore_grants_observed_before_a_later_denial() {
+    use super::consent_state::ConsentState;
+    use aterm_containment::consent::{FdaProbe, FdaState, ProbeGate, ProbeLabel};
+    use std::time::{Duration, Instant};
+    let mut app = App::headless_for_test();
+    app.config.privacy = Some(crate::app_config::PrivacyConfig {
+        observer: Some(true),
+        notice: Some(false),
+        ..Default::default()
+    });
+    let session = app.front_terminal(WindowId(0)).unwrap().session;
+    let granted = FdaProbe {
+        state: FdaState::Granted,
+        label: ProbeLabel::OpenOk,
+    };
+    let earlier = Instant::now() - Duration::from_millis(100);
+    let mut cached = ConsentState::inert();
+    cached.set_fda_arm_for_test(|_| FdaProbe::pending());
+    let (_, ticket) = cached.read_at(ProbeGate::on(), Duration::from_secs(5), earlier);
+    cached.complete_fda_for_test(ticket.expect("cache ticket"), granted, earlier);
+    app.consent = cached;
+    app.note_consent_attention(super::consent_observer::AttentionEvent::ProtectedEperm {
+        session: Some(session),
+    });
+    app.on_consent_probe_ready(Instant::now());
+    assert!(
+        a_tab_is_marked(&app),
+        "an older cached grant cannot answer the newer denial"
+    );
+    app.consent = ConsentState::with_cached_probe_for_test(granted);
+    app.on_consent_probe_ready(Instant::now());
+    assert!(!a_tab_is_marked(&app), "a subsequent grant answers it");
 }
 
 /// The park's announcement follows the stream that is RUNNING, not the
@@ -2156,13 +2382,13 @@ fn the_park_reads_the_running_mode_not_the_config() {
     // Undone, so the reload below is a change the admission path applies.
     app.config.privacy = reloaded;
 
-    app.windows
-        .get_mut(&WindowId(0))
-        .and_then(|window| window.tab_set.tab_at_mut(0))
-        .expect("the headless instance has tab 0")
-        .presentation
-        .indicators
-        .attention = false;
+    app.consent_observer.feed_for_test(
+        super::consent_observer::ObserverEvent::Line(super::consent_observer::TccEvent::Result {
+            msg_id: "7.1".into(),
+        }),
+        Instant::now(),
+    );
+    app.poll_consent_observer(Instant::now());
     assert!(!a_tab_is_marked(&app), "precondition");
     apply_config_text(&mut app, &dir, "[privacy]\nobserver = false\n");
     assert_eq!(app.consent_observer.running(), ObserverMode::Off);

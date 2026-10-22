@@ -3236,6 +3236,9 @@ pub struct Session<'a, C: Ctl> {
     /// The one folder the session's starter trusted for it, as the same
     /// `meta` read said it (`trusted_cwd=`, `ApprovalCtx::trusted_cwd`).
     trusted_cwd: Option<PathBuf>,
+    /// The agent a worker's spawn started on the session, as the last `meta`
+    /// read said it (`worker=`, `ApprovalCtx::worker_agent`).
+    worker_agent: Option<aterm_phase::Program>,
     /// The permission mode the worker's footer last showed: a box replaces the
     /// footer, so the box's own read cannot say whether the session bypasses
     /// permissions.
@@ -3493,6 +3496,19 @@ pub struct Session<'a, C: Ctl> {
     /// last published to the session's task record, or found published
     /// (`task_mark`): once a point.
     task_point: Option<u64>,
+    /// THE WORDS THE LAST FOLDED POINT'S SCREEN SAID, by its program's reader
+    /// ([`super::policy::turn_end::TurnEndReading::turn_said`] and
+    /// `said_tail`, whole: none where they were cut): a done's result where
+    /// the session's harness has no transcript aterm reads (agy, Muse Code,
+    /// Gemini CLI; `task_mark`'s `publish_done`).
+    point_said: Option<(aterm_phase::Program, String)>,
+    /// THE WORKER'S REPORT A SCREEN-READ LANDING'S RESULT OPENS WITH: the
+    /// [`Self::point_said`] of the point this loop typed the Land episode's
+    /// instruction at — the turn before its land acts, as a transcript's
+    /// result reads it (`harness::result`'s LANDING rule) — kept until the
+    /// episode ends ([`Self::land_over`]). `None`: no episode this loop
+    /// began, or that point's words were cut.
+    land_report: Option<(aterm_phase::Program, String)>,
     /// The session's task record was read at this loop's first fold
     /// (`task_mark`'s `task_seed`): read once a loop.
     task_seeded: bool,
@@ -3852,6 +3868,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             limit_cut: None,
             cwd: None,
             trusted_cwd: None,
+            worker_agent: None,
             footer: None,
             busy_read: false,
             ledger: Ledger::off(),
@@ -3905,6 +3922,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             landed_noted_ms: None,
             task_note: None,
             task_point: None,
+            point_said: None,
+            land_report: None,
             task_seeded: false,
             needs_told: None,
             needs_told_text: String::new(),

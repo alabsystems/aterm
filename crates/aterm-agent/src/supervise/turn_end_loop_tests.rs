@@ -22696,6 +22696,92 @@ fn a_landed_workers_task_is_marked_once_with_its_defense() {
     assert!(!untasked.exists(), "nothing written");
 }
 
+/// A SCREEN-READ HARNESS'S LANDING IS ITS RESULT, ITS REPORT FIRST (`spawn
+/// agent=gemini`'s worker; `task_mark`'s `publish_done`,
+/// `result::snapshot_screen`, `result::with_report`): a Gemini CLI worker,
+/// whose host reads no transcript, lands under Land, and its record is
+/// marked `done why=landed` once, its result the report Gemini CLI's reader
+/// read at the point the Land instruction was typed (the work turn's
+/// words), a blank line, then the defense read at the landing's point —
+/// as a transcript's result holds the report before the land act and the
+/// defense — `result` answering it under `source=screen program=gemini`.
+/// NEGATIVE CONTROL: Claude Code's same landing with no transcript to read
+/// has no result (`why=no-transcript`): Claude Code's result is its
+/// transcript's alone.
+#[test]
+fn a_screen_read_workers_landing_is_its_result() {
+    use aterm_phase::gemini::fixtures as g;
+    let root = crate::supervise::ScratchDir::new("task", "screen-result");
+    let defense = "Nothing left: all of it is merged into the remote main branch.";
+    let busy = aterm_phase::prompt::fixtures::screen(g::BUSY_THINKING);
+    let host = TaskHost::reading(&root.join("none.jsonl"), &[]);
+    let mut m = gemini_mock(vec![
+        busy.clone(),
+        gemini_ended(WORK),
+        busy,
+        gemini_ended(defense),
+    ]);
+    landing(&mut m);
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.vanish_after = Some(6);
+    m.stall_sleep = Some(Duration::from_millis(20));
+    m.task = working_task();
+    let tasks = root.join("tasks");
+    let opts = SuperviseOpts {
+        policy: owners_policy(),
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        tasks: Some(tasks.clone()),
+        ..auto(30)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            min_work: Duration::ZERO,
+            short_backoff: Duration::from_millis(30),
+            short_backoff_max: Duration::from_millis(60),
+            ..TurnEndTiming::default()
+        });
+    });
+    let marks = task_marks(&m);
+    let [mark] = marks.as_slice() else {
+        panic!("one done: {marks:?}: {lines:#?}");
+    };
+    let report = format!("{WORK}\n\n{defense}");
+    let path = mark
+        .strip_prefix(&format!(
+            "task mark done why=landed result_bytes={} result_path=",
+            report.len()
+        ))
+        .map(|p| PathBuf::from(aterm_codec::pct::decode(p)))
+        .unwrap_or_else(|| panic!("{mark}"));
+    assert!(path.starts_with(&tasks), "{mark}");
+    assert_eq!(
+        crate::harness::result::answer(&path, false),
+        format!(
+            "OK 3 source=screen program=gemini bytes={}\n{report}\n",
+            report.len()
+        )
+    );
+    // NEGATIVE CONTROL: Claude Code, no transcript.
+    let host = TaskHost::reading(&root.join("claude.jsonl"), &[]);
+    let mut m = Mock::new(landing_screens(defense));
+    landing(&mut m);
+    m.vanish_after = Some(4);
+    m.task = working_task();
+    let tasks = root.join("tasks-claude");
+    let lines = tasked_watch(&mut m, &host, &tasks, None);
+    let path = tasks.join("s-1-1.result.md");
+    assert_eq!(
+        task_marks(&m),
+        [done_mark("landed", 0, &path)],
+        "{lines:#?}"
+    );
+    assert_eq!(
+        crate::harness::result::answer(&path, false),
+        "ERR result unavailable why=no-transcript\n"
+    );
+}
+
 /// A DEFENSE TALLER THAN THE SCREEN IS READ WHOLE BEFORE IT LANDS
 /// (`Session::said_read_whole`): the land act's yield is a message whose
 /// `⏺` head scrolled into the history above the screen, its rows on the

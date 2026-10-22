@@ -172,8 +172,8 @@ terminal.
 The same binary answers the platform verbs (`ctl`, `pkg`, `fleet`, `drive`,
 `update`, `agents`, …), `help`, the diagnostic subcommands (`doctor`,
 `show-config`, …) and managed-tool dispatch; `aterm --help` lists them.
-`aterm-ctl`, `atpkg`, `abrew`, `aterm-fleet`, `aterm-drive` and `amacs` (aterm's
-editor, `aterm edit`) are symlinks onto it. <!-- From aterm_types::argv0::ALIASES. -->
+`aterm-ctl`, `atpkg`, `abrew`, `agh`, `aterm-fleet`, `aterm-drive` and `amacs`
+(aterm's editor, `aterm edit`) are symlinks onto it. <!-- From aterm_types::argv0::ALIASES. -->
 Window and headless modes serve the control socket by default
 (`--no-control-sock` turns it off) and fail closed when a secure socket cannot
 be created.

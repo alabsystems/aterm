@@ -328,8 +328,8 @@ __aterm_reroute_path_front
 #  2. Re-probe any managed dir that was absent when last checked.
 #  3. Re-front managed dirs only when `$PATH` no longer starts with
 #     `$__aterm_managed_want` (avoiding unnecessary command-hash flushes).
-#  4. Run `hash -d claude codex agy muse` so newly installed agent twins are not
-#     shadowed by previously hashed foreign binaries.
+#  4. Run `hash -d claude codex codex-old agy muse` so newly installed agent
+#     twins are not shadowed by previously hashed foreign binaries.
 __aterm_atpkg_hook="$HOME/.aterm/shell.d/00-atpkg.bash"
 __aterm_managed_live=0
 if [[ -n "${ATERM_CHILD:-}" || -n "${ATERM_SESSION_ID:-}" ]]; then
@@ -418,7 +418,7 @@ __aterm_managed_path_live() {
     fi
     # 4. Evict cached paths for managed agent binaries so new twins resolve immediately.
     if (( __aterm_managed_agents_on )); then
-        hash -d claude codex agy muse 2>/dev/null || :
+        hash -d claude codex codex-old agy muse 2>/dev/null || :
     fi
     return 0
 }

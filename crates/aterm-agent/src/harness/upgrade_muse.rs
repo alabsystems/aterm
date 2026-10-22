@@ -295,6 +295,53 @@ fn read(argv: &[String]) -> Result<Read, ArgvRefusal> {
     Ok(out)
 }
 
+/// The root options that say HOW A MUSE CODE RUN REACHES ITS PROVIDER: its
+/// provider, its preset, its base URL and its per-run settings, each carried
+/// by a relaunch ([`FLAGS`]).
+const PROVIDER_FLAGS: &[&str] = &["--provider", "--preset", "--base-url", "-c", "--config"];
+
+/// THE ROOT OPTIONS OF `argv` THAT SAY HOW ITS RUN REACHES ITS PROVIDER
+/// ([`PROVIDER_FLAGS`]), each with its value, verbatim and in order: what a
+/// worker the run starts carries (`harness::worker`), so its task goes where
+/// the starter's run goes, never to a default provider. Read with the table
+/// ([`FLAGS`]), whatever each other option's fate, before `--`.
+///
+/// # Errors
+/// A flag the table does not know ([`ArgvRefusal::UnknownFlag`]), which
+/// could hold the value of one of these: nothing guesses.
+pub fn provider_flags(argv: &[String]) -> Result<Vec<String>, ArgvRefusal> {
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < argv.len() {
+        let tok = argv[i].as_str();
+        i += 1;
+        if tok == "--" {
+            break;
+        }
+        if !maybe_option(tok) || tok == RESUME_LAST {
+            continue;
+        }
+        let (name, attached) = option_name(tok);
+        let Some((arity, _)) = flag(name) else {
+            return Err(ArgvRefusal::UnknownFlag(name.to_string()));
+        };
+        let value = if arity == Arity::One && !attached {
+            let Some(value) = argv.get(i) else {
+                return Err(ArgvRefusal::UnknownFlag(name.to_string()));
+            };
+            i += 1;
+            Some(value)
+        } else {
+            None
+        };
+        if PROVIDER_FLAGS.contains(&name) {
+            out.push(tok.to_string());
+            out.extend(value.cloned());
+        }
+    }
+    Ok(out)
+}
+
 /// Whether `argv` is an interactive Muse Code TUI's — no subcommand, or
 /// `resume` — and not `exec`, a tool subcommand, `--help` or `--version`,
 /// whose end is the one they were launched for. An argv the rewrite would

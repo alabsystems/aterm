@@ -549,7 +549,6 @@ fn the_setter_is_carried_in_one_form_and_dropped_with_its_word() {
         autopilot: autopilot.map(str::to_owned),
         land_at: None,
         autopilot_by: Some(by.to_owned()),
-        identity: None,
         theme: None,
         agent: None,
         supervised: None,

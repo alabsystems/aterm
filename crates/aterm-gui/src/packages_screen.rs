@@ -168,6 +168,11 @@ pub(crate) struct PackagesProgramRow {
     pub(crate) facts: Option<VendorFacts>,
     /// Source annotation: `Some("dev-link → /path")` for a dev-linked checkout.
     pub(crate) annotation: Option<String>,
+    /// The upstream an ALab build is based on, in `which`'s words (`based on upstream
+    /// rust-v0.163.0+g0123456789ab`, [`atpkg::alab::Upstream::words`]): read on the worker
+    /// off the record of the copy the program's shim runs, never by running it. `None` for
+    /// every other program and for a build whose record names none.
+    pub(crate) upstream: Option<String>,
     /// Version, source, last updated and latest known: read from the row and, on the
     /// worker, the store ([`PackagesStatusReport::attach_store_facts`]).
     pub(crate) update: ProgramUpdate,
@@ -528,6 +533,7 @@ impl PackagesProgramRow {
             words: None,
             kind,
             annotation: None,
+            upstream: None,
         }
     }
 }
@@ -1233,6 +1239,7 @@ impl PackagesStatusReport {
                     kind: ProgramStateKind::Other,
                     facts: None,
                     annotation,
+                    upstream: None,
                     update: ProgramUpdate::default(),
                     words: None,
                 });
@@ -1258,6 +1265,7 @@ impl PackagesStatusReport {
                     kind: ProgramStateKind::Other,
                     facts: None,
                     annotation: Some("cargo +trust does not run the managed toolchain".to_string()),
+                    upstream: None,
                     update: ProgramUpdate::default(),
                     words: None,
                 });
@@ -1460,6 +1468,12 @@ fn collect_packages_status_from_layout(
         row.update.fix = shadow_fix(&row.name, &row.kind);
     }
     if let Some(layout) = layout {
+        // The upstream an ALab build is based on: the copy its shim runs, a store build or
+        // a dev-linked package, the line `aterm pkg which` says.
+        for row in &mut report.programs {
+            row.upstream =
+                atpkg::alab::program_upstream(layout, &row.name).map(|upstream| upstream.words());
+        }
         report.declined = layout.declined().is_file();
         // The config is re-read here: a window lives for days.
         let pins = atpkg::cli::latest_known_pins(layout, &atpkg::config::load());
@@ -4676,6 +4690,94 @@ mod tests {
             Some("build 1971")
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The worker reads the upstream an ALab codex is based on off the record of the store
+    /// build its shim runs, in `which`'s words: a record from before the field, a malformed
+    /// one and a program ALab does not build carry none.
+    #[cfg(unix)]
+    #[test]
+    fn the_worker_reads_the_upstream_an_alab_build_records() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = aterm_tempfile::tempdir().expect("scratch folder");
+        let layout = atpkg::Layout {
+            prefix: root.path().join("pkg"),
+        };
+        const BUILD: u64 = 2_026_101_601;
+        let dir = layout.build_dir("codex", BUILD);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/codex"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            dir.join("bin/codex"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(atpkg::alab::PACKAGE_JSON),
+            r#"{"layoutVersion":1,"version":"0.164.0-dev.12+gabc","entrypoint":"bin/codex"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join(atpkg::alab::ALAB_BUILD_JSON), br#"{"source":"0"}"#).unwrap();
+        atpkg::store::mark_build_ready(&dir).unwrap();
+        atpkg::activate::activate_build(&layout, &dir).unwrap();
+        atpkg::activate::install_shims(
+            &layout,
+            &dir,
+            &["codex".to_string()],
+            atpkg::activate::Aliases::Off,
+        )
+        .unwrap();
+        let mut programs = std::collections::BTreeMap::new();
+        for (name, build) in [("codex", BUILD), ("ay", 1971)] {
+            programs.insert(
+                name.to_string(),
+                atpkg::ProgramStatus {
+                    installed_build: Some(build),
+                    state: atpkg::state::managed(build, 75),
+                    tree_root: String::new(),
+                },
+            );
+        }
+        atpkg::status::write(
+            &layout,
+            &atpkg::Status {
+                schema: 1,
+                programs,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let upstream = |name: &str| {
+            collect_packages_status_from_layout(true, Some(&layout), None)
+                .programs
+                .into_iter()
+                .find(|r| r.name == name)
+                .unwrap()
+                .upstream
+        };
+        assert_eq!(upstream("codex"), None, "a record from before the field");
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        let record = dir.join(atpkg::alab::ALAB_BUILD_JSON);
+        std::fs::write(
+            &record,
+            format!(
+                r#"{{"source":"0","upstream":{{"release":"rust-v0.163.0","commit":"{sha}","commit_date":"2026-10-15T18:02:11Z"}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            upstream("codex").as_deref(),
+            Some("based on upstream rust-v0.163.0+g0123456789ab")
+        );
+        assert_eq!(upstream("ay"), None, "ALab does not build it");
+        for bad in [
+            r#"{"source":"0","upstream":"rust-v0.163.0"}"#,
+            r#"{"source":"0","upstream":{"release":"rust-v0.163.0","commit":"0123"}}"#,
+            "{\"upstream\":{",
+        ] {
+            std::fs::write(&record, bad).unwrap();
+            assert_eq!(upstream("codex"), None, "{bad}");
+        }
     }
 
     fn entry(at: i64, kind: &str, pid: u32, fields: &[(&str, &str)]) -> atpkg::packages_log::Entry {

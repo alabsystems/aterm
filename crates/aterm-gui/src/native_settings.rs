@@ -38364,12 +38364,16 @@ fn packages_program_lines(packages: &PackagesProjection, width: SettingsWidth) -
                 plain.is_none()
             }
         };
-        // What follows the row's own words: the product facts and a dev-link
-        // annotation.
+        // What follows the row's own words: the product facts, the upstream an ALab
+        // build is based on and a dev-link annotation.
         let mut tail = String::new();
         if let Some(facts) = row.facts.as_ref() {
             tail.push_str(FACT_SEPARATOR);
             tail.push_str(&facts.line());
+        }
+        if let Some(upstream) = row.upstream.as_deref() {
+            tail.push_str(FACT_SEPARATOR);
+            tail.push_str(upstream);
         }
         if let Some(annotation) = row.annotation.as_deref() {
             tail.push_str(FACT_SEPARATOR);

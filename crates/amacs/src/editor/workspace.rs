@@ -347,10 +347,13 @@ impl EditorWorkspace {
             return Ok(vec![EditorEffect::Status("Quit".into())]);
         }
         if view.minibuffer_active() {
-            if matches!(view.minibuffer, Minibuffer::Search { .. })
-                && chord == KeyChord::parse("C-s").expect("static chord")
-            {
-                return self.update_incremental_search(store, view, true);
+            if matches!(view.minibuffer, Minibuffer::Search { .. }) {
+                if chord == KeyChord::parse("C-s").expect("static chord") {
+                    return self.navigate_search(store, view, true);
+                }
+                if chord == KeyChord::parse("C-r").expect("static chord") {
+                    return self.navigate_search(store, view, false);
+                }
             }
             return Ok(vec![EditorEffect::Status(
                 "Minibuffer active — Enter accepts; C-g cancels".to_string(),
@@ -532,10 +535,16 @@ impl EditorWorkspace {
                 view.cancel_transient();
                 return Ok(vec![EditorEffect::Status("Quit".into())]);
             }
-            if command == EditorCommand::IncrementalSearch
-                && matches!(&view.minibuffer, Minibuffer::Search { .. })
-            {
-                return self.update_incremental_search(store, view, true);
+            if matches!(&view.minibuffer, Minibuffer::Search { .. }) {
+                match command {
+                    EditorCommand::IncrementalSearch | EditorCommand::SearchNext => {
+                        return self.navigate_search(store, view, true);
+                    }
+                    EditorCommand::SearchPrevious => {
+                        return self.navigate_search(store, view, false);
+                    }
+                    _ => {}
+                }
             }
             return Ok(vec![EditorEffect::Status(
                 "Minibuffer active — Enter accepts; C-g cancels".to_string(),
@@ -900,6 +909,9 @@ impl EditorWorkspace {
                     query: String::new(),
                     origin,
                 });
+            }
+            EditorCommand::SearchNext | EditorCommand::SearchPrevious => {
+                return self.navigate_search(store, view, command == EditorCommand::SearchNext);
             }
             EditorCommand::GotoLine => {
                 view.mark_active = false;

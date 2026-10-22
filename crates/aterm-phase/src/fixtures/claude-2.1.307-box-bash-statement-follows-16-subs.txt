@@ -1,0 +1,45 @@
+# claude-code 2.1.307 · MEASURED 2026-10-21, `aterm ctl text` of a private headless aterm (144x50, aterm 0.109.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · default (manual) mode, `X=1 if true; then echo` and 16 function substitutions `${ echo a; }` then `; fi`: within the vendor's budget of 16, so no rm breaker; the statement-follows note instead, the negative control of the nested breaker box; approve=none · the lab's random project dir is spelled /private/tmp/at.lab0 here
+ ▐▛███▛█   Claude Code v2.1.307
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ toolstart
+
+⏺ Bash(echo $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+      $(true) $(true) $(true) $(t…)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Cogitated for 0s · done 6:56 PM
+
+❯ toolstart
+
+⏺ Bash(X=1 if true; then echo ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a;
+      } ${ echo a; } ${ echo…)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Sautéed for 0s · done 6:56 PM
+
+❯ toolstart
+
+⏺ Bash(X=1 if true; then echo ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a;
+      } ${ echo a; } ${ echo…)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Echo 16 function substitutions after an assignment
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ X=1 if true; then echo ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; }
+ │ ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; }; fi
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ statement directly follows another statement on the same line — bash reads the text as one command (`!` and shell keywords are plain words
+ │ after an assignment), not two statements
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and switch to auto mode · auto mode handles these prompts for you
+   3. No
+
+ Esc to cancel · Tab to amend

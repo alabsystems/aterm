@@ -1,0 +1,769 @@
+{
+  "recorded_with": "jq-1.7.1-apple",
+  "flags": "-r -c -S",
+  "rows": [
+    {
+      "name": "t01_names",
+      "program": ".[].name",
+      "input": "contents_dir.json",
+      "output": "Cargo.toml\nREADME.md\ncrates\ndocs\n"
+    },
+    {
+      "name": "t02_content",
+      "program": ".content",
+      "input": "contents_file.json",
+      "output": "W3BhY2thZ2VdCm5hbWUgPSAicGFja3MiCnZlcnNpb24gPSAiMC4xLjAiCmVk\naXRpb24gPSAiMjAyNCIKZGVzY3JpcHRpb24gPSAiZml4dHVyZSBwYWNrcyBm\nb3IgYWdoIHRlc3RzIgoKW2RlcGVuZGVuY2llc10K\n\n"
+    },
+    {
+      "name": "t03_tree_paths",
+      "program": ".tree[].path",
+      "input": "tree.json",
+      "output": "Cargo.toml\ncrates\ncrates/packs.rs\nREADME.md\n"
+    },
+    {
+      "name": "t04_gh_release_object",
+      "program": "{tag:.tagName,pre:.isPrerelease,draft:.isDraft,at:.publishedAt,assets:[.assets[].name]}",
+      "input": "release_gh.json",
+      "output": "{\"assets\":[\"SHA256SUMS\",\"aterm-0.97.0.dmg\",\"aterm-appcast.toml\",\"aterm-0.97.0.dmg.sig\"],\"at\":\"2026-10-01T09:30:00Z\",\"draft\":false,\"pre\":false,\"tag\":\"v0.97.0\"}\n"
+    },
+    {
+      "name": "t05_branch_lines",
+      "program": ".[] | \"\\(.name) \\(.commit.sha)\"",
+      "input": "branches.json",
+      "output": "main 0123456789abcdef0123456789abcdef01234567\nparity_journal 89abcdef0123456789abcdef0123456789abcdef\nrelease/0.85 fedcba9876543210fedcba9876543210fedcba98\n"
+    },
+    {
+      "name": "t06_branch_tsv",
+      "program": ".[] | [.name, .commit.sha] | @tsv",
+      "input": "branches.json",
+      "output": "main\t0123456789abcdef0123456789abcdef01234567\nparity_journal\t89abcdef0123456789abcdef0123456789abcdef\nrelease/0.85\tfedcba9876543210fedcba9876543210fedcba98\n"
+    },
+    {
+      "name": "t07_commit_lines",
+      "program": ".[] | \"\\(.sha[0:12]) \\(.commit.committer.date) \\(.commit.message|split(\"\\n\")[0])\"",
+      "input": "commits.json",
+      "output": "0123456789ab 2026-10-18T12:05:00Z packs: read the index once\n1123456789ab 2026-10-17T08:30:00Z docs: a one-line subject\n2123456789ab 2026-10-16T07:01:00Z Merge branch 'parity_journal'\n"
+    },
+    {
+      "name": "t08_commit_line",
+      "program": "\"\\(.sha) \\(.commit.committer.date) \\(.commit.message|split(\"\\n\")[0])\"",
+      "input": "commit.json",
+      "output": "0123456789abcdef0123456789abcdef01234567 2026-10-18T12:05:00Z packs: read the index once\n"
+    },
+    {
+      "name": "t09_asset_names",
+      "program": ".assets[].name",
+      "input": "release.json",
+      "output": "SHA256SUMS\naterm-0.97.0.dmg\naterm-appcast.toml\n"
+    },
+    {
+      "name": "t10_first_twelve",
+      "program": ".[0:12][] | .sha[0:9] + \" \" + (.commit.message | split(\"\\n\")[0])",
+      "input": "commits.json",
+      "output": "012345678 packs: read the index once\n112345678 docs: a one-line subject\n212345678 Merge branch 'parity_journal'\n"
+    },
+    {
+      "name": "t11_name_size",
+      "program": ".[] | \"\\(.name) \\(.size)\"",
+      "input": "contents_dir.json",
+      "output": "Cargo.toml 1834\nREADME.md 912\ncrates 0\ndocs 9\n"
+    },
+    {
+      "name": "t12_repo_object",
+      "program": "{default_branch, private, visibility, pushed_at, parent: .parent.full_name, fork}",
+      "input": "repo.json",
+      "output": "{\"default_branch\":\"main\",\"fork\":true,\"parent\":\"fixture-ext/packs\",\"private\":true,\"pushed_at\":\"2026-10-18T12:05:00Z\",\"visibility\":\"private\"}\n"
+    },
+    {
+      "name": "t13_commit_author_line",
+      "program": "\"\\(.sha) \\(.commit.author.date) \\(.commit.message|split(\"\\n\")[0])\"",
+      "input": "commit.json",
+      "output": "0123456789abcdef0123456789abcdef01234567 2026-10-18T12:00:00Z packs: read the index once\n"
+    },
+    {
+      "name": "t14_compare_object",
+      "program": "{status, ahead_by, behind_by, total_commits}",
+      "input": "compare.json",
+      "output": "{\"ahead_by\":3,\"behind_by\":1,\"status\":\"diverged\",\"total_commits\":3}\n"
+    },
+    {
+      "name": "t15_repo_detail",
+      "program": "{full_name, default_branch, pushed_at, created_at, description, size, private, parent: .parent.full_name}",
+      "input": "repo.json",
+      "output": "{\"created_at\":\"2025-01-02T03:04:05Z\",\"default_branch\":\"main\",\"description\":\"Fixture packs for agh's tests\",\"full_name\":\"fixture-dev/packs\",\"parent\":\"fixture-ext/packs\",\"private\":true,\"pushed_at\":\"2026-10-18T12:05:00Z\",\"size\":4096}\n"
+    },
+    {
+      "name": "t16_entry_tsv",
+      "program": ".[] | [.type, .name, .size] | @tsv",
+      "input": "contents_dir.json",
+      "output": "file\tCargo.toml\t1834\nfile\tREADME.md\t912\ndir\tcrates\t0\nsymlink\tdocs\t9\n"
+    },
+    {
+      "name": "t17_commit_tsv",
+      "program": "[.sha[0:10], .commit.author.date, (.commit.message|split(\"\\n\")[0])] | @tsv",
+      "input": "commit.json",
+      "output": "0123456789\t2026-10-18T12:00:00Z\tpacks: read the index once\n"
+    },
+    {
+      "name": "t18_compare_short",
+      "program": "{status, ahead_by, behind_by}",
+      "input": "compare.json",
+      "output": "{\"ahead_by\":3,\"behind_by\":1,\"status\":\"diverged\"}\n"
+    },
+    {
+      "name": "t19_type_name",
+      "program": ".[] | \"\\(.type) \\(.name)\"",
+      "input": "contents_dir.json",
+      "output": "file Cargo.toml\nfile README.md\ndir crates\nsymlink docs\n"
+    },
+    {
+      "name": "t20_branch_short_sha",
+      "program": ".[] | \"\\(.name) \\(.commit.sha[0:12])\"",
+      "input": "branches.json",
+      "output": "main 0123456789ab\nparity_journal 89abcdef0123\nrelease/0.85 fedcba987654\n"
+    },
+    {
+      "name": "t21_compare_line",
+      "program": "\"ahead_by=\\(.ahead_by) behind_by=\\(.behind_by) status=\\(.status)\"",
+      "input": "compare.json",
+      "output": "ahead_by=3 behind_by=1 status=diverged\n"
+    },
+    {
+      "name": "t22_asset_created",
+      "program": ".assets[] | \"\\(.name) \\(.created_at)\"",
+      "input": "release.json",
+      "output": "SHA256SUMS 2026-10-01T09:10:00Z\naterm-0.97.0.dmg 2026-10-01T09:12:00Z\naterm-appcast.toml 2026-10-01T09:21:00Z\n"
+    },
+    {
+      "name": "t23_asset_size",
+      "program": ".assets[] | \"\\(.name) \\(.size)\"",
+      "input": "release.json",
+      "output": "SHA256SUMS 512\naterm-0.97.0.dmg 48123456\naterm-appcast.toml 2048\n"
+    },
+    {
+      "name": "t24_gh_release_pub",
+      "program": "{tag:.tagName,pre:.isPrerelease,draft:.isDraft,pub:.publishedAt,assets:[.assets[].name]}",
+      "input": "release_gh.json",
+      "output": "{\"assets\":[\"SHA256SUMS\",\"aterm-0.97.0.dmg\",\"aterm-appcast.toml\",\"aterm-0.97.0.dmg.sig\"],\"draft\":false,\"pre\":false,\"pub\":\"2026-10-01T09:30:00Z\",\"tag\":\"v0.97.0\"}\n"
+    },
+    {
+      "name": "t25_gh_release_short",
+      "program": "{tag:.tagName,pre:.isPrerelease,assets:[.assets[].name]}",
+      "input": "release_gh.json",
+      "output": "{\"assets\":[\"SHA256SUMS\",\"aterm-0.97.0.dmg\",\"aterm-appcast.toml\",\"aterm-0.97.0.dmg.sig\"],\"pre\":false,\"tag\":\"v0.97.0\"}\n"
+    },
+    {
+      "name": "t26_tag_published",
+      "program": ".tag_name + \" \" + .published_at",
+      "input": "release.json",
+      "output": "v0.97.0 2026-10-01T09:30:00Z\n"
+    },
+    {
+      "name": "t27_gh_asset_select",
+      "program": ".assets[] | select(.name|test(\"appcast|dmg$\")) | .name + \" \" + .updatedAt",
+      "input": "release_gh.json",
+      "output": "aterm-0.97.0.dmg 2026-10-01T09:20:00Z\naterm-appcast.toml 2026-10-01T09:22:00Z\n"
+    },
+    {
+      "name": "t28_gh_release_dates",
+      "program": "{p:.publishedAt,c:.createdAt,draft:.isDraft,pre:.isPrerelease,assets:[.assets[].name]}",
+      "input": "release_gh.json",
+      "output": "{\"assets\":[\"SHA256SUMS\",\"aterm-0.97.0.dmg\",\"aterm-appcast.toml\",\"aterm-0.97.0.dmg.sig\"],\"c\":\"2026-10-01T09:00:00Z\",\"draft\":false,\"p\":\"2026-10-01T09:30:00Z\",\"pre\":false}\n"
+    },
+    {
+      "name": "t29_gh_published_join",
+      "program": ".publishedAt + \" \" + ([.assets[].name]|join(\",\"))",
+      "input": "release_gh.json",
+      "output": "2026-10-01T09:30:00Z SHA256SUMS,aterm-0.97.0.dmg,aterm-appcast.toml,aterm-0.97.0.dmg.sig\n"
+    },
+    {
+      "name": "t30_gh_release_created",
+      "program": "{tag:.tagName, pub:.publishedAt, created:.createdAt, assets:[.assets[].name]}",
+      "input": "release_gh.json",
+      "output": "{\"assets\":[\"SHA256SUMS\",\"aterm-0.97.0.dmg\",\"aterm-appcast.toml\",\"aterm-0.97.0.dmg.sig\"],\"created\":\"2026-10-01T09:00:00Z\",\"pub\":\"2026-10-01T09:30:00Z\",\"tag\":\"v0.97.0\"}\n"
+    },
+    {
+      "name": "t31_tag_regex_tsv",
+      "program": ".[] | select(.tag_name|test(\"^v0\\\\.7[2-9]|^v0\\\\.8[0-6]\")) | [.tag_name, .created_at, .published_at, .prerelease, .draft] | @tsv",
+      "input": "release_list.json",
+      "output": "v0.85.1\t2026-08-10T09:00:00Z\t\ttrue\ttrue\nv0.72.0\t2026-06-01T09:00:00Z\t2026-06-01T11:00:00Z\ttrue\tfalse\n"
+    },
+    {
+      "name": "t32_tag_name",
+      "program": ".tag_name",
+      "input": "release.json",
+      "output": "v0.97.0\n"
+    },
+    {
+      "name": "t33_gh_tag_and_assets",
+      "program": ".tagName, (.assets[].name)",
+      "input": "release_gh.json",
+      "output": "v0.97.0\nSHA256SUMS\naterm-0.97.0.dmg\naterm-appcast.toml\naterm-0.97.0.dmg.sig\n"
+    },
+    {
+      "name": "t34_gh_tags",
+      "program": ".[].tagName",
+      "input": "release_gh_list.json",
+      "output": "v0.97.0\nv0.96.0\nv0.95.2\n"
+    },
+    {
+      "name": "a01_release_fields",
+      "program": "[.tag_name, (.draft|tostring), (.prerelease|tostring), ([.assets[].name]|join(\"/\"))] | @tsv",
+      "input": "release.json",
+      "output": "v0.97.0\tfalse\tfalse\tSHA256SUMS/aterm-0.97.0.dmg/aterm-appcast.toml\n"
+    },
+    {
+      "name": "a02_view_fields",
+      "program": "[.tagName, (.isDraft|tostring), (.isPrerelease|tostring), ([.assets[].name]|join(\"/\"))] | @tsv",
+      "input": "release_gh.json",
+      "output": "v0.97.0\tfalse\tfalse\tSHA256SUMS/aterm-0.97.0.dmg/aterm-appcast.toml/aterm-0.97.0.dmg.sig\n"
+    },
+    {
+      "name": "a03_appcast_asset_list",
+      "program": ".[] | . as $r |\n    {release_id: $r.id,\n     tag: $r.tag_name,\n     draft: $r.draft,\n     target_commitish: $r.target_commitish,\n     assets: [$r.assets[]? |\n       select(.name == \"aterm-appcast.toml\" or .name == \"aterm-appcast.toml.sig\") |\n       {id: .id, name: .name}]}\n    | @json",
+      "input": "release_list.json",
+      "output": "{\"assets\":[{\"id\":300000501,\"name\":\"aterm-appcast.toml\"},{\"id\":300000502,\"name\":\"aterm-appcast.toml.sig\"}],\"draft\":false,\"release_id\":190000105,\"tag\":\"v0.90.0\",\"target_commitish\":\"main\"}\n{\"assets\":[{\"id\":300000401,\"name\":\"aterm-appcast.toml\"}],\"draft\":true,\"release_id\":190000104,\"tag\":\"v0.85.1\",\"target_commitish\":\"release/0.85\"}\n{\"assets\":[],\"draft\":false,\"release_id\":190000103,\"tag\":\"v0.72.0\",\"target_commitish\":\"main\"}\n{\"assets\":[{\"id\":300000201,\"name\":\"aterm-appcast.toml.sig\"}],\"draft\":false,\"release_id\":190000102,\"tag\":\"v0.71.0\",\"target_commitish\":\"main\"}\n",
+      "jq_differs": "jq 1.7.1's @json keeps an object's own key order, and agh's sorts the keys; recorded from the program without its last | @json"
+    },
+    {
+      "name": "a04_release_identity_object",
+      "program": "[.id, .tag_name, (.draft | tostring), .target_commitish] | @tsv",
+      "input": "release.json",
+      "output": "190000101\tv0.97.0\tfalse\tmain\n"
+    },
+    {
+      "name": "a05_release_identity_list",
+      "program": ".[] | [.id, .tag_name, (.draft | tostring), .target_commitish] | @tsv",
+      "input": "release_list.json",
+      "output": "190000105\tv0.90.0\tfalse\tmain\n190000104\tv0.85.1\ttrue\trelease/0.85\n190000103\tv0.72.0\tfalse\tmain\n190000102\tv0.71.0\tfalse\tmain\n"
+    },
+    {
+      "name": "a06_release_object_and_assets",
+      "program": "([\"R\", .id, .tag_name,\n      (.draft | tostring), .target_commitish] | @tsv),\n    (.assets[]? | [\"A\", .name, (.id | tostring), (.size | tostring)] | @tsv)",
+      "input": "release.json",
+      "output": "R\t190000101\tv0.97.0\tfalse\tmain\nA\tSHA256SUMS\t300000201\t512\nA\taterm-0.97.0.dmg\t300000202\t48123456\nA\taterm-appcast.toml\t300000203\t2048\n"
+    },
+    {
+      "name": "a07_asset_rows",
+      "program": ".assets[] | [.name, (.id | tostring), (.size | tostring)] | @tsv",
+      "input": "release.json",
+      "output": "SHA256SUMS\t300000201\t512\naterm-0.97.0.dmg\t300000202\t48123456\naterm-appcast.toml\t300000203\t2048\n"
+    },
+    {
+      "name": "a08_channel_preflight",
+      "program": "[(.private | tostring), (.permissions.push // false | tostring)] | @tsv",
+      "input": "repo.json",
+      "output": "true\ttrue\n"
+    },
+    {
+      "name": "a09_prerelease",
+      "program": ".prerelease | tostring",
+      "input": "release.json",
+      "output": "false\n"
+    },
+    {
+      "name": "a10_metadata",
+      "program": ".[] | . as $r |\n        ([$r.assets[]? | select(.name == \"aterm-appcast.toml\")] | length) as $exact_count |\n        [($r.id | tostring), $r.tag_name, ($r.draft | tostring),\n         ($r.prerelease | tostring), ($exact_count | tostring)] | @tsv",
+      "input": "release_list.json",
+      "output": "190000105\tv0.90.0\tfalse\tfalse\t1\n190000104\tv0.85.1\ttrue\ttrue\t1\n190000103\tv0.72.0\tfalse\ttrue\t0\n190000102\tv0.71.0\tfalse\tfalse\t0\n"
+    },
+    {
+      "name": "a11_release_steps_tag_name",
+      "program": ".tag_name",
+      "input": "release.json",
+      "output": "v0.97.0\n"
+    },
+    {
+      "name": "a12_machines_login",
+      "program": ".login",
+      "input": "user.json",
+      "output": "fixture-dev-bot\n"
+    },
+    {
+      "name": "a13_machines_keys",
+      "program": ".[] | [.id, .key] | @tsv",
+      "input": "keys.json",
+      "output": "70000001\tssh-ed25519 AAAAfixturekeyone\n70000002\tssh-ed25519 AAAAfixturekeytwo\n"
+    },
+    {
+      "name": "a14_machines_id",
+      "program": ".id",
+      "input": "user.json",
+      "output": "9000002\n"
+    },
+    {
+      "name": "r01_def_reduce_foreach",
+      "program": "reduce .[] as $x (0; . + $x)",
+      "refused": "reduce"
+    },
+    {
+      "name": "r02_recurse",
+      "program": "..",
+      "refused": ".."
+    },
+    {
+      "name": "r03_assignment",
+      "program": ".tag_name = \"x\"",
+      "refused": "="
+    },
+    {
+      "name": "r04_try_catch_error",
+      "program": "try .a catch \"b\"",
+      "refused": "try"
+    },
+    {
+      "name": "r05_label_break",
+      "program": "label $out | 1",
+      "refused": "label"
+    },
+    {
+      "name": "r06_path_functions",
+      "program": "[paths]",
+      "refused": "paths"
+    },
+    {
+      "name": "r07_input_env",
+      "program": "$ENV.HOME",
+      "refused": "$ENV"
+    },
+    {
+      "name": "r08_regex_functions",
+      "program": ".name | sub(\"a\"; \"b\")",
+      "refused": "sub"
+    },
+    {
+      "name": "r09_date_functions",
+      "program": "now | todate",
+      "refused": "now"
+    },
+    {
+      "name": "r10_shell_formats",
+      "program": ".name | @sh",
+      "refused": "@sh"
+    },
+    {
+      "name": "r11_generators",
+      "program": "[limit(2; .[])]",
+      "refused": "limit"
+    },
+    {
+      "name": "r12_destructuring",
+      "program": ". as [$a, $b] | $a",
+      "refused": "as ["
+    },
+    {
+      "name": "r13_destructuring_alternative",
+      "program": ".a ?// .b",
+      "refused": "?//"
+    },
+    {
+      "name": "r14_unknown_name",
+      "program": "if . then 1 else 2 end",
+      "refused": "if"
+    },
+    {
+      "name": "r15_update_assignment",
+      "program": ".a |= 1",
+      "refused": "|="
+    },
+    {
+      "name": "e01_slice_negative",
+      "program": ".tag_name[-6:-2]",
+      "input": "release.json",
+      "output": "0.97\n"
+    },
+    {
+      "name": "e02_slice_null_bounds",
+      "program": "[.tag_name[null:3], .tag_name[4:null], (.assets[:2] | map(.id)), (.assets[1:] | length)]",
+      "input": "release.json",
+      "output": "[\"v0.\",\"7.0\",[300000201,300000202],2]\n"
+    },
+    {
+      "name": "e03_slice_clamps",
+      "program": "[.tag_name[2:100], .tag_name[-100:2], .tag_name[5:2]]",
+      "input": "release.json",
+      "output": "[\".97.0\",\"v0\",\"\"]\n"
+    },
+    {
+      "name": "e04_alternative_swallows_error",
+      "program": "(.tag_name | tonumber) // \"not a number\"",
+      "input": "release.json",
+      "output": "not a number\n",
+      "jq_differs": "jq 1.7.1 raises the left side's error, and agh swallows it as the plan says; recorded from (.tag_name | tonumber?) // \"not a number\""
+    },
+    {
+      "name": "e05_question_mark",
+      "program": "[.assets[] | .name.x?], [.tag_name | .[]?], [.assets[]?.id]",
+      "input": "release.json",
+      "output": "[]\n[]\n[300000201,300000202,300000203]\n"
+    },
+    {
+      "name": "e06_null_plus",
+      "program": "[null + .id, .id + null, null + null]",
+      "input": "release.json",
+      "output": "[190000101,190000101,null]\n"
+    },
+    {
+      "name": "e07_sort_type_order",
+      "program": "[{\"a\":1}, [1], \"a\", 1, true, false, null, .id] | sort",
+      "input": "release.json",
+      "output": "[null,false,true,1,190000101,\"a\",[1],{\"a\":1}]\n"
+    },
+    {
+      "name": "e08_join_mixed",
+      "program": "[.tag_name, 1, null, true, 2.5] | join(\",\")",
+      "input": "release.json",
+      "output": "v0.97.0,1,,true,2.5\n"
+    },
+    {
+      "name": "e09_base64d_60_columns",
+      "program": ".content | @base64d",
+      "input": "contents_file.json",
+      "output": "[package]\nname = \"packs\"\nversion = \"0.1.0\"\nedition = \"2024\"\ndescription = \"fixture packs for agh tests\"\n\n[dependencies]\n\n",
+      "jq_differs": "jq 1.7.1 refuses the newlines, and agh skips ASCII whitespace; recorded from .content | gsub(\"\\n\"; \"\") | @base64d"
+    },
+    {
+      "name": "e10_tsv_object_item",
+      "program": "[.tag_name, .author] | @tsv",
+      "input": "release.json",
+      "fails": true
+    },
+    {
+      "name": "e11_unbound_variable",
+      "program": "$nope",
+      "input": "release.json",
+      "fails": true
+    },
+    {
+      "name": "e12_fraction_literal",
+      "program": "1.0, 1.5 + 1.5, 0.5",
+      "input": "release.json",
+      "output": "1.0\n3\n0.5\n",
+      "gojq_differs": "gojq prints the literal 1.0 as 1"
+    },
+    {
+      "name": "e13_index_negative",
+      "program": "[.assets[-1].name, .assets[1.7].name, .assets[9].name]",
+      "input": "release.json",
+      "output": "[\"aterm-appcast.toml\",\"aterm-0.97.0.dmg\",null]\n"
+    },
+    {
+      "name": "e14_entries",
+      "program": "(.stats | to_entries | map(\"\\(.key)=\\(.value)\") | join(\" \")), ([{key: \"a\", value: 1}, {name: \"b\", value: 2}] | from_entries)",
+      "input": "commit.json",
+      "output": "additions=9 deletions=3 total=12\n{\"a\":1,\"b\":2}\n"
+    },
+    {
+      "name": "e15_keys_has_length",
+      "program": "[(.stats | keys), (.stats | has(\"total\")), (.commit.message | length), (.stats | length), ([1,2] | has(1)), (-3 | length)]",
+      "input": "commit.json",
+      "output": "[[\"additions\",\"deletions\",\"total\"],true,64,3,true,3]\n"
+    },
+    {
+      "name": "e16_sort_by_unique_min_max",
+      "program": "[(map(.tag_name) | sort), (sort_by(.created_at) | map(.id)), ([.[].draft] | unique), (map(.id) | min), (map(.id) | max), ([] | min)]",
+      "input": "release_list.json",
+      "output": "[[\"v0.71.0\",\"v0.72.0\",\"v0.85.1\",\"v0.90.0\"],[190000102,190000103,190000104,190000105],[false,true],190000102,190000105,null]\n"
+    },
+    {
+      "name": "e17_any_all_add",
+      "program": "[(map(.draft) | any), (map(.draft) | all), any(.prerelease), all(.id > 0), ([.[].assets | length] | add), ([] | add)]",
+      "input": "release_list.json",
+      "output": "[true,false,true,true,6,null]\n"
+    },
+    {
+      "name": "e18_strings",
+      "program": "[(.tag_name | ltrimstr(\"v\")), (.tag_name | rtrimstr(\".0\")), (.name | ascii_upcase), (.name | ascii_downcase), (.tag_name | startswith(\"v0\")), (.tag_name | endswith(\".1\")), (.body | split(\"\\n\")), (1 | ltrimstr(\"x\"))]",
+      "input": "release.json",
+      "output": "[\"0.97.0\",\"v0.97\",\"ATERM 0.97.0\",\"aterm 0.97.0\",true,false,[\"First line of the notes.\",\"Second line.\"],1]\n"
+    },
+    {
+      "name": "e19_formats",
+      "program": "([.tag_name, 1, null, false, \"say \\\"hi\\\"\"] | @csv), (.assets[0] | {id, name} | @json), (.tag_name | @base64), (.tag_name | @text), ([.id] | @text)",
+      "input": "release.json",
+      "output": "\"v0.97.0\",1,,false,\"say \"\"hi\"\"\"\n{\"id\":300000201,\"name\":\"SHA256SUMS\"}\ndjAuOTcuMA==\nv0.97.0\n[190000101]\n"
+    },
+    {
+      "name": "e20_first_last_type",
+      "program": "[(.assets | first | .name), (.assets | last | .name), first(.assets[].size), last(.assets[].size), (.assets | type), (.draft | not), ([.assets[].digest | select(. != null)] | length), ([empty] | length)]",
+      "input": "release.json",
+      "output": "[\"SHA256SUMS\",\"aterm-appcast.toml\",512,2048,\"array\",true,2,0]\n"
+    },
+    {
+      "name": "e21_comparisons_and_or",
+      "program": "[.id == 190000101, .id != 1, .tag_name < \"v1\", .tag_name >= \"w\", (.draft or .prerelease), (.draft and true), ([1,2] < [1,3]), ({\"a\":1} < {\"b\":0})]",
+      "input": "release.json",
+      "output": "[true,true,true,false,false,false,true,true]\n"
+    },
+    {
+      "name": "e22_arithmetic",
+      "program": "[.id - 1, ([1,2,3,2] - [2]), ({\"a\":1} + {\"a\":2, \"b\":3}), (\"x\" + \"y\"), ([1] + [2])]",
+      "input": "release.json",
+      "output": "[190000100,[1,3],{\"a\":2,\"b\":3},\"xy\",[1,2]]\n"
+    },
+    {
+      "name": "e23_object_product",
+      "program": "{a: (1, 2), b: (.draft, .prerelease)}",
+      "input": "release.json",
+      "output": "{\"a\":1,\"b\":false}\n{\"a\":1,\"b\":false}\n{\"a\":2,\"b\":false}\n{\"a\":2,\"b\":false}\n"
+    },
+    {
+      "name": "e24_bind_and_variable_shorthand",
+      "program": ".tag_name as $t | .assets[0] | {$t, name, \"size\": .size}",
+      "input": "release.json",
+      "output": "{\"name\":\"SHA256SUMS\",\"size\":512,\"t\":\"v0.97.0\"}\n"
+    },
+    {
+      "name": "e25_tonumber_tostring",
+      "program": "[(\"42\" | tonumber), (12 | tostring), (.assets[0] | tostring | length > 10), ([1, \"a\"] | tostring)]",
+      "input": "release.json",
+      "output": "[42,\"12\",true,\"[1,\\\"a\\\"]\"]\n"
+    },
+    {
+      "name": "e26_iterate_object_sorted",
+      "program": "[.stats[]], (.stats | keys[0])",
+      "input": "commit.json",
+      "output": "[9,3,12]\nadditions\n"
+    },
+    {
+      "name": "e27_string_key_index",
+      "program": ".[\"tag_name\"], .\"name\", .assets[0].[\"id\"]",
+      "input": "release.json",
+      "output": "v0.97.0\naterm 0.97.0\n300000201\n"
+    },
+    {
+      "name": "e28_index_string_fails",
+      "program": ".tag_name.x",
+      "input": "release.json",
+      "fails": true
+    },
+    {
+      "name": "e29_object_iterates_sorted",
+      "program": "[.owner[]], (.owner | to_entries | map(.key))",
+      "input": "repo.json",
+      "output": "[9000010,\"fixture-dev\",\"Organization\"]\n[\"id\",\"login\",\"type\"]\n",
+      "jq_differs": "jq 1.7.1 iterates an object in its own order, and agh in sorted key order; recorded from [.owner | to_entries | sort_by(.key)[] | .value], (.owner | to_entries | sort_by(.key) | map(.key))"
+    },
+    {
+      "name": "e30_last_of_nothing_is_null",
+      "program": "[last(empty), last(.assets[] | select(.size < 0)), last(.assets[].name)]",
+      "input": "release.json",
+      "output": "[null,null,\"aterm-appcast.toml\"]\n"
+    },
+    {
+      "name": "e31_to_entries_of_an_array",
+      "program": "[.assets[0:2][].name] | to_entries",
+      "input": "release.json",
+      "output": "[{\"key\":0,\"value\":\"SHA256SUMS\"},{\"key\":1,\"value\":\"aterm-0.97.0.dmg\"}]\n"
+    },
+    {
+      "name": "e32_as_binds_the_term_before_it",
+      "program": "[1, 2 as $x | $x + 10], (.tag_name // \"none\" as $t | \"tag \\($t)\"), (\"v\" + .tag_name as $s | $s | ascii_upcase), [10 - 2 as $x | $x - 1]",
+      "input": "release.json",
+      "output": "[1,12]\nv0.97.0\nvV0.97.0\n[9]\n"
+    },
+    {
+      "name": "e33_interpolation_order",
+      "program": "\"\\(1,2) \\(3,4)\", \"\\(1,2)\\(3,4)\\(5,6)\"",
+      "input": "release.json",
+      "output": "1 3\n2 3\n1 4\n2 4\n135\n235\n145\n245\n136\n236\n146\n246\n"
+    },
+    {
+      "name": "e34_index_and_slice_order",
+      "program": "[([1,2],[3,4])[0,1]], [([1,2,3,4],[5,6,7,8])[0,1:2,3]]",
+      "input": "release.json",
+      "output": "[1,3,2,4]\n[[1,2],[5,6],[1,2,3],[5,6,7],[2],[6],[2,3],[6,7]]\n"
+    },
+    {
+      "name": "e35_number_literals_and_overflow",
+      "program": "[1e3 + 0, 2.5e-1 + 0, 1E2 + 1, 9007199254740993, 18446744073709551615], (\"1e308\" | tonumber) + (\"1e308\" | tonumber)",
+      "input": "release.json",
+      "output": "[1000,0.25,101,9007199254740993,18446744073709551615]\n1.7976931348623157e+308\n"
+    },
+    {
+      "name": "e36_del_is_escaped",
+      "program": "[\"x\\u007f\"], (\"x\\u007f\" | @json), ({\"a\": \"x\\u007f\"} | tostring)",
+      "input": "release.json",
+      "output": "[\"x\\u007f\"]\n\"x\\u007f\"\n{\"a\":\"x\\u007f\"}\n"
+    },
+    {
+      "name": "e37_negative_fraction_index_floors",
+      "program": "[.assets[-0.5].name]",
+      "input": "release.json",
+      "output": "[\"aterm-appcast.toml\"]\n",
+      "jq_differs": "jq 1.7.1 truncates -0.5 to 0 and gives the first asset; recorded from [.assets[-1].name]"
+    },
+    {
+      "name": "e38_from_entries_short_names",
+      "program": "[{\"k\": \"a\", \"v\": 1}, {\"K\": \"b\", \"V\": 2}] | from_entries",
+      "input": "release.json",
+      "output": "{\"a\":1,\"b\":2}\n",
+      "jq_differs": "jq 1.7.1 takes neither k nor K and fails on the null key; recorded from [{\"key\":\"a\",\"value\":1},{\"key\":\"b\",\"value\":2}] | from_entries"
+    },
+    {
+      "name": "e39_unbound_variable_never_evaluated",
+      "program": "[empty | $nope]",
+      "input": "release.json",
+      "output": "[]\n",
+      "jq_differs": "jq 1.7.1 refuses the program at compile time ($nope is not defined); recorded from [empty]"
+    },
+    {
+      "name": "e40_numbers_print_by_value",
+      "program": "[1.50, 1e3, -0]",
+      "input": "release.json",
+      "output": "[1.5,1000,0]\n",
+      "jq_differs": "jq 1.7.1 keeps a literal's text and prints [1.50,1E+3,-0]; recorded from [1.5, 1000, 0]"
+    },
+    {
+      "name": "e41_tostring_sorts_keys",
+      "program": "{\"b\": 1, \"a\": 2} | tostring",
+      "input": "release.json",
+      "output": "{\"a\":2,\"b\":1}\n",
+      "jq_differs": "jq 1.7.1's tostring keeps the object's own order, {\"b\":1,\"a\":2}; recorded from {\"a\": 2, \"b\": 1} | tostring"
+    },
+    {
+      "name": "e42_integer_arithmetic_is_exact",
+      "program": "9007199254740993 + 0",
+      "input": "release.json",
+      "output": "9007199254740993\n",
+      "jq_differs": "jq 1.7.1 adds in doubles and prints 9007199254740992; recorded from 9007199254740993"
+    },
+    {
+      "name": "e43_tonumber_keeps_a_double",
+      "program": "\"2.5e1\" | tonumber",
+      "input": "release.json",
+      "output": "25.0\n",
+      "jq_differs": "jq 1.7.1 prints 25; recorded from 25.0",
+      "gojq_differs": "gojq prints 25"
+    },
+    {
+      "name": "e44_question_after_a_step_skips_each_target",
+      "program": "([.assets[0], .tag_name, .assets[1]] | [.[].name?]), ([[1],\"s\",[2]] | [.[][0]?]), ([1,[2]] | [.[][]?]), ({\"a\":[1,\"s\",{\"k\":3}]} | [.a[].k?]), ([{\"a\":\"s\"},{\"a\":{\"b\":2}}] | [.[].a.b?]), [(.tag_name, \"s\", 1) | .[0:1]?], (\"x\" | [(.a.b)?]), [.assets[]?.name?]",
+      "input": "release.json",
+      "output": "[\"SHA256SUMS\",\"aterm-0.97.0.dmg\"]\n[1,2]\n[2]\n[3]\n[2]\n[\"v\",\"s\"]\n[]\n[\"SHA256SUMS\",\"aterm-0.97.0.dmg\",\"aterm-appcast.toml\"]\n"
+    },
+    {
+      "name": "e45_question_after_a_step_keeps_an_earlier_steps_error",
+      "program": "[.tag_name.x.y?]",
+      "input": "release.json",
+      "fails": true
+    },
+    {
+      "name": "e46_question_after_a_step_keeps_the_keys_error",
+      "program": "{\"a\":1} | [.[(\"a\",\"x\"|tonumber)]?]",
+      "input": "release.json",
+      "fails": true
+    },
+    {
+      "name": "e47_try_keeps_the_outputs_before_an_error",
+      "program": "[((1, (\"x\"|.a)) + 10)?], [((1,2) + (10, (\"a\"|tonumber)))?], [((true, (\"x\"|.a)) and true)?], [((false, (\"x\"|.a)) or (true, (\"y\"|.a)))?], [((1,2) == (1, (\"a\"|tonumber)))?], [{a: (1, (\"x\"|.a))}?], [{a: (1,2), b: (3, (\"x\"|tonumber))}?], [(\"\\((1, (\"x\"|.a)))\")?], [(\"\\(1, (\"x\"|.a))-\\(3,4)\")?], [(1 | select(true, (\"x\"|.a)))?], [[1,2] | any(true, (\"a\"|tonumber))], [[1,2] | all(false, (\"a\"|tonumber))], [(([1,2], (\"a\"|tonumber))[0,1])?], [([1,2,3] | .[(0,1):(1, (\"x\"|tonumber))])?], [{(.id): empty}], [1 | startswith(empty)]",
+      "input": "release.json",
+      "output": "[11]\n[11,12]\n[true]\n[true]\n[true,false]\n[{\"a\":1}]\n[{\"a\":1,\"b\":3}]\n[\"1\"]\n[\"1-3\"]\n[1]\n[true]\n[false]\n[1]\n[[1]]\n[]\n[]\n"
+    },
+    {
+      "name": "e48_alternative_keeps_the_outputs_before_an_error",
+      "program": "((1, (\"x\"|.a)) + 10) // 5",
+      "input": "release.json",
+      "output": "11\n",
+      "jq_differs": "jq 1.7.1 prints 11 and then raises the left side's error, which agh swallows; recorded from ((1, (\"x\"|.a)) + 10)? // 5"
+    },
+    {
+      "name": "e49_fractional_slice_bounds_count_from_the_end_first",
+      "program": "[1,2,3] | [.[:-0.5], .[-0.5:], .[-1.5:], .[:-1.5], .[:1.5], .[0.5:], .[-2.5:-0.5], .[-0.2:-0.1]]",
+      "input": "release.json",
+      "output": "[[1,2,3],[3],[2,3],[1,2],[1,2],[1,2,3],[1,2,3],[3]]\n"
+    },
+    {
+      "name": "e50_a_computed_double_prints_shortest",
+      "program": "[0.00001 + 0]",
+      "input": "release.json",
+      "output": "[0.00001]\n",
+      "jq_differs": "jq 1.7.1 prints [1e-05]; recorded from [0.00001]"
+    },
+    {
+      "name": "e51_test_dollar_is_the_very_end",
+      "program": "\"a.dmg\\n\" | test(\"dmg$\")",
+      "input": "release.json",
+      "output": "false\n",
+      "jq_differs": "jq 1.7.1's $ also matches before a final newline and gives true; recorded from \"a.dmg\\n\" | test(\"dmg\\\\z\")"
+    },
+    {
+      "name": "e52_has_on_null_and_a_fractional_index",
+      "program": "[(null | has(\"a\")), (null | has(0)), ([1,2] | has(-0.5)), ([1,2] | has(2.5))]",
+      "input": "release.json",
+      "output": "[false,false,true,false]\n"
+    },
+    {
+      "name": "e53_has_selects_past_a_null",
+      "program": "[null, {\"login\":\"x\"}] | map(select(has(\"login\")))",
+      "input": "release.json",
+      "output": "[{\"login\":\"x\"}]\n"
+    },
+    {
+      "name": "e54_from_entries_reads_jq_names_first",
+      "program": "[{\"name\":\"n\",\"Key\":\"KK\",\"value\":1}, {\"Name\":\"N\",\"k\":\"kk\",\"value\":2}, {\"key\":\"c\",\"v\":3,\"Value\":5}] | from_entries",
+      "input": "release.json",
+      "output": "{\"KK\":1,\"N\":2,\"c\":5}\n"
+    },
+    {
+      "name": "e55_tsv_and_csv_write_nul_as_backslash_zero",
+      "program": "[\"a\\u0000b\",\"c\"] | @tsv, @csv",
+      "input": "release.json",
+      "output": "a\\0b\tc\n\"a\\0b\",\"c\"\n"
+    },
+    {
+      "name": "e56_test_posix_classes_are_ascii",
+      "program": "[\"é\",\"É\",\"e\"] | map(test(\"[[:alpha:]]\"))",
+      "input": "release.json",
+      "output": "[false,false,true]\n",
+      "jq_differs": "jq 1.7.1's [[:alpha:]] takes Unicode letters and gives [true,true,true]; recorded from [\"é\",\"É\",\"e\"] | map(test(\"[a-zA-Z]\"))"
+    },
+    {
+      "name": "e57_test_case_folds_one_character_at_a_time",
+      "program": "\"Straße\" | test(\"(?i)strasse\")",
+      "input": "release.json",
+      "output": "false\n",
+      "jq_differs": "jq 1.7.1 folds ß to ss and gives true; recorded from \"Straße\" | test(\"strasse\")"
+    },
+    {
+      "name": "e58_test_reads_a_codepoint_escape",
+      "program": "\"x\" | test(\"\\\\u0078\")",
+      "input": "release.json",
+      "output": "true\n",
+      "jq_differs": "jq 1.7.1 reads \\u0078 as a literal u and gives false; recorded from \"x\" | test(\"x\")"
+    },
+    {
+      "name": "e59_tonumber_reads_an_infinity_as_the_largest_double",
+      "program": "[\"inf\", \"-Infinity\", \"1e1000\", \"-1E400\"] | map(tonumber)",
+      "input": "release.json",
+      "output": "[1.7976931348623157e+308,-1.7976931348623157e+308,1.7976931348623157e+308,-1.7976931348623157e+308]\n",
+      "jq_differs": "jq 1.7.1 keeps the text of an exponent past a double's range and prints 1E+1000 and -1E+400; recorded from [\"inf\", \"-Infinity\", \"1e1000\", \"-1E400\"] | map(tonumber + 0)"
+    },
+    {
+      "name": "e60_tonumber_of_nan_fails",
+      "program": "\"nan\" | tonumber",
+      "input": "release.json",
+      "fails": true,
+      "jq_differs": "jq 1.7.1 reads nan as a number and prints null"
+    },
+    {
+      "name": "e61_tonumber_of_a_bare_fraction_fails",
+      "program": "\".5\" | tonumber",
+      "input": "release.json",
+      "fails": true,
+      "jq_differs": "jq 1.7.1 reads .5 and prints 0.5"
+    },
+    {
+      "name": "e62_base64d_stops_at_the_first_padding",
+      "program": "[\"====\", \"=\", \"YQ====\", \"=YQ\", \"YWJj=YQ\"] | map(@base64d)",
+      "input": "release.json",
+      "output": "[\"\",\"\",\"a\",\"\",\"abc\"]\n"
+    },
+    {
+      "name": "e63_base64d_of_one_trailing_symbol_fails",
+      "program": "\"Y=Q=\" | @base64d",
+      "input": "release.json",
+      "fails": true
+    }
+  ]
+}

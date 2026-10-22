@@ -1914,8 +1914,9 @@ pub struct CheckOwed {
     /// as the check's yield (the merge review's MG7-A3); nothing it says ends
     /// the task (FOREVER CRUISE).
     pub rule: &'static str,
-    /// A WALL ANSWERED IT, its row after it: the wall's retry delivers it
-    /// again (`TurnEndState::cut_check`). Else its answer is the check's.
+    /// A WALL ANSWERED IT, its row after it (an API error's, which writes
+    /// none: its point's retry mark): the wall's retry delivers it again
+    /// (`TurnEndState::cut_check`). Else its answer is the check's.
     pub cut: bool,
     /// The check itself is the last act — typed then (unix ms), in a limit's
     /// place or not ([`act_reason`]'s mark) — rather than a wall's retry
@@ -1947,7 +1948,9 @@ pub struct CheckOwed {
 /// (`is_wall_retry`) typed while a check a wall cut stood — a wall's row
 /// after the check, no take after it ([`WALL_TAKEN`]: that wall was the
 /// screen it was typed at) and no other end ([`RULE_WALL_WAIT_END`]: the
-/// worker's work, a person's turn) since. A loop that follows reads that
+/// worker's work, a person's turn) since; an API error's wall writes no
+/// row, so the retry mark on the check's point is its cut, and someone's
+/// point after it its end. A loop that follows reads that
 /// answer's done report as the check's, as the loop that asked it does
 /// (`TurnEndState::seed_done_check`): read as a first one, it typed the
 /// check again after the task had ended, and through a whole wall's wait
@@ -1963,6 +1966,9 @@ pub fn done_check_owed_in(body: &str, sid: Option<&str>) -> Option<CheckOwed> {
     let mut owed: Option<CheckOwed> = None;
     // The points judged since the act owed, no wall cutting it ([`RULE_POINT`]).
     let mut judged = 0_u32;
+    // The cut is an API error's, read off the check's point ([`retry_mark_of`]): no wall-wait
+    // row ends it, so a later point does.
+    let mut api_cut = false;
     for v in body
         .lines()
         .filter(|l| {
@@ -1978,6 +1984,7 @@ pub fn done_check_owed_in(body: &str, sid: Option<&str>) -> Option<CheckOwed> {
         if text("decision") == Some("typed") {
             if rule != RULE_USAGE_PROBE {
                 judged = 0;
+                api_cut = false;
             }
             owed = match rule {
                 // The accounts probe's `/usage` is no act.
@@ -2035,6 +2042,7 @@ pub fn done_check_owed_in(body: &str, sid: Option<&str>) -> Option<CheckOwed> {
                     }
                     o.cut = true;
                 }
+                api_cut = false;
             }
             RULE_WALL_WAIT_END => {
                 owed = match owed {
@@ -2049,6 +2057,26 @@ pub fn done_check_owed_in(body: &str, sid: Option<&str>) -> Option<CheckOwed> {
             }
             // Off stood: a check a wall cut is delivered again no more.
             RULE_OFF_STOOD => owed = owed.filter(|o| !o.cut),
+            // An API error's wall writes no wall-wait row: the check's point carrying the wall's
+            // retry mark is the cut, and the wall's retry delivers the check again.
+            RULE_POINT
+                if judged == 0
+                    && owed.is_some_and(|o| !o.cut)
+                    && text("reason").and_then(retry_mark_of).is_some() =>
+            {
+                if let Some(o) = owed.as_mut() {
+                    o.cut = true;
+                    // Awaited no more: its point is judged.
+                    o.check = None;
+                    o.read_ms = None;
+                }
+                api_cut = true;
+            }
+            // Someone's turn since that cut: its point leaves no check for the retry to deliver.
+            RULE_POINT if api_cut && owed.is_some_and(|o| o.cut) => {
+                owed = None;
+                api_cut = false;
+            }
             // THE CHECK'S ANSWER JUDGED: the first point a loop judged after
             // it, no wall cutting it — and a second is a later turn's, after
             // which the check is nobody's to answer.
@@ -2311,6 +2339,17 @@ impl LandWalk {
                 e.answered = true;
                 e.hold = HoldStart::LANDED;
             }
+            // An API error's wall writes no wall-wait row: the act's point carrying its retry
+            // mark is the cut, and the wall's retry delivers the act again.
+            RULE_POINT
+                if e.landing
+                    && !e.cut
+                    && self.judged == 0
+                    && text("reason").and_then(retry_mark_of).is_some() =>
+            {
+                e.landing = false;
+                e.cut = true;
+            }
             // The act's answer judged; a second point is a later turn's.
             RULE_POINT if e.landing && !e.cut => {
                 self.judged += 1;
@@ -2318,6 +2357,8 @@ impl LandWalk {
                     e.landing = false;
                 }
             }
+            // Someone's turn since the cut: its point leaves no act for the retry to deliver.
+            RULE_POINT if e.cut && !e.landing => e.cut = false,
             // At the act's point: the wall's retry delivers it again.
             RULE_WALL_WAIT if e.landing => {
                 e.landing = false;
@@ -5341,6 +5382,88 @@ mod tests {
             landing("land-done", &[land, point(20_000), done_at(20_001)]),
             (true, true)
         );
+    }
+
+    /// A DONE CHECK AN API ERROR CUT IS OWED TO THE WALL'S RETRY, as a land act
+    /// is ([`LandWalk`]): an API error's wall writes no wall-wait row, so the
+    /// check's point carrying the wall's retry mark ([`RetryMark`]) is the
+    /// cut; the retry typed delivers the check again, and its answer's point
+    /// judges it. Someone's turn after the cut (its point, met by a 529 too or
+    /// not) leaves the check to nobody. Read as the check's answer judged, a
+    /// loop that followed between the 529 and the retry's answer held no check,
+    /// and where the retry's turn met a full context it typed `keep going` as
+    /// the `/compact`'s continuation where the loop that typed the check types
+    /// the check again. NEGATIVE CONTROL: the same point with no retry mark is
+    /// the check's answer judged, owed no more.
+    #[test]
+    fn a_done_check_an_api_error_cut_is_owed_to_the_walls_retry() {
+        use super::super::policy::turn_end::{RULE_API_RETRY, RULE_DONE_CHECK};
+        let dir = crate::supervise::ScratchDir::new("apr-seed", "check-cut-by-api");
+        let sid = Some("@s-9");
+        let check = (
+            10_000,
+            RULE_DONE_CHECK,
+            Outcome::Typed,
+            "(the check)",
+            act_reason(None),
+        );
+        let mark = |attempts: usize| RetryMark {
+            kind: aterm_phase::WallKind::Overloaded,
+            attempts,
+            ups: 0,
+            since_ms: 310_000,
+        };
+        let point = |ts: i64, retry: Option<RetryMark>| {
+            (
+                ts,
+                RULE_POINT,
+                Outcome::Waiting,
+                "",
+                point_reason(Carried { short: 1, retry }, false),
+            )
+        };
+        let retry = |ts: i64| {
+            (
+                ts,
+                RULE_API_RETRY,
+                Outcome::Typed,
+                "(the retry)",
+                act_reason_after(
+                    Carried {
+                        short: 1,
+                        retry: Some(mark(1)),
+                    },
+                    None,
+                ),
+            )
+        };
+        let cut = point(310_000, Some(mark(0)));
+        let owed = |name: &str, rows: &[(i64, &str, Outcome, &str, String)]| {
+            done_check_owed(&seed_ledger(&dir, name, rows), sid)
+        };
+        let o = owed("cut", &[check.clone(), cut.clone()]).expect("cut");
+        assert!(o.cut && o.check.is_none() && !o.answered, "{o:?}");
+        let o = owed("retried", &[check.clone(), cut.clone(), retry(370_000)]).expect("again");
+        assert!(!o.cut && o.check.is_none(), "{o:?}");
+        let answered = [
+            check.clone(),
+            cut.clone(),
+            retry(370_000),
+            point(550_000, None),
+        ];
+        assert_eq!(owed("answered", &answered), None);
+        // Someone's turn since the cut, met by a 529 too or not.
+        for (name, theirs) in [
+            ("theirs-cut", point(880_000, Some(mark(0)))),
+            ("theirs", point(880_000, None)),
+        ] {
+            let rows = [check.clone(), cut.clone(), theirs];
+            assert_eq!(owed(name, &rows), None, "{name}");
+            let rows = [rows.as_slice(), &[retry(940_000)]].concat();
+            assert_eq!(owed(&format!("{name}-retried"), &rows), None, "{name}");
+        }
+        // NEGATIVE CONTROL: the check's answer judged.
+        assert_eq!(owed("unmarked", &[check, point(310_000, None)]), None);
     }
 
     /// A CUT KEEPS WHAT THE READERS READ OF A RUN OF THE LOOP'S RECORDS

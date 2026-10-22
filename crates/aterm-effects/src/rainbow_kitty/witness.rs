@@ -115,6 +115,7 @@ impl Unit {
     };
 
     /// True for a column holding no glyph.
+    #[inline]
     #[must_use]
     pub fn is_blank(self) -> bool {
         self.ch == ' '
@@ -125,6 +126,7 @@ impl Unit {
 /// is blank; a `'\0'` continuation resolves to the lead one column left (a
 /// `'\0'` at column 0, or one whose lead is itself blank or `'\0'`, is a
 /// degenerate sample and reads as blank).
+#[inline]
 #[must_use]
 pub fn unit_at(cols: &[char], col: u16) -> Unit {
     let i = usize::from(col);
@@ -410,6 +412,7 @@ impl Seen {
 
     /// Start over as if just armed where nothing was seen (every offset clear,
     /// no twin): the record now stands where its observations were not about.
+    #[inline]
     fn forget_evidence(&mut self) {
         self.clear = ALL_OFFSETS;
         self.twin = 0;
@@ -420,6 +423,7 @@ impl Seen {
     /// to have been there before ([`Seen::clear`]) and never a twin there. A
     /// twin testifies only about its own row
     /// (`a_twin_testifies_only_about_its_own_row`).
+    #[inline]
     fn arrivals(&self) -> u8 {
         self.clear & !self.twin & ALL_OFFSETS
     }
@@ -715,6 +719,7 @@ impl Witness {
     /// searches that one row too ([`Witness::follow_runs`]), and
     /// `Engine::ribbon_rows_for` names it. A carry of one or two rows is
     /// already among [`FOLLOW_DRS`].
+    #[inline]
     #[must_use]
     pub fn scroll_carry(&self) -> u16 {
         if self.scroll_carry > 2 {
@@ -742,6 +747,7 @@ impl Witness {
     /// then scrolled (the step that fills the screen) is found too. Within
     /// the follow offsets, or equal to the scroll return, it adds nothing.
     /// Set before the follow pass and ended with it.
+    #[inline]
     pub(crate) fn carry_caret(&mut self, dr: i16) {
         let ret = i16::try_from(self.scroll_carry()).unwrap_or(i16::MAX);
         self.caret_carry = if dr.unsigned_abs() > 2 && dr != ret {
@@ -753,6 +759,7 @@ impl Witness {
 
     /// The caret's carry pending for this frame's follow pass
     /// ([`Witness::carry_caret`]), `0` for none.
+    #[inline]
     #[must_use]
     pub(crate) fn caret_carry(&self) -> i16 {
         self.caret_carry
@@ -762,6 +769,7 @@ impl Witness {
     /// [`Witness::carry_caret`]) on this frame's rows: they end here, as the
     /// scroll's does at the walk, which a scroll's own frame skips
     /// (`CursorGlow::scroll_rows`).
+    #[inline]
     pub(crate) fn end_scroll_carry(&mut self) {
         self.scroll_carry = 0;
         self.caret_carry = 0;
@@ -821,6 +829,7 @@ impl Witness {
     /// never-armed cell while no record beyond it on that side stayed behind
     /// (the Space typed at a full line's end before the wrapping glyph). Returns
     /// what the pass saw ([`FollowScore`]); allocation-free past warm-up.
+    #[inline]
     pub fn follow_runs(
         &mut self,
         cells: &[Cell],
@@ -1447,6 +1456,7 @@ impl Witness {
     /// ([`Witness::find_deferred_runs`]): judged gone, it would melt before
     /// the caret shows on its line. Each follow pass says it again, `None`
     /// when nothing waits.
+    #[inline]
     pub(crate) fn await_caret(&mut self, run: Option<(u16, u32)>) {
         self.awaiting = run;
     }
@@ -1550,12 +1560,14 @@ impl Witness {
     /// the placeholder's glyphs (Claude Code's `[Image #1] `) instead of
     /// retiring them (§27). A later re-lay with other text still retires the
     /// re-armed cells.
+    #[inline]
     pub fn forget_left_of(&mut self, row: u16, col: u16) {
         self.seen.retain(|s| !(s.row == row && s.col < col));
         self.blank_seen.retain(|b| !(b.0 == row && b.1 < col));
     }
 
     /// The record for the cell `(row, col, born)`, if any.
+    #[inline]
     fn find(&self, row: u16, col: u16, born: Instant) -> Option<usize> {
         self.seen
             .binary_search_by(|s| (s.row, s.col, s.born).cmp(&(row, col, born)))
@@ -1567,6 +1579,7 @@ impl Witness {
     /// `at_arm`): a copy already standing at an offset is a twin at once. The
     /// host samples a waiting key's row and its `±1` on that frame
     /// (`Engine::ribbon_rows_for`, `tests/erased_under_its_twin.rs`).
+    #[inline]
     fn arm(&mut self, cell: &Cell, unit: Unit, nb: &[Option<&[char]>; 4], now: Instant) {
         if unit.is_blank() {
             return;
@@ -1579,6 +1592,7 @@ impl Witness {
     /// A released record for a never-armed cell of a run the walk just
     /// released (the space in `hello world`): a glyph landing on it reads as
     /// replaced text, like its run-mates. Skipped when the witness is full.
+    #[inline]
     fn hold_released(&mut self, cell: &Cell) {
         let _ = self.insert(cell, Unit::BLANK, true);
     }
@@ -1615,6 +1629,7 @@ impl Witness {
     /// Both cells of the unit a record stands for, pushed onto `retire` by
     /// identity. The partner half has the same `born` (one keystroke lays both,
     /// `Ribbon::lay`); a cell there with another birth is judged on its own.
+    #[inline]
     fn push_unit(
         retire: &mut Vec<(u16, u16, Instant)>,
         row: u16,
@@ -1977,6 +1992,7 @@ impl Witness {
 
     /// Whether the last walk read `cell` over a blank with no record
     /// ([`Witness::blank_seen`]).
+    #[inline]
     fn was_blank(&self, cell: &Cell) -> bool {
         self.blank_seen
             .binary_search(&(cell.row, cell.col, cell.born))
@@ -2292,6 +2308,7 @@ impl Witness {
 
     /// The standing recorded glyphs of `run` this walk, column-sorted — a
     /// contiguous slice of the sorted [`Witness::standing_glyphs`].
+    #[inline]
     fn standing_glyphs_of(&self, run: (u16, u32)) -> &[(u16, u32, u16)] {
         let lo = self
             .standing_glyphs

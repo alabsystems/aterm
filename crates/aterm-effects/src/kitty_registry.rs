@@ -98,6 +98,7 @@ pub const SHELL_APP_ID: &str = "shell";
 
 /// The canonical app id for a basename: every shell is [`SHELL_APP_ID`];
 /// anything else is its basename.
+#[inline]
 #[must_use]
 pub fn canonical_app_id(basename: &str) -> &str {
     match basename {
@@ -307,6 +308,7 @@ const COAT_DISTANCE: [[f32; 16]; 16] = [
 /// `pet_baker::FACE_DETAIL_MIN_H` (every 1× display), so its legible identity is
 /// its coat. Symmetric, zero on the diagonal; out-of-range indices clamp as
 /// [`KittyLook::normalized`] clamps `coat`.
+#[inline]
 #[must_use]
 pub fn coat_distance(a: u8, b: u8) -> f32 {
     COAT_DISTANCE[usize::from(a.min(15))][usize::from(b.min(15))]
@@ -314,6 +316,7 @@ pub fn coat_distance(a: u8, b: u8) -> f32 {
 
 /// Stable semantic key for an authored glyph. Persist this rather than the Rust
 /// enum discriminant; contributor-added art may change roster ordinals.
+#[inline]
 #[must_use]
 pub fn glyph_key(id: CatGlyphId) -> &'static str {
     GLYPHS[id as usize].id
@@ -329,6 +332,7 @@ pub fn glyph_from_key(key: &str) -> Option<CatGlyphId> {
 }
 
 /// Stable persistence key for an age band.
+#[inline]
 #[must_use]
 pub fn age_key(age: CatAge) -> &'static str {
     match age {
@@ -340,6 +344,7 @@ pub fn age_key(age: CatAge) -> &'static str {
 }
 
 /// Resolve an age key from a ledger; unknown/legacy values use Adult.
+#[inline]
 #[must_use]
 pub fn age_from_key(key: &str) -> CatAge {
     match key {
@@ -380,6 +385,7 @@ impl KittyType {
     ];
 
     /// The stable `kitty-log.toml` / introspection key for this type.
+    #[inline]
     pub fn config_key(self) -> &'static str {
         match self {
             KittyType::HeadPeek => "head_peek",
@@ -421,6 +427,7 @@ impl KittyMagic {
     ];
 
     /// The stable `kitty-log.toml` / introspection key for this bucket.
+    #[inline]
     pub fn config_key(self) -> &'static str {
         match self {
             KittyMagic::None => "none",
@@ -432,6 +439,7 @@ impl KittyMagic {
     }
 
     /// The recorder's mapping from the (config-gated) genome decode.
+    #[inline]
     pub fn from_cat(magic: Option<CatMagic>) -> KittyMagic {
         match magic {
             None => KittyMagic::None,

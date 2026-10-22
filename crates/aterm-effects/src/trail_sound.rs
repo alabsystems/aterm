@@ -526,6 +526,7 @@ const BLOCK_LEAD_MAX_S: f32 = 0.050;
 /// cue) is `0`; punctuation buckets follow the keyboard's groups; any other
 /// printable glyph is `45`, one rank above the last bucket.
 #[must_use]
+#[inline]
 pub fn typed_glyph_rank(typed: Option<char>) -> u8 {
     let Some(c) = typed else { return 0 };
     if c.is_ascii_alphabetic() {
@@ -611,6 +612,7 @@ pub mod glyph_class {
 /// and non-ASCII glyphs are `LETTER`. The buckets are the keyboard's groups,
 /// total over ASCII punctuation, and lossy by design.
 #[must_use]
+#[inline]
 pub fn typed_glyph_class(typed: Option<char>) -> u8 {
     use glyph_class::*;
     match typed {
@@ -647,6 +649,7 @@ const PENTA: [f32; 5] = [1.0, 1.125, 1.25, 1.5, 1.666_666_7];
 
 /// `base` scaled to pentatonic `degree` (octaves wrap; negative degrees fall
 /// below `base`).
+#[inline]
 fn penta(base: f32, degree: i32) -> f32 {
     let oct = degree.div_euclid(5);
     let step = degree.rem_euclid(5) as usize;
@@ -675,6 +678,7 @@ const EXCITED_TRANSPOSE: f32 = 1.125;
 /// - Playful: the suspended *yo* penta (the walk takes wider steps).
 ///
 /// No table contains the bonk's minor-second/tritone intervals.
+#[inline]
 fn tone_tables(tone: Tone) -> (&'static [f32; 5], f32) {
     match tone {
         Tone::Technical | Tone::Calm => (&PENTA, 1.0),
@@ -688,6 +692,7 @@ fn tone_tables(tone: Tone) -> (&'static [f32; 5], f32) {
 /// spacing, applied at spawn. Narrow (±12 %) so the melody leans rather than
 /// lurches. Technical (the identity) and Frustrated are exactly 1.0. Bonk
 /// voices are exempt (spawn skips `duck_exempt` prototypes).
+#[inline]
 fn tone_feel(tone: Tone) -> f32 {
     match tone {
         Tone::Technical | Tone::Frustrated => 1.0,
@@ -809,6 +814,7 @@ const SONG_BASS: [i8; 12] = [0, 2, 1, 3, 0, 2, 4, 1, 0, 2, 3, 4];
 /// (`the_theme_never_folds_in_any_tone`); per-tone character lives in the
 /// scale table, transpose and lean. The fold remains a total guard for the
 /// bonk, the cursor family and the column nudge.
+#[inline]
 fn tone_register(tone: Tone) -> (i32, i32) {
     match tone {
         // The lean is +1: the theme occupies 1..=9.
@@ -824,6 +830,7 @@ fn tone_register(tone: Tone) -> (i32, i32) {
 /// Clamping would turn consecutive out-of-range notes into unisons; reflection
 /// turns the excess into a step back down the lattice. Modular (a triangle
 /// wave), so any input is handled in constant time.
+#[inline]
 fn fold_register(v: i32, lo: i32, hi: i32) -> i32 {
     let span = hi - lo;
     if span <= 0 {
@@ -835,6 +842,7 @@ fn fold_register(v: i32, lo: i32, hi: i32) -> i32 {
 
 /// Per-tone lean added to the pitch register: Excited +1, Frustrated −1, the
 /// rest 0.
+#[inline]
 fn melody_lean(tone: Tone) -> i32 {
     match tone {
         Tone::Excited => 1,
@@ -907,6 +915,7 @@ struct GestureShape {
 /// The capital's lift for one event in scale degrees: [`SHIFT_GLYPH_LIFT`]
 /// when a shifted glyph was typed, else zero. A function so palettes that
 /// build their own degree (Phaser) apply the same rule.
+#[inline]
 fn shift_lift(ev: &SoundEvent, kind: SoundKind) -> i32 {
     if kind == SoundKind::Typed && ev.shifted {
         SHIFT_GLYPH_LIFT
@@ -917,6 +926,7 @@ fn shift_lift(ev: &SoundEvent, kind: SoundKind) -> i32 {
 
 /// The capital's weight for one event: [`SHIFT_GLYPH_GAIN`] when a shifted
 /// glyph was typed, exactly 1.0 otherwise.
+#[inline]
 fn shift_gain(ev: &SoundEvent, kind: SoundKind) -> f32 {
     if kind == SoundKind::Typed && ev.shifted {
         SHIFT_GLYPH_GAIN
@@ -929,12 +939,14 @@ fn shift_gain(ev: &SoundEvent, kind: SoundKind) -> f32 {
 /// come from the lattice (Fire: a noise snap over a random 85–125 Hz ember
 /// knock). Derived from [`SHIFT_GLYPH_LIFT`] through the five-degree octave,
 /// so ratio and degree agree.
+#[inline]
 fn shift_ratio(ev: &SoundEvent, kind: SoundKind) -> f32 {
     (2.0f32).powf(shift_lift(ev, kind) as f32 / PENTA.len() as f32)
 }
 
 /// The gesture family's rule (see the section comment): every family degree
 /// in the engine comes from here.
+#[inline]
 fn gesture_shape(kind: SoundKind) -> GestureShape {
     match kind {
         // The lift before a capital: one step above the note it announces,
@@ -973,6 +985,7 @@ fn gesture_shape(kind: SoundKind) -> GestureShape {
 /// Octave-fold `f` into `[lo, 2 × lo)`. Halving and doubling are exact in
 /// binary floating point, so pitch class is preserved. The input is clamped,
 /// so the loops are bounded.
+#[inline]
 fn fold_octave(f: f32, lo: f32) -> f32 {
     let mut f = f.clamp(20.0, 20_000.0);
     while f >= lo * 2.0 {
@@ -986,12 +999,14 @@ fn fold_octave(f: f32, lo: f32) -> f32 {
 
 /// A palette's anchor folded into the space's bass register
 /// `[SPACE_BASS_LO_HZ, 2 × SPACE_BASS_LO_HZ)`.
+#[inline]
 fn bass_octave(anchor: f32) -> f32 {
     fold_octave(anchor, SPACE_BASS_LO_HZ)
 }
 
 /// The bend applied: `(f0, f1)` for a partial that settles onto `f` from
 /// `dir`'s side. Forward enters from a step below, inverse from a step above.
+#[inline]
 fn gesture_bend(f: f32, dir: i8) -> (f32, f32) {
     if dir >= 0 {
         (f / GESTURE_BEND, f)
@@ -1138,6 +1153,7 @@ const SHIFT_TING_OCTAVE_LEVEL: f32 = 0.14;
 const SHIFT_TING_VOICE_LEVEL: f32 = 0.33;
 
 /// Octave-fold a pitch into the ting's register `[SHIFT_TING_LO_HZ, 2×)`.
+#[inline]
 fn ting_octave(f: f32) -> f32 {
     fold_octave(f, SHIFT_TING_LO_HZ)
 }
@@ -1393,6 +1409,7 @@ const SPACE_TWINKLE_LO_HZ: f32 = SPACE_BASS_LO_HZ * 40.0;
 
 /// The twinkle's pitch for a root: `root × SPACE_TWINKLE_RATIO`, folded by
 /// exact octaves into the sparkle band [`SPACE_TWINKLE_LO_HZ`].
+#[inline]
 fn twinkle_hz(root: f32) -> f32 {
     fold_octave(root * SPACE_TWINKLE_RATIO, SPACE_TWINKLE_LO_HZ)
 }
@@ -1984,6 +2001,7 @@ struct Voice {
 
 impl Voice {
     /// Peak-ish loudness proxy used for voice stealing (quietest loses).
+    #[inline]
     fn weight(&self) -> f32 {
         if !self.on {
             return -1.0;
@@ -2040,6 +2058,7 @@ struct Bed {
 
 /// The bed's energy kick per admitted trail gesture, shared by v1's trail arm
 /// and the music box's `push_v2` so both feed the bed the same amounts.
+#[inline]
 fn bed_kick(kind: SoundKind) -> f32 {
     match kind {
         SoundKind::Jump | SoundKind::Kill | SoundKind::Land => 0.5,
@@ -2437,11 +2456,13 @@ impl TrailSynth {
     }
 
     /// Uniform in [0,1): [`xorshift01`] on the synth's stream.
+    #[inline]
     fn rnd(&mut self) -> f32 {
         xorshift01(&mut self.rng)
     }
 
     /// Uniform in [lo, hi).
+    #[inline]
     fn rnd_in(&mut self, lo: f32, hi: f32) -> f32 {
         lo + (hi - lo) * self.rnd()
     }
@@ -2449,6 +2470,7 @@ impl TrailSynth {
     /// True once every voice is dead, the bed has decayed and the DC blocker
     /// has settled: [`render`](Self::render) then writes exact zeros, so the
     /// host can pause its output queue.
+    #[inline]
     pub fn is_quiet(&self) -> bool {
         // 1e-3 pre-gain bed level is far below audibility (the style
         // coefficients scale it down another 20+ dB); snapping to exact zero
@@ -2485,6 +2507,7 @@ impl TrailSynth {
     /// Push one gesture. Applies the rate governor, feeds the bed (trail
     /// gestures only), and (if admitted) designs the gesture's voice(s).
     /// O(MAX_VOICES), no alloc.
+    #[inline]
     pub fn push(&mut self, ev: SoundEvent) {
         self.push_meta(ev, EventMeta::default());
     }
@@ -2529,6 +2552,7 @@ impl TrailSynth {
     ///
     /// Trail gestures only: the bonk, the sing-along riff and the output pips
     /// stay on the v1 chain even under the music box (§11).
+    #[inline]
     fn v2_engaged(&self, ev: &SoundEvent) -> bool {
         // The verdict is the one non-trail gesture the music box voices; its
         // cadence uses v2's lattice (`CHORD_LOOP`, `TINE_BASE_HZ`), so it forks

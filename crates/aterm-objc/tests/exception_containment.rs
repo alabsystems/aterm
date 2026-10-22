@@ -14,7 +14,7 @@
 //! `crates/aterm-gui/examples/objc_event_drive.rs`.
 //!
 //! The abort cases re-run this binary on the one test as a child
-//! (`support/reexec.rs`) and read the signal and stderr.
+//! (`support/reexec.rs`) and read its exit and stderr.
 
 #![cfg(target_os = "macos")]
 #![expect(
@@ -29,8 +29,6 @@ use aterm_objc::{
     Bool, ContainedException, Id, MainThread, NSRange, Sel, autoreleasepool, class,
     contained_count, msg, ns_string, sel,
 };
-
-const SIGABRT: i32 = 6;
 
 /// One containment as the sink saw it.
 #[derive(Debug, Clone)]
@@ -344,12 +342,11 @@ fn a_block_contains_a_raise_and_answers_its_inert_zero() {
 /// Set in a child so it performs the fatal send instead of re-spawning.
 const CHILD: &str = "ATERM_OBJC_CONTAINMENT_CHILD";
 
-/// Re-run `test` in a child with `CHILD=mode`; return `(signal, stdout, stderr)`.
+/// Re-run `test` in a child with `CHILD=mode`; return `(exit code, stdout, stderr)`.
 fn child(test: &str, mode: &str) -> (Option<i32>, String, String) {
-    use std::os::unix::process::ExitStatusExt as _;
     let out = crate::reexec::rerun(module_path!(), test, &[(CHILD, mode)]);
     (
-        out.status.signal(),
+        out.status.code(),
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
@@ -357,7 +354,7 @@ fn child(test: &str, mode: &str) -> (Option<i32>, String, String) {
 
 #[test]
 fn a_rust_panic_inside_a_contained_method_still_aborts_with_the_named_message() {
-    if std::env::var_os(CHILD).is_some() {
+    if crate::reexec::is_child(CHILD) {
         let drops = Arc::new(AtomicUsize::new(0));
         let obj = probe(&drops);
         // SAFETY: `-rustPanic` is `v@:`.
@@ -365,7 +362,7 @@ fn a_rust_panic_inside_a_contained_method_still_aborts_with_the_named_message() 
         println!("SURVIVED-THE-PANIC");
         return;
     }
-    let (sig, stdout, stderr) = child(
+    let (code, stdout, stderr) = child(
         "a_rust_panic_inside_a_contained_method_still_aborts_with_the_named_message",
         "panic",
     );
@@ -374,9 +371,9 @@ fn a_rust_panic_inside_a_contained_method_still_aborts_with_the_named_message() 
         "@catch(id) swallowed a Rust panic\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert_eq!(
-        sig,
-        Some(SIGABRT),
-        "expected SIGABRT\nstdout: {stdout}\nstderr: {stderr}"
+        code,
+        Some(crate::reexec::ABORTED),
+        "expected an abort\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
         stderr.contains("panic escaped Objective-C method `rust_panic`"),
@@ -390,7 +387,7 @@ fn a_rust_panic_inside_a_contained_method_still_aborts_with_the_named_message() 
 
 #[test]
 fn an_abort_on_exception_method_still_aborts_on_a_raise() {
-    if std::env::var_os(CHILD).is_some() {
+    if crate::reexec::is_child(CHILD) {
         let drops = Arc::new(AtomicUsize::new(0));
         let obj = probe(&drops);
         // SAFETY: `-raiseUncontained` is `q@:`.
@@ -398,7 +395,7 @@ fn an_abort_on_exception_method_still_aborts_on_a_raise() {
         println!("SURVIVED-THE-RAISE {v}");
         return;
     }
-    let (sig, stdout, stderr) = child(
+    let (code, stdout, stderr) = child(
         "an_abort_on_exception_method_still_aborts_on_a_raise",
         "raise",
     );
@@ -407,9 +404,9 @@ fn an_abort_on_exception_method_still_aborts_on_a_raise() {
         "the opted-out method was contained\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert_eq!(
-        sig,
-        Some(SIGABRT),
-        "expected SIGABRT\nstdout: {stdout}\nstderr: {stderr}"
+        code,
+        Some(crate::reexec::ABORTED),
+        "expected an abort\nstdout: {stdout}\nstderr: {stderr}"
     );
 }
 
@@ -435,27 +432,27 @@ aterm_objc::declare_class! {
 
 #[test]
 fn dealloc_keeps_the_abort_on_a_raise() {
-    if std::env::var_os(CHILD).is_some() {
+    if crate::reexec::is_child(CHILD) {
         let obj = DeallocProbe::alloc_init(mtm(), RaiseOnDrop).expect("alloc_init");
         drop(obj);
         println!("SURVIVED-DEALLOC");
         return;
     }
-    let (sig, stdout, stderr) = child("dealloc_keeps_the_abort_on_a_raise", "dealloc");
+    let (code, stdout, stderr) = child("dealloc_keeps_the_abort_on_a_raise", "dealloc");
     assert!(
         !stdout.contains("SURVIVED-DEALLOC"),
         "-dealloc contained a raise, which is a half-deallocated object to continue from\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert_eq!(
-        sig,
-        Some(SIGABRT),
-        "expected SIGABRT\nstdout: {stdout}\nstderr: {stderr}"
+        code,
+        Some(crate::reexec::ABORTED),
+        "expected an abort\nstdout: {stdout}\nstderr: {stderr}"
     );
 }
 
 #[test]
 fn the_default_sink_writes_one_line_naming_method_and_exception() {
-    if std::env::var_os(CHILD).is_some() {
+    if crate::reexec::is_child(CHILD) {
         // No sink installed in this child: the default writes to stderr.
         let drops = Arc::new(AtomicUsize::new(0));
         let obj = probe(&drops);
@@ -464,11 +461,11 @@ fn the_default_sink_writes_one_line_naming_method_and_exception() {
         println!("ANSWERED {v}");
         return;
     }
-    let (sig, stdout, stderr) = child(
+    let (code, stdout, stderr) = child(
         "the_default_sink_writes_one_line_naming_method_and_exception",
         "default-sink",
     );
-    assert_eq!(sig, None, "the child must not die\nstderr: {stderr}");
+    assert_eq!(code, Some(0), "the child must not die\nstderr: {stderr}");
     assert!(stdout.contains("ANSWERED 0"), "stdout: {stdout}");
     let lines: Vec<&str> = stderr
         .lines()

@@ -25,7 +25,7 @@ pub enum Owner {
     /// The lock was free.
     Dead,
     /// The file could not be opened or locked for another reason (missing, a
-    /// symlink, a platform with no wiring): no evidence either way.
+    /// symlink, nonregular file, a platform with no wiring): no evidence either way.
     Unknown,
 }
 
@@ -62,6 +62,9 @@ fn probe_while_locked(path: &Path, while_locked: impl FnOnce()) -> Owner {
     else {
         return Owner::Unknown;
     };
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return Owner::Unknown;
+    }
     // `try_lock` is `flock(LOCK_EX|LOCK_NB)` here, and only EWOULDBLOCK is
     // `WouldBlock`.
     #[expect(
@@ -222,6 +225,7 @@ pub(crate) mod tests {
 
         assert_eq!(probe(&path), Owner::Dead, "the probe released its own lock");
         assert_eq!(probe(&dir.join("absent.log")), Owner::Unknown);
+        assert_eq!(probe(&dir), Owner::Unknown, "a directory is no owner lock");
         let link = dir.join("link.log");
         std::os::unix::fs::symlink(&path, &link).expect("symlink");
         assert_eq!(probe(&link), Owner::Unknown, "a symlink is never followed");

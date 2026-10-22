@@ -68,6 +68,7 @@ const WEB_SHIFTED_SYMBOLS: &str = "~!@#$%^&*()_+{}|:\"<>?";
 /// the same table the native seam prices with (`aterm-gui`'s
 /// `typed_class_for`): the spacebar's rest, the `!` hero, a capital, and
 /// every other printable.
+#[inline]
 #[must_use]
 pub fn web_typed_class(ch: char) -> TypedClass {
     match ch {
@@ -125,6 +126,7 @@ fn terminal_cursor_color(term: &Terminal) -> u32 {
 
 /// The most recent completed command as the rain driver reads it:
 /// `(completed_command_seq, exit)`, `None` until one reported an exit code.
+#[inline]
 fn term_cmd_done(term: &Terminal) -> Option<(u64, i32)> {
     term.last_completed_command()
         .and_then(|m| Some((term.completed_command_seq(), m.exit_code?)))
@@ -138,6 +140,7 @@ fn term_cmd_done(term: &Terminal) -> Option<(u64, i32)> {
 /// through `Terminal::cell_frame_damage_scoped_into`, which consumes the
 /// session itself; an unconditional `take_damage` here would bump the
 /// extraction generation and force a full refill on the host's next frame.
+#[inline]
 fn close_open_damage_session(term: &mut Terminal) {
     if term.has_damage() {
         term.take_damage();
@@ -150,6 +153,7 @@ fn close_open_damage_session(term: &mut Terminal) {
 /// "requires" is load-bearing) fires unconditionally; once the resolved
 /// config enables that opt-in the warning is satisfied. Shared by the native
 /// `recompute_sparkle` log and [`EffectsPipeline::sparkle_lexicon_warnings`].
+#[inline]
 #[must_use]
 pub fn lexicon_warning_applies(warning: &str, cjk_single_char: bool) -> bool {
     !(cjk_single_char && warning.contains("requires cjk_single_char = true"))
@@ -171,6 +175,7 @@ struct CursorCoordinateSpace {
 /// natively, `apply` on the page), kept pure so it binds to the derived
 /// `cursor_scroll_signal_model`. The table lives in `aterm-core`
 /// ([`ContentScrollState::delta_since`]).
+#[inline]
 fn content_scroll_decision(
     previous: Option<ContentScrollState>,
     current: ContentScrollState,
@@ -522,6 +527,7 @@ impl EffectsPipeline {
     }
 
     /// The current injected instant (`t0 + clock`).
+    #[inline]
     #[must_use]
     pub fn now(&self) -> Instant {
         self.t0 + self.clock
@@ -537,13 +543,14 @@ impl EffectsPipeline {
     /// [`Self::next_deadline_ms`].
     #[must_use]
     pub fn is_active(&self) -> bool {
+        let now = self.now();
         self.cursor.trail.is_active()
             || self.cursor.glow.is_active()
             || self.cursor.bodies_active()
             || self.cursor.bodies_settling()
-            || self.decos.is_active(self.now())
+            || self.decos.is_active(now)
             || self.companion.needs_frames()
-            || self.companion.next_change_deadline(self.now()).is_some()
+            || self.companion.next_change_deadline(now).is_some()
             || self.rain.as_ref().is_some_and(|r| r.is_active())
             || self.streak.as_ref().is_some_and(|s| s.is_active())
     }
@@ -715,7 +722,8 @@ impl EffectsPipeline {
         _input: &RenderInput,
         ch: char,
     ) -> bool {
-        if !ch.is_control() {
+        let ctrl = ch.is_control();
+        if !ctrl {
             // A scalar commit is one input event even when it has no advance
             // (for example a combining mark). Its echo must not mint another.
             self.note_console_input(PetInputKind::Text);
@@ -725,7 +733,7 @@ impl EffectsPipeline {
         } else {
             aterm_grapheme::char_width(ch)
         };
-        if ch.is_control() || !(1..=2).contains(&width) {
+        if ctrl || !(1..=2).contains(&width) {
             self.note_keystroke();
             return false;
         }
@@ -741,7 +749,8 @@ impl EffectsPipeline {
         // The glyph class matters: a space rests the synth, a capital or `!`
         // earns its hero star (the same table as the native seam).
         let class = web_typed_class(ch);
-        let shifted = ch.is_uppercase() || WEB_SHIFTED_SYMBOLS.contains(ch);
+        let shifted = ch.is_uppercase()
+            || (ch.is_ascii() && WEB_SHIFTED_SYMBOLS.as_bytes().contains(&(ch as u8)));
         self.cursor
             .glow
             .note_typed_glyph(now, width as u16, shifted, class);
@@ -850,6 +859,7 @@ impl EffectsPipeline {
     /// quiescent). The pet has no master of its own: its term is the brain
     /// still owing frames, so it gets the one frame it needs to see its owner
     /// go before the all-off arm retires it.
+    #[inline]
     #[must_use]
     pub fn enabled_any(&self) -> bool {
         self.glow_cfg.enabled
@@ -1017,6 +1027,7 @@ impl EffectsPipeline {
     }
 
     /// The host's pet opt-in as last set.
+    #[inline]
     #[must_use]
     pub fn cursor_pet_enabled(&self) -> bool {
         self.companion.enabled()
@@ -1024,18 +1035,21 @@ impl EffectsPipeline {
 
     /// The alpha the last `apply` put on glass (`0` = no pet drawn) — the
     /// observability twin of the hit rect.
+    #[inline]
     #[must_use]
     pub fn cursor_pet_alpha(&self) -> u8 {
         self.companion.alpha()
     }
 
     /// Count of console input intentions, independent of their later echoes.
+    #[inline]
     #[must_use]
     pub fn cursor_pet_console_input_seq(&self) -> u64 {
         self.companion.console_input_seq()
     }
 
     /// Last classified console input intention; observing it never ticks.
+    #[inline]
     #[must_use]
     pub fn cursor_pet_console_input_kind(&self) -> Option<PetInputKind> {
         self.companion.console_input_kind()
@@ -1043,6 +1057,7 @@ impl EffectsPipeline {
 
     /// The pet's drawn body this frame in frame px `(x0, x1, y0, y1)`, the space
     /// [`Self::press_px`] reads; `None` when nothing is drawn.
+    #[inline]
     #[must_use]
     pub fn companion_hit_rect(&self) -> Option<(i32, i32, i32, i32)> {
         self.companion.hit_rect()
@@ -1082,6 +1097,7 @@ impl EffectsPipeline {
     }
 
     /// `true` while the sparkle master is on.
+    #[inline]
     #[must_use]
     pub fn sparkle_enabled(&self) -> bool {
         self.sparkle.is_some()
@@ -1325,6 +1341,7 @@ impl EffectsPipeline {
     }
 
     /// `true` while the rain master is on.
+    #[inline]
     #[must_use]
     pub fn matrix_rain_enabled(&self) -> bool {
         self.rain.is_some()

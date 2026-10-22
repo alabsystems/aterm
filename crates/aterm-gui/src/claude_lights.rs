@@ -891,13 +891,20 @@ const fn title_stamped(glass: &ChipGlass) -> bool {
 }
 
 impl TitleReading {
-    /// Rebuild this title where its complete reading inputs moved. The
-    /// event supplies its trail and local day; a kept reading asks for neither.
+    /// Rebuild this title where its complete reading inputs moved: the
+    /// chip's view and glass, or the trail's generation, which the hold and
+    /// the need's words move too ([`TitleWords`]). The event supplies its
+    /// trail and local day, and the hold and the need as they stand now
+    /// (`read_words`); a kept reading asks for none of them.
     /// Whether a new build was laid (the window then gives it a fit number).
     fn refresh(
         &mut self,
         generation: u64,
         built: (AutopilotView, ChipGlass),
+        read_words: impl FnOnce() -> (
+            Option<crate::harness_glass::HeldGlass>,
+            Option<crate::needs::HarnessAsk>,
+        ),
         read_trail: impl FnOnce(bool) -> (String, Option<i64>),
     ) -> bool {
         if self.generation == generation && self.built == built {
@@ -905,8 +912,18 @@ impl TitleReading {
         }
         self.generation = generation;
         self.built = built;
-        (self.trail, self.today) = read_trail(title_stamped(&built.1));
-        (self.whole, self.short) = autopilot_title(built.0, &built.1, &self.trail, self.today);
+        let (hold, need) = read_words();
+        (self.trail, self.today) = read_trail(title_stamped(&built.1) || hold.is_some());
+        (self.whole, self.short) = autopilot_title(
+            built.0,
+            &built.1,
+            &self.trail,
+            self.today,
+            TitleWords {
+                hold: hold.as_ref(),
+                need: need.as_ref(),
+            },
+        );
         true
     }
 }
@@ -2046,7 +2063,7 @@ fn title_of(
             // No reading (a title laid with no reading's build): no wall read
             // here, a frame's path, so a face clock stands without its day.
             let view = s.autopilot.unwrap_or(AutopilotView::Unhosted);
-            let (whole, short) = autopilot_title(view, &s.glass, "", None);
+            let (whole, short) = autopilot_title(view, &s.glass, "", None, TitleWords::default());
             (whole, short, false)
         }
         Chip::Team => {
@@ -2420,12 +2437,50 @@ impl ChipFace {
     }
 
     /// What the mode does, after the phrase and ` — ` in the whole title:
-    /// none where the phrase says it all (no harness runs).
+    /// none where the phrase says it all (no harness runs). Cruise and Land
+    /// say their sentence from the one table (`autopilot::MODE_WORDS`,
+    /// §12.4.1): `keeps going for ever, finding more to do`, `wrapping up:
+    /// landing everything on the remote main branch, then stopping`; a timed
+    /// Cruise keeps going until the time its phrase names. Under `⤓ land`,
+    /// where a hold stands (`words.hold`, §12.3.1), why Land still holds:
+    /// after a land act's yield was read, the hold's legs, then when it
+    /// began and its nudges (`not landed yet: needs you: rotate the deploy
+    /// key; 2 unpushed commits · landing since 14:02, 3 nudges`, `Fri 14:02`
+    /// on another local day than `today`); before, the sentence, then `·
+    /// landing since 14:02` ([`crate::harness_glass::hold_words`]' title
+    /// form, title-safe: no ` — ` and no ` · ` but its own one before the
+    /// clock).
     #[must_use]
-    pub(crate) fn explanation(self, _glass: &ChipGlass) -> Option<std::borrow::Cow<'static, str>> {
+    pub(crate) fn explanation(
+        self,
+        _glass: &ChipGlass,
+        words: TitleWords<'_>,
+        today: Option<i64>,
+    ) -> Option<std::borrow::Cow<'static, str>> {
+        use crate::autopilot::mode_words;
+        use aterm_agent::supervise::Autopilot;
         let fixed = match self {
-            ChipFace::Cruise | ChipFace::CruiseUntil => "keeps the work moving",
-            ChipFace::Land => "wrapping up",
+            ChipFace::Cruise => mode_words(Autopilot::Cruise).chip,
+            ChipFace::CruiseUntil => crate::autopilot::TIMED_CRUISE_CHIP,
+            ChipFace::Land => {
+                let sentence = mode_words(Autopilot::Land).chip;
+                let Some(hold) = words.hold else {
+                    return Some(sentence.into());
+                };
+                let held = crate::harness_glass::hold_words(
+                    hold,
+                    words.need,
+                    crate::harness_glass::HoldForm::Title,
+                    today,
+                );
+                return Some(match held {
+                    Some(held) if hold.read() => held.into(),
+                    Some(since) => {
+                        format!("{sentence}{}{since}", crate::native_ui::FACT_SEPARATOR).into()
+                    }
+                    None => sentence.into(),
+                });
+            }
             ChipFace::Landed => {
                 "all of the work is on the remote main branch; the harness types nothing more \
                  until someone else's turn"
@@ -2517,6 +2572,94 @@ const TITLE_MORE: &str = " \u{b7} right-click: more";
 /// `footer::LightsWidth::lean`).
 pub(crate) const LEAN_FORMS: usize = aterm_agent::harness::footer::LEAN_FORMS;
 
+/// WHAT THE AUTOPILOT CHIP'S TITLE SAYS BESIDE ITS GLASS
+/// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.2.3 item 5, §12.3.3
+/// item 4; the W4 title slice): Land's hold as the session's glass keeps it
+/// and the session's published need in the worker's words. Borrowed where a
+/// reading of the title is built (it starts, or the trail's generation moved:
+/// `harness_glass::on_land_held` moves it with the hold,
+/// `App::publish_need` with the need's words) and where the accessibility
+/// tree is built (`App::autopilot_spoken`: with each tree a screen reader is
+/// sent, the need lent under its lock, never copied) — never on the
+/// footer's own path. Neither is in [`ChipGlass`], the fitted block's key
+/// or the footer's repaint term: the chip at rest draws nothing of them,
+/// and a title nobody reads is never built for them.
+/// [`TitleWords::default`] says neither: the title as it was before them.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TitleWords<'a> {
+    /// Land's hold as the loop told it, whatever the face: the title reads
+    /// it under `⤓ land` alone ([`ChipFace::explanation`]).
+    pub(crate) hold: Option<&'a crate::harness_glass::HeldGlass>,
+    /// The session's need, where the published one is a harness's own ask
+    /// (`needs::Verdict::harness_ask`).
+    pub(crate) need: Option<&'a crate::needs::HarnessAsk>,
+}
+
+impl<'a> TitleWords<'a> {
+    /// The need said on its own part of the title (`· needs you: …;
+    /// carrying on`) and in the description under `face`: on every face a
+    /// harness explains (none where no harness runs), except a `⤓ land`
+    /// whose read hold names the need as its first leg, which says it once.
+    #[must_use]
+    pub(crate) fn need_under(self, face: ChipFace) -> Option<&'a crate::needs::HarnessAsk> {
+        let explained = !matches!(
+            face,
+            ChipFace::MasterOff | ChipFace::AgentOff(_) | ChipFace::Unhosted
+        );
+        let held = face == ChipFace::Land
+            && self.hold.is_some_and(|hold| {
+                hold.read() && hold.held.holds(aterm_agent::harness::acts::HoldLeg::Needs)
+            });
+        self.need.filter(|_| explained && !held)
+    }
+
+    /// The hold `face` says: under `⤓ land` alone.
+    #[must_use]
+    pub(crate) fn hold_under(self, face: ChipFace) -> Option<&'a crate::harness_glass::HeldGlass> {
+        self.hold.filter(|_| face == ChipFace::Land)
+    }
+}
+
+/// The words a title reads of session `session` ([`TitleWords`]), copied
+/// out: its hold from its glass, and its published need where it is a
+/// harness's ask ([`with_harness_ask`]). Asked where a reading of the title
+/// is built (it starts, or the trail's generation moved), never per frame.
+fn title_words_of(
+    glass: &std::collections::HashMap<u64, crate::harness_glass::SessionGlass>,
+    pool: &crate::SessionPool,
+    session: u64,
+) -> (
+    Option<crate::harness_glass::HeldGlass>,
+    Option<crate::needs::HarnessAsk>,
+) {
+    let hold = glass
+        .get(&session)
+        .and_then(crate::harness_glass::SessionGlass::hold);
+    (hold, with_harness_ask(pool, session, |need| need.cloned()))
+}
+
+/// Session `session`'s published need where it is a harness's ask, LENT to
+/// `f` under the session's timeline leaf lock (the hover's read,
+/// `App::presence_hover`): `f` composes words and takes no other lock, so
+/// a reader that only says the need copies none of it — its further needs
+/// least of all. `None` for a session the pool does not hold.
+fn with_harness_ask<R>(
+    pool: &crate::SessionPool,
+    session: u64,
+    f: impl FnOnce(Option<&crate::needs::HarnessAsk>) -> R,
+) -> R {
+    match pool.get(session) {
+        Some(s) => f(s
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .need()
+            .harness_ask()),
+        None => f(None),
+    }
+}
+
 /// THE AUTOPILOT CHIP'S TITLE under `view` with `glass`, whole and short
 /// (§9.2.1, §9.3.2, §9.4.1, §9.5.4), as hover, the keyboard's selection
 /// and the page read it. WHOLE: the mode phrase; ` — ` and what the mode
@@ -2536,31 +2679,57 @@ pub(crate) const LEAN_FORMS: usize = aterm_agent::harness::footer::LEAN_FORMS;
 /// short turns`, §10.5.1): a clock time, its weekday on another local day.
 /// A face clock from another local day than `today`
 /// names its weekday ([`ChipFace::phrase`]; `today` is the day the
-/// reading's one wall read gave, `None` where none was made). Built when a
-/// reading starts, an act arrives under it or the face moves under it
-/// (`App::claude_lights_block`), never per frame and never at rest; sized
-/// once from its parts: two allocations, the whole and the short — never
-/// one regrowth per part.
+/// reading's one wall read gave, `None` where none was made).
+///
+/// BESIDE THE GLASS (`words`, the W4 title slice, §12.2.1 and §12.3.1):
+/// under `⤓ land` the explanation says why Land still holds, where a hold
+/// stands ([`ChipFace::explanation`]); and on every face a harness explains,
+/// a harness's need standing on the session follows the explanation, before
+/// the pause: ` · needs you: <the need, whole> (+1 more); carrying on`
+/// ([`crate::harness_glass::need_title`]), title-safe, so its words never
+/// move [`lean_titles`]' cuts — said once under a hold that names it. A
+/// narrow rule gives these up with the explanation (rung 2); the state
+/// line and the hover always say them whole.
+///
+/// Built when a reading starts, an act arrives under it, the face moves
+/// under it, or the hold or the need's words move (the trail's
+/// generation, `App::claude_lights_block`), never per frame and never at
+/// rest; sized once from its parts: two allocations, the whole and the
+/// short — never one regrowth per part (the hold's and the need's words are
+/// composed once each, where they stand).
 #[must_use]
 pub(crate) fn autopilot_title(
     view: AutopilotView,
     glass: &ChipGlass,
     trail: &str,
     today: Option<i64>,
+    words: TitleWords<'_>,
 ) -> (String, String) {
+    #[cfg(test)]
+    crate::work_counts::autopilot_title_built();
     let face = ChipFace::of(view, glass);
     let phrase = face.phrase(glass, today);
-    let explanation = face.explanation(glass);
+    let explanation = face.explanation(
+        glass,
+        TitleWords {
+            hold: words.hold_under(face),
+            ..words
+        },
+        today,
+    );
     let click = face.click(glass);
     // ` · pausing until 18:41 after 3 short turns`: the part after the
-    // constant's ` · ` (four bytes: the dot is two).
+    // constant's ` · ` (four bytes: the dot is two). The need's part is
+    // led the same way.
     const PAUSE_LEAD: &str = " \u{b7} ";
+    let need = words.need_under(face).map(crate::harness_glass::need_title);
     let pause = glass.pause.map(|p| p.title_words(today));
     let mut whole = String::with_capacity(
         phrase.len()
             + explanation
                 .as_ref()
                 .map_or(0, |e| TITLE_EXPLAINS.len() + e.len())
+            + need.as_ref().map_or(0, |n| PAUSE_LEAD.len() + n.len())
             + pause.as_ref().map_or(0, |p| PAUSE_LEAD.len() + p.len())
             + if trail.is_empty() {
                 0
@@ -2575,6 +2744,10 @@ pub(crate) fn autopilot_title(
     if let Some(explanation) = explanation {
         whole.push_str(TITLE_EXPLAINS);
         whole.push_str(&explanation);
+    }
+    if let Some(need) = need {
+        whole.push_str(PAUSE_LEAD);
+        whole.push_str(&need);
     }
     if let Some(pause) = pause {
         whole.push_str(PAUSE_LEAD);
@@ -2597,21 +2770,24 @@ pub(crate) fn autopilot_title(
 /// allocation, laid straight into the block's cells:
 ///
 /// 0. without the trail (` · last: …`), so a rule with no room for the acts
-///    still offers the menu: `autopilot: cruise — keeps the work moving ·
-///    click: land · right-click: more` — `("", "")` where no act was taken,
-///    since that is the whole title itself. It keeps the loop's pause
-///    (` · pausing until 18:41 after 3 short turns`, §10.5.1): the one place
-///    on the chip that says the harness is pausing;
+///    still offers the menu: `autopilot: cruise — keeps going for ever,
+///    finding more to do · click: land · right-click: more` — `("", "")`
+///    where no act was taken, since that is the whole title itself. It
+///    keeps the loop's pause (` · pausing until 18:41 after 3 short turns`,
+///    §10.5.1): the one place on the chip that says the harness is pausing;
 /// 1. without the pause and the menu's line (` · right-click: more`) too:
-///    v1's words, `autopilot: cruise — keeps the work moving · click:
-///    land`, so every rule where v1's whole title fit still shows it;
-/// 2. without the explanation (` — …`) and the pause but with both clicks:
-///    `autopilot: land, landed 14:38 · click: off · right-click: more`, so
-///    a face whose explanation is long (a landed Land's runs past 150
-///    characters) still says what a click and a right-click do
-///    on a rule too narrow to explain it — `("", "")` where it would be no
-///    narrower than v1's words (an explanation no longer than the menu's
-///    line: `wrapping up`, `hands off`);
+///    v1's words, `autopilot: cruise — keeps going for ever, finding more
+///    to do · click: land`, so every rule where v1's whole title fit still
+///    shows it. It keeps what follows the explanation before the pause:
+///    a held landing's `· landing since 14:02, 3 nudges` and a harness's
+///    need (`· needs you: …; carrying on`, [`TitleWords`]);
+/// 2. without the explanation (` — …`), and with it a hold, a need and the
+///    pause, but with both clicks: `autopilot: land, landed 14:38 · click:
+///    off · right-click: more`, so a face whose explanation is long (a
+///    landed Land's runs past 150 characters) still says what a click and
+///    a right-click do on a rule too narrow to explain it — `("", "")`
+///    where it would be no narrower than v1's words (an explanation no
+///    longer than the menu's line: `hands off`);
 /// 3. without the menu's line too: the mode phrase and what a click does,
 ///    `autopilot: land, landed 14:38 · click: off`, the last form that
 ///    keeps a click before the short form gives the clicks up.
@@ -3040,12 +3216,13 @@ impl App {
                 .map_or((AutopilotView::Unhosted, ChipGlass::default()), |s| {
                     (s.autopilot.unwrap_or(AutopilotView::Unhosted), s.glass)
                 });
-            let title =
-                |trail: &str, today: Option<i64>| autopilot_title(built.0, &built.1, trail, today);
+            // The hold and the need beside the glass ([`TitleWords`]): read
+            // only where the title is built, never per frame.
+            let read_words = || title_words_of(&self.harness_glass, &self.pool, session);
             match at {
                 Some(i) => {
                     let reading = &mut lights.readings[i];
-                    if reading.refresh(generation, built, |stamped| {
+                    if reading.refresh(generation, built, read_words, |stamped| {
                         crate::harness_glass::trail_title(&self.harness_glass, session, stamped)
                     }) {
                         lights.fits += 1;
@@ -3054,12 +3231,22 @@ impl App {
                     Some(i)
                 }
                 None => {
+                    let (hold, need) = read_words();
                     let (trail, today) = crate::harness_glass::trail_title(
                         &self.harness_glass,
                         session,
-                        title_stamped(&built.1),
+                        title_stamped(&built.1) || hold.is_some(),
                     );
-                    let (whole, short) = title(&trail, today);
+                    let (whole, short) = autopilot_title(
+                        built.0,
+                        &built.1,
+                        &trail,
+                        today,
+                        TitleWords {
+                            hold: hold.as_ref(),
+                            need: need.as_ref(),
+                        },
+                    );
                     lights.fits += 1;
                     lights.readings.push(TitleReading {
                         session,
@@ -3964,6 +4151,94 @@ impl App {
     }
 }
 
+/// THE AUTOPILOT CHIP'S ACCESSIBILITY DESCRIPTION (§9.2.1, §10.5.1;
+/// §12.2.1 and §12.3.1, the W4 title slice), one sentence after another,
+/// glyph-free: under `⤓ land` where a hold stands, why Land still holds
+/// (`Not landed yet. Needs you: rotate the deploy key. 2 unpushed commits.
+/// Landing since 14:02, 3 nudges.`, or `Landing since 14:02.` before its
+/// yield is read: [`crate::harness_glass::hold_words`]' spoken form); a
+/// harness's need where the face says it on its own
+/// ([`TitleWords::need_under`]: `Needs you: <the need>. And 1 more.
+/// Carrying on.`); the loop's pause (`Pausing until 18:41.`); and the
+/// newest act, `last` (`Last: approved at 14:05.`). `None` where none of
+/// them stands. A description, never a live region: a reader is not
+/// interrupted as they move.
+#[must_use]
+pub(crate) fn autopilot_description(
+    face: ChipFace,
+    glass: &ChipGlass,
+    words: TitleWords<'_>,
+    today: Option<i64>,
+    last: Option<String>,
+) -> Option<String> {
+    let parts: Vec<String> = [
+        words.hold_under(face).and_then(|hold| {
+            crate::harness_glass::hold_words(
+                hold,
+                words.need,
+                crate::harness_glass::HoldForm::Spoken,
+                today,
+            )
+        }),
+        words
+            .need_under(face)
+            .map(crate::harness_glass::need_spoken),
+        glass.pause.map(|p| p.spoken(today)),
+        last,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+impl App {
+    /// WHAT A SCREEN READER SAYS OF SESSION `session`'S AUTOPILOT CHIP
+    /// under `view` with `glass`: its label, the face's words alone
+    /// ([`ChipFace::spoken`]: the painted word in it, WCAG 2.5.3), and its
+    /// description ([`autopilot_description`]), the hold and the need read
+    /// beside the glass ([`TitleWords`]). One wall read, where a face clock,
+    /// a pause or a hold is told, for its day. The accessibility tree's node
+    /// says these, and `chrome`'s `autopilot` lines print them
+    /// (`spoken=`, `description=`). Composed where one of them asks: a
+    /// `chrome` read, and each accessibility tree sent while a screen reader
+    /// is attached (`App::claude_chips_a11y`, beside the rows' own text) —
+    /// never on the footer's own path, and never where no reader is. The
+    /// need is lent under the session's lock ([`with_harness_ask`]), never
+    /// copied, so what the description costs does not grow with the further
+    /// needs it only counts.
+    #[must_use]
+    pub(crate) fn autopilot_spoken(
+        &self,
+        session: u64,
+        view: AutopilotView,
+        glass: &ChipGlass,
+    ) -> (String, Option<String>) {
+        let face = ChipFace::of(view, glass);
+        let hold = self
+            .harness_glass
+            .get(&session)
+            .and_then(crate::harness_glass::SessionGlass::hold);
+        let held = TitleWords {
+            hold: hold.as_ref(),
+            need: None,
+        }
+        .hold_under(face)
+        .is_some();
+        let today = (glass.task_at.is_some() || glass.pause.is_some() || held)
+            .then(|| crate::harness_glass::wall_today().1);
+        let last = crate::harness_glass::spoken_last_now(&self.harness_glass, session);
+        let description = with_harness_ask(&self.pool, session, |need| {
+            let words = TitleWords {
+                hold: hold.as_ref(),
+                need,
+            };
+            autopilot_description(face, glass, words, today, last)
+        });
+        (face.spoken(glass, today), description)
+    }
+}
+
 /// The harness's chips as a screen reader meets them (design §9.2.1): the
 /// accessibility tree's chip nodes, and a reader's click on one.
 #[cfg(a11y_tree)]
@@ -3978,7 +4253,8 @@ impl App {
     /// lab-sweep`, `Manages 3 workers`), what a click does its description
     /// where it does something ([`team_spoken`]).
     /// Built only where the tree is (a screen reader attached), never on the
-    /// footer's own path.
+    /// footer's own path. The Autopilot chip's words are
+    /// [`App::autopilot_spoken`]'s, which `chrome` prints too.
     pub(crate) fn claude_chips_a11y(&self, wid: WindowId) -> Vec<crate::a11y_tree::GridChip> {
         use crate::a11y_tree::{GridChip, HarnessChip};
         let Some(ws) = self.windows.get(&wid) else {
@@ -4040,19 +4316,11 @@ impl App {
                         .and_then(|s| s.autopilot)
                         .unwrap_or(AutopilotView::Unhosted);
                     let glass = self.chip_glass(node.session);
-                    // The tree's build is an event: one wall read, where a
-                    // face clock or a pause is told, for its day.
-                    let today = (glass.task_at.is_some() || glass.pause.is_some())
-                        .then(|| crate::harness_glass::wall_today().1);
-                    node.label = ChipFace::of(view, &glass).spoken(&glass, today);
-                    let last =
-                        crate::harness_glass::spoken_last_now(&self.harness_glass, node.session);
-                    // The loop's pause leads the description (§10.5.1):
-                    // `Pausing until 18:41. Last: approved at 18:35.`
-                    node.description = match (glass.pause.map(|p| p.spoken(today)), last) {
-                        (Some(pause), Some(last)) => Some(format!("{pause} {last}")),
-                        (pause, last) => pause.or(last),
-                    };
+                    // The label stays the face's words, the painted word in
+                    // it (WCAG 2.5.3); the description says the rest.
+                    let (label, description) = self.autopilot_spoken(node.session, view, &glass);
+                    node.label = label;
+                    node.description = description;
                 }
                 HarnessChip::Team => {
                     if let Some(face) = ws
@@ -4428,29 +4696,29 @@ mod tests {
                 AutopilotView::Cruise,
                 "\u{221e}",
                 ACCENT,
-                "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} \
-                 right-click: more",
+                format!("{} \u{b7} right-click: more", AutopilotView::Cruise.title()),
                 "autopilot: cruise",
             ),
             (
                 AutopilotView::Land,
                 "\u{2913} land",
                 AMBER,
-                "autopilot: land \u{2014} wrapping up \u{b7} click: off \u{b7} right-click: more",
+                format!("{} \u{b7} right-click: more", AutopilotView::Land.title()),
                 "autopilot: land",
             ),
             (
                 AutopilotView::Off,
                 "\u{25cb} off",
                 dim,
-                "autopilot: off \u{2014} hands off \u{b7} click: cruise \u{b7} right-click: more",
+                format!("{} \u{b7} right-click: more", AutopilotView::Off.title()),
                 "autopilot: off",
             ),
             (
                 AutopilotView::MasterOff,
                 "\u{2298} off",
                 dim,
-                "harness off in Settings \u{b7} click: turn the harness on \u{b7} right-click: more",
+                "harness off in Settings \u{b7} click: turn the harness on \u{b7} right-click: more"
+                    .to_owned(),
                 "harness off in Settings",
             ),
         ];
@@ -6364,10 +6632,10 @@ mod gesture_tests {
         frame(&mut app, wid);
         let text = row_text(&app, wid, chip.0);
         assert!(
-            text.contains(
-                "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} \
-                 right-click: more"
-            ),
+            text.contains(&format!(
+                "{} \u{b7} right-click: more",
+                AutopilotView::Cruise.title()
+            )),
             "the hover's title: {text:?}"
         );
         for (want, face, ink) in [
@@ -6723,8 +6991,9 @@ mod gesture_tests {
     /// width from 60 to 170 columns, Claude Code's rule under the pointer on
     /// the Autopilot chip shows the WHOLE title (v1's words, then `·
     /// right-click: more`) beside the whole facts, else V1'S WORDS
-    /// (`autopilot: cruise — keeps the work moving · click: land`, the
-    /// leaner form without the menu's line), else THE PHRASE WITH BOTH
+    /// (`autopilot: cruise — <Cruise's sentence> · click: land`, the leaner
+    /// form without the menu's line; the sentence from
+    /// `autopilot::MODE_WORDS`), else THE PHRASE WITH BOTH
     /// CLICKS (`autopilot: cruise · click: land · right-click: more`), else
     /// THE PHRASE WITH THE CLICK (`autopilot: cruise · click: land`), else
     /// the SHORT form (`autopilot: cruise`), else no title — in that order as
@@ -6742,9 +7011,20 @@ mod gesture_tests {
     /// did.
     #[test]
     fn the_hovered_title_offers_the_menu_where_it_fits_and_is_short_where_not() {
-        let v1 = "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land";
+        let v1 = &AutopilotView::Cruise.title();
         let whole = format!("{v1} \u{b7} right-click: more");
         let click = "autopilot: cruise \u{b7} click: land";
+        // What the explanation's ` — <Cruise's sentence>` takes, in cells
+        // (`autopilot::MODE_WORDS`), against the menu's line's 20.
+        let explained = u16::try_from(
+            format!(
+                " \u{2014} {}",
+                crate::autopilot::mode_words(Autopilot::Cruise).chip
+            )
+            .chars()
+            .count(),
+        )
+        .unwrap();
         let clicks = format!("{click} \u{b7} right-click: more");
         let (mut app, wid, session, _reader) = app();
         let _host = host(&mut app);
@@ -6830,8 +7110,9 @@ mod gesture_tests {
         );
         assert_eq!(
             apart(4, 3),
-            Some(4),
-            "both clicks where the explanation's 24 cells give way to the menu's 20: {seen:?}"
+            Some(explained - 20),
+            "both clicks where the explanation's {explained} cells give way to the menu's 20: \
+             {seen:?}"
         );
         assert_eq!(
             apart(3, 2),

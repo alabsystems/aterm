@@ -6,8 +6,9 @@
 //! index that pins it: every gate refuses before anything is signed, the pack the producer
 //! signs is what a client stages, and an ALab pin is signed only over a pack that verifies.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use atpkg_publish::api::{Baseline, IndexRequest};
 use atpkg_publish::artifact::package::{
@@ -22,9 +23,10 @@ use atpkg_publish::host::fake::FakeHost;
 use atpkg_publish::quad::{self, QUAD_FILES};
 use atpkg_publish::testkit::Keys;
 
+use super::super::shared::{Made, made_once};
 use super::fixture::{
-    COMMIT, CPU_X86_64, DORMANT_LEDGER, FakeTools, client_verifies, git, macho, put, put_exe,
-    scratch, toolchain as fixture_toolchain, trust_repo, version_text,
+    COMMIT, CPU_X86_64, DORMANT_LEDGER, FakeTools, bare_origin, client_verifies, git, macho, put,
+    put_exe, scratch, toolchain as fixture_toolchain, trust_repo, version_text,
 };
 
 const MAC: &str = "aarch64-apple-darwin";
@@ -53,6 +55,8 @@ struct World {
 fn world(label: &str) -> World {
     let tmp = scratch(label);
     let root = std::fs::canonicalize(tmp.path()).expect("root");
+    let commit = codex_alab(&root);
+    let source = root.join("codex-alab");
     let home = root.join("home");
     let keys = Keys::mint("m3", &[]);
     let host = Arc::new(FakeHost::new());
@@ -75,24 +79,6 @@ fn world(label: &str) -> World {
         root.join("seal/lib/librustc_driver-0123456789abcdef.dylib"),
     )
     .expect("rename the driver");
-    let bare = root.join("remotes/alabsystems/codex-alab.git");
-    std::fs::create_dir_all(&bare).expect("mkdir bare");
-    git(&bare, &["init", "-q", "--bare"]);
-    let source = root.join("codex-alab");
-    std::fs::create_dir_all(&source).expect("mkdir checkout");
-    git(&source, &["init", "-q", "."]);
-    git(
-        &source,
-        &["remote", "add", "origin", &bare.to_string_lossy()],
-    );
-    for n in ["one", "two"] {
-        put(&source.join("README"), n.as_bytes());
-        git(&source, &["add", "-A"]);
-        git(&source, &["commit", "-q", "-m", n]);
-    }
-    git(&source, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
-    git(&source, &["fetch", "-q", "origin"]);
-    let commit = git(&source, &["rev-parse", "HEAD"]);
     World {
         _tmp: tmp,
         root,
@@ -103,6 +89,34 @@ fn world(label: &str) -> World {
         commit,
         tools: FakeTools::new(MAC),
     }
+}
+
+/// Under `root` (which holds nothing yet), the codex-alab checkout `codex-alab` of two
+/// commits, pushed to and fetched from its origin, the bare `remotes/alabsystems/
+/// codex-alab.git`; its main's head. Thirteen git processes and a push's receive-pack, so
+/// the pair is made once per process, by the first world, and laid down for every world
+/// after, the checkout's origin moved to the bare beside it.
+fn codex_alab(root: &Path) -> String {
+    static MADE: Made<(), String> = Mutex::new(BTreeMap::new());
+    made_once(&MADE, &(), root, |root| {
+        let bare = root.join("remotes/alabsystems/codex-alab.git");
+        bare_origin(&bare);
+        let source = root.join("codex-alab");
+        std::fs::create_dir_all(&source).expect("mkdir checkout");
+        git(&source, &["init", "-q", "."]);
+        git(
+            &source,
+            &["remote", "add", "origin", &bare.to_string_lossy()],
+        );
+        for n in ["one", "two"] {
+            put(&source.join("README"), n.as_bytes());
+            git(&source, &["add", "-A"]);
+            git(&source, &["commit", "-q", "-m", n]);
+        }
+        git(&source, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+        git(&source, &["fetch", "-q", "origin"]);
+        git(&source, &["rev-parse", "HEAD"])
+    })
 }
 
 /// A copy of `/usr/bin/true` after `codesign <args>` ran on it.

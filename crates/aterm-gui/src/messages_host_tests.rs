@@ -176,7 +176,7 @@ fn torn_fabric_state_set_aside_is_one_exceptions_entry_at_the_next_park() {
     let _ = crate::message_inbox::take_queued();
     let _ = crate::message_inbox::take_queued_exceptions();
     let mut app = App::headless_for_test();
-    let entry = crate::message_reporters::torn_state_set_aside_entry(3);
+    let entry = crate::message_reporters::torn_state_set_aside_entry(3, true);
     let key = entry.key();
     assert_eq!(key, "fabric.state.torn");
     assert_eq!(
@@ -188,7 +188,7 @@ fn torn_fabric_state_set_aside_is_one_exceptions_entry_at_the_next_park() {
     store
         .read()
         .unwrap_or_else(|p| p.into_inner())
-        .torn_state_set_aside(3);
+        .torn_state_set_aside(3, true);
     assert!(!app.owes_exception(&key), "queued, not yet raised");
     app.drain_message_inbox();
     assert!(app.owes_exception(&key), "raised at the park");
@@ -200,7 +200,7 @@ fn torn_fabric_state_set_aside_is_one_exceptions_entry_at_the_next_park() {
     store
         .read()
         .unwrap_or_else(|p| p.into_inner())
-        .torn_state_set_aside(1);
+        .torn_state_set_aside(1, true);
     app.drain_message_inbox();
     assert_eq!(
         app.messages
@@ -210,6 +210,118 @@ fn torn_fabric_state_set_aside_is_one_exceptions_entry_at_the_next_park() {
             .count(),
         1,
         "one entry however many cuts"
+    );
+}
+
+/// THE TORN-FILES ENTRY ENDS WHEN THE OWNER EMPTIES THE QUARANTINE (sim item
+/// S6): the bridge's `link quarantine torn=<k>`, handed to the store as the
+/// fabric's registry ([`crate::fabric::Registry::torn_state_held`]). A count
+/// above 0 leaves the entry open; 0 ends it at the next park, `Resolved` —
+/// gone from the digest, never a row. And one the owner had dismissed is
+/// forgotten at 0, so the next power cut's set-aside is news again.
+/// NEGATIVE CONTROL: dismissed and never emptied, the next set-aside stays
+/// quiet inside the dismissal's span — the path an entry with no end had.
+#[test]
+fn torn_fabric_state_ends_once_the_quarantine_holds_none_of_it() {
+    let _lane = crate::message_inbox::lane_test_guard();
+    let _ = crate::message_inbox::take_queued();
+    let _ = crate::message_inbox::take_queued_exceptions();
+    let key = crate::message_reporters::torn_state_key();
+    assert_eq!(
+        key,
+        crate::message_reporters::torn_state_set_aside_entry(3, true).key(),
+        "the key it ends is the key it was filed under"
+    );
+    let store = crate::session_store::new_store();
+    let say = |f: &dyn Fn(&dyn crate::fabric::Registry)| {
+        f(&*store.read().unwrap_or_else(|p| p.into_inner()));
+    };
+
+    // OPEN: a count above 0 changes nothing; 0 ends it.
+    let mut app = App::headless_for_test();
+    say(&|r| r.torn_state_set_aside(3, true));
+    app.drain_message_inbox();
+    assert!(app.owes_exception(&key), "raised at the park");
+    say(&|r| r.torn_state_held(3));
+    app.drain_message_inbox();
+    assert!(app.owes_exception(&key), "still held: the entry stands");
+    say(&|r| r.torn_state_held(0));
+    assert!(app.owes_exception(&key), "queued, not yet ended");
+    app.drain_message_inbox();
+    assert!(!app.owes_exception(&key), "ended at the park");
+    assert!(app.messages.digest_keys_under("fabric.state.").is_empty());
+    assert_eq!(app.messages.live_rows().count(), 0, "never a row");
+
+    // THE LAST WORD IN ONE PARK WINS: raised then emptied before the park
+    // is ended; emptied then raised is open.
+    say(&|r| r.torn_state_set_aside(1, true));
+    say(&|r| r.torn_state_held(0));
+    app.drain_message_inbox();
+    assert!(
+        !app.owes_exception(&key),
+        "the empty quarantine was the last word"
+    );
+    say(&|r| r.torn_state_held(0));
+    say(&|r| r.torn_state_set_aside(2, true));
+    app.drain_message_inbox();
+    assert!(app.owes_exception(&key), "the set-aside was the last word");
+
+    // DISMISSED, then emptied, then a later set-aside: news again.
+    // NEGATIVE CONTROL first: dismissed and never emptied, it stays quiet.
+    for emptied in [false, true] {
+        let mut app = App::headless_for_test();
+        say(&|r| r.torn_state_set_aside(2, true));
+        app.drain_message_inbox();
+        let id = app
+            .messages
+            .digest()
+            .entries
+            .iter()
+            .find(|e| e.key == key)
+            .expect("the entry is open")
+            .id;
+        assert!(app.messages.file_digest_one(
+            id,
+            crate::messages_host::wall_stamp_now(),
+            std::time::Instant::now()
+        ));
+        assert!(!app.owes_exception(&key), "dismissed");
+        if emptied {
+            say(&|r| r.torn_state_held(0));
+            app.drain_message_inbox();
+        }
+        say(&|r| r.torn_state_set_aside(1, true));
+        app.drain_message_inbox();
+        assert_eq!(
+            app.owes_exception(&key),
+            emptied,
+            "emptied={emptied}: the next power cut's set-aside"
+        );
+    }
+}
+
+/// THE TORN-FILES ENTRY PROMISES AN END ONLY WHERE ITS BRIDGE WILL SAY ONE
+/// (sim item S6, the review's finding on its words): a bridge whose `hello`
+/// lane says `link quarantine` gets the line that the entry ends once the
+/// quarantine is empty; one from an older aterm never says it, so its entry
+/// says to dismiss it instead, and never that it ends on its own. Both pass
+/// the rule and are filed under one key, which a later bridge's `torn=0`
+/// ends either way.
+#[test]
+fn torn_fabric_state_promises_an_end_only_where_its_bridge_tells_one() {
+    let says = |told: bool| {
+        let entry = crate::message_reporters::torn_state_set_aside_entry(2, told);
+        assert_eq!(entry.key(), crate::message_reporters::torn_state_key());
+        entry.message().expect("the words pass the rule").detail
+    };
+    let ends = |detail: &[String]| detail.iter().any(|l| l.contains("This ends once"));
+    let told = says(true);
+    assert!(ends(&told), "{told:?}");
+    let older = says(false);
+    assert!(!ends(&older), "an older bridge never ends it: {older:?}");
+    assert!(
+        older.iter().any(|l| l.contains("dismiss this")),
+        "{older:?}"
     );
 }
 
@@ -5123,7 +5235,6 @@ fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
         checkpoint: None,
         control: None,
         frozen_path: true,
-        identity: None,
         topics: Vec::new(),
         rekey: false,
         loader: false,
@@ -6395,4 +6506,78 @@ fn a_restatement_carries_the_titles_short_form() {
         shown.ends_with('\u{2026}') && then.title.starts_with(shown.trim_end_matches('\u{2026}')),
         "the control: a cut of the whole title: {shown:?}"
     );
+}
+
+/// A TOOL'S `notice later … url=` (codex-alab's account security setup, said by every tab
+/// of every launch) is one entry of the digest, never a band row; its one button, `Open
+/// in browser`, files it answered whatever the browser does (a headless instance opens
+/// none and says so), and that answer holds against the next tab's post.
+#[test]
+fn a_tools_later_entry_is_one_digest_entry_its_link_press_files() {
+    let line = "later codex.security-setup.0123abcd tag=codex \
+                url=https://chatgpt.com/security/setup Set up Codex account security -- \
+                only you can enrol a second factor for your account -- \
+                Finish the setup in your browser";
+    let req = || wire::NoticeRequest::parse(line).expect("a later line");
+    let mut app = App::headless_for_test();
+    let first = app.take_notice(req());
+    assert!(
+        first.starts_with("OK later=") && first.ends_with(" how=new"),
+        "{first}"
+    );
+    let again = app.take_notice(req());
+    assert!(again.ends_with(" how=duplicate"), "{again}");
+    assert_eq!(app.messages.wanted_rows(), 0, "never a band row");
+    let digest = app.messages.digest();
+    assert_eq!(digest.len(), 1);
+    let entry = &digest.entries[0];
+    assert_eq!(
+        entry.actions,
+        [Intent::OpenLink {
+            url: "https://chatgpt.com/security/setup".into()
+        }]
+    );
+    assert!(
+        entry
+            .detail
+            .contains(&"Opens a page on chatgpt.com".to_string()),
+        "{:?}",
+        entry.detail
+    );
+    let id = entry.id;
+    assert_eq!(
+        app.perform_message_act(WindowId(0), id.raw(), 0),
+        MessageActOutcome::Refused {
+            feedback: "Could not open the page".to_string()
+        },
+        "a headless instance opens no browser"
+    );
+    assert!(app.messages.digest().is_empty(), "the press filed it");
+    assert!(matches!(
+        app.messages.log().get(id).and_then(LogRecord::retired),
+        Some(Retired::Answered { .. })
+    ));
+    let next_tab = app.take_notice(req());
+    assert!(next_tab.ends_with(" how=quiet"), "{next_tab}");
+}
+
+/// `Open in browser` opens only a web page on the host its entry named: the engine's
+/// rule and the click gate, both, at the press, whatever road the intent came by.
+#[test]
+fn open_in_browser_opens_only_an_https_page() {
+    assert!(openable_link("https://chatgpt.com/security/setup?x=1#a"));
+    for bad in [
+        "http://chatgpt.com/",
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "mailto:someone@chatgpt.com",
+        "https://someone@chatgpt.com/",
+        "https://chatgpt.com:8443/",
+        "https://chatgpt.com/\n",
+        "https://chatgpt.com/a b",
+        " https://chatgpt.com/",
+        "open-link:https://chatgpt.com/",
+    ] {
+        assert!(!openable_link(bad), "{bad:?}");
+    }
 }

@@ -92,7 +92,7 @@
 //!   kernel start) holds that session, and one no registry pins may hold any
 //!   session of the project it works in, and keeps them all
 //!   ([`RunningClaude::may_hold`]). The registries and transcripts read are
-//!   `~/.claude`'s, the identities' and the directory each running process
+//!   `~/.claude`'s, managed accounts' and the directory each running process
 //!   was started with ([`Roots::claude_dirs`]) — for REACH: each pin lets
 //!   the rest of a project's sessions be judged, and a Claude Code the
 //!   kernel does not name one (a renamed copy) is still named running by its
@@ -264,7 +264,7 @@ pub fn windows_claude_tmp(var: impl Fn(&str) -> Option<OsString>) -> Option<Path
 /// The Claude Code directories a survey reads sessions' ends from
 /// ([`Roots::claude_dirs`]): `home`'s own (`~/.claude`, as
 /// [`footer::claude_dir_of`] spells it) and every one in `known` — a
-/// supervised agent's, an identity's, the caller's, each resolved by its
+/// supervised agent's, an account's, the caller's, each resolved by its
 /// reader from its `CLAUDE_CONFIG_DIR` — each once.
 ///
 /// [`footer::claude_dir_of`]: super::super::footer::claude_dir_of
@@ -681,7 +681,7 @@ fn settled(
 /// process was started with ([`Running::dirs`]): one that lies where the
 /// watch never looks ([`checkout::never_looked_at`] in `home`: a
 /// privacy-guarded folder, a volume) is not read — but aterm's own state
-/// directory, where its identities and accounts keep theirs
+/// directory, where its managed accounts keep theirs
 /// ([`in_aterm_state`]), is — and none is ever a reason to refuse: a process
 /// whose directory is not read keeps its project, as an unpinned Claude Code
 /// does ([`OwnDir::Unread`]). Refused,
@@ -884,7 +884,7 @@ fn own_dir(exec: &Exec, cwd: Option<&Path>, home: Option<&Path>) -> OwnDir {
 }
 
 /// Whether `dir` lies in aterm's own state directory under `home` (macOS:
-/// `~/Library/Application Support/aterm`), where identities and accounts keep their Claude
+/// `~/Library/Application Support/aterm`), where managed accounts keep their Claude
 /// Code directories. No privacy consent guards it, so the census reads them. Lexical; a path
 /// that climbs out by `..` is not.
 fn in_aterm_state(dir: &Path, home: Option<&Path>) -> bool {

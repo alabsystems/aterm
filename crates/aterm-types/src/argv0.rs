@@ -10,15 +10,16 @@
 //! bundle reads it there). Programs that cannot import a Rust constant keep hand copies, and
 //! a change here is made in each of them too:
 //!
-//! - `tools/install.sh`: `STORE_ALIASES` (line 2403) and the loop that links it (3738);
-//! - `apps/aterm-win/build.ps1:217` and `apps/aterm-win/install.ps1:91`, spelled with
-//!   `.exe`; Windows lays the CLI names only, so `aterm-askpass` and `aterm-gui` (there the
-//!   windowed image, a file of its own) are not in them;
-//! - the `Get-Process` lists at `apps/aterm-win/install.ps1:225` and
-//!   `apps/aterm-win/uninstall.ps1:146`;
+//! - `tools/install.sh`: `STORE_ALIASES` and the `for alias in $STORE_ALIASES` loop that
+//!   links it;
+//! - the `$aliases = @(` lines of `apps/aterm-win/build.ps1` and `apps/aterm-win/install.ps1`,
+//!   spelled with `.exe`; Windows lays the CLI names only, so `aterm-askpass` and `aterm-gui`
+//!   (there the windowed image, a file of its own) are not in them;
+//! - the `Get-Process` lists of `apps/aterm-win/install.ps1` and
+//!   `apps/aterm-win/uninstall.ps1`;
 //! - the prose in `apps/aterm-win/build.ps1`: the dist layout's `argv0 alias` rows in its
-//!   header (lines 33-40) and the README it writes into the dist (462-470);
-//! - the symlink sentence at `README.md:174`.
+//!   header and the tool rows of the README it writes into the dist;
+//! - the symlink sentence of `README.md` (the one ending `are symlinks onto it.`).
 //!
 //! The lists among them (`STORE_ALIASES`, both `$aliases`, both `Get-Process` lists and the
 //! README sentence) each carry a comment naming this constant.
@@ -28,7 +29,7 @@
 /// BY NAME out of `[fabric] command`, so a shipped install must carry it too.
 ///
 /// Plain names: no directory and no `.exe` (a Windows reader appends it).
-pub const ALIASES: [&str; 11] = [
+pub const ALIASES: [&str; 12] = [
     "aterm-cli",
     "aterm-ctl",
     "atpkg",
@@ -36,6 +37,8 @@ pub const ALIASES: [&str; 11] = [
     // the short one shells and the reroute stub name, the long one the atpkg bin name.
     "abrew",
     "atpkg-abrew",
+    // agh, aterm's GitHub client (docs/DESIGN-agh-2026-10-19.md).
+    "agh",
     "aterm-fleet",
     "aterm-drive",
     // The `SUDO_ASKPASS` helper `sudo` runs with no tty

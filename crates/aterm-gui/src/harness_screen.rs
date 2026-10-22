@@ -2043,8 +2043,9 @@ impl HarnessSessionRow {
 }
 
 /// A state line's head where a harness's need stands (§12.2.1): `needs you:
-/// <the need> (+1 more); carrying on`.
-fn need_head(ask: &crate::needs::HarnessAsk) -> String {
+/// <the need> (+1 more); carrying on`. The chip's title says the same words,
+/// made title-safe (`harness_glass::need_title`).
+pub(crate) fn need_head(ask: &crate::needs::HarnessAsk) -> String {
     format!("needs you: {}{}; carrying on", ask.first, ask.more_words())
 }
 
@@ -3998,7 +3999,13 @@ thread_local! {
 
 #[cfg(unix)]
 fn collect_sibling_aterm_tabs() -> Vec<TabSpreadsheetRow> {
-    use std::io::{BufRead, BufReader, Write};
+    sibling_aterm_tabs_in(sibling_socket_dirs())
+}
+
+/// The folders [`collect_sibling_aterm_tabs`] reads sibling sockets in: the
+/// control folder, and outside a test the person's other per-user ones.
+#[cfg(unix)]
+fn sibling_socket_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
     if let Some(dir) = aterm_uds::control_socket_dir() {
         dirs.push(dir);
@@ -4022,6 +4029,14 @@ fn collect_sibling_aterm_tabs() -> Vec<TabSpreadsheetRow> {
             }
         }
     }
+    dirs
+}
+
+/// [`collect_sibling_aterm_tabs`] over the sibling sockets in `dirs`: a test
+/// names a folder of its own, short enough to bind in whatever `$TMPDIR` is.
+#[cfg(unix)]
+fn sibling_aterm_tabs_in(dirs: Vec<std::path::PathBuf>) -> Vec<TabSpreadsheetRow> {
+    use std::io::{BufRead, BufReader, Write};
     let own_pid = std::process::id();
     let comp_name = local_computer_label();
     let mut rows = Vec::new();

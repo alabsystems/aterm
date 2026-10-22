@@ -582,11 +582,12 @@ fn topic_offsets(w: &World, sid: &str, topic: &str) -> Vec<u64> {
 /// and a marker published there after the backlog reaching `s_a` proves the
 /// face has read past all of it: `s_b`'s `since=@<first>` really is behind.
 /// The backlog is one record more than a page: the one page a pushed opt-in
-/// may spend at once leaves the walk owing the rest until the next roster
-/// round, and the shout is posted at once. Exactly where it lands is this
-/// machine's timing; `aterm-link`'s engine test of this name pins that
-/// interleaving round by round, with the negative control (the frontier gate
-/// in `fan_in_say`).
+/// may spend at once leaves the walk owing the rest, and the shout is posted
+/// at once. Exactly where it lands is this machine's timing; `aterm-link`'s
+/// engine test of this name pins that interleaving round by round, with the
+/// negative control (the frontier gate in `fan_in_say`). A second opt-in walks
+/// the next owed page at once (`replay_topics`), not at the 2 s roster round;
+/// waiting for `s_a`'s copy of the shout first keeps the shout ahead of it.
 ///
 /// Sixty-four per sender, to stay under the ring's per-sender quota — the
 /// property under test is the cursor, not the ring.
@@ -598,6 +599,8 @@ fn a_live_record_does_not_cancel_a_backlog_still_owed() {
     w.wait_ready();
     let (s_a, s_b) = w.two_sessions();
     subscribe(&w, &s_a, "r23.mark");
+    // At the head, before anything is owed: this opt-in spends no page.
+    subscribe(&w, &s_a, "r23.deep");
     // The backlog, pipelined (`harness::publish_pipelined`): one fsync'd
     // round trip per window, not per record.
     let backlog: Vec<harness::Record> = (0..=PAGE)
@@ -631,6 +634,14 @@ fn a_live_record_does_not_cancel_a_backlog_still_owed() {
     // THE LIVE SHOUT, while the walk still owes the backlog.
     let posted = w.verb(&format!("@{s_a} post to=say:r23.deep kind=note r23live"));
     assert!(posted.ok(), "{}", posted.header());
+    until("the face to read the shout (s_a's own row)", || {
+        topic_rows(&w, &s_a, "r23.deep")
+            .iter()
+            .any(|r| r.contains("text=r23live"))
+            .then_some(())
+    });
+    // THE PUSH that walks what is still owed: the next page, now.
+    subscribe(&w, &s_a, "r23.nudge");
 
     let last = format!("text=r23bl-{PAGE}");
     let rows = until("the whole backlog and the live record", || {

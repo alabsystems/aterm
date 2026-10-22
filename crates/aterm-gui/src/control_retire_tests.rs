@@ -142,7 +142,7 @@ fn a_cold_exec_retires_the_control_socket_and_a_failed_one_reopens_it() {
     if !crate::test_alone::alone() {
         return;
     }
-    let dir = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir");
+    let dir = crate::test_scratch::short_dir("the retired socket");
     let path = dir.path().join("c.sock");
     let published = path.to_str().expect("utf8").to_string();
     let listener = CtlListener::bind(&path).expect("bind");

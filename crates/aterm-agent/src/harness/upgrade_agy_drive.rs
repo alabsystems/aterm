@@ -17,7 +17,7 @@
 //!    one-shot, no subcommand), its config directory (its `HOME`'s
 //!    `.gemini/antigravity-cli`, moved by its hidden `--gemini_dir` and
 //!    `--app_data_dir`), the conversation it holds — the one presence lock
-//!    `<config>/presence/<uuid>.lock` its process holds open (`lsof`,
+//!    `<config>/presence/<uuid>.lock` its process holds open ([`open_files`],
 //!    [`witness`]) — the crash file it holds open, and the shell-integration
 //!    block it runs in. The lock names no pid, so between idle points nothing
 //!    follows it: the loop's idle points read the snapshot again (as a
@@ -72,7 +72,7 @@ use super::{
     Client, Hand, Kernel, Live, LiveTab, NoPlan, Opts, Plan, PromptLook, RelaunchLineError, Report,
     STALE_S, St, TURN_WAIT, TabLife, Typed, alive, connect, cwd_of, descendants_in, exe_of,
     exit_status, file_holders, held, ids, is_generation, ledger, line_status, load,
-    lsof_open_files, managed_agent_twin, now_s, pause, registry_graph, registry_life, roster,
+    managed_agent_twin, now_s, open_files, pause, registry_graph, registry_life, roster,
     running_block, said, save, screen, shell_dialect_of, squash, started_ms, state_dir,
     store_version, table, turn_takes_gen, turn_verdict, twin_version, type_relaunch_line_with,
     under_hand, upgrade, wait_now, wait_until,
@@ -90,7 +90,7 @@ pub(super) trait AgyKernel: Kernel {
     fn args(&self, pid: u32) -> Option<atpkg::caller_shell::ProcArgs>;
     /// The executable the kernel mapped for `pid`.
     fn exe(&self, pid: u32) -> Option<PathBuf>;
-    /// Every file `pid` holds open (`lsof`), `None` when unreadable.
+    /// Every file `pid` holds open through a descriptor, `None` when unreadable.
     fn open_files(&self, pid: u32) -> Option<Vec<PathBuf>>;
     /// Every process holding `file` open, `None` when unreadable.
     fn holders_of(&self, file: &Path) -> Option<Vec<u32>>;
@@ -150,9 +150,9 @@ impl AgyKernel for Live {
         exe_of(pid)
     }
 
-    // The lanes' one read of these kernel facts (`lsof`).
+    // The lanes' one read of these kernel facts.
     fn open_files(&self, pid: u32) -> Option<Vec<PathBuf>> {
-        lsof_open_files(pid)
+        open_files(pid)
     }
 
     fn holders_of(&self, file: &Path) -> Option<Vec<u32>> {
@@ -191,7 +191,7 @@ impl AgyKernel for Live {
             .into_iter()
             .filter(|pid| agys.contains(pid))
         {
-            match lsof_open_files(pid) {
+            match open_files(pid) {
                 Some(files) => {
                     if ag::holds_no_lock(config, &files) {
                         out.push(pid);

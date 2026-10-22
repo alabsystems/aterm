@@ -89,6 +89,7 @@ impl GlowStyle {
     /// grounds a head already on glass once `pet_mode && sing <= 0.0`, including
     /// on a hot config reload. (The song tenure, `sing > 0.0`, is a bounded
     /// promise the pet does not own.)
+    #[inline]
     #[must_use]
     pub fn style_names_kitty_pet(s: &str) -> bool {
         matches!(
@@ -117,6 +118,7 @@ impl GlowStyle {
     /// not another trail: it resolves to [`GlowStyle::RainbowKitty`], so ribbon,
     /// starfield, chip melody and sound palette are unchanged; only the animal
     /// in front of the caret differs.
+    #[inline]
     #[must_use]
     pub fn style_names_dog_pet(s: &str) -> bool {
         spellings::canonical(s) == Some("rainbow dog pet")
@@ -125,6 +127,7 @@ impl GlowStyle {
     /// Whether this style string asks for the full-body pet in any species: the
     /// predicate the render path asks; use [`Self::style_names_dog_pet`] after
     /// only to pick the skin.
+    #[inline]
     #[must_use]
     pub fn style_names_any_pet(s: &str) -> bool {
         matches!(
@@ -148,6 +151,7 @@ impl GlowStyle {
     /// Not another [`GlowStyle`]: the classic field, scheduling, admission,
     /// companion, sound, sparkle, retract and delete machinery are one
     /// rainbow-kitty family; only the dark body geometry differs.
+    #[inline]
     #[must_use]
     pub fn style_names_underline_ribbon(s: &str) -> bool {
         spellings::canonical(s) == Some("rainbow kitty underline")
@@ -164,6 +168,7 @@ impl GlowStyle {
     /// [`GlowStyle::RainbowKitty`], draws the resident pet, and forks at
     /// [`GlowConfig::ribbon_flat`] alone. `rainbow kitty flat` is the tall flat
     /// body (owner, 2026-09-13).
+    #[inline]
     #[must_use]
     pub fn style_names_flat_ribbon(s: &str) -> bool {
         spellings::canonical(s) == Some("rainbow kitty flat")
@@ -173,6 +178,7 @@ impl GlowStyle {
     /// raw config string so a spelling that fell back to the default reads as a
     /// fallback. Stable wire tokens (hyphenated, lower case), not config
     /// spellings.
+    #[inline]
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
@@ -217,6 +223,7 @@ impl GlowStyle {
     }
     /// Whether this style spawns particles (sparks / embers / droplets /
     /// laser-ablation sparks / beam stardust / comet debris glitter).
+    #[inline]
     pub(super) fn has_particles(self) -> bool {
         matches!(
             self,
@@ -368,6 +375,7 @@ impl KnobContext {
     /// The context in which a knob shows at its widest for a style: the ring
     /// on and the classic face tinted. Settings lists a style's rows from it,
     /// so a row stays put while another knob toggles whether it shows.
+    #[inline]
     #[must_use]
     pub const fn widest(bar: bool) -> Self {
         Self {
@@ -405,6 +413,7 @@ impl GlowStyle {
     ///   the tails that fade from it (Lumen's tracer and Comet's dust and
     ///   coma fringe on a dark ground, the tinted classic tracer on either).
     /// * `FireShimmer`: Fire alone.
+    #[inline]
     #[must_use]
     pub fn reads_knob(self, knob: TrailKnob, ctx: KnobContext) -> bool {
         use GlowStyle::{
@@ -435,6 +444,7 @@ impl GlowStyle {
     /// Whether the style draws the trail colour on a block cursor: the auto
     /// accent then brightens it, and an explicit colour is pinned against the
     /// live cursor's. A style that does not keeps both on the cursor colour.
+    #[inline]
     #[must_use]
     pub fn draws_trail_color(self) -> bool {
         self.reads_knob(
@@ -458,6 +468,7 @@ impl GlowStyle {
 ///
 /// Keyed off the raw string, not [`GlowStyle`]: in the GUI resolver the raw
 /// `comet` spelling also routes the opaque cadence-comet body.
+#[inline]
 #[must_use]
 pub fn style_has_beam(style_raw: &str) -> bool {
     style_has_beam_of(GlowStyle::parse(style_raw.trim()), style_raw)
@@ -467,6 +478,7 @@ pub fn style_has_beam(style_raw: &str) -> bool {
 /// `glow_config` path), avoiding a re-parse while sharing one source of truth.
 /// `style_raw` is taken (currently unused) so a future raw-string distinction
 /// between spellings of one [`GlowStyle`] needs no call-site changes.
+#[inline]
 #[must_use]
 pub fn style_has_beam_of(style: GlowStyle, _style_raw: &str) -> bool {
     !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty)

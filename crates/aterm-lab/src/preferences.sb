@@ -1,0 +1,12 @@
+;; SPDX-License-Identifier: Apache-2.0
+;; Copyright 2026 Andrew Yates
+;; PREFERENCES: moving HOME does not move the UID account's CFPreferences daemons, shared memory or domains.
+;; Deny the channels themselves without asking a daemon for the owner's preferences.
+(deny mach-lookup
+    (global-name "com.apple.cfprefsd.daemon")
+    (global-name "com.apple.cfprefsd.agent")
+    (local-name "com.apple.cfprefsd.agent"))
+(deny ipc-posix-shm-read*
+    (ipc-posix-name-prefix "apple.cfprefs.")
+    (ipc-posix-name-prefix "/apple.cfprefs."))
+(deny user-preference-read)

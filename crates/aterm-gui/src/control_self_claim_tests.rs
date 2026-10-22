@@ -347,9 +347,306 @@ fn a_replacement_waits_for_the_writes_the_replaced_fence_admitted() {
 /// NEGATIVE CONTROLS: no claim, an unproven claim's own connection, and a
 /// proven claim's other connection with no proof are each `ERR denied` and
 /// record nothing.
+/// The native client's exact prepare/set exchange passes through the real meta
+/// dispatcher, including the landing mark and the task-face wake.
+#[test]
+fn bounded_harness_acts_prepare_and_publish_through_real_meta_dispatch() {
+    use aterm_agent::harness::acts::TaskFace;
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle_on(7510, -1);
+    store.write().unwrap().register(h.clone());
+    crate::term_lock(&h.term).process(b"\x1b]7501;state=idle:app=codex\x1b\\");
+    let holder = format!("codex-alab@{}", std::process::id());
+    claim_supervisor_as(
+        &h.ctx,
+        &holder,
+        Some(2),
+        None,
+        Some(running()),
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("a proven claim");
+    let serve =
+        |rest: &str, conn| super::meta_wakes_for_test(&store, &h.term, 7510, &h.ctx, rest, conn);
+    let (reply, wakes) = serve("prepare harness_act", Some(3));
+    assert_eq!(reply, "ERR denied\n");
+    assert!(wakes.is_empty());
+    let (reply, wakes) = serve("prepare harness_act", Some(2));
+    assert!(reply.starts_with("OK until_us="), "{reply}");
+    let deadline = reply
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("until_us="))
+        .and_then(|word| word.parse::<u64>().ok())
+        .expect("server-monotonic deadline");
+    assert!(deadline > 0);
+    assert!(reply.split_whitespace().any(|word| word == "lease_ms=5000"));
+    assert!(wakes.is_empty(), "preparing records no task face");
+    assert!(h.ctx.timeline.lock().unwrap().last_act().is_none());
+    let mark = crate::session_timeline::LandingMark {
+        program_turns: crate::term_lock(&h.term).program_state().turns,
+        busy_entries: h.ctx.timeline.lock().unwrap().agent().busy_entries,
+    };
+    let (reply, wakes) = serve(
+        &format!("set harness_act left-to-person@v1 until_us={deadline}"),
+        Some(2),
+    );
+    assert_eq!(reply, "OK\n");
+    assert!(matches!(
+        wakes.as_slice(),
+        [
+            crate::Wake::MetaChanged { session: 7510 },
+            crate::Wake::HarnessFact {
+                fact: crate::HarnessFact::SelfTask(TaskFace::Theirs),
+                ..
+            }
+        ]
+    ));
+    {
+        let mut timeline = h.ctx.timeline.lock().unwrap();
+        assert_eq!(timeline.last_act(), Some("left-to-person@v1"));
+        assert_eq!(timeline.landing_mark(), Some(mark));
+        assert_eq!(timeline.take_self_tasks(), [TaskFace::Theirs]);
+    }
+    // Ordinary callers keep their existing unbounded spelling.
+    let (reply, wakes) = serve("set harness_act continue@v1", Some(2));
+    assert_eq!(reply, "OK\n");
+    assert!(matches!(
+        wakes.as_slice(),
+        [
+            crate::Wake::MetaChanged { session: 7510 },
+            crate::Wake::HarnessFact {
+                fact: crate::HarnessFact::SelfTask(TaskFace::Open),
+                ..
+            }
+        ]
+    ));
+}
+
+#[test]
+fn bounded_harness_acts_reject_expiry_and_stale_proof_without_publication() {
+    use super::control_session::cmd_meta_harness_act_with_clock;
+    use aterm_agent::harness::acts::TaskFace;
+    use std::cell::Cell;
+    let h = crate::session_store::test_handle_on(7511, -1);
+    let ctx = h.ctx.as_ref();
+    let base = crate::metrics::now_us();
+    let clock = Cell::new(base);
+    let now = || clock.get();
+    let holder = format!("codex-alab@{}", std::process::id());
+    let mark = crate::session_timeline::LandingMark {
+        program_turns: 7,
+        busy_entries: 9,
+    };
+    let proof = |_: &str| Some(running());
+    let no_proof = |_: &str| None;
+    let serve = |rest: &str, conn, prove: &dyn Fn(&str) -> Option<Proven>| {
+        cmd_meta_harness_act_with_clock(
+            ctx,
+            Some(super::control_session::HarnessActSnapshot {
+                mark,
+                left_at_rest: true,
+            }),
+            conn,
+            aterm_slog::Actor::Ctl,
+            prove,
+            rest,
+            &now,
+        )
+        .expect("a harness-act command")
+    };
+    let empty = || {
+        let mut timeline = ctx.timeline.lock().unwrap();
+        assert!(timeline.last_act().is_none());
+        assert!(timeline.landing_mark().is_none());
+        assert!(timeline.take_self_tasks().is_empty());
+        assert!(
+            !timeline
+                .since(None)
+                .any(|row| row.kind == crate::session_timeline::HARNESS_ACT)
+        );
+    };
+    let bounded = format!("set harness_act left-to-person@v1 until_us={}", base + 100);
+    let denied = ("ERR denied\n".to_string(), false);
+    // Neither a free session nor an unproven holder may prepare or publish.
+    for proven in [false, true] {
+        if proven {
+            claim_supervisor_as(
+                ctx,
+                &holder,
+                Some(2),
+                None,
+                None,
+                base,
+                aterm_slog::Actor::Ctl,
+            )
+            .expect("unproven holder");
+        }
+        for rest in ["prepare harness_act", bounded.as_str()] {
+            assert_eq!(serve(rest, Some(2), &proof), denied);
+        }
+        empty();
+    }
+    assert!(release_supervisor(ctx, None, base, aterm_slog::Actor::Ctl));
+    claim_supervisor_as(
+        ctx,
+        &holder,
+        Some(2),
+        None,
+        Some(running()),
+        base,
+        aterm_slog::Actor::Ctl,
+    )
+    .expect("proven holder");
+    // The two commands share the same connection/kernel identity admission.
+    let reused = |_: &str| Some(gone());
+    let replaced = |_: &str| {
+        assert!(release_supervisor(ctx, None, base, aterm_slog::Actor::Ctl));
+        claim_supervisor_as(
+            ctx,
+            &holder,
+            Some(2),
+            None,
+            Some(running()),
+            base,
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("same identity under a new claim revision");
+        Some(running())
+    };
+    for prove in [
+        &no_proof as &dyn Fn(&str) -> Option<Proven>,
+        &reused,
+        &replaced,
+    ] {
+        for rest in ["prepare harness_act", bounded.as_str()] {
+            assert_eq!(serve(rest, Some(3), prove), denied);
+        }
+        empty();
+    }
+    for rest in [
+        "prepare harness_act extra",
+        "set harness_act left-to-person@v1 until_us=",
+        "set harness_act left-to-person@v1 until_us=-1",
+        "set harness_act left-to-person@v1 until_us=+1",
+        "set harness_act left-to-person@v1 until_us=1.5",
+        "set harness_act left-to-person@v1 until_us=18446744073709551616",
+        "set harness_act left-to-person@v1 until_us=1 extra",
+        "set harness_act left-to-person@v1 until_us=1 until_us=2",
+        "set harness_act left-to-person@v1 lease_ms=5000",
+    ] {
+        let (reply, changed) = serve(rest, Some(2), &proof);
+        assert!(reply.starts_with("ERR usage:"), "{rest}: {reply}");
+        assert!(!changed);
+        assert!(super::control_session::harness_act_face(rest).is_none());
+        empty();
+    }
+    for deadline in [0, base, base + 5_000_001, u64::MAX] {
+        assert_eq!(
+            serve(
+                &format!("set harness_act left-to-person@v1 until_us={deadline}"),
+                Some(2),
+                &proof
+            ),
+            if deadline <= base {
+                ("ERR expired harness_act\n".to_string(), false)
+            } else {
+                ("ERR usage: meta prepare harness_act | meta set harness_act <act> [until_us=<n>]\n".to_string(), false)
+            }
+        );
+        empty();
+    }
+    clock.set(u64::MAX);
+    assert_eq!(
+        serve("prepare harness_act", Some(2), &proof),
+        ("ERR clock unavailable\n".to_string(), false)
+    );
+    clock.set(base);
+    // The request is fresh when admitted, but its off-lock identity proof
+    // finishes at the exact expiry. No old task face may reach later work.
+    let expired = |_: &str| {
+        clock.set(base + 100);
+        Some(running())
+    };
+    assert_eq!(
+        serve(&bounded, Some(3), &expired),
+        ("ERR expired harness_act\n".to_string(), false)
+    );
+    empty();
+    // The matching control is still valid one microsecond before expiry.
+    clock.set(base);
+    let fresh = |_: &str| {
+        clock.set(base + 99);
+        Some(running())
+    };
+    assert_eq!(serve(&bounded, Some(3), &fresh), ("OK\n".to_string(), true));
+    let mut timeline = ctx.timeline.lock().unwrap();
+    assert_eq!(timeline.last_act(), Some("left-to-person@v1"));
+    assert_eq!(timeline.landing_mark(), Some(mark));
+    assert_eq!(timeline.take_self_tasks(), [TaskFace::Theirs]);
+}
+
+#[test]
+fn a_harness_act_rechecks_claim_expiry_at_the_timeline_commit() {
+    use super::control_session::cmd_meta_harness_act_with_clock;
+    for bounded in [false, true] {
+        let h = crate::session_store::test_handle_on(7512, -1);
+        let ctx = h.ctx.as_ref();
+        let base = crate::metrics::now_us();
+        let expires = base + 100;
+        claim_supervisor_as(
+            ctx,
+            &format!("codex-alab@{}", std::process::id()),
+            Some(2),
+            Some(expires),
+            Some(running()),
+            base,
+            aterm_slog::Actor::Ctl,
+        )
+        .expect("standing proven claim");
+        // Advance the injected clock only once the timeline commit hold is
+        // acquired: the claim was live through the off-lock identity proof,
+        // but its TTL elapsed while waiting for that final lock. The act's
+        // own publication deadline remains valid, isolating claim authority.
+        let clock = || {
+            if ctx.timeline.try_lock().is_err() {
+                expires
+            } else {
+                base
+            }
+        };
+        let rest = if bounded {
+            format!(
+                "set harness_act left-to-person@v1 until_us={}",
+                base + 5_000_000
+            )
+        } else {
+            "set harness_act left-to-person@v1".to_string()
+        };
+        assert_eq!(
+            cmd_meta_harness_act_with_clock(
+                ctx,
+                None,
+                Some(2),
+                aterm_slog::Actor::Ctl,
+                &|_| Some(running()),
+                &rest,
+                &clock
+            ),
+            Some(("ERR denied\n".to_string(), false))
+        );
+        let mut timeline = ctx.timeline.lock().unwrap();
+        assert!(timeline.last_act().is_none());
+        assert!(timeline.landing_mark().is_none());
+        assert!(timeline.take_self_tasks().is_empty());
+    }
+}
+
 #[test]
 fn only_a_proven_claims_holder_records_an_act() {
-    use super::control_session::cmd_meta_harness_act;
+    use super::control_session::{
+        HarnessActSnapshot, cmd_meta_harness_act, cmd_meta_harness_act_with_clock,
+    };
     let h = crate::session_store::test_handle_on(7505, -1);
     let ctx = h.ctx.as_ref();
     let now = crate::metrics::now_us();
@@ -394,6 +691,17 @@ fn only_a_proven_claims_holder_records_an_act() {
         ),
         denied
     );
+    assert_eq!(
+        cmd_meta_harness_act(
+            ctx,
+            None,
+            Some(1),
+            aterm_slog::Actor::Ctl,
+            &proof,
+            "prepare harness_act"
+        ),
+        denied
+    );
     // An unproven claim, on its own connection.
     let me = format!("codex-alab@{}", std::process::id());
     assert!(
@@ -411,6 +719,17 @@ fn only_a_proven_claims_holder_records_an_act() {
         denied
     );
     assert_eq!(acts(ctx), (Vec::new(), None));
+    assert_eq!(
+        cmd_meta_harness_act(
+            ctx,
+            None,
+            Some(1),
+            aterm_slog::Actor::Ctl,
+            &proof,
+            "prepare harness_act"
+        ),
+        denied
+    );
     // Proven, bound to connection 2.
     assert!(release_supervisor(ctx, None, now, aterm_slog::Actor::Ctl));
     assert!(
@@ -515,12 +834,21 @@ fn only_a_proven_claims_holder_records_an_act() {
     );
     assert_eq!(acts(ctx), before, "a stale act records nothing");
     // Usage: no act, two, a token no owner key could be, and `unset`.
-    let usage = Some(("ERR usage: meta set harness_act <act>\n".to_string(), false));
+    let usage = Some((
+        "ERR usage: meta prepare harness_act | meta set harness_act <act> [until_us=<n>]\n"
+            .to_string(),
+        false,
+    ));
     for rest in [
         "set harness_act",
         "set harness_act a b",
         "set harness_act a=b?",
         "unset harness_act",
+        "prepare harness_act extra",
+        "set harness_act continue until_us=bad",
+        "set harness_act continue until_us=-1",
+        "set harness_act continue until_us=18446744073709551616",
+        "set harness_act continue until_us=1 until_us=2",
     ] {
         assert_eq!(
             cmd_meta_harness_act(ctx, None, Some(2), aterm_slog::Actor::Ctl, &proof, rest),
@@ -536,6 +864,10 @@ fn only_a_proven_claims_holder_records_an_act() {
         program_turns,
         busy_entries,
     };
+    let snapshot = |mark| HarnessActSnapshot {
+        mark,
+        left_at_rest: true,
+    };
     let mark = || {
         ctx.timeline
             .lock()
@@ -546,7 +878,7 @@ fn only_a_proven_claims_holder_records_an_act() {
         assert_eq!(
             cmd_meta_harness_act(
                 ctx,
-                Some(next),
+                Some(snapshot(next)),
                 Some(conn),
                 aterm_slog::Actor::Ctl,
                 &proof,
@@ -560,7 +892,7 @@ fn only_a_proven_claims_holder_records_an_act() {
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
-            Some(landing(8, 9)),
+            Some(snapshot(landing(8, 9))),
             Some(2),
             aterm_slog::Actor::Ctl,
             &proof,
@@ -577,7 +909,7 @@ fn only_a_proven_claims_holder_records_an_act() {
     assert_eq!(
         cmd_meta_harness_act(
             ctx,
-            Some(landing(8, 9)),
+            Some(snapshot(landing(8, 9))),
             Some(3),
             aterm_slog::Actor::Ctl,
             &no_proof,
@@ -591,6 +923,135 @@ fn only_a_proven_claims_holder_records_an_act() {
         Some(landing(4, 6)),
         "nor replaces the admitted mark"
     );
+
+    // A prepare grants only a bounded deadline under the same proven claim;
+    // it neither records an act nor changes a landing or queues a face.
+    let _ = ctx.timeline.lock().unwrap().take_self_tasks();
+    let before = acts(ctx);
+    let base = 100;
+    let until = base + 5_000_000;
+    assert_eq!(
+        cmd_meta_harness_act_with_clock(
+            ctx,
+            None,
+            Some(2),
+            aterm_slog::Actor::Ctl,
+            &no_proof,
+            "prepare harness_act",
+            &|| base
+        ),
+        Some((format!("OK until_us={until} lease_ms=5000\n"), false))
+    );
+    assert_eq!(acts(ctx), before);
+    assert_eq!(mark(), Some(landing(4, 6)));
+    assert!(ctx.timeline.lock().unwrap().take_self_tasks().is_empty());
+
+    let request = format!("set harness_act left-to-person@v1 until_us={until}");
+    let clock = std::cell::Cell::new(base);
+    let guarded_read = std::cell::Cell::new(false);
+    let guarded_clock = || {
+        if ctx.meta.try_lock().is_err() && ctx.timeline.try_lock().is_err() {
+            guarded_read.set(true);
+        }
+        clock.get()
+    };
+    // Both the full lease and final admissible microsecond commit the
+    // earlier count snapshot. No real sleep stands in for the boundary.
+    for admitted in [base, until - 1] {
+        clock.set(admitted);
+        guarded_read.set(false);
+        assert_eq!(
+            cmd_meta_harness_act_with_clock(
+                ctx,
+                Some(snapshot(landing(7, 9))),
+                Some(2),
+                aterm_slog::Actor::Ctl,
+                &no_proof,
+                &request,
+                &guarded_clock
+            ),
+            ok
+        );
+        assert!(guarded_read.get(), "deadline read under both commit guards");
+        assert_eq!(mark(), Some(landing(7, 9)));
+        assert_eq!(
+            ctx.timeline.lock().unwrap().take_self_tasks(),
+            std::collections::VecDeque::from([aterm_agent::harness::acts::TaskFace::Theirs])
+        );
+    }
+    let before = acts(ctx);
+    for expired in [until, until + 1] {
+        clock.set(base);
+        guarded_read.set(false);
+        // Expiry during off-lock admission must still refuse at commit.
+        let delayed_proof = |_: &str| {
+            clock.set(expired);
+            Some(running())
+        };
+        assert_eq!(
+            cmd_meta_harness_act_with_clock(
+                ctx,
+                Some(snapshot(landing(20, 30))),
+                Some(3),
+                aterm_slog::Actor::Ctl,
+                &delayed_proof,
+                &request,
+                &guarded_clock
+            ),
+            Some(("ERR expired harness_act\n".to_string(), false))
+        );
+        assert!(
+            guarded_read.get(),
+            "expiry checked under both commit guards"
+        );
+        assert_eq!(acts(ctx), before, "an expired act records no row");
+        assert_eq!(
+            mark(),
+            Some(landing(7, 9)),
+            "nor replaces the captured mark"
+        );
+        assert!(ctx.timeline.lock().unwrap().take_self_tasks().is_empty());
+    }
+    // A forged longer horizon is not a lease, and an overflowing server
+    // clock cannot grant one. A prepare without another proof is refused.
+    assert_eq!(
+        cmd_meta_harness_act_with_clock(
+            ctx,
+            None,
+            Some(2),
+            aterm_slog::Actor::Ctl,
+            &no_proof,
+            &format!("set harness_act continue until_us={}", until + 1),
+            &|| base
+        ),
+        usage
+    );
+    assert_eq!(
+        cmd_meta_harness_act_with_clock(
+            ctx,
+            None,
+            Some(2),
+            aterm_slog::Actor::Ctl,
+            &no_proof,
+            "prepare harness_act",
+            &|| u64::MAX
+        ),
+        Some(("ERR clock unavailable\n".to_string(), false))
+    );
+    assert_eq!(
+        cmd_meta_harness_act_with_clock(
+            ctx,
+            None,
+            Some(3),
+            aterm_slog::Actor::Ctl,
+            &no_proof,
+            "prepare harness_act",
+            &|| base
+        ),
+        denied
+    );
+    assert_eq!(acts(ctx), before);
+    assert!(ctx.timeline.lock().unwrap().take_self_tasks().is_empty());
 }
 
 /// A PROVEN HOLDER'S ACT IS ONE ACT MARK (plan 5C-2; rulings T21, T24): in
@@ -1055,7 +1516,7 @@ fn read_until_done(master: i32) -> String {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_claim_is_proven_by_its_connections_peer_leading_the_foreground() {
-    let dir = aterm_tempfile::TempDir::new().expect("dir");
+    let dir = crate::test_scratch::short_dir("the claim's socket");
     let sock = dir.path().join("c.sock");
     let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
     listener

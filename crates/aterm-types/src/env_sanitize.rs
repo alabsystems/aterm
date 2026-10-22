@@ -238,13 +238,13 @@ mod tests {
         assert!(!key(b"ATERM_SESSION_ID\xff"));
     }
 
-    /// What a child must never inherit: agent identities and keys by prefix,
+    /// What a child must never inherit: AI-tool context and keys by prefix,
     /// the recursion-provisioning identity/edge vars and the retired
     /// edge-secret names (an inherited copy never leaks past one hop), the
     /// development seams (a nested aterm never runs under its parent's QA
     /// seam), and the retired credentials, all by exact name.
     #[test]
-    fn agent_identity_seams_and_credentials_are_denied() {
+    fn agent_context_seams_and_credentials_are_denied() {
         let ai_role = ["AI", "ROLE"].join("_");
         let ai_worker_id = ["AI", "WORKER", "ID"].join("_");
         for v in [

@@ -46,6 +46,15 @@
 //!   thread that only ever answers the bridge's own requests;
 //! * the PUSH LANE: aterm's `EVENT` lines are queued into the bridge's mailbox
 //!   by the scheduler itself;
+//! * a SIBLING under the node id, in worlds of its own: a copy of the state
+//!   dir's bridge, played by the scheduler (or, racing an attach, by the
+//!   broker inside one of the node's will requests) as its rows on the bus
+//!   under the node's producer and the copy's mark — its attach, its
+//!   session's row, its will — so the bridge's ghost sweep meets another
+//!   state dir's rows, at an incarnation this dir took too in the racing world
+//!   (finding F4: a ghost row whose writer's successors all died inside the
+//!   sweep's patience stood for good, which the bridge closes by reading the
+//!   state dir's mark on the row, and never a sibling's);
 //! * the ENTROPY: the back-off's jitter is the seed's.
 //!
 //! ## Why it is deterministic

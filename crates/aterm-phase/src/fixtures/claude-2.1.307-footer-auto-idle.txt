@@ -1,0 +1,10 @@
+# claude-code 2.1.307 · MEASURED 2026-10-21, `aterm ctl text` of a private headless aterm (80x24, aterm 0.109.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the launch mode, idle, empty composer: the mode row the footer rewrites and the lights read · settings {"effortLevel":"xhigh","env":{"CLAUDE_CODE_EFFORT_LEVEL":"xhigh"},"model":"opus"} · the lab's random project dir is spelled /private/tmp/at.lab0 here
+ ▐▛███▛█   Claude Code v2.1.307
+▝▜██████▀  Opus 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents        ◉ xhigh · /effort

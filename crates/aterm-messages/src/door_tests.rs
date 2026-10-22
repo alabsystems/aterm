@@ -140,6 +140,9 @@ fn is_snooze_names_exactly_the_snoozes() {
         Intent::OpenSystemPane {
             pane: "full-disk-access".into(),
         },
+        Intent::OpenLink {
+            url: "https://chatgpt.com/".into(),
+        },
         Intent::ApplyUpdate { build: 7 },
         Intent::NewWindow,
         Intent::StopPaste { session: 1 },

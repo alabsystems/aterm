@@ -216,11 +216,13 @@ pub struct SelView<'a> {
 }
 
 impl SelView<'_> {
+    #[inline]
     fn cell_selected(&self, row: u16, col: u16) -> bool {
         self.sel.contains(i32::from(row) - self.display_offset, col)
     }
 
     /// Any cell of the span `[c0, c1]` on `row` selected?
+    #[inline]
     fn span_selected(&self, row: u16, c0: u16, c1: u16) -> bool {
         (c0..=c1).any(|c| self.cell_selected(row, c))
     }
@@ -265,6 +267,7 @@ pub struct CompanionOnGlass {
 impl CompanionOnGlass {
     /// The flying head with no resolved sprite rect: only the caret band
     /// stands in, under-covering the sprite. Prefer [`Self::at_head`].
+    #[inline]
     #[must_use]
     pub fn at_cell(cell: (u16, u16)) -> Self {
         Self {
@@ -276,6 +279,7 @@ impl CompanionOnGlass {
 
     /// The flying head with its live drawn rect, from
     /// [`WordDecorations::kitty_cursor_footprint`]. Guards the caret band too.
+    #[inline]
     #[must_use]
     pub fn at_head(cell: (u16, u16), head_px: (i32, i32, i32, i32)) -> Self {
         Self {
@@ -287,6 +291,7 @@ impl CompanionOnGlass {
 
     /// A resident pet on glass. Its body is authoritative even while DECTCEM
     /// temporarily withholds the caret; callers must never guess a stale cell.
+    #[inline]
     #[must_use]
     pub fn at_body(cell: Option<(u16, u16)>, body_px: (i32, i32, i32, i32)) -> Self {
         Self {
@@ -297,6 +302,7 @@ impl CompanionOnGlass {
     }
 
     /// The rects an ambient cat must not stack on this frame.
+    #[inline]
     #[must_use]
     fn footprint(self, geom: EffectGeom) -> CompanionFootprint {
         CompanionFootprint {
@@ -329,6 +335,7 @@ pub(crate) struct CompanionFootprint {
 
 impl CompanionFootprint {
     /// Is the cat rect `(x, w, top..bottom)` stacked on any companion rect?
+    #[inline]
     #[must_use]
     pub(crate) fn stacked_on(&self, x: i32, w: i32, top: i32, bottom: i32) -> bool {
         self.rects
@@ -443,6 +450,7 @@ pub struct KittyCursorPlacement {
 }
 
 impl KittyCursorPlacement {
+    #[inline]
     fn settled(sample: CatFootprint) -> Self {
         Self {
             sample,
@@ -454,6 +462,7 @@ impl KittyCursorPlacement {
 
     /// True for either visible half-beat and the off-stage seam between them.
     /// Emitters keep signed X instead of clamping onto the opposite edge.
+    #[inline]
     #[must_use]
     pub fn in_motion(self) -> bool {
         !matches!(self.leg, KittyCursorPlacementLeg::Settled)
@@ -583,6 +592,7 @@ impl DecoConfig {
     /// Public so the typed-word detector ([`crate::kitty_summon`], fed by the
     /// host input path) scans with the same `allow_bare_cat` /
     /// `cjk_single_char` / `ignore` policy.
+    #[inline]
     pub fn scan_opts(&self) -> ScanOptions<'_> {
         ScanOptions {
             allow_bare_cat: self.allow_bare_cat,
@@ -694,6 +704,7 @@ fn class_default_spec(class: Class, cfg: &DecoConfig) -> WordEffectSpec {
 /// §3.1 rainbow base hue, degrees — a salted decode of the frozen genome so
 /// similar contexts start at similar (not identical) hues.
 const RAINBOW_HUE_SALT: u64 = 0x5A1A_D0FF_BEAD_5EED;
+#[inline]
 pub(crate) fn rainbow_base_hue(gkey: u64) -> f32 {
     (mix(gkey ^ RAINBOW_HUE_SALT) % 360) as f32
 }
@@ -896,6 +907,7 @@ impl Episode {
     /// Whether any one-shot started — the done-mark write condition whenever
     /// the episode leaves the persist map. Born-settled episodes are never
     /// marked; born-done ones refresh their mark.
+    #[inline]
     fn one_shot_started(&self) -> bool {
         !self.born_settled
             && (self.peek_started
@@ -909,6 +921,7 @@ impl Episode {
     }
 
     /// Born-done and born-settled episodes share the inert emission path.
+    #[inline]
     fn inert(&self) -> bool {
         self.born_done || self.born_settled
     }
@@ -1051,6 +1064,7 @@ struct AlignScore {
 }
 
 impl AlignScore {
+    #[inline]
     fn with_edge(self, stationary: bool, tier: u8, distance: u32) -> Self {
         Self {
             stationary: self.stationary.saturating_add(u16::from(stationary)),
@@ -1065,6 +1079,7 @@ impl AlignScore {
     /// transfer count. Distinguishes a log rotation (`[0,2] -> [2,4]`, row 2
     /// survives, row 4 is new) from a global insertion (`[0,2] -> [1,3]`, both
     /// transfer). Ties prefer stronger context and less motion.
+    #[inline]
     fn better_than(self, other: Self) -> bool {
         self.stationary > other.stationary
             || (self.stationary == other.stationary
@@ -1307,6 +1322,7 @@ impl Default for DoneMarkLru {
 }
 
 impl DoneMarkLru {
+    #[inline]
     fn len(&self) -> usize {
         self.index.len()
     }
@@ -1331,6 +1347,7 @@ impl DoneMarkLru {
 
     /// Detach `idx` from the resident order. Returns the number of neighbor
     /// link writes (bounded; head/tail writes are constant).
+    #[inline]
     fn detach(&mut self, idx: u32) -> u8 {
         let node = self.nodes[idx as usize];
         let mut writes = 0u8;
@@ -1351,6 +1368,7 @@ impl DoneMarkLru {
         writes + 2
     }
 
+    #[inline]
     fn attach_newest(&mut self, idx: u32) -> u8 {
         let mut writes = 2u8;
         self.nodes[idx as usize].older = self.newest;
@@ -1365,6 +1383,7 @@ impl DoneMarkLru {
         writes
     }
 
+    #[inline]
     fn touch(&mut self, key: u64) -> bool {
         let Some(&idx) = self.index.get(&key) else {
             return false;
@@ -1376,6 +1395,7 @@ impl DoneMarkLru {
         true
     }
 
+    #[inline]
     fn remove(&mut self, key: &u64) -> bool {
         let Some(idx) = self.index.remove(key) else {
             return false;
@@ -1385,6 +1405,7 @@ impl DoneMarkLru {
         true
     }
 
+    #[inline]
     fn insert(&mut self, key: u64) -> DoneMarkMutation {
         self.insert_with_cap(key, DONE_MARKS_CAP)
     }
@@ -1612,6 +1633,7 @@ impl ScanMemo {
 
     /// How many retired buffers the pool holds: one generation, exactly what
     /// the incoming generation asks `remember` for before the next rotation.
+    #[inline]
     fn pool_target(&self) -> usize {
         #[cfg(test)]
         if self.no_recycle {
@@ -1622,6 +1644,7 @@ impl ScanMemo {
 
     /// Move `gone`'s entry buffers into `spare` (up to `keep`), freeing the
     /// rest, and leave `gone` empty but allocated.
+    #[inline]
     fn recycle(
         spare: &mut Vec<(String, Vec<Match>)>,
         gone: &mut KeyedHashMap<String, Vec<Match>>,
@@ -1684,6 +1707,7 @@ impl ScanMemo {
     /// The memoized match list for a row [`touch`](Self::touch) reported
     /// resident. A miss would drop the row's decorations, so it is a debug
     /// assertion; release falls back to no matches.
+    #[inline]
     fn matches(&self, text: &str) -> &[Match] {
         debug_assert!(self.hot.contains_key(text), "touch() proved residency");
         self.hot.get(text).map_or(&[][..], Vec::as_slice)
@@ -1768,6 +1792,7 @@ fn scan_opts_fp(opts: &ScanOptions<'_>) -> u64 {
 ///   address is stable for a live memo and distinct between live lexicons;
 /// * `spaced_form_count()`, separating a rebuild that reuses the freed address.
 ///   Two lexicons at one address with equal counts would still collide.
+#[inline]
 fn scan_inputs_fp(lexicon: &Lexicon, opts: &ScanOptions<'_>) -> u64 {
     // `fnv_mix_u64` is the whole-scalar FNV-1a step, over the same prime the
     // gate fold above mixes bytes with.
@@ -2104,6 +2129,7 @@ struct ParkedPane {
 /// The §3.2b supernova's mutex-occupancy window: a Nuke holds it for its full
 /// 3600 ms, and no tier goes below the classic 2400 ms (the emitter has no
 /// short Flash arc).
+#[inline]
 fn super_window_of(tier: supernova::SuperTier) -> Duration {
     Duration::from_millis(supernova::total_ms(tier).max(supernova::SUPER_TOTAL_MS))
 }
@@ -2112,6 +2138,7 @@ fn super_window_of(tier: supernova::SuperTier) -> Duration {
 /// shared by `super_prepass`'s live walk and [`ParkedPane`]'s summary. `None`
 /// when the episode holds no window (finished, never granted, or a burst kind
 /// without the mutex). The mutex is two-way: a live classic nova counts.
+#[inline]
 fn burst_mutex_end(ep: &Episode) -> Option<Instant> {
     if ep.nova_done {
         return None;
@@ -2425,6 +2452,7 @@ impl WordDecorations {
     /// host bound one, else the session an unsplit host declared
     /// ([`Self::set_scan_session`]). `None` only when unknown; session tests
     /// then match everything.
+    #[inline]
     fn scan_scope(&self) -> Option<u64> {
         self.bound.or(self.scan_session)
     }
@@ -2585,8 +2613,10 @@ impl WordDecorations {
         self.active_until = None;
         // The memo is valid only for the lexicon and gates that produced it.
         self.scan_memo.clear();
+        self.scan_row_occupied.clear();
         self.ink_base_fg.clear();
         self.ink_cols.clear();
+        self.pet_ink_spans.clear();
         self.persist.clear();
         self.seed_ordinals.clear();
         self.pending.clear();
@@ -2610,10 +2640,12 @@ impl WordDecorations {
         self.ignitions.clear();
         self.novas.clear();
         self.coupling.clear();
+        self.dist_scratch.clear();
         // Supernova scratch and burst mutex clear with the nova state;
         // `birth_seq` survives so the roll stays decorrelated across resets.
         self.supers.clear();
         self.super_until = None;
+        self.burst_hint = self.parked.values().filter_map(|p| p.burst_end_max).max();
         // A fresh start cools the f-bomb combo (§3.2b); surviving heat would
         // force escalated rolls across rebirths.
         self.combo_births.clear();
@@ -2742,6 +2774,7 @@ impl WordDecorations {
 
     /// The host's last [`Self::set_presentable`] verdict.
     #[must_use]
+    #[inline]
     pub fn presentable(&self) -> bool {
         !self.away
     }
@@ -2749,6 +2782,7 @@ impl WordDecorations {
     /// The versioned atlas paired with this frame's `free_sprites` output
     /// (exact-size tiles, art at tile row 0). Hosts copy it into
     /// `RenderInput::free_atlas` only when free sprites were emitted.
+    #[inline]
     pub fn free_atlas(&mut self) -> Option<std::sync::Arc<aterm_render::SceneAtlas>> {
         self.cat_baker.atlas()
     }
@@ -2958,6 +2992,7 @@ impl WordDecorations {
     /// The flying head's lead in px for a `cell_w` cell — the one number the
     /// footprint and the companion router's seat law both read.
     #[must_use]
+    #[inline]
     pub fn kitty_cursor_lead_px(cell_w: u16) -> i32 {
         i32::from(cell_w).saturating_mul(Self::KITTY_LEAD_NUM) / Self::KITTY_LEAD_DEN
     }
@@ -3346,6 +3381,7 @@ impl WordDecorations {
     /// Claim this host frame's one companion body, or refuse
     /// ([`Self::companion_body_drawn`]). Taken before baking: over-claiming on
     /// a frame whose bake misses costs nothing.
+    #[inline]
     fn claim_companion_body(&mut self) -> bool {
         if !self.host_brackets_frames {
             return true;
@@ -3823,11 +3859,13 @@ impl WordDecorations {
     ];
 
     /// Quantize a rotation to its bake bucket.
+    #[inline]
     fn pet_mote_rot_bucket(rot: f32) -> u32 {
         let turn = rot.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU;
         ((turn * Self::PET_MOTE_ROT_BUCKETS as f32) as u32) % Self::PET_MOTE_ROT_BUCKETS
     }
 
+    #[inline]
     fn pet_mote_kind_tag(kind: crate::kitty_pet::PetMoteKind) -> u64 {
         match kind {
             crate::kitty_pet::PetMoteKind::Dust => 1,
@@ -3841,6 +3879,7 @@ impl WordDecorations {
 
     /// Stable atlas identity for one mote tile: kind, rotation bucket and exact
     /// size. Tint is absent: tiles bake white and are tinted per sprite.
+    #[inline]
     fn pet_mote_host_id(kind: crate::kitty_pet::PetMoteKind, bucket: u32, side: u16) -> u64 {
         let mut x = Self::PET_MOTE_HOST_SALT
             ^ (Self::pet_mote_kind_tag(kind) << 40)
@@ -3854,6 +3893,7 @@ impl WordDecorations {
     /// Per-kind tint, never a text colour. Dust is a neutral puff warmed by the
     /// accent; z's float pale. The note is gold and the heart pink on every
     /// coat and ground, with only a breath of the episode accent.
+    #[inline]
     fn pet_mote_tint(kind: crate::kitty_pet::PetMoteKind, colors: CatColorKey) -> u32 {
         let accent = Self::PET_MOTE_ACCENTS[usize::from(colors.accent.min(12))];
         match kind {
@@ -3873,6 +3913,7 @@ impl WordDecorations {
     /// on white or cream, never as a pale smudge. Dust and the z's are
     /// neutral and keep their tint (the law bends a hue, and a grey has
     /// none); a dark ground changes nothing.
+    #[inline]
     fn pet_mote_on_page(kind: crate::kitty_pet::PetMoteKind, tint: u32, page: Option<u32>) -> u32 {
         match (kind, page) {
             (
@@ -4268,6 +4309,7 @@ impl WordDecorations {
     /// `row`, `start_col..=end_col`: the place half of the witness, alongside
     /// [`Self::typed_edit_witness`]'s time/pane half. See
     /// [`TYPED_EDIT_REACH_COLS`].
+    #[inline]
     fn typed_edit_reached(&self, row: u16, start_col: u16, end_col: u16) -> bool {
         let Some(e) = self.typed_edit else {
             return false;
@@ -4291,6 +4333,7 @@ impl WordDecorations {
     /// records keys with no pane has one grid). Public so hosts can check the
     /// input seam is wired; without it every retype reads as a redraw.
     #[must_use]
+    #[inline]
     pub fn typed_edit_witness(&self, now: Instant) -> bool {
         self.typed_edit.is_some_and(|e| {
             !e.spent
@@ -4305,6 +4348,7 @@ impl WordDecorations {
 
     /// Consume the edit witness: this keystroke has now re-armed a cat, and the
     /// repaints that follow it must not ride the same key ([`TypedEdit::spent`]).
+    #[inline]
     fn spend_typed_edit(&mut self) {
         if let Some(e) = self.typed_edit.as_mut() {
             e.spent = true;
@@ -4312,6 +4356,7 @@ impl WordDecorations {
     }
 
     /// True if the grid changed since the last scan and a rescan is due.
+    #[inline]
     pub fn needs_rescan(&self, epoch: u64) -> bool {
         !self.have_scanned || epoch != self.last_epoch
     }
@@ -5740,17 +5785,30 @@ impl WordDecorations {
             };
             // §6 ink modifiers: the word's own nova (palette anchors, Dip,
             // sweep freeze, ember tint) + the §6.5 blast-coupling pulse.
-            let fx = ink_fx(
-                oi,
-                occ,
-                cfg,
-                now,
-                geom,
-                &self.novas,
-                &self.supers,
-                &self.coupling,
-                ep,
-            );
+            // `SelfGlow` words and non-ink occurrences ignore `fx` in `emit_ink`.
+            let fx = if occ.ink_cells > 0
+                && cfg.ink_enabled
+                && matches!(
+                    occ.spec.ink,
+                    Some(InkSpec {
+                        colorway: Colorway::Rainbow { .. } | Colorway::TwoTone { .. },
+                        ..
+                    })
+                ) {
+                ink_fx(
+                    oi,
+                    occ,
+                    cfg,
+                    now,
+                    geom,
+                    &self.novas,
+                    &self.supers,
+                    &self.coupling,
+                    ep,
+                )
+            } else {
+                INK_FX_NONE
+            };
             // Ink is emitted independently of the deco cap: its own budget was
             // enforced at rescan (≤ MAX_INK_CELLS captured lead cells).
             emit_ink(
@@ -6168,16 +6226,25 @@ impl WordDecorations {
         // encoding but count into separate pools (MAX_CATS vs MAX_ANIMALS).
         let (mut cat_slots, mut animal_slots) =
             self.occ.iter().fold((0usize, 0usize), |(c, a), occ| {
+                let Some(g) = occ.spec.graphic else {
+                    return (c, a);
+                };
+                if occ.inert {
+                    return (c, a);
+                }
                 let live = self.persist.get(&occ.ident).is_some_and(|e| {
                     e.shown_as == Some(KittyShownAs::Cat) && !e.peek_done && !e.inert()
                 });
-                match occ.spec.graphic.map(|g| g.collection) {
+                match g.collection {
                     _ if !live => (c, a),
-                    Some(Collection::Animals) => (c, a + 1),
+                    Collection::Animals => (c, a + 1),
                     _ => (c + 1, a),
                 }
             });
         for occ in &self.occ {
+            if occ.inert {
+                continue;
+            }
             let Some(ep) = self.persist.get_mut(&occ.ident) else {
                 continue;
             };
@@ -6444,12 +6511,12 @@ impl WordDecorations {
     ) -> Option<Instant> {
         self.supers.clear();
         self.super_until = None;
+        self.prune_ignitions(now);
         if cfg.reduced_motion {
             // reduced_motion suppresses the supernova outright (the word keeps
             // its static rainbow); perf_reduced degrades via freeze/thaw.
             return None;
         }
-        self.prune_ignitions(now);
         let mut until: Option<Instant> = None;
         // Any granted, unfinished window holds the mutex, even before its
         // delayed start and while its word is off screen. Two-way: a live
@@ -6592,10 +6659,8 @@ impl WordDecorations {
     ) -> Option<Instant> {
         self.novas.clear();
         self.coupling.clear();
-        // Spent slots constrain for one rolling window; scheduled (future)
-        // slots always survive. The supernova prepass already swept this
-        // shared record, so this is a no-op here.
-        self.prune_ignitions(now);
+        // `super_prepass` always runs immediately before `nova_prepass` and
+        // already swept `self.ignitions` for this tick.
         if cfg.reduced_motion {
             return None;
         }
@@ -6729,6 +6794,7 @@ impl WordDecorations {
 
 /// Pixel center of a burst word's span. DEC rows anchor via the row's real
 /// advance (2× on DECDWL). Shared by both burst prepasses.
+#[inline]
 fn burst_center(occ: &Occurrence, geom: EffectGeom) -> (i32, i32) {
     let advance = i32::from(geom.cell_w) * if occ.dec_line { 2 } else { 1 };
     let ch = i32::from(geom.cell_h);
@@ -7198,6 +7264,7 @@ fn split_super_selection(quads: &mut Vec<GlowQuad>, n0: usize, geom: EffectGeom,
 /// Squared px distance from `center` to the nearest point of the occurrence's
 /// visual span (along its row-band center line) — the §6.5 coupling metric
 /// and the ring-crossing distance.
+#[inline]
 fn span_dist2(occ: &Occurrence, center: (i32, i32), geom: EffectGeom) -> u64 {
     let advance = i32::from(geom.cell_w) * if occ.dec_line { 2 } else { 1 };
     let ch = i32::from(geom.cell_h);
@@ -7401,18 +7468,21 @@ struct CatGeom {
 
 /// §5.2 base art height before age scaling: `Hart = round(1.7·ch)`. The fitted
 /// result stays inside the two-row band above the word plus its chin slice.
+#[inline]
 pub fn cat_hart(cell_h: u16) -> u16 {
     ((1.7 * f32::from(cell_h)).round() as u16).max(1)
 }
 
 /// §5.2 chin slice: `floor(0.15·Hart)` — the part spilling into the word row
 /// (occluded by the word's ascenders: the cat is visibly behind the word).
+#[inline]
 pub fn cat_chin(hart: u16) -> u16 {
     (0.15 * f32::from(hart)).floor() as u16
 }
 
 /// Fit one authored cat into the atlas slot at a requested height, preserving
 /// its viewbox aspect; when the slot binds, both dimensions shrink together.
+#[inline]
 fn authored_cat_size(variant: CatGlyphId, desired_h: f32, cell_h: u16) -> (u16, u16) {
     let max_w = cell_h.saturating_mul(4).saturating_sub(PATCH_STRIP);
     fit_glyph(&GLYPHS[variant as usize], desired_h, max_w, cell_h)
@@ -7421,6 +7491,7 @@ fn authored_cat_size(variant: CatGlyphId, desired_h: f32, cell_h: u16) -> (u16, 
 /// Fit an authored glyph (cat or species head) at a requested height into a
 /// `max_w × 2·cell_h` box, preserving its viewbox aspect: when the width cap
 /// binds, both dimensions shrink together.
+#[inline]
 fn fit_glyph(glyph: &GlyphDef, desired_h: f32, max_w: u16, cell_h: u16) -> (u16, u16) {
     let aspect = (f32::from(glyph.aspect_x1000) / 1000.0).max(0.001);
     let max_w = f32::from(max_w.max(1));
@@ -7433,11 +7504,13 @@ fn fit_glyph(glyph: &GlyphDef, desired_h: f32, max_w: u16, cell_h: u16) -> (u16,
 
 /// §5.6 rest reveal: full Hart for every identity — bobs and entrances
 /// terminate at the same fixed point for everyone.
+#[inline]
 pub fn cat_rest_reveal(hart: u16) -> u16 {
     hart
 }
 
 /// cat-art v4 eligibility gate: the cat `feline_style` plus [`peek_eligible`].
+#[inline]
 fn cat_eligible(occ: &Occurrence, cfg: &DecoConfig, geom: EffectGeom) -> bool {
     cfg.feline_style == FelineStyle::Cat && peek_eligible(occ, geom)
 }
@@ -7448,6 +7521,7 @@ fn cat_eligible(occ: &Occurrence, cfg: &DecoConfig, geom: EffectGeom) -> bool {
 /// eligible (the plan picks [`PeekDir::Down`]); busy surfaces too, since heads
 /// draw [`FreeZ::UnderText`] and only a text wall on both sides is rejected.
 /// Ineligible words draw no graphic, just ink.
+#[inline]
 fn peek_eligible(occ: &Occurrence, geom: EffectGeom) -> bool {
     if geom.cell_h < CAT_MIN_CELL_H
         || geom.cell_w < CAT_MIN_CELL_W
@@ -7462,10 +7536,12 @@ fn peek_eligible(occ: &Occurrence, geom: EffectGeom) -> bool {
 
 /// §5.2 geometry: uniformly age-scaled authored aspect, word-midpoint anchor,
 /// and viewport clamp. v4 cats occupy at most the existing two-row atlas band.
+#[inline]
 fn cat_geometry(occ: &Occurrence, geom: EffectGeom, variant: CatGlyphId) -> CatGeom {
     cat_geometry_for(occ.start_col, occ.end_col, occ.genome.gkey, geom, variant)
 }
 
+#[inline]
 fn cat_geometry_for(
     start_col: u16,
     end_col: u16,
@@ -7480,6 +7556,7 @@ fn cat_geometry_for(
 
 /// Land a fitted `(w, hart)` glyph's authored visual center on the word
 /// midpoint, then clamp inward at viewport edges.
+#[inline]
 fn anchored_geom(
     start_col: u16,
     end_col: u16,
@@ -7504,6 +7581,7 @@ fn anchored_geom(
 /// §5.2 geometry for a species head: the cat law without the age scale (every
 /// animal is an adult) or the patch strip in the width cap (animal tiles are
 /// exact-size). Authored aspect, word-midpoint anchor, viewport clamp.
+#[inline]
 fn animal_geometry(occ: &Occurrence, geom: EffectGeom, species: AnimalGlyphId) -> CatGeom {
     let glyph = &ANIMAL_GLYPHS[species as usize];
     // `host_tile` admits `w ≤ slot_w (= 4·cell_h)` and `h ≤ 2·cell_h`.
@@ -7516,6 +7594,7 @@ fn animal_geometry(occ: &Occurrence, geom: EffectGeom, species: AnimalGlyphId) -
 /// (c+1)(p−1)³ + c(p−1)²`, `c` solved from the closed form
 /// `amp = 4c³ / (27(c+1)²)` by bisection so `max f = 1 + amp` (the genome
 /// amplitude, kitten-scaled ×1.3). `f(0) = 0`, `f(1) = 1`.
+#[inline]
 fn ease_out_back(p: f32, amp: f32) -> f32 {
     let c = overshoot_c(amp);
     let u = p - 1.0;
@@ -7566,6 +7645,7 @@ fn overshoot_c(amp: f32) -> f32 {
 }
 
 /// v3 §1.2 descend easing (easeInOutCubic), `f(0) = 0`, `f(1) = 1`.
+#[inline]
 fn ease_in_out_cubic(p: f32) -> f32 {
     let p = p.clamp(0.0, 1.0);
     if p < 0.5 {
@@ -7583,6 +7663,7 @@ fn ease_in_out_cubic(p: f32) -> f32 {
 
 /// Dwell base over the spec range (`2200..=3598 ms` default) in 4 genome
 /// steps (step `(hi − lo)/3` — 466 ms at the default range).
+#[inline]
 fn dwell_base_ms(gkey: u64, range: (u32, u32)) -> u64 {
     let lo = u64::from(range.0.min(range.1));
     let hi = u64::from(range.0.max(range.1));
@@ -7591,6 +7672,7 @@ fn dwell_base_ms(gkey: u64, range: (u32, u32)) -> u64 {
 
 /// The episode's dwell: base − `mix(ident) % 300` twin-desync jitter,
 /// + 500 ms for magic/accessory episodes, capped at 3750 ms.
+#[inline]
 fn peek_dwell_ms(ident: u64, gkey: u64, magical: bool, range: (u32, u32)) -> u64 {
     let mut d = dwell_base_ms(gkey, range).saturating_sub(mix(ident) % CAT_DWELL_JITTER_MS);
     if magical {
@@ -7600,6 +7682,7 @@ fn peek_dwell_ms(ident: u64, gkey: u64, magical: bool, range: (u32, u32)) -> u64
 }
 
 /// The optional 60 ms pre-descend anticipation lift (~50% of genomes).
+#[inline]
 fn anticipation_ms(gkey: u64) -> u64 {
     if mix(gkey ^ ANTIC_SALT) & 1 == 0 {
         CAT_ANTICIPATION_MS
@@ -7611,6 +7694,7 @@ fn anticipation_ms(gkey: u64) -> u64 {
 /// v4 §3 accessory presence (bow/crown/bell): the dwell bonus honors it exactly
 /// like magic. The decode is structurally `None` on special-build cats, so the
 /// bonus never double-counts a special.
+#[inline]
 fn has_accessory(magic: u64) -> bool {
     accessory_variant_v4(magic).is_some()
 }
@@ -7618,6 +7702,7 @@ fn has_accessory(magic: u64) -> bool {
 /// Total peek length: Rise + Dwell + optional anticipation + Descend. Worst
 /// case `450 + 3750 + 60 + 320 = 4580 ms` ([`CAT_DWELL_CAP_MS`] binds custom
 /// spec ranges and rare cats too).
+#[inline]
 fn peek_total_ms(ident: u64, gkey: u64, magical: bool, range: (u32, u32)) -> u64 {
     CAT_RISE_MS
         + peek_dwell_ms(ident, gkey, magical, range)
@@ -7629,6 +7714,7 @@ fn peek_total_ms(ident: u64, gkey: u64, magical: bool, range: (u32, u32)) -> u64
 /// span predicate shared by the ambiguous-prefix defer, the `at_live_cursor`
 /// retype witness, and the one-cat-per-caret suppression — features that must
 /// stay in agreement about what "at the caret" means.
+#[inline]
 fn caret_on_span(cell: (u16, u16), row: u16, start_col: u16, end_col: u16) -> bool {
     let (caret_row, caret_col) = cell;
     caret_row == row && caret_col >= start_col && caret_col <= end_col.saturating_add(1)
@@ -7637,12 +7723,14 @@ fn caret_on_span(cell: (u16, u16), row: u16, start_col: u16, end_col: u16) -> bo
 /// Whether the trick flash may paint under `cfg` — the SelfGlow law. Ink off
 /// means zero [`InkCell`]s for everyone; and reduced motion never arms the
 /// scheduler, so it could never take a transient tint off again: no flash.
+#[inline]
 fn trick_flash_paintable(cfg: &DecoConfig) -> bool {
     cfg.ink_enabled && !cfg.reduced_motion
 }
 
 /// Arm (or extend) the shared animation deadline to at least `until`, keeping
 /// the repaint scheduler awake through the latest live window.
+#[inline]
 fn arm_until(active_until: &mut Option<Instant>, until: Instant) {
     *active_until = Some(active_until.map_or(until, |d| d.max(until)));
 }
@@ -7651,12 +7739,14 @@ fn arm_until(active_until: &mut Option<Instant>, until: Instant) {
 /// ident current at departure. Keyed `ident ^ ctx_fp`; `ctx_fp` is stored
 /// because a horizontal redraw can rekey the position-bearing seed while the
 /// frozen genome stays unchanged.
+#[inline]
 fn mark_done(marks: &mut DoneMarkLru, ident: u64, ep: &Episode) {
     let key = ident ^ ep.ctx_fp;
     marks.insert(key);
 }
 
 /// Done-mark lookup with touch-on-hit (LRU refresh).
+#[inline]
 fn touch_done(marks: &mut DoneMarkLru, key: u64) -> bool {
     marks.touch(key)
 }
@@ -7685,6 +7775,7 @@ impl CatIdlePose {
 
     /// `td_ms` is the dwell-relative clock (zero at the end of the rise), so the
     /// entrance and the exit keep their authored kinematics exactly.
+    #[inline]
     fn breathing(td_ms: u64, gkey: u64, cell_h: u16) -> Self {
         // A whole device pixel either way on a ~1.7-cell-tall head: enough to
         // read as breathing at a glance, small enough to sit under reading.
@@ -7713,6 +7804,7 @@ impl CatIdlePose {
     clippy::too_many_arguments,
     reason = "one cat sprite: its dest box, its source window, and the living-cartoon pose"
 )]
+#[inline]
 fn push_cat_free(
     free: &mut Vec<FreeSprite>,
     x: i32,
@@ -7778,6 +7870,7 @@ struct CatTick<'a> {
 /// Judged by intersected area as a fraction of the cat's area: a cat peeking
 /// up from a few rows below grazes the caret's row by ~5 %, while a genuine
 /// stack covers most of the sprite. A third separates the two.
+#[inline]
 fn cat_is_stacked_on(a: (i32, i32, i32, i32), x: i32, w: i32, top: i32, bottom: i32) -> bool {
     let (x0, x1, y0, y1) = a;
     let iw = (x + w).min(x1) - x.max(x0);
@@ -8185,6 +8278,7 @@ fn emit_peek<'a>(
 
 /// The class base ink pair `(c0, c1)` (§4.2/§4.6), `0x00RRGGBB`. `None` = the
 /// class carries no ink.
+#[inline]
 fn ink_pair(class: Class) -> Option<(u32, u32)> {
     match class {
         Class::Emphasis => Some((0x007C_C8FF, 0x00C8_9AFF)),
@@ -8201,6 +8295,7 @@ fn ink_pair(class: Class) -> Option<(u32, u32)> {
 /// rotated by its Gray-decoded 4-bit code (`-18°..=+18°` in 2.4° steps — a
 /// bit-0 context flip moves one step). Profanity reads the nova layout window,
 /// every other ink-bearing class the cat layout window (`genome::ink_pair_nudges`).
+#[inline]
 fn nudged_ink_pair(class: Class, gkey: u64) -> Option<(u32, u32)> {
     let (c0, c1) = ink_pair(class)?;
     let (n0, n1) = genome::ink_pair_nudges(class, gkey);
@@ -8211,6 +8306,7 @@ fn nudged_ink_pair(class: Class, gkey: u64) -> Option<(u32, u32)> {
 /// settling to exactly 0, so the word returns to its own fg. Pure function of
 /// elapsed ms; the window and amplitude come from the spec (defaults
 /// [`FELINE_GLOW_MS`] / [`FELINE_GLOW_AMP`]).
+#[inline]
 fn feline_glow_env(t_ms: u64, window_ms: u64, amp: f32) -> f32 {
     if t_ms >= window_ms {
         return 0.0;
@@ -8223,6 +8319,7 @@ fn feline_glow_env(t_ms: u64, window_ms: u64, amp: f32) -> f32 {
 
 /// §4.2 specular lobe at gradient position `u` for sweep center `center`:
 /// `smoothstep(1 − min(1, |u − center|/0.28))²` — 28% wide, 0 outside.
+#[inline]
 fn spec_lobe(u: f32, center: f32) -> f32 {
     let d = (u - center).abs() / 0.28;
     if d >= 1.0 {
@@ -8623,6 +8720,7 @@ fn emit_rainbow_sparkles(
 
 /// Fold an ink cell's visible fields into the frame fingerprint (FNV-1a chain,
 /// the `fold_deco` sibling).
+#[inline]
 pub(crate) fn fold_ink(mut h: u64, c: &InkCell) -> u64 {
     for x in [
         u64::from(c.row),
@@ -8637,12 +8735,14 @@ pub(crate) fn fold_ink(mut h: u64, c: &InkCell) -> u64 {
 }
 
 /// Scale a `0x00RRGGBB` colour's channels by `f` (the §6.1 dip envelope).
+#[inline]
 fn dim_rgb(c: u32, f: f32) -> u32 {
     let f = f.clamp(0.0, 1.0);
     let m = |sh: u32| ((((c >> sh) & 0xff) as f32) * f).round() as u32;
     (m(16) << 16) | (m(8) << 8) | m(0)
 }
 
+#[inline]
 pub(crate) fn rgb3_to_u32(c: [u8; 3]) -> u32 {
     (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
 }
@@ -8967,6 +9067,7 @@ fn cat_peek_plan(
     }
 }
 
+#[inline]
 pub(crate) fn u32_to_rgb3(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
@@ -8983,6 +9084,7 @@ fn contrast_ratio(a: u32, b: u32) -> f32 {
 /// case-only redraws keep identity (row excluded → scroll-stable). [`FormId`]
 /// equality independently guards every adoption, so this hash is never treated
 /// as proof that two different lexical surfaces are equal.
+#[inline]
 fn seed_of(start_col: u16, class: Class, form_hash: u64) -> u64 {
     let mut h = FNV64_OFFSET;
     for x in [u64::from(start_col), class_tag(class), form_hash] {
@@ -8991,6 +9093,7 @@ fn seed_of(start_col: u16, class: Class, form_hash: u64) -> u64 {
     h
 }
 
+#[inline]
 fn class_tag(c: Class) -> u64 {
     match c {
         Class::Profanity => 1,
@@ -9003,6 +9106,7 @@ fn class_tag(c: Class) -> u64 {
     }
 }
 
+#[inline]
 fn glyph_id(g: DecoGlyph) -> u64 {
     match g {
         DecoGlyph::Star4 => 0,
@@ -9017,6 +9121,7 @@ fn glyph_id(g: DecoGlyph) -> u64 {
 }
 
 /// Fold a decoration's visible fields into the frame fingerprint.
+#[inline]
 fn fold_deco(mut h: u64, d: &WordDecoration) -> u64 {
     for x in [
         u64::from(d.row),
@@ -9037,6 +9142,7 @@ fn fold_deco(mut h: u64, d: &WordDecoration) -> u64 {
 /// `sampler` too (a same-rect Under→Over flip must change `deco_fp` or the
 /// early-out would swallow it), and the signed `x`/`y` as i32 bit patterns.
 /// The paired `free_atlas` version is folded once per tick.
+#[inline]
 fn fold_free(mut h: u64, s: &FreeSprite) -> u64 {
     for x in [
         u64::from(s.x as u32), // i32 bit pattern (signed off-grid origins)
@@ -9060,6 +9166,7 @@ fn fold_free(mut h: u64, s: &FreeSprite) -> u64 {
 
 /// Fold a supernova light quad's visible fields into the frame fingerprint
 /// (the `fold_free`/`fold_deco` sibling for the §6 `nova_add` stream).
+#[inline]
 fn fold_glow(mut h: u64, q: &GlowQuad) -> u64 {
     for x in [
         u64::from(q.row),
@@ -9075,6 +9182,7 @@ fn fold_glow(mut h: u64, q: &GlowQuad) -> u64 {
 }
 
 /// Pick a sparkle colour: a palette entry if configured, else a hue rotation.
+#[inline]
 fn pick_color(cfg: &DecoConfig, s: u64) -> u32 {
     if cfg.palette.is_empty() {
         hsv2rgb((s % 360) as f32, 0.85, 1.0)
@@ -9090,12 +9198,14 @@ fn pick_color(cfg: &DecoConfig, s: u64) -> u32 {
 /// counter, so it runs at [`crate::effect_util::TWINKLE_FLASH_HZ`] on every
 /// panel, inside the WCAG 2.3.1 flash bound
 /// (`effect_util`'s `twinkle_law_stays_under_the_photosensitivity_bound`).
+#[inline]
 fn twinkle(s: u64, age_s: f32) -> f32 {
     let phase = (s & 0xff) as f32 / 255.0 * std::f32::consts::TAU;
     crate::effect_util::twinkle_env(age_s, phase)
 }
 
 /// A signed sub-cell jitter in `[-j, j]` derived from `s`.
+#[inline]
 fn jitter(j: i8, s: u64) -> i8 {
     if j <= 0 {
         return 0;
@@ -9104,6 +9214,7 @@ fn jitter(j: i8, s: u64) -> i8 {
     (((s % span as u64) as i64) - i64::from(j)) as i8
 }
 
+#[inline]
 fn scale_u8(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * 255.0).round() as u8
 }
@@ -19992,6 +20103,23 @@ mod trick_flash_hook_tests {
         assert_eq!(wd.trick_flash_phase(thawed), TrickFlashPhase::Live);
         tick(&mut wd, thawed + Duration::from_millis(200), &mut ink);
         assert_eq!(ink.len(), 3);
+    }
+
+    #[test]
+    fn reset_clears_pet_ink_spans_and_tightens_burst_hint() {
+        let t0 = Instant::now();
+        let (lex, c) = (Lexicon::with_languages(&["en"]), DecoConfig::default());
+        let mut term = Terminal::new(4, 40);
+        term.process(b"kitty");
+        let mut wd = WordDecorations::default();
+        wd.rescan(&term, 4, 40, &lex, &c, 1, t0);
+        wd.burst_hint = Some(t0 + Duration::from_secs(5));
+        assert!(!wd.pet_ink().0.is_empty());
+        assert!(wd.burst_hint.is_some());
+
+        wd.reset();
+        assert_eq!(wd.pet_ink(), (&[][..], None));
+        assert_eq!(wd.burst_hint, None);
     }
 }
 

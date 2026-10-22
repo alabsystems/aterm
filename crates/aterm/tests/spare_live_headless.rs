@@ -1086,10 +1086,10 @@ fn an_rc_edited_under_a_ready_spare_sends_the_next_tab_cold() {
     );
 }
 
-/// L7: an identity, and another folder for a warm spare (its rc ran in its
-/// own): each spawn goes cold with its reason, and the spare stays.
+/// L7: another folder for a warm spare (its rc ran in its own) goes cold
+/// with its reason, and the spare stays.
 ///
-/// Both asks land behind the boot tab (`raise=f`), so the focused pane, whose
+/// The ask lands behind the boot tab (`raise=f`), so the focused pane, whose
 /// folder the spare follows, never moves: a tab raised in `/usr` would move
 /// it, and the follow rule retires a misplaced warm spare 10 s later
 /// (`REPLACE_WARM_AFTER`; a parked one 1 s later), a race with this test's own
@@ -1111,17 +1111,6 @@ fn asks_a_spare_cannot_serve_go_cold_and_the_spare_stays() {
     let sid = spawn(&inst, &["cwd=/usr", "raise=f"]);
     assert_eq!(born(&inst, &sid), "cold");
     assert!(metric(&inst, "spare_miss").contains("folder:1"));
-    assert_eq!(
-        metric(&inst, "spare"),
-        "ready",
-        "the spare stays: {}\n{}",
-        ctl_ok(&inst, &["metrics"]),
-        gate_log(&inst)
-    );
-    // An identity is never a spare's (it may not even exist: the ask is
-    // judged before the spawn).
-    let _ = headless_boot::ctl(&inst, &["spawn", "identity=nobody-here", "raise=f"]);
-    assert!(metric(&inst, "spare_miss").contains("ask:1"));
     assert_eq!(
         metric(&inst, "spare"),
         "ready",

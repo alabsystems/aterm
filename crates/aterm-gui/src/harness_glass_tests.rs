@@ -372,6 +372,8 @@ fn serious_mode_and_acts_off_light_nothing_and_keep_the_trail() {
 #[test]
 fn the_trail_title_lists_clock_times_weekdays_and_never_a_day_old_act() {
     let t0 = Instant::now();
+    // Cruise's sentence, from the one table (`autopilot::MODE_WORDS`).
+    let cruise = crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip;
     let today = T0_UNIX.div_euclid(86_400);
     let mut g = SessionGlass::default();
     let whole = |g: &SessionGlass, now: i64| {
@@ -380,15 +382,16 @@ fn the_trail_title_lists_clock_times_weekdays_and_never_a_day_old_act() {
             &g.chip(),
             &g.trail_text(now, today),
             Some(today),
+            crate::claude_lights::TitleWords::default(),
         )
     };
     assert_eq!(g.trail_text(T0_UNIX, today), "");
     assert_eq!(
         whole(&g, T0_UNIX),
         (
-            "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} \
-             right-click: more"
-                .to_owned(),
+            format!(
+                "autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more"
+            ),
             "autopilot: cruise".to_owned()
         ),
         "no acts: v1's title, and the menu's line"
@@ -404,7 +407,7 @@ fn the_trail_title_lists_clock_times_weekdays_and_never_a_day_old_act() {
     assert_eq!(
         whole(&g, T0_UNIX).0,
         format!(
-            "autopilot: cruise \u{2014} keeps the work moving \u{b7} last: ? answered {} 23:58 \
+            "autopilot: cruise \u{2014} {cruise} \u{b7} last: ? answered {} 23:58 \
              \u{b7} click: land \u{b7} right-click: more",
             Weekday::of_days(today - 1).short()
         ),
@@ -421,7 +424,7 @@ fn the_trail_title_lists_clock_times_weekdays_and_never_a_day_old_act() {
     assert_eq!(
         title,
         format!(
-            "autopilot: cruise \u{2014} keeps the work moving \u{b7} last: \u{2713} approved \
+            "autopilot: cruise \u{2014} {cruise} \u{b7} last: \u{2713} approved \
              14:02, \u{21bb} kept going 13:56, ? answered {day} 23:58 \u{b7} click: land \u{b7} \
              right-click: more"
         )
@@ -433,8 +436,13 @@ fn the_trail_title_lists_clock_times_weekdays_and_never_a_day_old_act() {
         AutopilotView::Land,
         AutopilotView::Off,
     ] {
-        let (_, short) =
-            autopilot_title(view, &g.chip(), &g.trail_text(T0_UNIX, today), Some(today));
+        let (_, short) = autopilot_title(
+            view,
+            &g.chip(),
+            &g.trail_text(T0_UNIX, today),
+            Some(today),
+            crate::claude_lights::TitleWords::default(),
+        );
         assert_eq!(
             short,
             crate::claude_lights::ChipFace::of(view, &g.chip()).phrase(&g.chip(), Some(today))
@@ -757,31 +765,45 @@ fn a_pause_moves_the_read_title_and_nothing_at_rest() {
 #[test]
 fn the_title_carries_the_pause_in_its_whole_and_first_leaner_forms() {
     use crate::claude_lights::lean_titles;
+    // Each mode's sentence, from the one table (`autopilot::MODE_WORDS`).
+    let (cruise, land) = (
+        crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip,
+        crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Land).chip,
+    );
     let pause = paused(18, 41, FRI, 3);
     let glass = ChipGlass {
         pause: Some(pause),
         ..ChipGlass::default()
     };
     let trail = "\u{2713} approved 18:35";
-    let (whole, short) = autopilot_title(AutopilotView::Cruise, &glass, trail, Some(FRI));
+    let (whole, short) = autopilot_title(
+        AutopilotView::Cruise,
+        &glass,
+        trail,
+        Some(FRI),
+        crate::claude_lights::TitleWords::default(),
+    );
     assert_eq!(
         whole,
-        "autopilot: cruise \u{2014} keeps the work moving \u{b7} pausing until 18:41 after 3 \
-         short turns \u{b7} last: \u{2713} approved 18:35 \u{b7} click: land \u{b7} right-click: \
-         more"
+        format!(
+            "autopilot: cruise \u{2014} {cruise} \u{b7} pausing until 18:41 after 3 short turns \
+             \u{b7} last: \u{2713} approved 18:35 \u{b7} click: land \u{b7} right-click: more"
+        )
     );
     assert_eq!(short, "autopilot: cruise");
     assert_eq!(whole.capacity(), whole.len(), "sized exactly: {whole}");
     let [lean, v1, clicks, click] = lean_titles(&whole);
     assert_eq!(
         format!("{}{}", lean.0, lean.1),
-        "autopilot: cruise \u{2014} keeps the work moving \u{b7} pausing until 18:41 after 3 \
-         short turns \u{b7} click: land \u{b7} right-click: more",
+        format!(
+            "autopilot: cruise \u{2014} {cruise} \u{b7} pausing until 18:41 after 3 short turns \
+             \u{b7} click: land \u{b7} right-click: more"
+        ),
         "the first leaner form keeps the pause"
     );
     assert_eq!(
         format!("{}{}", v1.0, v1.1),
-        "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land",
+        format!("autopilot: cruise \u{2014} {cruise} \u{b7} click: land"),
         "v1's words give it up"
     );
     assert_eq!(
@@ -794,19 +816,33 @@ fn the_title_carries_the_pause_in_its_whole_and_first_leaner_forms() {
         "autopilot: cruise \u{b7} click: land"
     );
     // No trail: the first leaner form is the whole itself; v1 still drops it.
-    let (bare, _) = autopilot_title(AutopilotView::Land, &glass, "", Some(FRI));
+    let (bare, _) = autopilot_title(
+        AutopilotView::Land,
+        &glass,
+        "",
+        Some(FRI),
+        crate::claude_lights::TitleWords::default(),
+    );
     assert_eq!(
         bare,
-        "autopilot: land \u{2014} wrapping up \u{b7} pausing until 18:41 after 3 short turns \
-         \u{b7} click: off \u{b7} right-click: more"
+        format!(
+            "autopilot: land \u{2014} {land} \u{b7} pausing until 18:41 after 3 short turns \
+             \u{b7} click: off \u{b7} right-click: more"
+        )
     );
     let [lean, v1, clicks, click] = lean_titles(&bare);
     assert_eq!(lean, ("", ""));
     assert_eq!(
         format!("{}{}", v1.0, v1.1),
-        "autopilot: land \u{2014} wrapping up \u{b7} click: off"
+        format!("autopilot: land \u{2014} {land} \u{b7} click: off")
     );
-    assert_eq!(clicks, ("", ""), "no narrower than v1's words");
+    // Land's sentence is longer than the menu's line, so both clicks
+    // stand where it is given up.
+    assert_eq!(
+        format!("{}{}", clicks.0, clicks.1),
+        "autopilot: land \u{b7} click: off \u{b7} right-click: more",
+        "the clicks give it up with the explanation"
+    );
     assert_eq!(
         format!("{}{}", click.0, click.1),
         "autopilot: land \u{b7} click: off"
@@ -817,17 +853,17 @@ fn the_title_carries_the_pause_in_its_whole_and_first_leaner_forms() {
         &ChipGlass::default(),
         trail,
         Some(FRI),
+        crate::claude_lights::TitleWords::default(),
     );
     assert!(!plain.contains("pausing"), "{plain}");
     let [lean, v1, ..] = lean_titles(&plain);
     assert_eq!(
         format!("{}{}", lean.0, lean.1),
-        "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} right-click: \
-         more"
+        format!("autopilot: cruise \u{2014} {cruise} \u{b7} click: land \u{b7} right-click: more")
     );
     assert_eq!(
         format!("{}{}", v1.0, v1.1),
-        "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land"
+        format!("autopilot: cruise \u{2014} {cruise} \u{b7} click: land")
     );
 }
 

@@ -48,6 +48,7 @@ aterm-ctl = { path = "../aterm-ctl" }     # `aterm ctl`  — control-socket clie
 # Already in the graph through aterm-gui; no new crate reaches the binary.
 aterm-control = { path = "../aterm-control" }
 atpkg = { path = "../atpkg" }             # `aterm pkg`  — toolchain package manager
+agh = { path = "../agh" }               # `aterm agh`  — the GitHub client
 # `aterm doctor` composed here (docs/DESIGN-init-system-2026-10-20.md §3.4): aterm-cli's
 # items, the packages' repair items and `pkg doctor`'s rows through the one engine, its
 # `--json` in the one report schema. Both already in the graph through atpkg.
@@ -132,6 +133,10 @@ aterm-secrets = { workspace = true }
 # the verb there by name.
 [target.'cfg(target_os = "macos")'.dependencies]
 aterm-machines = { workspace = true }
+
+# The transparent session's cancellable first-run countdown owns the tty before
+# its shell starts, and restores its termios before handing it to the session.
+libc = { workspace = true }
 
 [features]
 # DEVELOPMENT SEAMS in an optimized build: every `aterm_types::dev_seam!` read (the

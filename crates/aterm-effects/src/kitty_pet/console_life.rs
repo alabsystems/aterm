@@ -202,6 +202,7 @@ impl VisibilityHold {
     /// Nothing was drawn at all, a different `None` from "I cannot see there":
     /// retire any incomplete dwell or blind run about a body no longer on glass
     /// and advance the ramp, never feeding [`VETO_BLIND`].
+    #[inline]
     fn idle(&mut self, now: Instant) -> f32 {
         self.contrary_since = None;
         self.blind_since = None;
@@ -210,6 +211,7 @@ impl VisibilityHold {
     }
 
     /// Seconds since the last advance, clamped, with the clock moved on.
+    #[inline]
     fn advance(&mut self, now: Instant) -> f32 {
         let dt = self
             .at
@@ -220,6 +222,7 @@ impl VisibilityHold {
     }
 
     /// Move the cover one step toward the held verdict.
+    #[inline]
     fn ramp(&mut self, dt: f32) -> f32 {
         let target = if self.shown { 1.0 } else { 0.0 };
         let step = dt / VETO_FADE;
@@ -233,6 +236,7 @@ impl VisibilityHold {
 
     /// Put the envelope where the glass already is: hidden and settled, with no
     /// run in flight. For the paths that yield at once by design.
+    #[inline]
     fn hide_now(&mut self, now: Instant) {
         self.shown = false;
         self.cover = 0.0;
@@ -244,6 +248,7 @@ impl VisibilityHold {
 
     /// Nothing further will change without new evidence: no ramp in flight,
     /// no dwell counting down, and no blind run that could still time out.
+    #[inline]
     fn settled(&self) -> bool {
         let target = if self.shown { 1.0 } else { 0.0 };
         self.cover == target
@@ -265,6 +270,7 @@ struct ZHold {
 
 impl ZHold {
     /// Advance one drawn frame; `ink` is real ink under the drawn body.
+    #[inline]
     fn update(&mut self, now: Instant, ink: bool) -> bool {
         if ink {
             self.under = true;
@@ -279,6 +285,7 @@ impl ZHold {
     }
 
     /// When the clear run under way lands, so a quiet pet still surfaces.
+    #[inline]
     fn deadline(&self) -> Option<Instant> {
         self.clear_since
             .map(|since| since + Duration::from_secs_f32(Z_DWELL))
@@ -288,6 +295,7 @@ impl ZHold {
 /// Fold the hold's cover into an emitted opacity byte, floored at 1 while any
 /// cover remains: hosts gate "is the pet on glass" on `alpha > 0`, and rounding
 /// a faint body to zero would drop the sprite, its hit box and its motes.
+#[inline]
 fn cover_alpha(alpha: u8, cover: f32) -> u8 {
     if alpha == 0 || cover <= 0.0 {
         return 0;
@@ -311,6 +319,7 @@ pub enum PetInputKind {
 }
 
 impl PetInputKind {
+    #[inline]
     #[must_use]
     pub fn parse(kind: &str) -> Option<Self> {
         match kind {
@@ -344,6 +353,7 @@ pub enum PetAttention {
 }
 
 impl PetAttention {
+    #[inline]
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -472,6 +482,7 @@ pub(super) struct ConsoleLife {
 
 /// One pane row's characters as a hash (FNV-1a), for [`ConsoleLife::row_sig`];
 /// 0 for a row with nothing written on it.
+#[inline]
 fn row_signature(row: &[aterm_core::terminal::RenderCell]) -> u64 {
     let mut blank = true;
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -550,6 +561,7 @@ impl PetBrain {
         }
     }
 
+    #[inline]
     #[must_use]
     pub fn console_input_seq(&self) -> u64 {
         self.console.seq
@@ -559,26 +571,31 @@ impl PetBrain {
     /// seat by it (`None` before any): what a host proves its exclusions
     /// against — a cell the host painted chrome on reads
     /// [`crate::pet_world::PetCell::Protected`] here or the pet may sit on it.
+    #[inline]
     #[must_use]
     pub fn console_world(&self) -> Option<&PetWorld> {
         self.console.world.as_deref()
     }
 
+    #[inline]
     #[must_use]
     pub fn console_input_consumed_seq(&self) -> u64 {
         self.console.consumed
     }
 
+    #[inline]
     #[must_use]
     pub fn console_input_kind(&self) -> Option<PetInputKind> {
         self.console.input.map(|e| e.kind)
     }
 
+    #[inline]
     #[must_use]
     pub fn console_attention(&self) -> PetAttention {
         self.console.attention
     }
 
+    #[inline]
     #[must_use]
     pub fn console_reason(&self) -> &'static str {
         if self.console.reason.is_empty() {
@@ -588,16 +605,19 @@ impl PetBrain {
         }
     }
 
+    #[inline]
     #[must_use]
     pub fn console_anchor_id(&self) -> Option<u64> {
         self.console.anchor.map(|a| a.block_id)
     }
 
+    #[inline]
     #[must_use]
     pub fn console_event_seq(&self) -> u64 {
         self.console.source_seq
     }
 
+    #[inline]
     #[must_use]
     pub fn pose_name(&self) -> &'static str {
         PET_GLYPHS[self.species.skin(self.last_pose) as usize].id
@@ -605,6 +625,7 @@ impl PetBrain {
 
     /// Clear occupancy is read from the exact cell plane being presented.
     /// Calling this observer does not advance an animation or an input seq.
+    #[inline]
     pub fn observe_console(
         &mut self,
         input: &aterm_core::render::RenderInput,
@@ -618,6 +639,7 @@ impl PetBrain {
     /// `MAX_WORLD_ROWS` × `MAX_WORLD_COLS` per presented frame), so a running
     /// product can report the cost. Zero before any coherent observation and
     /// after a refused one ([`PetWorld::retire`] clears the count).
+    #[inline]
     #[must_use]
     pub fn observed_cells(&self) -> usize {
         self.console
@@ -626,6 +648,7 @@ impl PetBrain {
             .map_or(0, |world| world.examined_cells())
     }
 
+    #[inline]
     pub fn observe_console_with_exclusions(
         &mut self,
         input: &aterm_core::render::RenderInput,
@@ -641,6 +664,7 @@ impl PetBrain {
     /// bar; [`PetWorld::observe_with_overlays`]). They protect their cells
     /// alike, but the rest seat is solved without them, as without a live
     /// selection ([`PetBrain::console_station`]).
+    #[inline]
     pub fn observe_console_with_overlays(
         &mut self,
         input: &aterm_core::render::RenderInput,
@@ -848,6 +872,7 @@ impl PetBrain {
 
     /// An observed but incoherent surface cannot license new locomotion from
     /// the older ink spans. An unfed legacy host has no such observation.
+    #[inline]
     pub(super) fn console_observation_incoherent(&self) -> bool {
         self.console.presentable
             && self
@@ -859,6 +884,7 @@ impl PetBrain {
 
     /// Ownership/custody is independent of whether a live caret exists.
     /// This permits a valid reading anchor without manufacturing a caret.
+    #[inline]
     pub fn set_console_presentable(&mut self, presentable: bool) {
         if self.console.presentable != presentable {
             // Custody changed hands. A frozen ramp and a stale verdict from
@@ -871,6 +897,7 @@ impl PetBrain {
         self.console.presentable = presentable;
     }
 
+    #[inline]
     #[must_use]
     pub fn has_reading_interest(&self) -> bool {
         self.console
@@ -880,6 +907,7 @@ impl PetBrain {
     }
 
     /// Natural, pixel-rounded sprite coverage in fractional grid cells.
+    #[inline]
     fn console_body(&self, sense: PetSense) -> PetRect {
         still_body_rect(
             (self.col, self.row),
@@ -1110,6 +1138,7 @@ impl PetBrain {
     /// cell — exactly the live body's own verdict
     /// (`under_text_clearance_past_caret`). An incoherent map, or none,
     /// admits nothing.
+    #[inline]
     pub(super) fn console_still_body_clear(&self) -> bool {
         self.console_still_rect_verdict(self.col, self.row, self.last_stance) == Some(true)
     }
@@ -1120,6 +1149,7 @@ impl PetBrain {
     /// (`PetWorld::seen_under_text_clearance_past_caret`): `None` where the
     /// covered part is clear and the rest unseen, `Some(false)` over a
     /// protected cell or with no certified map.
+    #[inline]
     pub(super) fn console_still_rect_verdict(
         &self,
         col: f32,
@@ -1162,12 +1192,14 @@ impl PetBrain {
     /// a word. `true` with no observed world (the pane is all the cat's);
     /// `false` on a map that cannot see that ground, or none certified. At
     /// the last tick's cell metrics and grid.
+    #[inline]
     pub(super) fn console_stretch_on_blank(&self) -> bool {
         self.console_stretch_on_blank_at((self.col, self.row))
     }
 
     /// [`Self::console_stretch_on_blank`] for a body at `at` (cells): the
     /// sleeper's fall judges where it falls from and where it lands.
+    #[inline]
     pub(super) fn console_stretch_on_blank_at(&self, at: (f32, f32)) -> bool {
         if !self.console.presentable {
             return true;
@@ -1192,6 +1224,7 @@ impl PetBrain {
     /// The caret is not an obstruction to its own escort: [`STATION_LEAD`] seats the escort
     /// one cell past the caret, inside its 3x3 keep-off ring. Glyphs are `ink_overlaps`'s to
     /// judge; selections, images and uncertified geometry are this one's.
+    #[inline]
     pub(super) fn console_obstructed(&self, sense: PetSense) -> bool {
         self.console.presentable
             && self.console.world.as_ref().is_some_and(|world| {
@@ -1201,6 +1234,7 @@ impl PetBrain {
 
     /// The brain's own stream watch has the cat: a stare under way, or the
     /// vigil it armed (see `tick_console_resident`).
+    #[inline]
     fn watching_stream(&self) -> bool {
         (self.watch_heat >= WATCH_GATE && !self.watch_spent) || self.vigil_armed || self.vigil
     }
@@ -1804,6 +1838,7 @@ impl PetBrain {
 
     /// Whether ordinary locomotion still owes a flight or landing step.
     /// Pure projection for scheduler introspection and model conformance.
+    #[inline]
     #[must_use]
     pub fn console_legacy_motion_pending(&self) -> bool {
         self.flight.is_some()
@@ -1815,6 +1850,7 @@ impl PetBrain {
 
     /// Whether a deferred console owner still owes its first resident tick.
     /// Reading this latch never consumes it or advances the motion clock.
+    #[inline]
     #[must_use]
     pub fn console_resident_handoff_pending(&self) -> bool {
         self.console.resident_handoff
@@ -2390,6 +2426,7 @@ impl PetBrain {
     /// reading (`home_perch`, `nearest_under_text_perch`, the rounding
     /// re-check in [`Self::place_console_body_at_home`]), so the pet is never
     /// parked on the cursor.
+    #[inline]
     fn console_may_stand(world: &PetWorld, rect: PetRect, margin: f32) -> bool {
         world.under_text_clearance_past_caret(rect, margin) == Some(true)
     }
@@ -2397,6 +2434,7 @@ impl PetBrain {
     /// A stand's body as its clearance is judged ([`Self::stand_clearance`]):
     /// [`CLEARANCE`] short at the feet, so the margin round it stops at the
     /// ground it stands on.
+    #[inline]
     fn on_its_feet(body: PetRect) -> PetRect {
         PetRect::new(
             body.row,
@@ -2416,6 +2454,7 @@ impl PetBrain {
     /// the cat waited on the blank row over the composer, sixty cells behind
     /// the caret, until a kept seat ran out of reach and it leapt the line
     /// (2026-10-20, real Claude Code 2.1.305, windowed).
+    #[inline]
     fn stand_clearance(world: &PetWorld, body: PetRect) -> Option<bool> {
         let (feet, margin) = Self::stand_rect(world, body);
         world.under_text_clearance_past_caret(feet, margin)
@@ -2429,6 +2468,7 @@ impl PetBrain {
     /// accepted, the cat flew onto the rule, and the console law, finding
     /// nowhere to step it, hid it there until the wrap (2026-10-20, real
     /// Claude Code 2.1.305 with the harness on, windowed).
+    #[inline]
     fn stand_rect(world: &PetWorld, body: PetRect) -> (PetRect, f32) {
         let feet = Self::on_its_feet(body);
         (feet, world.margin_in_map(feet, CLEARANCE))
@@ -2440,6 +2480,7 @@ impl PetBrain {
     /// station. For a body that already exists, `None` usually means it left
     /// the caret-centred coverage window, which slides as the user types, so
     /// only a positive observation of a protected surface moves it.
+    #[inline]
     fn console_must_yield(world: &PetWorld, rect: PetRect) -> bool {
         world.under_text_clearance_past_caret(rect, 0.0) == Some(false)
     }
@@ -2656,6 +2697,7 @@ impl PetBrain {
     /// and the station follows the caret. A console rest seat stays put
     /// while the caret runs ([`Self::console_station`]), so a flight to it
     /// lands on it.
+    #[inline]
     pub(super) fn aims_ahead(&self) -> bool {
         self.rhythm_open() && !self.console.rest_seated.get()
     }
@@ -2665,6 +2707,7 @@ impl PetBrain {
     /// sweeps ([`PetWorld::ground_corridor_walled`]). An unknown cell is no
     /// wall: only a positive observation bars the way, as only one moves a
     /// body.
+    #[inline]
     fn console_walled(world: &PetWorld, from: PetRect, to: PetRect) -> bool {
         world.ground_corridor_walled(from, to)
     }
@@ -2675,6 +2718,7 @@ impl PetBrain {
     /// this of its own stand ([`PetBrain::tick`]'s watch station) and stays
     /// where it is when barred: chased, the console law stepped every
     /// flight across the composer's rule back off it.
+    #[inline]
     pub(super) fn console_bars(&self, desired: (f32, f32), rows: u16, width: f32) -> bool {
         if !self.console.presentable {
             return false;
@@ -2692,6 +2736,7 @@ impl PetBrain {
     /// The body rect the escort's own station puts the pet in, unchanged. The
     /// resident's caret home ([`Self::console_caret_home`]) is built from it,
     /// so escort and resident agree on the seat.
+    #[inline]
     fn console_stand_rect(desired: (f32, f32), rows: u16, width: f32) -> PetRect {
         PetRect::new(
             (desired.1 + 1.0 - ART_ROWS).clamp(
@@ -2745,6 +2790,7 @@ impl PetBrain {
     ///  * [`CaretSeat::Yield`]: a protected stand the escort's correction
     ///    could not fix; the caller asks [`PetWorld::nearest_under_text_perch`]
     ///    once more and yields on `None`.
+    #[inline]
     fn caret_seat(&self, world: &PetWorld, body: PetRect, stand: PetRect) -> CaretSeat {
         if self.speed.abs() <= 0.01
             && self.carry_speed() < FLIP_SPEED
@@ -2763,6 +2809,7 @@ impl PetBrain {
     /// the lead-free `stand` ([`Self::at_console_stand`]), or up to the
     /// escort's held keep-ahead ([`Self::lead`]) ahead of `stand` when the
     /// escort parked it beside this caret (`held_for`).
+    #[inline]
     fn at_escort_stand(&self, body: PetRect, stand: PetRect) -> bool {
         if Self::at_console_stand(body, stand) {
             return true;
@@ -2788,6 +2835,7 @@ impl PetBrain {
     /// [`Self::caret_seat`], with the bounded local search where there is no
     /// caret home. Advisory: [`Self::tick_console_resident`] decides from
     /// `caret_seat` (scroll compensation and the step-aside shift read this).
+    #[inline]
     fn console_seat(
         &self,
         world: &PetWorld,
@@ -2809,10 +2857,12 @@ impl PetBrain {
     /// [`ARRIVED`] in columns, and on the stand's row (a quarter row covers
     /// `body_px`'s rounding at cell heights of 4 px or more; a body between
     /// rows is mid-hop).
+    #[inline]
     fn at_console_stand(body: PetRect, stand: PetRect) -> bool {
         (body.col - stand.col).abs() <= ARRIVED && (body.row - stand.row).abs() < 0.25
     }
 
+    #[inline]
     fn near_console_home(rect: PetRect, home: Option<PetRect>) -> bool {
         home.is_none_or(|home| {
             (rect.col - home.col)
@@ -3158,22 +3208,24 @@ impl PetBrain {
         self.console.on_glass = frame.alpha > 0;
         // The whole emitted sprite, including motes and departing bodies,
         // is subordinate to selected text and the current occupancy map.
-        let min_ch = f32::from(sense.cell_h.max(6));
-        let cw = f32::from(sense.cell_w.max(1));
-        let ch = f32::from(sense.cell_h.max(1));
-        for mote in &mut frame.motes {
-            if mote.is_some_and(|m| {
-                // Conservative around the center, including minimum tile
-                // size, scaling and pixel rounding on every side.
-                let radius = min_ch * m.scale + 1.0;
-                let rw = radius / cw;
-                let rh = radius / ch;
-                !world.clear(
-                    PetRect::new(m.row - rh, m.col - rw, 2.0 * rh, 2.0 * rw),
-                    CLEARANCE,
-                )
-            }) {
-                *mote = None;
+        if frame.motes.iter().any(Option::is_some) {
+            let min_ch = f32::from(sense.cell_h.max(6));
+            let cw = f32::from(sense.cell_w.max(1));
+            let ch = f32::from(sense.cell_h.max(1));
+            for mote in &mut frame.motes {
+                if mote.is_some_and(|m| {
+                    // Conservative around the center, including minimum tile
+                    // size, scaling and pixel rounding on every side.
+                    let radius = min_ch * m.scale + 1.0;
+                    let rw = radius / cw;
+                    let rh = radius / ch;
+                    !world.clear(
+                        PetRect::new(m.row - rh, m.col - rw, 2.0 * rh, 2.0 * rw),
+                        CLEARANCE,
+                    )
+                }) {
+                    *mote = None;
+                }
             }
         }
         // One crossfade, one visibility rule: the emitter draws a departing ghost at
@@ -3251,6 +3303,7 @@ impl PetBrain {
         }
     }
 
+    #[inline]
     pub(super) fn console_hold_settled(&self) -> bool {
         self.console.hold.settled()
     }
@@ -3340,6 +3393,7 @@ impl PetBrain {
         .map(|at| at.max(now + ARM_MIN))
     }
 
+    #[inline]
     pub(super) fn note_console_completion(&mut self, now: Instant, failed: bool) {
         self.console.completion_seq = self.console.completion_seq.wrapping_add(1).max(1);
         self.console.completion = Some((now, failed));
@@ -3350,6 +3404,7 @@ impl PetBrain {
             failed.then(|| now + Duration::from_secs_f32(RESULT_HOLD));
     }
 
+    #[inline]
     pub(super) fn console_grieving(&self) -> bool {
         self.console
             .failure_quiet_until
@@ -3362,6 +3417,7 @@ impl PetBrain {
 /// grid cells: the `PetFrame::body_px` projection itself (`drawn_body_px`), origin, feet and
 /// grid clamp included, since a fractional landing can straddle a protected cell that the
 /// rounded body clears.
+#[inline]
 fn still_body_rect(
     seat: (f32, f32),
     stance: Stance,
@@ -3381,6 +3437,7 @@ fn still_body_rect(
 
 /// The frame's body in cell units: [`PetFrame::body_px`]'s pixel box divided
 /// back through the cell size.
+#[inline]
 fn body_rect(frame: &PetFrame, sense: PetSense) -> Option<PetRect> {
     frame
         .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
@@ -3402,6 +3459,7 @@ fn body_rect(frame: &PetFrame, sense: PetSense) -> Option<PetRect> {
 /// [`TYPED_RUN_MAX`]. A glyph typed there is the escort's next step, not ink
 /// arriving at the cat (as contact it would brace the escort on every burst's
 /// first key); ink anywhere else still touches.
+#[inline]
 fn typed_run(
     input: &aterm_core::render::RenderInput,
     pane: PetPane,
@@ -3428,6 +3486,7 @@ fn typed_run(
 /// Moving a cat or a caret toward old ink cannot manufacture contact. This
 /// tiny independent mask includes at most 16×32 cells; overflow is no claim.
 /// Cells of the caret's own `typed` run ([`typed_run`]) read as blank.
+#[inline]
 fn local_ink(
     world: &PetWorld,
     body: PetRect,
@@ -3443,18 +3502,19 @@ fn local_ink(
     }
     let mut bits = [0; 8];
     for r in r0..r1 {
-        let row_base = (r - r0) * 32;
-        let typed_cols = typed.and_then(|(row, first, end)| (row == r).then_some(first..end));
+        let dr = r - r0;
+        let typed_span = typed.and_then(|(row, first, end)| (row == r).then_some((first, end)));
+        let mut row_bits = 0u64;
         for c in c0..c1 {
             match world.ink_at(r, c) {
                 None => return None,
-                Some(true) if !typed_cols.as_ref().is_some_and(|cols| cols.contains(&c)) => {
-                    let i = row_base + c - c0;
-                    bits[i / 64] |= 1 << (i % 64);
+                Some(true) if !typed_span.is_some_and(|(first, end)| c >= first && c < end) => {
+                    row_bits |= 1u64 << (c - c0);
                 }
                 Some(_) => {}
             }
         }
+        bits[dr >> 1] |= row_bits << ((dr & 1) << 5);
     }
     Some(bits)
 }

@@ -573,6 +573,96 @@ mod tests {
         }
     }
 
+    /// THE 2.1.307 FOOTERS (measured 2026-10-21 by `aterm-lab footers` in the
+    /// lab's private headless aterm at 80x24, model opus at the top effort
+    /// level; docs/measured/claude-code-2.1.307-2026-10-21.md): each reads as
+    /// the mode and turn it was captured in, the mode row under the composer's
+    /// rule, with the vendor's `← for agents` hint gone from the rows drawn
+    /// past its first 10 s and the bypass row's effort tag wrapped onto a row
+    /// of its own. NEGATIVE CONTROL: the same screen with its mode row blanked
+    /// reads no mode.
+    #[test]
+    fn the_2_1_307_screens_read_as_measured() {
+        let cases: [(&str, &str, Mode, bool); 8] = [
+            (
+                "auto-idle",
+                include_str!(
+                    "../../../aterm-phase/src/fixtures/claude-2.1.307-footer-auto-idle.txt"
+                ),
+                Mode::Auto,
+                false,
+            ),
+            (
+                "auto-draft",
+                include_str!(
+                    "../../../aterm-phase/src/fixtures/claude-2.1.307-footer-auto-draft.txt"
+                ),
+                Mode::Auto,
+                false,
+            ),
+            (
+                "manual",
+                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.307-footer-manual.txt"),
+                Mode::Manual,
+                false,
+            ),
+            (
+                "accept-edits",
+                include_str!(
+                    "../../../aterm-phase/src/fixtures/claude-2.1.307-footer-accept-edits.txt"
+                ),
+                Mode::AcceptEdits,
+                false,
+            ),
+            (
+                "plan",
+                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.307-footer-plan.txt"),
+                Mode::Plan,
+                false,
+            ),
+            (
+                "busy",
+                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.307-footer-busy.txt"),
+                Mode::Auto,
+                true,
+            ),
+            (
+                "after-turn",
+                include_str!(
+                    "../../../aterm-phase/src/fixtures/claude-2.1.307-footer-after-turn.txt"
+                ),
+                Mode::Auto,
+                false,
+            ),
+            (
+                "bypass-idle",
+                include_str!(
+                    "../../../aterm-phase/src/fixtures/claude-2.1.307-footer-bypass-idle.txt"
+                ),
+                Mode::Bypass,
+                false,
+            ),
+        ];
+        for (name, text, mode, busy) in cases {
+            let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
+            let s = read_screen(&rows).unwrap_or_else(|| panic!("{name}: a composer"));
+            assert_eq!(s.mode, Some(mode), "{name}");
+            assert_eq!(s.busy, busy, "{name}");
+            let rule = aterm_phase::phase::composer_bottom(&rows)
+                .unwrap_or_else(|| panic!("{name}: the composer's bottom rule"));
+            let row = footer::mode_row(&rows)
+                .filter(|r| *r > rule)
+                .unwrap_or_else(|| panic!("{name}: the mode row under the rule"));
+            let mut blank = rows.clone();
+            blank[row].clear();
+            assert_eq!(
+                read_screen(&blank).and_then(|s| s.mode),
+                None,
+                "{name}: CONTROL"
+            );
+        }
+    }
+
     /// THE CURRENT VENDOR, LIVE: every 2.1.283 capture (measured 2026-09-25,
     /// `aterm ctl text` of a private headless aterm, the owner's settings)
     /// reads as the state it was captured in — mode and turn in flight. A

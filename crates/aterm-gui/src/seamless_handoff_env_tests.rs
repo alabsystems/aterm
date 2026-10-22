@@ -25,7 +25,7 @@
 
 #[cfg(target_os = "macos")]
 use super::tests::StagedHandoff;
-use super::tests::{ENV_LOCK, RestoreVar, pipe_pair, stage_outgoing_handoff};
+use super::tests::{ENV_LOCK, RestoreVar, env_alone, pipe_pair, stage_outgoing_handoff};
 use super::*;
 use crate::handoff_env::{HANDOFF_ENV_KEYS, HandoffEnv};
 use aterm_models_update::native_update_successor_warm_before_claim_model;
@@ -159,7 +159,7 @@ fn owned_pipe(label: &str) -> (OwnedFd, OwnedFd) {
 #[test]
 fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_environment() {
     use std::os::fd::BorrowedFd;
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_all();
     let model = native_update_successor_warm_before_claim_model();
     let staged = stage_outgoing_handoff("p1-launched", 2, None);
@@ -381,7 +381,7 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
 #[cfg(target_os = "macos")]
 #[test]
 fn a_failed_claim_owns_nothing_and_touches_no_environment() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_all();
     let model = native_update_successor_warm_before_claim_model();
     let staged = stage_outgoing_handoff("p1-refused", 1, None);
@@ -470,7 +470,7 @@ fn a_failed_claim_owns_nothing_and_touches_no_environment() {
 #[cfg(unix)]
 #[test]
 fn the_fork_lane_intake_from_the_snapshot_proves_what_the_parent_expects() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_all();
     let staged = stage_outgoing_handoff("p1-fork", 3, None);
     let (ready_read, ready_write) = owned_pipe("ready");
@@ -556,7 +556,7 @@ fn the_fork_lane_intake_from_the_snapshot_proves_what_the_parent_expects() {
 #[cfg(unix)]
 #[test]
 fn the_retired_env_transport_is_the_caught_mutant() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_all();
     let model = native_update_successor_warm_before_claim_model();
     let buggy = interp::with_buggy(&model, 1);
@@ -898,7 +898,7 @@ fn a_theme_file_edit_during_the_hold_is_warmed_again() {
 #[cfg(target_os = "macos")]
 #[test]
 fn the_hint_never_reaches_the_adoption_proof() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_all();
     let hint_key = crate::handoff_warm_hint::ENV_WARM_HINT;
     for (label, hint) in [

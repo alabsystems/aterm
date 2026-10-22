@@ -13,7 +13,7 @@ use aterm_objc::{CGPoint, CGRect, CGSize, Id, Obj, RcBlock, Sel, class, sel};
 use aterm_secrets::SecretBytes;
 
 use crate::appkit::{self, MainThread};
-use crate::secrets_join::{Choice, VaultWake, vault_host};
+use crate::secrets_join::{Choice, VaultWake};
 use crate::{App, Wake};
 
 /// The sheet that is up: its id, the window it hangs on, the retained secure field and
@@ -23,6 +23,7 @@ pub(crate) struct SecretsSheet {
     pub(crate) id: u64,
     window: crate::WindowId,
     field: Obj,
+    url: Obj,
     panel: Obj,
     parent: Obj,
     _keys: crate::alert_keys::PasswordKeyWatch,
@@ -54,16 +55,10 @@ impl Drop for SecretsSheet {
 }
 
 /// The sheet's words.
-const TITLE: &str = "Join the ALab secrets vault";
+const TITLE: &str = "Connect secrets vault";
 
 fn informative() -> String {
-    format!(
-        "This Mac can fill ~/.secrets and its GitHub, publishing and release credentials \
-         from the vault at {}.\n\nType the vault's join password: an admin Mac shows it with \
-         `aterm secrets password`. Leave it empty to have an admin Mac approve this Mac by \
-         its code instead.",
-        vault_host()
-    )
+    "Connect this Mac to your secrets vault. Leave the password blank for approval from another Mac.".to_owned()
 }
 
 impl App {
@@ -112,7 +107,7 @@ impl App {
         ) = (
             appkit::nsstring(TITLE),
             appkit::nsstring(&informative()),
-            appkit::nsstring("Join"),
+            appkit::nsstring("Apply"),
             appkit::nsstring("Not Now"),
             appkit::nsstring("Don\u{2019}t Ask Again"),
             appkit::nsstring("Join password (optional)"),
@@ -160,6 +155,35 @@ impl App {
         let Some(field) = field else {
             return Err("could not create the password field");
         };
+        // SAFETY: owned native text fields in a shared accessory, on the main thread.
+        let (url, accessory) = unsafe {
+            let frame = |y, height| CGRect {
+                origin: CGPoint { x: 0.0, y },
+                size: CGSize {
+                    width: 390.0,
+                    height,
+                },
+            };
+            let url = Obj::from_owned(appkit::send_id_rect(
+                appkit::alloc(class(c"NSTextField")),
+                sel!(initWithFrame:),
+                frame(40.0, 26.0),
+            ))
+            .ok_or("could not create URL field")?;
+            let accessory = Obj::from_owned(appkit::send_id_rect(
+                appkit::alloc(class(c"NSView")),
+                sel!(initWithFrame:),
+                frame(0.0, 70.0),
+            ))
+            .ok_or("could not create vault form")?;
+            let initial = appkit::nsstring(aterm_secrets::ALAB_DEFAULT_URL)
+                .ok_or("could not create default URL")?;
+            appkit::send_v_id(url.id(), sel!(setStringValue:), initial.id());
+            appkit::send_v_rect(field.id(), sel!(setFrame:), frame(0.0, 26.0));
+            appkit::send_v_id(accessory.id(), sel!(addSubview:), url.id());
+            appkit::send_v_id(accessory.id(), sel!(addSubview:), field.id());
+            (url, accessory)
+        };
         // SAFETY: standard NSAlert setters on the main thread, as the askpass sheet's:
         // text setters copy, `-addButtonWithTitle:` returns the +0 button the alert owns,
         // `-setAccessoryView:` retains the field, and
@@ -196,7 +220,7 @@ impl App {
             appkit::send_v_id(field.id(), sel!(setPlaceholderString:), hint.id());
             appkit::send_v_id(alert.id(), sel!(setMessageText:), message.id());
             appkit::send_v_id(alert.id(), sel!(setInformativeText:), informative.id());
-            appkit::send_v_id(alert.id(), sel!(setAccessoryView:), field.id());
+            appkit::send_v_id(alert.id(), sel!(setAccessoryView:), accessory.id());
             // The first button added is the default (Return); Escape is Not Now.
             let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), join.id());
             let later = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), not_now.id());
@@ -209,7 +233,7 @@ impl App {
             };
             let input = std::sync::Arc::new(crate::askpass::PasswordInput::new());
             let Some(keys) =
-                crate::alert_keys::watch_password_keys(&panel, &ns_window, &field, input)
+                crate::alert_keys::watch_password_keys(&panel, &ns_window, &accessory, input)
             else {
                 return Err("could not guard the password field's input");
             };
@@ -231,6 +255,7 @@ impl App {
             id,
             window: wid,
             field,
+            url,
             panel,
             parent: ns_window,
             _keys: keys,
@@ -244,18 +269,30 @@ impl App {
     /// ended either way. `None` for a stale id, an empty field (approved by code) or a
     /// password the field cannot hand over (a line break, over 1023 bytes).
     pub(crate) fn take_secrets_sheet(&mut self, id: u64, read: bool) -> Option<SecretBytes> {
+        self.take_secrets_sheet_with_source(id, read)
+            .and_then(|(_, password)| password)
+    }
+
+    pub(crate) fn take_secrets_sheet_with_source(
+        &mut self,
+        id: u64,
+        read: bool,
+    ) -> Option<(String, Option<SecretBytes>)> {
         let sheet = self.secrets_join.native.take_if(|sheet| sheet.id == id)?;
         if !read {
             return None;
         }
-        let Some(typed) = crate::askpass_sheet::read_secure_field(&sheet.field) else {
-            aterm_log::info!(
-                "secrets vault: the join password could not be read (a line break, or over 1023 bytes); joining to be approved by code"
-            );
-            return None;
-        };
+        // SAFETY: the retained URL control is read on the application main thread.
+        let source =
+            unsafe { appkit::nsstring_to_rust(appkit::send_id(sheet.url.id(), sel!(stringValue))) }
+                .trim()
+                .to_owned();
+        let typed = crate::askpass_sheet::read_secure_field(&sheet.field);
+        let password = typed
+            .filter(|typed| !typed.is_empty())
+            .map(|typed| SecretBytes::from(typed.as_bytes()));
         drop(sheet);
-        (!typed.is_empty()).then(|| SecretBytes::from(typed.as_bytes()))
+        Some((source, password))
     }
 
     /// The window `wid` closes, or `sudo`'s password sheet needs it: a sheet on it goes

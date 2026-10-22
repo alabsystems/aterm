@@ -94,6 +94,10 @@ pub struct Record {
     /// that is not a string reads as unknown (`None`), never refusing the
     /// record.
     pub frame: Option<String>,
+    /// The explicit pre-registration writer frame: all native identity and
+    /// frame fields are null, busy with an empty draft and no exit. Derived
+    /// from the parsed wire shape, never an extra field a writer may assert.
+    pub initializing: bool,
 }
 
 /// Why a record or its line is refused (one word, said in the ledger and
@@ -152,6 +156,11 @@ pub fn parse(text: &str) -> Result<Record, Refusal> {
         cwd: opt_str("cwd")?,
         draft_empty: v.get("draftEmpty").and_then(Value::as_bool),
         frame: v.get("state").and_then(Value::as_str).map(str::to_owned),
+        initializing: ["sessionId", "resumeArgv", "cwd", "state", "exit"]
+            .iter()
+            .all(|key| matches!(v.get(key), Some(Value::Null)))
+            && v.get("status").and_then(Value::as_str) == Some("busy")
+            && v.get("draftEmpty").and_then(Value::as_bool) == Some(true),
     })
 }
 
@@ -428,8 +437,9 @@ pub struct Copy {
     pub seen: Seen,
     /// The record's line, validated against the live process at that read
     /// ([`validate`]); `Err` names why it relaunches nothing. A record removed
-    /// or not readable is `Err("no-record")`; one never written yet is the
-    /// line [`inherited`] from aterm's own relaunch, else `Err("no-record-yet")`.
+    /// or not readable is `Err("no-record")`; one never written yet, or its
+    /// explicit pre-registration initializer, uses the line [`inherited`]
+    /// from aterm's own relaunch, else `Err("no-record-yet")`.
     pub resume: Result<Resume, Refusal>,
 }
 
@@ -486,8 +496,8 @@ pub fn copy_of(
     copy_seen(pid, start, home, seen, live, typed)
 }
 
-/// THE LINE A NEVER-WRITTEN RECORD INHERITS: `typed`, the line aterm's own
-/// crash rule typed in the tab, when the live process runs exactly it — its
+/// THE LINE A NEVER-WRITTEN OR INITIAL RECORD INHERITS: `typed`, the line
+/// aterm's own crash rule typed in the tab, when the live process runs exactly it — its
 /// launch path, `resume <session>` of that line's conversation, its root
 /// flags, its `CODEX_HOME` ([`validate`] of that line as a record of `pid`):
 /// the relaunch that started this very process. Any other process (one a
@@ -515,6 +525,7 @@ pub fn inherited(typed: Option<&Resume>, pid: u32, live: &Live) -> Result<Resume
         cwd: typed.cwd.clone(),
         draft_empty: None,
         frame: None,
+        initializing: false,
     };
     validate(&record, pid, live)
 }
@@ -532,6 +543,20 @@ pub fn fold(before: Option<&Copy>, mut read: Copy) -> Copy {
         read.seen = Seen::Removed;
         read.resume = Err("no-record");
     }
+    // Initializer authority belongs only before registration. A record that
+    // later goes blank cannot revive the launch's old conversation. Keep the
+    // refusal sticky through repeated initializers until a concrete record
+    // supplies its own validated line again.
+    if matches!(&read.seen, Seen::Present(record) if record.initializing)
+        && before.is_some_and(|b| {
+            (b.pid, b.start.as_str()) == (read.pid, read.start.as_str())
+                && !matches!(&b.seen, Seen::Never)
+                && !matches!(&b.seen, Seen::Present(record) if record.initializing)
+        })
+    {
+        read.seen = Seen::Unreadable("record-regressed");
+        read.resume = Err("record-regressed");
+    }
     read
 }
 
@@ -544,6 +569,19 @@ fn copy_seen(
     typed: Option<&Resume>,
 ) -> Copy {
     let resume = match &seen {
+        Seen::Present(record) if record.initializing => {
+            // The host already started this exact resume. The initializer
+            // contributes no new line; its pid and environment still have
+            // to agree with the live process, just as a materialized record's.
+            inherited(typed, pid, live).and_then(|resume| {
+                let record = Record {
+                    session_id: Some(resume.session),
+                    resume_argv: Some(resume.argv),
+                    ..record.clone()
+                };
+                validate(&record, pid, live)
+            })
+        }
         Seen::Present(record) => validate(record, pid, live),
         Seen::Never => inherited(typed, pid, live),
         Seen::Removed | Seen::Unreadable(_) => Err("no-record"),

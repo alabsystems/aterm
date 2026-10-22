@@ -130,17 +130,20 @@ impl CardShape {
     }
 
     /// The card-local scene a frame of this shape is drawn from.
+    #[inline]
     pub(super) fn scene(&self) -> &CardScene {
         &self.local
     }
 
     /// Whether a frame of this shape draws anything ([`Geo::new`]).
+    #[inline]
     pub(super) fn drawable(&self) -> bool {
         Geo::new(&self.local).is_some() && CardArts::dimensions(self.local.ch).is_some()
     }
 }
 
 /// `v` clamped into `i32`.
+#[inline]
 fn sat_i32(v: i64) -> i32 {
     i32::try_from(v).unwrap_or(if v < 0 { i32::MIN } else { i32::MAX })
 }
@@ -161,6 +164,7 @@ pub struct CardFrame {
 /// card (its session) mixed with the slot, so a card's two layers keep
 /// their ids from frame to frame and two cards never share one.
 #[must_use]
+#[inline]
 pub fn card_layer_id(card: u64, slot: FxSlot) -> u64 {
     let salt = match slot {
         FxSlot::Under => 0x4341_5244_5544_4552,
@@ -230,6 +234,7 @@ impl CardFrame {
 
     /// Whether the frame draws nothing: both contents empty.
     #[must_use]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.under.items().is_empty() && self.over.items().is_empty()
     }
@@ -247,6 +252,7 @@ pub struct SettledFrame {
 
 impl SettledFrame {
     /// The kept frame laid at `origin`.
+    #[inline]
     pub(super) fn at(&self, origin: (i32, i32)) -> CardFrame {
         CardFrame {
             under: Arc::clone(&self.under),
@@ -270,11 +276,13 @@ pub struct CardFrames {
 
 impl CardFrames {
     /// The settled frame kept, if any.
+    #[inline]
     pub(super) fn kept(&self) -> Option<&SettledFrame> {
         self.kept.as_ref()
     }
 
     /// Keep `kept` (an episode frame keeps nothing).
+    #[inline]
     pub(super) fn keep(&mut self, kept: Option<SettledFrame>) {
         self.kept = kept;
     }
@@ -282,6 +290,7 @@ impl CardFrames {
     /// The arts this card's frames are drawn with (its last frame's cell
     /// height), for a host that hands them to the renderer ahead of use.
     #[must_use]
+    #[inline]
     pub fn arts(&self) -> Option<&Arc<CardArts>> {
         self.arts.as_ref()
     }
@@ -335,11 +344,13 @@ fn refill(content: &mut Arc<FxContent>, f: impl FnOnce(&mut Vec<FxItem>, &mut Ve
 }
 
 /// A paint as a palette entry.
+#[inline]
 fn fx_ink(p: Paint) -> FxInk {
     FxInk::over(p.color, p.alpha)
 }
 
 /// Validate a producer's dimensions before allocating any texels.
+#[inline]
 fn art_size(w: i64, h: i64) -> Option<(u16, u16, usize)> {
     let (w, h) = (u16::try_from(w).ok()?, u16::try_from(h).ok()?);
     if w == 0
@@ -491,6 +502,7 @@ pub struct CardArts {
 }
 
 /// Which of the six kitty frames `art` (two rows or three) in `pose` is.
+#[inline]
 fn kitty_slot(art: &KittyArt, pose: KittyPose) -> usize {
     (art.rows() - 2).min(1) * 3 + pose as usize
 }
@@ -567,6 +579,7 @@ impl CardArts {
 
     /// The cell height these arts are for.
     #[must_use]
+    #[inline]
     pub fn ch(&self) -> u16 {
         self.ch
     }
@@ -585,14 +598,17 @@ impl CardArts {
         kitty.chain(rim).chain(stars)
     }
 
+    #[inline]
     fn kitty(&self, art: &KittyArt, pose: KittyPose) -> &Arc<FxArt> {
         &self.kitty[kitty_slot(art, pose)]
     }
 
+    #[inline]
     fn rim(&self, art: &KittyArt, pose: KittyPose) -> Option<&RimArt> {
         self.rim[kitty_slot(art, pose)].as_ref()
     }
 
+    #[inline]
     fn star(&self, arm: i64, gold: bool) -> Option<&StarArt> {
         let i = usize::try_from(arm.checked_sub(1)?).ok()?;
         self.stars.get(i)?[usize::from(gold)].as_ref()
@@ -805,6 +821,7 @@ fn rim(cx: &Emit<'_>, arts: &CardArts, items: &mut Vec<FxItem>, palette: &mut Ve
 }
 
 /// A card rectangle as an fx one (card-local pixels fit in `i32`).
+#[inline]
 fn px_rect(r: Rect) -> PxRect {
     PxRect::new(r.x0 as i32, r.y0 as i32, r.x1 as i32, r.y1 as i32)
 }
@@ -874,13 +891,6 @@ fn star(
             }
         };
     }
-    let tone = |rgb: u32, c: f32| {
-        if dark {
-            light(rgb, c)
-        } else {
-            ink(rgb, c * 255.0 / STAR_PRINT_FULL)
-        }
-    };
     let sprite = |art: &Arc<FxArt>, ink: u32, clip: Rect| {
         FxItem::Sprite(FxSprite {
             x: x as i32,
@@ -895,9 +905,10 @@ fn star(
     };
     if dark {
         let base = palette.len() as u32;
+        let tones: [u32; STAR_PAINTS] = std::array::from_fn(|id| light(color, covs[id]).color);
         palette.extend(p.classes().iter().map(|members| {
             FxInk::add(members.iter().fold(0, |sum, &id| {
-                add_sat(sum, tone(color, covs[usize::from(id)]).color) & 0x00FF_FFFF
+                add_sat(sum, tones[usize::from(id)]) & 0x00FF_FFFF
             }))
         }));
         items.push(sprite(folded, base, b));
@@ -905,7 +916,10 @@ fn star(
     }
     let base = palette.len() as u32;
     for rgb in [color, WHITE] {
-        palette.extend(covs.iter().map(|&c| fx_ink(tone(rgb, c))));
+        palette.extend(
+            covs.iter()
+                .map(|&c| fx_ink(ink(rgb, c * 255.0 / STAR_PRINT_FULL))),
+        );
     }
     tone_rects(b, on_trail, |r, white| {
         let ink = base + if white { STAR_PAINTS as u32 } else { 0 };

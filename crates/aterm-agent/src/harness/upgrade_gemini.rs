@@ -89,6 +89,12 @@ pub const CLI_HOME_ENV: &str = "GEMINI_CLI_HOME";
 /// The home it falls back to: `os.homedir()`, `$HOME` on a Unix.
 pub const HOME_ENV: &str = "HOME";
 
+/// The variable naming the trusted-folders file the CLI reads in place of
+/// `<gemini dir>/trustedFolders.json` (bundle 0.46.0:
+/// `Storage.getTrustedFoldersPath`): a worker's own, which trusts the one
+/// folder its starter trusted for it (`harness::worker`).
+pub const TRUSTED_FOLDERS_ENV: &str = "GEMINI_CLI_TRUSTED_FOLDERS_PATH";
+
 /// The Gemini directory under the home.
 pub const GEMINI_DIR: &str = ".gemini";
 
@@ -1282,9 +1288,14 @@ pub fn line_exit_kind(status: i64) -> ExitKind {
 /// it), and its `HOME` where that is absolute and other than `user_home`
 /// (the user's own, the shell's the line is typed at): either way its
 /// sessions are under another `.gemini`, which a resume under the shell's
-/// would not find (`Invalid session identifier`, exit 42). `get` names a
-/// variable of its exec environment. The other lanes carry the `HOME` of an
-/// agent under another one the same way.
+/// would not find (`Invalid session identifier`, exit 42) — and its
+/// trusted-folders file ([`TRUSTED_FOLDERS_ENV`]) where an absolute one is
+/// set: a worker's, without which its relaunch would stop at a folder-trust
+/// dialog its launch never drew. `get` names a variable of its exec
+/// environment. The other lanes carry the `HOME` of an agent under another
+/// one the same way. A record keeps no trusted-folders file
+/// ([`env_of_words`]): the file is the live worker's, removed with its
+/// session.
 #[must_use]
 pub fn relaunch_env<'a>(
     get: impl Fn(&str) -> Option<&'a str>,
@@ -1297,6 +1308,9 @@ pub fn relaunch_env<'a>(
     }
     if let Some(h) = get(CLI_HOME_ENV).filter(|h| !h.is_empty()) {
         out.push((CLI_HOME_ENV.to_string(), h.to_string()));
+    }
+    if let Some(f) = get(TRUSTED_FOLDERS_ENV).filter(|f| Path::new(f).has_root()) {
+        out.push((TRUSTED_FOLDERS_ENV.to_string(), f.to_string()));
     }
     out
 }
@@ -1334,8 +1348,10 @@ pub fn env_of_words(words: &[String]) -> Vec<(String, String)> {
 /// THE LINE A PERSON IS TOLD to resume a Gemini CLI session by hand: `cd`
 /// to its project (a resume from another directory finds no session) and
 /// Gemini CLI's own `gemini --resume <uuid>` (its farewell's hint), behind
-/// the homes its relaunch carries, each word quoted as a shell reads it.
-/// `None` for a session that is no full UUID, or a word no line can hold.
+/// the homes its relaunch carries, each word quoted as a shell reads it —
+/// never a worker's own trusted-folders file ([`TRUSTED_FOLDERS_ENV`]),
+/// which goes with its session: the person's own trust stands. `None` for a
+/// session that is no full UUID, or a word no line can hold.
 #[must_use]
 pub fn told_line(session: &str, env: &[(String, String)], root: &str) -> Option<String> {
     if !is_session_uuid(session) {
@@ -1363,7 +1379,7 @@ pub fn told_line(session: &str, env: &[(String, String)], root: &str) -> Option<
         said.push_str(&word(root));
         said.push_str(" && ");
     }
-    for (name, value) in env {
+    for (name, value) in env.iter().filter(|(name, _)| name != TRUSTED_FOLDERS_ENV) {
         if value.chars().any(char::is_control) {
             return None;
         }

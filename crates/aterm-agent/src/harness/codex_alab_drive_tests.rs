@@ -170,6 +170,7 @@ struct Crashed {
     births: Arc<Mutex<VecDeque<Option<String>>>>,
     looks: Arc<AtomicUsize>,
     marks: crate::harness::FakeInstanceLog,
+    owners: Mutex<VecDeque<aterm_uds::ownerlock::Owner>>,
 }
 
 /// [`NEW`]'s kernel start, as the record reader spells one.
@@ -223,14 +224,19 @@ impl AlabKernel for Crashed {
         })
     }
 
-    fn holders_of(&self, file: &Path) -> Option<Vec<u32>> {
-        Some(
-            if file == self.lock && self.relaunched.load(Ordering::SeqCst) {
-                vec![NEW]
-            } else {
-                Vec::new()
-            },
-        )
+    fn writer_owner(&self, file: &Path) -> aterm_uds::ownerlock::Owner {
+        use aterm_uds::ownerlock::Owner;
+        self.owners
+            .lock()
+            .expect("writer owners")
+            .pop_front()
+            .unwrap_or_else(|| {
+                if file == self.lock && self.relaunched.load(Ordering::SeqCst) {
+                    Owner::Live
+                } else {
+                    Owner::Dead
+                }
+            })
     }
 
     fn shell_has_terminal(&self, _: u32) -> bool {
@@ -360,6 +366,7 @@ impl Rig {
             births: Arc::new(Mutex::new(VecDeque::new())),
             looks: Arc::new(AtomicUsize::new(0)),
             marks: asked.clone(),
+            owners: Mutex::new(VecDeque::new()),
         };
         Rig {
             _waits: crate::harness::relaunch::virtual_waits(),
@@ -450,6 +457,82 @@ impl Rig {
 /// The verbs that type into a tab or read its screen.
 const TYPES_OR_READS: [&str; 7] = ["turn", "key", "send", "paste", "feed", "text", "cell"];
 
+/// A jail that refuses other processes' descriptor tables makes the all-process census
+/// unknown. The conversation's own kernel lock still gives an authoritative free answer.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_free_writer_lock_needs_no_read_of_unrelated_process_descriptors() {
+    const CHILD: &str = "ATERM_CODEX_WRITER_PROBE_CHILD";
+    const NAME: &str = "harness::upgrade_drive::codex_alab_drive::tests::a_free_writer_lock_needs_no_read_of_unrelated_process_descriptors";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let path = PathBuf::from(path);
+        assert_eq!(
+            super::super::file_holders(&path),
+            None,
+            "the jail keeps the unrelated census unknown"
+        );
+        assert_eq!(Live.writer_owner(&path), aterm_uds::ownerlock::Owner::Dead);
+        println!("PROBE: free conversation writer lock, unreadable unrelated census");
+        return;
+    }
+    let dir = scratch("writer-probe-jail");
+    let lock = dir.join("writer.lock");
+    std::fs::write(&lock, b"").expect("writer lock");
+    let profile = "(version 1)(allow default)(deny process-info-pidinfo)";
+    let out = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("/usr/bin/sandbox-exec")
+            .args(["-p", profile])
+            .arg(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, &lock),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .expect("the sandboxed kernel probe, within its hang detector");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("PROBE: free conversation writer lock"),
+        "{:?}\n{stdout}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A free kernel lock admits exactly the resume line; a held or unknown answer does not.
+/// Ownership is read again before typing, so an intervening change never gets a line.
+#[test]
+fn the_writer_lock_must_be_proven_free_at_both_relaunch_checks() {
+    use aterm_uds::ownerlock::Owner::{Dead, Live, Unknown};
+    for (name, owners, step, lines) in [
+        ("free", vec![Dead, Dead], "done:resumed", 1),
+        ("held", vec![Live], "wait:thread-locked", 0),
+        ("unknown", vec![Unknown], "wait:thread-locked", 0),
+        (
+            "became-held",
+            vec![Dead, Live],
+            "wait:conversation-owner-ambiguous",
+            0,
+        ),
+        (
+            "became-unknown",
+            vec![Dead, Unknown],
+            "wait:conversation-owner-ambiguous",
+            0,
+        ),
+    ] {
+        let rig = Rig::new(&format!("writer-{name}"), &["zsh: killed     codex"]);
+        *rig.kernel.owners.lock().expect("writer owners") = owners.into();
+        let r = self_claimed_after_exit(
+            &rig.opts,
+            &rig.snap(None),
+            &rig.resume(None),
+            ExitCause::Exit,
+            &rig.kernel,
+        );
+        assert_eq!(r.step, step, "{name}: {r:?}\n{:#?}", rig.asked());
+        assert_eq!(rig.typed().len(), lines, "{name}: {:#?}", rig.asked());
+    }
+}
+
 /// A crash relaunch held by a person at the prompt waits with nothing typed and no witness
 /// recorded; carried at the next decision, its line goes in under the captured `CODEX_HOME`
 /// alias, the witness is recorded once the line landed, and the relaunch is done once the new
@@ -524,6 +607,7 @@ fn a_self_claimed_crash_relaunch_keeps_the_captured_home_environment() {
             cwd: Some(snap.cwd.clone()),
             draft_empty: None,
             frame: None,
+            initializing: false,
         };
         let live = ClaimedLive {
             exec_path: launch,
@@ -887,6 +971,7 @@ impl Crashed {
     /// The same world, its files to be set.
     fn clone_world(&self) -> Crashed {
         Crashed {
+            owners: Mutex::new(VecDeque::new()),
             relaunched: Arc::clone(&self.relaunched),
             lock: self.lock.clone(),
             new_argv: self.new_argv.clone(),

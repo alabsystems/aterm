@@ -938,7 +938,8 @@ pub use paths::a_force_detached_volume_is_no_working_directory;
 #[cfg(all(windows, any(test, debug_assertions)))]
 pub use paths::scan_path_users_of_within;
 pub use paths::{
-    Exe, PathScan, PathUse, exe_of, scan_path_users, scan_path_users_of, write_open_files,
+    Exe, PathScan, PathUse, exe_of, open_files, scan_path_users, scan_path_users_of,
+    write_open_files,
 };
 
 /// Test seams: run a closure between one table's listing and the reads of its descriptors (to

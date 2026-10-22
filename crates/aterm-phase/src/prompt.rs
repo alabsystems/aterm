@@ -1305,6 +1305,9 @@ pub enum RmCommand {
 /// Why the vendor's rm/rmdir circuit breaker fired: the suffix of its note
 /// (`Dangerous ${rm|rmdir} operation ${suffix}`). Every form is in the 2.1.281
 /// and 2.1.282 binaries; 2.1.280's lacks the drive root and the placeholder.
+/// The `— <why>` forms may open `not ruled out ` (2.1.307 on), and on 2.1.307
+/// they need no rm in the command: the vendor could not rule one out
+/// ([`Self::TooManySubstitutions`], [`Self::NestedUnanalyzed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RmBreakerKind {
     /// `on possibly-empty variable path[ inside command substitution]: …` —
@@ -1322,8 +1325,24 @@ pub enum RmBreakerKind {
     WorkingDirectory,
     /// `on drive root: …` (a backslash-only target; 2.1.281 on).
     DriveRoot,
-    /// `— too many command substitutions to analyze (N)`.
+    /// `on mounted drive path: …`: an `rm -r` (or a glob) of a mounted drive,
+    /// the folder that holds them or the top of one (`/Volumes/<x>[/<y>]`,
+    /// `/mnt/…`, `/media/…`). In the 2.1.304, 2.1.306 and 2.1.307 binaries;
+    /// MEASURED on 2.1.307 (`rm -rf /Volumes/zz-lab-none`).
+    MountedDrivePath,
+    /// `— too many command substitutions to analyze (N)`: more than 64. 2.1.307
+    /// draws it `not ruled out — too many …` (MEASURED), and for ANY command
+    /// with that many, rm or none (`echo` and 65 `$(true)`, MEASURED; behind
+    /// the vendor's `tengu_tingly_pearl` gate, on unless its server says off),
+    /// where 2.1.306 drew it only for a command naming rm.
     TooManySubstitutions,
+    /// `not ruled out — some nested commands or function substitutions could
+    /// not be analyzed` (2.1.307 on): a shell keyword right after an
+    /// assignment or a redirect (`X=1 if …`) whose `${ …; }` function
+    /// substitutions overrun the vendor's budget (more than 16) or do not
+    /// parse. No rm need be in the command (MEASURED: `X=1 if true; then echo`
+    /// and 17 `${ echo a; }`).
+    NestedUnanalyzed,
 }
 
 /// The vendor's rm/rmdir circuit-breaker note, read whole.
@@ -1331,14 +1350,16 @@ pub enum RmBreakerKind {
 pub struct RmBreaker {
     pub command: RmCommand,
     pub kind: RmBreakerKind,
-    /// What follows the suffix's colon (the target and any advice), or the
-    /// count for [`RmBreakerKind::TooManySubstitutions`].
+    /// What follows the suffix's colon (the target and any advice), the
+    /// count for [`RmBreakerKind::TooManySubstitutions`], or the why for
+    /// [`RmBreakerKind::NestedUnanalyzed`].
     pub target: String,
 }
 
 /// Read a note as the vendor's rm/rmdir circuit breaker: it opens with
 /// `Dangerous rm operation ` or `Dangerous rmdir operation `, goes on with
-/// one of the suffixes of [`RmBreakerKind`] and a non-empty remainder, and
+/// one of the suffixes of [`RmBreakerKind`] (a `— <why>` one with or without
+/// the `not ruled out ` before it) and a non-empty remainder, and
 /// holds no second `Dangerous` (a note block that joined a second warning
 /// is not one breaker). `None` for every other note — the model-facing
 /// `Dangerous rm operation detected: …` message included, which Claude Code
@@ -1390,6 +1411,11 @@ pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
             RmBreakerKind::WorkingDirectory,
         ),
         ("box.rm_breaker.drive_root", "", RmBreakerKind::DriveRoot),
+        (
+            "box.rm_breaker.mounted_drive",
+            "",
+            RmBreakerKind::MountedDrivePath,
+        ),
     ];
     let (kind, target) = SUFFIXES
         .iter()
@@ -1399,13 +1425,23 @@ pub fn rm_breaker_of(note: &str) -> Option<RmBreaker> {
                 .map(|t| (kind, t))
         })
         .or_else(|| {
-            // `— too many command substitutions to analyze (65)`.
-            let n = rest
-                .strip_prefix("— ")?
-                .strip_prefix(const { anchor_text("box.rm_breaker.too_many") })?
-                .strip_suffix(')')?;
-            (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-                .then_some((RmBreakerKind::TooManySubstitutions, n))
+            // The `— <why>` forms, each with or without 2.1.307's `not ruled
+            // out ` before it: `— too many command substitutions to analyze
+            // (65)`, and `— some nested commands or function substitutions
+            // could not be analyzed`.
+            let why = rest
+                .strip_prefix(const { anchor_text("box.rm_breaker.not_ruled_out") })
+                .unwrap_or(rest)
+                .strip_prefix("— ")?;
+            if let Some(n) = why
+                .strip_prefix(const { anchor_text("box.rm_breaker.too_many") })
+                .and_then(|n| n.strip_suffix(')'))
+            {
+                return (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    .then_some((RmBreakerKind::TooManySubstitutions, n));
+            }
+            (why == const { anchor_text("box.rm_breaker.nested_unanalyzed") })
+                .then_some((RmBreakerKind::NestedUnanalyzed, why))
         })?;
     let target = crate::text::trim(target);
     (!target.is_empty()).then(|| RmBreaker {
@@ -6003,6 +6039,85 @@ pub mod fixtures {
     /// back.
     pub const USAGE_DISMISSED_FULLSCREEN_2_1_301: &str =
         include_str!("fixtures/claude-2.1.301-usage-dismissed-fullscreen.txt");
+    // THE SAME PANEL ON CLAUDE CODE 2.1.307, MEASURED 2026-10-21 in the lab
+    // (docs/measured/claude-code-2.1.307-2026-10-21.md), the same six
+    // screens at 120x50. What moved: the fullscreen `▔` rule no longer
+    // carries the effort tag.
+    /// `/usage` typed, before the Enter, inline: `❯ /usage` over
+    /// `/usage-credits`.
+    pub const USAGE_MENU_INLINE_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-usage-menu-inline.txt");
+    /// The same on the fullscreen renderer.
+    pub const USAGE_MENU_FULLSCREEN_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-usage-menu-fullscreen.txt");
+    /// 3 s after the Enter, inline: the session block, the 42 % and 61 %
+    /// header readings, `Could not refresh usage data`, `r to retry · Esc to
+    /// cancel` last. NOT SETTLED.
+    pub const USAGE_HEADER_READINGS_INLINE_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-usage-header-readings-inline.txt");
+    /// The same on the fullscreen renderer, under a bare `▔` rule.
+    pub const USAGE_HEADER_READINGS_FULLSCREEN_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-usage-header-readings-fullscreen.txt");
+    /// One Escape after the tab, inline: `⎿  Settings dialog dismissed`.
+    pub const USAGE_DISMISSED_INLINE_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-usage-dismissed-inline.txt");
+    /// One Escape after the tab, fullscreen: no row left of it.
+    pub const USAGE_DISMISSED_FULLSCREEN_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-usage-dismissed-fullscreen.txt");
+    // CLAUDE CODE 2.1.307'S PERMISSION BOXES, MEASURED 2026-10-21 in the lab
+    // at 144x50 (`lab tool`, `lab settings`), launched
+    // `--permission-mode default` with harness approve=none, so each box
+    // stood until it was captured.
+    /// `Bash command` for `touch x`: the auto-mode tip row over its
+    /// description `Create x`, four options, the third the auto-mode switch.
+    pub const BOX_BASH_TOUCH_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-box-bash-touch.txt");
+    /// `Create file` for `w.txt`: three options, the second the accept-edits
+    /// switch.
+    pub const BOX_WRITE_CREATE_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-box-write-create.txt");
+    /// `Edit file` for `notes.txt`, after a Read: the same three options.
+    pub const BOX_EDIT_2_1_307: &str = include_str!("fixtures/claude-2.1.307-box-edit.txt");
+    /// `Bash command` for `touch y` under the ask rule `Bash(touch:*)`: the
+    /// rule's note, `Yes` and `No` alone.
+    pub const BOX_BASH_ASK_RULE_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-box-bash-ask-rule.txt");
+    /// `Bash command` for `touch z` under a `PreToolUse` hook that answered
+    /// `ask`: the hook's `│` note with its `[settings]` source.
+    pub const BOX_BASH_HOOK_ASK_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-box-bash-hook-ask.txt");
+    /// ` Ready to code?` after `ExitPlanMode`: `Yes, and use auto mode`,
+    /// `Yes, manually approve edits`, `Tell Claude what to change`.
+    pub const PLAN_READY_2_1_307: &str = include_str!("fixtures/claude-2.1.307-plan-ready.txt");
+    /// The rm breaker over a one-line command with 65 command substitutions
+    /// and an rm, manual mode: its note `Dangerous rm operation not ruled out
+    /// — too many command substitutions to analyze (65)` (2.1.306 drew it
+    /// without `not ruled out`), `Yes` and `No`.
+    pub const BOX_RM_TOO_MANY_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-box-bash-rm-too-many.txt");
+    /// The rm breaker's other `not ruled out` note, `… some nested commands
+    /// or function substitutions could not be analyzed`, over a command that
+    /// names no rm: `X=1 if true; then echo` and 17 `${ echo a; }` (a keyword
+    /// after an assignment, its function substitutions past the vendor's 16).
+    pub const BOX_RM_NESTED_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-box-bash-rm-nested-unanalyzed.txt");
+    /// The same shape with 16 `${ echo a; }`, inside the budget: the
+    /// statement-follows note and three options, no breaker.
+    pub const BOX_STATEMENT_FOLLOWS_16_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-box-bash-statement-follows-16-subs.txt");
+    /// The too-many breaker over a command that names no rm (`echo` and 65
+    /// `$(true)`), manual mode: 2.1.307 draws it for any command past 64
+    /// substitutions.
+    pub const BOX_RM_TOO_MANY_NO_RM_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-box-bash-rm-too-many-no-rm.txt");
+    /// The same box in a bypass session, its auto-deny countdown under the
+    /// note (2.1.306 ran this command in bypass with no box).
+    pub const BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-box-bash-rm-too-many-no-rm-bypass.txt");
+    /// The breaker on a mounted drive path, `rm -rf /Volumes/zz-lab-none`:
+    /// the command one short row with no bar, the note at column two.
+    pub const BOX_RM_MOUNTED_DRIVE_2_1_307: &str =
+        include_str!("fixtures/claude-2.1.307-box-bash-rm-mounted-drive.txt");
     /// ` Ready to code?`: the plan (its own `1.` step), a second rule, the
     /// options, and only `ctrl+g to edit in VS Code · <plan>` under them.
     pub const PLAN_READY: &str = include_str!("fixtures/claude-2.1.282-plan-ready.txt");
@@ -7970,10 +8085,11 @@ mod tests {
     }
 
     /// Every rm/rmdir breaker note form (2.1.282: `Dangerous ${rm|rmdir}
-    /// operation ${suffix}`) reads as the breaker, each suffix its own kind.
+    /// operation ${suffix}`) reads as the breaker, each suffix its own kind,
+    /// a `— <why>` one with or without 2.1.307's `not ruled out ` before it.
     /// Controls: the model-facing `… detected: …` message, a note block that
-    /// joined a second warning, an unknown suffix, an empty target, another
-    /// vendor note.
+    /// joined a second warning, an unknown suffix or why, an empty target,
+    /// the qualifier before an `on …` suffix, another vendor note.
     #[test]
     fn every_rm_breaker_note_form_is_the_breaker() {
         use RmBreakerKind::*;
@@ -8033,10 +8149,28 @@ mod tests {
                 "\\",
             ),
             (
+                "Dangerous rm operation on mounted drive path: /Volumes/zz-lab-none",
+                RmCommand::Rm,
+                MountedDrivePath,
+                "/Volumes/zz-lab-none",
+            ),
+            (
                 "Dangerous rm operation — too many command substitutions to analyze (65)",
                 RmCommand::Rm,
                 TooManySubstitutions,
                 "65",
+            ),
+            (
+                "Dangerous rm operation not ruled out — too many command substitutions to analyze (65)",
+                RmCommand::Rm,
+                TooManySubstitutions,
+                "65",
+            ),
+            (
+                "Dangerous rm operation not ruled out — some nested commands or function substitutions could not be analyzed",
+                RmCommand::Rm,
+                NestedUnanalyzed,
+                "some nested commands or function substitutions could not be analyzed",
             ),
             (
                 "Dangerous rmdir operation on statically-unresolvable target: /tmp/a/*",
@@ -8064,6 +8198,13 @@ mod tests {
             "Dangerous rm operation on something new: /x",
             "Dangerous rm operation on critical path: ",
             "Dangerous rm operation — too many command substitutions to analyze (lots)",
+            "Dangerous rm operation not ruled out — too many command substitutions to analyze (lots)",
+            "Dangerous rm operation not ruled out — something new",
+            "Dangerous rm operation not ruled out — ",
+            "Dangerous rm operation not ruled out on critical path: /usr",
+            "Dangerous rm operation on mounted drive path: ",
+            "Dangerous rm operation on mounted drive: /Volumes/x",
+            "Dangerous rm operation not ruled out some nested commands or function substitutions could not be analyzed",
             "This command requires approval",
             "Permission rule Bash(rm:*) requires confirmation for this command.",
         ] {
@@ -8155,6 +8296,221 @@ mod tests {
                 Some("Accessing workspace:")
             );
         }
+    }
+
+    /// CLAUDE CODE 2.1.307'S BOXES MEASURED IN THE LAB (crates/aterm-lab,
+    /// 2026-10-21; docs/measured/claude-code-2.1.307-2026-10-21.md): each box
+    /// reads its kind, its subject, its options' roles with the cursor on
+    /// `1. Yes`, and an Esc that refuses it, in both readers; the Bash box's
+    /// auto-mode tip row is neither its command nor its description; the ask
+    /// rule and the hook read as the owner's review, the session's own boxes
+    /// as none. The rm breaker's `not ruled out — …` notes read as the
+    /// breaker (2.1.306's reader saw no breaker in them), over a command with
+    /// an rm and over ones with none, in bypass too; its mounted-drive note
+    /// reads as [`RmBreakerKind::MountedDrivePath`] (once a plain vendor
+    /// note). Plan mode's `Ready to code?` reads its three options.
+    /// NEGATIVE CONTROLS: each screen cut above its box's title holds no box
+    /// (the transcript's tool rows over it are none); the plain Bash box and
+    /// the nested shape inside the vendor's budget are no breaker.
+    #[test]
+    fn the_2_1_307_lab_boxes_read_as_measured() {
+        use Role::{Deny, ModeSwitch, Once, Persist};
+        for (what, text, kind, subject, description, roles, review) in [
+            (
+                "bash",
+                BOX_BASH_TOUCH_2_1_307,
+                PromptKind::Bash,
+                "touch x",
+                "Create x",
+                &[Once, Persist, ModeSwitch, Deny][..],
+                None,
+            ),
+            (
+                "write",
+                BOX_WRITE_CREATE_2_1_307,
+                PromptKind::Write,
+                "w.txt",
+                "",
+                &[Once, ModeSwitch, Deny][..],
+                None,
+            ),
+            (
+                "edit",
+                BOX_EDIT_2_1_307,
+                PromptKind::Edit,
+                "notes.txt",
+                "",
+                &[Once, ModeSwitch, Deny][..],
+                None,
+            ),
+            (
+                "ask rule",
+                BOX_BASH_ASK_RULE_2_1_307,
+                PromptKind::Bash,
+                "touch y",
+                "Create y",
+                &[Once, Deny][..],
+                Some(ReviewKind::Rule),
+            ),
+            (
+                "hook",
+                BOX_BASH_HOOK_ASK_2_1_307,
+                PromptKind::Bash,
+                "touch z",
+                "Create z",
+                &[Once, Deny][..],
+                Some(ReviewKind::Hook),
+            ),
+        ] {
+            let r = screen(text);
+            assert_eq!(
+                crate::phase::worker_phase(&r),
+                crate::phase::Phase::Prompt,
+                "{what}"
+            );
+            let p = parse_prompt_v2(&r).unwrap_or_else(|| panic!("{what}: the box"));
+            assert_eq!(p.kind, kind, "{what}");
+            if kind == PromptKind::Bash {
+                assert_eq!(p.command, subject, "{what}");
+                assert_eq!(p.description, description, "{what}");
+                assert!(
+                    p.readings().iter().all(|r| !r.contains("Tip:")),
+                    "{what}: {:?}",
+                    p.readings()
+                );
+            } else {
+                assert_eq!(p.path.as_deref(), Some(subject), "{what}");
+            }
+            assert_eq!(
+                p.options.iter().map(|o| o.role).collect::<Vec<_>>(),
+                roles,
+                "{what}: {:?}",
+                p.options
+            );
+            assert_eq!(p.select, Select::Digits, "{what}");
+            let first = p.focused().expect("the cursor");
+            assert_eq!((first.n, first.label.as_str()), (Some(1), "Yes"), "{what}");
+            assert_eq!(
+                p.cancel.as_ref().map(|c| c.effect),
+                Some(CancelEffect::Reject),
+                "{what}"
+            );
+            assert_eq!(p.owner_review().map(|o| o.kind), review, "{what}");
+            let v1 = parse_prompt(&r).unwrap_or_else(|| panic!("{what}: v1"));
+            assert_eq!(v1.command, subject, "{what}");
+            assert_eq!(
+                v1.options.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+                (1..=u8::try_from(roles.len()).expect("a few")).collect::<Vec<_>>(),
+                "{what}"
+            );
+            let (top, _) = prompt_box_span(&r).expect("the span");
+            assert_eq!(parse_prompt_v2(&r[..top]), None, "{what}: cut above");
+            assert_eq!(parse_prompt(&r[..top]), None, "{what}: cut above, v1");
+        }
+        // The rm breaker: its 2.1.307 notes read as the breaker of their kind,
+        // over a command with an rm, with none (the vendor could not rule one
+        // out), in bypass under the countdown, and on a mounted drive.
+        let nested_command = format!("X=1 if true; then echo{}; fi", " ${ echo a; }".repeat(17));
+        let no_rm_command = format!("echo{}", " $(true)".repeat(65));
+        for (what, text, command, kind, target) in [
+            (
+                "too many, rm",
+                BOX_RM_TOO_MANY_2_1_307,
+                None,
+                RmBreakerKind::TooManySubstitutions,
+                "65",
+            ),
+            (
+                "too many, no rm",
+                BOX_RM_TOO_MANY_NO_RM_2_1_307,
+                Some(no_rm_command.as_str()),
+                RmBreakerKind::TooManySubstitutions,
+                "65",
+            ),
+            (
+                "too many, no rm, bypass",
+                BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307,
+                Some(no_rm_command.as_str()),
+                RmBreakerKind::TooManySubstitutions,
+                "65",
+            ),
+            (
+                "nested, no rm",
+                BOX_RM_NESTED_2_1_307,
+                Some(nested_command.as_str()),
+                RmBreakerKind::NestedUnanalyzed,
+                "some nested commands or function substitutions could not be analyzed",
+            ),
+            (
+                "mounted drive",
+                BOX_RM_MOUNTED_DRIVE_2_1_307,
+                Some("rm -rf /Volumes/zz-lab-none"),
+                RmBreakerKind::MountedDrivePath,
+                "/Volumes/zz-lab-none",
+            ),
+        ] {
+            let r = screen(text);
+            assert_eq!(
+                crate::phase::worker_phase(&r),
+                crate::phase::Phase::Prompt,
+                "{what}"
+            );
+            let p = parse_prompt_v2(&r).unwrap_or_else(|| panic!("{what}: the rm box"));
+            assert_eq!(p.kind, PromptKind::Bash, "{what}");
+            match command {
+                Some(c) => assert_eq!(p.command, c, "{what}"),
+                None => assert!(p.command.ends_with("; rm -f zz-none"), "{}", p.command),
+            }
+            assert_eq!(
+                p.options.iter().map(|o| o.role).collect::<Vec<_>>(),
+                [Role::Once, Role::Deny],
+                "{what}"
+            );
+            let b = p
+                .rm_breaker()
+                .unwrap_or_else(|| panic!("{what}: {:?}", p.notes));
+            assert_eq!(
+                (b.command, b.kind, b.target.as_str()),
+                (RmCommand::Rm, kind, target),
+                "{what}"
+            );
+            let (top, _) = prompt_box_span(&r).expect("the span");
+            assert_eq!(parse_prompt_v2(&r[..top]), None, "{what}: cut above");
+        }
+        // NEGATIVE CONTROLS: the plain Bash box is no breaker, and neither is
+        // the nested shape inside the vendor's budget (16 function
+        // substitutions): its statement-follows note is a plain vendor note.
+        let plain = parse_prompt_v2(&screen(BOX_BASH_TOUCH_2_1_307)).expect("the box");
+        assert_eq!(plain.rm_breaker(), None);
+        let within = parse_prompt_v2(&screen(BOX_STATEMENT_FOLLOWS_16_2_1_307)).expect("the box");
+        assert_eq!(
+            within.command,
+            format!("X=1 if true; then echo{}; fi", " ${ echo a; }".repeat(16))
+        );
+        assert_eq!(within.notes.len(), 1, "{:?}", within.notes);
+        assert!(
+            within.notes[0].starts_with("statement directly follows another statement"),
+            "{:?}",
+            within.notes
+        );
+        assert_eq!(within.rm_breaker(), None);
+        let r = screen(PLAN_READY_2_1_307);
+        let p = parse_prompt_v2(&r).expect("the plan box");
+        assert_eq!(p.kind, PromptKind::PlanExit);
+        assert_eq!(
+            p.options
+                .iter()
+                .map(|o| o.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Yes, and use auto mode",
+                "Yes, manually approve edits",
+                "Tell Claude what to change"
+            ]
+        );
+        assert_eq!(p.focused().map(|o| o.n), Some(Some(1)));
+        let (top, _) = prompt_box_span(&r).expect("the span");
+        assert_eq!(parse_prompt_v2(&r[..top]), None, "plan: cut above");
     }
 
     /// THE USAGE-LIMIT DIALOG (module header): the dialog Claude Code

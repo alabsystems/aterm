@@ -71,6 +71,9 @@ use crate::protected::{
 /// The profile's fixed text, with `@…@` holes for what each lab names.
 const TEMPLATE: &str = include_str!("jail.sb");
 
+/// The same preference-channel denials in the regular lab and Codex rig.
+pub(crate) const PREFERENCES: &str = include_str!("preferences.sb");
+
 /// What a lab's profile names: its run and socket directories, the agents
 /// under test, whose data it guards, its mark, and what the lab trusts from
 /// OUTSIDE the jail (its state dir, its own program and source, the aterm its
@@ -116,7 +119,20 @@ impl Spec {
     /// `repo_target` filled from this program's own facts.
     #[must_use]
     pub fn for_lab(run: &str, claude: &str, codex: &str, sockdir: &str, mark: &str) -> Spec {
-        let p = crate::paths::paths();
+        Spec::for_lab_in(crate::paths::paths(), run, claude, codex, sockdir, mark)
+    }
+
+    /// [`Spec::for_lab`] from the facts `p` (the seam a test hands a fake
+    /// account home: [`crate::paths::Paths::resolve_with`]).
+    #[must_use]
+    pub fn for_lab_in(
+        p: &crate::paths::Paths,
+        run: &str,
+        claude: &str,
+        codex: &str,
+        sockdir: &str,
+        mark: &str,
+    ) -> Spec {
         Spec {
             run: run.into(),
             claude: claude.into(),
@@ -412,11 +428,32 @@ pub fn render(spec: &Spec) -> Result<String, String> {
             .iter()
             .map(|n| format!("(literal \"{run}/scratch/{n}\")")),
     );
+    // The harness's tape store (`aterm_agent::supervise::tape::store`) opens every directory from `/` down to the
+    // instance's state root (`<run>/scratch/state`), one no-follow open at a time, and keeps no tape when one is
+    // refused: a home's read fence refuses the run directory's ancestors inside it (the run sits in the checkout,
+    // in the account's home). Each of those directories is reopened alone.
+    let mut walk: Vec<String> = Vec::new();
+    for h in &homes {
+        if !Path::new(&run).starts_with(h) {
+            continue;
+        }
+        let mut p = run.clone();
+        loop {
+            walk.push(format!("(literal \"{p}\")"));
+            if p == *h || p == "/" {
+                break;
+            }
+            p = parent(&p);
+        }
+    }
+    walk.sort();
+    walk.dedup();
     let mut out = String::with_capacity(TEMPLATE.len() + 8192);
     for line in TEMPLATE.lines() {
         let piece = match line {
             "@MACH_DENY@" => deny_mach(MACH_DENY),
             "@MACH_DENY_OPEN@" => deny_mach(MACH_DENY_OPEN),
+            "@PREFERENCES@" => PREFERENCES.to_string(),
             "@PROTECTED@" => data.join("\n"),
             "@TMP_REPLICA@" => tmp_replica.join("\n"),
             "@AGENT_STORE@" => store.join("\n"),
@@ -425,6 +462,8 @@ pub fn render(spec: &Spec) -> Result<String, String> {
                 .map(|h| format!("(deny file-read-data (subpath \"{h}\"))"))
                 .collect::<Vec<_>>()
                 .join("\n"),
+            "@RUN_WALK@" if walk.is_empty() => String::new(),
+            "@RUN_WALK@" => format!("(allow file-read-data {})", walk.join(" ")),
             "@HOME_WRITE_DENY@" => homes
                 .iter()
                 .map(|h| format!("(deny file-write* (subpath \"{h}\"))"))
@@ -839,19 +878,28 @@ mod tests {
         s.agy = selected.display().to_string();
         s.lab_dirs = vec![source.display().to_string()];
         let operations = top.join("operations.txt");
-        std::fs::write(
-            &operations,
-            checks
-                .iter()
-                .map(|(op, _)| format!("{}\n", op.encode()))
-                .collect::<String>(),
-        )
-        .unwrap();
         let me = std::env::current_exe().unwrap();
-        for (name, body, contained) in [
-            ("control", "(version 1)(allow default)".into(), false),
-            ("contained", render(&s).unwrap(), true),
+        for (name, body, contained, preferences_only) in [
+            ("control", "(version 1)(allow default)".into(), false, false),
+            ("contained", render(&s).unwrap(), true, false),
+            ("proof", crate::codex_rig::jail_policy(4242), true, true),
         ] {
+            // Exercise the proof's actual policy on decision queries and
+            // exclusively owned shared memory, never a preferences service.
+            let checks: Vec<_> = checks
+                .iter()
+                .filter(|(op, _)| {
+                    !preferences_only || matches!(op, Op::PreferencePolicy(..) | Op::ShmRead(..))
+                })
+                .collect();
+            std::fs::write(
+                &operations,
+                checks
+                    .iter()
+                    .map(|(op, _)| format!("{}\n", op.encode()))
+                    .collect::<String>(),
+            )
+            .unwrap();
             let profile = top.join(format!("{name}.sb"));
             std::fs::write(&profile, body).unwrap();
             let mut cmd = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
@@ -907,6 +955,201 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The profile of a lab whose facts are `p`, on the test's run, socket,
+    /// state and temp dirs.
+    fn profile_of(d: &Dirs, p: &crate::paths::Paths, claude: &str) -> Result<String, String> {
+        let mut s = Spec::for_lab_in(
+            p,
+            &d.run,
+            claude,
+            "",
+            &d.sock,
+            "lab.jail.t.0123456789abcdef",
+        );
+        s.state.clone_from(&d.state);
+        s.user_tmp.clone_from(&d.ut);
+        s.lab_dirs = vec!["/L/bin".into(), "/L/src".into()];
+        s.aterm = "/A/aterm".into();
+        s.repo_target = "/R/target".into();
+        render(&s)
+    }
+
+    /// The rules a profile makes of the owner's data in `home`, as the
+    /// protected list words them (`.ssh`, `.claude.json`, `.gemini`,
+    /// `.codex`, Muse Code's and Antigravity's data, a browser profile), and
+    /// its bans on reading and writing the rest of it.
+    fn home_rules(home: &str) -> Vec<String> {
+        let mut rules: Vec<String> = [
+            ("subpath", ".ssh"),
+            ("prefix", ".claude.json"),
+            ("subpath", ".claude"),
+            ("subpath", ".gemini"),
+            ("subpath", ".codex"),
+            ("subpath", ".local/share/muse"),
+            ("subpath", "Library/Application Support/Muse"),
+            ("prefix", "Library/Application Support/Antigravity"),
+            ("subpath", "Library/Application Support/Google"),
+        ]
+        .iter()
+        .map(|(kind, rel)| format!("(deny file-read* file-write* ({kind} \"{home}/{rel}\"))"))
+        .collect();
+        rules.push(format!("(deny file-write* (subpath \"{home}\"))"));
+        rules.push(format!("(deny file-read-data (subpath \"{home}\"))"));
+        rules
+    }
+
+    /// THE JAIL A LAB'S OWN FACTS MAKE GUARDS THE ACCOUNT'S HOME UNDER A
+    /// SCRATCH `HOME`: [`Spec::for_lab_in`] on facts resolved with a fake
+    /// account home (the account database's, through
+    /// [`crate::paths::Paths::resolve_with`]) and a scratch `HOME` (every agent
+    /// run's rule) renders every entry of the protected list in both, reads
+    /// and writes banned in both, each shared rule once; an agent in the
+    /// account's package store keeps its build; and a run directory inside the
+    /// account's data is refused. NEGATIVE CONTROL: facts that take `HOME` as
+    /// the account's home (the lab before the fence) name none of the
+    /// account's paths and let that run directory through; facts with no
+    /// account home are refused.
+    #[test]
+    fn the_jail_of_the_lab_s_facts_guards_the_account_home_and_a_scratch_home_both() {
+        use crate::paths::Paths;
+        let d = dirs();
+        let top = std::fs::canonicalize(&d.top).unwrap();
+        let (account, scratch) = (top.join("account"), top.join("scratch-home"));
+        for h in [&account, &scratch] {
+            std::fs::create_dir_all(h).unwrap();
+        }
+        let (a, s) = (account.display().to_string(), scratch.display().to_string());
+        let p = Paths::resolve_with(Some(account.clone()), Some(scratch.clone().into()));
+        let store = format!("{a}/Library/Application Support/aterm/pkg/store/claude/1");
+        let profile = profile_of(&d, &p, &format!("{store}/bin/claude")).unwrap();
+        for rule in home_rules(&a).iter().chain(&home_rules(&s)) {
+            assert!(profile.contains(rule.as_str()), "{rule}");
+        }
+        let rules = profile
+            .lines()
+            .filter(|l| l.starts_with("(deny file-read* file-write* ("))
+            .count();
+        assert_eq!(
+            rules,
+            2 * protected_paths(&a, "/private/tmp/cc-socks").len() - 1,
+            "each home's list, the shared Claude sockets rule once"
+        );
+        assert!(profile.contains(&format!("(allow file-read* (subpath \"{store}\"))")));
+        // a run directory in the account's data is refused under the scratch HOME too
+        let inside = account.join(".config/run");
+        std::fs::create_dir_all(inside.join("scratch")).unwrap();
+        let mut in_data = Spec::for_lab_in(&p, &inside.to_string_lossy(), "/x", "", &d.sock, "");
+        in_data.state.clone_from(&d.state);
+        in_data.user_tmp.clone_from(&d.ut);
+        let err = render(&in_data).unwrap_err();
+        assert!(err.contains("owner's data"), "{err}");
+        // NEGATIVE CONTROL: HOME taken as the account's home
+        let env_only = Paths::resolve_with(Some(scratch.clone()), Some(scratch.clone().into()));
+        let bare = profile_of(&d, &env_only, &format!("{store}/bin/claude")).unwrap();
+        for rule in home_rules(&s) {
+            assert!(bare.contains(rule.as_str()), "{rule}");
+        }
+        assert!(
+            !bare.contains(&format!("\"{a}/")),
+            "nothing of the account's"
+        );
+        assert!(
+            !bare.contains(&format!("\"{a}\"")),
+            "nothing of the account's"
+        );
+        let mut bare_in =
+            Spec::for_lab_in(&env_only, &inside.to_string_lossy(), "/x", "", &d.sock, "");
+        bare_in.state.clone_from(&d.state);
+        bare_in.user_tmp.clone_from(&d.ut);
+        assert!(
+            render(&bare_in).is_ok(),
+            "its run in the account's data goes through"
+        );
+        // no account home at all is refused, whatever HOME says
+        let none = Paths::resolve_with(None, Some(scratch.into()));
+        assert!(profile_of(&d, &none, "/x").is_err());
+    }
+
+    /// THE HARNESS'S TAPE STORE WALKS THROUGH THE HOME FENCE TO ITS STATE
+    /// ROOT: a lab's run directory sits in the checkout, in the account's
+    /// home, and the tape store opens every directory from `/` down to
+    /// `<run>/scratch/state` (no-follow, one at a time). Under the profile,
+    /// applied, each of those opens goes through, while a sibling directory
+    /// of the walk, a file beside it and a protected entry of the home stay
+    /// shut. NEGATIVE CONTROL: the same profile without the walk's rule
+    /// refuses the home's own directory (the store then keeps no tape).
+    #[test]
+    fn the_tape_store_walks_through_the_home_fence_to_the_run() {
+        let d = dirs();
+        let top = std::fs::canonicalize(&d.top).unwrap();
+        let home = top.join("account");
+        let run = home.join("Developer/lab/runs/t");
+        let state = run.join("scratch/state");
+        for dir in [state.clone(), home.join("Developer/other")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        for f in [home.join("plain"), home.join(".ssh/id")] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, "owned replica\n").unwrap();
+        }
+        let mut s = spec(&d, "/x", "", &home.display().to_string());
+        s.run = run.display().to_string();
+        let profile = render(&s).unwrap();
+        let mut walk: Vec<std::path::PathBuf> = state.ancestors().map(Path::to_path_buf).collect();
+        walk.reverse();
+        let shut = [
+            home.join("Developer/other"),
+            home.join("plain"),
+            home.join(".ssh/id"),
+        ];
+        let opens = |profile: &str| -> Vec<String> {
+            let file = top.join("walk.sb");
+            std::fs::write(&file, profile).unwrap();
+            let mut cmd = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
+            cmd.arg("-f")
+                .arg(&file)
+                .args([
+                    "/bin/sh",
+                    "-c",
+                    r#"for p in "$@"; do if (exec 3< "$p") 2>/dev/null; then echo ok; else echo no; fi; done"#,
+                    "sh",
+                ])
+                .args(walk.iter().chain(&shut))
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin");
+            let out = aterm_uds::deadline::outputs_until(
+                &mut [&mut cmd],
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+            )
+            .pop()
+            .unwrap()
+            .expect("the walk ran");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        let mut want = vec!["ok"; walk.len()];
+        want.extend(["no"; 3]);
+        assert_eq!(opens(&profile), want, "{walk:?} {shut:?}");
+        // NEGATIVE CONTROL: without the walk's rule the home's own directory is refused
+        let rule = format!("(literal \"{}\")", home.display());
+        let bare: String = profile
+            .lines()
+            .filter(|l| !(l.starts_with("(allow file-read-data (literal") && l.contains(&rule)))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_ne!(bare, profile, "the walk's rule is in the profile");
+        let at = walk.iter().position(|p| *p == home).unwrap();
+        assert_eq!(opens(&bare)[at], "no");
     }
 
     #[test]

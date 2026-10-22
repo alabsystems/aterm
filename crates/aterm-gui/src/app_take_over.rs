@@ -22,7 +22,6 @@
 //! * **Show Needs in Windows** flips the live bit at the click and queues the
 //!   `[presence] rim` leaf's durable write through the serialized config lane
 //!   (`App::queue_presence_write`), as Serious Mode persists.
-//! * **Show Identity** opens the focused session's identity as a tab.
 //!
 //! Headless (no OS window, the test harness) every row composes and writes
 //! nothing outside the process: the command plan is kept on the App, no child
@@ -524,33 +523,6 @@ pub(crate) fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     }
     let mut file = opts.open(path)?;
     file.write_all(text.as_bytes())
-}
-
-/// The Show Identity tab's text: a heading, then either the `identities <name>`
-/// reply verbatim in a fenced block, or the sentence for a session with none.
-pub(crate) fn identity_markdown(sid: &str, identity: Option<&str>, reply: Option<&str>) -> String {
-    let mut s = String::with_capacity(256 + reply.map_or(0, str::len));
-    match identity {
-        Some(name) => {
-            s.push_str(&format!("# Identity \u{2014} {name}\n\n"));
-            s.push_str(&format!(
-                "Session {sid} runs under the agent identity `{name}`: its agents keep \
-                 their homes (and logins) in the identity's own directory. Read-only.\n\n"
-            ));
-            s.push_str("```text\n");
-            s.push_str(reply.unwrap_or("").trim_end());
-            s.push_str("\n```\n");
-        }
-        None => {
-            s.push_str("# Identity \u{2014} none\n\n");
-            s.push_str(&format!(
-                "Session {sid} carries no agent identity: it runs under your own agent \
-                 configuration. File \u{25b8} New Tab With Identity\u{2026} (or `spawn \
-                 identity=<name>`) starts a session that has one.\n"
-            ));
-        }
-    }
-    s
 }
 
 /// A command's tab text: the command, how it ended, what a Take Over on
@@ -1316,39 +1288,6 @@ impl App {
         }
     }
 
-    /// Show Identity (palette): the focused session's agent identity, read-only,
-    /// as a Markdown tab: the `identities <name>` reply when the session wears
-    /// one, else a sentence saying it runs under the user's own agent
-    /// configuration.
-    pub(crate) fn open_session_identity_tab(&mut self, wid: WindowId) {
-        let Some(session) = self.focused_session_id(wid) else {
-            return;
-        };
-        let Some(sid) = self
-            .pool
-            .get(session)
-            .map(|s| s.ctx.self_id.as_str().to_string())
-        else {
-            return;
-        };
-        let identity = self.identity_of_local(session);
-        let reply = identity
-            .as_deref()
-            .map(|name| crate::agent_identity::cmd_identities(&self.store, name));
-        let text = identity_markdown(&sid, identity.as_deref(), reply.as_deref());
-        let path = menu_document_path("identity", &sid);
-        match write_private(&path, &text) {
-            Ok(()) => {
-                self.open_menu_document(wid, path);
-            }
-            Err(e) => self.menu_failure(
-                "identity",
-                "Show Identity did not open",
-                &[&e.to_string(), &path.display().to_string()],
-            ),
-        }
-    }
-
     /// Open a file this menu wrote as a Markdown tab on `wid` (the same
     /// admission every Open Markdown… takes), remembering it for the tests.
     /// `false` (and said on the band) when no tab was asked for.
@@ -2052,45 +1991,6 @@ mod tests {
         let mine =
             crate::message_reporters::long_hold_entry(ctx.self_id.as_str(), "-", 30, None).key();
         assert_eq!(keys(&app), [mine], "this tab's entry, the earlier one gone");
-    }
-
-    /// Show Identity: a session with no identity opens a read-only, owner-private
-    /// tab saying so; for a session that wears one, the markdown fences the
-    /// `identities <name>` reply verbatim.
-    #[test]
-    fn show_identity_opens_a_read_only_tab_for_the_focused_session() {
-        let (mut app, wid, _sid, ctx) = app_with_stub();
-        app.open_session_identity_tab(wid);
-        let path = app
-            .last_menu_document
-            .clone()
-            .expect("a document was written");
-        let text = std::fs::read_to_string(&path).expect("readable");
-        assert!(text.starts_with("# Identity \u{2014} none\n"), "{text}");
-        assert!(
-            text.contains(&format!(
-                "Session {} carries no agent identity",
-                ctx.self_id.as_str()
-            )),
-            "{text}"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "the document is the owner's");
-        }
-        let _ = std::fs::remove_file(&path);
-
-        let worn = super::identity_markdown(
-            "s-abc",
-            Some("worker"),
-            Some("OK 2\nworker dir=/x sessions=1 agents=claude:present\nagent=claude\n"),
-        );
-        assert!(worn.starts_with("# Identity \u{2014} worker\n"));
-        assert!(worn.ends_with(
-            "```text\nOK 2\nworker dir=/x sessions=1 agents=claude:present\nagent=claude\n```\n"
-        ));
     }
 
     /// Set Role…: the pin's editor, one field over — the commit writes `meta

@@ -15,8 +15,8 @@ use atpkg_publish::host::fake::FakeHost;
 use atpkg_publish::testkit::Keys;
 
 use super::fixture::{
-    Answer, EM_AARCH64, EM_X86_64, FakeTools, elf, git, put, put_exe, ran, scratch,
-    toolchain as fixture_toolchain,
+    Answer, EM_AARCH64, EM_X86_64, FakeTools, checkout as fixture_checkout, elf, git, put, put_exe,
+    ran, scratch, toolchain as fixture_toolchain,
 };
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
@@ -37,10 +37,7 @@ fn world(label: &str) -> World {
     put_exe(&bin.join("cargo"), &elf(EM_X86_64, 2, 1));
     put_exe(&bin.join("trustdoc"), &elf(EM_X86_64, 2, 1));
     let checkout = root.join("trust-ir");
-    put(&checkout.join("Cargo.toml"), b"[workspace]\n");
-    git(&checkout, &["init", "-q", "."]);
-    git(&checkout, &["add", "-A"]);
-    git(&checkout, &["commit", "-q", "-m", "one"]);
+    fixture_checkout(&checkout, &[("Cargo.toml", b"[workspace]\n")]);
     World {
         _tmp: tmp,
         root,

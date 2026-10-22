@@ -39,6 +39,7 @@ pub struct PetRect {
 }
 
 impl PetRect {
+    #[inline]
     #[must_use]
     pub const fn new(row: f32, col: f32, rows: f32, cols: f32) -> Self {
         Self {
@@ -49,11 +50,13 @@ impl PetRect {
         }
     }
 
+    #[inline]
     #[must_use]
     pub fn foot_row(self) -> f32 {
         self.row + self.rows - 1.0
     }
 
+    #[inline]
     #[must_use]
     pub fn valid(self) -> bool {
         self.row.is_finite()
@@ -65,6 +68,7 @@ impl PetRect {
     }
 
     /// Do these two rectangles share any area at all?
+    #[inline]
     #[must_use]
     pub fn overlaps(self, other: Self) -> bool {
         self.valid()
@@ -75,6 +79,7 @@ impl PetRect {
             && other.col < self.col + self.cols
     }
 
+    #[inline]
     fn union(self, other: Self) -> Self {
         let row = self.row.min(other.row);
         let col = self.col.min(other.col);
@@ -114,6 +119,7 @@ pub struct PetReserve<'a> {
 impl<'a> PetReserve<'a> {
     /// Only protected surfaces: the reserve before typed glyphs were told
     /// apart, and every host that splices none.
+    #[inline]
     #[must_use]
     pub const fn protected(protected: &'a [PetRect]) -> Self {
         Self {
@@ -136,7 +142,7 @@ enum Window {
 }
 
 /// One map-local cell that only the live caret's 3x3 ring protects.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct CaretCell {
     row: usize,
     col: usize,
@@ -168,6 +174,7 @@ pub struct PetPane {
 }
 
 impl PetPane {
+    #[inline]
     #[must_use]
     pub fn full(input: &RenderInput) -> Self {
         Self {
@@ -210,6 +217,7 @@ impl PetWorldStamp {
     /// A last visible caret remains a screen-local home through a completely
     /// explained scroll. Content anchors still use the stricter whole-surface
     /// identity: this permission neither translates them nor invents input.
+    #[inline]
     pub(crate) fn preserves_cursor_home(self, previous: Self) -> bool {
         let a = previous.surface;
         let b = self.surface;
@@ -390,7 +398,8 @@ pub struct PetWorld {
     /// the ground plane only the caret protects them, so its readers forgive
     /// them as `caret_cells` are forgiven on the live plane (a shell's stand
     /// sits in the ring by design). At most nine, with `caret_cells`.
-    ground_caret_cells: [Option<CaretCell>; 9],
+    ground_caret_cells: [CaretCell; 9],
+    ground_caret_cells_len: u8,
     /// Per map row, the map-local columns `[lo, hi)` from its first
     /// substantive ink to its last: a glyph (not a lone Braille speck) or a
     /// coloured background. A gap between a line's words, the gutter of a
@@ -401,7 +410,8 @@ pub struct PetWorld {
     coverage: PetPane,
     /// Map-local cells only the live caret's 3x3 ring protects (at most nine), kept apart so
     /// each visibility reading forgives its own subset ([`Forgive`]).
-    caret_cells: [Option<CaretCell>; 9],
+    caret_cells: [CaretCell; 9],
+    caret_cells_len: u8,
     stamp: Option<PetWorldStamp>,
     anchors: [Option<PetAnchor>; MAX_WORLD_ANCHORS],
     selection_rect: Option<PetRect>,
@@ -422,10 +432,12 @@ impl Default for PetWorld {
             ground_blocked_prefix: vec![0; (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1)],
             ground_protected_prefix: vec![0; (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1)],
             ground_split: false,
-            ground_caret_cells: [None; 9],
+            ground_caret_cells: [CaretCell::default(); 9],
+            ground_caret_cells_len: 0,
             hull: vec![(0, 0); MAX_WORLD_ROWS],
             coverage: PetPane::default(),
-            caret_cells: [None; 9],
+            caret_cells: [CaretCell::default(); 9],
+            caret_cells_len: 0,
             stamp: None,
             anchors: [None; MAX_WORLD_ANCHORS],
             selection_rect: None,
@@ -438,12 +450,13 @@ impl Default for PetWorld {
 
 impl PetWorld {
     /// Retire all geometry without reallocating the bounded buffer.
+    #[inline]
     pub fn retire(&mut self) {
         self.stamp = None;
         self.coverage = PetPane::default();
         self.ground_split = false;
-        self.caret_cells = [None; 9];
-        self.ground_caret_cells = [None; 9];
+        self.caret_cells_len = 0;
+        self.ground_caret_cells_len = 0;
         self.anchors = [None; MAX_WORLD_ANCHORS];
         self.selection_rect = None;
         self.selection_target = None;
@@ -451,33 +464,40 @@ impl PetWorld {
         self.examined_cells = 0;
     }
 
+    #[inline]
     #[must_use]
     pub fn stamp(&self) -> Option<PetWorldStamp> {
         self.stamp
     }
+    #[inline]
     #[must_use]
     #[cfg(test)]
     pub fn coverage(&self) -> PetPane {
         self.coverage
     }
+    #[inline]
     #[must_use]
     pub fn examined_cells(&self) -> usize {
         self.examined_cells
     }
+    #[inline]
     #[must_use]
     pub fn anchors(&self) -> &[Option<PetAnchor>; MAX_WORLD_ANCHORS] {
         &self.anchors
     }
+    #[inline]
     #[must_use]
     pub fn selection_rect(&self) -> Option<PetRect> {
         self.selection_rect
     }
+    #[inline]
     #[must_use]
     pub fn selection_target(&self) -> Option<(f32, f32)> {
         self.selection_target
     }
     /// The application's last explicit state. No task identity, update event,
     /// or command completion is inferred from this sampled value.
+    #[inline]
     #[must_use]
     pub fn progress(&self) -> Option<TaskbarProgress> {
         self.progress
@@ -485,12 +505,14 @@ impl PetWorld {
 
     /// Rebuild from a coherent pre-effects snapshot. False retires every
     /// observation. Callers must not fall back to a previous successful map.
+    #[inline]
     pub fn observe(&mut self, input: &RenderInput, facts: &PetWorldFacts, pane: PetPane) -> bool {
         self.observe_with_exclusions(input, facts, pane, &[])
     }
 
     /// As `observe`, with pane-local search/menu/overlay exclusion rectangles.
     /// An excessive list fails closed rather than dropping a protected region.
+    #[inline]
     pub fn observe_with_exclusions(
         &mut self,
         input: &RenderInput,
@@ -506,6 +528,7 @@ impl PetWorld {
     /// protect their cells alike; an overlay, like a live selection, is left
     /// off the ground plane a rest seat is solved on
     /// ([`Self::nearest_clear_perch`]).
+    #[inline]
     pub fn observe_with_overlays(
         &mut self,
         input: &RenderInput,
@@ -530,6 +553,7 @@ impl PetWorld {
     /// ([`PetReserve`]): its chrome and its transient overlays protected, and
     /// the person's typed glyphs as ink. An excessive list of any fails
     /// closed.
+    #[inline]
     pub fn observe_with_reserve(
         &mut self,
         input: &RenderInput,
@@ -846,11 +870,11 @@ impl PetWorld {
                 // the caret every one of these cells is `Ink` or `Clear` and
                 // that layer admits both.
                 if cursor && !others && n_caret_cells < self.caret_cells.len() {
-                    self.caret_cells[n_caret_cells] = Some(CaretCell {
+                    self.caret_cells[n_caret_cells] = CaretCell {
                         row: r,
                         col: c,
                         blank: !painted,
-                    });
+                    };
                     n_caret_cells += 1;
                 }
                 let class = if others || cursor {
@@ -873,11 +897,11 @@ impl PetWorld {
                     && !lasting
                     && n_ground_caret_cells < self.ground_caret_cells.len()
                 {
-                    self.ground_caret_cells[n_ground_caret_cells] = Some(CaretCell {
+                    self.ground_caret_cells[n_ground_caret_cells] = CaretCell {
                         row: r,
                         col: c,
                         blank: !painted,
-                    });
+                    };
                     n_ground_caret_cells += 1;
                 }
                 if track_ground {
@@ -897,6 +921,8 @@ impl PetWorld {
             }
             self.hull[r] = (hull_lo, hull_hi);
         }
+        self.caret_cells_len = n_caret_cells as u8;
+        self.ground_caret_cells_len = n_ground_caret_cells as u8;
         if self.ground_split {
             // The ground plane's two tables, the same two readings of
             // `ground_cells`; built only when a transient cell exists.
@@ -974,6 +1000,7 @@ impl PetWorld {
         true
     }
 
+    #[inline]
     #[must_use]
     pub fn cell(&self, row: usize, col: usize) -> PetCell {
         if self.stamp.is_none() {
@@ -993,6 +1020,7 @@ impl PetWorld {
 
     /// Actual glyph/decorated-cell occupancy, independent of caret/selection
     /// protection. None means unobserved or unsupported geometry, never blank.
+    #[inline]
     #[must_use]
     pub fn ink_at(&self, row: usize, col: usize) -> Option<bool> {
         self.glyph_at(row, col)
@@ -1002,12 +1030,14 @@ impl PetWorld {
     /// Ink substantial enough to displace a pet drawn beneath the glyphs.
     /// Only an isolated, undecorated one-dot Braille cell is exempt; actual
     /// glyph occupancy, protected surfaces and unknown coverage are unchanged.
+    #[inline]
     #[must_use]
     pub fn locomotion_ink_at(&self, row: usize, col: usize) -> Option<bool> {
         self.glyph_at(row, col)
             .map(|glyph| glyph == PetGlyph::Substantive)
     }
 
+    #[inline]
     fn glyph_at(&self, row: usize, col: usize) -> Option<PetGlyph> {
         self.stamp?;
         let r = row.checked_sub(self.coverage.row)?;
@@ -1024,6 +1054,7 @@ impl PetWorld {
     /// `false`, like an obstructed one. Right for placement (never stand where
     /// you cannot see), wrong for visibility; [`Self::clearance`] is the
     /// three-valued answer.
+    #[inline]
     #[must_use]
     pub fn clear(&self, rect: PetRect, margin: f32) -> bool {
         self.clearance(rect, margin) == Some(true)
@@ -1035,6 +1066,7 @@ impl PetWorld {
     ///
     /// Fail-closed and two-valued like [`Self::clear`];
     /// [`Self::under_text_clearance`] is the three-valued answer.
+    #[inline]
     #[must_use]
     pub fn under_text_clear(&self, rect: PetRect, margin: f32) -> bool {
         self.under_text_clearance(rect, margin) == Some(true)
@@ -1049,6 +1081,7 @@ impl PetWorld {
     /// * `None`: unknown. There is no coherent snapshot, or the rectangle leaves
     ///   the coverage window, which is centred on the caret and slides as the
     ///   user types. Collapsing this to `false` invents ink.
+    #[inline]
     #[must_use]
     pub fn clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
         self.clearance_in(&self.blocked_prefix, Forgive::Nothing, rect, margin)
@@ -1056,6 +1089,7 @@ impl PetWorld {
 
     /// [`Self::clearance`] for a resident admitted behind ordinary text: the same three
     /// answers, counted over protected and unknown cells only.
+    #[inline]
     #[must_use]
     pub fn under_text_clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
         self.clearance_in(&self.protected_prefix, Forgive::Nothing, rect, margin)
@@ -1065,6 +1099,7 @@ impl PetWorld {
     /// without the caret do not count. Placement uses [`Self::clearance`], so the pet never
     /// rests on the cursor; visibility uses this, so a pet walking past the caret is not hidden.
     /// A ring cell with a glyph, selection, image or non-default background stays blocked.
+    #[inline]
     #[must_use]
     pub fn clearance_past_caret(&self, rect: PetRect, margin: f32) -> Option<bool> {
         self.clearance_in(&self.blocked_prefix, Forgive::BlankCaret, rect, margin)
@@ -1073,6 +1108,7 @@ impl PetWorld {
     /// [`Self::clearance_past_caret`] as a two-valued, fail-closed answer:
     /// occupancy for a body beside the live caret, discounting only the caret's
     /// blank ring cells.
+    #[inline]
     #[must_use]
     pub fn clear_past_caret(&self, rect: PetRect, margin: f32) -> bool {
         self.clearance_past_caret(rect, margin) == Some(true)
@@ -1082,6 +1118,7 @@ impl PetWorld {
     /// stand under ordinary ink, and the caret's ring does not obstruct its
     /// escort. Every ring cell is forgivable here (absent the caret each is
     /// `Ink` or `Clear`); selections, images and unknown geometry still veto.
+    #[inline]
     #[must_use]
     pub fn under_text_clearance_past_caret(&self, rect: PetRect, margin: f32) -> Option<bool> {
         self.clearance_in(&self.protected_prefix, Forgive::AnyCaret, rect, margin)
@@ -1095,6 +1132,7 @@ impl PetWorld {
     /// * `Some(true)`: it lies wholly inside the window and nothing there is protected;
     /// * `None`: the covered part, if any, is clear and the rest is outside; the caller keeps
     ///   the verdict the body came with.
+    #[inline]
     #[must_use]
     pub fn seen_under_text_clearance_past_caret(&self, rect: PetRect) -> Option<bool> {
         self.stamp?;
@@ -1123,6 +1161,7 @@ impl PetWorld {
     /// `None` outside this map; a degenerate query or an unobserved cell answers inked.
     ///
     /// A walk, not a prefix plane: callers ask once per frame about a sprite-sized window.
+    #[inline]
     #[must_use]
     pub fn ink_clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
         self.stamp?;
@@ -1135,6 +1174,7 @@ impl PetWorld {
         }
     }
 
+    #[inline]
     fn clearance_in(
         &self,
         prefix: &[u16],
@@ -1145,19 +1185,33 @@ impl PetWorld {
         self.clearance_on(prefix, false, forgive, rect, margin)
     }
 
+    #[inline]
+    fn carets_len(&self, ground: bool) -> usize {
+        usize::from(self.caret_cells_len)
+            + if ground && self.ground_split {
+                usize::from(self.ground_caret_cells_len)
+            } else {
+                0
+            }
+    }
+
     /// The live caret's ring cells a plane forgives: `caret_cells`, and on
     /// the ground plane also those only a selection or an overlay hid.
+    #[inline]
     fn carets(&self, ground: bool) -> impl Iterator<Item = &CaretCell> {
-        let extra: &[Option<CaretCell>] = if ground && self.ground_split {
-            &self.ground_caret_cells
+        let extra: &[CaretCell] = if ground && self.ground_split {
+            &self.ground_caret_cells[..usize::from(self.ground_caret_cells_len)]
         } else {
             &[]
         };
-        self.caret_cells.iter().chain(extra).flatten()
+        self.caret_cells[..usize::from(self.caret_cells_len)]
+            .iter()
+            .chain(extra)
     }
 
     /// [`Self::clearance_in`] on the live plane, or (`ground`) the ground
     /// plane `prefix` was read from.
+    #[inline]
     fn clearance_on(
         &self,
         prefix: &[u16],
@@ -1174,7 +1228,7 @@ impl PetWorld {
                 let blocked = usize::from(self.blocked(prefix, r0, c0, r1, c1));
                 if blocked == 0
                     || matches!(forgive, Forgive::Nothing)
-                    || blocked > self.caret_cells.len()
+                    || blocked > self.carets_len(ground)
                 {
                     return Some(blocked == 0);
                 }
@@ -1195,6 +1249,7 @@ impl PetWorld {
     }
 
     /// The half-open map-local cell window a rectangle and its margin touch.
+    #[inline]
     fn window(&self, rect: PetRect, margin: f32) -> Window {
         if !rect.valid() || !margin.is_finite() || margin < 0.0 {
             return Window::Degenerate;
@@ -1221,6 +1276,7 @@ impl PetWorld {
 
     /// Cells the supplied prefix table counts in a map-local window: four
     /// reads, whatever the sprite's size.
+    #[inline]
     fn blocked(&self, prefix: &[u16], r0: usize, c0: usize, r1: usize, c1: usize) -> u16 {
         let r0_base = r0 * (MAX_WORLD_COLS + 1);
         let r1_base = r1 * (MAX_WORLD_COLS + 1);
@@ -1235,6 +1291,7 @@ impl PetWorld {
     /// ring; read strictly, the pet could never leave. So the caret does not
     /// obstruct its escort here either, matching
     /// [`Self::under_text_clearance_past_caret`].
+    #[inline]
     #[must_use]
     pub fn under_text_corridor_clear_past_caret(
         &self,
@@ -1249,6 +1306,7 @@ impl PetWorld {
 
     /// The ground plane's `(blocked, protected)` prefix tables
     /// (`ground_cells`): the live ones where no transient cell was observed.
+    #[inline]
     fn ground_prefixes(&self) -> (&[u16], &[u16]) {
         if self.ground_split {
             (&self.ground_blocked_prefix, &self.ground_protected_prefix)
@@ -1259,6 +1317,7 @@ impl PetWorld {
 
     /// [`Self::clear`] on the GROUND PLANE: as if no selection were live and
     /// no transient overlay were open (`ground_cells`).
+    #[inline]
     #[must_use]
     pub fn ground_clear(&self, rect: PetRect, margin: f32) -> bool {
         self.clearance_on(
@@ -1273,6 +1332,7 @@ impl PetWorld {
     /// [`Self::under_text_clearance_past_caret`] on the GROUND PLANE: what
     /// protects `rect` for good (the host's chrome, an image, an expanded
     /// row, the caret's ring is forgiven), not a selection or an overlay.
+    #[inline]
     #[must_use]
     pub fn ground_under_text_clearance_past_caret(
         &self,
@@ -1293,6 +1353,7 @@ impl PetWorld {
     /// clear on the ground plane past the caret
     /// ([`Self::ground_under_text_clearance_past_caret`]). Ink is crossed
     /// behind the text.
+    #[inline]
     #[must_use]
     pub fn ground_corridor_clear(&self, from: PetRect, to: PetRect) -> bool {
         from.valid()
@@ -1304,6 +1365,7 @@ impl PetWorld {
     /// between `from` and `to`: a protected cell in their swept box, with no
     /// margin, on the ground plane past the caret. Not the negation of
     /// [`Self::ground_corridor_clear`]: an unknown cell walls nothing.
+    #[inline]
     #[must_use]
     pub fn ground_corridor_walled(&self, from: PetRect, to: PetRect) -> bool {
         from.valid()
@@ -1314,6 +1376,7 @@ impl PetWorld {
     /// Whether `rect` and its margin stay off every observed row's ink hull
     /// (`hull`): no gap inside a line counts as ground. `false` outside the
     /// coverage window and for a degenerate query.
+    #[inline]
     #[must_use]
     pub fn hull_clear(&self, rect: PetRect, margin: f32) -> bool {
         if self.stamp.is_none() {
@@ -1331,10 +1394,11 @@ impl PetWorld {
     /// Cells the ground plane protects in a map-local window, less the live
     /// caret's ring (forgiven, as [`Self::ground_under_text_clearance_past_caret`]
     /// forgives it).
+    #[inline]
     fn ground_protected_count(&self, r0: usize, c0: usize, r1: usize, c1: usize) -> u16 {
         let raw = self.blocked(self.ground_prefixes().1, r0, c0, r1, c1);
-        if raw == 0 {
-            return 0;
+        if raw == 0 || self.carets_len(true) == 0 {
+            return raw;
         }
         let forgiven = self
             .carets(true)
@@ -1413,6 +1477,7 @@ impl PetWorld {
 
     /// Nearest certified body placement among eight local row searches. Each
     /// search inspects at most the bounded map width and never allocates.
+    #[inline]
     #[must_use]
     pub fn nearest_perch(&self, near: PetRect, margin: f32, max_distance: f32) -> Option<PetRect> {
         self.perch_near((near.foot_row(), near.col), near, margin, max_distance)
@@ -1420,6 +1485,7 @@ impl PetWorld {
 
     /// Prefer empty space near home, then the same bounded search under text.
     /// Never expand the search across the console just to avoid ordinary ink.
+    #[inline]
     #[must_use]
     pub fn home_perch(&self, near: PetRect, margin: f32, max_distance: f32) -> Option<PetRect> {
         if !max_distance.is_finite() || max_distance < 0.0 {
@@ -1658,6 +1724,7 @@ impl PetWorld {
     }
 
     /// Closest protected-free placement, without preferring distant blank ink.
+    #[inline]
     #[must_use]
     pub fn nearest_under_text_perch(
         &self,
@@ -1675,6 +1742,7 @@ impl PetWorld {
     /// asking whether a stand is refused reads as clear. A body that itself
     /// leaves the map (or no body) keeps `margin`, so its reading stays
     /// unknown.
+    #[inline]
     #[must_use]
     pub fn margin_in_map(&self, rect: PetRect, margin: f32) -> f32 {
         let cov = self.coverage;
@@ -1692,6 +1760,7 @@ impl PetWorld {
 
     /// Whether `to` is on the ground `from` stands on: the same feet row,
     /// give or take half a row.
+    #[inline]
     #[must_use]
     pub fn same_ground(from: PetRect, to: PetRect) -> bool {
         (from.foot_row() - to.foot_row()).abs() < 0.5
@@ -1702,6 +1771,7 @@ impl PetWorld {
     /// ([`Self::ground_corridor_clear`]); anywhere else by a flight, which
     /// passes over the host's chrome (the console law leaves a body in the
     /// air alone: `kitty_pet::console_life`'s `place_console_body_at_home`).
+    #[inline]
     #[must_use]
     pub fn reaches(&self, from: PetRect, to: PetRect) -> bool {
         !Self::same_ground(from, to) || self.ground_corridor_clear(from, to)
@@ -1710,6 +1780,7 @@ impl PetWorld {
     /// Closest protected-free placement reachable from `from`
     /// ([`Self::reaches`]): walked to on its own ground without crossing
     /// protected ground, flown to on any other.
+    #[inline]
     #[must_use]
     pub fn nearest_under_text_perch_from(
         &self,
@@ -1732,6 +1803,7 @@ impl PetWorld {
     /// The returned destination is clear; travel must separately clear the
     /// corridor from the current body ([`Self::clear`] over the union of the
     /// two bodies).
+    #[inline]
     #[must_use]
     pub fn perch_near(
         &self,
@@ -1913,6 +1985,7 @@ struct SparseRow<'a, T> {
 }
 
 impl<'a, T> SparseRow<'a, T> {
+    #[inline]
     fn new(items: Option<&'a Vec<(usize, T)>>) -> Self {
         let items = items.map_or([].as_slice(), Vec::as_slice);
         Self {
@@ -1924,6 +1997,7 @@ impl<'a, T> SparseRow<'a, T> {
 
     /// The value at `col`. Exactly `binary_search_by_key(&col, ..).ok()`, for a
     /// non-decreasing sequence of `col`.
+    #[inline]
     fn get(&mut self, col: usize) -> Option<&'a T> {
         let items = self.items;
         if !self.ordered {
@@ -1943,6 +2017,7 @@ impl<'a, T> SparseRow<'a, T> {
 }
 
 impl<'a> RowScan<'a> {
+    #[inline]
     fn new(input: &'a RenderInput, row: usize) -> Self {
         let bg = match input.default_bg_spans.get(row).map(Vec::as_slice) {
             // A missing row and an empty one both resolve every column to the
@@ -1973,6 +2048,7 @@ impl<'a> RowScan<'a> {
         }
     }
 
+    #[inline]
     fn default_bg(&mut self, col: usize) -> u32 {
         let input = self.input;
         match &mut self.bg {
@@ -1997,6 +2073,7 @@ impl<'a> RowScan<'a> {
         }
     }
 
+    #[inline]
     fn line_size(&mut self, col: usize) -> LineSize {
         let input = self.input;
         match &mut self.line {
@@ -2019,14 +2096,17 @@ impl<'a> RowScan<'a> {
         }
     }
 
+    #[inline]
     fn cluster(&mut self, col: usize) -> Option<&'a str> {
         self.clusters.get(col).map(AsRef::as_ref)
     }
 
+    #[inline]
     fn combining(&mut self, col: usize) -> Option<&'a [char]> {
         self.combining.get(col).map(AsRef::as_ref)
     }
 
+    #[inline]
     fn image(&mut self, col: usize) -> Option<&'a ImageRef> {
         aterm_core::render::images_in_row_at(self.images, col)
             .last()
@@ -2034,6 +2114,7 @@ impl<'a> RowScan<'a> {
     }
 }
 
+#[inline]
 fn is_single_braille_dot(ch: char) -> bool {
     let code = u32::from(ch);
     (0x2800..=0x28ff).contains(&code) && (code - 0x2800).count_ones() == 1
@@ -2046,6 +2127,7 @@ fn is_single_braille_dot(ch: char) -> bool {
 /// with the very comparisons a cell-by-cell test makes. It agrees with that
 /// predicate however the rect's edges round
 /// (`exclusion_spans_agree_with_the_cell_test`).
+#[inline]
 fn exclusion_span(rect: PetRect, row: usize, limit: usize) -> Option<(usize, usize)> {
     let row_f = row as f32;
     if !(rect.row < row_f + 1.0 && rect.row + rect.rows > row_f) {

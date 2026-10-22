@@ -26,8 +26,8 @@ use atpkg_publish::triple::{
 
 use super::fixture::{
     Answer, CPU_ARM64, CPU_X86_64, DORMANT_LEDGER, EM_AARCH64, EM_X86_64, FakeTools, MINTED_LEDGER,
-    client_verifies, elf, git, macho, push_from_elsewhere, put, put_exe, ran, scratch, seed_mint,
-    toolchain as fixture_toolchain, trust_repo,
+    checkout as fixture_checkout, client_verifies, elf, macho, push_from_elsewhere, put, put_exe,
+    ran, scratch, seed_mint, toolchain as fixture_toolchain, trust_repo,
 };
 
 /// A machine with a rostered key, a channel head, a dormant trust checkout at `$HOME/trust`,
@@ -57,10 +57,7 @@ fn world(label: &str) -> World {
     trust_repo(&home.join("trust"), DORMANT_LEDGER);
     let bin = fixture_toolchain(&root.join("seal"));
     let checkout = root.join("ay");
-    put(&checkout.join("Cargo.toml"), b"[package]\nname = \"ay\"\n");
-    git(&checkout, &["init", "-q", "."]);
-    git(&checkout, &["add", "-A"]);
-    git(&checkout, &["commit", "-q", "-m", "one"]);
+    fixture_checkout(&checkout, &[("Cargo.toml", b"[package]\nname = \"ay\"\n")]);
     World {
         _tmp: tmp,
         root,

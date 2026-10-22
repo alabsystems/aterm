@@ -61,6 +61,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+pub mod export;
 mod guards;
 mod held_guard;
 mod lazy_init;

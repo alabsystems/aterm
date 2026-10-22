@@ -15,8 +15,7 @@
 //! it reserves the session id (and a window's id), copies the spawn
 //! factory and hands [`crate::spawn::spawn_session`] to the one `aterm-spawner`
 //! thread. The folder a pane held by another program reported is checked
-//! there too ([`crate::spawn_folder::PaneFolder`]), not in the turn, and so is
-//! a request's agent identity ([`IdentityPrep`]). The
+//! there too ([`crate::spawn_folder::PaneFolder`]), not in the turn. The
 //! session comes back in [`crate::Wake::TabSpawned`]; the main thread attaches
 //! its reader and installs the tab or pane as Cmd-T and Cmd-D always did
 //! ([`App::land_tab_spawn`]). Whoever waits is answered then
@@ -56,7 +55,7 @@
 //! what is typed before its dispatch waits for it, then for the spawn it booked
 //! ([`App::claim_menu_held_input`]), or goes on as typed if it booked none.
 //!
-//! A new window (Cmd-N, the menu, the identity picker's window rows, a
+//! A new window (Cmd-N, the menu, a
 //! connected preset's `place=window`) is built around its first session, so it
 //! is made when that session lands ([`App::install_spawned`]): installed at the
 //! grid the shell was spawned at, frontmost, and given its OS window there
@@ -102,7 +101,6 @@ use aterm_window::event_loop::{ActiveEventLoop, EventLoopProxy};
 use aterm_window::keyboard::ModifiersState;
 use aterm_window::window::WindowId as WinitWindowId;
 
-use crate::agent_identity::{self, SpawnAdmit};
 use crate::platform::AppRt as _;
 use crate::{App, Session, Wake, WindowId};
 
@@ -277,9 +275,6 @@ pub(crate) struct TabSpawnJob {
     /// here takes.
     cwd: Option<String>,
     pane_folders: Vec<crate::spawn_folder::PaneFolder>,
-    identity: Option<String>,
-    /// What is done with `identity` before the fork.
-    identity_prep: IdentityPrep,
     /// The session a controller-as-tab preset observes.
     observe: Option<aterm_session::SessionId>,
     /// A worker's task file, written by `spawn_session` once the sid is known.
@@ -329,10 +324,6 @@ pub(crate) struct SpawnAsk {
     /// connected preset's origin), read in the turn and checked on the spawner
     /// like the focused pane's.
     pub(crate) folder_of: Option<crate::spawn_folder::PaneFolder>,
-    /// The agent identity the newborn spawns under; `None` is the human's own.
-    pub(crate) identity: Option<String>,
-    /// What the spawner does with `identity` before the fork.
-    pub(crate) identity_prep: IdentityPrep,
     /// The session a controller-as-tab preset observes
     /// (`ATERM_OBSERVE_SESSION_ID`).
     pub(crate) observe: Option<aterm_session::SessionId>,
@@ -351,77 +342,22 @@ pub(crate) struct SpawnAsk {
     pub(crate) theme: Option<crate::session_theme::SessionTheme>,
 }
 
-/// What the spawner does with a spawn's agent identity before it forks, where
-/// the identities folder's metadata (it can sit on a slow volume) holds no
-/// window, and only once the main thread admitted the spawn, so a spawn
-/// refused there (its window, its `of=`) makes no identity.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum IdentityPrep {
-    /// Only the spawn's own check that it exists (a picker row naming one from
-    /// the roster).
-    #[default]
-    Exists,
-    /// Admit it as a request's spawn does
-    /// ([`crate::agent_identity::check_for_spawn`]): an `inherited` one must
-    /// exist; one the request named is made first, the verb's only create
-    /// path. Its folders are private before the fork, its primer writes off
-    /// this thread, and the admission holds it against `identities forget`
-    /// until the shell's own does ([`provision`]). Refused, the waiter hears
-    /// why in the words the request's turn refused it with, and no failure row
-    /// is posted ([`Refusal`]).
-    Admit { inherited: bool },
-    /// Make it first, if it does not exist (the picker's new-identity row), and
-    /// admit it as a named one: a failure is the tab's failure row.
-    Create,
-}
-
 impl SpawnAsk {
-    /// A plain ask: the folder and identity, nothing made, nothing observed.
-    pub(crate) fn new(cwd: Option<&str>, identity: Option<&str>) -> Self {
+    /// A plain ask inheriting the focused pane's folder unless named.
+    pub(crate) fn new(cwd: Option<&str>) -> Self {
         Self {
             cwd: cwd.map(str::to_owned),
-            identity: identity.map(str::to_owned),
             ..Self::default()
         }
     }
 
-    /// A wire `spawn`'s ask: the folder it named and the identity it wears,
-    /// admitted on the spawner; `inherited` when the request named none and
-    /// the aimed session's is passed down.
-    pub(crate) fn requested(
-        cwd: Option<String>,
-        identity: Option<String>,
-        inherited: bool,
-    ) -> Self {
+    /// A wire spawn's explicitly named folder.
+    pub(crate) fn requested(cwd: Option<String>) -> Self {
         Self {
             cwd,
-            identity,
-            identity_prep: IdentityPrep::Admit { inherited },
             ..Self::default()
         }
     }
-}
-
-/// A spawn the spawner refused before forking, for a reason its waiter hears
-/// verbatim, with no failure row: what the request's turn refused before the
-/// check moved to the spawner ([`IdentityPrep::Admit`]).
-#[derive(Debug)]
-struct Refusal(String);
-
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Refusal {}
-
-/// The words of the [`Refusal`] `e` carries, if the spawner refused the spawn
-/// rather than failed it.
-fn refusal(e: &std::io::Error) -> Option<String> {
-    e.get_ref()
-        .and_then(|inner| inner.downcast_ref::<Refusal>())
-        .map(|refused| refused.0.clone())
 }
 
 /// What the spawner thread hands back ([`crate::Wake::TabSpawned`]).
@@ -1037,8 +973,6 @@ fn run(job: TabSpawnJob, park_wait: Duration) {
         proxy,
         cwd,
         pane_folders,
-        identity,
-        identity_prep,
         observe,
         task,
         completion,
@@ -1106,35 +1040,27 @@ fn run(job: TabSpawnJob, park_wait: Duration) {
         let cwd = resolved.unwrap_or_else(|| {
             cwd.or_else(|| crate::spawn_folder::PaneFolder::first_taken(pane_folders))
         });
-        let session = state_answers()
-            .and_then(|()| provision(identity.as_deref(), identity_prep))
-            .and_then(|admission| {
-                // Forked once the event loop parks, bounded, waited at the fork
-                // itself (`watchdog::forks_wait_for_park`): the turn that booked
-                // this tab and the sweep after it would otherwise wait out the
-                // fork's malloc locks.
-                let session = crate::watchdog::forks_wait_for_park(park_wait, || {
-                    crate::spawn::spawn_session(
-                        id,
-                        window,
-                        rows,
-                        cols,
-                        cell_px,
-                        &factory,
-                        &proxy,
-                        cwd.as_deref(),
-                        observe.as_ref(),
-                        identity.as_deref(),
-                        task.as_ref(),
-                        None,
-                    )
-                });
-                // Held until here: the session holds its identity itself from the
-                // shell's own check on (`agent_identity::admit_existing`), so no
-                // forget lands between this admission and the fork.
-                drop(admission);
-                session
-            });
+        let session = state_answers().and_then(|()| {
+            // Forked once the event loop parks, bounded, waited at the fork
+            // itself (`watchdog::forks_wait_for_park`): the turn that booked
+            // this tab and the sweep after it would otherwise wait out the
+            // fork's malloc locks.
+            crate::watchdog::forks_wait_for_park(park_wait, || {
+                crate::spawn::spawn_session(
+                    id,
+                    window,
+                    rows,
+                    cols,
+                    cell_px,
+                    &factory,
+                    &proxy,
+                    cwd.as_deref(),
+                    observe.as_ref(),
+                    task.as_ref(),
+                    None,
+                )
+            })
+        });
         park_reader(session, window, &proxy, &factory)
     }))
     .unwrap_or_else(|_| (Err(std::io::Error::other("the spawn panicked")), None));
@@ -1182,45 +1108,6 @@ fn state_answers_with(
             format!("{} did not answer", state.display()),
         )),
         _ => Ok(()),
-    }
-}
-
-/// Ready agent identity `identity` for the spawn as `prep` says: admit it, or
-/// make it first, and hand back the admission, which holds the identity
-/// against `identities forget` while the spawner keeps it. With
-/// [`IdentityPrep::Exists`] the spawn's own check that it exists is all.
-fn provision(
-    identity: Option<&str>,
-    prep: IdentityPrep,
-) -> std::io::Result<Option<agent_identity::Admission>> {
-    provision_with(identity, prep, agent_identity::check_for_spawn)
-}
-
-/// [`provision`] through `admit` ([`crate::agent_identity::check_for_spawn`]
-/// in a run; a test's own root and primer handoff).
-fn provision_with(
-    identity: Option<&str>,
-    prep: IdentityPrep,
-    admit: impl FnOnce(&str, SpawnAdmit) -> std::io::Result<agent_identity::Admission>,
-) -> std::io::Result<Option<agent_identity::Admission>> {
-    let Some(name) = identity else {
-        return Ok(None);
-    };
-    match prep {
-        IdentityPrep::Exists => Ok(None),
-        IdentityPrep::Admit { inherited } => {
-            let how = if inherited {
-                SpawnAdmit::Inherited
-            } else {
-                SpawnAdmit::Named
-            };
-            admit(name, how).map(Some).map_err(|e| {
-                std::io::Error::new(e.kind(), Refusal(format!("identity {name}: {e}")))
-            })
-        }
-        IdentityPrep::Create => admit(name, SpawnAdmit::Named)
-            .map(Some)
-            .map_err(|e| std::io::Error::new(e.kind(), format!("identity {name}: {e}"))),
     }
 }
 
@@ -1321,7 +1208,7 @@ impl App {
         cwd_override: Option<&str>,
         then: TabSpawnThen,
     ) {
-        let ask = SpawnAsk::new(cwd_override, None);
+        let ask = SpawnAsk::new(cwd_override);
         self.open_off_loop(owner, SpawnPlace::Tab, ask, then);
     }
 
@@ -1468,8 +1355,6 @@ impl App {
             admission,
             cwd,
             folder_of,
-            identity,
-            identity_prep,
             observe,
             task,
             background,
@@ -1555,10 +1440,8 @@ impl App {
         // draw, which lands only after the shell has started.
         #[cfg(windows)]
         {
-            factory.shell_appearance = self.spawn_shell_appearance(
-                theme.as_ref().map(|theme| theme.selector.as_str()),
-                identity.as_deref(),
-            );
+            factory.shell_appearance =
+                self.spawn_shell_appearance(theme.as_ref().map(|theme| theme.selector.as_str()));
         }
         let completion = Arc::new(TabSpawnCompletion::default());
         self.tab_spawns.in_flight.push(InFlight {
@@ -1586,8 +1469,6 @@ impl App {
             proxy,
             cwd,
             pane_folders,
-            identity,
-            identity_prep,
             observe,
             task,
             completion,
@@ -1892,7 +1773,7 @@ impl App {
             // cancel would, the session drops with its reader still parked.
             _ if os.exiting() => Err(QUITTING.to_string()),
             // Refused before the fork: in the request's own words, no row.
-            Err(e) => Err(refusal(&e).unwrap_or_else(|| place.failed(self, &e.to_string()))),
+            Err(e) => Err(place.failed(self, &e.to_string())),
             Ok(_) if !new_window && !self.windows.contains_key(&window) => {
                 Err("the window closed before the session started".to_string())
             }
@@ -2084,8 +1965,7 @@ impl App {
 
     /// The theme a split of `window`'s focused pane inherits: that pane's own
     /// theme, as [`crate::session_theme::SessionThemeOrigin::Split`]; `None`
-    /// when it has none (an identity theme is not carried: it resolves from
-    /// the newborn's own identity).
+    /// when it has none.
     pub(crate) fn split_theme(
         &self,
         window: WindowId,
@@ -2931,60 +2811,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// A REQUEST'S IDENTITY IS ADMITTED ON THE SPAWNER, before the fork, and
-    /// a refusal there is still the request's own answer: the waiter hears
-    /// `identity <name>: <why>`, the words the request's turn refused it with,
-    /// and no "Couldn't open a new tab" row goes up, since nobody gestured.
-    /// NEGATIVE CONTROL: a failure that is not a refusal still posts its row
-    /// (the test above).
-    #[test]
-    fn an_identity_the_spawner_refuses_answers_its_waiter_without_a_failure_row() {
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("aterm-spawn-admit")
-            .tempdir()
-            .expect("scratch dir");
-        crate::test_env::scoped("ATERM_STATE_HOME", scratch.path().join("state"), || {
-            let refused = provision(Some("ghost"), IdentityPrep::Admit { inherited: true })
-                .expect_err("nobody made `ghost`");
-            assert_eq!(
-                refusal(&refused).as_deref(),
-                Some("identity ghost: no such identity ghost")
-            );
-
-            let mut app = App::headless_for_test();
-            let wid = WindowId(0);
-            let (old, _old_pty) = piped_session(app.next_session_id);
-            app.push_stub_tab(wid, old);
-            let tabs = app.windows[&wid].tab_set.len();
-            let (tx, rx) = channel();
-            let id = book(
-                &mut app,
-                wid,
-                TabSpawnThen::Reply {
-                    reply: tx,
-                    raise: false,
-                },
-            );
-            assert!(!app.install_spawned_tab(TabSpawned {
-                id,
-                window: wid,
-                session: Err(refused),
-                reader_gate: None
-            }));
-            assert_eq!(
-                rx.try_recv(),
-                Ok(Err("identity ghost: no such identity ghost".to_string()))
-            );
-            assert_eq!(app.windows[&wid].tab_set.len(), tabs, "no tab");
-            assert!(
-                !app.messages
-                    .live_rows()
-                    .any(|l| l.msg.title == "Couldn't open a new tab"),
-                "a request's refusal is its reply, not a row"
-            );
-        });
-    }
-
     /// A window that closed while its tab was in flight lands nothing: the session
     /// is dropped, which hangs up and reaps its shell, and the waiter hears why.
     #[test]
@@ -3598,7 +3424,7 @@ pub(crate) mod tests {
     /// A SPAWN WHOSE STATE FOLDER DID NOT ANSWER IS REFUSED BY NAME, before
     /// anything is written or forked: on a volume that is not local whose look
     /// did not answer, the spawner says which folder (`TimedOut`, a failure
-    /// row's words, never a [`Refusal`]) and goes on to the next tab, where it
+    /// row's words) and goes on to the next tab, where it
     /// waited out the mount; a local folder is never looked at, and one that
     /// answered, or none at all, lets the spawn go on. NEGATIVE CONTROL: a gate
     /// that does not ask the look lets the silent folder through.
@@ -3612,7 +3438,6 @@ pub(crate) mod tests {
             refused.to_string(),
             format!("{} did not answer", state.display())
         );
-        assert_eq!(refusal(&refused), None, "a failure, said in a row");
         assert!(state_answers_with(Some(state), |_| false, |_| true).is_ok());
         assert!(
             state_answers_with(
@@ -3623,63 +3448,6 @@ pub(crate) mod tests {
             .is_ok()
         );
         assert!(state_answers_with(None, |_| false, |_| false).is_ok());
-    }
-
-    /// The spawner makes the identity a request names (`spawn identity=<name>`,
-    /// `Admit` with nothing inherited) or a new-identity row names (`Create`)
-    /// before the shell that wears it, so nothing is made for a spawn the main
-    /// thread refused before booking it, and the primer is handed off rather
-    /// than waited for. An inherited one and a roster row's make nothing. A
-    /// request's refusal is its own words ([`Refusal`]); the row's is a failure.
-    /// NEGATIVE CONTROL: the inherited admission of a missing name is refused.
-    #[test]
-    fn the_spawner_makes_a_named_identity_before_its_shell() {
-        use crate::agent_identity::check_for_spawn_in;
-        let state = aterm_tempfile::tempdir().expect("scratch state root");
-        let root = state.path().join("identities");
-        let primed = std::cell::RefCell::new(Vec::new());
-        let admit = |name: &str, how: SpawnAdmit| {
-            check_for_spawn_in(&root, name, how, |dir, _| {
-                primed.borrow_mut().push(dir.to_path_buf());
-            })
-        };
-        let inherited = provision_with(
-            Some("worker"),
-            IdentityPrep::Admit { inherited: true },
-            admit,
-        )
-        .expect_err("an inherited identity nobody made is refused");
-        assert_eq!(
-            refusal(&inherited).as_deref(),
-            Some("identity worker: no such identity worker")
-        );
-        assert!(!root.exists(), "and none is made");
-        assert!(
-            provision_with(
-                Some("worker"),
-                IdentityPrep::Admit { inherited: false },
-                admit
-            )
-            .is_ok()
-        );
-        assert!(root.join("worker/.claude").is_dir(), "a request's is made");
-        assert!(provision_with(Some("gamma"), IdentityPrep::Create, admit).is_ok());
-        assert!(root.join("gamma").is_dir(), "a new-identity row's is made");
-        assert_eq!(
-            *primed.borrow(),
-            [root.join("worker"), root.join("gamma")],
-            "each primer handed off, none written in the admission"
-        );
-        assert!(provision_with(Some("delta"), IdentityPrep::Exists, admit).is_ok());
-        assert!(!root.join("delta").exists(), "a roster row makes none");
-        assert!(provision_with(None, IdentityPrep::Create, admit).is_ok());
-        let refused = provision_with(Some("Bad Name"), IdentityPrep::Create, admit)
-            .expect_err("the grammar refuses it");
-        assert!(
-            refused.to_string().starts_with("identity Bad Name: "),
-            "{refused}"
-        );
-        assert!(refusal(&refused).is_none(), "a row's failure is no refusal");
     }
 
     /// [`piped_session`] with its pipe standing in for the PTY master, so the

@@ -138,6 +138,10 @@ pub struct Ctx {
     pub sumd: J,
     harness_keys: String,
     kw: LabKw,
+    /// The survey arm's pace: a write made again this often while Claude Code
+    /// reports no re-read, and the hang detector from the first write
+    /// ([`crate::settings_witness::REWRITE_EVERY`] and `HANG`).
+    pub witness_pace: (std::time::Duration, std::time::Duration),
 }
 
 fn r3(v: f64) -> J {
@@ -184,6 +188,10 @@ impl Ctx {
             sumd: J::Obj(Vec::new()),
             harness_keys: harness_keys.into(),
             kw,
+            witness_pace: (
+                crate::settings_witness::REWRITE_EVERY,
+                crate::settings_witness::HANG,
+            ),
         }
     }
 
@@ -412,14 +420,43 @@ impl Ctx {
         t
     }
 
-    /// `CLAUDE_FORCE_DISPLAY_SURVEY=1` live in the running Claude's settings env.
+    /// `CLAUDE_FORCE_DISPLAY_SURVEY=1` live in the running Claude's settings
+    /// env, returned once Claude Code reported re-reading the file after the
+    /// write ([`crate::settings_witness`]: a flag written and taken on trust
+    /// was missed under load, and the card never drew). The summary keeps the
+    /// writes it took and the seconds to the re-read (`arm_writes`,
+    /// `arm_reread_s`).
     ///
     /// # Errors
-    /// Interrupted.
+    /// Interrupted, or Claude Code reported no re-read within the hang
+    /// detector of [`Ctx::witness_pace`] (the lab's: one minute).
     pub fn arm(&mut self) -> R {
-        let _ = crate::verbs::set_env(&self.run, "CLAUDE_FORCE_DISPLAY_SURVEY", Some("1"));
-        self.mark("survey flag on", None);
-        stop::sleep(std::time::Duration::from_secs(3))?;
+        self.arm_with_wait(&crate::settings_witness::WallWait::new())
+    }
+
+    fn arm_with_wait(&mut self, wait: &impl crate::settings_witness::Wait) -> R {
+        let t = now();
+        let r = crate::settings_witness::set_env_reread_with_wait(
+            &self.run,
+            "CLAUDE_FORCE_DISPLAY_SURVEY",
+            Some("1"),
+            self.witness_pace,
+            wait,
+        )
+        .map_err(|f| match f.stopped {
+            Some(_) => ScnErr::from(f),
+            None => ScnErr::Failed(format!(
+                "the survey flag was not armed: {}",
+                f.msg.unwrap_or_default()
+            )),
+        })?;
+        self.mark("survey flag written", Some(t));
+        self.mark(
+            &format!("survey flag on (re-read after {} write(s))", r.writes),
+            None,
+        );
+        self.put("arm_writes", J::Int(i64::from(r.writes)));
+        self.put("arm_reread_s", r2(r.after.as_secs_f64()));
         Ok(())
     }
 
@@ -2703,6 +2740,13 @@ pub fn run_selftest(tag: &str) -> Result<i32, Stopped> {
             if trust { "yes" } else { "not seen" }
         );
         println!(
+            "survey flag written -> re-read       : {}   (Claude Code's ConfigChange hook; {} write(s))",
+            sec("arm_reread_s"),
+            d.get("arm_writes")
+                .and_then(J::as_i64)
+                .map_or_else(|| "?".into(), |n| n.to_string())
+        );
+        println!(
             "turn idle -> card shown              : {}   (Claude's gate: 2 s idle)",
             sec("idle_to_card")
         );
@@ -2921,6 +2965,105 @@ mod tests {
         corpus_decision(&mut ctx, start, "CHOSE", 60.0).expect("not interrupted");
         assert_eq!(ctx.sumd.get("error"), None, "{}", ctx.sumd.py());
         assert_eq!(ctx.sumd.get("decided").and_then(J::as_str), Some("CHOSE"));
+    }
+
+    /// THE SURVEY ARM RETURNS ONLY ONCE CLAUDE CODE REPORTED A RE-READ, AND
+    /// WRITES AGAIN UNTIL THEN: the watcher's stand-in misses the first write
+    /// and answers a later one, so `arm` returns with the line in the log,
+    /// the flag in the settings and its writes counted (`arm_writes` > 1).
+    /// NEGATIVE CONTROLS: a watcher that never answers, and one whose line
+    /// names another settings file, fail the arm as "the survey flag was not
+    /// armed", at the hang detector; an arm that wrote and slept would return
+    /// with no line in the log.
+    #[test]
+    fn the_survey_arm_returns_only_once_claude_code_reported_a_reread() {
+        use crate::settings_witness::{HANG, LOG, REWRITE_EVERY, SteppedWait, Wait as _};
+        use std::cell::Cell;
+        let owned = aterm_tempfile::tempdir().expect("owned scratch");
+        // The scratch is read through no link on its whole path; `/var` is one.
+        let w = std::fs::canonicalize(owned.path()).expect("a physical scratch");
+        for (what, answers, same_file) in [
+            ("reread", true, true),
+            ("no line", false, true),
+            ("another file", true, false),
+        ] {
+            let run = Run {
+                w: w.join(what),
+                ..Run::default()
+            };
+            std::fs::create_dir_all(run.w.join("home/.claude")).expect("the settings' dir");
+            std::fs::write(run.settings(), "{}\n").expect("the settings");
+            let settings = run.settings().to_string_lossy().into_owned();
+            let names = if same_file {
+                settings.clone()
+            } else {
+                run.w
+                    .join("proj/.claude/settings.json")
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let log = run.w.join(LOG);
+            let pauses = Cell::new(0);
+            let wait = SteppedWait::new(REWRITE_EVERY, || {
+                let settings = J::parse(&crate::util::scratch_text(&run.settings()))
+                    .expect("the settings just written");
+                assert_eq!(
+                    settings
+                        .get("env")
+                        .and_then(|env| env.get("CLAUDE_FORCE_DISPLAY_SURVEY")),
+                    Some(&J::s("1")),
+                    "the actual writer set the flag before pausing"
+                );
+                pauses.set(pauses.get() + 1);
+                // Each controlled pause advances to the next rewrite. The
+                // first write is missed; only a later write gets a line.
+                if answers && pauses.get() == 2 {
+                    let line = J::obj([
+                        ("hook_event_name", J::s("ConfigChange")),
+                        ("file_path", J::s(&names)),
+                    ]);
+                    std::fs::write(&log, format!("{}\n", line.py())).expect("the witness's log");
+                }
+            });
+            let mut ctx = Ctx::new("t", 1, "lab", "", LabKw::default(), true, false);
+            ctx.run = run.clone();
+            let armed = ctx.arm_with_wait(&wait);
+            if answers && same_file {
+                armed.expect("armed");
+                let logged = crate::util::scratch_text(&log);
+                assert_eq!(
+                    crate::settings_witness::rereads(&logged, &settings),
+                    1,
+                    "the line was in the log when the arm returned: {logged:?}"
+                );
+                let writes = ctx.sumd.get("arm_writes").and_then(J::as_i64).unwrap_or(0);
+                assert!(
+                    writes >= 2,
+                    "the missed write was made again: {}",
+                    ctx.sumd.py()
+                );
+                assert!(wait.elapsed() < HANG);
+                continue;
+            }
+            match armed {
+                Err(ScnErr::Failed(m)) => assert!(
+                    m.starts_with("the survey flag was not armed: ") && m.contains("no re-read"),
+                    "{what}: {m}"
+                ),
+                other => panic!("{what}: {other:?}"),
+            }
+            assert_eq!(ctx.sumd.get("arm_writes"), None, "{what}");
+            assert_eq!(
+                crate::settings_witness::rereads(&crate::util::scratch_text(&log), &names),
+                usize::from(answers),
+                "{what}: the controlled watcher supplied exactly its intended evidence"
+            );
+            assert!(
+                wait.elapsed() >= HANG,
+                "{what}: the simulated hang detector ended the wait"
+            );
+            assert!(pauses.get() >= 2, "{what}: the missed write was made again");
+        }
     }
 
     #[test]

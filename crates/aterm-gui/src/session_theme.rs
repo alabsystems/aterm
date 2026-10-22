@@ -9,10 +9,7 @@
 //!    on the control socket, `spawn theme=`, a split from a pane that has one,
 //!    the command palette's Choose Tab Theme, or what a seamless update or a
 //!    restore carried;
-//! 2. else the `identity_themes` entry for the identity it was spawned under
-//!    (`spawn identity=`), resolved live from the config so an edit re-themes
-//!    those sessions on the next reload;
-//! 3. else the instance's theme (and its preview).
+//! 2. else the instance's theme (and its preview).
 //!
 //! A session theme resolves through the same [`Config::resolved_colors`] the
 //! instance does, with its selector as the candidate, so the config's colour
@@ -70,13 +67,11 @@ impl SessionThemeOrigin {
     }
 }
 
-/// Who chose the theme a session asks for: its own, or its identity's.
+/// Who chose the theme a session asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionDrawOrigin {
     /// The session's own theme.
     Own(SessionThemeOrigin),
-    /// The `identity_themes` entry for the session's identity.
-    Identity,
 }
 
 impl SessionDrawOrigin {
@@ -84,7 +79,6 @@ impl SessionDrawOrigin {
     pub(crate) const fn word(self) -> &'static str {
         match self {
             Self::Own(origin) => origin.word(),
-            Self::Identity => "identity",
         }
     }
 }
@@ -153,20 +147,12 @@ impl App {
         }
     }
 
-    /// The theme session `sid` asks for: its own, else its identity's
-    /// `identity_themes` entry, else none.
+    /// The theme session `sid` asks for, or none for the instance's theme.
     pub(crate) fn session_choice(&self, sid: u64) -> Option<SessionChoice> {
-        if let Some(theme) = self.pool.theme(sid) {
-            return Some(SessionChoice {
-                selector: theme.selector.clone(),
-                origin: SessionDrawOrigin::Own(theme.origin),
-            });
-        }
-        let identity = self.pool.get(sid)?.identity.as_deref()?;
-        let selector = self.config.identity_theme(identity)?;
+        let theme = self.pool.theme(sid)?;
         Some(SessionChoice {
-            selector: selector.to_string(),
-            origin: SessionDrawOrigin::Identity,
+            selector: theme.selector.clone(),
+            origin: SessionDrawOrigin::Own(theme.origin),
         })
     }
 
@@ -195,7 +181,7 @@ impl App {
     /// The light/dark side a new session's shell is told it runs on (its
     /// `COLORFGBG`, Windows): that of the theme the session will draw, by
     /// [`Self::session_draw`]'s precedence, its own `theme` (asked, inherited
-    /// by a split, restored), else its identity's `identity_themes` entry.
+    /// by a split, restored).
     /// `None` when it will draw the instance's, whose side the factory already
     /// carries. Decided at booking, since the session's theme lands only after
     /// its shell has started.
@@ -203,32 +189,26 @@ impl App {
     pub(crate) fn spawn_shell_appearance(
         &self,
         theme: Option<&str>,
-        identity: Option<&str>,
     ) -> Option<aterm_types::Appearance> {
-        let selector =
-            theme.or_else(|| identity.and_then(|name| self.config.identity_theme(name)))?;
+        let selector = theme?;
         self.resolve_session_selector(selector)
             .ok()
             .map(|colors| colors.reported)
     }
 
     /// The instance's session factory for a fresh shell whose session will
-    /// draw `theme`, else its `identity`'s theme: told that theme's side
+    /// draw `theme`: told that theme's side
     /// ([`Self::spawn_shell_appearance`]). A spawn that books off the loop sets
     /// the same field on its own copy (`tab_spawn`).
     #[cfg(windows)]
-    pub(crate) fn shell_factory(
-        &self,
-        theme: Option<&str>,
-        identity: Option<&str>,
-    ) -> crate::spawn::SessionFactory {
+    pub(crate) fn shell_factory(&self, theme: Option<&str>) -> crate::spawn::SessionFactory {
         crate::spawn::SessionFactory {
-            shell_appearance: self.spawn_shell_appearance(theme, identity),
+            shell_appearance: self.spawn_shell_appearance(theme),
             ..self.session_factory.clone()
         }
     }
 
-    /// What session `sid` draws: precedence own > identity > instance; a
+    /// What session `sid` draws: precedence own > instance; a
     /// choice that does not draw falls back to the instance.
     pub(crate) fn session_draw(&self, sid: u64) -> SessionDraw {
         let Some(choice) = self.session_choice(sid) else {
@@ -394,7 +374,7 @@ impl App {
 
     /// Take a session into the pool and bring it up to the theme it draws
     /// ([`Self::install_session_colors`]): every production insertion goes
-    /// through here, so an identity theme or a carried one is on the engine
+    /// through here, so a carried theme is on the engine
     /// before its reader runs.
     pub(crate) fn pool_insert(&mut self, session: crate::Session) -> u64 {
         let sid = self.pool.insert(session);
@@ -409,7 +389,7 @@ impl App {
     }
 
     /// `session_theme=<selector>|- theme_origin=<word>|instance`: the session
-    /// `status` fields, the selector percent-encoded as `identity=` is, so a
+    /// `status` fields, the selector percent-encoded, so a
     /// name with spaces stays one field.
     ///
     /// Polled, so it resolves nothing: whether the session draws its choice is

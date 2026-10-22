@@ -522,6 +522,9 @@ fn recovery_capability(
     native: &restore::NativeLeafRestore,
 ) -> Option<crate::native_app::RecoveryCapability> {
     match native.restore_tag.as_str() {
+        "system-state" if native.route.is_none() && native.uri.is_none() => {
+            Some(crate::native_app::RecoveryCapability::SystemState)
+        }
         "settings" => native
             .route
             .as_deref()
@@ -859,6 +862,7 @@ impl App {
         };
         let app = self.native_runtime.app(native.instance)?;
         match app.kind() {
+            crate::native_app::AppKind::SystemState => Some(restore::NativeTabRestore::SystemState),
             crate::native_app::AppKind::Settings => {
                 let crate::native_app::AppViewState::Settings(state) =
                     self.native_runtime.view_state(view)?
@@ -877,7 +881,8 @@ impl App {
                         restore::NativeTabRestore::Markdown { uri }
                     }
                     crate::native_app::AppKind::Editor => restore::NativeTabRestore::Editor { uri },
-                    crate::native_app::AppKind::Settings => unreachable!(),
+                    crate::native_app::AppKind::Settings
+                    | crate::native_app::AppKind::SystemState => unreachable!(),
                     crate::native_app::AppKind::Recovery => unreachable!(),
                 })
             }
@@ -1040,13 +1045,8 @@ impl App {
                         land_at: user_meta.land_at,
                         // Who set the word, beside it (§11.7.3, item 5).
                         autopilot_by: user_meta.autopilot_set_by.map(|set_by| set_by.carried()),
-                        // The spawn-time identity, so the respawn is under it.
-                        identity: self
-                            .pool
-                            .get(terminal.session)
-                            .and_then(|s| s.identity.clone()),
-                        // Its own theme (not an identity's, nor a Choose Tab
-                        // Theme… highlight not yet kept), so it comes back.
+                        // Its own theme, excluding a Choose Tab Theme… highlight
+                        // not yet kept, so it comes back.
                         theme: self
                             .kept_session_theme(terminal.session)
                             .map(|theme| theme.selector.clone()),
@@ -1110,6 +1110,10 @@ impl App {
                 }
                 let mut descriptor = match (app.kind(), state) {
                     (
+                        crate::native_app::AppKind::SystemState,
+                        crate::native_app::AppViewState::SystemState(_),
+                    ) => restore::NativeLeafRestore::system_state(),
+                    (
                         crate::native_app::AppKind::Settings,
                         crate::native_app::AppViewState::Settings(settings),
                     ) => restore::NativeLeafRestore::settings(settings.route.path().to_string()),
@@ -1134,6 +1138,7 @@ impl App {
                     _ => return None,
                 };
                 match state {
+                    crate::native_app::AppViewState::SystemState(_) => {}
                     crate::native_app::AppViewState::Settings(settings) => {
                         if carry_drafts {
                             descriptor.settings_drafts = settings.carried_field_drafts().carried;
@@ -1210,7 +1215,8 @@ impl App {
             return false;
         };
         match state {
-            crate::native_app::AppViewState::Settings(_) => true,
+            crate::native_app::AppViewState::Settings(_)
+            | crate::native_app::AppViewState::SystemState(_) => true,
             crate::native_app::AppViewState::Markdown(markdown) => {
                 let Some(text) = document_text.as_deref() else {
                     return false;
@@ -1935,8 +1941,8 @@ impl App {
             .unwrap_or(0)
             .min(restored_tabs.len().saturating_sub(1));
         // As `restore_recursive_into_window` does: the bootstrap projection
-        // goes and its shell waits, detached, for the first leaf that names
-        // what it wears. Nothing detached crosses a turn: tabs land in
+        // goes and its shell waits, detached, for the first terminal leaf.
+        // Nothing detached crosses a turn: tabs land in
         // manifest order until one has and the bootstrap is placed.
         let mut reusable = self.clear_restore_target(wid, true);
         self.frontmost_window = Some(wid);
@@ -1953,8 +1959,7 @@ impl App {
                 break;
             }
         }
-        // A bootstrap no leaf took (every one names another identity) is not
-        // user content on a cold restore.
+        // A bootstrap no terminal leaf took is not user content on a cold restore.
         if let Some((view, session)) = reusable.take() {
             self.view_store.remove(view);
             self.teardown_session(session);
@@ -2807,20 +2812,6 @@ impl App {
         // once, so it is still waiting here; were it taken, the window's bootstrap
         // would be a fresh stand-in, which `carry_restored_identity` gives no identity.
         let adopt = take_handed_off_shell(&mut self.seamless_adopt, wl.bootstrap_local_id());
-        // IDENTITY (session identities; review 2026-09-17): a bootstrap that
-        // is FORKED here runs under the identity the pane it fills names —
-        // the same pick as its cwd — while that identity still exists
-        // (`restorable`: create = false, one stderr line when it is gone).
-        // The graft refuses a bootstrap that does not wear what its pane
-        // names, so a bootstrap forked without this came back as the
-        // human's login under a `worker` tab. An adopted shell's env is
-        // what it was; its label rides `Adopted::identity`.
-        let identity0: Option<String> = if adopt.is_none() {
-            wl.bootstrap_identity()
-                .and_then(crate::agent_identity::restorable)
-        } else {
-            None
-        };
         let outer = (wl.outer_x, wl.outer_y);
         let maximized = wl.maximized;
         let show = wl.show;
@@ -2836,7 +2827,6 @@ impl App {
             adopt,
             None,
             None,
-            identity0.as_deref(),
             crate::app_window::CarriedFrame::of(&wl),
             (outer, maximized),
         ) else {
@@ -3066,7 +3056,6 @@ impl App {
             session.handoff_local_id = Some(adopted.local_id);
             session.journal_key = adopted.journal_key;
             session.frozen_path = adopted.frozen_path;
-            session.identity = adopted.identity;
             crate::keeper_link::register(&session, adopted.keeper);
             return Ok(session);
         }
@@ -3085,7 +3074,6 @@ impl App {
             &proxy,
             None,
             None, // not a connected controller spawn
-            None, // adopted: the shell keeps its env; the label rides `Adopted::identity`
             None, // no worker's task
             Some(adopted),
         )
@@ -3806,7 +3794,7 @@ impl App {
     /// exited rather than idle — as a carried exit, not news
     /// ([`Self::note_carried_exit`]; round eight, U34); and `leaf` — the
     /// terminal leaf its placeholder retired — gives it back its user identity
-    /// (the `meta set` fields and the spawn identity), so the next update
+    /// (the `meta set` fields), so the next update
     /// carries them on.
     /// No agent the leaf names is relaunched: nothing runs in a held pane.
     fn restore_held_leaf(
@@ -3873,13 +3861,6 @@ impl App {
                 id,
             );
         }
-        // The label as the outgoing process wore it, checked as a name: a
-        // held pane spawns nothing under it, so it needs no identity
-        // directory (`restorable` would say "starts a default shell").
-        session.identity = leaf
-            .identity
-            .as_deref()
-            .and_then(|name| crate::agent_identity::parse_name(name).ok());
         Self::seed_restored_user_meta(&session, leaf);
         let view = self
             .view_store
@@ -3925,38 +3906,10 @@ impl App {
         // re-adopted a session below was ever re-seeded. Which shell the leaf's
         // identity lands on is `carry_restored_identity`'s business, and what it
         // may overwrite there is `graft_restored_user_meta`'s.
-        //
-        // THE AGENT IDENTITY IS THE SHELL'S, NOT THE LEAF'S. A shell's env is
-        // set at its fork and cannot be re-injected, so on a COLD restore the
-        // bootstrap fills this pane only if it already runs under the identity
-        // the leaf names (`main_entry` and `apply_restore_manifest` fork it
-        // under `bootstrap_identity`, by the same pick as its cwd). Measured
-        // 2026-09-17 (review): grafting regardless put a `worker` tab's first
-        // leaf on the human's login, labeled `identity=-`. A bootstrap that
-        // wears something else stays in `reusable_terminal` for a later pane
-        // that names what it wears, or is retired unconsumed
-        // (`restore_recursive_into_window`); this pane forks its own shell
-        // below. A handoff's bootstrap is the adopted shell its leaf names
-        // (or a stand-in forked under that leaf's identity), and its label is
-        // the shell's own — grafted as before.
-        if let Some((view, session)) = *reusable_terminal {
-            let from_handoff = ids == LeafIds::Retired && self.handoff_successor;
-            if from_handoff || self.bootstrap_wears_leaf_identity(session, terminal) {
-                *reusable_terminal = None;
-                self.carry_restored_identity(terminal, FillingShell::Registered(session), ids);
-                self.carry_restored_theme(session, terminal);
-                return Ok(view);
-            }
-            crate::logging::stderr_line!(
-                "aterm-gui: session restore: the window's bootstrap shell runs under identity \
-                 {} and the pane names {}; the pane gets its own shell, and the bootstrap \
-                 fills a later pane that names its identity or is retired",
-                self.pool
-                    .get(session)
-                    .and_then(|live| live.identity.as_deref())
-                    .unwrap_or("-"),
-                terminal.identity.as_deref().unwrap_or("-")
-            );
+        if let Some((view, session)) = reusable_terminal.take() {
+            self.carry_restored_identity(terminal, FillingShell::Registered(session), ids);
+            self.carry_restored_theme(session, terminal);
+            return Ok(view);
         }
         // A SESSION THE HANDOFF LAYOUT NAMES TWICE (round six, finding 10): one
         // shell `Open Session in New Window` showed in two views. The first leaf
@@ -4024,7 +3977,6 @@ impl App {
                 session.handoff_local_id = Some(shell.local_id);
                 session.journal_key = shell.journal_key;
                 session.frozen_path = shell.frozen_path;
-                session.identity = shell.identity;
                 crate::spawn::seed_adopted_fabric(
                     &session.ctx.fabric,
                     &session.ctx.timeline,
@@ -4033,12 +3985,6 @@ impl App {
                     &shell.fabric,
                 );
                 crate::keeper_link::register(&session, shell.keeper);
-            } else {
-                // A cold restore's stand-in: the leaf's identity, create=false.
-                session.identity = terminal
-                    .identity
-                    .as_deref()
-                    .and_then(crate::agent_identity::restorable);
             }
             self.carry_restored_identity(terminal, FillingShell::Unregistered(&session), ids);
             let view = self
@@ -4061,26 +4007,13 @@ impl App {
             .map(|window| (window.rows, window.cols))
             .ok_or_else(|| "restore window disappeared".to_string())?;
         let adopt = take_handed_off_shell(&mut self.seamless_adopt, terminal.local_id);
-        // IDENTITY on a COLD restore (session identities, 2026-09-17): the leaf
-        // names the identity its shell ran under; respawn under it only if it
-        // still exists (`create = false` — restore never creates one; a
-        // forgotten identity is a default shell and one stderr line). An
-        // adopted shell needs none of this: its env is what it was.
-        let identity = if adopt.is_none() {
-            terminal
-                .identity
-                .as_deref()
-                .and_then(crate::agent_identity::restorable)
-        } else {
-            None
-        };
         // A cold restore's shell starts on the side of the theme its leaf will
         // draw (`carry_restored_theme`, after the spawn), as a booked tab's does.
         // An adopted shell keeps the env it has.
         #[cfg(windows)]
         let shell_factory = adopt
             .is_none()
-            .then(|| self.shell_factory(terminal.theme.as_deref(), identity.as_deref()));
+            .then(|| self.shell_factory(terminal.theme.as_deref()));
         #[cfg(windows)]
         let factory = shell_factory.as_ref().unwrap_or(&self.session_factory);
         #[cfg(not(windows))]
@@ -4096,7 +4029,6 @@ impl App {
             &proxy,
             terminal.start_cwd().as_deref(),
             None, // not a connected controller spawn
-            identity.as_deref(),
             None, // no worker's task
             adopt,
         )
@@ -4178,28 +4110,6 @@ impl App {
                     .bootstrap_local_id()
                     .and_then(|local_id| self.adopted_handoff_session(local_id))
                     .is_some())
-    }
-
-    /// Whether the window's bootstrap session `session` runs under the agent
-    /// identity restore leaf `leaf` names — what a COLD restore may graft. The
-    /// leaf's name counts only while the identity still exists
-    /// (`agent_identity::existing`, the silent read: `main_entry` already
-    /// said so when it forked the bootstrap); a forgotten identity is a
-    /// default shell on both sides, so they match.
-    fn bootstrap_wears_leaf_identity(
-        &self,
-        session: u64,
-        leaf: &restore::TerminalLeafRestore,
-    ) -> bool {
-        let wears = self
-            .pool
-            .get(session)
-            .and_then(|live| live.identity.as_deref());
-        let names = leaf
-            .identity
-            .as_deref()
-            .and_then(crate::agent_identity::existing);
-        wears == names.as_deref()
     }
 
     /// Re-seed a freshly-respawned session's USER metadata (`meta set` fields)
@@ -4636,6 +4546,10 @@ impl App {
         // processes' A/B books once, as its arrival does.
         let mut reads_harness = false;
         match descriptor.restore_tag.as_str() {
+            "system-state" => {
+                self.stage_system_state_tab(wid)
+                    .map_err(|why| format!("System State could not be reopened: {why:?}"))?;
+            }
             "settings" => {
                 // Every route is a page, Manual included: going to one opens
                 // nothing, so each restores as it was captured.
@@ -4989,7 +4903,9 @@ impl App {
             crate::native_app::AppKind::Editor => {
                 crate::native_app::AppViewState::Editor(Box::default())
             }
-            crate::native_app::AppKind::Settings | crate::native_app::AppKind::Recovery => {
+            crate::native_app::AppKind::Settings
+            | crate::native_app::AppKind::SystemState
+            | crate::native_app::AppKind::Recovery => {
                 return Err("restore descriptor is not a document app".to_string());
             }
         };
@@ -5307,6 +5223,10 @@ impl App {
         descriptor: &restore::NativeTabRestore,
     ) -> Option<crate::tab_model::TabId> {
         let result = match descriptor {
+            restore::NativeTabRestore::SystemState => self
+                .open_system_state_tab_in_window(wid)
+                .then_some(())
+                .ok_or_else(|| "could not install System State".to_string()),
             restore::NativeTabRestore::Settings { route } => {
                 let Some(route) = crate::native_settings::SettingsRoute::from_path(route) else {
                     crate::logging::stderr_line!(
@@ -5425,7 +5345,6 @@ impl App {
                 &proxy,
                 leaf.cwd(),
                 None, // not a connected controller spawn
-                None, // a legacy (RESTORE-1) layout carries no identity
                 None, // no worker's task
                 adopt,
             ) {

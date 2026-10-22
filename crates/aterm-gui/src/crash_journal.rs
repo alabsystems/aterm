@@ -3086,7 +3086,6 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             attention: a_attention,
             questions: a_questions,
             autopilot: a_autopilot,
-            identity: a_identity,
             agent: a_agent,
             supervised: a_supervised,
             held: a_held,
@@ -3111,7 +3110,6 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             attention: b_attention,
             questions: b_questions,
             autopilot: b_autopilot,
-            identity: b_identity,
             agent: b_agent,
             supervised: b_supervised,
             held: b_held,
@@ -3134,7 +3132,6 @@ fn same_but_titles(a: &RestoreManifest, b: &RestoreManifest) -> bool {
             && a_attention == b_attention
             && a_questions == b_questions
             && a_autopilot == b_autopilot
-            && a_identity == b_identity
             && a_agent == b_agent
             && a_supervised == b_supervised
             && a_held == b_held
@@ -3672,7 +3669,6 @@ pub(crate) mod fixtures {
                 autopilot: None,
                 land_at: None,
                 autopilot_by: None,
-                identity: None,
                 theme: None,
                 agent: None,
                 supervised: None,
@@ -3728,10 +3724,14 @@ pub(crate) mod tests {
     use crate::crash_signal::{MarkerOwner, markers};
     use crate::restore::{self, RestoreManifest};
 
+    /// A journal directory for one test, under a process root: an unretired lane's
+    /// writer can re-create it after the guard drops, and the root goes at exit.
     pub(crate) fn scratch(tag: &str) -> aterm_tempfile::TempDir {
+        let root = crate::test_scratch::process_root("aterm-cj-");
+        std::fs::create_dir_all(&root).expect("the journals' root");
         aterm_tempfile::Builder::new()
             .prefix(tag)
-            .tempdir()
+            .tempdir_in(&root)
             .expect("scratch dir")
     }
 

@@ -452,11 +452,26 @@ fn rendezvous_dir() -> Option<PathBuf> {
 #[cfg(test)]
 static DIR_OVERRIDE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
 
-/// Test-only: point [`rendezvous_dir`] at `dir` (or clear it). Hold
-/// [`rendezvous_test_guard`] across the whole window; this is process-global.
+/// Test-only: point [`rendezvous_dir`] at `dir` until the guard drops, under
+/// [`rendezvous_test_guard`]: the override is process-global.
 #[cfg(test)]
-pub(crate) fn set_rendezvous_override(dir: Option<PathBuf>) {
-    *DIR_OVERRIDE.write().unwrap_or_else(|p| p.into_inner()) = dir;
+pub(crate) fn rendezvous_override(dir: &Path) -> RendezvousOverride {
+    let serial = rendezvous_test_guard();
+    *DIR_OVERRIDE.write().unwrap_or_else(|p| p.into_inner()) = Some(dir.to_path_buf());
+    RendezvousOverride { _serial: serial }
+}
+
+/// [`rendezvous_override`]'s guard: clears the override, then lets the next test in.
+#[cfg(test)]
+pub(crate) struct RendezvousOverride {
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for RendezvousOverride {
+    fn drop(&mut self) {
+        *DIR_OVERRIDE.write().unwrap_or_else(|p| p.into_inner()) = None;
+    }
 }
 
 /// Test-only: serialize every test that redirects [`rendezvous_dir`].
@@ -795,7 +810,6 @@ mod tests {
     fn session_id_claim_conformance_real_adoption_projects_onto_model() {
         let _guard = rendezvous_test_guard();
         let d = dir();
-        set_rendezvous_override(Some(d.path().to_path_buf()));
 
         // ── arm 1: the ordinary world (Handoff = 0) ──
         let m = aterm_models_session::session_id_claim_model();
@@ -1075,9 +1089,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_handoff_candidate_registration_is_exactly_its_own() {
-        let _guard = rendezvous_test_guard();
         let d = dir();
-        set_rendezvous_override(Some(d.path().to_path_buf()));
+        let _override = rendezvous_override(d.path());
         let mut successor = aterm_uds::spawnfd::command("/bin/sleep")
             .arg("30")
             .stdin(aterm_uds::spawnfd::Stdio::null())
@@ -1145,7 +1158,6 @@ mod tests {
             None,
             "a dead candidate's entry holds nothing"
         );
-        set_rendezvous_override(None);
     }
 }
 

@@ -918,6 +918,33 @@ fn a_wide_glyph_echo_pays_for_the_cells_its_own_glyphs_occupy() {
         bought.is_empty(),
         "two presses bought seven wide glyphs {bought:?}; lit: {cols:?}"
     );
+
+    // Control 4: each press claims at most ONE extra column. Two presses
+    // over three wide glyphs pay 2 + 2 of 6 swept (16 < 18), refused; were
+    // every continuation free, 2 + 3 would pass.
+    // Control 5: the two-press floor. One press over ONE wide glyph (vim's
+    // `l` across it) would pay 1 + 1 of 2 swept, three quarters and more,
+    // yet one credit is one credit.
+    for (presses, glyphs) in [(2u64, 3u16), (1, 1)] {
+        let mut few = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        few.tick(Some((3, 2)), t0, &c, g, &mut out);
+        for i in 0..presses {
+            few.note_typed_cells(t0 + Duration::from_millis(10 + i * 100), 1);
+        }
+        let to = 2 + 2 * glyphs;
+        // 50 ms after the last press: its stamp is fresh, the share rule judges.
+        let at = t0 + Duration::from_millis(60 + (presses - 1) * 100);
+        few.observe_row(3, to, &wide_row(2, glyphs), at);
+        few.tick(Some((3, to)), at, &c, g, &mut out);
+        let cols = v2_cols(&few, 3);
+        let bought: Vec<u16> = (2..to - 1).filter(|col| cols.contains(col)).collect();
+        assert!(
+            bought.is_empty(),
+            "{presses} presses bought {glyphs} wide glyphs {bought:?}; lit: {cols:?}"
+        );
+    }
 }
 
 /// Continuity law: whatever mix of single advances and batched hops typing

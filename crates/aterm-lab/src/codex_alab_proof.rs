@@ -9,6 +9,11 @@
 //! [`crate::codex_alab_model`]): no key, no account, no byte off the machine,
 //! nothing of the owner's touched.
 //!
+//! The instance's sandbox fences the owner's homes too ([`policy`]): the
+//! account's, whatever `HOME` says (a scratch `HOME` still finds the managed
+//! codex-alab in its store), and the caller's. The package runs from a clone
+//! in the proof's scratch, so nothing of those homes is read for it.
+//!
 //! The package is linked as the owner links it (`aterm pkg link codex <pkg>
 //! bin/codex` under the scratch HOME), so a tab's `codex` is atpkg's twin, and
 //! every leg is a tab of ONE instance whose `[harness]` is on (headless,
@@ -391,6 +396,30 @@ pub fn package(given: Option<&str>, home: &str) -> Result<PathBuf, String> {
     Ok(root)
 }
 
+/// The instance's sandbox: the rig's network rule ([`codex_rig::jail_policy`],
+/// one loopback `port`) and every home the lab's facts `p` guard fenced
+/// ([`codex_rig::home_guards`]: the account's, whatever `HOME` says, and the
+/// caller's), so the codex-alab it runs reads none of the owner's protected
+/// data and writes nowhere in either home.
+///
+/// # Errors
+/// No home to fence, or the proof's scratch `s` lies in one (the instance
+/// could write nothing).
+fn policy(port: u16, p: &crate::paths::Paths, s: &Path) -> Result<String, String> {
+    let homes = p.need_guarded_homes()?;
+    if let Some(h) = homes.iter().find(|h| s.starts_with(h.as_str())) {
+        return Err(format!(
+            "codex-alab-proof: its scratch {} lies in the owner's home {h}, which the sandbox fences",
+            s.display()
+        ));
+    }
+    Ok(format!(
+        "{}{}",
+        codex_rig::jail_policy(port),
+        codex_rig::home_guards(&homes)?
+    ))
+}
+
 /// One leg's tab and files.
 struct Leg {
     name: &'static str,
@@ -681,21 +710,128 @@ const EXCHANGE_QUIET: Duration = Duration::from_secs(60);
 /// once after a turn of real work, it is late past this.
 const CONTROL_ACT_MS: i64 = 120_000;
 
+/// The continued reply's token must not trigger another request in this
+/// window, starting at its server-finished-writing witness. Later
+/// Cruise defenses belong to the global claim check.
+const CONTINUE_QUIET: Duration = Duration::from_secs(15);
+
 /// codex-alab's journal words for a point it leaves to a person (its
 /// decider's note, `<thread>: nothing (a person's own exchange: theirs to
 /// answer)`): the rule aterm journals as `left-to-person@v1` ([`RULE_LEFT`]).
 const EXCHANGE_WORDS: &str = "a person's own exchange";
 
-/// The reply to a leg's typed turn (`<leg>:person`): when its answer went
-/// (the request's time plus its hold, unix ms), and the leg's requests after
-/// that one.
+/// Attach only an unambiguous successful write witness for this exact
+/// request. Request tags are not identities: retries can repeat them.
+fn with_replies(mut rows: Vec<J>, replies: &[J]) -> Vec<J> {
+    for i in 0..rows.len() {
+        let row = &rows[i];
+        let Some(id) = row
+            .get("request_id")
+            .and_then(J::as_i64)
+            .filter(|id| *id > 0)
+        else {
+            continue;
+        };
+        if rows
+            .iter()
+            .filter(|r| r.get("request_id").and_then(J::as_i64) == Some(id))
+            .count()
+            != 1
+        {
+            continue;
+        }
+        let Some(at) = row.get("mono_ms").and_then(J::as_i64).filter(|at| *at >= 0) else {
+            continue;
+        };
+        let matching: Vec<&J> = replies
+            .iter()
+            .filter(|r| {
+                str_of(r, "event") == "response_written"
+                    && r.get("request_id").and_then(J::as_i64) == Some(id)
+            })
+            .collect();
+        let [reply] = matching.as_slice() else {
+            continue;
+        };
+        if reply.get("status") != row.get("status") {
+            continue;
+        }
+        let Some(written) = reply
+            .get("mono_ms")
+            .and_then(J::as_i64)
+            .filter(|t| *t >= at)
+        else {
+            continue;
+        };
+        if let J::Obj(fields) = &mut rows[i] {
+            fields.push(("reply_ms".into(), J::Int(written)));
+        }
+    }
+    rows
+}
+
+/// The reply to a leg's typed turn (`<leg>:person`): its successful HTTP
+/// write witness on the run's monotonic clock, and subsequent requests.
 fn person_reply<'a>(leg: &str, rows: &'a [J]) -> Option<(i64, &'a [J])> {
     let head = format!("{leg}:person");
     let at = rows
         .iter()
         .position(|r| str_of(r, "tag").starts_with(&head))?;
     let row = &rows[at];
-    Some((int_of(row, "t") + int_of(row, "hold_ms"), &rows[at + 1..]))
+    let reply = written_reply(row)?;
+    Some((reply, &rows[at + 1..]))
+}
+
+fn written_reply(row: &J) -> Option<i64> {
+    let at = row.get("mono_ms")?.as_i64()?;
+    let written = row.get("reply_ms")?.as_i64()?;
+    (int_of(row, "status") == 200 && at >= 0 && written >= at).then_some(written)
+}
+
+/// A matched successful server-write witness, read on the same monotonic
+/// clock. This is not a receipt that the client consumed the response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplyWrite {
+    request_id: i64,
+    written_ms: i64,
+}
+
+fn observe_reply(rows: &[J], head: &str, observed_ms: i64) -> Option<ReplyWrite> {
+    let row = rows.iter().find(|r| str_of(r, "tag").starts_with(head))?;
+    let written_ms = written_reply(row)?;
+    let request_id = row.get("request_id")?.as_i64()?;
+    (request_id > 0 && observed_ms >= written_ms).then_some(ReplyWrite {
+        request_id,
+        written_ms,
+    })
+}
+
+fn continued_quiet(rows: &[J], reply: Option<ReplyWrite>, now_ms: i64) -> Result<(), String> {
+    let reply = reply
+        .filter(|r| observe_reply(rows, "continue:continue", now_ms) == Some(*r))
+        .ok_or_else(|| "the continued reply has no observed successful write".to_string())?;
+    let until = reply
+        .written_ms
+        .checked_add(ms_of(CONTINUE_QUIET))
+        .ok_or_else(|| "the continued reply's quiet window overflowed".to_string())?;
+    if now_ms < until {
+        return Err("the continued reply's quiet window has not finished".to_string());
+    }
+    let mut tags = Vec::new();
+    for row in rows {
+        let at = row
+            .get("mono_ms")
+            .and_then(J::as_i64)
+            .filter(|t| *t >= 0)
+            .ok_or_else(|| "a model request has no readable monotonic time".to_string())?;
+        if at <= until {
+            tags.push(str_of(row, "tag"));
+        }
+    }
+    if tags != ["continue:person", "continue:continue"] {
+        return Err(format!("the model asked: {}", tags.join(" ")));
+    }
+    Ok(())
 }
 
 /// THE CONTROL'S VERDICT: its turn, typed as a control write, is codex-alab's
@@ -711,7 +847,12 @@ fn continued_after(leg: &str, rows: &[J], acts: &[String]) -> Result<i64, String
         return Err("nothing asked after its reply".to_string());
     };
     let tag = str_of(next, "tag");
-    let late = int_of(next, "t") - reply;
+    let late = next
+        .get("mono_ms")
+        .and_then(J::as_i64)
+        .and_then(|at| at.checked_sub(reply))
+        .filter(|late| *late >= 0)
+        .ok_or_else(|| "the continuation has no time after the witnessed reply".to_string())?;
     if !tag.starts_with(&format!("{leg}:continue")) {
         return Err(format!(
             "the request after its reply was {tag}, no continuation"
@@ -790,12 +931,17 @@ fn left_to_person(
     leg: &str,
     rows: &[J],
     acts: &[String],
+    observed: Option<ReplyWrite>,
     now_ms: i64,
     control_ms: Option<i64>,
 ) -> Result<String, String> {
-    let Some((reply, after)) = person_reply(leg, rows) else {
-        return Err("the person's turn never reached the model".to_string());
+    let Some((_, after)) = person_reply(leg, rows) else {
+        return Err("the person's turn has no successful reply write".to_string());
     };
+    let head = format!("{leg}:person");
+    let observed = observed
+        .filter(|r| observe_reply(rows, &head, now_ms) == Some(*r))
+        .ok_or_else(|| "the person's reply has no local observation".to_string())?;
     let acts = typed_acts(acts);
     if !after.is_empty() || !acts.is_empty() {
         let asked: Vec<String> = after.iter().map(|r| str_of(r, "tag")).collect();
@@ -806,17 +952,17 @@ fn left_to_person(
     let Some(control) = control_ms else {
         return Err("the control got no continuation, so a quiet here proves nothing".to_string());
     };
-    let watched = now_ms - reply;
+    let watched = now_ms.checked_sub(observed.written_ms).unwrap_or(-1);
     if watched < ms_of(EXCHANGE_QUIET) || watched <= control {
         return Err(format!(
-            "watched only {} past the reply (at least {} s, and past the control's {})",
+            "watched only {} since the successful server write (at least {} s, and past the control's {})",
             secs(watched),
             EXCHANGE_QUIET.as_secs(),
             secs(control)
         ));
     }
     Ok(format!(
-        "nothing asked and no act for {} past the reply; the control's continuation came {} after its own",
+        "nothing asked and no act for {} since the successful server write; the control's continuation came {} after its own",
         secs(watched),
         secs(control)
     ))
@@ -915,7 +1061,9 @@ struct Proof {
     s: PathBuf,
     h: PathBuf,
     world_env: Vec<(String, String)>,
-    api_log: PathBuf,
+    api_log: Arc<std::sync::Mutex<codex_rig::ApiLog>>,
+    /// The fake API and observer share this clock, outside every re-exec.
+    api_clock: Instant,
     port: u16,
     fails: Vec<String>,
     /// The bus the Autopilot Off step's mail rides.
@@ -973,10 +1121,11 @@ impl Proof {
     /// The fake model's log rows for `leg` (`t`, `tag`, `u`, `tool_output`, `status`).
     fn requests(&self, leg: &str) -> Vec<J> {
         let head = format!("{leg}:");
-        std::fs::read_to_string(&self.api_log)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| J::parse(l).ok())
+        let Some((rows, replies)) = self.api_log.lock().ok().and_then(|l| l.snapshot().ok()) else {
+            return Vec::new();
+        };
+        with_replies(rows, &replies)
+            .into_iter()
             .filter(|v| {
                 v.get("tag")
                     .and_then(J::as_str)
@@ -1247,6 +1396,34 @@ impl Proof {
         })
     }
 
+    /// Read a successful write of this request's whole response. Its server
+    /// timestamp starts quiet, never a planned delay or a client-read claim.
+    fn await_reply(
+        &self,
+        leg: &Leg,
+        step: &str,
+        limit: Duration,
+    ) -> Result<Option<ReplyWrite>, Stopped> {
+        let head = format!("{}:{step}", leg.name);
+        let mut reply = None;
+        Self::wait_for(limit, Duration::from_millis(250), || {
+            let rows = self.requests(leg.name);
+            reply = observe_reply(&rows, &head, codex_rig::monotonic_ms(self.api_clock));
+            reply.is_some()
+        })?;
+        Ok(reply)
+    }
+
+    fn sleep_past_reply(&self, reply: ReplyWrite, window: Duration) -> Result<(), Stopped> {
+        let Some(until) = reply.written_ms.checked_add(ms_of(window)) else {
+            return Ok(()); // the judge refuses the unrepresentable window
+        };
+        while codex_rig::monotonic_ms(self.api_clock) < until {
+            sleep(Duration::from_millis(250))?;
+        }
+        Ok(())
+    }
+
     /// [`Self::await_tag`] with its hang detector anchored at unix ms `by_ms`
     /// (read off the run's own clock marks, never when the lab looked): no
     /// wait at all once it has passed.
@@ -1421,15 +1598,21 @@ impl Proof {
             ),
             replied && keep == 1,
         );
-        sleep(Duration::from_secs(15))?;
+        let reply = self.await_reply(leg, "continue", Duration::from_secs(60))?;
+        if let Some(reply) = reply {
+            self.sleep_past_reply(reply, CONTINUE_QUIET)?;
+        }
         let ended = self.has_any(leg, &[FINISHED, LANDED]);
-        let tags = self.tags("continue");
+        let rows = self.requests("continue");
+        let quiet = continued_quiet(&rows, reply, codex_rig::monotonic_ms(self.api_clock));
+        let tags: Vec<String> = rows.iter().map(|r| str_of(r, "tag")).collect();
         self.check(
             &format!(
-                "continue: the continued turn's token ends nothing (ends {ended:?}; the model asked: {})",
-                tags.join(" ")
+                "continue: the continued turn's token ends nothing (ends {ended:?}; the model asked: {}; quiet window: {})",
+                tags.join(" "),
+                quiet.as_ref().map_or_else(Clone::clone, |()| "quiet".to_string())
             ),
-            replied && ended.is_empty() && tags == ["continue:person", "continue:continue"],
+            replied && ended.is_empty() && quiet.is_ok(),
         );
         Ok(())
     }
@@ -1979,6 +2162,9 @@ impl Proof {
                 face = task_face(&self.status(&leg.sid));
                 face == "landed"
             })?;
+        if face.is_empty() {
+            face = task_face(&self.status(&leg.sid));
+        }
         self.check(
             &format!(
                 "repo: pushed, the next clean defense lands it ({LANDED}; status task={face})"
@@ -2610,20 +2796,11 @@ impl Proof {
         Ok((theirs, ours))
     }
 
-    /// Wait until unix ms `at` (no wait where it has passed): the anchored
-    /// end of a window read off the model's log, never when the lab looked.
-    fn sleep_until(at: i64) -> Result<(), Stopped> {
-        while crate::util::now_ms() < at {
-            sleep(Duration::from_millis(250))?;
-        }
-        Ok(())
-    }
-
     /// A PERSON'S OWN EXCHANGE, judged (module header): the control's turn
     /// continued, the person's left to them — nothing typed, the rule named
-    /// in its journal, aterm's face `theirs`. Each wait is anchored at the
-    /// replies' times in the model's log, so a judge called late waits for
-    /// nothing.
+    /// in its journal, aterm's face `theirs`. Quiet starts at the server's
+    /// monotonic successful-write witness, not a scheduled delay, the wall
+    /// clock, or a late reader that could overlap a valid later defense.
     fn exchange_leg(
         &mut self,
         person: &Leg,
@@ -2643,8 +2820,20 @@ impl Proof {
         // detectors anchored there.
         let asked = self.tag_by(person, "person", theirs.pressed_ms + 60_000)?
             && self.tag_by(control, "person", ours.pressed_ms + 60_000)?;
-        if let Some((reply, _)) = person_reply(control.name, &self.requests(control.name))
-            && self.tag_by(control, "continue", reply + CONTROL_ACT_MS)?
+        let control_reply =
+            self.await_reply(control, "person", SLOW_TURN + Duration::from_secs(60))?;
+        let remaining = control_reply.map_or(0, |r| {
+            r.written_ms
+                .saturating_add(CONTROL_ACT_MS)
+                .saturating_sub(codex_rig::monotonic_ms(self.api_clock))
+                .max(0)
+        });
+        if control_reply.is_some()
+            && self.await_tag(
+                control,
+                "continue",
+                Duration::from_millis(remaining.unsigned_abs()),
+            )?
         {
             // Its act is on the timeline once it is typed.
             let _ = self.await_act(control, "continue@v1", Duration::from_secs(60))?;
@@ -2666,21 +2855,28 @@ impl Proof {
         let control_ms = continued.ok();
         // The person's quiet: at least a minute past their reply, and past
         // the control's latency.
-        let reply = person_reply(person.name, &self.requests(person.name)).map(|(r, _)| r);
+        let reply = self.await_reply(person, "person", SLOW_TURN + Duration::from_secs(60))?;
         if let Some(reply) = reply {
             let need = ms_of(EXCHANGE_QUIET).max(control_ms.unwrap_or(0) + 10_000);
-            Self::sleep_until(reply + need)?;
+            self.sleep_past_reply(reply, Duration::from_millis(need.unsigned_abs()))?;
         }
         let acts = self.acts(&person.sid);
         let rows = self.requests(person.name);
-        let left = left_to_person(person.name, &rows, &acts, crate::util::now_ms(), control_ms);
+        let left = left_to_person(
+            person.name,
+            &rows,
+            &acts,
+            reply,
+            codex_rig::monotonic_ms(self.api_clock),
+            control_ms,
+        );
         let proven = self.proven_pid(&person.sid).is_some();
         self.check(
             &format!(
                 "exchange: after the person's own turn and the model's plain reply of real work \
-                 ({} after their Enter), codex-alab types NOTHING, its claim still proven ({}; \
+                 (successful reply write: {}), codex-alab types NOTHING, its claim still proven ({}; \
                  proven: {proven})",
-                reply.map_or_else(|| "?".to_string(), |r| secs(r - theirs.pressed_ms)),
+                reply.map_or("not observed", |_| "observed"),
                 left.as_ref().unwrap_or_else(|why| why)
             ),
             asked && left.is_ok() && proven,
@@ -2764,6 +2960,10 @@ impl Proof {
     ) -> Result<(), Stopped> {
         let rows = self.requests(person.name);
         let Some((reply, _)) = person_reply(person.name, &rows) else {
+            self.check(
+                "exchange: a successful reply write was observed before the final no-typing check",
+                false,
+            );
             return Ok(());
         };
         let Some((pid, generation, resumed)) = was else {
@@ -2805,7 +3005,8 @@ impl Proof {
             left,
         );
         let rows = self.requests(person.name);
-        let asked: Vec<String> = person_reply(person.name, &rows)
+        let reply_still_written = person_reply(person.name, &rows);
+        let asked: Vec<String> = reply_still_written
             .map(|(_, after)| after.iter().map(|r| str_of(r, "tag")).collect())
             .unwrap_or_default();
         let acts = self.acts(&person.sid);
@@ -2814,11 +3015,12 @@ impl Proof {
         self.check(
             &format!(
                 "exchange: nothing typed into the person's exchange by the run's end, past the \
-                 upgrade ({} since the reply; asked after it: {asked:?}; acts: {acts:?}; \
+                 upgrade ({} since the reply; write still witnessed: {}; asked after it: {asked:?}; acts: {acts:?}; \
                  journal typed: {journal:?})",
-                secs(crate::util::now_ms() - reply)
+                secs(codex_rig::monotonic_ms(self.api_clock) - reply),
+                reply_still_written.is_some()
             ),
-            asked.is_empty() && typed.is_empty() && journal.is_empty(),
+            reply_still_written.is_some() && asked.is_empty() && typed.is_empty() && journal.is_empty(),
         );
         Ok(())
     }
@@ -2907,6 +3109,11 @@ fn codex_config(port: u16, proj: &Path, home: &Path, extra: &str) -> String {
 
 /// `codex-alab-proof [--package DIR] [--aterm PATH] [--keep]`.
 ///
+/// Once the proof admits its copied programs, it retains its own scratch
+/// even without `--keep` and reports the path on exit: a failed first exec
+/// may still be under macOS assessment, and these relaunching legs do not
+/// prove that every copied image ran before cleanup.
+///
 /// # Errors
 /// Usage, a run that could not start, or an interrupt.
 pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
@@ -2922,7 +3129,8 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     }
     let not_run = |why: String| Fail::exit(3, format!("NOT RUN: {why}"));
     let aterm = instance::resolve_aterm(aterm).map_err(not_run)?;
-    let home = crate::paths::paths().need_home().map_err(not_run)?;
+    // the managed codex-alab is in the package store of the account's home, whatever HOME says
+    let home = crate::paths::paths().need_store_home().map_err(not_run)?;
     let pkg = package(given.as_deref(), home).map_err(not_run)?;
     let build =
         std::fs::read_to_string(pkg.join(aterm_agent::harness::codex_alab::ALAB_BUILD_JSON))
@@ -2952,7 +3160,16 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     let s = world.dir.clone();
     let h = world.home.clone();
     let prefix = h.join("Library/Application Support/aterm/pkg");
-    let api_log = s.join("api.log");
+    let api_clock = Instant::now();
+    let api_log = Arc::new(std::sync::Mutex::new(codex_rig::ApiLog::new(
+        s.join("api.log"),
+        api_clock,
+    )));
+    // The stand-ins below and both package clones may run or re-exec. No
+    // complete per-copy execution proof owns their lifetime, so retain only
+    // this proof's world before admitting the first copy. World::drop reports
+    // its path on success, setup failure, interruption and failed first exec.
+    world.keep();
     let made = (|| -> std::io::Result<u16> {
         for d in ["zdot", "legs"] {
             std::fs::create_dir_all(s.join(d))?;
@@ -2960,7 +3177,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         codex_rig::stand_ins(&s.join("bin"))?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        let log = api_log.clone();
+        let log = Arc::clone(&api_log);
         std::thread::spawn(move || codex_rig::serve(listener, log, Arc::new(model::answer)));
         std::fs::write(
             s.join("zdot/.zshrc"),
@@ -2987,22 +3204,26 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
             .and_then(|mut f| f.write_all(fabric.table.as_bytes()))
             .map_err(|e| format!("codex-alab-proof: cannot name the bridge: {e}"))?;
     }
-    // The re-exec upgrade's build: the same bytes at another path (a clone).
-    let pkg_b = s.join("pkg-b");
-    let cloned = aterm_uds::spawnfd::command("/bin/cp")
-        .arg("-cR")
-        .arg(&pkg)
-        .arg(&pkg_b)
-        .stdin(Stdio::null())
-        .status()
-        .is_ok_and(|st| st.success());
-    if !cloned {
-        return Err(Fail::die(format!(
-            "codex-alab-proof: cannot copy {} to {}",
-            pkg.display(),
-            pkg_b.display()
-        )));
+    // The package the legs run (a clone: the sandbox fences the owner's homes, the account's store
+    // among them), and the re-exec upgrade's build: the same bytes at another path (another clone).
+    let (pkg_a, pkg_b) = (s.join("pkg-a"), s.join("pkg-b"));
+    for to in [&pkg_a, &pkg_b] {
+        let cloned = aterm_uds::spawnfd::command("/bin/cp")
+            .arg("-cR")
+            .arg(&pkg)
+            .arg(to)
+            .stdin(Stdio::null())
+            .status()
+            .is_ok_and(|st| st.success());
+        if !cloned {
+            return Err(Fail::die(format!(
+                "codex-alab-proof: cannot copy {} to {}",
+                pkg.display(),
+                to.display()
+            )));
+        }
     }
+    let sandbox = policy(port, crate::paths::paths(), &s).map_err(Fail::die)?;
     let sstr = |sub: &str| s.join(sub).to_string_lossy().into_owned();
     let env: Vec<(String, String)> = [
         (
@@ -3035,7 +3256,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
                 .to_vec(),
             env,
             cwd: s.clone(),
-            sandbox: Some(codex_rig::jail_policy(port)),
+            sandbox: Some(sandbox),
         },
     )?;
     let mut proof = Proof {
@@ -3044,11 +3265,12 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
         h,
         world_env,
         api_log,
+        api_clock,
         port,
         fails: Vec::new(),
         fabric,
     };
-    let outcome = legs(&mut proof, &pkg, &pkg_b);
+    let outcome = legs(&mut proof, &pkg_a, &pkg_b);
     proof.end_all();
     if let Err(f) = outcome
         && (f.stopped.is_some() || proof.fails.is_empty())
@@ -3288,6 +3510,108 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
 mod tests {
     use super::*;
 
+    /// What a child under the profile `profile` (none: unsandboxed) reaches:
+    /// for each attempt of [`FENCE_SCRIPT`], `ok` or `no`. `A`, `S` and `W`
+    /// name the account's home, the scratch `HOME` and the proof's scratch.
+    fn reached(profile: &str, tag: &str, a: &Path, s: &Path, w: &Path) -> Vec<String> {
+        let mut cmd = aterm_uds::spawnfd::command("/usr/bin/sandbox-exec");
+        cmd.args(["-p", profile, "/bin/sh", "-c", FENCE_SCRIPT])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("A", a)
+            .env("S", s)
+            .env("W", w)
+            .env("TAG", tag)
+            .stdin(Stdio::null());
+        let out = aterm_uds::deadline::outputs_until(
+            &mut [&mut cmd],
+            Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(60),
+        )
+        .pop()
+        .expect("one child")
+        .expect("the child ran");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Each attempt a line: a write into the account's home, into the scratch
+    /// `HOME`, a read of each one's `.ssh`, of the account's package store, of
+    /// a plain file of the account's home, and a write into the proof's scratch.
+    const FENCE_SCRIPT: &str = r#"try() { if "$@" >/dev/null 2>&1; then echo ok; else echo no; fi; }
+try sh -c 'echo x > "$1/new-$2"' _ "$A" "$TAG"
+try sh -c 'echo x > "$1/new-$2"' _ "$S" "$TAG"
+try cat "$A/.ssh/id"
+try cat "$S/.ssh/id"
+try cat "$A/Library/Application Support/aterm/pkg/store/codex/1/bin/codex"
+try cat "$A/plain"
+try sh -c 'echo x > "$1/new-$2"' _ "$W" "$TAG"
+"#;
+
+    /// THE PROOF'S SANDBOX FENCES THE OWNER'S HOMES, APPLIED: a child under
+    /// the profile [`policy`] makes from the lab's facts with a fake account
+    /// home (handed in through [`crate::paths::Paths::resolve_with`]) and a
+    /// scratch `HOME` writes into neither home and reads neither's `.ssh` nor
+    /// the account's package store, while it reads a plain file of the account
+    /// (the aterm under test lives in a checkout there) and writes the proof's
+    /// scratch. NEGATIVE CONTROLS: under the rig's network rule alone (the
+    /// proof before the fence) every attempt goes through, and a scratch
+    /// inside a fenced home is refused.
+    #[test]
+    fn the_proofs_sandbox_fences_the_account_home_and_a_scratch_home() {
+        let top = aterm_tempfile::Builder::new()
+            .prefix("lab-alab-fence-")
+            .tempdir()
+            .unwrap();
+        let real = std::fs::canonicalize(top.path()).unwrap();
+        let (account, scratch, world) =
+            (real.join("account"), real.join("scratch"), real.join("w"));
+        for h in [&account, &scratch] {
+            for f in [
+                ".ssh/id",
+                "Library/Application Support/aterm/pkg/store/codex/1/bin/codex",
+                "plain",
+            ] {
+                let path = h.join(f);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, "owned replica\n").unwrap();
+            }
+        }
+        std::fs::create_dir_all(&world).unwrap();
+        let p =
+            crate::paths::Paths::resolve_with(Some(account.clone()), Some(scratch.clone().into()));
+        let fenced = policy(4242, &p, &world).unwrap();
+        assert!(
+            fenced.starts_with(&codex_rig::jail_policy(4242)),
+            "the network rule stays"
+        );
+        assert_eq!(
+            reached(&fenced, "fenced", &account, &scratch, &world),
+            ["no", "no", "no", "no", "no", "ok", "ok"]
+        );
+        assert!(!account.join("new-fenced").exists() && !scratch.join("new-fenced").exists());
+        // NEGATIVE CONTROLS
+        assert_eq!(
+            reached(
+                &codex_rig::jail_policy(4242),
+                "control",
+                &account,
+                &scratch,
+                &world
+            ),
+            ["ok"; 7]
+        );
+        assert!(policy(4242, &p, &account.join("w")).is_err());
+        assert!(policy(4242, &p, &scratch.join("w")).is_err());
+    }
+
     /// THE CARRY LEG'S HOLDER CHECK FROM THE SESSION LOG (phase 6, 6F-7):
     /// the act mark `harness-turn@v1` writes names its holder, as the
     /// timeline's row does. NEGATIVE CONTROLS: the mark without `holder=`
@@ -3398,6 +3722,81 @@ mod tests {
         assert_eq!(secs(130_000), "130.0 s");
     }
 
+    /// A successful write of this exact reply must be observed before the
+    /// quiet clock starts. Delayed writes extend that clock; wall-clock
+    /// changes, configured holds and late readers cannot move its boundary.
+    #[test]
+    fn a_continuation_is_quiet_through_its_own_reply_window() {
+        let row = |id: i64, at: i64, tag: &str| {
+            J::obj([
+                ("request_id", J::Int(id)),
+                ("mono_ms", J::Int(at)),
+                ("t", J::Int(i64::MAX)),
+                ("tag", J::s(tag)),
+                ("hold_ms", J::Int(0)),
+                ("status", J::Int(200)),
+            ])
+        };
+        let response = |id, at, status| {
+            J::obj([
+                ("event", J::s("response_written")),
+                ("request_id", J::Int(id)),
+                ("mono_ms", J::Int(at)),
+                ("status", J::Int(status)),
+            ])
+        };
+        let asked = vec![
+            row(1, 0, "continue:person"),
+            row(2, 120_000, "continue:continue"),
+        ];
+        // The configured hold was zero; the write actually finished late,
+        // and its witness was not observed until later still.
+        let sent = response(2, 190_000, 200);
+        let initial = with_replies(asked.clone(), std::slice::from_ref(&sent));
+        let seen = observe_reply(&initial, "continue:continue", 200_000);
+        assert!(seen.is_some());
+        let until = 205_000;
+        let mut later = initial.clone();
+        later.push(row(3, 370_000, "continue:defend+repo"));
+        assert_eq!(continued_quiet(&later, seen, 500_000), Ok(()));
+        assert_eq!(continued_quiet(&initial, seen, until), Ok(()));
+        // NEGATIVE CONTROLS: even delayed inspection rejects a request one
+        // second after the reply or at the inclusive fifteen-second bound.
+        for extra_at in [191_000, until] {
+            let mut spin = initial.clone();
+            spin.push(row(3, extra_at, "continue:defend+repo"));
+            assert!(continued_quiet(&spin, seen, 500_000).is_err(), "{extra_at}");
+        }
+        assert!(continued_quiet(&initial, seen, until - 1).is_err());
+        assert!(continued_quiet(&initial[..1], seen, 500_000).is_err());
+        assert_eq!(observe_reply(&initial, "continue:continue", 189_999), None);
+        // No response, another request's response, status disagreement,
+        // before-request timestamps and duplicate witnesses cannot prove it.
+        for replies in [
+            vec![],
+            vec![response(3, 190_000, 200)],
+            vec![response(2, 190_000, 429)],
+            vec![response(2, 119_999, 200)],
+            vec![sent.clone(), sent],
+        ] {
+            let rows = with_replies(asked.clone(), &replies);
+            let seen = observe_reply(&rows, "continue:continue", 500_000);
+            assert_eq!(seen, None);
+            assert!(continued_quiet(&rows, seen, i64::MAX).is_err());
+        }
+        // Repeated tags are distinct requests; one reply cannot prove both.
+        let mut retried = asked;
+        retried.push(row(3, 195_000, "continue:continue"));
+        let rows = with_replies(retried, &[response(3, 196_000, 200)]);
+        assert_eq!(observe_reply(&rows, "continue:continue", 500_000), None);
+        let duplicate = vec![
+            row(2, 120_000, "continue:continue"),
+            row(2, 120_000, "continue:continue"),
+        ];
+        let rows = with_replies(duplicate, &[response(2, 190_000, 200)]);
+        assert_eq!(observe_reply(&rows, "continue:continue", 500_000), None);
+    }
+
     /// THE CRUISE CHECK'S READER ([`claims_of`]): a done claim met by the
     /// defend prompt, pending inside its back-off, unmet by another act or by
     /// nothing past it. NEGATIVE CONTROLS beside each.
@@ -3500,6 +3899,9 @@ mod tests {
         let row = |t: i64, tag: &str, hold: i64| {
             J::obj([
                 ("t", J::Int(t)),
+                ("request_id", J::Int(t + 1)),
+                ("mono_ms", J::Int(t)),
+                ("reply_ms", J::Int(t + hold)),
                 ("tag", J::s(tag)),
                 ("hold_ms", J::Int(hold)),
                 ("status", J::Int(200)),
@@ -3534,8 +3936,9 @@ mod tests {
         assert!(continued_after("control", &[], &[]).is_err());
         // The person's exchange: its reply, nothing after, watched 70 s past.
         let person = vec![row(0, "exchange:person", reply)];
+        let seen = observe_reply(&person, "exchange:person", reply);
         let now = reply + 70_000;
-        let held = left_to_person("exchange", &person, &[], now, Some(2_000));
+        let held = left_to_person("exchange", &person, &[], seen, now, Some(2_000));
         assert!(
             held.as_ref().is_ok_and(|s| s.contains("70.0 s")),
             "{held:?}"
@@ -3549,6 +3952,7 @@ mod tests {
             "exchange",
             &typed,
             &acts(&["continue@v1"]),
+            seen,
             now,
             Some(2_000),
         )
@@ -3559,28 +3963,65 @@ mod tests {
         );
         // An act on the timeline alone (an answer, an approval) is typing too.
         assert!(
-            left_to_person("exchange", &person, &acts(&["answer@v1"]), now, Some(2_000)).is_err()
+            left_to_person(
+                "exchange",
+                &person,
+                &acts(&["answer@v1"]),
+                seen,
+                now,
+                Some(2_000)
+            )
+            .is_err()
         );
         // The point left to the person, recorded and never typed, is no
         // typing; beside a typed act it hides nothing.
         let left = acts(&[RULE_LEFT]);
-        assert!(left_to_person("exchange", &person, &left, now, Some(2_000)).is_ok());
+        assert!(left_to_person("exchange", &person, &left, seen, now, Some(2_000)).is_ok());
         let after = acts(&[RULE_LEFT, "continue@v1"]);
-        assert!(left_to_person("exchange", &person, &after, now, Some(2_000)).is_err());
+        assert!(left_to_person("exchange", &person, &after, seen, now, Some(2_000)).is_err());
         // The live upgrade's re-exec at rest, recorded and never typed, is no
         // typing either; beside a typed act it hides nothing.
         let upgraded = acts(&[RULE_LEFT, RULE_UPGRADE]);
-        assert!(left_to_person("exchange", &person, &upgraded, now, Some(2_000)).is_ok());
+        assert!(left_to_person("exchange", &person, &upgraded, seen, now, Some(2_000)).is_ok());
         assert_eq!(
             typed_acts(&acts(&[RULE_UPGRADE, "continue@v1", RULE_LEFT])),
             acts(&["continue@v1"])
         );
         // NEGATIVE CONTROLS: watched under the minute, or not past the
         // control's latency; a control that got nothing; no turn at all.
-        assert!(left_to_person("exchange", &person, &[], reply + 59_000, Some(2_000)).is_err());
-        assert!(left_to_person("exchange", &person, &[], now, Some(75_000)).is_err());
-        assert!(left_to_person("exchange", &person, &[], now, None).is_err());
-        assert!(left_to_person("exchange", &[], &[], now, Some(2_000)).is_err());
+        assert!(
+            left_to_person("exchange", &person, &[], seen, reply + 59_000, Some(2_000)).is_err()
+        );
+        assert!(left_to_person("exchange", &person, &[], seen, now, Some(75_000)).is_err());
+        assert!(left_to_person("exchange", &person, &[], seen, now, None).is_err());
+        assert!(left_to_person("exchange", &[], &[], seen, now, Some(2_000)).is_err());
+        assert!(left_to_person("exchange", &person, &[], None, i64::MAX, Some(2_000)).is_err());
+        // A late reader preserves the historical server-write boundary;
+        // no Unix-clock value enters this test.
+        let late_seen = observe_reply(&person, "exchange:person", now);
+        assert!(left_to_person("exchange", &person, &[], late_seen, now, Some(2_000)).is_ok());
+        assert!(
+            left_to_person(
+                "exchange",
+                &person,
+                &[],
+                late_seen,
+                reply + 59_999,
+                Some(2_000)
+            )
+            .is_err()
+        );
+        let before_reply = vec![
+            row(0, "control:person", reply),
+            row(reply - 1, "control:continue", 0),
+        ];
+        assert!(continued_after("control", &before_reply, &acts(&["continue@v1"])).is_err());
+        let mut no_reply = person.clone();
+        if let J::Obj(fields) = &mut no_reply[0] {
+            fields.retain(|(k, _)| k != "reply_ms");
+        }
+        assert!(person_reply("exchange", &no_reply).is_none());
+        assert!(left_to_person("exchange", &no_reply, &[], seen, i64::MAX, Some(2_000)).is_err());
     }
 
     /// THE JOURNAL AND THE HAND ([`exchange_rule`], [`journal_typed`],

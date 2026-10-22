@@ -1135,6 +1135,9 @@ fn the_sidecar_line_reads_back_and_a_stem_is_one_name() {
             transcript: Some(PathBuf::from("/t/a b.jsonl")),
             turn: Some("u-task 1".to_string()),
         },
+        Source::Screen {
+            program: "gemini".to_string(),
+        },
     ] {
         assert_eq!(Source::parse(&source.line()), Some(source.clone()));
     }
@@ -1142,6 +1145,8 @@ fn the_sidecar_line_reads_back_and_a_stem_is_one_name() {
         "",
         "source=else",
         "source=none why=Not%20a%20word",
+        "source=screen",
+        "source=screen program=Not%20a%20word",
         "source=transcript uuid=a",
     ] {
         assert_eq!(Source::parse(bad), None, "{bad:?}");
@@ -1154,6 +1159,132 @@ fn the_sidecar_line_reads_back_and_a_stem_is_one_name() {
         );
     }
     assert!(std::fs::read_dir(&*tasks).expect("dir").next().is_none());
+}
+
+/// A SCREEN-READ LANDING'S RESULT OPENS WITH ITS REPORT ([`with_report`]):
+/// the words read where the Land instruction was typed, a blank line, then
+/// the landing's own. NEGATIVE CONTROLS: no report, a blank one, and one
+/// that is the landing's own words leave the landing's words alone.
+#[test]
+fn a_screen_landings_result_opens_with_its_report() {
+    let defense = "Nothing left: merged into the remote main branch.";
+    assert_eq!(
+        with_report(Some("Fixed the parser.\n"), defense),
+        format!("Fixed the parser.\n\n{defense}")
+    );
+    for none in [None, Some(""), Some("  \n"), Some(defense)] {
+        assert_eq!(with_report(none, defense), defense, "{none:?}");
+    }
+}
+
+/// A SCREEN'S RESULT (agy, Muse Code, Gemini CLI: no transcript aterm
+/// reads, [`snapshot_screen`]): the landing's words the screen's reader read
+/// are the snapshot, its sidecar `source=screen program=<agent>`, and
+/// `result` answers them under that stamp, cut at [`RESULT_MAX_CHARS`] as a
+/// transcript's result is; `result full` has no transcript to read.
+/// NEGATIVE CONTROLS: words that are only blanks are no result
+/// (`no-words`); the same done with neither words nor a transcript is
+/// `no-transcript`, as before.
+#[test]
+fn a_screens_result_is_the_landings_words() {
+    let tasks = ScratchDir::new("result", "screen");
+    let said = screen_said(
+        Some("Merged the parser.\n"),
+        "Nothing left: all of it is merged into the remote main branch.\n",
+    );
+    assert_eq!(
+        said,
+        "Merged the parser.\n\nNothing left: all of it is merged into the remote main branch."
+    );
+    assert_eq!(screen_said(None, " last "), "last");
+    for program in ["gemini", "agy", "muse"] {
+        let stem = format!("s-{program}-2");
+        let snap = snapshot_screen(&tasks, &stem, program, &said, DoneBy::Turn).expect("written");
+        assert_eq!(snap.bytes, said.len() as u64);
+        assert_eq!(snap.unavailable, None);
+        assert_eq!(
+            std::fs::read_to_string(&snap.path).expect("the result"),
+            said
+        );
+        assert_eq!(
+            source_of(&snap.path),
+            Some(Source::Screen {
+                program: program.to_string()
+            })
+        );
+        assert_eq!(
+            answer(&snap.path, false),
+            format!(
+                "OK 3 source=screen program={program} bytes={}\n{said}\n",
+                said.len()
+            )
+        );
+        assert_eq!(
+            answer(&snap.path, true),
+            "ERR result unavailable why=no-transcript\n"
+        );
+    }
+    let long = "x".repeat(RESULT_MAX_CHARS + 10);
+    let snap = snapshot_screen(&tasks, "s-long-1", "agy", &long, DoneBy::Turn).expect("written");
+    assert!(
+        answer(&snap.path, false).contains("… truncated; full: "),
+        "cut as a transcript's is"
+    );
+    // The controls.
+    let blank =
+        snapshot_screen(&tasks, "s-blank-1", "muse", " \n ", DoneBy::Turn).expect("written");
+    assert_eq!(blank.unavailable, Some("no-words"));
+    assert_eq!(
+        answer(&blank.path, false),
+        "ERR result unavailable why=no-words\n"
+    );
+    let none = snapshot(&tasks, "s-none-1", None, DoneBy::Turn).expect("written");
+    assert_eq!(
+        answer(&none.path, false),
+        "ERR result unavailable why=no-transcript\n"
+    );
+    assert!(snapshot_screen(&tasks, "../x", "agy", &said, DoneBy::Turn).is_err());
+}
+
+/// EACH SCREEN-READ HARNESS'S LANDING IS READ OFF ITS OWN SCREEN: Gemini
+/// CLI's, agy's and Muse Code's measured end of a turn, read by its reader
+/// as the turn-end loop reads a point (`TurnEndReading::of`), carries its
+/// reply whole, and the words the done edge snapshots ([`screen_said`], the
+/// loop's `fold_point`) end with that reply — what a manager's `result`
+/// returns for a worker of theirs. NEGATIVE CONTROL: a shell's prompt, read
+/// by the same readers, carries no words, so no result is made of it.
+#[test]
+fn each_screen_harnesss_landing_words_are_read_off_its_screen() {
+    use crate::supervise::policy::turn_end::{TurnEndReading, screen_alone};
+    use aterm_phase::Program;
+    let shell = aterm_phase::prompt::fixtures::rows(&["% "]);
+    for (program, text) in [
+        (Program::Gemini, aterm_phase::gemini::fixtures::END_OF_TURN),
+        (Program::Agy, aterm_phase::agy::fixtures::lab::END_OF_TURN),
+        (Program::Muse, aterm_phase::muse::fixtures::END_OF_TURN),
+    ] {
+        assert!(screen_alone(program), "{program:?}: no transcript is read");
+        let rows = aterm_phase::prompt::fixtures::screen(text);
+        let reading = aterm_phase::read(Some(program.name()), &rows, None);
+        let point = TurnEndReading::of(&reading, &rows, false, None, None, None);
+        let tail = point
+            .said_tail
+            .as_deref()
+            .unwrap_or_else(|| panic!("{program:?}: the reply's words"));
+        assert!(!point.said_cut, "{program:?}: whole on its screen");
+        let said = screen_said(point.turn_said.as_deref(), tail);
+        assert!(!said.trim().is_empty(), "{program:?}");
+        assert!(
+            said.ends_with(tail.trim()),
+            "{program:?}: {said:?} ends with {tail:?}"
+        );
+        let none = aterm_phase::read(Some(program.name()), &shell, None);
+        let none = TurnEndReading::of(&none, &shell, false, None, None, None);
+        assert_eq!(
+            none.said_tail, None,
+            "CONTROL {program:?}: a shell's prompt"
+        );
+    }
 }
 
 /// The task's turn as the done edge can read it before Claude Code wrote its

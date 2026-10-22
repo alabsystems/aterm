@@ -11,10 +11,9 @@
 use std::fs;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use crate::artifact::{self, Compilers, Complete, Identity};
-use crate::ledger::GitCli;
+use crate::ledger::testing::Git;
 
 const VERSION: &str = "0.102.0";
 
@@ -25,9 +24,10 @@ fn scratch() -> aterm_tempfile::TempDir {
         .unwrap()
 }
 
-/// git with nothing of this machine's own configuration in it.
+/// git with nothing of this machine's own configuration in it
+/// ([`crate::ledger::testing::git`]).
 fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = crate::ledger::testing::git()
         .arg("-C")
         .arg(dir)
         .args([
@@ -43,8 +43,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "core.hooksPath=/dev/null",
         ])
         .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap();
     assert!(
@@ -309,7 +307,7 @@ fn the_verified_judge_reads_the_record_of_the_tree_on_these_bytes() {
     fs::write(repo.join("README"), "another tree\n").unwrap();
     git(&repo, &["commit", "-q", "-am", "another tree"]);
     let other = git(&repo, &["rev-parse", "HEAD"]);
-    let g = GitCli::new(&repo);
+    let g = Git::new(&repo);
     let macho = "ab".repeat(32);
     let judge = |commit: &str| crate::gates::verified(&g, commit, &macho).unwrap();
 
@@ -392,13 +390,13 @@ impl Clone {
     }
 
     fn verify(&self, macho: &str) {
-        crate::gates::record_verified(&GitCli::new(&self.repo), &self.source, macho).unwrap();
+        crate::gates::record_verified(&Git::new(&self.repo), &self.source, macho).unwrap();
     }
 
     /// The bundle a cut whose prover is `toolchain` would sign.
     fn bundle_for(&self, toolchain: &str) -> Result<crate::publish::VerifiedBundle, String> {
         crate::publish::verified_release_bundle(
-            &GitCli::new(&self.repo),
+            &Git::new(&self.repo),
             &self.repo,
             &self.source,
             VERSION,
@@ -431,7 +429,7 @@ fn a_cut_signs_only_its_releases_verified_bundle() {
 
     // Another release's journal (another published commit): nothing to sign.
     crate::publish::verified_release_bundle(
-        &GitCli::new(&c.repo),
+        &Git::new(&c.repo),
         &c.repo,
         &"0".repeat(40),
         VERSION,
@@ -537,7 +535,7 @@ fn between_releases_ship_build_builds_head_under_a_provisional_number() {
         "[workspace.package]\nversion = \"9.9.0\"\n",
     )
     .unwrap();
-    let identity = artifact::provisional_identity(&GitCli::new(&repo)).unwrap();
+    let identity = artifact::provisional_identity(&Git::new(&repo)).unwrap();
     assert_eq!(
         identity,
         Identity {

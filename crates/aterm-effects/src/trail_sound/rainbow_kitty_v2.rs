@@ -105,6 +105,7 @@ pub(super) const LANE_AGE_GUARD_S: f32 = 0.040;
 /// CASCADE is 4 because one brrrring is four notes; one cascade at a time is
 /// [`MelodyV2::on_jump`]'s [`CASCADE_EXCLUSIVE_MS`] window.
 /// `the_lanes_hold_their_caps_and_steals_are_zero` runs §14's worst case.
+#[inline]
 pub(super) fn lane_cap(lane: u8) -> usize {
     match lane {
         LANE_TUNE | LANE_CASCADE => 4,
@@ -120,6 +121,7 @@ pub(super) fn lane_cap(lane: u8) -> usize {
 /// [`LANE_AGE_GUARD_S`]: `true` drops the newcomer, `false` steals anyway.
 /// A missing GLINT or BLOOM is inaudible; a missing TUNE voice is a key that
 /// made no sound, so the tune always speaks.
+#[inline]
 pub(super) fn lane_drops_the_newcomer(lane: u8) -> bool {
     matches!(lane, LANE_GLINT | LANE_BLOOM)
 }
@@ -134,6 +136,7 @@ pub(super) fn lane_drops_the_newcomer(lane: u8) -> bool {
 /// 13 apart (`a`/`n`) fold to 0 too, which would stutter. [`MelodyV2::derive`]
 /// passes whether the raw difference is zero, so a folded-to-zero leap takes
 /// the smallest real move instead.
+#[inline]
 const fn stride_mag(r: i32, repeated: bool) -> i32 {
     if repeated {
         return 0;
@@ -435,6 +438,7 @@ const FLOW_ECHO_LEVEL: f32 = 0.25;
 /// identity.
 const FLOW_KEY_HEADROOM: f32 = 0.954_992_6;
 
+#[inline]
 fn flow_key_headroom(flow: f32) -> f32 {
     lerp(1.0, FLOW_KEY_HEADROOM, flow.sqrt())
 }
@@ -484,6 +488,7 @@ const FLOW_P2_LVL: f32 = 0.22;
 /// 3); exactly `(P1_LVL, P2_LVL)` at `flow == 0.0`. P2 rises and P1 falls by the
 /// same amount, so the strike's sum is 0.78 at every heat: warming P2 alone
 /// would raise the onset peak, which §9.6 forbids.
+#[inline]
 fn flow_partials(flow: f32) -> (f32, f32) {
     let p2 = lerp(P2_LVL, FLOW_P2_LVL, flow);
     (P1_LVL - (p2 - P2_LVL), p2)
@@ -823,6 +828,7 @@ const MARK_DOUBLED: u8 = 0x80;
 /// The phrase mark a class is, or [`MARK_NONE`]. Keyed on the class (the
 /// character never reaches the synth), so an echo-born cue (class 0) is a
 /// letter.
+#[inline]
 fn phrase_kind(class: u8) -> u8 {
     match class {
         STOP => MARK_PERIOD,
@@ -838,6 +844,7 @@ fn phrase_kind(class: u8) -> u8 {
 /// The harmonic half: which [`CHORD_LOOP`] indices state the function a mark
 /// asks the next Space for. `.` and `!` close on I (0, 4), `?` `,` `:` hang on
 /// V (3, 5), `;` turns to vi (1, 6). `None` is the ordinary `chord + 1`.
+#[inline]
 fn mark_chords(mark: u8) -> Option<[u8; 2]> {
     match mark {
         MARK_PERIOD | MARK_BANG => Some([0, 4]),
@@ -1195,6 +1202,7 @@ const TING_DUCK_RAMP_S: f32 = LANE_FADE_STEAL_S;
 
 /// Octave-folds a pitch into the v2 ting's register `[TING_LO_HZ, 2×)`; v1's
 /// [`super::ting_octave`] is separate.
+#[inline]
 fn ting_fold(mut f: f32) -> f32 {
     while f >= TING_LO_HZ * 2.0 {
         f *= 0.5;
@@ -1936,6 +1944,7 @@ impl MelodyV2 {
     /// The state's undo frame ([`Undo`]): `push_undo` saves exactly this and
     /// `pop_undo` restores it, so "type a key, delete it" leaves `frame()`
     /// unchanged (`backspace_unsings_a_phrase`).
+    #[inline]
     fn frame(&self) -> Undo {
         self.text
     }
@@ -1962,12 +1971,14 @@ impl MelodyV2 {
     }
 
     /// Is `deg` a chord tone of the live chord (§10.3)?
+    #[inline]
     fn deg_is_lit(&self, deg: i32) -> bool {
         let pc = deg.rem_euclid(5) as u8;
         CHORD_LOOP[usize::from(self.text.chord)].lit & (1 << pc) != 0
     }
 
     /// Is the sounding degree a chord tone of the live chord (§10.3)?
+    #[inline]
     fn lit(&self) -> bool {
         self.deg_is_lit(i32::from(self.text.walk))
     }
@@ -2043,6 +2054,7 @@ impl MelodyV2 {
     /// The mark the next Space will confirm (test / introspection hook): 0
     /// none, 1 `.`, 2 `!`, 3 `?`, 4 `,`, 5 `;`, 6 `:`; 0 for a doubled mark
     /// ([`MARK_DOUBLED`]).
+    #[inline]
     #[must_use]
     pub fn pending_mark(&self) -> u8 {
         if self.text.last_mark & MARK_DOUBLED != 0 {
@@ -2843,6 +2855,7 @@ impl MelodyV2 {
 /// Folds a signed quantity into `−6..=6` by adding or subtracting 13: §3.1
 /// step 1's interval fold, for the alphabet's distance and for the gap that
 /// stands in for it when there is no pair of glyphs.
+#[inline]
 fn fold_signed13(d: i32) -> i32 {
     (d + 6).rem_euclid(13) - 6
 }
@@ -2854,6 +2867,7 @@ fn fold_signed13(d: i32) -> i32 {
 /// A stride is bounded by [`WORD_LEAP_MAX_DEG`] and the register is eight
 /// degrees wide, so one reflection suffices and the final clamp is
 /// unreachable.
+#[inline]
 fn reflect_deg(deg: i32) -> i32 {
     let mut d = deg;
     for _ in 0..8 {
@@ -2870,11 +2884,13 @@ fn reflect_deg(deg: i32) -> i32 {
 
 /// τ_v from the smoothed inter-onset interval (§9.1). See [`TAU_V_BASE_S`] for
 /// why this is the masking law and not a taste dial.
+#[inline]
 fn tau_v_s(ioi_s: f32) -> f32 {
     (TAU_V_BASE_S * (TAU_V_OFFSET + TAU_V_SLOPE * ioi_s)).clamp(TAU_V_MIN_S, TAU_V_MAX_S)
 }
 
 /// §9.6's loudness arc, `g_IOI = clamp(√(IOI_s / 0.25), 0.45, 1.0)`.
+#[inline]
 fn g_ioi(ioi_s: f32) -> f32 {
     (ioi_s / G_IOI_REF_S).sqrt().clamp(G_IOI_MIN, 1.0)
 }
@@ -2904,6 +2920,7 @@ fn roof_hz(cps: f32, lit: bool, heat: f32, hue: f32, touch: Touch) -> f32 {
 /// The hue's position on the arc, 0 at the red end and 1 at the cyan end,
 /// through [`tri`] (period two, so the hue is doubled) so the wrap at 1 → 0
 /// reflects instead of jumping. Drives the note's roof and the bloom's pan.
+#[inline]
 fn hue_arc(hue: f32) -> f32 {
     tri(2.0 * hue.clamp(0.0, 1.0))
 }
@@ -2915,6 +2932,7 @@ const HUE_AIR_FLOOR: f32 = 0.80;
 
 /// The hue's air (§3.3 item 2): the bloom is dimmest at the red end of the arc
 /// and brightest at the cyan end. Smooth and periodic, so the wrap has no seam.
+#[inline]
 fn hue_air(hue: f32) -> f32 {
     HUE_AIR_FLOOR + (1.0 - HUE_AIR_FLOOR) * (0.5 - 0.5 * (core::f32::consts::TAU * hue).cos())
 }
@@ -3092,6 +3110,7 @@ impl Forte {
 /// the 7639 Hz where the one-pole's coefficient saturates at 48 kHz, i.e. they
 /// are a bypass; under a shifted key they are clamped to the highest roof that
 /// still filters. Under a plain key this returns its operand unchanged.
+#[inline]
 fn shifted_roof(lp_cut: f32, shifted: bool) -> f32 {
     if shifted {
         lp_cut.min(ROOF_MAX_HZ)
@@ -3103,6 +3122,7 @@ fn shifted_roof(lp_cut: f32, shifted: bool) -> f32 {
 /// The hammer's modulation index on a fundamental of `f` Hz at `force`:
 /// [`FORTE_FM_INDEX`] at and under [`FORTE_FM_REF_HZ`], falling as
 /// `(ref / f)²` above it.
+#[inline]
 fn forte_index(f: f32, force: f32) -> f32 {
     let roll = (FORTE_FM_REF_HZ / f).min(1.0);
     FORTE_FM_INDEX * force * roll * roll
@@ -3167,6 +3187,7 @@ fn wood(v: &mut Voice, f: f32, touch: Touch) {
 /// digits are not marks. The full stop that steers ([`TypedPlan::steered`]) is
 /// also a tine, decided in `v2_typed`, since only the melody knows which dot
 /// it is.
+#[inline]
 fn pluck_class(class: u8) -> bool {
     matches!(
         class,
@@ -3177,6 +3198,7 @@ fn pluck_class(class: u8) -> bool {
 /// Which classes may breathe behind their note ([`STOP_BREATH_DELAY_S`]): the
 /// four stops `. , ; :`. Whether a key does is the melody's answer: only the
 /// token's steering mark ([`TypedPlan::steered`]).
+#[inline]
 fn stop_breathes(class: u8) -> bool {
     matches!(class, STOP | COMMA | SEMI | COLON)
 }
@@ -3269,6 +3291,7 @@ fn bass_dyad(root: f32, partner: f32, decay: f32, delay: f32) -> Voice {
 }
 
 /// A lone sine at `f0` on [`P1_LVL`], the upper partials silent.
+#[inline]
 fn p1_sine(f0: f32) -> [Partial; 3] {
     [
         Partial {
@@ -3369,6 +3392,7 @@ impl TrailSynth {
     /// synth's block clock (§16 row 7), wrapping like a host's u32 millisecond
     /// stamp rather than saturating, which after 49.7 days would pin every gap
     /// at zero. A wrap costs one key a nonsense gap; it still steps and speaks.
+    #[inline]
     fn v2_at_ms(&self, meta: EventMeta) -> u32 {
         if meta.at_ms != 0 {
             meta.at_ms
@@ -3951,7 +3975,7 @@ impl TrailSynth {
         // The bloom's own gain, kept for the air cloud, which is two taps of
         // it.
         let (air, spread) = if stops.hue {
-            (hue_air(ev.hue), BLOOM_SPREAD * (hue_arc(ev.hue) - 0.5))
+            (hue_air(ev.hue), BLOOM_SPREAD * (arc - 0.5))
         } else {
             (hue_air(0.25), 0.0)
         };

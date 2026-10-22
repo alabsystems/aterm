@@ -1170,6 +1170,7 @@ impl<C: Ctl> Session<'_, C> {
             program: self.program.clone(),
             cwd: cwd.clone(),
             trusted_cwd: self.trusted_cwd.clone(),
+            worker_agent: self.worker_agent,
             bypass: self.footer == Some(crate::harness::lights::Mode::Bypass),
             limit_reset_passed: self.reset_passed_here(),
             ..BoxFacts::default()

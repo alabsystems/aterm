@@ -212,6 +212,14 @@ pub(crate) struct TaskRecord {
     /// move [`Self::rev`] and keep it, so it names ONE entry into the state —
     /// the done a `turn`'s Enter found ([`reopen_at_turn`]). Not on the wire.
     pub(crate) entered: u64,
+    /// THE AGENT A WORKER'S SPAWN STARTED (`spawn agent=<word>`,
+    /// `App::start_worker`; `None` for a record a `task mark` made): whose
+    /// reader the startup deadline reads the worker's screen by before the
+    /// tab publishes an agent (`harness_host::startup_seen`), whose product
+    /// its stall names, and what the window harness reads as the worker's
+    /// agent (`meta`'s `worker=`). A mark keeps it; a seamless update
+    /// carries it ([`Self::carry_row`]). Not on the wire.
+    pub(crate) agent: Option<aterm_phase::Program>,
 }
 
 impl TaskRecord {
@@ -282,8 +290,8 @@ impl TaskRecord {
 
     /// The row a seamless update carries ([`crate::session_store::SessionRecord::task`]):
     /// `rev= state= from= since=<unix ms> result_bytes= attention=<0|1>`, then
-    /// `why=`, `exit=` and `result_path=` when set. [`Self::from_carry_row`]
-    /// reads it back.
+    /// `why=`, `exit=` and `result_path=` when set, and `agent=` a worker's
+    /// ([`Self::agent`]). [`Self::from_carry_row`] reads it back.
     #[must_use]
     #[cfg(any(unix, test))]
     pub(crate) fn carry_row(&self) -> String {
@@ -297,6 +305,10 @@ impl TaskRecord {
             u8::from(self.attention)
         );
         self.push_optional(&mut out);
+        if let Some(agent) = self.agent {
+            out.push_str(" agent=");
+            out.push_str(agent.name());
+        }
         out
     }
 
@@ -305,7 +317,9 @@ impl TaskRecord {
     /// missing a key this build needs, or holding one it cannot read, is
     /// `None` — the session crosses with no record, never with a made-up one.
     /// A key this build does not know is skipped: the row a NEWER build wrote
-    /// still reads here after a rollback, as the manifest it rides does.
+    /// still reads here after a rollback, as the manifest it rides does — and
+    /// so is an `agent=` word it does not know (an agent a newer build
+    /// added): the record crosses, read as a `task mark`'s.
     /// `now`/`now_unix_ms` re-anchor the monotonic `since` so `since_ms=`
     /// keeps counting from when the state was entered.
     #[must_use]
@@ -355,8 +369,18 @@ impl TaskRecord {
             // The rev it entered its state at is not carried: this process's
             // own entry into it is the one a turn here can find.
             entered: rev,
+            agent: field("agent").and_then(worker_agent),
         })
     }
+}
+
+/// The agent a worker's `agent=` word names: one a spawn can start
+/// (`aterm_agent::harness::worker::worker_cli`), else none.
+fn worker_agent(word: &str) -> Option<aterm_phase::Program> {
+    aterm_phase::Program::ALL
+        .into_iter()
+        .find(|p| p.name() == word)
+        .filter(|p| aterm_agent::harness::worker::worker_cli(*p).is_some())
 }
 
 /// The [`TASK_WHY`] word `value` is, as its `'static` spelling.
@@ -444,8 +468,9 @@ impl TaskMark {
     /// Apply this mark to the record `current` at `now` (`now_unix_ms` on the
     /// wall clock), with the supervisor's attention as `attention` reads it
     /// now. Returns the record after it and whether it moved: a new record is
-    /// rev 1; a change bumps the rev, and a change of state restarts `since`;
-    /// the same state with the same facts changes nothing.
+    /// rev 1, no worker's ([`TaskRecord::agent`]); a change bumps the rev, and
+    /// a change of state restarts `since`; the same state with the same facts
+    /// changes nothing. The record's agent is kept.
     #[must_use]
     pub(crate) fn apply(
         &self,
@@ -472,6 +497,7 @@ impl TaskMark {
                 since_unix_ms: now_unix_ms,
                 since: now,
                 entered: 1,
+                agent: None,
             };
             return (record, true);
         };

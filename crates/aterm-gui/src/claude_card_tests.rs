@@ -1149,9 +1149,12 @@ fn the_cards_line_follows_an_armed_timer() {
             std::ptr::eq(texts, line_texts(AutopilotView::Cruise, end)),
             "made once"
         );
+        // Against words made here, not the process's cache: a timed end
+        // under Land must not leave its time in Land's words for every later
+        // line (it did when this was the first Land line asked for).
         assert_eq!(
             line_texts(AutopilotView::Land, end),
-            line_texts(AutopilotView::Land, LineEnd::Mode),
+            make_line_texts(AutopilotView::Land, LineEnd::Mode),
             "the timer is Cruise's"
         );
     }
@@ -1202,7 +1205,7 @@ fn the_cards_line_follows_an_armed_timer() {
             ));
             assert_eq!(
                 line_texts_for(rows_kind, AutopilotView::Land, end),
-                line_texts_for(rows_kind, AutopilotView::Land, LineEnd::Mode),
+                make_line_texts_for(Some(agent), AutopilotView::Land, LineEnd::Mode),
                 "the timer is Cruise's",
             );
             timed.push(texts);

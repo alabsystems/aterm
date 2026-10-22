@@ -197,6 +197,7 @@ pub enum RainSignal {
 
 impl RainSignal {
     #[must_use]
+    #[inline]
     pub fn from_code(code: u32) -> Option<Self> {
         Some(match code {
             0 => Self::AssistantStream,
@@ -214,6 +215,7 @@ impl RainSignal {
         })
     }
 
+    #[inline]
     fn priority(self) -> u8 {
         match self {
             Self::Failure | Self::Interrupted => 3,
@@ -787,6 +789,7 @@ impl MatrixRain {
     /// non-focused pane whose drain completed. Skipping leaves `last_epoch`
     /// unbumped, so the scan runs on the first frame the gate lifts.
     #[must_use]
+    #[inline]
     pub fn can_emit(&self) -> bool {
         self.cfg.enabled
             && !self.reduced_motion
@@ -796,6 +799,7 @@ impl MatrixRain {
     /// Whether literal mode needs a fresh authoritative host sample even if
     /// occupancy is already current (for example after a live mode switch).
     #[must_use]
+    #[inline]
     pub fn needs_material_sample(&self) -> bool {
         self.cfg.output_material && self.material_sample_needed
     }
@@ -839,6 +843,7 @@ impl MatrixRain {
     /// Whether an input note could animate this engine, so the host skips
     /// useless wake redraws: false when disabled or under reduced motion.
     #[must_use]
+    #[inline]
     pub fn notes_can_wake(&self) -> bool {
         self.cfg.enabled
             && !self.reduced_motion
@@ -930,6 +935,7 @@ impl MatrixRain {
 
     /// True when the grid changed since the last Tier-A scan.
     #[must_use]
+    #[inline]
     pub fn needs_rescan(&self, epoch: u64) -> bool {
         !self.have_scanned || epoch != self.last_epoch
     }
@@ -939,6 +945,7 @@ impl MatrixRain {
     /// scan advances (neither `needs_rescan` nor `diag_line`'s sticky `scanned=`
     /// shows a host that stopped feeding it).
     #[must_use]
+    #[inline]
     pub fn scanned_epoch(&self) -> Option<u64> {
         self.have_scanned.then_some(self.last_epoch)
     }
@@ -1333,6 +1340,7 @@ impl MatrixRain {
 
     /// The atlas version (folded into the fingerprint; exposed for hosts).
     #[must_use]
+    #[inline]
     pub fn atlas_version(&self) -> u64 {
         self.baker.version()
     }
@@ -1478,6 +1486,7 @@ impl MatrixRain {
     /// runs at the fps knob; CALM, SLEEP and drain gate at 12 Hz, so the timer
     /// does not wake for ticks that advance nothing.
     #[must_use]
+    #[inline]
     pub fn current_period_ms(&self) -> u64 {
         u64::from(match self.eff_weather() {
             RainWeather::Working => self.tick_ms,
@@ -1490,6 +1499,7 @@ impl MatrixRain {
     /// period, this preserves partial progress when a PTY/input redraw lands
     /// between rain frames, so web timers neither gap nor double-step.
     #[must_use]
+    #[inline]
     pub fn next_tick_in_ms(&self) -> u64 {
         let period = self.current_period_ms();
         let backlog = self.clock_ms.saturating_sub(self.consumed_ms);
@@ -1497,6 +1507,7 @@ impl MatrixRain {
     }
 
     /// Weather capped by visibility (`min`: unfocused ≤ CALM, hidden = SLEEP).
+    #[inline]
     fn eff_weather(&self) -> RainWeather {
         let cap = match self.visibility {
             RainVisibility::Focused => RainWeather::Working,
@@ -1819,6 +1830,7 @@ impl MatrixRain {
     }
 
     /// Apply the drain penalty + flicker dither to a base trail level.
+    #[inline]
     fn drained_level(
         &self,
         ctx: &EmitCtx<'_>,
@@ -1844,6 +1856,7 @@ impl MatrixRain {
     /// so codepoints keep their sampled adjacency. Literal glyphs are never
     /// mirrored. `material_start` is [`Self::material_start`], `Some` exactly
     /// while the table is live.
+    #[inline]
     fn cell_quad(
         &self,
         ctx: &EmitCtx<'_>,
@@ -1853,7 +1866,7 @@ impl MatrixRain {
         head: bool,
         material_start: Option<usize>,
     ) -> SpriteQuad {
-        let (cw, ch) = (u32::from(ctx.geom.cell_w), u32::from(ctx.geom.cell_h));
+        let (cw, ch) = (ctx.geom.cell_w, ctx.geom.cell_h);
         let (g, flip_x) = match material_start {
             None => glyph_from_epoch(self.seed32, row, u32::from(col), ctx.glyph_epoch),
             Some(start) => {
@@ -1869,14 +1882,14 @@ impl MatrixRain {
         };
         SpriteQuad {
             row: row as u16,
-            x: (u32::from(col) * cw) as u16,
-            y: (row * ch) as u16,
-            w: cw as u16,
-            h: ch as u16,
+            x: col.wrapping_mul(cw),
+            y: (row as u16).wrapping_mul(ch),
+            w: cw,
+            h: ch,
             ax,
             ay,
-            aw: cw as u16,
-            ah: ch as u16,
+            aw: cw,
+            ah: ch,
             tint: ctx.ramp[(lvl as usize).min(15)],
             alpha,
             flip_x,
@@ -1889,6 +1902,7 @@ impl MatrixRain {
     /// together, modify pairs counterflow, execute groups advance briskly,
     /// network groups form two-cell packets, waiting holds. `start` is
     /// [`Self::material_start`].
+    #[inline]
     fn semantic_material_index(&self, start: usize, col: u16, row: u32, glyph_epoch: u32) -> usize {
         let len = self.material.len();
         debug_assert!(len > 0);
@@ -1916,6 +1930,7 @@ impl MatrixRain {
     /// Where column `col`'s walk starts on the output tape: a hash of the
     /// column (or, under a semantic pulse, of its lane) — constant for every
     /// row of the column this frame.
+    #[inline]
     fn material_start(&self, col: u16) -> usize {
         if self.semantic_phase == RainSignal::AssistantStream {
             return field::rain_hash32(u32::from(col) ^ self.seed32 ^ 0x00C0_FFEE) as usize;
@@ -1941,6 +1956,7 @@ impl MatrixRain {
 
     /// Body coverage for a trail level: linear in level, capped at the
     /// derived body alpha (level 15 body cells sit just under the head).
+    #[inline]
     fn alpha_of(&self, lvl: u32) -> u8 {
         ((u32::from(self.body_alpha) * (lvl + 1)) / 16).max(1) as u8
     }
@@ -2117,11 +2133,13 @@ impl MatrixRain {
     }
 
     /// Tier-A + Tier-B mask: occupancy bit, cursor band, live selection.
+    #[inline]
     fn cell_eligible(&self, row: u32, col: u16, input: &RainTickInput<'_>) -> bool {
         self.occ_bit(row, col) && self.cell_unmasked(row, col, input)
     }
 
     /// The Tier-B half of [`Self::cell_eligible`]: cursor band, live selection.
+    #[inline]
     fn cell_unmasked(&self, row: u32, col: u16, input: &RainTickInput<'_>) -> bool {
         // The composer band `sample_material` protects also holds for
         // emission, even before the damage ring warms. `row < geom.rows`, so it
@@ -2142,6 +2160,7 @@ impl MatrixRain {
     /// covering multiline input); and, with a hidden cursor and unknown band
     /// (first enable, resize, full damage), the bottom
     /// [`HIDDEN_CURSOR_BAND_ROWS`] rows.
+    #[inline]
     fn row_banded(r: usize, rows: usize, cursor: Option<(u16, u16)>, hidden_band: &[u16]) -> bool {
         let row = r as u16;
         cursor.is_some_and(|(cr, _)| i32::from(cr.abs_diff(row)) <= CURSOR_BAND_ROWS)
@@ -2166,9 +2185,13 @@ impl MatrixRain {
             return;
         }
         let len = self.halo_cands.len();
-        let start = (self.tick / u64::from(self.dq.max(1))) as usize % len;
-        for i in 0..len {
-            let (r, c) = self.halo_cands[(start + i) % len];
+        let mut idx = (self.tick / u64::from(self.dq.max(1))) as usize % len;
+        for _ in 0..len {
+            let (r, c) = self.halo_cands[idx];
+            idx += 1;
+            if idx == len {
+                idx = 0;
+            }
             // A halo spans at most 3 row bands; grant whole halos only.
             if add.len() + 3 > MAX_RAIN_ADD {
                 return;
@@ -2234,6 +2257,7 @@ fn clamp_config(mut cfg: RainConfig) -> RainConfig {
 
 /// Quantize the EMA byte onto the density staircase (steps of 21 — one
 /// WORKING density unit), so ring change-points stay a handful per front.
+#[inline]
 fn quantize_density(v: i32) -> u8 {
     (((v.max(0) + 10) / 21) * 21).min(255) as u8
 }
@@ -2322,6 +2346,7 @@ fn luminance_match(mut ramp: [u32; 16], reference: [u32; 16]) -> [u32; 16] {
 /// Composite `tint` at `alpha` OVER `bg`, integer sRGB-side per channel —
 /// the CPU stamp's `(c·a + b·(255-a) + 127)/255` rounding, so the invariant
 /// is checked on the bytes the renderer actually lands.
+#[inline]
 fn srgb_over(tint: u32, alpha: u8, bg: u32) -> u32 {
     let a = u32::from(alpha);
     let ch = |sh: u32| {
@@ -2407,6 +2432,7 @@ fn derive_alphas(cfg: &RainConfig, ramp: &[u32; 16]) -> (u8, u8) {
 /// tables (bit `i` ⇒ slot `i` must be re-authored and re-baked). A slot past the
 /// end of a table holds the decorative glyph, so "absent from both" is unchanged
 /// and "present in exactly one" is a change.
+#[inline]
 fn slot_change_mask(old: &[char], new: &[char]) -> u64 {
     let mut mask = 0u64;
     for slot in 0..rom::ROM_GLYPHS {

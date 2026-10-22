@@ -40,6 +40,7 @@
 //! | `store-current`     | a store `current` path run unresolved |
 //! | `key-material`      | a master phrase on the key surface, a key file in the checkout |
 //! | `capture-privacy`   | in an encoded test capture's decoded bytes (a pty log's hex, a `.reads` file's escapes), what the export forbids in text, a home path, a banner's plan or a session id |
+//! | `export-content`    | in a file the export publishes, as its transforms leave it, a line or a path the publication engine's content guard refuses |
 //! | `devtools-door`     | a developer-mode change outside the owner's gesture; an admin-rights API |
 //! | `machines-root-door`| a root tool (`installer`, `pmset`, `/etc/sudoers.d`, …) or the machines agent outside aterm-machines |
 //! | `ffi-door`          | a WindowServer or process-creation `extern` declared outside its one file |
@@ -53,6 +54,9 @@
 //! | `term-write`        | a session's terminal written through a raw guard, which rings no screen reader |
 //! | `slog-inert`        | a PTY write path or an input-verb request in the session log's code; `dispatch_mark` past its calls |
 //! | `eager-drop`        | `then_some` building a value whose type has a `Drop` (built and dropped on false) |
+//! | `github-auth-door`  | the credential header spelled outside agh's door (`crates/agh/`), or a Bearer header beside a GitHub API origin elsewhere |
+//! | `gh-spawn`          | a `gh` child process outside the caps the agh migration lowers |
+//! | `agh-fx`            | a clock, a sleep, a socket or a GitHub round trip in agh outside its effect seam (`crates/agh/src/fx/`), or aterm-http's client outside `wire/http.rs` |
 //! | `licence-header`    | a `.rs` without its SPDX and copyright lines |
 //!
 //! [`run_guards`] returns typed [`Finding`]s; `aterm-census --guards` (and
@@ -71,6 +75,8 @@ mod bridge_fx;
 mod captures;
 mod doors;
 mod eager_drop;
+mod export_content;
+mod github;
 mod graph;
 mod installer;
 mod keys;
@@ -129,6 +135,7 @@ pub const GUARDS: &[Rule] = &[
     rules::STORE_CURRENT,
     keys::KEY_MATERIAL,
     captures::CAPTURE_PRIVACY,
+    export_content::EXPORT_CONTENT,
     doors::DEVTOOLS_DOOR,
     machines::MACHINES_ROOT_DOOR,
     doors::FFI_DOOR,
@@ -142,6 +149,9 @@ pub const GUARDS: &[Rule] = &[
     term_write::TERM_WRITE,
     slog_inert::SLOG_INERT,
     eager_drop::EAGER_DROP,
+    github::GITHUB_AUTH_DOOR,
+    github::GH_SPAWN,
+    github::AGH_FX,
     rules::LICENCE_HEADER,
 ];
 

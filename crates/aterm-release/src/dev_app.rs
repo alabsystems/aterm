@@ -1033,7 +1033,7 @@ mod tests {
     fn the_stamp_is_heads_facts_as_the_build_script_reads_them() {
         let (_dir, root) = scratch();
         let git = |args: &[&str]| {
-            let out = aterm_uds::spawnfd::command("git")
+            let out = crate::ledger::testing::git()
                 .current_dir(&root)
                 .args([
                     "-c",
@@ -1049,7 +1049,6 @@ mod tests {
                 ])
                 .args(args)
                 .env("GIT_COMMITTER_DATE", "1790000000 +0000")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .output()
                 .expect("git");
             assert!(out.status.success(), "git {args:?}: {out:?}");

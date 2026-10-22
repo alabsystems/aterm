@@ -5277,7 +5277,8 @@ fn claiming_body(world: &Arc<World>, claimed: &Arc<Mutex<Vec<String>>>) -> Arc<B
 /// FAILS WITHOUT THE FIX: the host claims every agent session at resume —
 /// `s-adopted` is claimed at once. (Measured: with the watch's wait in
 /// `worker_run` removed, the first assertion that it is not yet claimed
-/// fails.)
+/// fails.) The hold-off is read under an hour's grace, so it is asserted on every run; the
+/// claim at the grace's end runs on a short grace.
 #[test]
 fn the_successor_harness_waits_a_renewal_before_claiming_an_adopted_session() {
     // The production grace outlasts two renewal steps of an external
@@ -5286,40 +5287,46 @@ fn the_successor_harness_waits_a_renewal_before_claiming_an_adopted_session() {
         ADOPTED_CLAIM_GRACE > 2 * aterm_agent::supervise::CLAIM_RENEW,
         "{ADOPTED_CLAIM_GRACE:?}"
     );
-    let grace = Duration::from_millis(1500);
-    let world = Arc::new(World::default());
-    world.set(&[
-        ("s-adopted", Program::Claude),
-        ("s-vouched", Program::Claude),
-    ]);
-    let claimed: Arc<Mutex<Vec<String>>> = Arc::default();
-    let host = HostHandle::start(
-        on(),
-        false,
-        true,
-        hooks(&world, claiming_body(&world, &claimed)),
+    // A suspended successor's host with `s-adopted` named for `grace`, then resumed.
+    let resumed_with = |grace: Duration| {
+        let world = Arc::new(World::default());
+        world.set(&[
+            ("s-adopted", Program::Claude),
+            ("s-vouched", Program::Claude),
+        ]);
+        let claimed: Arc<Mutex<Vec<String>>> = Arc::default();
+        let host = HostHandle::start(
+            on(),
+            false,
+            true,
+            hooks(&world, claiming_body(&world, &claimed)),
+        );
+        // Named before the Commit, while suspended: the grace has not started.
+        host.defer_adopted_claims(vec!["s-adopted".to_string()], grace);
+        assert!(!host.is_running());
+        let resumed = Instant::now();
+        host.resume();
+        until("the vouched session is claimed at resume", || {
+            claimed.lock().unwrap().iter().any(|sid| sid == "s-vouched")
+        });
+        until("the adopted session watched", || {
+            host.live() == ["s-adopted", "s-vouched"]
+        });
+        (host, claimed, resumed)
+    };
+    // Inside the grace: not claimed, and not the host's for the menu bar.
+    let (host, claimed, _) = resumed_with(Duration::from_secs(3600));
+    assert_eq!(
+        *claimed.lock().unwrap(),
+        ["s-vouched"],
+        "held off through its grace"
     );
-    // Named before the Commit, while the host is suspended: nothing runs,
-    // and the grace has not started.
-    host.defer_adopted_claims(vec!["s-adopted".to_string()], grace);
-    assert!(!host.is_running());
-    let resumed = Instant::now();
-    host.resume();
-    until("the vouched session is claimed at resume", || {
-        claimed.lock().unwrap().iter().any(|sid| sid == "s-vouched")
-    });
-    until("the adopted session watched", || {
-        host.live() == ["s-adopted", "s-vouched"]
-    });
-    // Still inside the grace (read, THEN the clock, so the reading is
-    // known to predate the grace's end): not claimed, and not the host's
-    // for the menu bar.
-    let taken = claimed.lock().unwrap().clone();
-    let held_off = host.held_off();
-    if Instant::now() < resumed + grace {
-        assert_eq!(taken, ["s-vouched"], "held off through its grace");
-        assert_eq!(held_off, ["s-adopted"]);
-    }
+    assert_eq!(host.held_off(), ["s-adopted"]);
+    host.shutdown_and_join();
+
+    // Once the grace has run out: claimed by the worker that watched.
+    let grace = Duration::from_millis(100);
+    let (host, claimed, resumed) = resumed_with(grace);
     until("claimed once its grace has run out", || {
         claimed.lock().unwrap().len() == 2
     });
@@ -5453,6 +5460,7 @@ fn standing_record() -> self_claimed::Seen {
         cwd: None,
         draft_empty: None,
         frame: None,
+        initializing: false,
     })
 }
 
@@ -6676,10 +6684,8 @@ fn another_supervisors_claim_is_no_window_hosts() {
 #[cfg(unix)]
 fn scratch_server(tag: &str) -> (String, std::thread::JoinHandle<Vec<String>>) {
     use std::io::{BufRead, BufReader};
-    let dir = std::env::temp_dir().join(format!("ah-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let sock = dir.join("a.sock");
+    let dir = crate::test_scratch::short_dir(&format!("the {tag} server's socket"));
+    let sock = dir.path().join("a.sock");
     let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
     let path = sock.to_string_lossy().into_owned();
     let h = std::thread::spawn(move || {
@@ -6698,7 +6704,7 @@ fn scratch_server(tag: &str) -> (String, std::thread::JoinHandle<Vec<String>>) {
                 }
             }
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(dir);
         seen
     });
     (path, h)
@@ -7138,6 +7144,9 @@ struct Acting {
     /// What the carry-on answers, in turn; `done` once spent.
     carry: Mutex<VecDeque<&'static str>>,
     carried: AtomicUsize,
+    /// At each idle point answered: the carry-ons taken by then, and whether the worker holds
+    /// a look for later ([`IdleHost::wants_at`] or [`IdleHost::wants`]).
+    decided: Mutex<Vec<(usize, bool)>>,
     /// Whether each carry-on was told its session is under Land
     /// ([`Acts::resume`]), in order.
     landing: Mutex<Vec<bool>>,
@@ -7565,10 +7574,11 @@ impl Acting {
             .unwrap_or_else(|| snap(sid).start)
     }
 
-    /// The harness state directory the stamps live under.
+    /// The harness state directory the stamps live under, in a process root: the
+    /// host loop's unjoined thread holds this world past the test, and the root goes at exit.
     fn stamp_dir(&self) -> &std::path::Path {
         self.stamps
-            .get_or_init(|| aterm_tempfile::TempDir::new().expect("stamp dir"))
+            .get_or_init(|| crate::test_scratch::outlived_dir("aterm-hh-stamps-"))
             .path()
     }
 
@@ -7842,6 +7852,11 @@ impl Acting {
                         if let Some(said) = host.at_idle() {
                             w3.idle_said.lock().unwrap().push(said.line);
                         }
+                        let holds_look = host.wants_at().is_some() || host.wants();
+                        w3.decided
+                            .lock()
+                            .unwrap()
+                            .push((w3.carried.load(Ordering::SeqCst), holds_look));
                         if w3.turns_between.load(Ordering::SeqCst) {
                             host.turn_ran();
                         }
@@ -21867,7 +21882,7 @@ fn a_relaunched_agent_is_carried_on_where_its_loop_parks() {
 /// ([`relaunch::owed`]), and the watch would come only past that look's
 /// bound: the worker looks again at the first rung, and the look's own word
 /// ends it. NEGATIVE CONTROL: a `done` that leaves nothing owed is looked at
-/// no more.
+/// no more: the point that took it holds no look for later.
 #[test]
 fn a_quiet_restarts_look_is_taken_at_the_tabs_next_look() {
     for (steps, carried) in [(vec!["done:resumed", "done"], 2), (vec!["done"], 1)] {
@@ -21877,13 +21892,24 @@ fn a_quiet_restarts_look_is_taken_at_the_tabs_next_look() {
         a.open.lock().unwrap().insert("s-q".to_string());
         a.set(&[("s-q", Program::Claude)]);
         let host = HostHandle::start(on(), false, false, a.hooks());
-        until("the owed look taken", || {
-            a.carried.load(Ordering::SeqCst) == carried
-        });
+        // What the worker decided at the point each carry-on was taken.
+        let decided = || {
+            let decided = a.decided.lock().unwrap();
+            (1..=carried)
+                .map(|n| {
+                    decided
+                        .iter()
+                        .find(|(at, _)| *at == n)
+                        .map(|&(_, look)| look)
+                })
+                .collect::<Option<Vec<bool>>>()
+        };
+        until("every carry-on's point answered", || decided().is_some());
         assert!(!a.owed.load(Ordering::SeqCst), "{steps:?}");
-        // Looked at no more (five of the scaled first rung): a look would be
-        // another carry-on step.
-        std::thread::sleep(Duration::from_millis(100));
+        let looks = decided().expect("answered");
+        // A look for later after each word but the last (`done:resumed` leaves one owed).
+        let expected: Vec<bool> = (1..=carried).map(|n| n < carried).collect();
+        assert_eq!(looks, expected, "{steps:?}");
         assert_eq!(a.carried.load(Ordering::SeqCst), carried, "{steps:?}");
         host.shutdown_and_join();
     }
@@ -28008,7 +28034,11 @@ fn the_real_restart_act_conforms_to_its_model() {
                 seen.inflight = false;
                 seen.fresh = false;
                 step(&seen, "the Commit");
-                assert!(crate::restart_act::carry(&agent.ctx, a.stamp_dir()));
+                assert!(crate::restart_act::carry(
+                    &agent.ctx,
+                    a.stamp_dir(),
+                    aterm_time::unix_secs().expect("clock")
+                ));
                 true
             }
             Case::BareSignal => {
@@ -29816,7 +29846,11 @@ fn a_program_stopped_across_a_commit_is_ended_once_its_successor_read_it() {
         "still running, away from its tab"
     );
     assert!(
-        crate::restart_act::carry(&job.agent.ctx, a.stamp_dir()),
+        crate::restart_act::carry(
+            &job.agent.ctx,
+            a.stamp_dir(),
+            aterm_time::unix_secs().expect("clock")
+        ),
         "the act's stamp still stands: carried"
     );
     job.fg();
@@ -30156,7 +30190,7 @@ fn a_stamp_that_no_longer_stands_is_no_acts_to_finish() {
     assert!(stale.stands_for(now).is_zero());
     restart_stamp::write(state.path(), &agent.sid, &stale).expect("the stamp");
     assert!(
-        !crate::restart_act::carry(&agent.ctx, state.path()),
+        !crate::restart_act::carry(&agent.ctx, state.path(), now),
         "no carrier on a stamp that no longer stands"
     );
     assert!(!crate::restart_act::escalating(agent.pid));
@@ -30182,7 +30216,7 @@ fn a_stamp_that_no_longer_stands_is_no_acts_to_finish() {
     let brief = stamp_at(now + 20 - aterm_agent::harness::relaunch::STALE_S);
     restart_stamp::write(state.path(), &agent.sid, &brief).expect("the stamp");
     assert!(
-        !crate::restart_act::carry(&agent.ctx, state.path()),
+        !crate::restart_act::carry(&agent.ctx, state.path(), now),
         "no carrier on a stamp too close to its end to be read"
     );
     assert_eq!(
@@ -30203,7 +30237,7 @@ fn a_stamp_that_no_longer_stands_is_no_acts_to_finish() {
     );
     // A stamp that still stands: carried.
     restart_stamp::write(state.path(), &agent.sid, &stamp_at(now - 35)).expect("the stamp");
-    assert!(crate::restart_act::carry(&agent.ctx, state.path()));
+    assert!(crate::restart_act::carry(&agent.ctx, state.path(), now));
     until("the carrier ended it", || agent.ended().is_some());
     let status = agent.ended().expect("ended");
     assert_eq!(
@@ -30291,7 +30325,11 @@ fn many_restarts_of_one_program_run_one_watch() {
         );
     }
     assert!(
-        crate::restart_act::carry(&agent.ctx, a.stamp_dir()),
+        crate::restart_act::carry(
+            &agent.ctx,
+            a.stamp_dir(),
+            aterm_time::unix_secs().expect("clock")
+        ),
         "a carrier finds it watched"
     );
     assert_eq!(
@@ -30370,14 +30408,20 @@ fn a_restart_after_its_programs_watch_let_go_gets_a_watch_of_its_own() {
             origin: "fleet".to_string(),
         })
     ));
+    // Carried at the second it was stamped, so no stall between the two lets it lapse first.
+    let stamped = aterm_time::unix_secs().expect("clock");
     let cut = restart_stamp::Stamp {
         pid: agent.upid(),
         start: agent.start.clone(),
         cause: restart_stamp::Cause::Stall,
-        at: aterm_time::unix_secs().expect("clock") + 33 - aterm_agent::harness::relaunch::STALE_S,
+        at: stamped + 33 - aterm_agent::harness::relaunch::STALE_S,
     };
     restart_stamp::write(a.stamp_dir(), &agent.sid, &cut).expect("the stamp a Commit cut");
-    assert!(crate::restart_act::carry(&agent.ctx, a.stamp_dir()));
+    assert!(crate::restart_act::carry(
+        &agent.ctx,
+        a.stamp_dir(),
+        stamped
+    ));
     until("the carrier let it go under the hold", || {
         crate::restart_act::watches(pid) == 0
     });
@@ -33273,6 +33317,7 @@ fn held_worker(sid: &str, state: StartupState, read: HeldRead) -> Startup {
 /// The shell at its prompt, no agent: a launcher a seamless update ended.
 fn no_agent() -> StartupHold {
     StartupHold::NoAgent {
+        agent: Program::Claude,
         program: Some("zsh".to_string()),
     }
 }
@@ -33387,6 +33432,7 @@ fn the_startup_deadline_stalls_a_worker_that_never_shows_its_composer() {
         StartupState::Working,
         t0,
         StartupSeen::Holds(StartupHold::Box {
+            agent: Program::Claude,
             title: "Bash command".to_string(),
         }),
     )]);
@@ -33506,7 +33552,9 @@ fn supervision_back_on_gives_a_worker_a_whole_deadline() {
     let w = Arc::new(StartupWorld::default());
     let hooks = w.hooks();
     let t0 = Instant::now() + Duration::from_secs(3 * 3600);
-    let trust = StartupSeen::Holds(StartupHold::Trust);
+    let trust = StartupSeen::Holds(StartupHold::Trust {
+        agent: Program::Claude,
+    });
     let mut books = Startups::default();
     w.set(vec![startup(
         "s-a",
@@ -33535,12 +33583,28 @@ fn supervision_back_on_gives_a_worker_a_whole_deadline() {
         &OffSessions::default(),
         &hooks,
     );
-    assert_eq!(w.marks(), [stalled("s-a", StartupHold::Trust)]);
+    assert_eq!(
+        w.marks(),
+        [stalled(
+            "s-a",
+            StartupHold::Trust {
+                agent: Program::Claude
+            }
+        )]
+    );
     // NEGATIVE CONTROL: no gap.
     let mut books = Startups::default();
     look_at_startups(&mut books, t0, true, &OffSessions::default(), &hooks);
     look_at_startups(&mut books, back, true, &OffSessions::default(), &hooks);
-    assert_eq!(w.marks(), [stalled("s-a", StartupHold::Trust)]);
+    assert_eq!(
+        w.marks(),
+        [stalled(
+            "s-a",
+            StartupHold::Trust {
+                agent: Program::Claude
+            }
+        )]
+    );
 }
 
 /// AN OFF WORKER IS NOT THE DEADLINE'S ([`OffSessions`]): Autopilot Off is
@@ -33556,7 +33620,9 @@ fn the_startup_deadline_marks_no_off_worker() {
     let w = Arc::new(StartupWorld::default());
     let hooks = w.hooks();
     let t0 = Instant::now() + Duration::from_secs(3 * 3600);
-    let trust = StartupSeen::Holds(StartupHold::Trust);
+    let trust = StartupSeen::Holds(StartupHold::Trust {
+        agent: Program::Claude,
+    });
     let word = |word: Autopilot| OffSessions {
         words: [("s-a".to_string(), word)].into(),
         default: Autopilot::Cruise,
@@ -33593,7 +33659,15 @@ fn the_startup_deadline_marks_no_off_worker() {
     );
     assert!(w.marks().is_empty(), "not on the clock it had before Off");
     look_at_startups(&mut books, late + STARTUP_DEADLINE, true, &cruise, &hooks);
-    assert_eq!(w.marks(), [stalled("s-a", StartupHold::Trust)]);
+    assert_eq!(
+        w.marks(),
+        [stalled(
+            "s-a",
+            StartupHold::Trust {
+                agent: Program::Claude
+            }
+        )]
+    );
     // Stalled, then Off: its start is not marked while Off, and is once back.
     w.set(vec![startup(
         "s-a",
@@ -33612,7 +33686,15 @@ fn the_startup_deadline_marks_no_off_worker() {
     let mut books = Startups::default();
     look_at_startups(&mut books, t0, true, &none, &hooks);
     look_at_startups(&mut books, t0 + STARTUP_DEADLINE, true, &none, &hooks);
-    assert_eq!(w.marks(), [stalled("s-a", StartupHold::Trust)]);
+    assert_eq!(
+        w.marks(),
+        [stalled(
+            "s-a",
+            StartupHold::Trust {
+                agent: Program::Claude
+            }
+        )]
+    );
 }
 
 /// THE STARTUP DEADLINE SKIPS THE HARNESS'S OWN WAITS: a successor that
@@ -33684,6 +33766,7 @@ fn the_startup_deadline_skips_the_harnesss_own_waits() {
             StartupState::Working,
             t0,
             StartupSeen::Holds(StartupHold::Box {
+                agent: Program::Claude,
                 title: "Allow this tool?".to_string(),
             }),
         )
@@ -33988,7 +34071,9 @@ fn the_held_deadline_judges_started_workers_and_no_off_one() {
     // Not started yet: at the startup deadline's mercy alone.
     let mut books = Startups::held_after(short);
     w.set(vec![Startup {
-        seen: StartupSeen::Holds(StartupHold::NoComposer),
+        seen: StartupSeen::Holds(StartupHold::NoComposer {
+            agent: Program::Claude,
+        }),
         ..held_worker("s-a", StartupState::Working, held_at("unknown", still))
     }]);
     let since = w.reads.lock().unwrap()[0].since;
@@ -34562,39 +34647,64 @@ fn a_workers_start_is_read_off_its_screen() {
     ]);
     composed.extend(f::composer("  ? for shortcuts"));
     assert_eq!(
-        startup_seen(&composed, Some("claude"), Some(Program::Claude)),
+        startup_seen(&composed, Some("claude"), Some(Program::Claude), None),
         StartupSeen::Started
     );
     assert_eq!(
-        startup_seen(&f::bash_one_row(), Some("claude"), Some(Program::Claude)),
+        startup_seen(
+            &f::bash_one_row(),
+            Some("claude"),
+            Some(Program::Claude),
+            None
+        ),
         StartupSeen::Started
     );
     assert_eq!(
-        startup_seen(&f::screen(f::TRUST), Some("claude"), Some(Program::Claude)),
-        StartupSeen::Holds(StartupHold::Trust)
+        startup_seen(
+            &f::screen(f::TRUST),
+            Some("claude"),
+            Some(Program::Claude),
+            None
+        ),
+        StartupSeen::Holds(StartupHold::Trust {
+            agent: Program::Claude
+        })
     );
     let blank = vec![String::new(); 24];
     assert_eq!(
-        startup_seen(&blank, Some("claude"), Some(Program::Claude)),
-        StartupSeen::Holds(StartupHold::NoComposer)
+        startup_seen(&blank, Some("claude"), Some(Program::Claude), None),
+        StartupSeen::Holds(StartupHold::NoComposer {
+            agent: Program::Claude
+        })
     );
     let prompt = f::rows(&["Last login: Thu Oct 15 09:00:00 on ttys001", "% "]);
     assert_eq!(
-        startup_seen(&prompt, Some("zsh"), None),
+        startup_seen(&prompt, Some("zsh"), None, None),
         StartupSeen::Holds(no_agent())
     );
     assert_eq!(
-        startup_seen(&prompt, None, None),
-        StartupSeen::Holds(StartupHold::NoAgent { program: None })
+        startup_seen(&prompt, None, None, None),
+        StartupSeen::Holds(StartupHold::NoAgent {
+            agent: Program::Claude,
+            program: None
+        })
     );
     for hold in [
-        StartupHold::Trust,
+        StartupHold::Trust {
+            agent: Program::Claude,
+        },
         StartupHold::Box {
+            agent: Program::Claude,
             title: "Bash command".to_string(),
         },
-        StartupHold::NoComposer,
+        StartupHold::NoComposer {
+            agent: Program::Claude,
+        },
         no_agent(),
-        StartupHold::NoAgent { program: None },
+        StartupHold::NoAgent {
+            agent: Program::Claude,
+            program: None,
+        },
     ] {
         assert!(
             deadline_attention_stands(Some(&hold.attention())),
@@ -34636,7 +34746,7 @@ fn another_harnesss_agent_at_its_composer_has_started() {
     ] {
         let screen = rows(text);
         assert_eq!(
-            startup_seen(&screen, Some(agent.name()), Some(agent)),
+            startup_seen(&screen, Some(agent.name()), Some(agent), None),
             StartupSeen::Started,
             "{agent:?}"
         );
@@ -34644,20 +34754,122 @@ fn another_harnesss_agent_at_its_composer_has_started() {
             StartupSeen::Started
         } else {
             StartupSeen::Holds(StartupHold::NoAgent {
+                agent: Program::Claude,
                 program: Some(agent.name().to_string()),
             })
         };
         assert_eq!(
-            startup_seen(&screen, Some(agent.name()), None),
+            startup_seen(&screen, Some(agent.name()), None, None),
             by_claude,
             "{agent:?}: Claude Code's reader"
         );
     }
     let prompt = aterm_phase::prompt::fixtures::rows(&["% "]);
     assert_eq!(
-        startup_seen(&prompt, Some("zsh"), Some(Program::Agy)),
-        StartupSeen::Holds(no_agent())
+        startup_seen(&prompt, Some("zsh"), Some(Program::Agy), None),
+        StartupSeen::Holds(StartupHold::NoAgent {
+            agent: Program::Agy,
+            program: Some("zsh".to_string()),
+        })
     );
+}
+
+/// A SPAWNED WORKER'S START IS READ BY THE AGENT ITS SPAWN STARTED
+/// (`TaskRecord::agent`, which a seamless update carries) until its tab
+/// publishes one: each
+/// harness's measured trust box — Gemini CLI's folder-trust dialog, drawn
+/// before its screen names it, agy's and Muse Code's workspace-trust boxes —
+/// is that agent's Trust hold, named by its product; its composer is
+/// Started; the shell's prompt, the line never typed, is "no <product>
+/// started"; and under its published name a screen with neither is that
+/// agent's own no-composer screen. NEGATIVE CONTROLS: with no agent
+/// expected the same trust boxes are no Trust hold of that agent's (Claude
+/// Code's reader names its own product, or none), and a published agent
+/// wins over the expected one.
+#[test]
+fn a_spawned_workers_start_is_read_by_its_own_agent() {
+    use aterm_phase::prompt::fixtures::screen;
+    let prompt = aterm_phase::prompt::fixtures::rows(&["% "]);
+    for (agent, trust, idle) in [
+        (
+            Program::Gemini,
+            aterm_phase::gemini::fixtures::TRUST,
+            aterm_phase::gemini::fixtures::IDLE,
+        ),
+        (
+            Program::Agy,
+            aterm_phase::agy::fixtures::lab::FIRST_RUN_TRUST,
+            aterm_phase::agy::fixtures::lab::IDLE,
+        ),
+        (
+            Program::Muse,
+            aterm_phase::muse::fixtures::TRUST_1_4_10,
+            aterm_phase::muse::fixtures::IDLE_1_4_10,
+        ),
+    ] {
+        let held = startup_seen(&screen(trust), Some("node"), None, Some(agent));
+        assert_eq!(
+            held,
+            StartupSeen::Holds(StartupHold::Trust { agent }),
+            "{agent:?}: its trust box"
+        );
+        let StartupSeen::Holds(hold) = held else {
+            unreachable!()
+        };
+        assert!(
+            hold.attention()
+                .contains(&format!("{}'s folder-trust dialog", agent.product())),
+            "{}",
+            hold.attention()
+        );
+        assert!(deadline_attention_stands(Some(&hold.attention())));
+        assert_eq!(
+            startup_seen(&screen(idle), Some(agent.name()), None, Some(agent)),
+            StartupSeen::Started,
+            "{agent:?}: its composer"
+        );
+        let shell = startup_seen(&prompt, Some("zsh"), None, Some(agent));
+        assert_eq!(
+            shell,
+            StartupSeen::Holds(StartupHold::NoAgent {
+                agent,
+                program: Some("zsh".to_string()),
+            }),
+            "{agent:?}: the line never typed"
+        );
+        let StartupSeen::Holds(hold) = shell else {
+            unreachable!()
+        };
+        assert!(
+            hold.attention().contains(&format!(
+                "no {} started; `zsh` holds the tab",
+                agent.product()
+            )),
+            "{}",
+            hold.attention()
+        );
+        let blank = vec![String::new(); 24];
+        assert_eq!(
+            startup_seen(&blank, Some(agent.name()), Some(agent), Some(agent)),
+            StartupSeen::Holds(StartupHold::NoComposer { agent }),
+            "{agent:?}: its own screen with no composer"
+        );
+        assert_ne!(
+            startup_seen(&screen(trust), Some("node"), None, None),
+            StartupSeen::Holds(StartupHold::Trust { agent }),
+            "CONTROL {agent:?}: Claude Code's reader"
+        );
+        assert_eq!(
+            startup_seen(
+                &screen(idle),
+                Some(agent.name()),
+                Some(agent),
+                Some(Program::Claude)
+            ),
+            StartupSeen::Started,
+            "CONTROL {agent:?}: the published agent's reader wins"
+        );
+    }
 }
 
 /// THE STALL'S ATTENTION IS TAKEN DOWN ONLY WHERE IT IS THE STALL'S
@@ -34666,7 +34878,10 @@ fn another_harnesss_agent_at_its_composer_has_started() {
 #[test]
 fn the_startup_attention_is_taken_down_only_where_it_is_the_stalls() {
     assert!(deadline_attention_stands(Some(
-        &StartupHold::Trust.attention()
+        &StartupHold::Trust {
+            agent: Program::Claude
+        }
+        .attention()
     )));
     assert!(!deadline_attention_stands(Some(
         "claude wall: API Error: 529 Overloaded."
@@ -34724,7 +34939,9 @@ fn the_startup_marks_land_only_on_the_record_the_look_read() {
             marked
         })
     };
-    let hold = StartupHold::Trust;
+    let hold = StartupHold::Trust {
+        agent: Program::Claude,
+    };
     let stall = StartupMark::Stalled { hold: &hold };
     set(TaskState::Working, None);
     let before = record().rev;
@@ -34949,7 +35166,10 @@ fn the_held_marks_are_one_edge_and_land_only_on_the_record_the_look_read() {
 /// task a later turn opened again (`working why=turn`) or one the held
 /// deadline stalled that moved on (`working why=moved`), its agent long
 /// started either way, is no worker the startup deadline judges — the held
-/// deadline does. NEGATIVE CONTROL: a session with no record is not listed.
+/// deadline does. A worker a seamless update carried is read by the agent
+/// its spawn started, which its carried record names, and its stall names
+/// that agent's product (never Claude Code's). NEGATIVE CONTROL: a session
+/// with no record is not listed.
 #[test]
 fn the_store_lists_each_task_record_and_reads_a_judged_workers_screen() {
     use crate::task_record::{TaskMark, TaskState};
@@ -34977,18 +35197,40 @@ fn the_store_lists_each_task_record_and_reads_a_judged_workers_screen() {
     mark(&reopened, TaskState::Working, Some("turn"));
     let moved = crate::session_store::test_handle(10);
     mark(&moved, TaskState::Working, Some("moved"));
+    // A Gemini CLI worker's record, carried by a seamless update onto the
+    // adopting session, whose shell holds its prompt.
+    let row = {
+        let spawned = crate::session_store::test_handle(12);
+        mark(&spawned, TaskState::Working, None);
+        let mut tl = spawned.ctx.timeline.lock().unwrap();
+        tl.set_task_agent(Program::Gemini);
+        tl.task().expect("a record").carry_row()
+    };
+    let carried = crate::session_store::test_handle(11);
+    crate::task_record::seed_carried(&carried.ctx, Some(&row));
+    {
+        let mut tl = carried.ctx.timeline.lock().unwrap();
+        tl.note_foreground_group(78);
+        tl.set_program(78, Some("zsh".into()));
+    }
+    carried.term.lock().unwrap().process(b"% ");
     // Done straight over the deadline's stall, its attention still up.
     let over = crate::session_store::test_handle(9);
     mark(&over, TaskState::Done, Some("marker"));
     crate::session_timeline::write_attention_owned(
         &over.ctx,
         ATTENTION_OWNER,
-        crate::session_timeline::MetaEdit::Set(&StartupHold::Trust.attention()),
+        crate::session_timeline::MetaEdit::Set(
+            &StartupHold::Trust {
+                agent: Program::Claude,
+            }
+            .attention(),
+        ),
         aterm_slog::Actor::Harness,
     )
     .expect("written");
     for h in [
-        &worker, &stalled, &launcher, &plain, &reopened, &moved, &over,
+        &worker, &stalled, &launcher, &plain, &reopened, &moved, &over, &carried,
     ] {
         store.write().unwrap().register(h.clone());
     }
@@ -35010,12 +35252,23 @@ fn the_store_lists_each_task_record_and_reads_a_judged_workers_screen() {
         (
             sid(&stalled),
             StartupState::StalledAtStartup,
-            StartupSeen::Holds(StartupHold::NoAgent { program: None }),
+            StartupSeen::Holds(StartupHold::NoAgent {
+                agent: Program::Claude,
+                program: None,
+            }),
         ),
         (sid(&launcher), StartupState::Other, StartupSeen::Unread),
         (sid(&reopened), StartupState::Reopened, StartupSeen::Unread),
         (sid(&moved), StartupState::Reopened, StartupSeen::Unread),
         (sid(&over), StartupState::StallOver, StartupSeen::Unread),
+        (
+            sid(&carried),
+            StartupState::Working,
+            StartupSeen::Holds(StartupHold::NoAgent {
+                agent: Program::Gemini,
+                program: Some("zsh".to_string()),
+            }),
+        ),
     ];
     want.sort_by(|a, b| a.0.cmp(&b.0));
     assert_eq!(by_sid(&std::collections::HashSet::new()), want);
@@ -36455,9 +36708,21 @@ fn a_carry_that_missed_nothing_says_no_row() {
 #[test]
 fn a_carried_restart_that_did_not_land_is_said_as_its_records_agent() {
     let _lane = crate::message_inbox::lane_test_guard();
+    // `other` is the other agent's remedy, not its bare name: the row also names a
+    // folder under `$TMPDIR`, which in a Claude Code session spells `claude`.
     for (agent, who, resume, other) in [
-        (upgrade::Agent::Codex, "Codex", "codex resume", "claude"),
-        (upgrade::Agent::Claude, "Claude", "claude --resume", "codex"),
+        (
+            upgrade::Agent::Codex,
+            "Codex",
+            "codex resume",
+            "claude --resume",
+        ),
+        (
+            upgrade::Agent::Claude,
+            "Claude",
+            "claude --resume",
+            "codex resume",
+        ),
     ] {
         let _ = crate::message_inbox::take_queued();
         let world = Arc::new(World::default());
@@ -36525,9 +36790,9 @@ fn a_restored_codex_the_queue_did_not_bring_back_is_said_as_codex() {
         let rows = restored_rows_now();
         assert_eq!(rows.len(), 1, "codex={codex}");
         let (who, resume, other) = if codex {
-            ("Codex", "type codex resume there", "claude")
+            ("Codex", "type codex resume there", "claude --resume")
         } else {
-            ("Claude", "type claude --resume there", "codex")
+            ("Claude", "type claude --resume there", "codex resume")
         };
         assert_eq!(
             rows[0].message.title,
@@ -38261,9 +38526,8 @@ fn the_sweep_journals_a_finished_stage_and_counts_it() {
 fn the_hosted_loop_presents_the_in_memory_token_and_falls_back_beside() {
     use std::io::{BufRead, BufReader};
     let harness = crate::control_auth::harness_token().expect("entropy");
-    let dir = std::env::temp_dir().join(format!("ah-tok-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir_guard = crate::test_scratch::short_dir("the token server's socket");
+    let dir = dir_guard.path().to_path_buf();
     let sock = dir.join("a.sock");
     let names = aterm_types::control_socket::token_names_for_sock("a.sock");
     std::fs::write(dir.join(&names[0]), "beside\n").unwrap();
@@ -38305,7 +38569,6 @@ fn the_hosted_loop_presents_the_in_memory_token_and_falls_back_beside() {
     assert!(landed.ok(), "{landed:?}");
     drop(ctl);
     let seen = h.join().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(
         seen,
         vec![
@@ -38683,6 +38946,95 @@ fn a_self_supervised_crash_no_snapshot_read_reached_is_relaunched_at_the_tabs_sh
         said.len() == 1 && said[0].contains("no shell to start it again at"),
         "said once: {said:?}"
     );
+}
+
+/// A record written before native registration does not erase the exact
+/// relaunch the host started. Neither that line nor a claim invents a shell;
+/// a missing line must be diagnosed before asking for one.
+#[test]
+fn an_unread_initial_record_relaunches_only_with_its_validated_line_and_shell() {
+    let line = vec![
+        "/u/.aterm/agents/codex".to_string(),
+        "resume".to_string(),
+        "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77".to_string(),
+    ];
+    let dead = gone_pid();
+    let run = |sid: &str, shell: Option<u32>, typed: bool| {
+        let a = Arc::new(Acting::default());
+        a.unreadable.store(true, Ordering::SeqCst);
+        a.open.lock().unwrap().insert(sid.to_string());
+        if let Some(shell) = shell {
+            a.self_shells.lock().unwrap().insert(sid.to_string(), shell);
+        }
+        a.set(&[(sid, Program::Codex)]);
+        let base = self_copy(&a, sid, self_claimed::Seen::Never, Ok(line.clone()));
+        let live = self_claimed::Live {
+            exec_path: line[0].clone(),
+            image: Some(line[0].clone().into()),
+            argv: line.clone(),
+            codex_home: None,
+            cwd: None,
+            twin: None,
+        };
+        let initial = format!(
+            r#"{{"v":1,"pid":{},"sessionId":null,"resumeArgv":null,"cwd":null,"state":null,"status":"busy","exit":null,"draftEmpty":true}}"#,
+            base.pid
+        );
+        let copy = self_claimed::copy_of(
+            base.pid,
+            &base.start,
+            base.home.clone(),
+            Some(&initial),
+            &live,
+            typed.then(|| base.resume.as_ref().unwrap()),
+        );
+        a.self_copies.lock().unwrap().insert(sid.to_string(), copy);
+        let host = HostHandle::start(on(), false, false, a.hooks());
+        until("attached", || host.live() == [sid]);
+        a.claims
+            .lock()
+            .unwrap()
+            .insert(sid.to_string(), format!("codex-alab@{dead}"));
+        a.proven.lock().unwrap().insert(sid.to_string());
+        a.set(&[]);
+        until("the exit decided", || {
+            !a.self_relaunched.lock().unwrap().is_empty()
+                || a.notes
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|n| matches!(n, HostNote::Inform { .. }))
+        });
+        host.shutdown_and_join();
+        a
+    };
+    let a = run("s-initial-lined-shell", Some(4141), true);
+    assert_eq!(
+        *a.self_relaunched.lock().unwrap(),
+        [("s-initial-lined-shell".to_string(), line.clone(), None)]
+    );
+    for (sid, shell, typed, reason) in [
+        ("s-initial-lined-noshell", None, true, "no shell"),
+        ("s-initial-unlined-shell", Some(4141), false, "resume line"),
+    ] {
+        let a = run(sid, shell, typed);
+        assert!(a.self_relaunched.lock().unwrap().is_empty());
+        let notes = a.notes.lock().unwrap();
+        let said: Vec<&str> = notes
+            .iter()
+            .filter_map(|n| match n {
+                HostNote::Inform { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(said.len() == 1 && said[0].contains(reason), "{said:?}");
+        if !typed {
+            assert!(
+                !said[0].contains("no shell"),
+                "the line failed before shell lookup"
+            );
+        }
+    }
 }
 
 /// THE SNAPSHOT A SELF-CLAIMED CRASH IS RELAUNCHED FROM IS ITS OWN

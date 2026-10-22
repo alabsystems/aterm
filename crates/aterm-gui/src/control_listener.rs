@@ -1203,8 +1203,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     fn scratch() -> aterm_tempfile::TempDir {
-        // Short and private: a unix-socket path must fit in 104 bytes.
-        aterm_tempfile::TempDir::new_in("/tmp").expect("scratch dir")
+        crate::test_scratch::short_dir("a listener's socket")
     }
 
     /// The macOS reading is the kernel's own queue: N connects nobody accepted

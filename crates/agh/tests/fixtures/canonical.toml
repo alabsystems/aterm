@@ -1,0 +1,27 @@
+[profiles.dev]
+token_file = "{root}/tokens/dev.token"
+tier = "dev"
+login = "fixture-dev-bot"
+
+[profiles.release]
+token_file = "{root}/secrets/release.token"
+tier = "release"
+login = "fixture-release-bot"
+
+[[owners]]
+name = "fixture-dev"
+tier = "dev"
+read = ["dev"]
+write = "dev"
+
+[[owners]]
+name = "alabsystems"
+tier = "release"
+read = ["dev", "anonymous"]
+write = "release"
+
+[default]
+read = ["dev", "anonymous"]
+
+[targets]
+channel = "alabsystems/aterm"

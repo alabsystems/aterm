@@ -15,7 +15,7 @@
 //! 1. **The snapshot** ([`snapshot`]): the tab's foreground Muse Code TUI
 //!    (no `exec`, no tool subcommand), its data home (its own
 //!    `XDG_DATA_HOME`, else its `HOME`'s), the session it holds — the
-//!    `.session.lock` at session depth its process holds open (`lsof`) AND
+//!    `.session.lock` at session depth its process holds open ([`open_files`]) AND
 //!    whose body names its pid ([`witness`]) — the session's workspace as its
 //!    own log names it, and the shell-integration block it runs in. It is
 //!    followed between idle points ([`follow`]): `/new` and an in-TUI
@@ -62,7 +62,7 @@ use super::{
     Client, Hand, Kernel, Live, LiveTab, NoPlan, Opts, Plan, PromptLook, RelaunchLineError, Report,
     STALE_S, St, TURN_WAIT, TabLife, Typed, alive, connect, cwd_of, descendants_in, exe_of,
     exit_status, file_holders, held, ids, is_generation, ledger, line_status, load,
-    lsof_open_files, managed_agent_twin, now_s, pause, registry_graph, registry_life, roster,
+    managed_agent_twin, now_s, open_files, pause, registry_graph, registry_life, roster,
     running_block, said, save, screen, shell_dialect_of, squash, started_ms, state_dir,
     store_version, table, turn_takes_gen, turn_verdict, twin_version, type_relaunch_line_with,
     under_hand, upgrade, wait_now, wait_until,
@@ -80,7 +80,7 @@ pub(super) trait MuseKernel: Kernel {
     fn args(&self, pid: u32) -> Option<atpkg::caller_shell::ProcArgs>;
     /// The executable the kernel mapped for `pid`.
     fn exe(&self, pid: u32) -> Option<PathBuf>;
-    /// Every file `pid` holds open (`lsof`), `None` when unreadable.
+    /// Every file `pid` holds open through a descriptor, `None` when unreadable.
     fn open_files(&self, pid: u32) -> Option<Vec<PathBuf>>;
     /// Every process holding `file` open, `None` when unreadable.
     fn holders_of(&self, file: &Path) -> Option<Vec<u32>>;
@@ -121,9 +121,9 @@ impl MuseKernel for Live {
         exe_of(pid)
     }
 
-    // The lanes' one read of these kernel facts (`lsof`), codex-alab's too.
+    // The lanes' one read of these kernel facts, codex-alab's too.
     fn open_files(&self, pid: u32) -> Option<Vec<PathBuf>> {
-        lsof_open_files(pid)
+        open_files(pid)
     }
 
     fn holders_of(&self, file: &Path) -> Option<Vec<u32>> {

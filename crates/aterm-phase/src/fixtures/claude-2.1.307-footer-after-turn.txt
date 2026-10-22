@@ -1,0 +1,18 @@
+# claude-code 2.1.307 · MEASURED 2026-10-21, `aterm ctl text` of a private headless aterm (80x24, aterm 0.109.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · idle after a turn in the launch mode · settings {"effortLevel":"xhigh","env":{"CLAUDE_CODE_EFFORT_LEVEL":"xhigh"},"model":"opus"} · the lab's random project dir is spelled /private/tmp/at.lab0 here
+ ▐▛███▛█   Claude Code v2.1.307
+▝▜██████▀  Opus 5.5 · Claude API
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ count from 1 to 30
+
+⏺ tick 1 tick 2 tick 3 tick 4 tick 5 tick 6 tick 7 tick 8 tick 9 tick 10 tick 11
+  tick 12 tick 13 tick 14 tick 15 tick 16 tick 17 tick 18 tick 19 tick 20 tick
+  21 tick 22 tick 23 tick 24 tick 25 tick 26 tick 27 tick 28 tick 29 tick 30
+
+✻ Cogitated for 30s · done 5:28 PM
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

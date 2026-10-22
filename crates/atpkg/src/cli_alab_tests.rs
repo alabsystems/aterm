@@ -343,3 +343,140 @@ fn a_rollback_onto_an_alab_build_names_alab_s_channel() {
          the next update returns it to OpenAI's latest)"
     );
 }
+
+/// A complete, active store build of codex at [`at::BUILD`]: an ALab package whose record is
+/// `record`, its shims laid.
+fn alab_store_codex(layout: &crate::store::Layout, record: &[u8]) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = layout.build_dir("codex", at::BUILD);
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    std::fs::write(dir.join("bin/codex"), b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(
+        dir.join("bin/codex"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join(crate::alab::PACKAGE_JSON),
+        r#"{"layoutVersion":1,"version":"0.164.0-dev.1+gabc","entrypoint":"bin/codex"}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join(crate::alab::ALAB_BUILD_JSON), record).unwrap();
+    crate::store::mark_build_ready(&dir).unwrap();
+    crate::activate::activate_build(layout, &dir).unwrap();
+    crate::activate::install_shims(
+        layout,
+        &dir,
+        &["codex".to_string()],
+        crate::activate::Aliases::Off,
+    )
+    .unwrap();
+    dir
+}
+
+/// `which codex` over an ALab store build says the upstream its record names after its
+/// state, read off the record (the binary only exits). A record from before the field says
+/// nothing more, and so does every malformed one: the line is the older one, byte for byte.
+#[test]
+fn which_codex_says_the_upstream_an_alab_build_records() {
+    let layout = world::layout("alab-which-upstream");
+    let dir = alab_store_codex(&layout, br#"{"source":"0"}"#);
+    let path = std::env::join_paths([layout.bin_dir()]).unwrap();
+    let which = || {
+        which_line_in(
+            &layout,
+            "codex",
+            Some(&path),
+            crate::reroute::StubEnv::default(),
+        )
+        .unwrap()
+    };
+    let older = which();
+    assert!(
+        older.starts_with(&format!(
+            "codex → {} → {} — ",
+            layout
+                .shim(&crate::store::ToolName::new("codex").unwrap())
+                .display(),
+            dir.join("bin/codex").display()
+        )),
+        "{older}"
+    );
+    assert!(older.contains("ALab build 0.164.0-dev.1+gabc"), "{older}");
+    assert!(!older.contains("based on upstream"), "{older}");
+    assert_eq!(older.lines().count(), 1, "{older}");
+    let record = dir.join(crate::alab::ALAB_BUILD_JSON);
+    std::fs::write(&record, at::upstream_record(&at::full_upstream())).unwrap();
+    assert_eq!(
+        which(),
+        format!("{older} — based on upstream rust-v0.163.0+g0123456789ab")
+    );
+    for bad in [
+        at::upstream_record(r#""rust-v0.163.0""#),
+        at::upstream_record(r#"{"release":"rust-v0.163.0","commit":"0123456789ab"}"#),
+        "{\"upstream\":{\"release\":\"rust-v0.163.0\",".to_string(),
+        "\u{0}not json".to_string(),
+    ] {
+        std::fs::write(&record, &bad).unwrap();
+        assert_eq!(which(), older, "{bad}");
+    }
+}
+
+/// A dev link of an ALab package directory says the upstream its record names after the
+/// dev-linked words; a package from before the field keeps the words alone.
+#[test]
+fn which_codex_says_the_upstream_a_dev_linked_package_records() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let layout = world::layout("alab-which-upstream-link");
+    let d = crate::testdir::dir("atpkg-cli-alab-upstream-link-");
+    let pkg = std::path::absolute(d.join("pkg")).unwrap();
+    std::fs::create_dir_all(pkg.join("bin")).unwrap();
+    std::fs::write(pkg.join("bin/codex"), b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(
+        pkg.join("bin/codex"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join(crate::alab::PACKAGE_JSON),
+        r#"{"layoutVersion":1,"version":"0.164.0-dev.2+gdef","entrypoint":"bin/codex"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        pkg.join(crate::alab::ALAB_BUILD_JSON),
+        at::upstream_record(&at::full_upstream()),
+    )
+    .unwrap();
+    crate::link(
+        &layout,
+        "codex",
+        &pkg,
+        &[std::path::PathBuf::from("bin/codex")],
+    )
+    .unwrap();
+    let path = std::env::join_paths([layout.bin_dir()]).unwrap();
+    let which = || {
+        which_line_in(
+            &layout,
+            "codex",
+            Some(&path),
+            crate::reroute::StubEnv::default(),
+        )
+        .unwrap()
+    };
+    let linked = which();
+    assert!(
+        linked.ends_with(
+            " — dev-linked (managed from that checkout, not the index) — based on upstream \
+             rust-v0.163.0+g0123456789ab"
+        ),
+        "{linked}"
+    );
+    std::fs::write(pkg.join(crate::alab::ALAB_BUILD_JSON), b"{}").unwrap();
+    assert_eq!(
+        which(),
+        linked
+            .strip_suffix(" — based on upstream rust-v0.163.0+g0123456789ab")
+            .unwrap()
+    );
+}

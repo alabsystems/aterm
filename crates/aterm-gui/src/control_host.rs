@@ -321,7 +321,6 @@ mod tests {
             term: term.clone(),
             master: -1,
             ctx,
-            identity: None,
         }
     }
 

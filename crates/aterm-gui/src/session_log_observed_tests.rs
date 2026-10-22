@@ -918,7 +918,8 @@ fn a_delivery_whose_hook_drops_the_fact_writes_the_row_and_no_mail_mark() {
             (sid == self.0.self_id()).then(|| Arc::clone(&self.0))
         }
         fn bridge_lost_advised(&self, _: usize) {}
-        fn torn_state_set_aside(&self, _: u64) {}
+        fn torn_state_set_aside(&self, _: u64, _: bool) {}
+        fn torn_state_held(&self, _: u64) {}
     }
     // 5B-7's presence check: the inbox row at `off` has its mark.
     let check = |ctx: &crate::SessionCtx, off: u64| -> Result<(), String> {

@@ -1459,6 +1459,14 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
     ) {
         let awaited = self.turn_end.account_answer_awaited(r);
+        // What the point's screen said, whole, for a done's result where no
+        // transcript is read (`task_mark`'s `publish_done`).
+        self.point_said = r.said_tail.as_deref().filter(|_| !r.said_cut).map(|tail| {
+            (
+                r.program,
+                crate::harness::result::screen_said(r.turn_said.as_deref(), tail),
+            )
+        });
         self.observe_point(r, now, seq);
         // A lost login ended back: news to the tabs that waited on its
         // sign-in ([`IdleHost::login_back`]). A limit that ended with no
@@ -2699,6 +2707,7 @@ impl<C: Ctl> Session<'_, C> {
     /// ([`approvals::land_episode`]).
     pub(super) fn land_over(&mut self, had: bool, seq: u64) {
         if had && !self.turn_end.land_episode().0 {
+            self.land_report = None;
             self.ledger_row(
                 approvals::RULE_LAND_OVER,
                 approvals::Outcome::Waiting,
@@ -2843,6 +2852,11 @@ impl<C: Ctl> Session<'_, C> {
         let r = self.turn_end_reread(&point.screen, opts);
         let land = self.turn_end.land_episode().0;
         self.turn_end.acted(&action, &r, self.fx.mono());
+        // The episode's instruction typed at this point: its words are the
+        // report a screen-read landing's result opens with.
+        if !land && self.turn_end.land_episode().0 {
+            self.land_report = self.point_said.clone();
+        }
         self.land_over(land, seq);
         let word = if matches!(action, TurnEndAction::TypeCommand { .. }) {
             "TYPED"

@@ -1,0 +1,48 @@
+# claude-code 2.1.307 · MEASURED 2026-10-21, `aterm ctl text` of a private headless aterm (144x50, aterm 0.109.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · default (manual) mode, `rm -rf /Volumes/zz-lab-none` (no such volume): the rm breaker's `on mounted drive path: ` note, drawn at column two with no bar because the command is one short row; approve=none, then approve=safe escalated it as a vendor note (the reader before MountedDrivePath) · the lab's random project dir is spelled /private/tmp/at.lab0 here
+ ▐▛███▛█   Claude Code v2.1.307
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ toolstart
+
+⏺ Bash(echo $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true) $(true)
+      $(true) $(true) $(true) $(t…)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Cogitated for 0s · done 6:56 PM
+
+❯ toolstart
+
+⏺ Bash(X=1 if true; then echo ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a;
+      } ${ echo a; } ${ echo…)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Sautéed for 0s · done 6:56 PM
+
+❯ toolstart
+
+⏺ Bash(X=1 if true; then echo ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a; } ${ echo a;
+      } ${ echo a; } ${ echo…)
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Churned for 0s · done 6:57 PM
+
+❯ toolstart
+
+⏺ Bash(rm -rf /Volumes/zz-lab-none)
+  ⎿  Waiting…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Remove /Volumes/zz-lab-none
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ rm -rf /Volumes/zz-lab-none
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Dangerous rm operation on mounted drive path: /Volumes/zz-lab-none
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+
+ Esc to cancel · Tab to amend

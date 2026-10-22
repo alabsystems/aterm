@@ -79,6 +79,7 @@ impl RainBaker {
 
     /// Whether all 64 tiles are baked at the current metric.
     #[must_use]
+    #[inline]
     pub fn complete(&self) -> bool {
         self.next_tile >= ROM_GLYPHS || self.cell_w == 0 || self.cell_h == 0
     }
@@ -106,6 +107,7 @@ impl RainBaker {
     /// vacuously true (`cell_w == 0`) but there is no buffer to patch, so that
     /// case is excluded.
     #[must_use]
+    #[inline]
     pub fn can_rebake(&self) -> bool {
         self.cell_w != 0 && self.cell_h != 0 && self.next_tile >= ROM_GLYPHS
     }
@@ -139,6 +141,7 @@ impl RainBaker {
 
     /// Monotonic atlas version (folded into the frame fingerprint).
     #[must_use]
+    #[inline]
     pub fn version(&self) -> u64 {
         self.version
     }
@@ -160,6 +163,7 @@ impl RainBaker {
 
     /// Atlas texel origin of `glyph`'s tile (its rect is `cell_w × cell_h`).
     #[must_use]
+    #[inline]
     pub fn tile_origin(&self, glyph: u32) -> (u16, u16) {
         let g = glyph as usize % ROM_GLYPHS;
         (
@@ -222,15 +226,20 @@ impl RainBaker {
             }
             let src_row = &src[..src_len];
             let row_base = (oy + y) * atlas_w + ox;
+            if src_row.is_empty() {
+                for x in 0..cw {
+                    let idx = (row_base + x) * 4;
+                    self.rgba[idx..idx + 4].copy_from_slice(&[255, 255, 255, 0]);
+                }
+                continue;
+            }
             for x in 0..cw {
                 let mut num: u32 = 0;
-                if !src_row.is_empty() {
-                    let seg = &self.col_seg[self.col_off[x] as usize..self.col_off[x + 1] as usize];
-                    for &(wy, row) in src_row {
-                        for &(mx, wx) in seg {
-                            if (row >> mx) & 1 == 1 {
-                                num += wx * wy;
-                            }
+                let seg = &self.col_seg[self.col_off[x] as usize..self.col_off[x + 1] as usize];
+                for &(wy, row) in src_row {
+                    for &(mx, wx) in seg {
+                        if (row >> mx) & 1 == 1 {
+                            num += wx * wy;
                         }
                     }
                 }

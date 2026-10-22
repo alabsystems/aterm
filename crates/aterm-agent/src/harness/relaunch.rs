@@ -702,13 +702,15 @@ pub(super) fn worker_homes(
     }
 }
 
-/// THE LINE A WORKER'S SHELL RUNS AT ITS FIRST PROMPT (`spawn agent=claude`):
-/// `exe` started fresh, `--model <model>` when one is named, under the Claude
-/// home, `HOME` and login it must carry ([`required_env`], refused rather
-/// than dropped) and the survey switch ([`CLAUDE_LAUNCH_ENV`], a nicety
-/// dropped first, as on every relaunch line), its task the fixed operand
-/// [`upgrade::TASK_OPERAND`]. So the task is argv — the agent's first prompt —
-/// and the shell stays under the agent, as a relaunch needs it.
+/// THE LINE A CLAUDE CODE WORKER'S SHELL RUNS AT ITS FIRST PROMPT (`spawn
+/// agent=claude`), Claude Code's row of the one line every worker's is
+/// ([`super::worker::line`]): `exe` started fresh, `--model <model>` when one
+/// is named, under the Claude home, `HOME` and login it must carry
+/// ([`required_env`], refused rather than dropped) and the survey switch
+/// ([`CLAUDE_LAUNCH_ENV`], a nicety dropped first, as on every relaunch
+/// line), its task the fixed operand [`upgrade::TASK_OPERAND`]. So the task
+/// is argv — the agent's first prompt — and the shell stays under the agent,
+/// as a relaunch needs it.
 ///
 /// # Errors
 /// The line cannot be written ([`upgrade::task_line_env`]), or `home` is
@@ -722,23 +724,23 @@ pub fn task_launch_line(
     homedir: Option<&str>,
     login: Option<&str>,
 ) -> Result<String, String> {
-    // Rootless: under the worker's own directory (a root alone, as Windows
-    // spells one with no drive, is not the worker's).
-    if let Some(home) = home.filter(|home| !Path::new(home).has_root()) {
-        return Err(format!(
-            "the starter's Claude home ({home:?}) is relative and the directory it names could \
-             not be read"
-        ));
-    }
-    let flags: Vec<String> = model
-        .map(|m| vec!["--model".to_string(), m.to_string()])
-        .unwrap_or_default();
+    let Some(claude) = super::worker::worker_cli(aterm_phase::Program::Claude) else {
+        return Err("no worker row for Claude Code".to_string());
+    };
     // A `HOME` only where the manager's records are under its own, not the
     // user's: the worker's shell is the server's, under the user's `HOME`.
     let required = required_env(home, homedir, login);
-    let both: Vec<(&str, &str)> = required.iter().copied().chain(CLAUDE_LAUNCH_ENV).collect();
-    upgrade::task_line_env(dialect, &both, exe, &flags)
-        .or_else(|_| upgrade::task_line_env(dialect, &required, exe, &flags))
+    super::worker::line_of(
+        claude,
+        dialect,
+        exe,
+        &[],
+        &required,
+        &super::worker::Fresh {
+            model,
+            ..super::worker::Fresh::default()
+        },
+    )
 }
 
 /// `flags` with every `--model` spelling replaced by `model` (before the

@@ -1,0 +1,11 @@
+{
+  "sha": "0123456789abcdef0123456789abcdef01234567",
+  "commit": {
+    "author": {"name": "Fixture Dev", "date": "2026-10-18T12:00:00Z"},
+    "committer": {"name": "Fixture Dev", "date": "2026-10-18T12:05:00Z"},
+    "message": "packs: read the index once\n\nThe second paragraph of the message."
+  },
+  "author": {"login": "fixture-dev-bot", "id": 9000002, "type": "Bot"},
+  "html_url": "https://github.com/fixture-dev/packs/commit/0123456789abcdef0123456789abcdef01234567",
+  "stats": {"additions": 9, "deletions": 3, "total": 12}
+}

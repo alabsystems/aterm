@@ -290,7 +290,7 @@ pub(crate) const BUILTIN_CMD_CHORDS: &[(&str, &str)] = &[
 /// equivalent to one of these two tables.
 pub(crate) const MENU_CMD_CHORDS: &[(&str, &str)] = &[
     ("cmd+,", "Settings…"),
-    ("cmd+o", "Open File in Editor…"),
+    ("cmd+o", "Open File…"),
     ("cmd+a", "Select All"),
     ("cmd+g", "Find Next"),
     ("cmd+shift+g", "Find Previous"),

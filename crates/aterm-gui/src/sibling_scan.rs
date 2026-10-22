@@ -474,12 +474,7 @@ mod tests {
     fn summarize_peer_reads_a_scripted_sibling() {
         use std::io::{BufRead, BufReader, Write};
         for (needs, published) in [(" needs=ask", true), ("", false)] {
-            // `/tmp`, never the test's TMPDIR: a socket path must fit
-            // SUN_LEN, and another test may point TMPDIR somewhere long.
-            let scratch = aterm_tempfile::Builder::new()
-                .prefix("atsib")
-                .tempdir_in("/tmp")
-                .unwrap();
+            let scratch = crate::test_scratch::short_dir("the peer's socket");
             let dir = scratch.path();
             let sock = dir.join("peer.sock");
             // The sibling token read beside the socket (non-pid name ⇒

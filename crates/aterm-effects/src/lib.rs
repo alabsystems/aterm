@@ -156,6 +156,11 @@ pub mod spec;
 /// [`spectrum::spectrum_snap`].
 pub mod spectrum;
 pub mod supernova;
+/// The tests' replay pool ([`test_pool::par_map`]), for the unit tests and
+/// the integration suite: a test seam, absent from a release build.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub mod test_pool;
 /// Tone of typing: a small hashed char-n-gram classifier that maps the line
 /// being typed to a mood hint for `trail_sound`'s tone tables. Trained by
 /// `examples/tone_train.rs`; weights ship as a verified binary asset.

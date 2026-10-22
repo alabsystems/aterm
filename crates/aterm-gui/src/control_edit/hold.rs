@@ -697,10 +697,7 @@ mod tests {
 
         use aterm_agent::supervise::{Ctl as _, Endpoint, RelayCtl};
 
-        let dir = aterm_tempfile::Builder::new()
-            .prefix("aterm-edit-hold-")
-            .tempdir()
-            .unwrap();
+        let dir = crate::test_scratch::short_dir("the scratch server's socket");
         let sock = dir.path().join("a.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let server = std::thread::spawn(move || {

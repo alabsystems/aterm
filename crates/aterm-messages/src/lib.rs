@@ -100,14 +100,15 @@ pub use digest::{DigestEntry, DigestView, RECENT_FILED, ReportScope, report as e
 pub use glass::{CapsuleLayout, CapsuleRole, Hit, Links, Presentation, RowKind, RowLayout};
 pub use log::{CodecError, LogLine, LogRecord, LogState, MessageLog, Retired, Shelf};
 pub use model::{
-    ActionIndex, Amount, Decision, Glyph, Hold, Intent, Load, Loads, Message, MessageId, Meter,
-    Origin, Restatement, Severity, Tag, TagError, Unit, UpgradeWord, WallStamp, tags,
+    ActionIndex, Amount, Decision, Glyph, Hold, Intent, LINK_URL_CAP, Load, Loads, Message,
+    MessageId, Meter, Origin, Restatement, Severity, Tag, TagError, Unit, UpgradeWord, WallStamp,
+    link_host, tags,
 };
 pub use progress::{Eta, ProgressTrack, Waiter};
 pub use waits::{SessionWait, WaitEnd, WaitKind, WaitSample, WaitStep};
 pub use wire::{
-    Applied, DoneHow, DoneRequest, NoticeRequest, Paint, Press, ProgressRequest, WireGate,
-    WireIndicator,
+    Applied, DoneHow, DoneRequest, LaterRequest, NoticeRequest, Paint, Press, ProgressRequest,
+    WireGate, WireIndicator,
 };
 
 // ---------------------------------------------------------------------------
@@ -323,6 +324,12 @@ pub(crate) const STALE_WIRE: Duration = Duration::from_mins(2);
 /// included, so everything one script has in flight is on the glass. A
 /// restate or a same-key supersede does not count against it.
 pub(crate) const WIRE_LIVE_CAP: usize = MAX_ROWS as usize;
+/// The most wire entries open in the digest at once (`notice later`): a third of
+/// [`need::DIGEST_CAP`], so the tools that file there leave aterm's own facts
+/// most of the list. A repeat, a restatement or a dismissed key's quiet does not
+/// count against it, and a wire entry is never filed into a full digest, so none
+/// evicts one of aterm's.
+pub(crate) const WIRE_LATER_CAP: usize = 4;
 /// New wire messages — rows and records, each a log line — per trailing
 /// [`WIRE_MINT_WINDOW`].
 pub(crate) const WIRE_MINTS_PER_WINDOW: usize = 60;
@@ -353,6 +360,7 @@ pub const GLASS_TITLE_CHARS: usize = 48;
 const _: () =
     assert!(WIRE_KEY_PREFIX.len() + WIRE_KEY_MAX <= KEY_CAP && GLASS_TITLE_CHARS < TITLE_CAP);
 const _: () = assert!(WIRE_LOG_SHARE < LOG_CAP && WIRE_LIVE_CAP < WIRE_LOG_SHARE);
+const _: () = assert!(WIRE_LATER_CAP * 3 <= need::DIGEST_CAP);
 
 const _: () = assert!(
     STALLED_WORD.len() <= ETA_SHORT_W
@@ -387,6 +395,8 @@ mod entry_tests;
 mod exception_fuzz_tests;
 #[cfg(test)]
 mod family_tests;
+#[cfg(test)]
+mod later_tests;
 #[cfg(test)]
 mod need_tests;
 #[cfg(test)]

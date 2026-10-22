@@ -21,7 +21,7 @@ use aterm_render::{FxFrame, GlowQuad};
 
 use super::layers::{kitty_art, one_star, rim_art, rim_cover};
 use super::oracle::{Sink, kitty_quads, lay_star, quads, rim_quads};
-use super::tests::{aired, clipped, scene, scenes};
+use super::tests::{aired, clipped, scene, scenes, widest};
 use super::*;
 use crate::cursor_glow::Geom;
 use crate::effect_util::{push_twinkle_star, star_pieces};
@@ -1246,6 +1246,63 @@ fn the_card_is_bounded_without_its_art() {
          the kitty's own {real_kitty} -> {dith_kitty}",
         real_items.iter().max()
     );
+}
+
+/// THE UNDER CONTENT REACHES ITS BOUND AND STOPS THERE: the widest box and
+/// longest trail ([`widest`]) lay each edge in [`MAX_EDGE_SEGMENTS`] ramps and
+/// the stepping trail in [`MAX_TRAIL_SEGMENTS`] segments of its six
+/// stripes: the border alone holds `2 · MAX_EDGE_SEGMENTS + 2` items and
+/// border and trail exactly [`CARD_UNDER_ITEMS_MAX`], on both grounds,
+/// seated and at the episode's end, and the layers still put the quad
+/// oracle's pixels on the glass. CONTROL: the same trail at rest is one
+/// segment.
+#[test]
+fn the_under_content_reaches_its_bound_and_stops_there() {
+    let wide = widest();
+    let border_only = CardScene {
+        trail: None,
+        ..wide
+    };
+    let stripes = TRAIL_STOPS.len();
+    let edges = 2 * MAX_EDGE_SEGMENTS as usize + 2;
+    let mut frames = CardFrames::default();
+    let mut seen = Seen::default();
+    let under = |frames: &mut CardFrames, s: &CardScene, clock: Clock| {
+        fx_frame(frames, s, clock, 7)
+            .expect("a frame")
+            .under
+            .items()
+            .len()
+    };
+    for dark in [true, false] {
+        let (wide, border_only) = (
+            CardScene { dark, ..wide },
+            CardScene {
+                dark,
+                ..border_only
+            },
+        );
+        for clock in [
+            Clock::seated(BLINK_AT_MS + 10),
+            Clock::riding(EPISODE_MS - 40),
+        ] {
+            assert_eq!(
+                (
+                    under(&mut frames, &border_only, clock),
+                    under(&mut frames, &wide, clock)
+                ),
+                (edges, CARD_UNDER_ITEMS_MAX),
+                "dark {dark}, {clock:?}: (the border's items, the border's and the trail's)"
+            );
+            let what = format!("the widest box and longest trail, dark {dark}, {clock:?}");
+            assert_same_pixels(&mut frames, &wide, clock, 7, &mut seen, &what);
+        }
+        assert_eq!(
+            under(&mut frames, &wide, Clock::SETTLED),
+            edges + stripes,
+            "CONTROL: dark {dark}: the trail at rest is one segment"
+        );
+    }
 }
 
 /// A THEME SWITCH REBAKES NO ART: a card's frames drawn once at a cell

@@ -349,6 +349,17 @@ impl Mover {
         Self(Intent::NewWindow)
     }
 
+    /// Open the web page where the fix is made (`notice later … url=`): `None` for an
+    /// address [`crate::model::link_host`] refuses. Crate only: the wire's door is its one
+    /// caller.
+    #[must_use]
+    pub(crate) fn open_link(url: &str) -> Option<Self> {
+        crate::model::link_host(url)?;
+        Some(Self(Intent::OpenLink {
+            url: url.to_string(),
+        }))
+    }
+
     /// The intent the capsule carries.
     #[must_use]
     pub fn intent(&self) -> &Intent {
@@ -494,6 +505,13 @@ impl Fingerprint {
             format!("{head}~{:04x}", hash & 0xffff)
         };
         Self(format!("{family}.{subject}.{cause}"))
+    }
+
+    /// A wire key (`wire.<key>`, which the wire's rule already holds to [`KEY_CAP`]) kept
+    /// whole: [`Self::new`] would cut its last segment to a 20-char cause, so two keys
+    /// that differ past it would share one entry and one dismissal. Crate only.
+    pub(crate) fn wire(full: &str) -> Self {
+        Self(clip(full, KEY_CAP))
     }
 
     /// The key.

@@ -9958,52 +9958,126 @@ fn the_harness_switch_writes_turn_every_switch_on() {
 /// the list's screen held no control Tab could land on, and Tab from the
 /// search field went round the sidebar and back — the keyboard never got
 /// into the list (the lab found 13 such pages at 220x12, 17 at 102x12).
-/// Tab now goes to the list's first control, which the list scrolls into
-/// view.
+/// Tab goes to the list's first control, Shift-Tab to its last, which the
+/// list scrolls into view. All the opening screen's focusable controls
+/// precede the list: Shift-Tab must reach it by wrapping past the end.
 #[test]
 fn tab_enters_a_settings_list_whose_screen_shows_no_control() {
     let preferences = crate::native_appearance::current_preferences();
-    crate::native_appearance::install_preferences(
-        crate::native_appearance::AppearancePreferences {
-            text_scale: 2.0,
-            ..preferences
-        },
-    );
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    if let Some(ws) = app.windows.get_mut(&wid) {
-        ws.cols = 220;
-        ws.rows = 12;
-    }
-    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate));
-    let (_, view) = app.active_native_view(wid).expect("active Settings view");
     // The window's chrome: the sidebar and the search field.
     let chrome = |key: &crate::native_ui::UiKey| {
         key.as_str().starts_with("settings/nav/") || key.as_str() == "settings/search"
     };
-    let compiled = app.compiled_native_ui(wid).unwrap();
-    assert!(
-        compiled.focus_order.iter().all(chrome),
-        "PREMISE: the opening screen shows no control of the page: {:?}",
-        compiled.focus_order
-    );
-    let focus = |app: &App| {
-        app.native_runtime
-            .view_state(view)
-            .and_then(|state| state.common().last_focus.clone())
-    };
-    let mut entered = None;
-    for _ in 0..6 {
-        app.move_native_focus(wid, false).unwrap();
-        if let Some(key) = focus(&app).filter(|key| !chrome(key)) {
-            entered = Some(key);
-            break;
+    for backwards in [false, true] {
+        let mut app = App::headless_for_test();
+        crate::native_appearance::install_preferences(
+            crate::native_appearance::AppearancePreferences {
+                text_scale: 2.0,
+                ..preferences
+            },
+        );
+        assert_eq!(crate::native_appearance::text_scale(), 2.0);
+        let wid = WindowId(0);
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.cols = 220;
+            ws.rows = 12;
         }
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate));
+        let (_, view) = app.active_native_view(wid).expect("active Settings view");
+        let compiled = app.compiled_native_ui(wid).unwrap();
+        assert!(
+            compiled.focus_order.iter().all(chrome),
+            "PREMISE: the opening screen shows no control of the page: {:?}",
+            compiled.focus_order
+        );
+        let list = compiled
+            .semantics
+            .iter()
+            .position(|node| {
+                node.role == crate::native_ui::SemanticRole::List
+                    && node.key.as_str() != "settings/navigation/list"
+            })
+            .expect("the page has a list");
+        assert!(compiled.focus_order.iter().all(|key| {
+            compiled
+                .semantics
+                .iter()
+                .position(|node| &node.key == key)
+                .is_some_and(|at| at < list)
+        }));
+        // End focuses the sidebar's last row without changing the page.
+        // Software Update is its section's first row, so the initial rail
+        // shows its heading above it, not a second row. At the end of the
+        // group the same room shows the preceding row instead.
+        let rail = compiled
+            .focus_order
+            .iter()
+            .find(|key| key.as_str().starts_with("settings/nav/"))
+            .expect("the sidebar has a visible row")
+            .clone();
+        app.focus_native_control(wid, rail).unwrap();
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            crate::native_app::AppEvent::TextInput(crate::native_app::TextInputEvent::End {
+                extend: false,
+            }),
+        )
+        .unwrap();
+        let end = app.compiled_native_ui(wid).unwrap();
+        assert!(matches!(
+            app.native_runtime.view_state(view),
+            Some(crate::native_app::AppViewState::Settings(state))
+                if state.route == crate::native_settings::SettingsRoute::SoftwareUpdate
+        ));
+        assert!(
+            end.focus_order.iter().all(chrome),
+            "PREMISE: End left the page's screen without a control"
+        );
+        // Start from the first visible row, not its last: Tab leaves the
+        // sidebar as one stop even when raw next is another sidebar row.
+        let rail = end
+            .focus_order
+            .iter()
+            .find(|key| key.as_str().starts_with("settings/nav/"))
+            .expect("End shows a sidebar row")
+            .clone();
+        app.focus_native_control(wid, rail.clone()).unwrap();
+        let seated = app.compiled_native_ui(wid).unwrap();
+        let at = seated
+            .focus_order
+            .iter()
+            .position(|key| *key == rail)
+            .expect("the focused sidebar row is visible");
+        assert!(
+            seated
+                .focus_order
+                .get(at + 1)
+                .is_some_and(|key| key.as_str().starts_with("settings/nav/")),
+            "PREMISE: the raw next focus entry is another sidebar row"
+        );
+        let focus = |app: &App| {
+            app.native_runtime
+                .view_state(view)
+                .and_then(|state| state.common().last_focus.clone())
+        };
+        let mut entered = None;
+        for _ in 0..6 {
+            app.move_native_focus(wid, backwards).unwrap();
+            if let Some(key) = focus(&app).filter(|key| !chrome(key)) {
+                entered = Some(key);
+                break;
+            }
+        }
+        let entered =
+            entered.unwrap_or_else(|| panic!("backwards={backwards}: Tab enters the list"));
+        assert!(
+            app.compiled_native_ui(wid)
+                .unwrap()
+                .semantic(&entered)
+                .is_some(),
+            "backwards={backwards}: {entered:?} is on screen"
+        );
     }
-    let shown = entered
-        .as_ref()
-        .is_some_and(|key| app.compiled_native_ui(wid).unwrap().semantic(key).is_some());
     crate::native_appearance::install_preferences(preferences);
-    let entered = entered.expect("Tab enters the list");
-    assert!(shown, "{entered:?} is on screen");
 }

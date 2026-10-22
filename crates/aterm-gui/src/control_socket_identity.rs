@@ -351,7 +351,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     fn fixture() -> (aterm_tempfile::TempDir, SocketPlan, CtlListener, String) {
-        let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+        let dir = crate::test_scratch::short_dir("the control socket");
         let path = dir.path().join("control.sock");
         let plan = SocketPlan {
             sock_path: path.to_str().unwrap().to_string(),
@@ -369,9 +369,9 @@ mod tests {
     #[test]
     fn consume_incoming_takes_the_witness_once_through_the_blessed_helper() {
         // `HandoffEnv::capture`'s conformance takes this name out of the process too.
-        let _env = crate::seamless::tests::ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(_env) = crate::seamless::tests::env_alone() else {
+            return;
+        };
         aterm_log::env::unset(ENV_IDENTITY);
         assert!(consume_incoming() == Ok(None), "absent: nothing to consume");
         assert!(std::env::var_os(ENV_IDENTITY).is_none());
@@ -413,8 +413,8 @@ mod tests {
         if !crate::test_alone::alone() {
             return;
         }
-        let original = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
-        let foreign = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+        let original = crate::test_scratch::short_dir("the original socket");
+        let foreign = crate::test_scratch::short_dir("the foreign socket");
         std::env::set_current_dir(original.path()).unwrap();
         let original_dir = std::env::current_dir().unwrap();
         std::fs::create_dir("nested").unwrap();

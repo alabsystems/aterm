@@ -182,7 +182,7 @@ fn boot(root: &Path, sock: &Path, soft_limit: u64) -> (Reaped, u64) {
     let log = std::fs::File::create(&log_path)
         .and_then(|log| Ok((log.try_clone()?, log)))
         .unwrap_or_else(|e| could_not_run(format!("cannot open the instance log ({e})")));
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+    let mut cmd = Command::new(launch_isolation::aterm_executable());
     launch_isolation::apply(&mut cmd, root);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
         .arg("--control-sock")
@@ -724,7 +724,7 @@ fn the_connection_past_the_cap_takes_the_stalest_place_and_tabs_still_open() {
 /// refusal is an answer, returned at once.
 fn aterm_ctl(root: &Path, sock: &Path, args: &[&str]) -> std::process::Output {
     ctl_accept::until_accepted(|| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+        let mut cmd = Command::new(launch_isolation::aterm_executable());
         launch_isolation::apply(&mut cmd, root);
         cmd.arg("ctl")
             .arg("--sock")

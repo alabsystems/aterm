@@ -1784,13 +1784,10 @@ mod tests {
     use aterm_spec::verify;
     use std::collections::BTreeMap;
 
-    /// A per-test scratch dir: tests share one process, so the name keeps parallel
-    /// tests apart.
+    /// A per-test scratch dir in a process root: [`KittyLogHost::flush_exit`] may
+    /// detach a writer that re-creates it after the test, and the root goes at exit.
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "aterm-kitty-log-test-{name}-{}",
-            std::process::id()
-        ));
+        let d = crate::test_scratch::process_root("aterm-kitty-log-test-").join(name);
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.join(KITTY_LOG_FILE)

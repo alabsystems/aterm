@@ -75,13 +75,26 @@ impl Registry for crate::session_store::SessionStore {
         let _ = sessions;
     }
 
-    fn torn_state_set_aside(&self, files: u64) {
+    fn torn_state_set_aside(&self, files: u64, told_when_empty: bool) {
         // A fact for the owner's later look: an exceptions entry, raised at
         // the next park ([`crate::message_inbox::queue_exception`]).
         #[cfg(any(unix, test))]
         crate::message_inbox::queue_exception(
-            crate::message_reporters::torn_state_set_aside_entry(files),
+            crate::message_reporters::torn_state_set_aside_entry(files, told_when_empty),
         );
+        #[cfg(not(any(unix, test)))]
+        let _ = (files, told_when_empty);
+    }
+
+    fn torn_state_held(&self, files: u64) {
+        // At 0 the owner took the torn bytes away: the entry's cause has
+        // ended, and it ends at the next park
+        // ([`crate::message_inbox::queue_exception_clear`]). A count above 0
+        // leaves the entry as the owner left it, open or filed.
+        #[cfg(any(unix, test))]
+        if files == 0 {
+            crate::message_inbox::queue_exception_clear(crate::message_reporters::torn_state_key());
+        }
         #[cfg(not(any(unix, test)))]
         let _ = files;
     }

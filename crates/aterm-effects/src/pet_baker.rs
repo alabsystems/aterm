@@ -128,6 +128,7 @@ pub const EYE_REFLECTION_ECHO_MAX_RADIUS_PX: f32 = 0.52;
 
 /// `xform` with an extra `(kx, ky)` zoom about the normalized point `(cx, cy)`, which keeps its
 /// device pixel: a feature grows in place instead of sliding across the face.
+#[inline]
 fn zoom_about(xform: PathTransform, cx: f32, cy: f32, kx: f32, ky: f32) -> PathTransform {
     PathTransform {
         scale_x: xform.scale_x * kx,
@@ -356,11 +357,12 @@ fn paint_eye_dots(
                     .round()
                     .clamp(0.0, f32::from(FIXED_ONE)) as u16
             };
+            let (x_lo, x_hi, y_lo, y_hi) = (fx(gx - hw), fx(gx + hw), fx(cy - hh), fx(cy + hh));
             let plug = [
-                PathSeg::Move(fx(gx - hw), fx(cy - hh)),
-                PathSeg::Line(fx(gx + hw), fx(cy - hh)),
-                PathSeg::Line(fx(gx + hw), fx(cy + hh)),
-                PathSeg::Line(fx(gx - hw), fx(cy + hh)),
+                PathSeg::Move(x_lo, y_lo),
+                PathSeg::Line(x_hi, y_lo),
+                PathSeg::Line(x_hi, y_hi),
+                PathSeg::Line(x_lo, y_hi),
                 PathSeg::Close,
             ];
             fill_path_fixed(tile, &[&plug[..]], col, alpha, xform);
@@ -439,6 +441,7 @@ impl PetBakeKey {
 /// The shared-atlas host-tile id of one exact-size bake key's integer fields: FNV-1a (stable
 /// across std releases, unlike `DefaultHasher`) with the high bit set, so it never collides
 /// with a small hand-assigned host id. Non-pet rosters lead `words` with a namespace salt.
+#[inline]
 pub(crate) fn host_tile_id(words: &[u64]) -> u64 {
     let mut h = aterm_hash::FNV64_OFFSET;
     for &word in words {
@@ -476,11 +479,12 @@ fn bake_pose_with_reflections(
     }
     let xform = PathTransform::fit(w, h);
     let face_lod = h < FACE_DETAIL_MIN_H;
+    let mouth_lod = h < MOUTH_DETAIL_MIN_H;
     for layer in PET_GLYPHS[pose as usize].layers {
         // LOD cull by authored role: whisker/blush/pattern are sub-pixel charm;
         // iris/catch-light/pupil (`Detail`) are what the dot and its
         // device-sized reflection replace.
-        if face_lod
+        if (face_lod
             && matches!(
                 layer.role,
                 GlyphRole::Whisker
@@ -489,16 +493,14 @@ fn bake_pose_with_reflections(
                     | GlyphRole::Iris
                     | GlyphRole::CatchLight
                     | GlyphRole::Detail
-            )
+            ))
+            || (mouth_lod && layer.role == GlyphRole::Mouth)
         {
             continue;
         }
         let (col, alpha) = resolve_layer(layer, fills);
         if face_lod && layer.role == GlyphRole::Eye {
             paint_eye_dots(&mut tile, layer, col, alpha, xform, reflections);
-            continue;
-        }
-        if h < MOUTH_DETAIL_MIN_H && layer.role == GlyphRole::Mouth {
             continue;
         }
         if matches!(layer.role, GlyphRole::Outline | GlyphRole::Whisker) {
@@ -601,6 +603,7 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
     }
 
     /// Monotonic bake/clear counter, for the frame fingerprint.
+    #[inline]
     pub fn version(&self) -> u64 {
         self.version
     }
@@ -686,6 +689,7 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
 impl PetBaker {
     /// The authored aspect (width ÷ height) of a pose, from its viewbox; callers size the
     /// destination box from it. Clamped away from zero so a degenerate asset cannot make a NaN.
+    #[inline]
     #[must_use]
     pub fn aspect(pose: PetGlyphId) -> f32 {
         (f32::from(PET_GLYPHS[pose as usize].aspect_x1000) / 1000.0).max(0.001)

@@ -398,7 +398,7 @@ fn a_co_viewed_session_names_each_window() {
 }
 
 /// GEMINI CLI HAS NO FOOTER, SO NO CHIP: its line says `face=- drawn=-
-/// why=no-footer spoken=-`, its mode notwithstanding. NEGATIVE CONTROL:
+/// why=no-footer spoken=- description=-`, its mode notwithstanding. NEGATIVE CONTROL:
 /// `drawn_for` ignored prints its face (`face=cruise`); and the same pane
 /// running Claude Code prints one.
 #[test]
@@ -412,7 +412,8 @@ fn the_chip_line_names_no_chip_for_gemini() {
     assert_eq!(
         line,
         format!(
-            "autopilot sid={} window=0 program=gemini face=- drawn=- why=no-footer spoken=-",
+            "autopilot sid={} window=0 program=gemini face=- drawn=- why=no-footer spoken=- \
+             description=-",
             sid.as_str()
         )
     );
@@ -421,6 +422,186 @@ fn the_chip_line_names_no_chip_for_gemini() {
     frame(&mut app, wid);
     let line = line_of(&app, session);
     assert_eq!(token(&line, "face"), "cruise", "{line}");
+}
+
+/// Session `session`'s harness need, as the loop's request lands it: the
+/// needs owner's entry (`None`: its `unset`) and its `MetaChanged` wake,
+/// which publishes the need.
+fn need(app: &mut App, session: u64, entry: Option<&str>) {
+    let ctx = app.pool.get(session).expect("session").ctx.clone();
+    ctx.meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .set_attention_kind(
+            crate::harness_host::NEEDS_ATTENTION_OWNER,
+            entry.map(str::to_string),
+            entry.map(|_| aterm_types::needs::AttentionKind::Ask),
+        )
+        .expect("a slot");
+    app.on_meta_changed(session);
+}
+
+/// What the accessibility tree's node for `session`'s Autopilot chip on
+/// window `wid` describes it as, `None` where it has no description.
+#[cfg(a11y_tree)]
+fn node_description(app: &App, wid: WindowId, session: u64) -> Option<String> {
+    app.claude_chips_a11y(wid)
+        .into_iter()
+        .find(|c| c.session == session && c.chip == crate::a11y_tree::HarnessChip::Autopilot)
+        .and_then(|c| c.description)
+}
+
+/// CHROME SAYS THE CHIP'S DESCRIPTION AS ITS NODE DOES (the W4 title
+/// slice, §12.2.1 and §12.3.1): a Cruise chip with nothing to say beside
+/// its face prints `description=-`; with a harness's need published,
+/// `description="Needs you: <the need>. Carrying on."`; under `⤓ land` with
+/// a read hold, `spoken="Autopilot: land."` still (the painted word, WCAG
+/// 2.5.3) and a description that leads `Not landed yet.` and names the
+/// need in the hold, once; each the accessibility node's own. A worker's
+/// `▸` is said as a comma against the word before it. NEGATIVE CONTROL (as
+/// run): `drawn_chip_line` printing `description=-` whatever the node says
+/// fails the need's line.
+#[test]
+fn chrome_says_the_chips_description_as_its_node_does() {
+    use crate::harness_glass::hold_tests::held;
+    let (mut app, wid, session, _reader, _host) = desk();
+    let line = line_of(&app, session);
+    assert_eq!(token(&line, "description"), "-", "{line}");
+    // A need with the worker's own `▸`: said a comma against its word.
+    need(
+        &mut app,
+        session,
+        Some(
+            "claude needs you: grant Screen Recording in System Settings \u{25b8} Privacy & \
+             Security \u{2014} carrying on",
+        ),
+    );
+    let line = line_of(&app, session);
+    assert_eq!(
+        quoted(&line, "description").as_deref(),
+        Some(
+            "Needs you: grant Screen Recording in System Settings, Privacy and Security. Carrying on."
+        ),
+        "{line}"
+    );
+    need(
+        &mut app,
+        session,
+        Some("claude needs you: approve the 0.48.0 release notes \u{2014} carrying on"),
+    );
+    frame(&mut app, wid);
+    let line = line_of(&app, session);
+    assert_eq!(
+        quoted(&line, "spoken").as_deref(),
+        Some("Autopilot: cruise.")
+    );
+    assert_eq!(
+        quoted(&line, "description").as_deref(),
+        Some("Needs you: approve the 0.48.0 release notes. Carrying on."),
+        "{line}"
+    );
+    #[cfg(a11y_tree)]
+    assert_eq!(
+        quoted(&line, "description"),
+        node_description(&app, wid, session),
+        "{line}"
+    );
+    set_word(&app, session, Autopilot::Land);
+    assert!(crate::harness_glass::on_land_held(
+        &mut app,
+        session,
+        Some(held())
+    ));
+    frame(&mut app, wid);
+    let line = line_of(&app, session);
+    assert_eq!(token(&line, "face"), "land", "{line}");
+    assert_eq!(quoted(&line, "spoken").as_deref(), Some("Autopilot: land."));
+    let description = quoted(&line, "description").expect("described");
+    assert!(
+        description.starts_with(
+            "Not landed yet. Needs you: approve the 0.48.0 release notes. 2 unpushed commits. "
+        ),
+        "{line}"
+    );
+    assert_eq!(description.matches("Needs you").count(), 1, "{line}");
+    #[cfg(a11y_tree)]
+    assert_eq!(
+        Some(description),
+        node_description(&app, wid, session),
+        "{line}"
+    );
+    // The need taken down: the hold names one earlier in its reply.
+    need(&mut app, session, None);
+    let line = line_of(&app, session);
+    assert!(
+        quoted(&line, "description")
+            .is_some_and(|d| d.starts_with("Not landed yet. A need named earlier in its reply.")),
+        "{line}"
+    );
+}
+
+/// THE HOVERED TITLE ON THE GLASS SAYS THE NEED AND THE HOLD (§12.2.3
+/// item 5, §12.3.3 item 4; the W4 title slice's review): pointed at on a
+/// rule with room for the whole title, a Cruise chip's title as the frame
+/// drew it carries the session's published need as `need_title` makes it,
+/// and under `⤓ land` with a read hold, the hold's title form right after
+/// the mode phrase — what the block read off the session's own glass and
+/// timeline, where the face tests hand `autopilot_title` its words
+/// themselves. NEGATIVE CONTROL (as run): the block's `read_words`
+/// answering `(None, None)` draws the title without the need and fails the
+/// first assert.
+#[test]
+fn the_hovered_title_on_the_glass_says_the_need_and_the_hold() {
+    use super::super::gesture_tests::{footer_row, row_text};
+    use crate::harness_glass::{HoldForm, SessionGlass, hold_tests::held};
+    let (mut app, wid, session, _reader, _host) = desk();
+    assert!(app.apply_term_resize(wid, 24, 400));
+    draw_claude(&app, session, BYPASS);
+    need(
+        &mut app,
+        session,
+        Some("claude needs you: approve the 0.48.0 release notes \u{2014} carrying on"),
+    );
+    let ask = app
+        .pool
+        .get(session)
+        .expect("session")
+        .ctx
+        .timeline
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .need()
+        .harness_ask()
+        .cloned()
+        .expect("CONTROL: the need is a harness's ask");
+    app.hover_claude_chip(wid, Some((session, super::Chip::Autopilot)));
+    frame(&mut app, wid);
+    let rule = row_text(&app, wid, footer_row(&app, wid));
+    let said = crate::harness_glass::need_title(&ask);
+    assert!(
+        rule.contains(&said),
+        "the need {said:?} on the glass: {rule:?}"
+    );
+    set_word(&app, session, Autopilot::Land);
+    assert!(crate::harness_glass::on_land_held(
+        &mut app,
+        session,
+        Some(held())
+    ));
+    frame(&mut app, wid);
+    let rule = row_text(&app, wid, footer_row(&app, wid));
+    let hold = app
+        .harness_glass
+        .get(&session)
+        .and_then(SessionGlass::hold)
+        .expect("CONTROL: the hold on the session's glass");
+    let today = Some(crate::harness_glass::wall_today().1);
+    let held_words = crate::harness_glass::hold_words(&hold, Some(&ask), HoldForm::Title, today)
+        .expect("a read hold's words");
+    assert!(
+        rule.contains(&format!("autopilot: land \u{2014} {held_words}")),
+        "the hold {held_words:?} on the glass: {rule:?}"
+    );
 }
 
 /// A PANE NO SUPERVISOR ADMITS PRINTS NO LINE: a shell's pane, beside a

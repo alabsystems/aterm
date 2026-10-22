@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod complete_input;
+mod github_api;
 mod read_owned_file;
 mod relay;
 mod rename_noreplace;
@@ -33,6 +34,26 @@ pub use stops::name as stop_name;
 /// The default bound on one tool run. Generous: a hung tool is what it catches, not a
 /// slow one.
 pub const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
+
+/// A complete bounded GitHub read, including the pagination headers.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GithubResponse {
+    /// The HTTP status.
+    pub status: u16,
+    /// Response headers in received order, preserving duplicates for admission.
+    pub headers: Vec<(String, String)>,
+    /// The complete response body.
+    pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for GithubResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GithubResponse")
+            .field("status", &self.status)
+            .field("body_bytes", &self.body.len())
+            .finish_non_exhaustive()
+    }
+}
 
 /// One tool run.
 #[derive(Clone, PartialEq, Eq)]
@@ -340,6 +361,21 @@ pub trait Relaying {
 
 /// The operating system, as items see it.
 pub trait System: Sync {
+    /// Read one GitHub API endpoint through agh as the already-admitted development
+    /// credential. No credential is written to process environment, files or logs.
+    /// The live arm runs only as `user`; unsupported and test backends never network.
+    ///
+    /// # Errors
+    /// Unsupported backend, user mismatch, invalid credential, or incomplete/failed read.
+    fn github_api(
+        &self,
+        _user: &User,
+        _token: &Secret,
+        _endpoint: &str,
+    ) -> Result<GithubResponse, String> {
+        Err("GitHub reads are not implemented by this backend".into())
+    }
+
     /// Natural scrolling through the same native getter used by System Settings.
     /// Apple's getter synchronizes and reads preferences; it does not independently
     /// query WindowServer's active input state. No preference write or UI prompt.
@@ -965,6 +1001,18 @@ impl Default for Live {
 }
 
 impl System for Live {
+    fn github_api(
+        &self,
+        user: &User,
+        token: &Secret,
+        endpoint: &str,
+    ) -> Result<GithubResponse, String> {
+        if self.euid() != user.uid {
+            return Err("GitHub reads must run as their local user".into());
+        }
+        github_api::read(token, endpoint)
+    }
+
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         std::fs::canonicalize(path)
     }
@@ -1578,7 +1626,10 @@ pub use fake::Fake;
 #[cfg(test)]
 mod fake {
     use super::scratch::{OwnedDirectory, prefix};
-    use super::{Cmd, Ran, Relaying, RunFailed, Scratch, Secret, StagedChild, Stat, System, User};
+    use super::{
+        Cmd, GithubResponse, Ran, Relaying, RunFailed, Scratch, Secret, StagedChild, Stat, System,
+        User,
+    };
     use std::collections::BTreeMap;
     use std::io;
     use std::path::{Path, PathBuf};
@@ -1595,6 +1646,7 @@ mod fake {
         scroll_set_error: Mutex<Option<String>>,
         scroll_set_readback: Mutex<Option<bool>>,
         replies: Mutex<BTreeMap<String, Vec<Ran>>>,
+        github_replies: Mutex<BTreeMap<String, Vec<Result<GithubResponse, String>>>>,
         outputs: Mutex<BTreeMap<String, Vec<Output>>>,
         strict_refusals: Mutex<BTreeMap<String, String>>,
         stage_commit_refused: Mutex<bool>,
@@ -1906,6 +1958,22 @@ mod fake {
             self
         }
 
+        /// Script a GitHub read without retaining its credential or opening a socket.
+        pub fn on_github_api(
+            &self,
+            user: &User,
+            endpoint: &str,
+            reply: Result<GithubResponse, String>,
+        ) -> &Self {
+            self.github_replies
+                .lock()
+                .unwrap()
+                .entry(format!("{}$ agh GET {endpoint}", user.name))
+                .or_default()
+                .push(reply);
+            self
+        }
+
         /// Seed a file.
         pub fn file(&self, path: &str, bytes: &[u8]) -> &Self {
             self.files
@@ -2006,6 +2074,22 @@ mod fake {
     }
 
     impl System for Fake {
+        fn github_api(
+            &self,
+            user: &User,
+            _token: &Secret,
+            endpoint: &str,
+        ) -> Result<GithubResponse, String> {
+            let key = format!("{}$ agh GET {endpoint}", user.name);
+            self.calls.lock().unwrap().push(key.clone());
+            let mut replies = self.github_replies.lock().unwrap();
+            match replies.get_mut(&key) {
+                Some(list) if list.len() > 1 => list.remove(0),
+                Some(list) if list.len() == 1 => list[0].clone(),
+                _ => Err("fake: no GitHub response was scripted".into()),
+            }
+        }
+
         fn natural_scrolling(&self) -> Result<bool, String> {
             self.calls
                 .lock()

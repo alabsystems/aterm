@@ -117,8 +117,8 @@ fn claims(w: &World, sid: &str, n: usize) {
 
 /// RULING Q5 END TO END: a bridge with the default `[fabric] log` mirrors
 /// nothing. Sessions write claims and exit; the bus holds no `v=2` body on
-/// any face, the state dir holds no `logpin`, and `fabric status` says
-/// nothing of a mirror.
+/// any face, the state dir holds no `logpin` and none of its durable copies
+/// (`logkey`, `logfloor`), and `fabric status` says nothing of a mirror.
 #[test]
 fn the_default_mirrors_nothing_and_writes_nothing() {
     let w = World::boot("lm-off", &[]);
@@ -136,7 +136,9 @@ fn the_default_mirrors_nothing_and_writes_nothing() {
         "a v=2 body on the bus with the mirror off: {:?}",
         all.iter().find(|b| b.starts_with("v=2"))
     );
-    assert!(!w.state.join("logpin").exists(), "no pin is ever written");
+    for file in ["logpin", "logkey", "logfloor"] {
+        assert!(!w.state.join(file).exists(), "no {file} is ever written");
+    }
     let fs = w.verb("fabric status");
     assert!(!fs.header().contains("bridge_log="), "{}", fs.header());
 }
@@ -172,6 +174,42 @@ fn turns_land_once_with_ms_dense() {
         fs.header().contains(" bridge_log=turns mirror=on"),
         "{}",
         fs.header()
+    );
+    // RULINGS Q6 AND Q13 ON THE MEDIA: the pin's key and total have their
+    // durable copies, written by the real bridge on the real filesystem — the
+    // key in `logkey` (owner-only, one line), and a floor at or above the
+    // total in `logfloor` — so a power cut that tears the pin stops nothing.
+    let pin = until("a pin between batches", || {
+        let text = std::fs::read_to_string(w.state.join("logpin")).ok()?;
+        aterm_link::mirror::Pin::parse(&text)
+            .ok()
+            .filter(|p| p.slots.is_empty() && p.total > 0)
+    });
+    let key = std::fs::read_to_string(w.state.join("logkey")).expect("logkey");
+    assert_eq!(
+        Some(key.trim_end().to_string()),
+        pin.key
+            .map(|k| k.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        "the pin's key is logkey's"
+    );
+    assert_eq!(key.len(), 33, "32 hex digits and a newline: {key:?}");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(w.state.join("logkey"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "the key is its owner's alone: {mode:o}");
+    }
+    let floor: u64 = std::fs::read_to_string(w.state.join("logfloor"))
+        .expect("logfloor")
+        .trim_end()
+        .parse()
+        .expect("one number");
+    assert!(
+        floor >= pin.total,
+        "the floor {floor} covers the total {}",
+        pin.total
     );
     // The second session exits: its close reaches the bus too.
     assert!(w.verb(&format!("@{b} close")).ok());

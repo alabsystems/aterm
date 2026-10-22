@@ -90,12 +90,10 @@ fn every_lost_draft_of_the_update_is_said_in_one_row() {
 /// saved whole beside messages.log, and the row says where.
 #[test]
 fn every_lost_draft_is_saved_whole_and_the_row_says_where() {
-    let folder = std::env::temp_dir().join(format!(
-        "aterm-lost-drafts-{}-{}",
-        std::process::id(),
-        crate::metrics::now_us()
-    ));
-    std::fs::create_dir_all(&folder).expect("scratch folder");
+    // Short: the row's line holds the path whole only under 240 characters,
+    // whatever `$TMPDIR` is.
+    let scratch = crate::test_scratch::short_dir("the saved drafts");
+    let folder = scratch.path().to_path_buf();
     let long = format!("{}\n\tsecond line", "a".repeat(1000));
     let mut drafts = vec![("no_such_row_long".to_string(), long.clone())];
     drafts.extend((1..=17).map(|index| (format!("no_such_row_{index}"), format!("draft {index}"))));
@@ -140,7 +138,6 @@ fn every_lost_draft_is_saved_whole_and_the_row_says_where() {
         rows[0].detail
     );
     drop(app);
-    let _ = std::fs::remove_dir_all(&folder);
 }
 
 /// A seamless successor loses nothing before Commit: its restore settles the carried drafts
@@ -150,12 +147,10 @@ fn every_lost_draft_is_saved_whole_and_the_row_says_where() {
 #[cfg(unix)]
 #[test]
 fn a_successor_saves_and_says_its_lost_drafts_only_at_commit() {
-    let folder = std::env::temp_dir().join(format!(
-        "aterm-lost-drafts-commit-{}-{}",
-        std::process::id(),
-        crate::metrics::now_us()
-    ));
-    std::fs::create_dir_all(&folder).expect("scratch folder");
+    // Short: the row's line holds the path whole only under 240 characters,
+    // whatever `$TMPDIR` is.
+    let scratch = crate::test_scratch::short_dir("the saved drafts");
+    let folder = scratch.path().to_path_buf();
     let saved_sets = |folder: &std::path::Path| -> Vec<std::path::PathBuf> {
         std::fs::read_dir(folder)
             .expect("the folder")
@@ -201,7 +196,6 @@ fn a_successor_saves_and_says_its_lost_drafts_only_at_commit() {
     assert_eq!(saved_sets(&folder).len(), 1, "said once");
     assert_eq!(loss_rows(&app).len(), 1);
     drop(app);
-    let _ = std::fs::remove_dir_all(&folder);
 }
 
 /// A draft that landed in a view the restore then closed (the native-only window arm's answer

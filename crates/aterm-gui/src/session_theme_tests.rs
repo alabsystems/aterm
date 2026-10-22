@@ -347,90 +347,27 @@ fn program_colours_survive_a_session_theme_change() {
     assert_ne!(bg(&app, 1), builtin("Nord").background);
 }
 
-/// Spec `session-theme-draw`: a session spawned under an identity draws its
-/// `identity_themes` entry (origin `identity`), and a theme of its own beats
-/// it. NEGATIVE CONTROL: an identity the map does not name draws the
-/// instance's.
-#[test]
-fn identity_theme_and_precedence() {
-    let mut app = App::headless_for_test();
-    app.config =
-        aterm_toml::from_str("theme = \"Nord\"\nidentity_themes = { Worker = \"Hearth\" }\n")
-            .expect("toml");
-    app.install_resolved_colors(ThemeChange::ConfigReload);
-    let mut worker = crate::stub_session(1);
-    worker.identity = Some("worker".to_string());
-    insert(&mut app, worker);
-    let mut other = crate::stub_session(2);
-    other.identity = Some("reviewer".to_string());
-    insert(&mut app, other);
-
-    assert_eq!(bg(&app, 1), builtin("Hearth").background, "drawn at birth");
-    let line = run_on(&mut app, ThemeCtlOp::SessionStatus, Some(1)).expect("status");
-    assert_eq!(
-        field(&line, "origin").as_deref(),
-        Some("identity"),
-        "{line}"
-    );
-    assert_eq!(bg(&app, 2), builtin("Nord").background);
-
-    set(&mut app, 1, "Linen").expect("pinned");
-    assert_eq!(bg(&app, 1), builtin("Linen").background);
-    run_on(&mut app, ThemeCtlOp::SessionClear, Some(1)).expect("clear");
-    assert_eq!(
-        bg(&app, 1),
-        builtin("Hearth").background,
-        "cleared, the identity's theme draws again"
-    );
-    // A misspelt map value is a notice, and its sessions draw the instance's.
-    app.config = aterm_toml::from_str("identity_themes = { worker = \"Nope\" }\n").expect("toml");
-    let misses = crate::app_config::theme_misses(&app.config, &app.config_assets.themes);
-    assert!(
-        misses
-            .iter()
-            .any(|m| m.starts_with("identity_themes.worker")),
-        "{misses:?}"
-    );
-}
-
 /// A new session's shell is told the side of the theme it will draw, which
 /// lands only after the shell has started: its own (asked, inherited by a
-/// split, restored), else its identity's, as `session_draw` ranks them. `None`,
-/// the instance's side the factory already carries, when it draws none of its
-/// own or one that does not draw. On Windows that side is the shell's
+/// split, restored), as `session_draw` ranks them. `None` uses the instance's
+/// side the factory already carries, when it draws none of its own or one
+/// that does not draw. On Windows that side is the shell's
 /// `COLORFGBG`, which named the instance's for a light tab on a dark instance.
 #[test]
 fn a_new_shell_is_told_the_side_of_the_theme_it_will_draw() {
     let mut app = App::headless_for_test();
-    app.config =
-        aterm_toml::from_str("theme = \"Nord\"\nidentity_themes = { Worker = \"Aterm Day\" }\n")
-            .expect("toml");
+    app.config = aterm_toml::from_str("theme = \"Nord\"\n").expect("toml");
     app.install_resolved_colors(ThemeChange::ConfigReload);
     assert_eq!(
         app.installed_colors.reported,
         Appearance::Dark,
         "a dark instance"
     );
-    let side =
-        |theme: Option<&str>, identity: Option<&str>| app.spawn_shell_appearance(theme, identity);
-    assert_eq!(side(Some("Default Light"), None), Some(Appearance::Light));
-    assert_eq!(
-        side(None, Some("worker")),
-        Some(Appearance::Light),
-        "the identity's"
-    );
-    assert_eq!(
-        side(Some("Nord"), Some("worker")),
-        Some(Appearance::Dark),
-        "its own beats its identity's"
-    );
-    assert_eq!(
-        side(Some("Nope"), Some("worker")),
-        None,
-        "a miss draws the instance's"
-    );
-    assert_eq!(side(None, Some("reviewer")), None);
-    assert_eq!(side(None, None), None);
+    let side = |theme: Option<&str>| app.spawn_shell_appearance(theme);
+    assert_eq!(side(Some("Default Light")), Some(Appearance::Light));
+    assert_eq!(side(Some("Nord")), Some(Appearance::Dark));
+    assert_eq!(side(Some("Nope")), None, "a miss draws the instance's");
+    assert_eq!(side(None), None);
     #[cfg(windows)]
     {
         assert_eq!(
@@ -438,7 +375,7 @@ fn a_new_shell_is_told_the_side_of_the_theme_it_will_draw() {
             "15;0",
             "the instance's"
         );
-        let light = app.shell_factory(Some("Default Light"), None);
+        let light = app.shell_factory(Some("Default Light"));
         assert_eq!(light.shell_colorfgbg().1, "0;15", "the light tab's own");
         assert_ne!(
             light.spawn_fingerprint(),
@@ -461,7 +398,6 @@ fn spawn_with_bad_theme_spawns_nothing() {
         None,
         None,
         false,
-        None,
         Some("NoSuchTheme".to_string()),
         None,
         tx,

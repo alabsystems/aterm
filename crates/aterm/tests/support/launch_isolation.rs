@@ -231,28 +231,9 @@ pub fn prepare(root: &Path) -> std::io::Result<()> {
     )
 }
 
-/// The executable chosen by a private external test collector. An explicit
-/// artifact must be absolute and a regular file; an invalid selection is a
-/// broken fixture, never permission to launch a different build. The collector
-/// attests the owned artifact's hash before and after the test. This test-only
-/// variable is stripped from children by [`apply`].
-pub fn aterm_executable() -> std::path::PathBuf {
-    let Some(selected) = std::env::var_os("ATERM_TEST_EXECUTABLE") else {
-        return Path::new(env!("CARGO_BIN_EXE_aterm")).to_owned();
-    };
-    let selected = std::path::PathBuf::from(selected);
-    assert!(
-        selected.is_absolute(),
-        "ATERM_TEST_EXECUTABLE must name an absolute owned artifact: {selected:?}"
-    );
-    let metadata = std::fs::metadata(&selected)
-        .unwrap_or_else(|error| panic!("ATERM_TEST_EXECUTABLE {selected:?}: {error}"));
-    assert!(
-        metadata.is_file(),
-        "ATERM_TEST_EXECUTABLE must name a regular file: {selected:?}"
-    );
-    selected
-}
+#[path = "aterm_under_test.rs"]
+mod aterm_under_test;
+pub use aterm_under_test::aterm_executable;
 
 pub fn apply(cmd: &mut Command, root: &Path) {
     // Isolated from this process's descriptors as well, before any hook a caller

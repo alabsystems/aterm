@@ -496,15 +496,16 @@ fn the_coverage_modes_pick_their_chains() {
         [LandQ, LandP, LandW, WroteC, LandT, Mgr, Worker, Off]
     );
     assert_eq!(Chain::of_mode(Mode::Cap), [Cap, Off]);
-    // `spawn agent=claude` starts Claude Code alone
-    assert_eq!(
-        Chain::of_mode_on(Mode::Cover, Harness::Gemini),
-        [LandQ, LandP, LandW, WroteC, LandT, Off]
-    );
-    assert_eq!(
-        Chain::of_mode_on(Mode::Cover, Harness::Claude),
-        Chain::of_mode(Mode::Cover)
-    );
+    // `spawn agent=<harness>` starts a worker of every harness: L15's two
+    // run on each
+    for h in Harness::ALL {
+        assert_eq!(
+            Chain::of_mode_on(Mode::Cover, h),
+            Chain::of_mode(Mode::Cover),
+            "{}",
+            h.name()
+        );
+    }
     // the measured modes are as they were
     assert_eq!(Chain::of_mode_on(Mode::Both, Harness::Muse), Chain::ALL);
     assert_eq!(
@@ -904,8 +905,8 @@ fn the_words_are_read() {
         [Chain::Cruise, Chain::LandJ, Chain::LandK]
     );
     // --chains names a chain of any mode, narrowing the mode's on each
-    // harness: L15's two run on Claude Code alone, a chain of another mode
-    // runs nowhere
+    // harness: L15's two run on every harness, a chain of another mode runs
+    // nowhere
     let d = parse_args(&v(&[
         "--harness",
         "all",
@@ -920,7 +921,14 @@ fn the_words_are_read() {
         d.chains(Harness::Claude),
         [Chain::LandQ, Chain::Mgr, Chain::Worker]
     );
-    assert_eq!(d.chains(Harness::Gemini), [Chain::LandQ]);
+    for h in [Harness::Gemini, Harness::Agy, Harness::Muse] {
+        assert_eq!(
+            d.chains(h),
+            [Chain::LandQ, Chain::Mgr, Chain::Worker],
+            "{}",
+            h.name()
+        );
+    }
     // Worker-only selection retains its prerequisite, in the mode's order.
     let worker = parse_args(&v(&[
         "--harness",
@@ -932,8 +940,14 @@ fn the_words_are_read() {
     ]))
     .unwrap()
     .unwrap();
-    assert_eq!(worker.chains(Harness::Claude), [Chain::Mgr, Chain::Worker]);
-    assert!(worker.chains(Harness::Gemini).is_empty());
+    for h in Harness::ALL {
+        assert_eq!(
+            worker.chains(h),
+            [Chain::Mgr, Chain::Worker],
+            "{}",
+            h.name()
+        );
+    }
     // Asking only for the manager starts no worker; unrelated chains gain none.
     let manager = parse_args(&v(&[
         "--harness",
@@ -962,6 +976,49 @@ fn the_words_are_read() {
         .unwrap();
     assert!(e.chains(Harness::Muse).is_empty());
     assert!(parse_args(&v(&["-h"])).unwrap().is_none());
+    // --window: L13's person types through hwkey in a windowed lab; a run
+    // with no chain a person opens has nothing to press (CONTROL: without it)
+    let keys = parse_args(&v(&[
+        "--harness",
+        "all",
+        "--mode",
+        "cover",
+        "--chains",
+        "land-p",
+        "--window",
+    ]))
+    .unwrap()
+    .unwrap();
+    assert!(keys.window);
+    assert_eq!(keys.chains(Harness::Muse), [Chain::LandP]);
+    assert!(!question.window);
+    assert!(
+        parse_args(&v(&["--harness", "claude", "--mode", "cover", "--window"]))
+            .unwrap()
+            .unwrap()
+            .window
+    );
+    for bad in [
+        &[
+            "--harness",
+            "claude",
+            "--mode",
+            "cover",
+            "--chains",
+            "land-q",
+            "--window",
+        ][..],
+        &["--harness", "claude", "--mode", "land", "--window"],
+        &["--harness", "muse", "--mode", "wall", "--window"],
+    ] {
+        let f = parse_args(&v(bad)).err();
+        assert_eq!(f.as_ref().map(|f| f.code), Some(2), "{bad:?}");
+        assert!(
+            f.and_then(|f| f.msg)
+                .is_some_and(|m| m.contains("needs land-p")),
+            "{bad:?}"
+        );
+    }
     for bad in [
         &["t"][..],
         &["--harness"],
@@ -2658,6 +2715,148 @@ fn land_p_passes_only_on_a_persons_exchange_left_to_them() {
     }
 }
 
+/// `--window` UNDER `LAB_RESTORE=1` IS A USAGE ERROR (exit 2), refused
+/// before any lab is made, never a harness's COULD NOT RUN. CONTROLS: the
+/// window alone carries the window, the person's seam and the lifeline; the
+/// seam alone stays headless; `--keep` holds no lifeline.
+#[test]
+fn forever_window_under_the_restore_seam_is_a_usage_error_not_could_not_run() {
+    let restored = crate::lab::UpOpts {
+        restore: true,
+        ..crate::lab::UpOpts::default()
+    };
+    let f = lab_opts(restored.clone(), Mode::Cover, false, (true, true)).expect_err("refused");
+    assert_eq!(f.code, 2, "{f:?}");
+    let msg = f.msg.unwrap_or_default();
+    assert!(
+        msg.starts_with("forever: a windowed lab takes no LAB_RESTORE=1"),
+        "{msg}"
+    );
+    assert!(!msg.contains("COULD NOT RUN"), "{msg}");
+    let windowed = lab_opts(
+        crate::lab::UpOpts::default(),
+        Mode::Cover,
+        false,
+        (true, true),
+    )
+    .expect("the window alone");
+    assert!(windowed.window && windowed.trust && windowed.lifeline);
+    assert!(windowed.instance_env.contains(PERSON_SEAM));
+    let headless = lab_opts(restored, Mode::Cover, true, (false, false)).expect("the seam alone");
+    assert!(!headless.window && headless.restore && !headless.lifeline);
+    assert!(!headless.instance_env.contains(PERSON_SEAM));
+}
+
+/// L13 TYPED THROUGH HWKEY (`forever --window`): the stamp is the keys' and
+/// theirs alone (`status human_seq=` moved by exactly the presses `hwkey`
+/// posted), and the verdict says how the prompt was typed. NEGATIVE
+/// CONTROLS: a count short of the keys, past them, unread after the Enter,
+/// gone back, or no key posted is UNOBSERVED (no exchange is judged on it,
+/// the harness's act in it included); keys that account for the stamp are
+/// judged as the seam's are (Land's act in the exchange FAILS).
+#[test]
+fn land_p_typed_through_hwkey_passes_only_where_the_keys_account_for_the_stamp() {
+    let l13 = |s: &Seen| one(Chain::LandP, s, "claude", Scenario::L13);
+    let posted = u64::try_from(Chain::LandP.prompt().chars().count() + 1).unwrap();
+    let keyed = |before: u64, after: Option<u64>, posted: u64| {
+        let mut s = left_to_them();
+        s.cover.keyed = Some(Keyed {
+            posted,
+            key_window: 0,
+            seq_before: before,
+            seq_after: after,
+        });
+        s
+    };
+    let (w, why) = l13(&keyed(0, Some(posted), posted));
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains(&format!(
+            "typed through hwkey: {posted} key(s) posted to the window's event queue (0 to the key window of the active app), status human_seq= 0 -> {posted}"
+        )),
+        "{why}"
+    );
+    assert!(why.contains("land@v1 typed at +434.0 s"), "{why}");
+    // CONTROL: the seam's run says it was the seam's
+    let (w, why) = l13(&left_to_them());
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.starts_with("typed through the `as=person` seam;"),
+        "{why}"
+    );
+    // keys that account for the stamp are judged: an act in the exchange fails
+    let mut s = keyed(3, Some(3 + posted), posted);
+    s.journal.insert(
+        2,
+        j(
+            134_000,
+            "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land:",
+        ),
+    );
+    assert_eq!(l13(&s).0, "FAIL");
+    for (before, after, n, said) in [
+        (
+            0,
+            Some(posted - 1),
+            posted,
+            "not every key the real key path took",
+        ),
+        (
+            0,
+            Some(posted + 1),
+            posted,
+            "another hand reached the session",
+        ),
+        (0, None, posted, "was not read after the Enter"),
+        (9, Some(4), posted, "the person's count went back"),
+        (0, Some(0), 0, "no key was posted"),
+    ] {
+        let mut s = keyed(before, after, n);
+        s.journal.insert(
+            2,
+            j(
+                134_000,
+                "CONTINUED seq=1 rule=land@v1 [aterm harness] Autopilot is Land:",
+            ),
+        );
+        let (w, why) = l13(&s);
+        assert_eq!(w, "UNOBSERVED", "{said}: {why}");
+        assert!(why.contains(said), "{why}");
+        assert!(
+            why.contains("whose hand the prompt was is not known"),
+            "{why}"
+        );
+    }
+    // no stamp after hwkey's keys: nobody's, said as the keys'
+    let mut s = keyed(0, Some(0), posted);
+    s.cover.person_stamp = Some("-".into());
+    let (w, why) = l13(&s);
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(why.contains("(hwkey's keys did not stamp it)"), "{why}");
+}
+
+/// Every character of land-p's prompt is a key `hwkey` names (printable
+/// U.S. ASCII, the layout its key table maps), a space by its name (the verb
+/// splits its words on it); no `?` (Gemini CLI's shortcuts key).
+#[test]
+fn land_p_s_prompt_is_typed_key_by_key_through_hwkey() {
+    let prompt = Chain::LandP.prompt();
+    assert!(
+        prompt.chars().all(|c| c == ' ' || c.is_ascii_graphic()) && !prompt.contains('?'),
+        "{prompt}"
+    );
+    let names: Vec<String> = prompt.chars().map(hwkey_name).collect();
+    assert_eq!(names.len(), prompt.chars().count());
+    assert!(names.iter().all(|n| !n.contains(' ') && !n.is_empty()));
+    assert_eq!(hwkey_name(' '), "space");
+    assert_eq!(hwkey_name('F'), "F");
+    assert_eq!(hwkey_name('.'), ".");
+    assert_eq!(
+        names.iter().filter(|n| *n == "space").count(),
+        prompt.matches(' ').count()
+    );
+}
+
 /// L14 is L1, L3 and L5 on replies opening `Wrote `, their words read.
 fn wrote_landed() -> Seen {
     let mut s = landed_a();
@@ -2805,10 +3004,21 @@ fn land_t_passes_on_a_record_working_past_its_startup_deadline() {
     assert_eq!(p5(&s).0, "UNOBSERVED");
 }
 
+/// The `result` header a worker of `program` answers with: Claude Code's
+/// from its transcript, every other harness's from its screen.
+fn result_head(program: &str) -> String {
+    if program == "claude" {
+        "OK 3 source=transcript session=8f0e uuid=41aa bytes=129".into()
+    } else {
+        format!("OK 3 source=screen program={program} bytes=129")
+    }
+}
+
 /// L15 as a live run that passes it records it: L7's landing on a worker
-/// the manager `@s-mgr` spawned, its wait returning at the landing, the
-/// result as stubbed.
-fn spawned() -> Seen {
+/// of `program` the manager `@s-mgr` (running it) spawned, `meta` naming
+/// it, its wait returning at the landing, the result as stubbed from the
+/// source its harness has.
+fn spawned_on(program: &str) -> Seen {
     let mut s = tasked();
     s.task[0].1 =
         "OK task rev=1 state=working from=s-mgr since_ms=0 result_bytes=0 agent=- attention=-"
@@ -2823,9 +3033,17 @@ fn spawned() -> Seen {
             "OK 1\n@s-w1 rev=2 state=done agent=idle attention=- result_bytes=120\n".into(),
         )),
         result: Some(format!("{WORK}\n\n{CLEAN}\n")),
+        agent: Some(program.into()),
+        result_head: Some(result_head(program)),
+        worker: Some(program.into()),
         ..Cover::default()
     };
     s
+}
+
+/// [`spawned_on`] Claude Code.
+fn spawned() -> Seen {
+    spawned_on("claude")
 }
 
 #[test]
@@ -2841,6 +3059,22 @@ fn worker_passes_on_a_spawned_workers_landing_its_managers_wait_and_result() {
     let mut s = spawned();
     s.status[0] = status(1_000, "open", "cruise");
     assert_eq!(l15(&s).0, "FAIL");
+    // A FIRST READ RACING THE AGENT'S START (measured: Gemini CLI 0.46.0's
+    // worker read `autopilot=- supervisor=-` at +0.0 s, `land` at +4.1 s):
+    // `-` until the tab runs an agent is no word, the first word is judged
+    let mut s = spawned_on("gemini");
+    s.status.insert(0, status(-1_000, "-", "-"));
+    let (w, why) = one(Chain::Worker, &s, "gemini", Scenario::L15);
+    assert_eq!(w, "PASS", "{why}");
+    // …and its first word other than land fails, as does no word at all
+    s.status[1] = status(1_000, "open", "cruise");
+    let (w, why) = one(Chain::Worker, &s, "gemini", Scenario::L15);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("is not autopilot=land"), "{why}");
+    s.status = vec![status(-1_000, "-", "-"), status(1_000, "open", "-")];
+    let (w, why) = one(Chain::Worker, &s, "gemini", Scenario::L15);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("none named one"), "{why}");
     // the manager's wait returned before the landing (an attention, a stall)
     let mut s = spawned();
     s.cover.awaited = Some((
@@ -2887,6 +3121,90 @@ fn worker_passes_on_a_spawned_workers_landing_its_managers_wait_and_result() {
     let mut s = spawned();
     s.cover.spawn = None;
     assert_eq!(l15(&s).0, "UNOBSERVED");
+}
+
+#[test]
+fn a_spawned_worker_of_each_harness_passes_as_that_harness_alone() {
+    for program in ["claude", "gemini", "agy", "muse"] {
+        let l15 = |s: &Seen| one(Chain::Worker, s, program, Scenario::L15);
+        let (w, why) = l15(&spawned_on(program));
+        assert_eq!(w, "PASS", "{program}: {why}");
+        assert!(why.contains(&format!("spawned agent={program} ")), "{why}");
+        // NEGATIVE CONTROLS. The spawn named another agent than the harness
+        // under test (a worker of Claude Code on another harness's manager)
+        let other = if program == "claude" {
+            "gemini"
+        } else {
+            "claude"
+        };
+        let mut s = spawned_on(program);
+        s.cover.agent = Some(other.into());
+        let (w, why) = l15(&s);
+        assert_eq!(w, "FAIL", "{program}: {why}");
+        assert!(why.contains("not the harness under test's"), "{why}");
+        // …or none
+        let mut s = spawned_on(program);
+        s.cover.agent = None;
+        assert_eq!(l15(&s).0, "FAIL", "{program}");
+        // `meta` names another worker, or none was read
+        let mut s = spawned_on(program);
+        s.cover.worker = Some(other.into());
+        assert_eq!(l15(&s).0, "FAIL", "{program}");
+        let mut s = spawned_on(program);
+        s.cover.worker = None;
+        let (w, why) = l15(&s);
+        assert_eq!(w, "FAIL", "{program}: {why}");
+        assert!(why.contains("meta names worker=(not read)"), "{why}");
+        // the result from the other source (a screen read for Claude Code,
+        // a transcript for a screen-read harness), or another program's
+        // screen, or no header at all
+        let mut s = spawned_on(program);
+        s.cover.result_head = Some(result_head(other));
+        let (w, why) = l15(&s);
+        assert_eq!(w, "FAIL", "{program}: {why}");
+        assert!(why.contains("result's header is not"), "{why}");
+        let mut s = spawned_on(program);
+        s.cover.result_head = None;
+        assert_eq!(l15(&s).0, "FAIL", "{program}");
+        // the same records judged as another harness's run fail
+        let (w, _) = one(Chain::Worker, &spawned_on(program), other, Scenario::L15);
+        assert_eq!(w, "FAIL", "{program} judged as {other}");
+    }
+    // a screen worker's header naming another screen-read harness
+    let mut s = spawned_on("agy");
+    s.cover.result_head = Some(result_head("muse"));
+    assert_eq!(one(Chain::Worker, &s, "agy", Scenario::L15).0, "FAIL");
+}
+
+#[test]
+fn a_worker_shells_gemini_runs_the_labs_build_and_its_project_is_trusted() {
+    let w = gemini_wrapper("/opt/homebrew/bin/gemini");
+    assert!(w.starts_with("#!/bin/sh\n"), "{w}");
+    assert!(w.ends_with("exec /opt/homebrew/bin/gemini \"$@\"\n"), "{w}");
+    // a path a shell would split is quoted
+    assert!(
+        gemini_wrapper("/a b/gemini").ends_with("exec '/a b/gemini' \"$@\"\n"),
+        "{w}"
+    );
+    // the project, as named and as resolved (`/tmp` is `/private/tmp`):
+    // every folder under it trusted, nothing else named
+    let j = crate::pyjson::J::parse(&gemini_trusted_project("/tmp")).unwrap();
+    let crate::pyjson::J::Obj(rows) = &j else {
+        panic!("{j:?}")
+    };
+    let mut keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["/private/tmp", "/tmp"]);
+    assert!(
+        rows.iter()
+            .all(|(_, v)| *v == crate::pyjson::J::s("TRUST_FOLDER"))
+    );
+    // a path that resolves to itself is named once
+    let j = crate::pyjson::J::parse(&gemini_trusted_project("/nonexistent/proj")).unwrap();
+    assert_eq!(
+        j,
+        crate::pyjson::J::obj([("/nonexistent/proj", crate::pyjson::J::s("TRUST_FOLDER"))])
+    );
 }
 
 /// CAP as a live run that passes it records it: land@v1 at +125 s, the next

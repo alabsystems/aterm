@@ -138,8 +138,6 @@ display faces); a theme never sets `font_px`. `bold_is_bright` and `schema` are 
   themed pane inherits it; it survives an update and a restore; `theme preview` does not reach
   it (`ctl theme` shows `pinned=`). `@<sid> status` carries `session_theme=` and
   `theme_origin=`. A name that does not draw is refused and nothing changes.
-- `identity_themes = { worker = "Hearth" }` in `aterm.toml` themes every session spawned
-  under that identity (`spawn identity=worker`) unless it has a theme of its own.
 
 ## Light/dark pairs
 

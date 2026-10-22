@@ -36,8 +36,7 @@ use crate::session_store::{SessionStore, test_handle};
 type State = BTreeMap<&'static str, i64>;
 
 fn fixture() -> (aterm_tempfile::TempDir, control_auth::SocketPlan) {
-    // Keep sun_path short even when the platform temporary root is long.
-    let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+    let dir = crate::test_scratch::short_dir("the control socket");
     let sock = dir.path().join("control.sock");
     let plan = control_auth::SocketPlan {
         sock_path: sock.to_str().unwrap().to_string(),
@@ -112,8 +111,9 @@ impl Entry {
     }
 }
 
-/// Clears the process-global discovery state this test sets, even when an
-/// assertion fails, so no other test in the binary inherits it.
+/// Clears the discovery state this test sets (its own,
+/// `proxy::self_sock_test_guard`), even when an assertion fails: its queue
+/// drains while its mirror override still stands.
 struct ProcessDiscoveryReset;
 
 impl Drop for ProcessDiscoveryReset {
@@ -139,13 +139,15 @@ fn publish_session_landed(sid: &SessionId, nonce: &LaunchNonce) {
 #[test]
 fn discovery_entries_are_published_only_after_the_bind() {
     let _guard = crate::proxy::self_sock_test_guard();
-    let mirror = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+    let mirror = crate::test_scratch::short_dir("the mirror dir");
     crate::proxy::set_mirror_dir_override(Some(mirror.path().to_path_buf()));
     crate::proxy::clear_self_sock();
+    // Made before the reset so it drops after it: the reset's flush lands every
+    // queued write while the directory stands, not in a re-created `<dir>/graph`.
+    let (_dir, plan) = fixture();
     let _reset = ProcessDiscoveryReset;
 
     let model = publish_ordering_model();
-    let (_dir, plan) = fixture();
     let sock_path = plan.sock_path.clone();
     let sock_dir = control_auth::dir_of_socket(&sock_path);
 
@@ -218,13 +220,14 @@ fn discovery_entries_are_published_only_after_the_bind() {
 #[cfg(unix)]
 #[test]
 fn the_snapshot_entries_are_written_with_the_store_let_go() {
-    let _guard = crate::proxy::self_sock_test_guard();
-    let mirror = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+    let guard = crate::proxy::self_sock_test_guard();
+    let mirror = crate::test_scratch::short_dir("the mirror dir");
     crate::proxy::set_mirror_dir_override(Some(mirror.path().to_path_buf()));
     crate::proxy::clear_self_sock();
+    // Before the reset, as in `discovery_entries_are_published_only_after_the_bind`.
+    let (_dir, plan) = fixture();
     let _reset = ProcessDiscoveryReset;
 
-    let (_dir, plan) = fixture();
     let sock_dir = control_auth::dir_of_socket(&plan.sock_path);
     let store: Store = Arc::new(RwLock::new(SessionStore::default()));
     let early = test_handle(1);
@@ -243,7 +246,9 @@ fn the_snapshot_entries_are_written_with_the_store_let_go() {
         .expect("bind the control socket");
     let publishing = Arc::clone(&store);
     let (published, done) = std::sync::mpsc::channel();
+    let lent = guard.lend();
     std::thread::spawn(move || {
+        let _state = lent.enter();
         let _ = published.send(publish_discovery(bound, None, &publishing));
     });
     let in_loop = aterm_spec::wait::within(

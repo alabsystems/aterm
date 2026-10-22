@@ -121,14 +121,16 @@ impl CursorGlow {
     ) -> Option<(u16, u16)> {
         // A hidden repaint can return from a proved foreign-row park beyond the
         // hide bridge's reach; only the original input row and its paid
-        // forward echo claim custody.
+        // forward echo claim custody. The return is paid as a move on the
+        // park's own row ([`Self::judging_on_rows`]), as on the visible lane.
         if let (Some(p), Some((row, col))) = (self.held_park, cur)
             && p.cross_row
             && self.park_source_confirmed
             && p.fresh(now)
             && row == p.row
             && col >= p.origin
-            && (col == p.origin || self.park_return_paid(&p, col, now))
+            && (col == p.origin
+                || self.judging_on_rows(p.row, row, |glow| glow.park_return_paid(&p, col, now)))
         {
             return Some((p.landing_row, p.landing));
         }
@@ -512,6 +514,7 @@ impl CursorGlow {
     /// A scripted preview is licensed by the same terms:
     /// [`Self::note_synthetic_move`] stamps `user_gesture_hint` and
     /// [`Self::note_synthetic_typed`] stamps `type_hint`.
+    #[inline]
     #[must_use]
     pub fn move_licensed(&self, now: Instant) -> bool {
         self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH) || self.one_shot_licensed(now)
@@ -520,6 +523,7 @@ impl CursorGlow {
     /// The one-shot classes of [`Self::move_licensed`]: every licence term but
     /// the typed stamp bank (Backspace, navigation, Enter, newline, Tab /
     /// scripted gesture).
+    #[inline]
     pub(super) fn one_shot_licensed(&self, now: Instant) -> bool {
         hint_fresh(self.quench_hint, now, Self::QUENCH_HINT_FRESH)
             || hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
@@ -535,6 +539,7 @@ impl CursorGlow {
     /// stamp bank's one-stamp-per-echo law (a `+3` spends three presses but
     /// pops one stamp), so the credit ring is the ledger consulted. The one-shot
     /// classes carry no credit.
+    #[inline]
     pub(super) fn seam_licensed(&self, now: Instant, cfg: &GlowConfig) -> bool {
         let stamp = self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH)
             && (!matches!(cfg.style, GlowStyle::RainbowKitty)
@@ -544,6 +549,7 @@ impl CursorGlow {
 
     /// This row's remembered print endpoint and brand, with its slot
     /// ([`Self::anchor_rows`]: a linear scan of [`ANCHOR_ROWS`] rows).
+    #[inline]
     pub(super) fn anchor_row(&self, row: u16) -> Option<(usize, AnchorRow)> {
         self.anchor_rows
             .iter()
@@ -622,6 +628,7 @@ impl CursorGlow {
     /// caret's row ([`Self::hand_types_at_the_caret`] false) the run is the keys'
     /// echo and their presses are forgotten; on it, the presses are held to the
     /// hand's row ([`Self::hold_the_live_presses`]).
+    #[inline]
     pub(super) fn refused_below_the_caret(caret: Option<(u16, u16)>, row: u16) -> bool {
         caret.is_some_and(|(cr, _)| row > cr)
     }
@@ -631,6 +638,7 @@ impl CursorGlow {
     /// nothing but glyphs and line edits were pressed since
     /// ([`Self::clear_typed_keeping_hand`]). Another row's run meanwhile is a
     /// program's.
+    #[inline]
     pub(super) fn hand_types_at_the_caret(&self, caret: Option<(u16, u16)>) -> bool {
         caret.is_some_and(|(cr, _)| self.hand_row.is_some_and(|hand| hand.row == cr))
     }
@@ -640,6 +648,7 @@ impl CursorGlow {
     /// live press typed: the run may be an echo area's (Emacs `C-u 8-`), so the
     /// presses may now pay only for a move on the hand's row
     /// ([`Self::judging_on_rows`]).
+    #[inline]
     pub(super) fn hold_the_live_presses(&mut self, now: Instant) {
         self.type_press_ring.hold_through(now);
     }
@@ -647,10 +656,14 @@ impl CursorGlow {
     /// Run `judge`, a judgment of a move from row `from` to row `to`, with the
     /// held presses ([`PressCredits::held_through`]) payable exactly when the
     /// move stays on the hand's row ([`Self::hand_row`]): the key's echo, a
-    /// coalesced batch, an in-row re-wrap, an Ink park and return. Folds, hops
+    /// coalesced batch, an in-row re-wrap, a park's return (judged from the
+    /// park's origin on its own row, wherever the caret parked meanwhile:
+    /// an Ink park, or a foreign-row park the hand's echo comes back from;
+    /// [`Self::release_held_park`]). Folds, hops
     /// or re-anchors off the row, other rows' advances and reads outside a
     /// judgment see only free presses. A keyless `+1` at the caret on the
     /// hand's row is a stalled echo's shape and is paid like one.
+    #[inline]
     pub(super) fn judging_on_rows<R>(
         &mut self,
         from: u16,
@@ -1753,7 +1766,10 @@ impl CursorGlow {
     /// - the visible-lane return, a forward move from the landing past the
     ///   origin, judged `origin -> target`; paid only by presses banked at or
     ///   before the park ([`Self::park_return_paid`]; vim's `$` after `b` must
-    ///   not pay) or by a delivered insert's echo shape;
+    ///   not pay) or by a delivered insert's echo shape. Both are judged on the
+    ///   park's own row ([`Self::judging_on_rows`]), so a foreign-row park's
+    ///   return to the hand's row is paid as the hand's echo, held presses
+    ///   included;
     /// - the anchored-lane return (Ink's hide-rewrite-show sampled mid-bracket),
     ///   the print anchor advancing from the origin, judged `origin -> end`;
     /// - the same-end rewrite, a repaint back to the old end: dropped, and the
@@ -1776,10 +1792,12 @@ impl CursorGlow {
         match lane {
             SpawnLane::Visible if cr == p.row && pr == p.landing_row && pc == p.landing => {
                 if cc > p.origin
-                    && (self.park_return_paid(&p, cc, now)
-                        || self
-                            .insert_echo(p.row, p.origin, cr, cc, now, cfg)
-                            .is_some())
+                    && self.judging_on_rows(p.row, cr, |glow| {
+                        glow.park_return_paid(&p, cc, now)
+                            || glow
+                                .insert_echo(p.row, p.origin, cr, cc, now, cfg)
+                                .is_some()
+                    })
                 {
                     self.held_park = None;
                     self.in_flight_tally.park_returns += 1;
@@ -1805,6 +1823,7 @@ impl CursorGlow {
         }
     }
 
+    #[inline]
     #[allow(
         clippy::too_many_arguments,
         reason = "from/to cursor cells + clock + config + geometry; packing them into a struct would only obscure a single internal call site"
@@ -1821,7 +1840,8 @@ impl CursorGlow {
         lane: SpawnLane,
     ) -> bool {
         // The held presses pay for this move only if it stays on the hand's
-        // row — a park's return included ([`Self::judging_on_rows`]).
+        // row; a park's return is judged on the park's own row
+        // ([`Self::judging_on_rows`], [`Self::release_held_park`]).
         self.judging_on_rows(pr, cr, |glow| {
             glow.spawn_on_rows(pr, pc, cr, cc, now, cfg, geom, lane)
         })
@@ -1845,7 +1865,13 @@ impl CursorGlow {
     ) -> bool {
         let (pr, pc) = match self.release_held_park(lane, (pr, pc), (cr, cc), now, cfg) {
             Some(ParkRelease::Cancelled) => return false,
-            Some(ParkRelease::Return { pr, pc }) => (pr, pc),
+            // The return is the move from the park's origin on its own row
+            // ([`Self::judging_on_rows`]), wherever the caret parked.
+            Some(ParkRelease::Return { pr, pc }) => {
+                return self.judging_on_rows(pr, cr, |glow| {
+                    glow.spawn_judged(pr, pc, cr, cc, now, cfg, geom, lane, SpawnCall::Live)
+                });
+            }
             None => (pr, pc),
         };
         // A fresh cross-row park keeps custody through more foreign-row
@@ -1935,6 +1961,7 @@ impl CursorGlow {
     /// after `at` are set aside and put back, so a judgment at a past clock
     /// (a park flush, a Return's or arrow's forget edge) cannot spend a press
     /// typed since. `judge` never banks, so indices are unchanged.
+    #[inline]
     pub(super) fn with_presses_banked_through<R>(
         &mut self,
         at: Instant,
@@ -1973,6 +2000,7 @@ impl CursorGlow {
 
     /// The clock a swept cell is born at: the key's, floored one stamp window
     /// before the echo, so a debounced TUI's late echo is not born mid-retract.
+    #[inline]
     pub(super) fn sweep_born(key_at: Instant, now: Instant) -> Instant {
         key_at.max(
             now.checked_sub(Duration::from_secs_f32(Self::TYPE_HINT_FRESH))
@@ -1984,6 +2012,7 @@ impl CursorGlow {
     /// ([`HeldPark::landing_glyph`]); the probe is fed before the tick, so at
     /// park time it is the row as the park found it. No probe, or another
     /// row's, reads as a glyph.
+    #[inline]
     pub(super) fn landing_glyph_at(&self, row: u16, col: u16) -> bool {
         self.row_cur_meta.is_none_or(|m| {
             m.row != row
@@ -1996,6 +2025,7 @@ impl CursorGlow {
     /// Whether presses banked at or before the park pay for the return's cells
     /// `origin..cc` ([`HeldPark`]): outright, or under the share rule, so a
     /// rewrite one press short of a burst still returns.
+    #[inline]
     pub(super) fn park_return_paid(&self, p: &HeldPark, cc: u16, now: Instant) -> bool {
         let cells = usize::from(cc.saturating_sub(p.origin));
         let before = if p.cross_row {
@@ -2009,6 +2039,7 @@ impl CursorGlow {
     /// Flush a held park before an edge that would have judged it (a class
     /// change, a scroll or band move carrying it off, a stale hidden boundary,
     /// a teardown), so a park never outlives its row.
+    #[inline]
     pub(super) fn flush_held_park(&mut self) {
         if let Some(p) = self.held_park.take() {
             self.flush_park(p);
@@ -2089,6 +2120,7 @@ impl CursorGlow {
     /// ([`Self::park_candidate`]). An unwired host reports no anchor and
     /// holds only the adjacent row's park. A cursor-only jump onto a retained
     /// endpoint from an earlier tick does not supply fresh print evidence.
+    #[inline]
     pub(super) fn landing_ends_a_print(&self, row: u16, col: u16) -> bool {
         self.print_in_tick
             && self
@@ -2187,6 +2219,7 @@ impl CursorGlow {
     /// One past the last glyph of a sampled row inside the focused pane (the
     /// whole row when no pane is set): a split's neighbour is not this
     /// input's text.
+    #[inline]
     pub(super) fn ink_end_in_pane(&self, cols: &[char]) -> usize {
         let pane_end = self
             .pane_columns
@@ -2205,6 +2238,7 @@ impl CursorGlow {
     /// before `classify_move` consumed the quench hint, so a quench-licensed jump
     /// keeps its class. A `Synthetic` move that took the Tab's gesture spends its
     /// insert stamp with it.
+    #[inline]
     pub(super) fn v2_licence(
         &mut self,
         mv: &MoveCtx,
@@ -2238,6 +2272,7 @@ impl CursorGlow {
     /// the share rule refused, a typed-paired hop past the cap. A Return's,
     /// arrow's, newline's or moving kill's move forgets only presses banked at or
     /// before its own key (`spare`): later glyphs are type-ahead.
+    #[inline]
     pub(super) fn forget_at_licensed_move(
         &mut self,
         mv: &MoveCtx,
@@ -3063,6 +3098,7 @@ impl CursorGlow {
     /// Record a licensed typed-class verdict: `licence=key` for a press-hint
     /// class, `licence=inflight` for a move the in-flight pool alone licensed,
     /// which is also tallied for `trail status`.
+    #[inline]
     pub(super) fn log_typed_licensed(
         &mut self,
         at: Instant,
@@ -3081,6 +3117,7 @@ impl CursorGlow {
     /// How much born geometry the engine holds now: the census the spawn seam
     /// brackets its emitters with, so the diagnosis ring can tell a licensed
     /// move that painted from one that fell through every shape gate.
+    #[inline]
     pub(super) fn born_geometry_census(&self) -> usize {
         self.sparks.len()
             + self.particles.len()

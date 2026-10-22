@@ -1864,16 +1864,16 @@ pub fn measure(spec: &Spec) -> Report {
     md.extend(pingpong_md);
     md.extend(attach_md);
     let binary_at_end = binary_identity();
-    // THE ARM IS THE BINARY'S. `harness::ATERM` is the window and, through the
+    // THE ARM IS THE BINARY'S. `harness::aterm()` is the window and, through the
     // seam, the bridge; cargo built it, and this test (which holds the broker),
     // under one profile, whose directory it sits in.
-    let arm = Profile::of_binary(Path::new(harness::ATERM));
+    let arm = Profile::of_binary(Path::new(harness::aterm()));
     let json = json!({
         "schema": "aterm-fabric-bench-v1",
         "spec": spec.words(),
         "profile": arm.map_or("unknown", Profile::name),
         "build": arm.map_or("a binary in neither arm's build directory", Profile::describe),
-        "aterm_binary": harness::ATERM,
+        "aterm_binary": harness::aterm(),
         "aterm_binary_identity": { "start": binary_at_start, "end": binary_at_end },
         "broker": broker_note(spec),
         "clock": "one monotonic origin in the bench process; microsecond stamps",
@@ -1891,7 +1891,8 @@ pub fn measure(spec: &Spec) -> Report {
 /// [`profile::identity`] of the harness's `aterm`, or why it could not be read,
 /// which the lane takes as no identity.
 fn binary_identity() -> String {
-    profile::identity(Path::new(harness::ATERM)).unwrap_or_else(|why| format!("unreadable: {why}"))
+    profile::identity(Path::new(harness::aterm()))
+        .unwrap_or_else(|why| format!("unreadable: {why}"))
 }
 
 #[cfg(test)]

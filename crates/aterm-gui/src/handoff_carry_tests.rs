@@ -263,6 +263,9 @@ fn a_busy_lock_or_a_moved_archive_carries_the_counters_only() {
 /// a carry that took both locks notes nothing.
 #[test]
 fn a_lock_the_export_gives_up_on_is_said_by_session_and_cause() {
+    // Its own turn-id count: another test's intake between the export and the
+    // read below would raise the process's past what the export vouched.
+    let _own = crate::control::own_turn_ids();
     let (term, turns) = session(80);
     let losses = |src: CarrySource| {
         let mut noted = Vec::new();

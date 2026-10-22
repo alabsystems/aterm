@@ -12,6 +12,9 @@
 //! * nothing replaces a published asset except a [`Replace::Clobber`] upload, which only
 //!   the staging owner's convergence and the Linux lane's manifest extension ask for.
 
+pub mod agh;
+/// The tests' host: never in a release build, which the lane's snapshot is.
+#[cfg(any(test, debug_assertions))]
 pub mod fake;
 pub mod gh;
 

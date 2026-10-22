@@ -1,0 +1,51 @@
+# claude-code 2.1.307 · MEASURED 2026-10-21, `aterm ctl text` of a private headless aterm (120x50, aterm 0.109.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake claude.ai OAuth token (`claude --subscriber`) and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · /usage typed at an idle composer, before the Enter: the command menu, fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1), subscriber MAX login (profile scope, oauthAccount composed), the stub's 5h 0.42 and 7d 0.61 headers; harness off · the lab's random project dir is spelled /private/tmp/at.lab0 here
+
+ ▐▛███▛█   Claude Code v2.1.307
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 1)
+
+✻ Worked for 0s · done 5:25 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ❯ /usage                      Show session cost, plan usage, and activity stats
+    /usage-credits              Configure usage credits or request them from your admin when you hit a limit
+    /context                    Visualize current context usage as a colored grid
+    /effort                     Set effort level for model usage
+    /rate-limit-options         Manage usage limits and upgrade options
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /usage
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  lab status line
+  ⏵⏵ auto mode on (shift+tab to cycle)

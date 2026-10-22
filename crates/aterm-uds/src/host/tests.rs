@@ -3,6 +3,97 @@
 
 use super::*;
 
+/// The preflight works on injected process limits: no test changes the
+/// runner's limits, and a successful write is never its own readback proof.
+#[cfg(unix)]
+#[test]
+fn descriptor_room_preserves_limits_and_reports_the_actual_result() {
+    use std::cell::Cell;
+    for (soft, hard, want, ceiling, target) in [
+        (256, u64::MAX, 4096, 92_160, 4096),
+        (256, 1024, 4096, u64::MAX, 1024),
+        (256, u64::MAX, 4096, 512, 512),
+        (8192, u64::MAX, 4096, 4096, 8192),
+        (256, 256, 4096, u64::MAX, 256),
+        (256, u64::MAX, 0, u64::MAX, 256),
+    ] {
+        for refused in [false, true] {
+            let current = Cell::new(soft);
+            let wrote = Cell::new(false);
+            let room = open_file_room_with(
+                want,
+                ceiling,
+                || Ok((current.get(), hard)),
+                |next, unchanged_hard| {
+                    assert_eq!(unchanged_hard, hard, "the hard limit never changes");
+                    assert!(next > soft && next <= hard && next <= ceiling);
+                    wrote.set(true);
+                    if refused {
+                        return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                    }
+                    current.set(next);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!((room.before, room.hard, room.target), (soft, hard, target));
+            assert_eq!(wrote.get(), target > soft);
+            assert_eq!(room.after, if refused { soft } else { target });
+            assert_eq!(room.refusal.is_some(), refused && target > soft);
+            if let Some(error) = room.refusal {
+                assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+            }
+        }
+    }
+
+    let written = Cell::new(false);
+    let room = open_file_room_with(
+        4096,
+        4096,
+        || Ok((if written.get() { 2048 } else { 256 }, u64::MAX)),
+        |_, _| {
+            written.set(true);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(room.target, 4096);
+    assert_eq!(
+        room.after, 2048,
+        "report the observed limit, not the request"
+    );
+
+    assert!(
+        open_file_room_with(
+            4096,
+            4096,
+            || Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            |_, _| panic!("an unreadable initial limit authorizes no write"),
+        )
+        .is_err()
+    );
+    let written = Cell::new(false);
+    assert!(
+        open_file_room_with(
+            4096,
+            4096,
+            || {
+                if written.get() {
+                    Err(std::io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    Ok((256, u64::MAX))
+                }
+            },
+            |_, _| {
+                written.set(true);
+                Ok(())
+            },
+        )
+        .is_err(),
+        "a failed readback is never reported as an applied limit"
+    );
+}
+
 /// A file at `path` (its directory made): what the resolver looks for is a file.
 fn stand_in(path: &Path) {
     std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");

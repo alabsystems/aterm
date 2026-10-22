@@ -24,7 +24,12 @@
 //!   result_bytes=<n> result_path=<pct>` — after its result is snapshotted
 //!   from the agent's transcript: the landing, the report before the land
 //!   act and the defense that landed it
-//!   ([`crate::harness::result::snapshot`], [`DoneBy`]), the previous
+//!   ([`crate::harness::result::snapshot`], [`DoneBy`]) — or, for a harness
+//!   aterm reads no transcript of (agy, Muse Code, Gemini CLI), from its
+//!   screen's reader: the words of the point the Land episode's instruction
+//!   was typed at (the report), then the landing's words at this point
+//!   ([`crate::harness::result::snapshot_screen`],
+//!   [`crate::harness::result::with_report`]) — the previous
 //!   landing's result of the session pruned ([`result::prune_results`]). A
 //!   record already `done why=landed` at this loop's first landing is this
 //!   loop restarted on a point published before it, and nothing is marked;
@@ -118,6 +123,7 @@ const UNAVAILABLE: &[&str] = &[
     "no-marker",
     "empty",
     "no-transcript",
+    "no-words",
 ];
 
 /// [`ResultTaken`] as a tape holds it: the snapshot written, or why none
@@ -356,6 +362,26 @@ impl<C: Ctl> Session<'_, C> {
         let by = DoneBy::Turn;
         let stem = result_stem(self.setup.sid.as_deref(), record.rev);
         let transcript = opts.idle_host.as_ref().and_then(|h| h.transcript());
+        // A harness aterm reads no transcript of (agy, Muse Code, Gemini
+        // CLI): the landing's words as its screen's reader read them at this
+        // point ([`Session::point_said`]).
+        // The report the Land episode's instruction was typed after opens it
+        // ([`Session::land_report`]), as a transcript's landing reads it.
+        let screen = if transcript.is_none() {
+            self.point_said
+                .clone()
+                .filter(|(program, _)| crate::supervise::policy::turn_end::screen_alone(*program))
+                .map(|(program, said)| {
+                    let report = self
+                        .land_report
+                        .as_ref()
+                        .filter(|(by, _)| *by == program)
+                        .map(|(_, report)| report.as_str());
+                    (program, result::with_report(report, &said))
+                })
+        } else {
+            None
+        };
         // The screen's done point can come before Claude Code wrote the
         // turn's last rows: read on until the turn's end row, at most the
         // bound (`result::settled`). The turn waited for is the one the done
@@ -375,6 +401,10 @@ impl<C: Ctl> Session<'_, C> {
             r.extend_from_slice(stem.as_bytes());
             r.push(b' ');
             r.extend_from_slice(by.word().as_bytes());
+            if let Some((program, said)) = &screen {
+                r.extend_from_slice(format!(" screen={} ", program.name()).as_bytes());
+                r.extend_from_slice(said.as_bytes());
+            }
             r
         };
         let taken = self.fx.exchange(doors::TASK_RESULT, request, || {
@@ -384,12 +414,17 @@ impl<C: Ctl> Session<'_, C> {
                 settle = Some((settled.waits, settled.ended));
                 (path, settled.tail)
             });
-            let snap = result::snapshot(
-                tasks,
-                &stem,
-                transcript.as_ref().map(|(p, t)| (p.as_path(), t.as_str())),
-                by,
-            )
+            let snap = match &screen {
+                Some((program, said)) if transcript.is_none() => {
+                    result::snapshot_screen(tasks, &stem, program.name(), said, by)
+                }
+                _ => result::snapshot(
+                    tasks,
+                    &stem,
+                    transcript.as_ref().map(|(p, t)| (p.as_path(), t.as_str())),
+                    by,
+                ),
+            }
             .map_err(|e| e.to_string());
             // The landing before this one is no result any record names now
             // (the record was opened again first): its pair goes once this

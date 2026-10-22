@@ -2210,6 +2210,11 @@ impl App {
         let pressed = state == ElementState::Pressed;
         let seen = pressed.then(|| self.focused_session_id(wid)).flatten();
         self.on_mouse_input(wid, state, button);
+        if pressed {
+            // Resolve the hit against the frame that was shown before stopping
+            // the timer changes its label and invalidates that frame's stamp.
+            self.interact_system_state(wid);
+        }
         if let Some(session) = seen {
             self.note_human_acted_on(wid, session);
         }
@@ -4036,11 +4041,6 @@ impl App {
             self.autopilot_menu_motion(wid, x, y);
             return;
         }
-        // The session picker: the same one-slot modal boundary.
-        if self.session_picker_claims_pointer(wid) {
-            self.session_picker_pointer_motion(wid, x, y);
-            return;
-        }
         if self.overview_claims_pointer(wid) {
             self.overview_pointer_motion(wid, x, y);
             return;
@@ -5473,24 +5473,6 @@ impl App {
             }
             return;
         }
-        // Session picker: same boundary; left press/release choose a row.
-        if self.session_picker_claims_pointer(wid) {
-            let (x, y) = self
-                .windows
-                .get(&wid)
-                .map_or((0.0, 0.0), |window| window.last_cursor_px);
-            if button == WinitMouseButton::Left {
-                if pressed {
-                    self.session_picker_pointer_press(wid, x, y);
-                } else {
-                    self.session_picker_pointer_release(wid, x, y);
-                }
-            }
-            if !pressed {
-                self.settle_pointer_drags(wid);
-            }
-            return;
-        }
         // OVERVIEW: same boundary; a left press and release on the same row
         // activate it as ⏎ does — a chip goes to its tab, a manages line to
         // the manager.
@@ -6472,7 +6454,6 @@ impl App {
         // without reaching native or terminal scroll consumers, and so do horizontal ones
         // over the palette or a native view: only the terminal seam answers that axis.
         let palette = self.palette_claims_pointer(wid);
-        let session_picker = self.session_picker_claims_pointer(wid);
         let overview = self.overview_claims_pointer(wid);
         // A native page scrolls by the wheel only while the pointer is its: over a terminal
         // pane beside it the notch is that terminal's (`pointer_route`, below).
@@ -6480,13 +6461,32 @@ impl App {
             self.active_native_view(wid).is_some() && !self.pointer_routes_to_a_terminal_pane(wid);
         // Do not bank fractional wheel deltas from chrome: otherwise a later
         // scroll in content would inherit motion that began over its title.
-        if !(palette || session_picker || overview) && self.pointer_is_over_pane_header(wid) {
+        if !(palette || overview) && self.pointer_is_over_pane_header(wid) {
             return;
         }
         // Nor from the stats surfaces: a wheel over the Deck, a sill instrument
         // or the lens reaches no pane.
-        if !(palette || session_picker || overview) && self.stats_owns_pointer(wid) {
+        if !(palette || overview) && self.stats_owns_pointer(wid) {
             return;
+        }
+        let seam_owned = self
+            .windows
+            .get(&wid)
+            .is_none_or(|ws| ws.tab_menu.is_some() || ws.overlay_open());
+        let (dx, dy) = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
+            MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
+        };
+        // A deliberate gesture stops setup even before it banks a whole row,
+        // or when its horizontal axis scrolls no native list. Gesture-end
+        // callbacks with no motion leave an untouched offer running.
+        if native_page
+            && !(seam_owned || palette || overview)
+            && dx.is_finite()
+            && dy.is_finite()
+            && (dx != 0.0 || dy != 0.0)
+        {
+            self.interact_system_state(wid);
         }
         // The vertical pixel delta, taken before `wheel_notches` banks it: banking keeps
         // only whole rows and a direction flip forfeits the remainder (right for the seam's
@@ -6507,12 +6507,8 @@ impl App {
             // (`overlay_open`), the tab context menu (`tab_menu_input_event`; not an
             // `Overlay`, so no `*_claims_pointer` names it), a modal card or a native view.
             // Otherwise the band would move under a card whose rows move nothing.
-            let seam_owned = self
-                .windows
-                .get(&wid)
-                .is_none_or(|ws| ws.tab_menu.is_some() || ws.overlay_open());
             if let Some(dy_px) = track_px
-                && !(seam_owned || palette || session_picker || overview || native_page)
+                && !(seam_owned || palette || overview || native_page)
             {
                 // The band belongs to the pane under the pointer, as the whole
                 // rows below do (`pointer_route`).
@@ -6533,7 +6529,7 @@ impl App {
         // also trips `note_update_handoff_activity`, the `is_present_recovery_stimulus`
         // rearm and `note_alt_scroll`.
         let vertical_up = dir.vertical_up();
-        if vertical_up.is_none() && (palette || session_picker || overview || native_page) {
+        if vertical_up.is_none() && (palette || overview || native_page) {
             return;
         }
         if let Some(up) = vertical_up {
@@ -6544,10 +6540,6 @@ impl App {
             };
             if palette {
                 self.palette_pointer_wheel(wid, signed);
-                return;
-            }
-            if session_picker {
-                self.session_picker_pointer_wheel(wid, signed);
                 return;
             }
             if overview {
@@ -7593,6 +7585,77 @@ mod tests {
         // Over the sidebar the wheel is the sidebar's: the list stays.
         assert!(app.pointer_cmd(lines(1.0, Some(&nav))).is_ok());
         assert_eq!(page_scroll(&app), 3, "the sidebar's wheel leaves the list");
+    }
+
+    #[test]
+    fn system_state_wheel_interaction_precedes_notch_normalization() {
+        use super::NativePointerTarget;
+        use crate::system_state::SystemStateAction;
+        use crate::workstation_setup::Request;
+        use aterm_types::macos_setup::Plan;
+        use aterm_window::event::{MouseScrollDelta, TouchPhase};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        for (delta, phase, interacts) in [
+            (
+                MouseScrollDelta::PixelDelta(aterm_window::dpi::PhysicalPosition::new(0.0, 0.25)),
+                TouchPhase::Moved,
+                true,
+            ),
+            (
+                MouseScrollDelta::LineDelta(0.0, 0.25),
+                TouchPhase::Moved,
+                true,
+            ),
+            (
+                MouseScrollDelta::PixelDelta(aterm_window::dpi::PhysicalPosition::new(1.0, 0.0)),
+                TouchPhase::Moved,
+                true,
+            ),
+            (
+                MouseScrollDelta::LineDelta(1.0, 0.0),
+                TouchPhase::Moved,
+                true,
+            ),
+            (
+                MouseScrollDelta::PixelDelta(aterm_window::dpi::PhysicalPosition::new(0.0, 0.0)),
+                TouchPhase::Ended,
+                false,
+            ),
+        ] {
+            let mut app = crate::App::headless_for_test();
+            let wid = crate::WindowId(0);
+            app.on_resize(wid, aterm_window::dpi::PhysicalSize::new(1_000, 750));
+            assert!(app.open_system_state_tab());
+            app.pointer_cmd(PointerAction::MoveNative(NativePointerTarget::Key(
+                "system-state/url".to_owned(),
+            )))
+            .unwrap();
+            assert!(!app.pointer_routes_to_a_terminal_pane(wid));
+            assert!(!app.pointer_is_over_pane_header(wid));
+            assert!(!app.stats_owns_pointer(wid));
+            let (send, _receive) = mpsc::channel();
+            let request = Request::new(Plan::default(), send);
+            assert!(app.native_runtime.offer_system_state(request.clone()));
+            let start = Instant::now();
+            app.native_runtime.tick_system_state(start, true);
+
+            app.on_mouse_wheel_phased(wid, delta, phase);
+
+            app.native_runtime
+                .tick_system_state(start + Duration::from_secs(31), true);
+            let action = app.native_runtime.take_system_state_action();
+            if interacts {
+                assert!(action.is_none(), "{delta:?} must stop the timer");
+                assert!(request.pending());
+            } else {
+                assert!(
+                    matches!(action, Some(SystemStateAction::Apply(_))),
+                    "a zero-delta end must leave the timer running"
+                );
+            }
+        }
     }
 
     /// `pointer wheel` is a hand's wheel over a terminal too: where the pointer
@@ -9126,7 +9189,7 @@ mod tests {
         let (_, view) = app.active_native_view(wid).expect("Settings active");
         assert!(app.prepare_native_input_scratch(wid));
         app.palette_enter();
-        for c in "Settings: Search".chars() {
+        for c in "Settings: Go to Themes".chars() {
             app.palette_filter_push(c);
         }
         assert_eq!(app.windows[&wid].palette().unwrap().filtered().len(), 1);
@@ -9140,7 +9203,10 @@ mod tests {
             .native_runtime
             .take_view_state(view)
             .expect("detach live Settings view");
-        let before_focus = detached.common().last_focus.clone();
+        let before_route = match &detached {
+            AppViewState::Settings(settings) => settings.route,
+            _ => panic!("Settings state"),
+        };
         assert_eq!(app.native_runtime.view_generation(view), None);
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
 
@@ -9149,8 +9215,8 @@ mod tests {
             panic!("Settings state");
         };
         assert_eq!(
-            settings.common.last_focus, before_focus,
-            "stale generation receives no search action"
+            settings.route, before_route,
+            "stale generation receives no route action"
         );
     }
 

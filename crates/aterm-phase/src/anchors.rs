@@ -422,10 +422,12 @@ pub const ANCHORS: &[Anchor] = &[
     ),
     // The vendor's rm/rmdir circuit breaker. Its note is ONE template,
     // `Dangerous ${rm|rmdir} operation ${suffix}` (Uy() in the 2.1.282
-    // binary), with seven suffixes; `crate::prompt::rm_breaker_of` reads the
-    // whole family. `box.rm_breaker` is the possibly-empty-variable member
-    // (the one the supervisor's rm-breaker rule resolves); the rest were
-    // read from the 2.1.280/2.1.281/2.1.282 binaries, and
+    // binary), with seven suffixes on 2.1.282 and nine on 2.1.307;
+    // `crate::prompt::rm_breaker_of` reads the whole family. `box.rm_breaker`
+    // is the possibly-empty-variable member (the one the supervisor's
+    // rm-breaker rule resolves); the rest were read from the
+    // 2.1.280/2.1.281/2.1.282 binaries (the mounted drive's and the nested
+    // why's from later ones, below), and
     // `on statically-unresolvable target:` was measured live on 2.1.280
     // (2026-09-24, a workflow subagent's box).
     composed(
@@ -465,10 +467,28 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.280",
     ),
     lit("box.rm_breaker.drive_root", "on drive root: ", "2.1.281"),
+    // `rm -r` of a mounted drive or the top of one: in the 2.1.304, 2.1.306
+    // and 2.1.307 binaries, MEASURED on 2.1.307 (2026-10-21, `rm -rf
+    // /Volumes/zz-lab-none` in the lab).
+    lit(
+        "box.rm_breaker.mounted_drive",
+        "on mounted drive path: ",
+        "2.1.304",
+    ),
     lit(
         "box.rm_breaker.too_many",
         "too many command substitutions to analyze (",
         "2.1.280",
+    ),
+    // 2.1.307 qualifies the `— <why>` forms as `not ruled out — <why>`
+    // (`Dangerous rm operation not ruled out — too many command substitutions
+    // to analyze (65)`, MEASURED in the lab 2026-10-21), and adds a why of
+    // its own (read from the 2.1.307 binary).
+    lit("box.rm_breaker.not_ruled_out", "not ruled out ", "2.1.307"),
+    lit(
+        "box.rm_breaker.nested_unanalyzed",
+        "some nested commands or function substitutions could not be analyzed",
+        "2.1.307",
     ),
     // 2.1.281: a box in a session read as unattended carries a countdown
     // row under its notes (`⚠ Claude Code will automatically deny this
@@ -1433,6 +1453,19 @@ pub const MUSE_ANCHORS: &[Anchor] = &[
     // (`0` before any, and after a first turn a person stopped: the lab's
     // captures `usage`, `fresh-status-cards`).
     composed("muse.card.turns", "Turns", "1.4.10-R6427.1"),
+    // A signed-in `/status` card's account and billing rows and a signed-in
+    // `/usage` card's subscription rows (MEASURED 2026-10-21 on
+    // 1.4.11-R6667.1 signed in with a Meta account, the capture
+    // `usage-signed-in`): `│  ACCOUNT        Name (address) │`,
+    // `│  BILLING        Subscription · Muse Code Max Usage │`,
+    // `│    Weekly         71% used · Resets Oct 25 at 5:00 PM │`. The
+    // API-key lab captures draw none of them.
+    composed("muse.card.account", "ACCOUNT", "1.4.11-R6667.1"),
+    composed("muse.card.billing", "BILLING", "1.4.11-R6667.1"),
+    composed("muse.card.subscription", "Subscription", "1.4.11-R6667.1"),
+    composed("muse.card.weekly", "Weekly", "1.4.11-R6667.1"),
+    composed("muse.card.used", "% used", "1.4.11-R6667.1"),
+    composed("muse.card.session_usage", "Session usage", "1.4.10-R6427.1"),
     // The warning a resumed session opens with after a run that recorded no
     // clean shutdown (SIGHUP, SIGKILL): `warning: the previous run of this
     // session ended abnormally around <time> …` (the harness's relaunch on
@@ -2353,30 +2386,81 @@ mod tests {
 
     /// THE RESET'S TEMPLATES ARE ITS ANCHORS' WORDS, WHOLE: each is built
     /// from the rows the readers match by, none is empty or another's, and
-    /// a text that spells them all holds every one. NEGATIVE CONTROL: that
-    /// text with the confirmation's yes reworded misses that template, and a
-    /// planted template of a kind no build names is missing from it.
+    /// a text that spells them all holds every one. A template with two
+    /// spellings (the model limits' strip, 2.1.306's and 2.1.307's) holds in
+    /// a text with either: the older spellings alone, or the newest alone.
+    /// NEGATIVE CONTROLS: that text with the confirmation's yes reworded
+    /// misses that template, a planted template of a kind no build names is
+    /// missing from it, and the newest spellings without the strip's helper
+    /// body (the helper's argument alone) miss the helper row.
     #[test]
     fn the_reset_templates_are_built_from_the_readers_rows() {
+        type Templates = Vec<(&'static str, Vec<String>)>;
         let templates = reset_templates();
         let mut names: Vec<&str> = templates.iter().map(|(name, _)| *name).collect();
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), templates.len(), "a name is two templates'");
-        assert!(templates.iter().all(|(_, text)| !text.is_empty()));
-        let spelled = |templates: &[(&'static str, String)]| {
+        assert!(
             templates
                 .iter()
-                .map(|(_, text)| text.as_str())
+                .all(|(_, spellings)| !spellings.is_empty()
+                    && spellings.iter().all(|t| !t.is_empty()))
+        );
+        let spelled = |templates: &[(&'static str, Vec<String>)]| {
+            templates
+                .iter()
+                .flat_map(|(_, spellings)| spellings.iter().map(String::as_str))
                 .collect::<Vec<_>>()
                 .join("|")
                 .into_bytes()
         };
         let bytes = spelled(&templates);
         assert!(missing_templates(&bytes, &templates).is_empty());
-        let reworded: Vec<(&'static str, String)> = templates
+        let one = |pick: fn(&[String]) -> &String| -> Templates {
+            templates
+                .iter()
+                .map(|(name, spellings)| (*name, vec![pick(spellings).clone()]))
+                .collect()
+        };
+        let (older, newest) = (one(|s| &s[0]), one(|s| &s[s.len() - 1]));
+        assert!(missing_templates(&spelled(&older), &templates).is_empty());
+        assert!(missing_templates(&spelled(&newest), &templates).is_empty());
+        // The strip's two spellings as the 2.1.306 and 2.1.307 bundles hold
+        // them (each once, read from the store's binaries 2026-10-21).
+        let strip = templates
             .iter()
-            .map(|(name, text)| (*name, text.replace(anchor("reset.yes"), "Yes, spend my")))
+            .find(|(name, _)| *name == "model limit names' strip")
+            .map(|(_, spellings)| spellings.as_slice());
+        assert_eq!(
+            strip,
+            Some(
+                &[
+                    ".replace(/ limit$/,\"\"));break;case\"seven_day_sonnet\":".to_string(),
+                    ",\" limit\"));break;case\"seven_day_sonnet\":".to_string(),
+                ][..]
+            )
+        );
+        let no_helper: Templates = newest
+            .iter()
+            .filter(|(name, _)| *name != "model limit names' strip helper")
+            .cloned()
+            .collect();
+        assert_eq!(
+            missing_templates(&spelled(&no_helper), &templates),
+            ["model limit names' strip helper"]
+        );
+        let reworded: Templates = templates
+            .iter()
+            .map(|(name, spellings)| {
+                (
+                    *name,
+                    spellings
+                        .iter()
+                        .map(|t| t.replace(anchor("reset.yes"), "Yes, spend my"))
+                        .collect(),
+                )
+            })
             .collect();
         assert_eq!(
             missing_templates(&spelled(&reworded), &templates),
@@ -2384,7 +2468,10 @@ mod tests {
         );
         let planted = [(
             "planted",
-            format!("{} planted-by-no-build reset?", anchor("reset.row")),
+            vec![format!(
+                "{} planted-by-no-build reset?",
+                anchor("reset.row")
+            )],
         )];
         assert_eq!(missing_templates(&bytes, &planted), ["planted"]);
     }

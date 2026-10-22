@@ -80,6 +80,7 @@ fn stage_hooks(gate: Option<&StageGate>) -> crate::install::StageHooks<'_> {
     crate::install::StageHooks {
         pre_swap: gate,
         sidecars: None,
+        aliases: &[],
     }
 }
 

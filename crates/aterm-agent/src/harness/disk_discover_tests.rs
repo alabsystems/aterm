@@ -451,7 +451,7 @@ fn each_running_claude_code_names_the_home_it_runs_in() {
 /// ended — and one caught mid-spawn is read again, judged once its exec
 /// completes. The census reads, for reach, the directory each process was
 /// started with — a renamed Claude Code's registry names its session there;
-/// aterm's own identities' in `~/Library` too, never another place of
+/// aterm's own accounts' in `~/Library` too, never another place of
 /// `~/Library` nor one that climbs out by `..` — and none is a reason to
 /// refuse.
 #[test]
@@ -467,7 +467,7 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
     register(&home, std::process::id(), LIVE);
     register(&home, NO_PID, DEAD);
     // Two sessions of a Claude Code with a CLAUDE_CONFIG_DIR of its own
-    // (`other/.claude`, as `spawn identity=` starts one): the temp root is
+    // (`other/.claude`): the temp root is
     // every Claude Code's of this uid, the registry and transcripts are that
     // directory's. One runs (this process), one ended.
     let other = tmp.path().join("other");
@@ -546,7 +546,7 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
             verdict(&mut owners, s)
         );
     }
-    // Knowing that directory too (an identity's, a supervised agent's
+    // Knowing that directory too (an account's, a supervised agent's
     // CLAUDE_CONFIG_DIR), each is judged by its own registry and transcript:
     // the running one is live, the ended one gone — and one any known
     // registry names running is live wherever its transcript is.
@@ -755,7 +755,7 @@ fn a_session_is_gone_only_when_nothing_names_it_and_nothing_of_it_was_written() 
         },
     )
     .expect("aterm's state directory");
-    let identity = state.join("identities/work/.claude");
+    let identity = state.join("accounts/work/.claude");
     let started_in = |config: PathBuf| {
         let mut p = process(4242, [store; 2], &[store], Some("/proj"), STARTED);
         if let Some(exec) = p.exec.as_mut() {

@@ -46,6 +46,7 @@ fn identity(repo: &Path) {
 }
 
 fn bare_fixture(name: &str) -> BareFixture {
+    static BUILT: crate::template::Template<String> = crate::template::Template::new();
     let parent = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("publisher-fence-model");
     std::fs::create_dir_all(&parent).unwrap();
     let dir = aterm_tempfile::Builder::new()
@@ -53,6 +54,18 @@ fn bare_fixture(name: &str) -> BareFixture {
         .tempdir_in(parent)
         .unwrap();
     let root = dir.path();
+    let owner = BUILT.lay(root, build_bare);
+    BareFixture {
+        repo: root.join("publisher"),
+        owner,
+        _root: dir,
+    }
+}
+
+/// [`bare_fixture`]'s tree, built from nothing under `root` (once per process,
+/// [`crate::template::Template`]): a bare origin holding the release
+/// claim and a clone of it; the claim.
+fn build_bare(root: &Path) -> String {
     let remote = root.join("origin.git");
     let seed = root.join("seed");
     assert!(
@@ -98,11 +111,7 @@ fn bare_fixture(name: &str) -> BareFixture {
             .success()
     );
     identity(&repo);
-    BareFixture {
-        repo,
-        owner,
-        _root: dir,
-    }
+    owner
 }
 
 fn transition(

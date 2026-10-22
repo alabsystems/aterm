@@ -69,6 +69,10 @@ ring = { workspace = true }
 # the entry point every trust path uses: canonical padding REQUIRED and no
 # trailing bits, so a pinned key has exactly one spelling.
 aterm-codec = { workspace = true }
+# The export's text rewrite (`aterm_census::export::rewrite`), defined once and
+# shared with the census's export-content guard, which reads the checkout as the
+# transforms leave it. std-only; its one dependency is aterm-regex.
+aterm-census = { workspace = true }
 # The provisioning engine: `targo --unverified ship provision` drives the join ceremony
 # in-process (RELEASE-KEYS.md's "signing is in-process" rule, extended to
 # minting), so one phrase prompt provisions the machine with no second binary.

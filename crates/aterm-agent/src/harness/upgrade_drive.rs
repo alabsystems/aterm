@@ -1621,9 +1621,21 @@ pub(super) fn exe_of(pid: u32) -> Option<PathBuf> {
     aterm_sysprobe::process_path(pid)
 }
 
-/// Every file `pid` holds open (`lsof -p`), `None` when unreadable: the
-/// lanes' read of a process's own locks (codex-alab's writer lock, a Muse
-/// Code's session lock, an agy's presence lock and crash file).
+/// Every file `pid` holds open through a descriptor, `None` when unreadable or exited: the
+/// lanes' read of a process's own locks (codex-alab's writer lock, a Muse Code's session lock,
+/// an agy's presence lock and crash file). Read in process ([`aterm_uds::holders::open_files`]),
+/// else by [`lsof_open_files`] where that is unsupported or a descriptor is refused (a file in a
+/// protected folder, which the kernel describes only to an entitled reader such as `lsof`).
+pub(super) fn open_files(pid: u32) -> Option<Vec<PathBuf>> {
+    match aterm_uds::holders::open_files(pid) {
+        Ok(files) => Some(files),
+        // Exited: it holds nothing now, which `lsof` answers as nothing read.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => lsof_open_files(pid),
+    }
+}
+
+/// Every file `pid` holds open (`lsof -p`), `None` when unreadable: [`open_files`]'s fallback.
 pub(super) fn lsof_open_files(pid: u32) -> Option<Vec<PathBuf>> {
     let mut cmd = aterm_uds::spawnfd::command("lsof");
     cmd.args(["-n", "-P", "-w", "-p", &pid.to_string(), "-Fn"]);

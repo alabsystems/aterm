@@ -1236,6 +1236,54 @@ fn a_card_under_a_turns_end_is_no_part_of_it() {
     assert_eq!(phase(&replyless), (Phase::Idle, false), "the control");
 }
 
+/// THE SIGNED-IN CARDS NAME THE ACCOUNT AND THE WEEKLY QUOTA (1.4.11,
+/// measured 2026-10-21 signed in with a Meta account): the `/status`
+/// card's `ACCOUNT` row is the address the footer's account slot shows
+/// and its `BILLING` row the tier; the `/usage` card's `Weekly 71% used`
+/// is the footer's `weekly 29% left`. NEGATIVE CONTROLS: the lab's
+/// API-key cards draw neither an `ACCOUNT` row nor a subscription block
+/// (no account, no quota, never a guess); the screen is still just idle.
+#[test]
+fn the_signed_in_cards_name_the_account_and_the_weekly_quota() {
+    let rows = screen(USAGE_SIGNED_IN);
+    assert_eq!(
+        status_card_account(&rows),
+        Some((
+            "redacted-user@example.test".to_owned(),
+            Some("Muse Code Max Usage".to_owned()),
+        ))
+    );
+    assert_eq!(usage_card_weekly(&rows).as_deref(), Some("weekly 29% left"));
+    let r = muse(USAGE_SIGNED_IN);
+    assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
+    for text in [USAGE_CARD, STATUS_CARD] {
+        let rows = screen(text);
+        assert_eq!(status_card_account(&rows), None, "the API-key control");
+        assert_eq!(usage_card_weekly(&rows), None, "the API-key control");
+    }
+}
+
+/// THE TOP RULE AT REST IS THE IDLE VOICE LABEL, and no other voice state
+/// is: the window's branding may take the resting label's cells, never
+/// the words of a recording. NEGATIVE CONTROLS: Muse Code's other
+/// measured rules (the busy screen's, a plain bottom rule) are none.
+#[test]
+fn the_top_rule_at_rest_is_the_idle_voice_label() {
+    let rows = screen(IDLE);
+    let rule = rows
+        .iter()
+        .find(|r| r.starts_with("── Voice input"))
+        .expect("the measured rule");
+    assert!(is_idle_voice_rule(rule));
+    for other in [
+        "── Recording ──────────────────────────────",
+        "──────────────────────────────────────────",
+        "❯ Voice input (⌥ + v to start)",
+    ] {
+        assert!(!is_idle_voice_rule(other), "the control: {other:?}");
+    }
+}
+
 /// CARDS ALONE ABOVE THE OPEN COMPOSER ARE A SESSION AT REST (1.4.10, the lab
 /// of 2026-10-21): `/status` entered three times under the usage wall pushed
 /// the notice out of sight, the composer open and empty under the cards,

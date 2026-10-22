@@ -8,6 +8,7 @@
 //! Every host is a [`FakeHost`] (or a wrapper adding one failure mode), every key is minted
 //! in-process by the shipping signer, and every "verified" is the client's chain.
 
+mod agh_read_contract;
 mod conformance_index_publish;
 mod gh;
 mod group;

@@ -187,6 +187,7 @@ pub struct Commands<'a> {
 impl<'a> Commands<'a> {
     /// Each command surface as typed: at least one, never empty, never the
     /// name.
+    #[inline]
     pub fn iter(self) -> impl Iterator<Item = &'a str> {
         let Commands {
             word,
@@ -267,6 +268,7 @@ impl Word {
 
     /// Only whole characters go in and out, so the prefix is valid UTF-8; the
     /// checked conversion runs at boundaries only.
+    #[inline]
     fn as_str(&self) -> &str {
         let bytes = self.bytes.get(..usize::from(self.len)).unwrap_or(&[]);
         std::str::from_utf8(bytes).unwrap_or("")
@@ -274,6 +276,7 @@ impl Word {
 
     /// `false` (and nothing written) when the character does not fit — which
     /// the caller's character count already rules out.
+    #[inline]
     fn push(&mut self, c: char) -> bool {
         let start = usize::from(self.len);
         let end = start.saturating_add(c.len_utf8());
@@ -286,6 +289,7 @@ impl Word {
         true
     }
 
+    #[inline]
     fn pop(&mut self) -> Option<char> {
         let c = self.as_str().chars().next_back()?;
         let width = u8::try_from(c.len_utf8()).unwrap_or(u8::MAX);
@@ -293,6 +297,7 @@ impl Word {
         Some(c)
     }
 
+    #[inline]
     fn clear(&mut self) {
         self.len = 0;
     }
@@ -327,7 +332,11 @@ enum Kind {
 
 /// Uses the lexicon's own predicates, so a typed line segments exactly as the
 /// vocabulary was segmented at load.
+#[inline]
 fn kind_of(c: char) -> Kind {
+    if c == ' ' {
+        return Kind::Space;
+    }
     if is_token_char(c) || is_no_space_script(c) {
         return Kind::Word;
     }
@@ -350,6 +359,7 @@ fn kind_of(c: char) -> Kind {
 /// A character of a script written without spaces between words: the
 /// vocabulary's no-space set minus Hangul, which is in that set only to be
 /// looked up raw (Korean writes its spaces).
+#[inline]
 fn is_unspaced_script(c: char) -> bool {
     is_no_space_script(c) && !matches!(c as u32, 0x1100..=0x11FF | 0xAC00..=0xD7AF)
 }
@@ -462,6 +472,7 @@ enum Outcome {
 /// token and Enter) into the one event a press reports. The newest wins, except
 /// that a `Confirm` folds into the tentative `Fire` it confirms, so `sit⏎` is
 /// one final fire.
+#[inline]
 fn fold(acc: Option<Outcome>, next: Option<Outcome>) -> Option<Outcome> {
     match (acc, next) {
         (acc, None) => acc,
@@ -484,6 +495,7 @@ fn fold(acc: Option<Outcome>, next: Option<Outcome>) -> Option<Outcome> {
 /// consumed (the caret still stands before them). The word ends
 /// `since_end - fed` left of the caret; when negative the word lies right of
 /// the caret: distance 0 inside it, else what remains past its length.
+#[inline]
 fn back_chars(since_end: u32, fed: u32, word_chars: u32) -> u16 {
     let distance = if fed <= since_end {
         since_end.saturating_sub(fed)
@@ -556,6 +568,7 @@ impl Line {
     };
 
     /// The open token can still be looked up: non-empty and inside the window.
+    #[inline]
     fn token_is_live(&self) -> bool {
         self.token_chars > 0 && self.token_chars as usize <= TOKEN_CHARS
     }
@@ -603,6 +616,7 @@ impl Default for TrickListener {
 
 impl TrickListener {
     /// A listener on a fresh, pure line, bound to no session yet.
+    #[inline]
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -625,6 +639,7 @@ impl TrickListener {
 
     /// Whether [`note_char`](Self::note_char) with `c` would consult the
     /// vocabulary: `c` closes a lookup-able open token on a pure, unpoisoned line.
+    #[inline]
     #[must_use]
     pub fn needs_lexicon(&self, c: char) -> bool {
         self.judging()
@@ -653,12 +668,14 @@ impl TrickListener {
     }
 
     /// [`needs_lexicon`](Self::needs_lexicon) for Enter.
+    #[inline]
     #[must_use]
     pub fn submit_needs_lexicon(&self) -> bool {
         self.judging() && self.line.token_is_live()
     }
 
     /// The line can still fire: pure and unpoisoned.
+    #[inline]
     fn judging(&self) -> bool {
         self.line.pure && !self.line.poisoned
     }
@@ -666,6 +683,7 @@ impl TrickListener {
     // ---- observers ----
 
     /// Every token so far was pet vocabulary and no code has appeared.
+    #[inline]
     #[must_use]
     pub fn is_pure(&self) -> bool {
         self.line.pure
@@ -673,6 +691,7 @@ impl TrickListener {
 
     /// The line holds something the listener did not see; nothing fires until
     /// a reset.
+    #[inline]
     #[must_use]
     pub fn is_poisoned(&self) -> bool {
         self.line.poisoned
@@ -687,6 +706,7 @@ impl TrickListener {
 
     /// Characters typed on this line while unpoisoned. Zero proves the line
     /// empty only when it is not [poisoned](Self::is_poisoned).
+    #[inline]
     #[must_use]
     pub fn line_chars(&self) -> u32 {
         self.line.line_chars
@@ -758,6 +778,7 @@ impl TrickListener {
     /// One typed character (the shifted glyph; Space arrives here too).
     /// `lexicon` may be `None` unless [`needs_lexicon`](Self::needs_lexicon)
     /// says otherwise.
+    #[inline]
     pub fn note_char(
         &mut self,
         now: Instant,
@@ -876,6 +897,7 @@ impl TrickListener {
     /// (unpoisoned, nothing counted) is reset; any other is a break. A poisoned
     /// zero proves nothing: Esc then `sot`, a line recalled with ↑ or a paste
     /// leave text the shell keeps, and `sit␣` would then fire inside `sotsit␣`.
+    #[inline]
     pub fn note_job_chord(&mut self) -> TrickFeed<'_> {
         if self.line.line_chars == 0 && !self.line.poisoned {
             self.note_line_reset()
@@ -914,6 +936,7 @@ impl TrickListener {
 
     /// Tab, Esc, arrows, Home / End / PgUp / PgDn, any other chord, raw
     /// controller bytes, a paste: poisoned until a reset.
+    #[inline]
     pub fn note_break(&mut self) -> TrickFeed<'_> {
         let out = self.poison();
         self.feed(out, false)
@@ -922,6 +945,7 @@ impl TrickListener {
     /// A press at a prompt whose tty swallows input (a password): poisons the
     /// line, so a passphrase cannot move the pet. The host answers Enter there
     /// with [`note_line_reset`](Self::note_line_reset) instead.
+    #[inline]
     pub fn note_no_echo(&mut self) -> TrickFeed<'_> {
         let out = self.poison();
         self.feed(out, false)
@@ -1168,6 +1192,7 @@ impl TrickListener {
 
     /// Snapshot the line, then take the open token off it. The snapshot is the
     /// one level of undo Backspace has (module docs).
+    #[inline]
     fn end_token(&mut self) -> (Word, u32) {
         let token = (self.line.token, self.line.token_chars);
         if self.line.token_chars > 0 {
@@ -1450,6 +1475,7 @@ impl TrickListener {
         self.line.tentative.take().map(|_| Outcome::Revoke)
     }
 
+    #[inline]
     fn fresh_line(&mut self) -> Option<Outcome> {
         let revoked = self.line.tentative.is_some();
         self.line = Line::FRESH;
@@ -1480,6 +1506,7 @@ impl TrickListener {
         popped
     }
 
+    #[inline]
     fn feed(&self, out: Option<Outcome>, submit_pet_only: bool) -> TrickFeed<'_> {
         let event = out.map(|out| match out {
             Outcome::Fire {

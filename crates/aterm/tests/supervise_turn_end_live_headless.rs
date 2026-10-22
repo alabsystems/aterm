@@ -474,16 +474,21 @@ cur=ready; buf=""; ev=0
 # them back, `stamps_when`). A
 # screen is marked BEFORE it is drawn, a submit AFTER its Enter was read.
 mark() { ev=$((ev + 1)); : > "$events/$ev.$1"; }
-# The caret row and the rows under it are read once per SCREEN, so a composer
-# frame is written by builtins alone: no spawn can stall between clearing the
-# composer and drawing its text, or between the half frame and the whole one,
-# for longer than the supervisor's 500 ms settle.
+# Read the complete screen and its composer metadata BEFORE changing the
+# terminal. The old clear-then-cat left a process-start gap inside the redraw;
+# the loop could read its suggestion before the final cursor-home sequence and
+# take the text under a displaced cursor for a person's draft. One builtin
+# writes the clear, screen and final cursor together. Composer redraws likewise
+# use only builtins after loading their metadata.
 draw() {
-  mark "draw-$1"; cur="$1"; printf '\033[H\033[2J'; cat "$dir/$1.scr"
+  screen=$(cat "$dir/$1.scr"; printf .); screen="${screen%.}"
   # The box is answered by a key, never composed into: it has no composer.
-  [ -e "$dir/$1.row" ] || return 0
-  IFS= read -r row < "$dir/$1.row"
-  below=$(cat "$dir/$1.below"; printf .); below="${below%.}"
+  if [ -e "$dir/$1.row" ]; then
+    IFS= read -r row < "$dir/$1.row"
+    below=$(cat "$dir/$1.below"; printf .); below="${below%.}"
+  fi
+  mark "draw-$1"; cur="$1"
+  printf '\033[H\033[2J%s' "$screen"
 }
 # A busy spell of $1 s. While a loop watches (its connection made "$seen"
 # before this spell began, `Tap`), the seconds run from when the loop has READ
@@ -732,6 +737,9 @@ struct Tap {
     seen: PathBuf,
     /// The last screen read showed the busy spell.
     read_busy: bool,
+    /// Raw reads for diagnosing a torn fixture frame versus a real person
+    /// stamp. Written only by this loop, in its scratch world.
+    reads: PathBuf,
 }
 
 impl Tap {
@@ -756,6 +764,16 @@ impl Ctl for Tap {
             self.saw_busy();
         }
         let reply = self.ctl.call(args);
+        if matches!(verb, Some("text" | "status")) {
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.reads)
+            {
+                let _ = writeln!(file, "{args:?}: {reply:?}");
+            }
+        }
         if verb == Some("text") {
             self.read_busy = matches!(&reply, Ok(r) if r.ok() && r.stdout.contains("Deliberating"));
         }
@@ -795,6 +813,7 @@ impl Supervisor {
             events: inst.tmp.join("events"),
             seen,
             read_busy: false,
+            reads: inst.tmp.join("reads.log"),
         };
         let cut = ctl.interrupter();
         let ledger = inst.tmp.join(LEDGER);
@@ -930,13 +949,19 @@ fn cruise_submit() -> String {
 /// record on the journal's clock ([`record`]) — enough to name which side
 /// stalled, and where.
 fn evidence(inst: &Instance, out: &str) -> String {
+    let reads = std::fs::read_to_string(inst.tmp.join("reads.log")).unwrap_or_default();
+    let mut start = reads.len().saturating_sub(32 * 1024);
+    while !reads.is_char_boundary(start) {
+        start += 1;
+    }
     format!(
         "the loop said:\n{out}\njournal:\n{}\nsubmitted: {:?}\nkeys: {:?}\nthe worker's \
-         events: {:?}",
+         events: {:?}\nlast raw reads:\n{}",
         journal(inst),
         std::fs::read_to_string(inst.tmp.join("submits.log")).unwrap_or_default(),
         std::fs::read_to_string(inst.tmp.join("keys.log")).unwrap_or_default(),
         record(&inst.tmp.join("events")),
+        &reads[start..],
     )
 }
 

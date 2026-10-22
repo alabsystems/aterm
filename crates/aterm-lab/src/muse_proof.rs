@@ -60,8 +60,8 @@ use crate::procs::JailOut;
 use crate::run::Run;
 use crate::runtime_dirs::Held;
 use crate::selftest::{
-    jail_left, jail_orphan, lab_roots, members_table, observe_open_files, orphan_seen,
-    owner_strays, strays_verdict,
+    Watched, jail_left, jail_orphan, lab_roots, members_table, observe_open_files, orphan_seen,
+    owner_dirs, owner_strays, strays_verdict,
 };
 use crate::sys::{PutSrc, put};
 use crate::util::scratch_text;
@@ -128,13 +128,14 @@ pub fn key_verdict(stub_log: &str) -> Verdict {
 }
 
 /// The files `lsof -Fn` lines name under one of the owner's Muse Code
-/// directories (`<real_home>/<dir>` of [`OWNER_DIRS`]): the `n<path>` lines
-/// whose path is the directory or under it.
+/// directories (`<home>/<dir>` of [`OWNER_DIRS`], in each of the owner's
+/// `homes`: [`crate::paths::Paths::guarded_homes`]): the `n<path>` lines whose
+/// path is the directory or under it.
 #[must_use]
-pub fn held_under(lsof_fn: &str, real_home: &str) -> Vec<String> {
+pub fn held_under(lsof_fn: &str, homes: &[String]) -> Vec<String> {
     let roots: Vec<String> = OWNER_DIRS
         .iter()
-        .map(|d| format!("{real_home}/{d}"))
+        .flat_map(|d| owner_dirs(homes, d))
         .collect();
     lsof_fn
         .lines()
@@ -150,12 +151,12 @@ pub fn held_under(lsof_fn: &str, real_home: &str) -> Vec<String> {
 }
 
 /// The kernel refusals (each one log line) that name one of the owner's
-/// Muse Code directories ([`OWNER_DIRS`] under `real_home`).
+/// Muse Code directories ([`OWNER_DIRS`] under each of `homes`).
 #[must_use]
-pub fn naming_own_dirs(refusals: &[String], real_home: &str) -> Vec<String> {
+pub fn naming_own_dirs(refusals: &[String], homes: &[String]) -> Vec<String> {
     let roots: Vec<String> = OWNER_DIRS
         .iter()
-        .map(|d| format!("{real_home}/{d}"))
+        .flat_map(|d| owner_dirs(homes, d))
         .collect();
     refusals
         .iter()
@@ -387,7 +388,8 @@ pub fn runtime_verdict(made: &[String], left: &[String], complete: bool) -> Verd
 fn checks(run: &Run) -> Result<Before, Fail> {
     let verb = "muse-selftest";
     crate::muse::need_muse(run)?;
-    let real_home = crate::paths::paths().real_home.clone();
+    // the owner's homes: the account's, whatever HOME says, and HOME's when it names another
+    let watched = Watched::of(crate::paths::paths());
     // The refusals' control: a jailed write into the run directory, which the jail refuses; the unified log keeps
     // such a report or drops it, so its silence about the owner's Muse Code directories counts only when it kept
     // the control. The recorder's control: a bare-name `open` in the jail, on the agent's PATH, lands on the
@@ -404,18 +406,7 @@ fn checks(run: &Run) -> Result<Before, Fail> {
         &["/usr/bin/touch", &run.run.join(&ctlname).to_string_lossy()],
         JailOut::Capture,
     );
-    let shim_path = format!("{}:/usr/bin:/bin", run.run.join("shim").display());
-    let open_control = run.w.join("open-control.log");
-    let _ = crate::procs::jailed(
-        run,
-        &run.w,
-        &[
-            ("PATH", &shim_path),
-            ("LAB_OPEN_LOG", &open_control.to_string_lossy()),
-        ],
-        &["open", "x-lab-control://selftest"],
-        JailOut::Capture,
-    );
+    let open_control = crate::recorder::control(run);
     println!(
         "== Muse Code {} in lab '{}' (the stub's Meta model API at http://127.0.0.1:{}, a fake META_API_KEY, every \
          proxy the black hole)",
@@ -483,20 +474,8 @@ fn checks(run: &Run) -> Result<Before, Fail> {
     {
         println!("  {l}");
     }
-    let opened = scratch_text(&run.w.join("open.log"));
-    let ctl_open = scratch_text(&open_control);
-    println!(
-        "== the open recorder (a URL or app something tried to open; its control: {})",
-        ctl_open.chars().take(80).collect::<String>().trim_end()
-    );
-    println!(
-        "  {}",
-        if opened.trim().is_empty() {
-            "(nothing)"
-        } else {
-            opened.trim_end()
-        }
-    );
+    let opened = crate::recorder::Witness::read(run, &open_control);
+    opened.print();
     // the owner's Muse Code directories: what the kernel refused naming them, what Muse Code holds open, and its
     // own writes under the scratch HOME
     let mut klog = String::new();
@@ -517,19 +496,19 @@ fn checks(run: &Run) -> Result<Before, Fail> {
         .lines()
         .filter_map(|l| crate::verbs::refusal_of(l, &pat))
         .collect();
-    let denied: Vec<String> = naming_own_dirs(&refusals, &real_home)
+    let denied: Vec<String> = naming_own_dirs(&refusals, watched.homes())
         .into_iter()
         .take(5)
         .collect();
     let (mut held, mut strays, mut observed) = (Vec::new(), Vec::new(), true);
-    let roots = lab_roots(run, &run.muse_bin, &real_home);
+    let roots = lab_roots(run, &run.muse_bin, watched.homes());
     // a file a failed or partial report names is still held; only complete reports prove that none is
     for &pid in &pids {
         let seen = observe_open_files(pid);
         observed &= seen.complete;
-        held.extend(held_under(&seen.text, &real_home));
+        held.extend(held_under(&seen.text, watched.homes()));
         held.truncate(5);
-        strays.extend(owner_strays(&seen.text, &real_home, &roots));
+        strays.extend(owner_strays(&seen.text, watched.homes(), &roots));
         strays.truncate(5);
     }
     let wrote = own_writes(run);
@@ -612,10 +591,7 @@ fn checks(run: &Run) -> Result<Before, Fail> {
     let egress = fs::read_to_string(run.run.join("egress.log")).unwrap_or_default();
     let (requests, other_auth) = muse_auths(&stub_log);
     let refusals = refusals_verdict(&denied, control);
-    let open_ok = opened.trim().is_empty()
-        && ctl_open
-            .lines()
-            .any(|l| l.ends_with(" open x-lab-control://selftest"));
+    let open_ok = opened.ok();
     println!("== checks");
     let mut t = Tally::default();
     t.check(
@@ -669,11 +645,7 @@ fn checks(run: &Run) -> Result<Before, Fail> {
         ),
         refusals,
     );
-    t.check(
-        "nothing was opened on the desktop: the open recorder logged nothing from the lab (its control, a bare-name \
-         open in the jail, was logged)",
-        ok(open_ok),
-    );
+    t.check(crate::recorder::NOTHING_OPENED, ok(open_ok));
     t.check(
         "the isolation probes passed on a replica home with this lab's rules (loopback only, the owner's data \
          denied, the desktop, the store, the scratch's directories, the lab's state dir)",
@@ -769,7 +741,7 @@ mod tests {
     /// files are not.
     #[test]
     fn a_file_open_under_the_owners_muse_dirs_is_named() {
-        let home = "/Users//owner";
+        let home = &["/Users//owner".to_string()];
         let lsof = "p4242\nfcwd\nn/private/tmp/at.lab0/proj\nf3\nn/Users//owner/.config/muse/auth.json\n\
                     f4\nn/Users//owner/.local/share/muse/sessions/a.jsonl\nf5\nn/Users//owner/.config/muse\n\
                     f6\nn/Users//owner/.config/muse-other/x\nf7\nn/s/runs/t/scratch/home/.config/muse/.auth.json.lock\n\
@@ -795,7 +767,7 @@ mod tests {
     /// only begins the same, is not. NEGATIVE CONTROL: no refusal names none.
     #[test]
     fn a_refusal_naming_the_owners_muse_dirs_is_named() {
-        let home = "/Users//owner";
+        let home = &["/Users//owner".to_string()];
         let refusals = vec![
             "deny(1) file-read-data /Users//owner/.config/muse/auth.json".to_string(),
             "deny(1) file-read-metadata /Users//owner/.local/share/muse".to_string(),
@@ -809,6 +781,35 @@ mod tests {
         assert!(naming_own_dirs(&[], home).is_empty(), "the control");
         assert_eq!(refusals_verdict(&refusals[..1], true), Verdict::Fail);
         assert_eq!(refusals_verdict(&[], false), Verdict::Unproven);
+    }
+
+    /// UNDER A SCRATCH `HOME` THE ACCOUNT'S MUSE CODE DIRECTORIES ARE
+    /// WATCHED: Muse Code 1.4.10 opened the account's own `session-names.db`
+    /// whatever `HOME` said, so a file held, or a refusal named, under the
+    /// account's home (the account database's) counts, as does one under the
+    /// scratch home's own. NEGATIVE CONTROL: the witness of `$HOME` alone (the
+    /// lab before this) sees none of the account's.
+    #[test]
+    fn under_a_scratch_home_the_account_muse_dirs_are_watched() {
+        let homes = crate::paths::guarded("/Users//owner", "/private/tmp/s/home");
+        let db =
+            "/Users//owner/Library/Application Support/Muse/session-name-authority/session-names.db";
+        let lsof = format!(
+            "p7\nf3\nn{db}\nf4\nn/private/tmp/s/home/.config/muse/auth.json\nf5\nn/Users//owner/Documents/x\n"
+        );
+        assert_eq!(
+            held_under(&lsof, &homes),
+            [db, "/private/tmp/s/home/.config/muse/auth.json"]
+        );
+        let refusals = vec![format!("deny(1) file-read-data {db}")];
+        assert_eq!(naming_own_dirs(&refusals, &homes), refusals);
+        // NEGATIVE CONTROL: $HOME's witness alone
+        let env_only = crate::paths::guarded("", "/private/tmp/s/home");
+        assert_eq!(
+            held_under(&lsof, &env_only),
+            ["/private/tmp/s/home/.config/muse/auth.json"]
+        );
+        assert!(naming_own_dirs(&refusals, &env_only).is_empty());
     }
 
     /// THE OWNER'S-DATA CHECK FAILS ON A HELD FILE whatever its control saw,
@@ -850,7 +851,7 @@ mod tests {
                 result.map_err(aterm_uds::deadline::CompleteOutputError::Run),
             );
             owner_verdict(
-                &held_under(&seen.text, "/Users//owner"),
+                &held_under(&seen.text, &["/Users//owner".to_string()]),
                 &wrote,
                 &[7],
                 seen.complete,

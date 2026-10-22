@@ -5,8 +5,24 @@
 //! §5.5, session log phase 4): the `[fabric] log` mode, a take's slots as the
 //! endpoint frames them, the PIN that holds one batch across a crash, the
 //! landing line and its answer, the rate bucket and the node's alias key
-//! (minted once and kept in the pin, [`Pin::key`]). The bridge's wiring
-//! (`bridge_mirror.rs`) does the I/O.
+//! (minted once, kept durably in `logkey` and copied into the pin,
+//! [`Pin::key`]). The bridge's wiring (`bridge_mirror.rs`) does the I/O.
+//!
+//! WHAT OUTLIVES A REBOOT HAS A DURABLE COPY. The pin is atomic only, so a
+//! power cut may roll it back or tear it, and two things in it no reboot ends:
+//! the alias key (ruling Q6) and the node's lifetime total (ruling Q13). The
+//! key is written durably to `logkey` before the first take that names it, so
+//! no alias derived from it reaches the bus before it is on the media; the
+//! total has a durable FLOOR, `logfloor`, raised by [`FLOOR_LEASE_BYTES`] past
+//! a batch's bytes before any byte of the batch is sent, so it is at or above
+//! every byte the node ever mirrored. A pin a power cut tore is then set aside
+//! like any torn file, a whole one written from the copies in its place, and
+//! the mirror resumes at the same key with the floor as its total: no second
+//! alias, never a total below what was counted (`StateDir::reconcile_logpin`).
+//! The copies hold only while no build that keeps neither writes the pin, so
+//! this build's pins are of a version an older build refuses ([`Pin`]'s
+//! `v=2`). A recovered `v=1` pin is replaced durably by `v=2` before any
+//! copies are made or recovered slot sent, even while its landing is owed.
 //!
 //! ONE BATCH IN FLIGHT. A take (`log-take`) is pinned before a byte of it is
 //! sent: each slot gets a producer sequence from the bridge's reserved block,
@@ -73,6 +89,17 @@ pub const RATE_BURST: u64 = 2048;
 /// (`mirror=capped`). 256 MiB of bodies is about two million records, some
 /// two hundred days of a busy agent node at the sustained rate's typical use.
 pub const TOTAL_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// THE FLOOR'S LEASE (ruling Q13 across a power cut): how far past a batch's
+/// bytes `logfloor` is raised, durably, when the batch would pass it — so the
+/// floor costs one durable write per MiB of bodies (some eight thousand
+/// records, minutes at the sustained rate). The price is paid at each reboot
+/// after an unclean stop, which cannot tell the newest pin from an older
+/// one a power cut brought back: the total resumes at the floor, at most
+/// this much AND ONE BATCH'S BODIES ([`BATCH_MAX`]) more than was mirrored
+/// — the batch in flight is in the floor, and when it lands again its bytes
+/// are counted once more — so some 256 such reboots in a node's life bring
+/// [`TOTAL_MAX_BYTES`] nearer by what they did not send. Never a byte less.
+pub const FLOOR_LEASE_BYTES: u64 = 1024 * 1024;
 
 /// One slot of a take: its session, its cursor and its `v=2` body.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,17 +177,31 @@ pub struct PinSlot {
 /// holds them.
 ///
 /// ```text
-/// logpin v=1 inc=<inc> n=<k> total=<bytes> key=<32 hex>
+/// logpin v=2 inc=<inc> n=<k> total=<bytes> key=<32 hex>
 /// <pseq> <sid> <ep>:<seq>:<ms> <body>        (k lines)
 /// ```
 ///
 /// `n=0` is a bridge between batches. A pin that does not read stops the
-/// mirror for this bridge's life and is never deleted. `key=` is minted once,
-/// 16 random bytes, the first time a bridge of this state dir mirrors, and
-/// kept by every rewrite of the pin: never derived from the node's caps (a
-/// renewed cap, a changed grant set, an unguarded broker's empty ring), so an
-/// edge's alias on the bus is the same for the node's life, and nobody
-/// holding the fleet's mint secret can recompute it.
+/// mirror for this bridge's life and is never deleted — save one a power cut
+/// tore, which the first bridge after the unclean stop sets aside once the
+/// state dir holds its durable copies (`logkey`, `logfloor`), and the mirror
+/// resumes from them. `key=` is minted once, 16 random bytes, the first time
+/// a bridge of this state dir mirrors, written durably to `logkey` before any
+/// take names it, and kept by every rewrite of the pin: never derived from
+/// the node's caps (a renewed cap, a changed grant set, an unguarded broker's
+/// empty ring), so an edge's alias on the bus is the same for the node's
+/// life, and nobody holding the fleet's mint secret can recompute it.
+///
+/// `v=2` IS A PIN WITH ITS COPIES. A build before `logkey` and `logfloor`
+/// wrote `v=1`, and reads nothing else: it refuses a `v=2` pin as one of
+/// another version, stops its mirror and keeps the pin, so it never mirrors
+/// past a floor it does not raise nor under a key it minted itself (the
+/// bridge binary is whatever `[fabric] command` names, so an older build can
+/// run on the same state dir). This build reads both, and writes `v=2` only;
+/// its first `v=2` over a `v=1` pin or none is durable, so no power cut
+/// brings back a pin that an older build would read. A recovered `v=1` is
+/// upgraded before the copies are written or its batch sent; its own durable
+/// key and total protect the interval before those copies exist.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Pin {
     /// The incarnation the sequences were reserved under.
@@ -183,7 +224,34 @@ pub fn mint_alias_key() -> Option<[u8; 16]> {
     Some(key)
 }
 
+/// The head of every pin this build writes ([`Pin::render`]).
+pub const PIN_HEADER: &str = "logpin v=2";
+
+/// The head of a pin a build before the durable copies wrote: it reads
+/// nothing else ([`Pin`]'s `v=2`).
+const OLDER_PIN_HEADER: &str = "logpin v=1";
+
 impl Pin {
+    /// Whether `bytes`, whole or cut short, begin as an OLDER BUILD'S pin
+    /// (`v=1`): one written by a build that keeps neither `logkey` nor
+    /// `logfloor`, so those copies need not cover what it holds. A prefix too
+    /// short to name its version is not one: this build wrote no `v=1`, and
+    /// once it pinned, no older build writes over its pin.
+    #[must_use]
+    pub fn by_an_older_build(bytes: &[u8]) -> bool {
+        bytes.starts_with(OLDER_PIN_HEADER.as_bytes())
+    }
+
+    /// Whether `bytes` begin as a pin of THIS build (`v=2`), which an older
+    /// build refuses: what a rewrite of the pin may replace atomically, since
+    /// no power cut can then bring back a version an older build reads.
+    #[must_use]
+    pub fn by_this_build(bytes: &[u8]) -> bool {
+        bytes
+            .strip_prefix(PIN_HEADER.as_bytes())
+            .is_some_and(|rest| rest.starts_with(b" "))
+    }
+
     /// The file's text.
     #[must_use]
     pub fn render(&self) -> String {
@@ -191,7 +259,7 @@ impl Pin {
             format!(" key={}", aterm_codec::hex::encode_lower(&k))
         });
         let mut out = format!(
-            "logpin v=1 inc={} n={} total={}{key}\n",
+            "{PIN_HEADER} inc={} n={} total={}{key}\n",
             self.inc,
             self.slots.len(),
             self.total
@@ -211,7 +279,10 @@ impl Pin {
     /// not end at the newline every line of it ends with ([`Pin::render`]): a
     /// power cut may leave a prefix, and one cut inside its header still reads
     /// as a pin with a lower total and no key (rulings Q13 and Q6, reset), one
-    /// cut inside its last slot as that slot with its body's tail gone.
+    /// cut inside its last slot as that slot with its body's tail gone. So
+    /// what this refuses is exactly what is not PROVABLY WHOLE, the rule the
+    /// state dir's sweep sets a torn file aside by (`StateDir::reconcile_logpin`).
+    /// An older build's `v=1` pin reads as this build's `v=2` does.
     pub fn parse(text: &str) -> Result<Pin, String> {
         if !text.ends_with('\n') {
             return Err(if text.is_empty() {
@@ -223,7 +294,10 @@ impl Pin {
         let mut lines = text.lines();
         let head = lines.next().ok_or("an empty logpin")?;
         let mut toks = head.split(' ');
-        if (toks.next(), toks.next()) != (Some("logpin"), Some("v=1")) {
+        if !matches!(
+            (toks.next(), toks.next()),
+            (Some("logpin"), Some("v=1" | "v=2"))
+        ) {
             return Err(format!("a logpin of another version: {head:?}"));
         }
         let mut field = |k: &str| -> Result<u64, String> {

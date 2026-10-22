@@ -177,6 +177,8 @@ pub enum Verb {
     ResourceRun,
     /// `aterm pkg` — the toolchain package manager.
     Pkg,
+    /// `aterm agh` — the GitHub client: reads as the routed identity, JSON out, typed exits.
+    Agh,
     /// `aterm fleet` — fleet membership (`init`, `join`, `peers`, `allow`, `leave`).
     Fleet,
     /// `aterm drive` — the window harness's readers (`classify`, `phase`, `answer`, `ledger`, `tape`, `replay`).
@@ -225,6 +227,7 @@ impl Verb {
         Verb::Conn,
         Verb::ResourceRun,
         Verb::Pkg,
+        Verb::Agh,
         Verb::Fleet,
         Verb::Drive,
         Verb::Link,
@@ -253,6 +256,7 @@ impl Verb {
             Verb::Conn => "conn",
             Verb::ResourceRun => "resource-run",
             Verb::Pkg => "pkg",
+            Verb::Agh => "agh",
             Verb::Fleet => "fleet",
             Verb::Drive => "drive",
             Verb::Link => "link",
@@ -289,6 +293,9 @@ impl Verb {
             Verb::Conn => None,
             Verb::ResourceRun => None,
             Verb::Pkg => Some("atpkg"),
+            // The alias is the verb's own name, which the roster test forbids;
+            // AliasRoute::Agh routes it.
+            Verb::Agh => None,
             Verb::Fleet => Some("aterm-fleet"),
             Verb::Drive => Some("aterm-drive"),
             Verb::Link => Some("aterm-link"),
@@ -330,6 +337,7 @@ impl Verb {
             | Verb::Conn
             | Verb::ResourceRun
             | Verb::Pkg
+            | Verb::Agh
             | Verb::Fleet
             | Verb::Drive
             | Verb::Link
@@ -356,6 +364,7 @@ impl Verb {
             Verb::Conn => "aterm conn [<cmd>]",
             Verb::ResourceRun => "aterm resource-run <args>",
             Verb::Pkg => "aterm pkg <args>",
+            Verb::Agh => "aterm agh <args>",
             Verb::Fleet => "aterm fleet <args>",
             Verb::Drive => "aterm drive <args>",
             Verb::Link => "aterm link <args>",
@@ -396,6 +405,9 @@ impl Verb {
                 "--session @self --job label -- program [args]; optional --ai label.",
             ],
             Verb::Pkg => &["Install / update / verify the toolchain (the package manager)."],
+            Verb::Agh => {
+                &["GitHub reads as the routed identity: JSON out, typed exits (agh help)."]
+            }
             Verb::Fleet => &[
                 "This machine's membership in a fleet, the aterms of one LAN",
                 "that read each other (init | join | peers | allow | leave);",

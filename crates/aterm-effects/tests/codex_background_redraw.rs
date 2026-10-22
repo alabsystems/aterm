@@ -45,8 +45,8 @@ impl Host {
             self.glow.note_repaint_blink(self.now);
         }
         self.glow.note_context(self.term.is_alternate_screen());
-        self.glow
-            .observe_print_anchor(aterm_effects::host::motion_print_anchor(&self.term).0);
+        let (anchor, glyph) = aterm_effects::host::motion_print_anchor(&self.term);
+        self.glow.observe_print_anchor_glyph(anchor, glyph);
         self.term.row_cols_into(usize::from(c.row), &mut self.buf);
         self.glow.observe_row(c.row, c.col, &self.buf, self.now);
         // The caret row's neighbours, as `EffectsPipeline::cursor_step` feeds them: the classifiers
@@ -551,4 +551,102 @@ fn replaced_text_and_an_expired_original_do_not_restore() {
     h.idle(800);
     h.program(b"  ab\x1b[?25h");
     assert!(h.live(20).is_empty(), "a redraw cannot mint expired cells");
+}
+
+/// A key the hand's-row hold kept (`CursorGlow::hold_the_live_presses`: a footer tick beside the
+/// hand ended on a glyph no live press typed) still pays for its own echo when that echo comes
+/// back as a foreign-row park's return. The return is judged from the park's origin on the hand's
+/// row, so it is a move on the hand's row. `i`, a footer tick refused `program-row`, then `j`;
+/// Codex parks the caret on its status row and comes back 300 ms later with `ij`, the caret shown
+/// or hidden for the return. Control: with no footer tick nothing is held and both cells light
+/// either way.
+#[test]
+fn a_held_key_s_echo_returning_from_a_foreign_row_park_lights_at_the_return() {
+    use aterm_effects::rainbow_kitty::TypedClass;
+    for (tick, hidden) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut h = Host::new();
+        h.program(b"\x1b7\x1b[24;5H1\x1b8");
+        for b in b"abcdefgh" {
+            h.key(*b);
+        }
+        h.idle(400);
+        h.now += Duration::from_millis(90);
+        h.glow
+            .note_typed_expected(h.now, 1, false, TypedClass::Glyph, 'i');
+        h.program(if tick { b"\x1b7\x1b[24;6H7\x1b8" } else { b"" });
+        h.now += Duration::from_millis(30);
+        h.glow
+            .note_typed_expected(h.now, 1, false, TypedClass::Glyph, 'j');
+        h.program(b"\x1b[22;30H.");
+        h.program(b"\x1b[22;32H.");
+        h.idle(300);
+        if hidden {
+            h.program(b"\x1b[?25l");
+            h.program(b"\x1b[21;11Hij\x1b[?25h");
+        } else {
+            h.program(b"\x1b[21;11Hij");
+        }
+        let refused_tick = h.glow.admission_log().any(|r| {
+            (r.origin, r.target, r.reason) == ((23, 5), (23, 6), CursorGlow::DECLINE_PROGRAM_ROW)
+        });
+        let tally = h.glow.in_flight_tally();
+        assert_eq!(
+            (
+                refused_tick,
+                h.live(20),
+                tally.park_returns,
+                tally.park_flushed
+            ),
+            (tick, (2..12).collect::<Vec<_>>(), 1, 0),
+            "footer tick {tick}, caret hidden for the return {hidden}: (the tick refused, \
+             composer row live, park returns, parks flushed)"
+        );
+    }
+}
+
+/// A foreign-row park's return is paid by every press in flight
+/// (`CursorGlow::park_return_paid`), outright or under the share rule: a key typed while the caret
+/// sits parked on the status row is echoed with the return and lit, and three keys whose return
+/// draws four cells (an auto-paired glyph, or a press the ring dropped) still return whole.
+/// CONTROL: one key cannot buy a two-cell return, which is left dark.
+#[test]
+fn a_foreign_row_park_s_return_is_paid_by_every_press_in_flight() {
+    use aterm_effects::rainbow_kitty::TypedClass;
+    let press = |h: &mut Host, keys: &[u8]| {
+        for &key in keys {
+            h.now += Duration::from_millis(90);
+            h.glow
+                .note_typed_expected(h.now, 1, false, TypedClass::Glyph, char::from(key));
+        }
+    };
+    // (keys pressed before the park, keys pressed during it, the return's text)
+    let cases: [(&[u8], &[u8], &[u8]); 3] = [
+        (b"i", b"j", b"ij"),
+        (b"ijk", b"", b"ijkl"),
+        (b"i", b"", b"ij"),
+    ];
+    let returns = cases.map(|(before, during, text)| {
+        let mut h = Host::new();
+        for b in b"abcdefgh" {
+            h.key(*b);
+        }
+        h.idle(400);
+        press(&mut h, before);
+        h.program(b"\x1b[22;30H.");
+        press(&mut h, during);
+        h.program(b"\x1b[22;32H.");
+        h.idle(300);
+        h.program(&[b"\x1b[21;11H".as_slice(), text].concat());
+        (h.live(20), h.glow.in_flight_tally().park_returns)
+    });
+    assert_eq!(
+        returns,
+        [
+            ((2..12).collect::<Vec<_>>(), 1),
+            ((2..14).collect(), 1),
+            ((2..10).collect(), 0),
+        ],
+        "(composer row live, park returns): `i`, then `j` in the park, returning `ij`; `ijk` \
+         returning `ijkl`; CONTROL `i` returning `ij`"
+    );
 }

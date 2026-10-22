@@ -3250,6 +3250,18 @@ impl App {
             .app(instance)
             .map(crate::native_app::NativeApp::kind)
             .ok_or_else(|| "active native app disappeared".to_string())?;
+        if kind == crate::native_app::AppKind::SystemState
+            && match &event {
+                AppEvent::TextInput(event) => crate::system_state::text_input_interacts(event),
+                AppEvent::Action(_)
+                | AppEvent::ScrollLines(_)
+                | AppEvent::ScrollPage(_)
+                | AppEvent::ScrollAt { .. } => true,
+                _ => false,
+            }
+        {
+            self.interact_system_state(wid);
+        }
         // Only Settings scrolls a second region (its sidebar): every other
         // view's aimed scroll is its one list's, lowered before its own
         // mappings (Markdown's measured scroll, the editor's view scroll).
@@ -3508,6 +3520,19 @@ impl App {
     ) -> bool {
         use crate::input::{InputEvent, ScrollIntent};
         use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+
+        if matches!(
+            event,
+            InputEvent::Key { .. }
+                | InputEvent::Text(_)
+                | InputEvent::KeySequence(_)
+                | InputEvent::Paste(..)
+                | InputEvent::MouseButton { pressed: true, .. }
+                | InputEvent::Wheel { .. }
+                | InputEvent::ScrollView(_)
+        ) {
+            self.interact_system_state(wid);
+        }
 
         let Some((instance, active_view)) = self.active_native_view(wid) else {
             return false;
@@ -4261,6 +4286,21 @@ impl App {
                         }
                     },
                 );
+            // The Settings sidebar is one Tab stop: resolve its step before
+            // deciding whether it crosses the list, which may hold no
+            // focusable control on its current screen.
+            let next = match self.native_runtime.view_state(view) {
+                Some(crate::native_app::AppViewState::Settings(state)) => state
+                    .tab_past_navigation(
+                        current.as_ref(),
+                        &focus_order[next],
+                        !backwards,
+                        focus_order,
+                    )
+                    .and_then(|target| focus_order.iter().position(|key| *key == target))
+                    .unwrap_or(next),
+                _ => next,
+            };
             // Whether the step from `current` to `next` passes over the
             // list in reading order: forward from before it to after it (or
             // round to the window's start), back from after it to before it
@@ -4268,26 +4308,21 @@ impl App {
             let passes_list = list_at
                 .zip(current.as_ref().and_then(order_of))
                 .is_some_and(|(list, from)| {
-                    let to = order_of(&focus_order[next]);
-                    if backwards {
-                        from > list && to.is_none_or(|to| to < list || to > from)
-                    } else {
-                        from < list && to.is_none_or(|to| to > list || to < from)
-                    }
+                    order_of(&focus_order[next]).is_none_or(|to| {
+                        // Read a backwards step as the same interval in
+                        // forward order. A wrapped interval can cross a list
+                        // before or after both of its focusable endpoints.
+                        let (from, to) = if backwards { (to, from) } else { (from, to) };
+                        if from < to {
+                            from < list && list < to
+                        } else {
+                            list > from || list < to
+                        }
+                    })
                 });
             (focus_order.clone(), next, passes_list)
         };
         let mut key = focus_order[next].clone();
-        // The Settings sidebar is one Tab stop: Tab leaves it for the page
-        // in one step, and entering it lands on the selected row (its arrow
-        // keys move between rows).
-        if let Some(crate::native_app::AppViewState::Settings(state)) =
-            self.native_runtime.view_state(view)
-            && let Some(target) =
-                state.tab_past_navigation(current.as_ref(), &key, !backwards, &focus_order)
-        {
-            key = target;
-        }
         // TAB ENTERS A LIST WHOSE SCREEN SHOWS NONE OF ITS CONTROLS: a step
         // that would pass over it goes to its first control (Shift-Tab: its
         // last), which the list scrolls into view.
@@ -7204,6 +7239,17 @@ impl App {
             };
 
         match request {
+            RecoveryRequest::Retry(RecoveryCapability::SystemState) => {
+                if self.open_system_state_tab_in_window(wid) {
+                    RecoveryOutcome::Opened {
+                        message: "Reopened System State".into(),
+                    }
+                } else {
+                    RecoveryOutcome::Failed {
+                        message: "System State could not be reopened".into(),
+                    }
+                }
+            }
             RecoveryRequest::Retry(RecoveryCapability::Settings { route }) => {
                 let Some(route) = crate::native_settings::SettingsRoute::from_path(&route) else {
                     return RecoveryOutcome::Denied {

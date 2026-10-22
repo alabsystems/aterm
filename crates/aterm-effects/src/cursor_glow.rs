@@ -1231,11 +1231,13 @@ impl FrameFingerprint {
         self.0 = Some(hash);
     }
 
+    #[inline]
     fn forge_fill(&mut self, fill: u32) {
         self.begin_stream(Self::FORGE_FILL, 1);
         self.write(u64::from(fill));
     }
 
+    #[inline]
     fn finish(self) -> u64 {
         match self.0 {
             None => 0,
@@ -1812,6 +1814,7 @@ impl CursorGlow {
     /// Last honest visible source owned by this engine. Native and pipeline
     /// hosts require the classic trail to report the same anchor before they
     /// arm any candidate; a reset/unseeded pair cannot reconstruct a path.
+    #[inline]
     #[must_use]
     pub fn cursor_anchor(&self) -> Option<(u16, u16)> {
         self.last
@@ -1820,6 +1823,7 @@ impl CursorGlow {
 
     /// Reduced-motion arm for the fresh-ink pop (see the `reduced_motion`
     /// field). Idempotent; the host sets it beside the tick.
+    #[inline]
     pub fn set_reduced_motion(&mut self, reduced: bool) {
         self.reduced_motion = reduced;
         // Seam point 2 (§17.2, §6.11): the posture change goes to v2, dated to
@@ -1840,6 +1844,7 @@ impl CursorGlow {
     /// wake): a key typed during the ember clears it and re-lights, so only a
     /// window nobody types into goes dark on blur. Sound gates on raw focus
     /// too (`sound_policy::trail_sound_gain`). Inert unless v2 is engaged.
+    #[inline]
     pub fn note_focus(&mut self, focused: bool, now: Instant) {
         if self.v2.engaged() {
             self.v2.on_event(rk::Event::Focus(focused), now);
@@ -1852,6 +1857,7 @@ impl CursorGlow {
     /// ([`Self::BLINK_HINT_FRESH`]) selecting re-anchor morphology for an
     /// admitted typed/delete candidate on the alt screen. Never admits movement
     /// or gates bytes.
+    #[inline]
     pub fn note_repaint_blink(&mut self, now: Instant) {
         self.unsettle();
         self.blink_hint = Some(now);
@@ -1860,6 +1866,7 @@ impl CursorGlow {
     /// Drop the blink hint — a tab/pane switch re-pointed this window at a
     /// different terminal, and a blink carried from the old one must not
     /// classify a candidate (or, host-side, the probe) against the new one.
+    #[inline]
     pub fn clear_blink(&mut self) {
         self.blink_hint = None;
     }
@@ -1868,6 +1875,7 @@ impl CursorGlow {
     /// this frame (read beside the row probe). Only the re-anchor classifier
     /// consults it; `false` (main screen, or a host that never calls this)
     /// leaves the classifier unchanged.
+    #[inline]
     pub fn note_context(&mut self, alt: bool) {
         self.ctx_alt = alt;
     }
@@ -1875,6 +1883,7 @@ impl CursorGlow {
     /// Stamp the focused pane's rows (`first_row`, `rows`) in the coordinate
     /// space handed to [`Self::tick`], for v2's band floor. Morphology only:
     /// [`Self::move_licensed`] remains the sole authority to mint light.
+    #[inline]
     pub fn note_pane_rows(&mut self, first_row: u16, rows: usize) {
         let pane_rows = u16::try_from(rows)
             .ok()
@@ -1886,6 +1895,7 @@ impl CursorGlow {
     /// Stamp the focused pane's exact columns in the coordinate space handed
     /// to [`Self::tick`]. This is morphology only: [`Self::move_licensed`]
     /// remains the sole authority to mint light.
+    #[inline]
     pub fn note_pane_columns(&mut self, first_col: u16, cols: usize) {
         self.pane_columns = u16::try_from(cols)
             .ok()
@@ -1902,6 +1912,7 @@ impl CursorGlow {
     /// the theme fill. A pending kill hint also arms: a reflowing TUI's kill is
     /// answered by the caret fallback, which runs only on a ticked frame after
     /// its grace (bounded by [`Self::KILL_HINT_FRESH`], paced coarsely).
+    #[inline]
     pub fn is_active(&self) -> bool {
         // The classic wake's light is moving light (`has_live_motion`).
         self.has_live_motion()
@@ -1923,6 +1934,7 @@ impl CursorGlow {
     /// predicates so they cannot drift. Fire-gated: every style integrates
     /// `disp_t`, but only Fire has a metal; `last_style` is the style of the
     /// tick that produced this state.
+    #[inline]
     fn ember_live(&self) -> bool {
         self.cursor_temp > Self::FORGE_MIN_TEMP
             || (matches!(self.last_style, Some(GlowStyle::Fire))
@@ -1934,6 +1946,7 @@ impl CursorGlow {
     /// a detector tick (a kill via its row-diff/fallback licence, a Backspace
     /// via an exact confirmed span), so scheduling seams read this one
     /// accessor.
+    #[inline]
     fn poof_hint_pending(&self) -> Option<Instant> {
         match (self.kill_hint, self.bs_poof_hint) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -1946,6 +1959,7 @@ impl CursorGlow {
     /// The kill fallback's early release from [`Self::POOF_FALLBACK_GRACE`];
     /// a plain Backspace shares it. A `None` baseline (no probe at the key) is
     /// no witness either way, so the fallback keeps its timed grace.
+    #[inline]
     fn poof_erase_witnessed(&self) -> bool {
         match (self.bs_baseline, self.row_cur_meta) {
             (Some((brow, bfill)), Some(cur)) => {
@@ -1959,6 +1973,7 @@ impl CursorGlow {
 
     /// Whether any moving light is alive (everything is_active tracks except
     /// the standing forge ember and a pending kill hint).
+    #[inline]
     fn has_live_motion(&self) -> bool {
         self.needs_frame_cadence() || !self.vapor.is_empty()
     }
@@ -1967,6 +1982,7 @@ impl CursorGlow {
     /// cadence: the GUI scheduler's choice between its frame train and
     /// [`Self::next_change_deadline`]'s coarse path. Vapor, the forge ember and
     /// kill-hint polling are excluded; a live style crossfade counts.
+    #[inline]
     #[must_use]
     pub fn needs_frame_cadence(&self) -> bool {
         // The classic wake's comet, crown and ring all move every frame. Each
@@ -1977,6 +1993,7 @@ impl CursorGlow {
 
     /// [`Self::needs_frame_cadence`] for this engine's own light, without the
     /// classic wake's.
+    #[inline]
     fn modern_needs_frame_cadence(&self) -> bool {
         !self.sparks.is_empty()
             || !self.particles.is_empty()
@@ -2152,6 +2169,7 @@ impl CursorGlow {
     ///
     /// Four call sites (degenerate-grid return, classic wake, zero-amplitude
     /// return, live path), bound by the `TrailSoundSeam` model's conformance.
+    #[inline]
     fn settle_key_seam(&mut self, cfg: &GlowConfig, drew: bool) {
         let open = drew || cfg.audible;
         if !open {
@@ -2175,6 +2193,7 @@ impl CursorGlow {
     /// ends ([`rk::Engine::curtain`]). Hosts call this for alternate-screen
     /// entry, tab or terminal switches, resizes and content invalidation; a
     /// style switch, teardown and serious mode `reset()`.
+    #[inline]
     pub fn curtain(&mut self, now: Instant) {
         self.reset_space(Some(now));
     }
@@ -2183,6 +2202,7 @@ impl CursorGlow {
     /// Returns `true` when v2 owns the frame and will run its clocks but write
     /// nothing next tick, keeping the band for when the live viewport returns;
     /// `false` for other styles, whose caller resets instead.
+    #[inline]
     pub fn hide_v2(&mut self) -> bool {
         if !self.v2.engaged() {
             return false;
@@ -2194,6 +2214,7 @@ impl CursorGlow {
     /// Whether v2 owns the frame: for a host path deciding between keeping
     /// Rainbow Kitty's band and resetting other styles' marks without arming a
     /// hide it has no tick for ([`Self::hide_v2`]; `TornBand::Keep`).
+    #[inline]
     #[must_use]
     pub fn v2_owns_frame(&self) -> bool {
         self.v2.engaged()
@@ -2211,6 +2232,7 @@ impl CursorGlow {
     /// reads them too (its bed's rail and its over-ink account); only its
     /// spectrum face, which reads neither, lets a host skip the two row
     /// reads.
+    #[inline]
     #[must_use]
     pub fn reads_neighbor_rows(&self) -> bool {
         self.v2_owns_frame()
@@ -2222,6 +2244,7 @@ impl CursorGlow {
 
     /// Whether a one-frame hide is armed and not yet taken — the twins'
     /// witness that no non-ticking path left one standing.
+    #[inline]
     #[must_use]
     pub fn v2_hide_armed(&self) -> bool {
         self.v2.hide_armed()
@@ -2230,6 +2253,7 @@ impl CursorGlow {
     /// Drop all in-flight light and forget the last cursor position, when the
     /// cursor's coordinate space changes out from under the animator (e.g. a
     /// single pane ⇄ split layout transition).
+    #[inline]
     pub fn reset(&mut self) {
         self.reset_space(None);
     }
@@ -3284,6 +3308,7 @@ impl CursorGlow {
     /// The incoming style's ramp-in amplitude: `1.0` in steady state, else a
     /// cosine ease from [`Self::RAMP_IN_FLOOR`] to 1.0 over [`Self::RAMP_IN_S`],
     /// clearing itself when complete.
+    #[inline]
     fn ramp_in_scale(&mut self, now: Instant) -> f32 {
         let Some(t0) = self.ramp_in_at else {
             return 1.0;
@@ -3347,6 +3372,7 @@ impl CursorGlow {
     }
 
     /// Deterministic xorshift float in [0,1).
+    #[inline]
     fn frand(&mut self) -> f32 {
         let mut x = self.rng;
         x ^= x << 13;
@@ -3359,6 +3385,7 @@ impl CursorGlow {
 
 /// The first `n` host-sampled witness `rows` as [`rk::witness::RowSample`]s,
 /// in a stack array (no allocation), and how many slots are filled.
+#[inline]
 fn witness_samples(
     rows: &[WitnessRowBuf],
     n: usize,

@@ -89,6 +89,32 @@ pub struct Config {
     pub host: String,
 }
 
+/// Whether a requested join pin admits this configured authority. An absent
+/// pin retains an admitted source; an explicit pin may name its signer or a
+/// verified predecessor. Retired authority gives way exactly as it does at sync.
+/// This reads no files and never joins or fetches a vault.
+pub fn pin_admitted(config: &Config, requested: Option<[u8; 32]>) -> bool {
+    let Some(signer) = config.signer else {
+        return requested.is_none() && matches!(config.source, Source::Path(_));
+    };
+    let retired = Retired::compiled();
+    if retired.gives_way(&signer, &config.followed) {
+        return false;
+    }
+    let Some(requested) = requested else {
+        return true;
+    };
+    let requested = if retired.gives_way(&requested, &[]) {
+        let Some(current) = retired.current else {
+            return false;
+        };
+        current
+    } else {
+        requested
+    };
+    signer == requested || config.followed.contains(&requested)
+}
+
 /// Whether this machine is in the vault.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Membership {
@@ -248,8 +274,8 @@ fn read_toml(path: &Path, what: &str) -> crate::Result<Option<aterm_toml::Table>
     }
 }
 
-/// Serialises writers of this machine's state (a subscriber and a person's command). An
-/// advisory lock released by `LOCK_UN` on drop (clippy.toml: the flock release rule).
+/// Serialises state writers and coherent readiness observations. An advisory
+/// lock released by `LOCK_UN` on drop (clippy.toml: the flock release rule).
 struct StateLock(std::fs::File);
 
 impl StateLock {
@@ -270,6 +296,42 @@ impl StateLock {
         file.lock()
             .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
         Ok(StateLock(file))
+    }
+
+    /// Observe only an existing regular lockfile, without changing the state
+    /// directory or waiting behind a subscriber's materialization pass.
+    fn observe(paths: &Paths) -> crate::Result<Option<StateLock>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = paths.lock_file();
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(Error::new(format!("{}: {error}", path.display()))),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| Error::new(format!("{}: {error}", path.display())))?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::new(format!(
+                "{}: not a regular file",
+                path.display()
+            )));
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the shared take of StateLock, whose Drop releases by LOCK_UN (File::unlock)"
+        )]
+        match file.try_lock_shared() {
+            Ok(()) => Ok(Some(StateLock(file))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(Error::new(format!("{}: {error}", path.display())))
+            }
+        }
     }
 }
 
@@ -509,6 +571,9 @@ impl Stored {
 struct State {
     seq: u64,
     digest: Option<[u8; 32]>,
+    /// The source, vault name and signer this version and membership belong to.
+    /// Absent in older records until a successful sync establishes the binding.
+    source_identity: Option<[u8; 32]>,
     heard: u64,
     requested: u64,
     membership: Stored,
@@ -536,11 +601,13 @@ fn load_state(paths: &Paths) -> crate::Result<State> {
             .and_then(|n| u64::try_from(n).ok())
             .unwrap_or(0)
     };
-    let digest = table
-        .get("digest")
-        .and_then(aterm_toml::Value::as_str)
-        .and_then(|text| aterm_codec::hex::decode_vec(text.as_bytes()))
-        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok());
+    let digest = |key: &str| {
+        table
+            .get(key)
+            .and_then(aterm_toml::Value::as_str)
+            .and_then(|text| aterm_codec::hex::decode_vec(text.as_bytes()))
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+    };
     let digests = |key: &str| {
         let mut digests = BTreeMap::new();
         if let Some(files) = table.get(key).and_then(aterm_toml::Value::as_table) {
@@ -557,7 +624,8 @@ fn load_state(paths: &Paths) -> crate::Result<State> {
     };
     Ok(State {
         seq: int("seq"),
-        digest,
+        digest: digest("digest"),
+        source_identity: digest("source_identity"),
         heard: int("heard"),
         requested: int("requested"),
         membership: Stored::from_word(
@@ -595,6 +663,9 @@ fn save_state(paths: &Paths, state: &State) -> crate::Result<()> {
     if let Some(digest) = &state.digest {
         text.push_str(&format!("digest = {}\n", toml_str(&hex(digest))));
     }
+    if let Some(identity) = &state.source_identity {
+        text.push_str(&format!("source_identity = {}\n", toml_str(&hex(identity))));
+    }
     text.push_str(&format!(
         "heard = {}\n",
         i64::try_from(state.heard).unwrap_or(i64::MAX)
@@ -620,6 +691,43 @@ fn save_state(paths: &Paths, state: &State) -> crate::Result<()> {
         }
     }
     fsx::write_atomic(&paths.state_file(), text.as_bytes(), 0o600)
+}
+
+fn source_identity(config: &Config) -> [u8; 32] {
+    let mut identity = Vec::new();
+    match &config.source {
+        Source::Url(url) => {
+            identity.push(0);
+            identity.extend_from_slice(url.as_bytes());
+        }
+        Source::Path(path) => {
+            identity.push(1);
+            identity.extend_from_slice(path.to_string_lossy().as_bytes());
+        }
+    }
+    identity.push(0);
+    identity.extend_from_slice(config.name.as_bytes());
+    identity.push(0);
+    if let Some(signer) = config.signer {
+        identity.push(1);
+        identity.extend_from_slice(&signer);
+    } else {
+        identity.push(0);
+    }
+    sha256(&identity)
+}
+
+fn source_bound(config: &Config, state: &State) -> bool {
+    state.source_identity == Some(source_identity(config))
+        && (config.signer.is_none() || state.digest.is_some())
+}
+
+/// Invalidate old materialization durably before publishing a new source or
+/// authority. Keep its manifest so the next sync can safely replace tracked files.
+fn prepare_materialization(paths: &Paths, state: &mut State) -> crate::Result<()> {
+    state.failed = true;
+    state.source_identity = None;
+    save_state(paths, state)
 }
 
 // ── Status ──────────────────────────────────────────────────────────────────
@@ -648,6 +756,40 @@ pub fn status(paths: &Paths) -> crate::Result<Status> {
         membership,
         names: state.manifest.files.keys().cloned().collect(),
     })
+}
+
+/// Whether an admitted vault's last sync finished and its tracked files still
+/// match. Reads local state and private file digests; never fetches or writes.
+/// Call explicitly when checking readiness, rather than during status polling.
+/// Missing state or a concurrent writer is not ready.
+pub fn materialization_ready(paths: &Paths) -> crate::Result<bool> {
+    materialization_ready_with(paths, None, files_intact)
+}
+
+/// Observe readiness only while this exact source/authority is still configured.
+/// A changed config is refused before reading another source's tracked files.
+pub fn materialization_ready_for(paths: &Paths, expected: &Config) -> crate::Result<bool> {
+    materialization_ready_with(paths, Some(expected), files_intact)
+}
+
+fn materialization_ready_with(
+    paths: &Paths,
+    expected: Option<&Config>,
+    intact: impl FnOnce(&Paths, &State) -> bool,
+) -> crate::Result<bool> {
+    let Some(_observation) = StateLock::observe(paths)? else {
+        return Ok(false);
+    };
+    let Some(config) = config(paths)? else {
+        return Ok(false);
+    };
+    if expected.is_some_and(|expected| *expected != config) || !pin_admitted(&config, None) {
+        return Ok(false);
+    }
+    let state = load_state(paths)?;
+    Ok(matches!(state.membership, Stored::In | Stored::Plain)
+        && source_bound(&config, &state)
+        && intact(paths, &state))
 }
 
 // ── Reading a vault ─────────────────────────────────────────────────────────
@@ -896,15 +1038,19 @@ fn quiet(report: &Report) -> bool {
 /// Fetch, verify, decrypt and materialize once. `wait` turns the fetch into a long-poll for a
 /// version newer than the one held.
 pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome> {
-    let config = config(paths)?.ok_or_else(|| {
+    let mut config = config(paths)?.ok_or_else(|| {
         Error::new("no vault configured: run aterm secrets join <url> (or aterm init)")
     })?;
     // A long-poll is held without the lock, so a person's command is never queued behind it.
     let before = load_state(paths)?;
     let fetched = match (&config.source, wait) {
         (Source::Url(_), Some(wait)) => {
-            let after = (before.membership != Stored::None && !pin_gives_way(&config))
-                .then_some(before.seq);
+            let after = (before.membership != Stored::None
+                && !pin_gives_way(&config)
+                && source_bound(&config, &before)
+                && (!matches!(before.membership, Stored::In | Stored::Plain)
+                    || (!before.failed && before.pending.is_empty())))
+            .then_some(before.seq);
             transport::fetch(&config.source, after, wait + Duration::from_secs(10))?
         }
         _ => transport::fetch(&config.source, None, Duration::from_secs(30))?,
@@ -948,6 +1094,7 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
         let report = apply_entries(paths, &mut state, &entries)?;
         state.membership = Stored::Plain;
         state.failed = !report.failed.is_empty();
+        state.source_identity = (!state.failed).then(|| source_identity(&config));
         state.heard = now();
         save_state(paths, &state)?;
         if quiet(&report) {
@@ -965,16 +1112,16 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
         // cut short after the move does not leave the new pin under that floor.
         state.seq = 0;
         state.digest = None;
-        save_state(paths, &state)?;
     }
     if let Pin::Rotated(new) | Pin::Replaced(new) = pinned {
-        let mut config = config.clone();
+        prepare_materialization(paths, &mut state)?;
         config.signer = Some(new);
         config.followed = chain_keys(&envelope);
         save_config(paths, &config)?;
     }
     if verdict == Verdict::Unchanged
         && state.membership == Stored::In
+        && source_bound(&config, &state)
         && files_intact(paths, &state)
     {
         save_state(paths, &state)?;
@@ -991,12 +1138,14 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
             Stored::In | Stored::Revoked => Stored::Revoked,
             _ => Stored::Pending,
         };
+        state.source_identity = Some(source_identity(&config));
         save_state(paths, &state)?;
         return Ok(SyncOutcome::NotIn);
     };
     let report = apply_entries(paths, &mut state, &entries)?;
     state.membership = Stored::In;
     state.failed = !report.failed.is_empty();
+    state.source_identity = (!state.failed).then(|| source_identity(&config));
     save_state(paths, &state)?;
     Ok(SyncOutcome::Applied {
         seq: envelope.seq,
@@ -1455,13 +1604,13 @@ pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutco
         plain_entries(&config, path)?;
         {
             let _lock = StateLock::take(paths)?;
-            save_config(paths, &config)?;
             // What an earlier source wrote stays tracked; its versions do not carry over.
             let mut state = load_state(paths)?;
             state.seq = 0;
             state.digest = None;
             state.membership = Stored::Plain;
-            save_state(paths, &state)?;
+            prepare_materialization(paths, &mut state)?;
+            save_config(paths, &config)?;
         }
         sync(paths, None)?;
         return Ok(JoinOutcome::Plain {
@@ -1516,16 +1665,18 @@ pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutco
     {
         let _lock = StateLock::take(paths)?;
         let replaced = matches!(checked, Pin::Replaced(_));
+        let mut state = load_state(paths)?;
         if !same_place || stored != Some(pin) || replaced {
             // Another vault, or another signing authority (a pin that gave way among them):
             // what the old one wrote stays, but its versions do not carry over. So too with no
             // source.toml at all: a state.toml left beside it holds another vault's seq, which
             // would read as a rollback.
-            let mut state = load_state(paths)?;
             state.seq = 0;
             state.digest = None;
             state.membership = Stored::None;
-            save_state(paths, &state)?;
+            prepare_materialization(paths, &mut state)?;
+        } else if previous.as_ref() != Some(&config) {
+            prepare_materialization(paths, &mut state)?;
         }
         save_config(paths, &config)?;
     }
@@ -2173,12 +2324,12 @@ pub fn create(
     };
     {
         let _lock = StateLock::take(paths)?;
-        save_config(paths, &config)?;
         let mut state = load_state(paths)?;
         state.seq = 0;
         state.digest = None;
         state.membership = Stored::None;
-        save_state(paths, &state)?;
+        prepare_materialization(paths, &mut state)?;
+        save_config(paths, &config)?;
     }
     sync(paths, None)?;
     Ok(Created {
@@ -2459,6 +2610,334 @@ mod tests {
             },
         )
         .expect("join")
+    }
+
+    #[test]
+    fn readiness_observation_creates_no_state_or_lock_and_never_changes_directory_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let reader = Paths::for_home(&root.path().join("absent"));
+        let expected = Config {
+            source: Source::Path(root.path().join("team.secrets")),
+            name: "team".into(),
+            signer: None,
+            followed: Vec::new(),
+            host: "reader".into(),
+        };
+        assert!(!materialization_ready(&reader).unwrap());
+        assert!(!materialization_ready_for(&reader, &expected).unwrap());
+        assert!(!reader.home.exists());
+
+        std::fs::create_dir_all(&reader.dir).unwrap();
+        std::fs::set_permissions(&reader.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!materialization_ready(&reader).unwrap());
+        assert!(!reader.lock_file().exists());
+        assert_eq!(
+            std::fs::metadata(&reader.dir).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[test]
+    fn readiness_observation_yields_to_writers_and_coexists_with_shared_readers() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("team.secrets");
+        fsx::write_atomic(&source, b"token=inert-token\n", 0o600).unwrap();
+        let reader = Paths::for_home(&root.path().join("reader"));
+        join_pinned(&reader, source.to_str().unwrap(), "reader");
+        let writer = StateLock::take(&reader).unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let observing = reader.clone();
+        let worker = std::thread::spawn(move || {
+            send.send(materialization_ready(&observing)).unwrap();
+        });
+        // A hang detector, not a latency requirement: the writer stays locked
+        // until this nonblocking observation has answered.
+        let result = receive.recv_timeout(Duration::from_secs(60));
+        drop(writer);
+        worker.join().unwrap();
+        assert!(
+            !result
+                .expect("readiness must not wait for the writer")
+                .unwrap()
+        );
+        assert!(materialization_ready(&reader).unwrap());
+
+        let shared = StateLock::observe(&reader).unwrap().expect("first reader");
+        assert!(materialization_ready(&reader).unwrap());
+        drop(shared);
+        let writer = StateLock::take(&reader).unwrap();
+        drop(writer);
+        assert!(materialization_ready(&reader).unwrap());
+    }
+
+    #[test]
+    fn readiness_refuses_a_changed_source_before_its_file_digests() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let first = root.path().join("first.secrets");
+        let second = root.path().join("second.secrets");
+        fsx::write_atomic(&first, b"token=first-token\n", 0o600).unwrap();
+        fsx::write_atomic(&second, b"token=second-token\n", 0o600).unwrap();
+        let reader = Paths::for_home(&root.path().join("reader"));
+        join_pinned(&reader, first.to_str().unwrap(), "reader");
+        let expected = status(&reader).unwrap().config.unwrap();
+        assert!(materialization_ready_for(&reader, &expected).unwrap());
+        join_pinned(&reader, second.to_str().unwrap(), "reader");
+        let digests_read = std::cell::Cell::new(false);
+        assert!(
+            !materialization_ready_with(&reader, Some(&expected), |paths, state| {
+                digests_read.set(true);
+                files_intact(paths, state)
+            })
+            .unwrap()
+        );
+        assert!(!digests_read.get());
+        assert!(!materialization_ready_for(&reader, &expected).unwrap());
+        assert!(materialization_ready(&reader).unwrap());
+        assert!(materialization_ready_for(&reader, &pinned(&reader)).unwrap());
+
+        join_pinned(&reader, first.to_str().unwrap(), "reader");
+        assert!(materialization_ready_for(&reader, &expected).unwrap());
+    }
+
+    #[test]
+    fn readiness_lock_admission_refuses_symlinks_and_nonregular_files() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let reader = Paths::for_home(&root.path().join("reader"));
+        std::fs::create_dir_all(&reader.dir).unwrap();
+        let target = root.path().join("owned-target");
+        fsx::write_atomic(&target, b"inert target", 0o600).unwrap();
+        std::os::unix::fs::symlink(&target, reader.lock_file()).unwrap();
+        assert!(StateLock::observe(&reader).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"inert target");
+        std::fs::remove_file(reader.lock_file()).unwrap();
+        std::fs::create_dir(reader.lock_file()).unwrap();
+        assert!(StateLock::observe(&reader).is_err());
+    }
+
+    #[test]
+    fn pin_admission_follows_verified_rotation_and_compiled_replacement() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("team.vault");
+        let admin = Paths::for_home(&root.path().join("admin"));
+        create(&admin, source.to_str().expect("utf-8"), None, Some("admin"))
+            .expect("create scratch vault");
+        let original = pinned(&admin).signer.expect("original pin");
+        rotate(&admin);
+        let successor = pinned(&admin).signer.expect("successor pin");
+        rotate(&admin);
+        let config = pinned(&admin);
+        let current = config.signer.expect("current pin");
+        let unrelated = envelope::signer_public(&[239; 32]).expect("unrelated public key");
+        for pin in [original, successor, current] {
+            assert!(pin_admitted(&config, Some(pin)));
+        }
+        assert!(!pin_admitted(&config, Some(unrelated)));
+
+        // The original seed now gives way to the compiled successor, whose
+        // legitimate later rotation is still the configured authority.
+        let mut fork = config.clone();
+        fork.signer = Some(unrelated);
+        fork.followed = vec![original];
+        let admitted = retiring(vec![original], successor, || {
+            [
+                pin_admitted(&config, Some(original)),
+                pin_admitted(&config, Some(successor)),
+                pin_admitted(&config, Some(current)),
+                pin_admitted(&config, Some(unrelated)),
+                pin_admitted(&fork, None),
+                pin_admitted(&fork, Some(unrelated)),
+            ]
+        });
+        assert_eq!(admitted, [true, true, true, false, false, false]);
+
+        let mut unsigned = config;
+        unsigned.signer = None;
+        unsigned.followed.clear();
+        assert!(pin_admitted(&unsigned, None));
+        assert!(!pin_admitted(&unsigned, Some(current)));
+        unsigned.source = Source::Url("https://vault.example/v1/team".into());
+        assert!(!pin_admitted(&unsigned, None));
+    }
+
+    #[test]
+    fn materialization_readiness_rejects_intact_files_under_retired_authority() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("team.vault");
+        let admin = Paths::for_home(&root.path().join("admin"));
+        create(&admin, source.to_str().expect("utf-8"), None, Some("admin"))
+            .expect("create scratch vault");
+        let opened = admin_open(&admin).expect("open scratch vault");
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "token", b"inert-token")
+            .expect("add test credential");
+        admin_publish(&admin, &opened, &doc).expect("publish test credential");
+        sync(&admin, None).expect("materialize test credential");
+        assert!(materialization_ready(&admin).expect("ready before retirement"));
+        let old = pinned(&admin).signer.expect("held pin");
+        let current = envelope::signer_public(&[238; 32]).expect("replacement public key");
+        let state_before = std::fs::read(admin.state_file()).expect("state before check");
+        let source_before = std::fs::read(admin.source_file()).expect("source before check");
+        let ready = retiring(vec![old], current, || materialization_ready(&admin));
+        assert!(!ready.expect("retired authority refused"));
+        assert_eq!(std::fs::read(admin.state_file()).unwrap(), state_before);
+        assert_eq!(std::fs::read(admin.source_file()).unwrap(), source_before);
+        assert!(materialization_ready(&admin).expect("test authority restored"));
+    }
+
+    #[test]
+    fn plain_source_changes_never_admit_the_previous_sources_intact_files() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let first = root.path().join("first.secrets");
+        let second = root.path().join("second.secrets");
+        fsx::write_atomic(&first, b"token=first-token\n", 0o600).expect("first vault");
+        fsx::write_atomic(&second, b"token=second-token\n", 0o600).expect("second vault");
+        let reader = Paths::for_home(&root.path().join("reader"));
+        join_pinned(&reader, first.to_str().unwrap(), "reader");
+        assert!(materialization_ready(&reader).unwrap());
+        let original = pinned(&reader);
+        let mut changed = original.clone();
+        changed.source = Source::Path(second.clone());
+        changed.name = "second".into();
+
+        // Old clients could publish another source while leaving an intact old
+        // manifest. Neither a mismatched nor an absent binding certifies it.
+        save_config(&reader, &changed).unwrap();
+        assert!(!materialization_ready(&reader).unwrap());
+        let mut legacy = load_state(&reader).unwrap();
+        legacy.source_identity = None;
+        legacy.failed = false;
+        save_state(&reader, &legacy).unwrap();
+        assert!(!materialization_ready(&reader).unwrap());
+        sync(&reader, None).expect("migrate the old record");
+        assert!(materialization_ready(&reader).unwrap());
+        let token = materialize::target_path(&reader.home, "token").unwrap();
+        assert_eq!(std::fs::read(&token).unwrap(), b"second-token");
+
+        // Stop at the same preparation/config boundary used by plain join,
+        // then make its second fetch fail. The old files are still intact.
+        let mut state = load_state(&reader).unwrap();
+        state.seq = 0;
+        state.digest = None;
+        state.membership = Stored::Plain;
+        prepare_materialization(&reader, &mut state).unwrap();
+        assert!(!materialization_ready(&reader).unwrap());
+        save_config(&reader, &original).unwrap();
+        std::fs::remove_file(&first).expect("remove only scratch vault");
+        assert!(sync(&reader, None).is_err());
+        assert!(!materialization_ready(&reader).unwrap());
+        assert_eq!(std::fs::read(&token).unwrap(), b"second-token");
+        fsx::write_atomic(&first, b"token=first-token\n", 0o600).expect("restore scratch vault");
+        sync(&reader, None).expect("finish the interrupted join");
+        assert!(materialization_ready(&reader).unwrap());
+        assert_eq!(std::fs::read(token).unwrap(), b"first-token");
+    }
+
+    #[test]
+    fn signed_source_binding_and_applied_digest_are_required_until_sync_repairs_them() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("team.vault");
+        let admin = Paths::for_home(&root.path().join("admin"));
+        create(&admin, source.to_str().unwrap(), None, Some("admin")).unwrap();
+        let opened = admin_open(&admin).unwrap();
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "token", b"intact-token")
+            .unwrap();
+        admin_publish(&admin, &opened, &doc).unwrap();
+        sync(&admin, None).unwrap();
+        assert!(materialization_ready(&admin).unwrap());
+        for missing_digest in [false, true] {
+            let mut legacy = load_state(&admin).unwrap();
+            if missing_digest {
+                legacy.digest = None;
+            } else {
+                legacy.source_identity = None;
+            }
+            legacy.failed = false;
+            save_state(&admin, &legacy).unwrap();
+            assert!(!materialization_ready(&admin).unwrap());
+            assert!(matches!(
+                sync(&admin, None).unwrap(),
+                SyncOutcome::Applied { .. }
+            ));
+            assert!(materialization_ready(&admin).unwrap());
+        }
+
+        let old_config = pinned(&admin);
+        let old_state = load_state(&admin).unwrap();
+        rotate(&admin);
+        let new_config = pinned(&admin);
+        assert_ne!(old_config.signer, new_config.signer);
+        assert!(
+            materialization_ready(&admin).unwrap(),
+            "one sync binds the new signer"
+        );
+        save_state(&admin, &old_state).unwrap();
+        assert!(
+            !materialization_ready(&admin).unwrap(),
+            "old signer binding cannot admit new config"
+        );
+
+        for replaced in [false, true] {
+            save_config(&admin, &old_config).unwrap();
+            let mut interrupted = old_state.clone();
+            if replaced {
+                interrupted.seq = 0;
+                interrupted.digest = None;
+            }
+            prepare_materialization(&admin, &mut interrupted).unwrap();
+            save_config(&admin, &new_config).unwrap();
+            assert!(!materialization_ready(&admin).unwrap());
+            sync(&admin, None).expect("resume after rotated or replaced config publication");
+            assert!(materialization_ready(&admin).unwrap());
+            assert_eq!(
+                load_state(&admin).unwrap().source_identity,
+                Some(source_identity(&new_config))
+            );
+        }
+    }
+
+    #[test]
+    fn materialization_readiness_tracks_failed_resumed_and_missing_files() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("team.secrets");
+        fsx::write_atomic(
+            &source,
+            b"token=inert-token\n~/.tool/token=inert-value\n",
+            0o600,
+        )
+        .expect("plain vault");
+        let reader = Paths::for_home(&root.path().join("reader"));
+        assert!(!materialization_ready(&reader).expect("unconfigured"));
+        assert!(!reader.dir.exists(), "a readiness check creates no state");
+        let blocked = materialize::target_path(&reader.home, "~/.tool/token").expect("target");
+        std::fs::create_dir_all(&blocked).expect("directory blocks the file");
+        assert!(matches!(
+            join_pinned(&reader, source.to_str().expect("utf-8"), "reader"),
+            JoinOutcome::Plain { .. }
+        ));
+        assert_eq!(
+            status(&reader).expect("status").membership,
+            Membership::Plain
+        );
+        assert!(load_state(&reader).expect("state").failed);
+        assert!(!materialization_ready(&reader).expect("partial sync"));
+
+        std::fs::remove_dir(&blocked).expect("remove only the test's empty directory");
+        sync(&reader, None).expect("retry same source");
+        assert!(materialization_ready(&reader).expect("complete sync"));
+
+        let token = materialize::target_path(&reader.home, "token").expect("token path");
+        std::fs::remove_file(&token).expect("remove test token");
+        let state_before = std::fs::read(reader.state_file()).expect("state before check");
+        assert!(!materialization_ready(&reader).expect("missing file"));
+        assert!(!token.exists(), "readiness must not repair the file");
+        assert_eq!(std::fs::read(reader.state_file()).unwrap(), state_before);
+        sync(&reader, None).expect("repair missing file");
+        assert!(materialization_ready(&reader).expect("repaired"));
+
+        fsx::write_atomic(&token, b"inert-local-edit", 0o600).expect("edit test token");
+        assert!(!materialization_ready(&reader).expect("changed file"));
     }
 
     /// Admit every machine that asked to join the vault `admin` opens.
@@ -3038,12 +3517,14 @@ mod tests {
             .pending
             .insert(gap.to_string(), materialize::digest_hex(b"vault-config\n"));
         save_state(&reader, &state).expect("saved");
+        assert!(!materialization_ready(&reader).expect("interrupted write"));
         assert!(matches!(
             sync(&reader, None).expect("sync again"),
             SyncOutcome::Applied { .. }
         ));
         assert_eq!(std::fs::read(&at).expect("filled"), b"vault-config\n");
         assert!(load_state(&reader).expect("state").pending.is_empty());
+        assert!(materialization_ready(&reader).expect("resumed write completed"));
     }
 
     /// A plain entry whose target was a directory when the pass looked, and is a gap by the

@@ -1317,7 +1317,30 @@ pub(crate) fn park_modal() -> ModalPark {
 fn park_modal_in(main: &'static MainWatch) -> ModalPark {
     let previous = main.current();
     beat_on(main, Breadcrumb::Modal);
-    ModalPark { main, previous }
+    advance_modal_epoch();
+    ModalPark {
+        main,
+        previous,
+        _main_thread: std::marker::PhantomData,
+    }
+}
+
+// Nested native modal loops can return with the same focused window they had
+// before opening. Timed offers must discard that inaccessible interval rather
+// than infer continuous focus from their two observations around the dialog.
+#[cfg(any(target_os = "macos", test))]
+thread_local! {
+    static MODAL_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn modal_epoch() -> u64 {
+    MODAL_EPOCH.get()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn advance_modal_epoch() {
+    MODAL_EPOCH.set(MODAL_EPOCH.get().wrapping_add(1));
 }
 
 /// The RAII half of [`park_modal`].
@@ -1325,12 +1348,14 @@ fn park_modal_in(main: &'static MainWatch) -> ModalPark {
 pub(crate) struct ModalPark {
     main: &'static MainWatch,
     previous: Breadcrumb,
+    _main_thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 #[cfg(any(target_os = "macos", test))]
 impl Drop for ModalPark {
     fn drop(&mut self) {
         beat_on(self.main, self.previous);
+        advance_modal_epoch();
     }
 }
 
@@ -1812,10 +1837,13 @@ mod tests {
         let _serial = beat_serial();
         beat_on(&WATCH, Breadcrumb::WindowEvent);
         let before = WATCH.heartbeat.load(Ordering::Relaxed);
+        let modal_before = modal_epoch();
         {
             let _park = park_modal_in(&WATCH);
             assert_eq!(WATCH.current(), Breadcrumb::Modal);
+            assert_eq!(modal_epoch(), modal_before.wrapping_add(1));
         }
+        assert_eq!(modal_epoch(), modal_before.wrapping_add(2));
         assert_eq!(WATCH.current(), Breadcrumb::WindowEvent);
         assert_eq!(WATCH.heartbeat.load(Ordering::Relaxed), before + 2);
     }

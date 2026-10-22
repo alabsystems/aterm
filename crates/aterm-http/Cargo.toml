@@ -16,6 +16,10 @@ description = "Deadline-bounded TLS stream verified against the OS trust store, 
 [dependencies]
 # `aterm_uds::deadline::TRUST`: the process's one gate for calls that wait on
 # macOS's trustd (`src/verifier/apple.rs`), shared with the PTY keeper's checks.
+# It is a PUBLIC dependency too: `aterm_uds::secret::Secret` is part of this
+# crate's API (`RequestBuilder::secret_header` takes one), and
+# `aterm_uds::secret::scrub` clears the rendered head after its write, so a
+# caller names the same aterm-uds.
 aterm-uds = { workspace = true }
 # TLS 1.3/1.2 with the `ring` provider.
 rustls = { workspace = true }

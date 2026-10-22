@@ -96,7 +96,8 @@ fn assert_retired(exe: &Path, form: &[&str]) {
 
 #[test]
 fn every_one_binary_route_to_the_retired_hook_is_a_silent_success() {
-    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+    let aterm = crate::launch_isolation::aterm_executable();
+    let aterm = aterm.as_path();
     for form in [
         &["hook", "run", "stop", "--state", "/nonexistent/aterm-link"][..],
         &["hook", "run"][..],
@@ -130,7 +131,8 @@ fn every_retired_hook_shape_through_the_alias_is_a_silent_success() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
     let alias = dir.join("aterm-link");
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_aterm"), &alias).expect("argv0 alias");
+    std::os::unix::fs::symlink(crate::launch_isolation::aterm_executable(), &alias)
+        .expect("argv0 alias");
     let state = dir.join("state");
     let state = state.to_string_lossy().into_owned();
     let input = br#"{"session_id":"s","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
@@ -177,7 +179,7 @@ fn every_retired_hook_shape_through_the_alias_is_a_silent_success() {
 #[test]
 fn a_bare_hook_word_is_still_refused() {
     let out = run(
-        Path::new(env!("CARGO_BIN_EXE_aterm")),
+        &crate::launch_isolation::aterm_executable(),
         &["hook", "walk", "stop"],
     );
     assert_eq!(out.status.code(), Some(2));

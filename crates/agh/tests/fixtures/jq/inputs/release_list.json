@@ -1,0 +1,51 @@
+[
+  {
+    "id": 190000105,
+    "tag_name": "v0.90.0",
+    "draft": false,
+    "prerelease": false,
+    "target_commitish": "main",
+    "created_at": "2026-09-20T09:00:00Z",
+    "published_at": "2026-09-20T10:00:00Z",
+    "assets": [
+      {"id": 300000501, "name": "aterm-appcast.toml", "size": 2000},
+      {"id": 300000502, "name": "aterm-appcast.toml.sig", "size": 88},
+      {"id": 300000503, "name": "aterm-0.90.0.dmg", "size": 47000000}
+    ]
+  },
+  {
+    "id": 190000104,
+    "tag_name": "v0.85.1",
+    "draft": true,
+    "prerelease": true,
+    "target_commitish": "release/0.85",
+    "created_at": "2026-08-10T09:00:00Z",
+    "published_at": null,
+    "assets": [
+      {"id": 300000401, "name": "aterm-appcast.toml", "size": 1990}
+    ]
+  },
+  {
+    "id": 190000103,
+    "tag_name": "v0.72.0",
+    "draft": false,
+    "prerelease": true,
+    "target_commitish": "main",
+    "created_at": "2026-06-01T09:00:00Z",
+    "published_at": "2026-06-01T11:00:00Z",
+    "assets": []
+  },
+  {
+    "id": 190000102,
+    "tag_name": "v0.71.0",
+    "draft": false,
+    "prerelease": false,
+    "target_commitish": "main",
+    "created_at": "2026-05-15T09:00:00Z",
+    "published_at": "2026-05-15T09:45:00Z",
+    "assets": [
+      {"id": 300000201, "name": "aterm-appcast.toml.sig", "size": 90},
+      {"id": 300000202, "name": "notes.txt", "size": 10}
+    ]
+  }
+]

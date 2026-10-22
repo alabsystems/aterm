@@ -376,3 +376,20 @@ fn tape_text_is_inert_and_round_trips_active_unicode() {
         "active display characters escaped in tape text: {active_output:?}"
     );
 }
+
+/// agh's tapes are a subset of atape-text 1 (design §21.3 of docs/DESIGN-agh-2026-10-19.md):
+/// a fixture agh recorded from GitHub reads here as effects alone, with no stamp, and renders
+/// back to the very same text. aterm-agent never links agh; it reads agh's file.
+#[test]
+fn agh_fixture_tape_is_atape_text() {
+    let text = include_str!("../../../../agh/tests/tapes/repo-view.atape");
+    let (header, items) = parse(text).expect("agh's tape reads as atape-text 1");
+    assert!(!items.is_empty());
+    for item in &items {
+        assert!(
+            matches!(item, Item::Effect { stamp: None, .. }),
+            "not a bare effect: {item:?}"
+        );
+    }
+    assert_eq!(render(header.as_deref(), &items), text);
+}

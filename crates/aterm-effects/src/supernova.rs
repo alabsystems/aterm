@@ -128,6 +128,7 @@ const _: () = {
 
 /// Decode the tier from the high half of the birth draw at a combo level;
 /// `level <= 1` uses the base windows.
+#[inline]
 #[must_use]
 pub fn tier_for(draw: u64, level: u32) -> SuperTier {
     let row = level.clamp(1, COMBO_EXTREME_LEVEL) as usize - 1;
@@ -141,6 +142,7 @@ pub fn tier_for(draw: u64, level: u32) -> SuperTier {
 
 /// Escalate the configured chance by combo level:
 /// `min(100, cfg + COMBO_CHANCE_STEP·(level − 1))`. `cfg == 0` stays 0.
+#[inline]
 #[must_use]
 pub fn combo_chance(cfg: u8, level: u32) -> u8 {
     if cfg == 0 {
@@ -151,6 +153,7 @@ pub fn combo_chance(cfg: u8, level: u32) -> u8 {
 }
 
 /// Total visible window per tier — the host's `nova_done` edge and ember start.
+#[inline]
 #[must_use]
 pub fn total_ms(tier: SuperTier) -> u64 {
     match tier {
@@ -174,6 +177,7 @@ pub const SUPER_RADIUS_ROWS: f32 = 6.0;
 /// The reach clamp in px: `min(6 rows · cell_h, grid_h / 2)`, floored at 1 px;
 /// the expression the engine's prepass resolves [`SuperEnv::r_max`] with. Keep
 /// every `r_max` producer, tests included, on it.
+#[inline]
 #[must_use]
 pub fn r_max_for(cell_h: i32, grid_h: i32) -> f32 {
     (SUPER_RADIUS_ROWS * cell_h.max(1) as f32)
@@ -276,6 +280,7 @@ struct QuadSink<'a> {
 }
 
 impl QuadSink<'_> {
+    #[inline]
     fn push(&mut self, x: i32, y: i32, w: i32, h: i32, premul: u32) {
         if w <= 0 || h <= 0 || premul == 0 || self.cell_h <= 0 {
             return;
@@ -315,6 +320,7 @@ impl QuadSink<'_> {
 }
 
 /// Premultiply a `0x00RRGGBB` color by coverage (single quantization point).
+#[inline]
 fn premul(color: u32, cov: f32) -> u32 {
     let a = cov.clamp(0.0, 1.0);
     let m = |sh: u32| ((((color >> sh) & 0xff) as f32) * a).round() as u32;
@@ -322,11 +328,13 @@ fn premul(color: u32, cov: f32) -> u32 {
 }
 
 /// `sin(π·e)` — one rise-and-fall, never periodic (flash-safety shape).
+#[inline]
 fn rise_fall(e: f32) -> f32 {
     (core::f32::consts::PI * e.clamp(0.0, 1.0)).sin()
 }
 
 /// `1 − (1 − q)²` ease-out (the nova shockwave curve).
+#[inline]
 fn ease_out(q: f32) -> f32 {
     let u = 1.0 - q.clamp(0.0, 1.0);
     1.0 - u * u
@@ -464,6 +472,9 @@ fn bound_additive_overlap(quads: &mut [GlowQuad]) {
 /// * each reading is the same order-independent `u32` sum (≤ 900 × 255 cannot
 ///   overflow; retirement only subtracts what was admitted).
 fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
+    if quads.is_empty() {
+        return 0;
+    }
     // Side permutations: the emitted `GlowQuad` order is observable (the GPU
     // parity suite byte-compares it), so `quads` is never reordered; the sweep
     // sorts reusable thread-local copies. In-bucket order does not matter.
@@ -477,6 +488,16 @@ fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
         by_row.sort_unstable_by_key(|q| q.row);
         let mut peak = 0u32;
         for row in by_row.chunk_by_mut(|a, b| a.row == b.row) {
+            if let [q] = row {
+                if q.w > 0 && q.h > 0 {
+                    let c = q.color;
+                    peak = peak
+                        .max((c >> 16) & 0xff)
+                        .max((c >> 8) & 0xff)
+                        .max(c & 0xff);
+                }
+                continue;
+            }
             // One bucket per cell row: admissions walk `row` by start edge,
             // retirements walk `by_end` by end edge; each y-band is one merge.
             row.sort_unstable_by_key(|q| q.x);
@@ -484,7 +505,10 @@ fn peak_additive_channel(quads: &[GlowQuad]) -> u32 {
             by_end.extend_from_slice(row);
             by_end.sort_unstable_by_key(|q| u32::from(q.x) + u32::from(q.w));
             let row = &*row;
-            for y_edge in row {
+            for (yi, y_edge) in row.iter().enumerate() {
+                if row[..yi].iter().any(|q| q.y == y_edge.y) {
+                    continue;
+                }
                 let py = u32::from(y_edge.y);
                 let mut sum = [0u32; 3];
                 let (mut i, mut j) = (0, 0);
@@ -542,6 +566,7 @@ fn max_channel(rgb: u32) -> u32 {
     ((rgb >> 16) & 0xff).max((rgb >> 8) & 0xff).max(rgb & 0xff)
 }
 
+#[inline]
 fn scale_rgb_floor(rgb: u32, numerator: u32, denominator: u32) -> u32 {
     debug_assert!(denominator > 0);
     let scale = |shift: u32| (((rgb >> shift) & 0xff) * numerator / denominator) << shift;
@@ -550,6 +575,7 @@ fn scale_rgb_floor(rgb: u32, numerator: u32, denominator: u32) -> u32 {
 
 /// Charge mote `k`'s px position at progress `p` (0..1): a spiral converging on
 /// the word centre, shared by the dark and light paths.
+#[inline]
 fn charge_mote_pos(env: &SuperEnv, k: usize, p: f32) -> (i32, i32) {
     let s = crate::genome::mix(env.seed ^ (k as u64).wrapping_mul(0xA24B_AED4_963E_E407));
     let ang = (s % 4096) as f32 / 4096.0 * core::f32::consts::TAU + p * 1.8; // gentle spiral
@@ -597,6 +623,8 @@ fn emit_ring_chords(sink: &mut QuadSink<'_>, env: &SuperEnv, r: f32, thick: f32,
     }
     let ro = r + 0.5 * thick;
     let ri = (r - 0.5 * thick).max(0.0);
+    let ro2 = ro * ro;
+    let ri2 = ri * ri;
     let extent = 2.0 * ro;
     let bands = if extent >= 2.0 * SUPER_RING_BANDS as f32 {
         SUPER_RING_BANDS
@@ -614,9 +642,10 @@ fn emit_ring_chords(sink: &mut QuadSink<'_>, env: &SuperEnv, r: f32, thick: f32,
         if dy.abs() >= ro {
             continue;
         }
-        let xo = (ro * ro - dy * dy).sqrt();
+        let dy2 = dy * dy;
+        let xo = (ro2 - dy2).sqrt();
         let xi = if dy.abs() < ri {
-            (ri * ri - dy * dy).sqrt()
+            (ri2 - dy2).sqrt()
         } else {
             0.0
         };
@@ -861,6 +890,7 @@ pub fn emit_super_decos(t_ms: u64, env: &SuperEnv, out: &mut Vec<WordDecoration>
 
 /// The population the eclipse bound governs, by blend and glyph: light-theme
 /// charge motes and debris are Over too but must not be darkened with the veil.
+#[inline]
 fn is_shade(d: &WordDecoration) -> bool {
     matches!(d.blend, DecoBlend::Over) && matches!(d.glyph, DecoGlyph::Shade)
 }

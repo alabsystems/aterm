@@ -73,6 +73,143 @@ fn file_uri(path: &std::path::Path) -> String {
 }
 
 #[test]
+fn configured_find_keys_navigate_the_editor_before_and_after_search_is_accepted() {
+    use crate::keybinding::Keybindings;
+    use crate::native_app::AppViewState;
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{
+        Key as WinitKey, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
+    };
+
+    fn press(app: &mut App, wid: WindowId, code: KeyCode, key: WinitKey, mods: ModifiersState) {
+        app.windows.get_mut(&wid).unwrap().mods = mods;
+        for state in [ElementState::Pressed, ElementState::Released] {
+            app.on_key(
+                wid,
+                KeyEvent::synthetic_for_test(
+                    PhysicalKey::Code(code),
+                    key.clone(),
+                    None,
+                    KeyLocation::Standard,
+                    state,
+                    false,
+                ),
+            );
+        }
+    }
+
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("find.txt");
+    let source = "α needle β needle γ needle";
+    fs::write(&path, source).unwrap();
+    let matches: Vec<_> = source
+        .match_indices("needle")
+        .map(|(at, text)| at..at + text.len())
+        .collect();
+    for (next, previous, code, key, mods) in [
+        (
+            "f3",
+            "shift+f3",
+            KeyCode::F3,
+            WinitKey::Named(NamedKey::F3),
+            ModifiersState::empty(),
+        ),
+        (
+            "cmd+g",
+            "cmd+shift+g",
+            KeyCode::KeyG,
+            WinitKey::Character(SmolStr::new("g")),
+            ModifiersState::SUPER,
+        ),
+    ] {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.keybindings = Keybindings::resolved(Some(
+            &[
+                (next.to_string(), "find_next".to_string()),
+                (previous.to_string(), "find_prev".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        app.search_last_query = "terminal-only".to_string();
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let original = app.document_store.snapshot(document).unwrap();
+        let selected = |app: &App| {
+            let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
+                panic!("editor view");
+            };
+            state.buffer.as_ref().unwrap().primary_selection().range()
+        };
+        press(&mut app, wid, code, key.clone(), mods);
+        assert_eq!(selected(&app), 0..0);
+        app.find_requested();
+        assert_eq!(
+            app.input(wid, InputEvent::Text("needle".to_string()), Source::Human),
+            InputOutcome::Ok
+        );
+        assert_eq!(selected(&app), matches[0]);
+        for accepted in [false, true] {
+            if accepted {
+                assert_eq!(
+                    app.input(
+                        wid,
+                        InputEvent::Key {
+                            key: Key::Named(aterm_types::keyboard::NamedKey::Enter),
+                            mods: Modifiers::empty(),
+                            base_layout: None,
+                            layout_text: None,
+                            event_type: KeyEventType::Press,
+                        },
+                        Source::Human
+                    ),
+                    InputOutcome::Ok
+                );
+            }
+            for (backward, index) in [(false, 1), (true, 0), (true, 2), (false, 0)] {
+                let held = if backward {
+                    mods | ModifiersState::SHIFT
+                } else {
+                    mods
+                };
+                press(&mut app, wid, code, key.clone(), held);
+                assert_eq!(
+                    selected(&app),
+                    matches[index],
+                    "{next}, accepted={accepted}, backward={backward}"
+                );
+            }
+        }
+        assert!(app.windows[&wid].search.is_none());
+        assert_eq!(app.search_last_query, "terminal-only");
+        let after = app.document_store.snapshot(document).unwrap();
+        assert_eq!(after.seq, original.seq);
+        assert_eq!(after.text, original.text);
+        assert!(app.open_settings_tab(SettingsRoute::Home));
+        press(&mut app, wid, code, key.clone(), mods);
+        press(
+            &mut app,
+            wid,
+            code,
+            key.clone(),
+            mods | ModifiersState::SHIFT,
+        );
+        assert_eq!(selected(&app), matches[0]);
+        assert!(app.windows[&wid].search.is_none());
+
+        app.switch_tab_in(wid, 0);
+        press(&mut app, wid, code, key, mods);
+        assert_eq!(
+            app.windows[&wid].search.as_ref().unwrap().query,
+            "terminal-only"
+        );
+    }
+}
+
+#[test]
 fn picker_path_opens_only_the_exact_local_document_grant() {
     let dir = std::env::temp_dir().join(format!(
         "aterm-native-picker-{}-{:?}",

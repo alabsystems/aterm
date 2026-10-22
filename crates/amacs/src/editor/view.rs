@@ -75,6 +75,9 @@ pub struct EditorBufferView {
     viewport_lines: usize,
     pub folds: Vec<Range<usize>>,
     pub minibuffer: Minibuffer,
+    /// The last accepted query belongs to this view, never to a terminal or
+    /// another editor view. Explicit next/previous can resume it after Enter.
+    pub(super) last_search_query: String,
     /// `set-mark-command` activates a persistent region anchor. Ordinary motion
     /// advances only `head` while this bit is set; document mutations and abort
     /// deactivate it. A non-empty pointer/Shift selection does not need this bit
@@ -105,6 +108,7 @@ impl EditorBufferView {
             viewport_lines: 4,
             folds: Vec::new(),
             minibuffer: Minibuffer::Inactive,
+            last_search_query: String::new(),
             mark_active: false,
             prefix_hud: None,
             desired_column: None,
@@ -124,6 +128,16 @@ impl EditorBufferView {
         self.selections
             .get(self.primary.min(self.selections.len().saturating_sub(1)))
             .unwrap_or(&NO_SELECTION)
+    }
+
+    pub fn has_search_query(&self) -> bool {
+        match &self.minibuffer {
+            Minibuffer::Search { query, .. } => {
+                !query.is_empty() || !self.last_search_query.is_empty()
+            }
+            Minibuffer::Inactive => !self.last_search_query.is_empty(),
+            _ => false,
+        }
     }
 
     /// The document sequence this view's coordinates are expressed at.
@@ -366,6 +380,11 @@ impl EditorBufferView {
             selection.rebase(deltas);
         }
         self.viewport_anchor = rebase_position(self.viewport_anchor, deltas);
+        if let Minibuffer::Search { origin, .. } | Minibuffer::GotoLine { origin, .. } =
+            &mut self.minibuffer
+        {
+            *origin = rebase_position(*origin, deltas);
+        }
         self.anchor_seq = seq;
         self.desired_column = None;
     }

@@ -16,11 +16,10 @@ type Held = (
     HeldSuccessor,
     aterm_uds::spawnfd::Child,
     aterm_uds::CtlStream,
-    Option<aterm_tempfile::TempDir>,
 );
 
-/// Binds a rendezvous (where production would, else in a private directory of
-/// the test's own, so the test runs on every host), dials it from a test
+/// Binds a rendezvous (where production binds it: in this test binary, a private
+/// directory of its own, so the test runs on every host), dials it from a test
 /// thread, accepts and holds the claim, and spawns `script` as the process the
 /// claim stands for.
 fn hold(script: &str) -> Held {
@@ -32,7 +31,8 @@ fn hold(script: &str) -> Held {
 /// interleaving.
 fn hold_with_stdin(script: &str, stdin: aterm_uds::spawnfd::Stdio) -> Held {
     let nonce = aterm_uds::rand::hex_token::<16>().expect("a rendezvous nonce");
-    let (rendezvous, short_dir) = crate::handoff_rendezvous::bind_anywhere_for_test(&nonce);
+    let rendezvous =
+        crate::handoff_rendezvous::Rendezvous::bind(&nonce).expect("bind a rendezvous");
     let path = rendezvous.path().to_path_buf();
     let secret = rendezvous.claim().to_string();
     let dialer = std::thread::spawn(move || {
@@ -69,7 +69,6 @@ fn hold_with_stdin(script: &str, stdin: aterm_uds::spawnfd::Stdio) -> Held {
         },
         child,
         stream,
-        short_dir,
     )
 }
 
@@ -178,7 +177,7 @@ fn a_successor_that_exits_on_eof_is_proven_gone_without_a_signal() {
     // The stand-in exits when the hook below closes its stdin, once the stand-down has revoked
     // and found it running: forced inside the grace, with no timing for the exit watch to beat
     // (a timed stand-in could exit before `CandidateExitWatch::watch` attached under load).
-    let (held, mut child, stream, _short_dir) =
+    let (held, mut child, stream) =
         hold_with_stdin(EXIT_ON_STDIN_EOF, aterm_uds::spawnfd::Stdio::piped());
     let mut stdin = Some(child.stdin.take().expect("piped stdin"));
     let reaper = reap_in_background(child);
@@ -225,7 +224,7 @@ const EXIT_ON_STDIN_EOF: &str = "read line; exit 0";
 /// queued the knote before the pid fell vacant.
 #[test]
 fn the_exit_between_the_witness_read_and_the_pid_probe_is_still_witnessed() {
-    let (held, mut child, stream, _short_dir) =
+    let (held, mut child, stream) =
         hold_with_stdin(EXIT_ON_STDIN_EOF, aterm_uds::spawnfd::Stdio::piped());
     let mut stdin = Some(child.stdin.take().expect("piped stdin"));
     let mut reaper = Some(reap_in_background(child));
@@ -280,7 +279,7 @@ fn the_exit_between_the_witness_read_and_the_pid_probe_is_still_witnessed() {
 /// before either read. The exit must still be witnessed.
 #[test]
 fn a_witness_the_hold_loop_already_read_still_names_the_exit_at_the_stand_down() {
-    let (held, mut child, stream, _short_dir) =
+    let (held, mut child, stream) =
         hold_with_stdin(EXIT_ON_STDIN_EOF, aterm_uds::spawnfd::Stdio::piped());
     drop(child.stdin.take().expect("piped stdin"));
     let status = reap_in_background(child).join().expect("reaper");
@@ -323,7 +322,7 @@ fn a_witness_the_hold_loop_already_read_still_names_the_exit_at_the_stand_down()
 /// the kill is ours, so the death is `Unobserved`.
 #[test]
 fn a_successor_that_ignores_eof_is_killed_after_the_grace_and_proven_gone() {
-    let (held, child, stream, _short_dir) = hold("sleep 30");
+    let (held, child, stream) = hold("sleep 30");
     let reaper = reap_in_background(child);
     let stood = super::stand_down_held_successor(held, std::time::Duration::from_millis(200));
     assert!(
@@ -362,7 +361,7 @@ fn a_successor_that_ignores_eof_is_killed_after_the_grace_and_proven_gone() {
 #[test]
 fn a_held_successor_the_machine_killed_has_its_counted_launch_given_back() {
     use std::os::unix::process::ExitStatusExt as _;
-    let (held, mut child, _stream, _short_dir) = hold_with_stdin(
+    let (held, mut child, _stream) = hold_with_stdin(
         "read line; kill -KILL $$",
         aterm_uds::spawnfd::Stdio::piped(),
     );
@@ -383,15 +382,11 @@ fn a_held_successor_the_machine_killed_has_its_counted_launch_given_back() {
     );
 }
 
-/// A bound rendezvous (where production would, else in a private directory of
-/// the test's own, returned beside it for the test to hold), so the test runs
-/// on every host.
-fn bind_rendezvous() -> (
-    crate::handoff_rendezvous::Rendezvous,
-    Option<aterm_tempfile::TempDir>,
-) {
+/// A bound rendezvous, where production binds it (in this test binary, a
+/// private directory of its own: `handoff_rendezvous::rendezvous_dir_candidate`).
+fn bind_rendezvous() -> crate::handoff_rendezvous::Rendezvous {
     let nonce = aterm_uds::rand::hex_token::<16>().expect("a rendezvous nonce");
-    crate::handoff_rendezvous::bind_anywhere_for_test(&nonce)
+    crate::handoff_rendezvous::Rendezvous::bind(&nonce).expect("bind a rendezvous")
 }
 
 /// A launched successor that never dials: alive until killed.
@@ -428,7 +423,7 @@ fn assert_the_undialled_stand_down_licenses_the_retire(steps: &[StandDownStep]) 
 #[test]
 fn a_successor_undialled_at_the_dial_deadline_is_killed_and_proven_gone_before_the_retire() {
     use std::os::unix::process::ExitStatusExt as _;
-    let (rendezvous, _short_dir) = bind_rendezvous();
+    let rendezvous = bind_rendezvous();
     let child = never_dials();
     let pid = child.id();
     let reaper = reap_in_background(child);
@@ -529,7 +524,7 @@ fn the_undialled_ends_retire_only_over_a_successor_proven_gone() {
             crate::UpdateHandoffOutcome::TimedOut,
         ),
     ] {
-        let (rendezvous, _short_dir) = bind_rendezvous();
+        let rendezvous = bind_rendezvous();
         let child = never_dials();
         let pid = child.id();
         let reaper = reap_in_background(child);
@@ -581,7 +576,7 @@ fn the_undialled_ends_retire_only_over_a_successor_proven_gone() {
 /// does: the arm retired at once over the running stand-in.
 #[test]
 fn a_successor_undialled_at_the_cancel_is_named_by_its_launch_stamp() {
-    let (rendezvous, _short_dir) = bind_rendezvous();
+    let rendezvous = bind_rendezvous();
     let child = never_dials();
     let pid = child.id();
     let birth = super::read_candidate_birth(pid).expect("a live child's birth stamp");
@@ -634,7 +629,7 @@ fn a_successor_undialled_at_the_cancel_is_named_by_its_launch_stamp() {
 /// and nothing is claimed.
 #[test]
 fn an_undialled_successor_reported_gone_is_not_signalled_and_an_unnamed_one_is_not_claimed() {
-    let (rendezvous, _short_dir) = bind_rendezvous();
+    let rendezvous = bind_rendezvous();
     let in_flight = crate::app_launch_successor::LaunchInFlight::scripted(None);
     in_flight.answer_for_test(
         crate::app_launch_successor::LaunchInFlight::admitted_for_test(
@@ -685,7 +680,7 @@ fn an_undialled_successor_reported_gone_is_not_signalled_and_an_unnamed_one_is_n
         StandDownStep::Reap,
     ]);
 
-    let (rendezvous, _short_dir) = bind_rendezvous();
+    let rendezvous = bind_rendezvous();
     let end = super::stand_down_undialled_successor(
         rendezvous,
         &crate::app_launch_successor::LaunchInFlight::scripted(None),

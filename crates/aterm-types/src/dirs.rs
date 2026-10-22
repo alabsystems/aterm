@@ -380,8 +380,8 @@ pub fn not_own_account_with(
 }
 
 /// aterm's own STATE root — where it keeps what it owns across launches (the
-/// harness state, the document journal, the session identities, the workers'
-/// tasks). ONE rule, so every state reader agrees on the directory:
+/// harness state, the document journal, the workers' tasks). ONE rule, so
+/// every state reader agrees on the directory:
 ///
 /// - in a development build only, the `ATERM_STATE_HOME` seam
 ///   ([`crate::dev_seam!`], absolute; a relative value is refused as `None`,
@@ -560,13 +560,6 @@ pub fn resolve_logs_dir(
         let _ = platform;
         None
     }
-}
-
-/// Where session identities live: `<state_dir>/identities/<name>/`, each holding the agents'
-/// relocated config dirs (`.claude/`, `.codex/`, …; see `aterm_primer::agent_homes`).
-#[must_use]
-pub fn identities_dir() -> Option<PathBuf> {
-    state_dir().map(|state| state.join("identities"))
 }
 
 #[cfg(test)]
@@ -943,7 +936,6 @@ mod tests {
         assert_eq!(state_dir(), Some(want_state.clone()));
         assert_eq!(aterm_data_dir(), Some(want_state.clone()));
         assert_eq!(logs_dir(), Some(want_state.join("logs")));
-        assert_eq!(identities_dir(), Some(want_state.join("identities")));
         assert_eq!(data_dir(), Some(root.join("data")));
         assert!(runs_under_private_state_root());
         let config = std::env::var_os("XDG_CONFIG_HOME")

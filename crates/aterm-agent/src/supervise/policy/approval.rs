@@ -650,6 +650,13 @@ pub struct ApprovalCtx {
     /// trust root — never a folder beneath it, and no other session's
     /// ([`RULE_TRUST_DIALOG`]). `None` for every session no such spawn started.
     pub trusted_cwd: Option<PathBuf>,
+    /// THE AGENT A WORKER'S SPAWN STARTED ON THIS SESSION (`spawn
+    /// agent=<word>`, `meta`'s `worker=`), whose first prompt — its task — is
+    /// in its argv. A Gemini CLI worker's folder-trust dialog is never
+    /// pressed, by the safe rules or full power: its `Trust folder` relaunches
+    /// the CLI with that argv, and the task would be sent again
+    /// ([`gemini_worker_trust`]). `None` for every session no spawn started.
+    pub worker_agent: Option<Program>,
     /// Where a Read box may read ([`RULE_READ_OUTSIDE_CWD`]): the trust
     /// roots and the system roots ([`Self::new`]).
     pub read_roots: Vec<ScratchRoot>,
@@ -787,6 +794,7 @@ impl ApprovalCtx {
             login_method: None,
             trust_roots: Vec::new(),
             trusted_cwd: None,
+            worker_agent: None,
             read_roots: Vec::new(),
             scratch_roots,
             rm_breaker_warn: !defaults.rm_breaker_ask,
@@ -1741,8 +1749,10 @@ const TALL_RM_PATHS: &str = "its paths written as literal absolute paths (a comm
 /// ([`yes_no_to_proceed`]), with the rm rule's roots present, is declined
 /// ([`decline`], [`RULE_TALL_BOX`]) — the plain `No` with a reason, which
 /// settles nothing and whatever the cut title — telling the worker to rerun
-/// the quoted part alone with literal paths ([`TALL_RM_PATHS`]). Everything
-/// else is handed over with `why`.
+/// the quoted part alone with literal paths ([`TALL_RM_PATHS`]), or, under a
+/// breaker the vendor drew because it could not rule an rm out
+/// ([`breaker_not_ruled_out`]), to split the line. Everything else is handed
+/// over with `why`.
 fn tall_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, why: String) -> Decision {
     let handed_over = |not: Option<String>| {
         Decision::escalate(match not {
@@ -1773,13 +1783,23 @@ fn tall_box(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, why: String) 
     if let Err(not) = yes_no_to_proceed(prompt, rows) {
         return handed_over(Some(not));
     }
-    let fix = format!(
-        "Run {} on its own as a short command, separate from the rest, {TALL_RM_PATHS}",
-        quoted_invocation(&note).map_or_else(
-            || "the removal".to_string(),
-            |inv| format!("`{}`", clip(inv, DECLINE_WHY_CHARS))
+    // A breaker by which the vendor could not rule an rm out is drawn over a
+    // command that may name none: the line is to be split, not a removal
+    // pulled out of it.
+    let fix = if rm_breaker_of(&note).is_some_and(|b| breaker_not_ruled_out(&b)) {
+        format!(
+            "Split it into shorter commands with fewer substitutions, run one at a time, any \
+             removal among them on its own, {TALL_RM_PATHS}"
         )
-    );
+    } else {
+        format!(
+            "Run {} on its own as a short command, separate from the rest, {TALL_RM_PATHS}",
+            quoted_invocation(&note).map_or_else(
+                || "the removal".to_string(),
+                |inv| format!("`{}`", clip(inv, DECLINE_WHY_CHARS))
+            )
+        )
+    };
     let text = decline_text("this command", TALL_WHY, &fix);
     let subject = format!("a box taller than the screen, its note: {note}");
     decline(RULE_TALL_BOX, prompt, text, subject).unwrap_or_else(|not| handed_over(Some(not)))
@@ -1816,9 +1836,19 @@ fn quoted_invocation(note: &str) -> Option<&str> {
 }
 
 /// The safe rules alone ([`Approve::Safe`]): the rule for the box's kind,
-/// or an escalation. They judge Claude Code's boxes alone.
+/// or an escalation. They judge Claude Code's boxes, and of another
+/// harness's only its folder-trust dialog in the one folder a worker's
+/// starter trusted for it ([`spawned_trust`]).
 fn decide_safe(reading: &Reading, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     if !draws_claude_boxes(reading.program) {
+        if let Some(prompt) = reading.prompt.as_ref()
+            && prompt.kind == PromptKind::Trust
+            && reading.phase == Phase::Prompt
+            && reading.phase_authoritative
+            && reading.program.supervisable()
+        {
+            return spawned_trust(reading.program, prompt, rows, ctx);
+        }
         return Decision::escalate(format!(
             "{} session's box: the safe rules judge Claude Code's boxes",
             a_or_an(reading.program.name())
@@ -2277,7 +2307,11 @@ fn resolvable_breaker(b: &RmBreaker) -> Result<(), String> {
 
 /// The vendor's rm/rmdir breaker as a reason names it, in the note's own words
 /// (`the rm circuit breaker (statically-unresolvable target)`). The words are
-/// aterm-phase's anchors.
+/// aterm-phase's anchors. The two kinds by which the vendor could not rule an
+/// rm out ([`RmBreakerKind::TooManySubstitutions`],
+/// [`RmBreakerKind::NestedUnanalyzed`]) say so, and that the command need not
+/// name rm: 2.1.307 draws them over commands with none (MEASURED, `echo` and
+/// 65 `$(true)`).
 pub fn rm_breaker_label(b: &RmBreaker) -> String {
     let id = match b.kind {
         RmBreakerKind::EmptyVariable {
@@ -2290,7 +2324,9 @@ pub fn rm_breaker_label(b: &RmBreaker) -> String {
         RmBreakerKind::CriticalPath => "box.rm_breaker.critical_path",
         RmBreakerKind::WorkingDirectory => "box.rm_breaker.working_dir",
         RmBreakerKind::DriveRoot => "box.rm_breaker.drive_root",
+        RmBreakerKind::MountedDrivePath => "box.rm_breaker.mounted_drive",
         RmBreakerKind::TooManySubstitutions => "box.rm_breaker.too_many",
+        RmBreakerKind::NestedUnanalyzed => "box.rm_breaker.nested_unanalyzed",
     };
     let why = anchor(id)
         .trim()
@@ -2301,7 +2337,24 @@ pub fn rm_breaker_label(b: &RmBreaker) -> String {
         RmCommand::Rm => "rm",
         RmCommand::Rmdir => "rmdir",
     };
+    if breaker_not_ruled_out(b) {
+        let not_ruled_out = anchor("box.rm_breaker.not_ruled_out").trim();
+        return format!(
+            "the {command} circuit breaker ({not_ruled_out}: {why}; the command need not name \
+             {command})"
+        );
+    }
     format!("the {command} circuit breaker ({why})")
+}
+
+/// Whether this breaker is one by which the vendor could not rule a removal
+/// out (its analysis gave up), not one that found a removal: such a box is
+/// drawn whether or not the command names rm (2.1.307 on).
+fn breaker_not_ruled_out(b: &RmBreaker) -> bool {
+    matches!(
+        b.kind,
+        RmBreakerKind::TooManySubstitutions | RmBreakerKind::NestedUnanalyzed
+    )
 }
 
 /// A breaker box's escalation `reason` with its kind named once: unchanged if
@@ -2767,6 +2820,152 @@ fn trust_dialog(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisi
     }
 }
 
+/// ANOTHER HARNESS'S FOLDER-TRUST DIALOG ON A WORKER ([`RULE_TRUST_DIALOG`],
+/// `spawn agent=agy|muse`): agy's (`Do you trust the contents of this
+/// project?`) and Muse Code's (`Do you trust this workspace?`), answered by
+/// the safe rules ONLY in the one folder the session's starter trusted for it
+/// ([`ApprovalCtx::trusted_cwd`], the spawn's `cwd=`), and only while the
+/// session stands there — never under a trust root, which was measured on
+/// Claude Code's dialog alone ([`trust_dialog`]). The folder is the one the
+/// dialog names, by its path, whose row guards the press. Its trust option
+/// alone is chosen; the other options must each exit or refuse. GEMINI CLI'S
+/// IS NEVER PRESSED HERE: its dialog names its folder by the last component
+/// alone (`Trust folder (<name>)`), which another folder of that name shares,
+/// and its `Trust folder` relaunches it with its argv — a worker's task —
+/// which would be sent again ([`gemini_worker_trust`]). Its worker's line
+/// trusts the spawn's folder by a trusted-folders file of its own
+/// (`harness::worker`), so in that folder it draws none.
+fn spawned_trust(
+    program: Program,
+    prompt: &PromptV2,
+    rows: &[String],
+    ctx: &ApprovalCtx,
+) -> Decision {
+    let product = program.product();
+    if relaunches_at_trust(program) {
+        return Decision::escalate(format!(
+            "{product}'s folder-trust dialog: it names no folder by its path, and its `Trust \
+             folder` relaunches it with its first prompt"
+        ));
+    }
+    if !ctx.cwd_known {
+        return Decision::escalate(format!(
+            "{product}'s folder-trust dialog with the session's cwd unknown (meta cwd=-)"
+        ));
+    }
+    let Some(trusted) = ctx
+        .trusted_cwd
+        .as_deref()
+        .and_then(|dir| abs_components(&dir.to_string_lossy()))
+    else {
+        return Decision::escalate(format!(
+            "{product}'s folder-trust dialog: no folder its starter trusted for this session"
+        ));
+    };
+    if abs_components(&ctx.cwd.to_string_lossy()).as_deref() != Some(trusted.as_slice()) {
+        return Decision::escalate(format!(
+            "{product}'s folder-trust dialog: the session's cwd {} is not the folder its \
+             starter trusted",
+            ctx.cwd.display()
+        ));
+    }
+    let trust: Vec<usize> = (0..prompt.options.len())
+        .filter(|&k| prompt.options[k].role == Role::Trust)
+        .collect();
+    let [target] = trust.as_slice() else {
+        return Decision::escalate(format!(
+            "{product}'s folder-trust dialog with no single trust option"
+        ));
+    };
+    let target = *target;
+    if let Some(o) = prompt
+        .options
+        .iter()
+        .find(|o| !matches!(o.role, Role::Trust | Role::Exit | Role::Deny))
+    {
+        return Decision::escalate(format!(
+            "{product}'s folder-trust dialog with an option that neither trusts this folder nor \
+             exits (`{}` {})",
+            o.label,
+            o.role.name()
+        ));
+    }
+    let (top, bottom) = prompt.span;
+    let span = (top..=bottom.min(rows.len().saturating_sub(1))).filter(|&k| k < rows.len());
+    let Some(path) = prompt.path.as_deref() else {
+        return Decision::escalate(format!("{product}'s folder-trust dialog with no folder"));
+    };
+    let comps = match resolve_abs(path, ctx.home.as_deref()) {
+        Ok(c) => c,
+        Err(why) => {
+            return Decision::escalate(format!("{product}'s folder-trust dialog for {why}"));
+        }
+    };
+    if comps != trusted {
+        return Decision::escalate(format!(
+            "{product}'s folder-trust dialog for {path}, not the folder its starter trusted"
+        ));
+    }
+    let Some(row) = span.clone().find(|&k| rows[k].trim_end().ends_with(path)) else {
+        return Decision::escalate(format!(
+            "{product}'s folder-trust dialog: the folder's row is not on the screen"
+        ));
+    };
+    let choice = match prompt.select {
+        Select::Digits => match prompt.options[target].n {
+            Some(n) => Choice::Digit(n),
+            None => return Decision::escalate("a numbered dialog with an unnumbered option"),
+        },
+        Select::ArrowsEnter => {
+            let Some(at) = prompt.options.iter().position(|o| o.focused) else {
+                return Decision::escalate(format!(
+                    "{product}'s folder-trust dialog with no focused option"
+                ));
+            };
+            Choice::Focus {
+                steps: focus_steps(at, target),
+                label: prompt.options[target].label.clone(),
+            }
+        }
+    };
+    Decision::Approve {
+        rule_id: RULE_TRUST_DIALOG,
+        choice,
+        guard: row_guard(&rows[row]),
+        subject: path.to_string(),
+        unproven: None,
+    }
+}
+
+/// A GEMINI CLI WORKER'S FOLDER-TRUST DIALOG, which nothing presses — not
+/// full power's [`RULE_TRUST_ANY`] either: on a session a spawn started
+/// Gemini CLI on ([`ApprovalCtx::worker_agent`]), the CLI's argv holds the
+/// worker's task as its first prompt, its `Trust folder` relaunches it with
+/// that argv (bundle 0.46.0: `relaunchApp` once the trust changes), and the
+/// prompt it submitted while the dialog stood would be sent a second time. A
+/// person answers it. `None` for any other box or session.
+fn gemini_worker_trust(program: Program, p: &PromptV2, ctx: &ApprovalCtx) -> Option<String> {
+    (relaunches_at_trust(program)
+        && p.kind == PromptKind::Trust
+        && ctx.worker_agent.is_some_and(relaunches_at_trust))
+    .then(|| {
+        "Gemini CLI's folder-trust dialog on a worker: its `Trust folder` relaunches it with \
+         its task, which would be sent again"
+            .to_string()
+    })
+}
+
+/// Whether `program`'s `Trust folder` relaunches it with its argv — its
+/// first prompt with it (Gemini CLI 0.46.0's `relaunchApp` once the trust
+/// changes): a worker's task would be sent again ([`spawned_trust`],
+/// [`gemini_worker_trust`]).
+fn relaunches_at_trust(program: Program) -> bool {
+    match program {
+        Program::Gemini => true,
+        Program::Claude | Program::Codex | Program::Agy | Program::Muse | Program::Generic => false,
+    }
+}
+
 /// The most rows of one backstop warning's list [`backstop_warnings`]
 /// names; the rest are counted.
 const BACKSTOP_ROWS: usize = 10;
@@ -2908,6 +3107,9 @@ fn full_power(reading: &Reading, rows: &[String], ctx: &ApprovalCtx, safe: Strin
         return Decision::escalate(safe);
     };
     if let Some(why) = unmeasured_box(reading.program, p) {
+        return Decision::escalate(format!("{why} (the safe rules: {safe})"));
+    }
+    if let Some(why) = gemini_worker_trust(reading.program, p, ctx) {
         return Decision::escalate(format!("{why} (the safe rules: {safe})"));
     }
     if p.kind == PromptKind::Other

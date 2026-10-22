@@ -1,0 +1,5 @@
+[
+  {"name": "main", "commit": {"sha": "0123456789abcdef0123456789abcdef01234567", "url": "https://api.github.com/repos/fixture-dev/packs/commits/0123456789abcdef0123456789abcdef01234567"}, "protected": true},
+  {"name": "parity_journal", "commit": {"sha": "89abcdef0123456789abcdef0123456789abcdef", "url": "https://api.github.com/repos/fixture-dev/packs/commits/89abcdef0123456789abcdef0123456789abcdef"}, "protected": false},
+  {"name": "release/0.85", "commit": {"sha": "fedcba9876543210fedcba9876543210fedcba98", "url": "https://api.github.com/repos/fixture-dev/packs/commits/fedcba9876543210fedcba9876543210fedcba98"}, "protected": false}
+]

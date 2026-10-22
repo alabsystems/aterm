@@ -62,6 +62,7 @@ pub(super) fn erase_poof_drive(mom: f32, cells: u16) -> f32 {
 impl CursorGlow {
     /// A non-typing move slams the flare, except a fire jump (its meteor carries
     /// the drama) and a pure navigation move (no light).
+    #[inline]
     pub(super) fn retire_abandoned_light(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
             typing,
@@ -136,6 +137,7 @@ impl CursorGlow {
     }
 
     /// Per-style birth brightness for a typing spark (1.0 on the jump path).
+    #[inline]
     pub(super) fn birth_boost(&self, mv: &MoveCtx) -> f32 {
         let &MoveCtx { cfg, typing, .. } = mv;
         if typing {
@@ -278,7 +280,8 @@ impl CursorGlow {
         now: Instant,
         geom: Geom,
     ) {
-        let snuffed = |row: u16, col: u16| row != cr || (back_leap && col > cc.saturating_add(1));
+        let cc_plus_1 = cc.saturating_add(1);
+        let snuffed = |row: u16, col: u16| row != cr || (back_leap && col > cc_plus_1);
         for s in &mut self.sparks {
             if snuffed(s.row, s.col) {
                 let age = now.saturating_duration_since(s.born).as_secs_f32();
@@ -301,10 +304,13 @@ impl CursorGlow {
         geom: Geom,
         within_s: f32,
     ) {
+        if self.particles.is_empty() {
+            return;
+        }
         let (oy, chf) = (f32::from(geom.origin_y), geom.ch as f32);
+        let cr_i32 = i32::from(cr);
         for p in &mut self.particles {
-            let prow = ((p.y0 - oy) / chf).floor() as i32;
-            if prow != i32::from(cr) || back_leap {
+            if back_leap || ((p.y0 - oy) / chf).floor() as i32 != cr_i32 {
                 let age = now.saturating_duration_since(p.born).as_secs_f32();
                 p.life = p.life.min(age + within_s);
             }
@@ -1215,6 +1221,7 @@ impl CursorGlow {
     }
 
     /// Append a bolt, evicting the oldest once [`Self::MAX_BOLTS`] are live.
+    #[inline]
     pub(super) fn push_bolt(&mut self, b: Bolt) {
         if self.bolts.len() >= Self::MAX_BOLTS {
             self.bolts.remove(0);
@@ -1429,6 +1436,7 @@ impl CursorGlow {
     /// this frame; an unprobed frame keeps the previous truth. The content
     /// witnesses' neighbour captures rotate with it, so metadata and buffers
     /// stay one unit.
+    #[inline]
     pub(super) fn rotate_row_probe(&mut self) {
         if self.row_cur_meta.is_some() {
             std::mem::swap(&mut self.row_prev, &mut self.row_cur);

@@ -41,6 +41,7 @@ struct BareFixture {
 }
 
 fn bare_fixture(name: &str) -> BareFixture {
+    static BUILT: crate::template::Template<(String, String)> = crate::template::Template::new();
     let parent = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("release-lease");
     std::fs::create_dir_all(&parent).expect("create lease fixture");
     let dir = aterm_tempfile::Builder::new()
@@ -48,6 +49,20 @@ fn bare_fixture(name: &str) -> BareFixture {
         .tempdir_in(parent)
         .expect("create lease fixture");
     let root = dir.path();
+    let (owner_a, owner_b) = BUILT.lay(root, build_bare);
+    BareFixture {
+        repo_a: root.join("publisher-a"),
+        repo_b: root.join("publisher-b"),
+        owner_a,
+        owner_b,
+        _root: dir,
+    }
+}
+
+/// [`bare_fixture`]'s tree, built from nothing under `root` (once per process,
+/// [`crate::template::Template`]): a bare origin holding two claim
+/// commits and two clones of it; the two commits.
+fn build_bare(root: &Path) -> (String, String) {
     let remote = root.join("origin.git");
     let seed = root.join("seed");
     assert!(
@@ -110,13 +125,9 @@ fn bare_fixture(name: &str) -> BareFixture {
         );
         path
     };
-    BareFixture {
-        repo_a: clone("publisher-a"),
-        repo_b: clone("publisher-b"),
-        owner_a: first,
-        owner_b: second,
-        _root: dir,
-    }
+    clone("publisher-a");
+    clone("publisher-b");
+    (first, second)
 }
 
 /// Pause same-claim sessions after both observed the same fence token (or

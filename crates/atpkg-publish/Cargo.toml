@@ -28,6 +28,8 @@ test = false
 # admission and object scan, and the toolchain lease are its library functions — never
 # a copy. Pack-time relocation and the LINEAGE stamp are producer-only (artifact::).
 atpkg = { workspace = true }
+# The release host over agh (host::agh::AghHost): its read half in M1, used by tests only.
+agh = { workspace = true }
 # The signer as a library: `sign`/`pubkey_b64` over the machine key, `verify_signed` for
 # an ALab release's SHA256SUMS, and (tests) `generate` + `roster_ops`.
 atpkg-keys = { workspace = true }
@@ -60,6 +62,8 @@ aterm-digest = { workspace = true }
 aterm-tempfile = { workspace = true }
 
 [dev-dependencies]
+# The loopback GitHub the read contract drives AghHost against.
+agh-fake = { workspace = true }
 # The derived `AtpkgIndexPublishWalk` model, whose writer half drives the index's
 # compare-and-swap (tests/channel/).
 aterm-spec = { workspace = true }

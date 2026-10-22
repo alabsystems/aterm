@@ -19,8 +19,8 @@ use atpkg_publish::lane::report::Transcript;
 use atpkg_publish::lane::state::LaneState;
 use atpkg_publish::triple::{AARCH64_APPLE_DARWIN as ARM, X86_64_APPLE_DARWIN as X86};
 
-use super::super::shared::{Made, made_once};
-use super::fixture::{self, Fx, Release, git};
+use super::super::shared::{Made, made_once, scratch};
+use super::fixture::{self, Fx, Held, Release, git};
 
 /// The shell suite's world: index 5 pins ay 2, nn 2, trust-ir 1, trust 5, trust-mc 4 and
 /// carries a claude pin. ay's newest SIGNED release is v0.2.0 (build 3) beside a prerelease
@@ -48,7 +48,12 @@ fn at(history: &[String], build: u64) -> &str {
 
 impl World {
     fn new(label: &str) -> Self {
-        let fx = Fx::new(label);
+        Self::new_at(scratch(label))
+    }
+
+    /// [`World::new`] in `tmp`.
+    fn new_at(tmp: aterm_tempfile::TempDir) -> Self {
+        let fx = Fx::at(tmp);
         let (_, ay) = fx.dev_repo("ay", 4);
         fx.release("ay", "v0.1.0", at(&ay, 2), Release::GOOD);
         fx.release("ay", "v0.2.0", at(&ay, 3), Release::GOOD);
@@ -89,6 +94,10 @@ impl World {
                 ("claude", 2_026_090_101),
             ],
         );
+        Self::of(fx)
+    }
+
+    fn of(fx: Fx) -> Self {
         let opts = Options::new(&fx.ctx, false);
         Self {
             fx,
@@ -98,14 +107,25 @@ impl World {
     }
 
     /// [`World::new`], run until every program sits at its pin: ay packed and pinned, the
-    /// person's trust bundle landed, the rustc group moved (head 7).
+    /// person's trust bundle landed, the rustc group moved (head 7). Two runs of the lane
+    /// (about 90 git processes), so it is made once per process, by the first caller in its
+    /// own directory, and laid down for every caller after ([`Fx::laid`]).
     fn settled(label: &str) -> Self {
-        let w = Self::new(label);
-        ok(w.run(false));
-        w.fx.stage("trust", 7, &[ARM]);
-        let (o, _) = ok(w.run(false));
-        assert_eq!(o.published, Some(7));
-        w
+        static MADE: Made<(), Held> = Mutex::new(BTreeMap::new());
+        let mut tmp = Some(scratch(label));
+        let dir = tmp.as_ref().expect("a scratch dir").path().to_path_buf();
+        let mut made = None;
+        let held = made_once(&MADE, &(), &dir, |_| {
+            let w = Self::new_at(tmp.take().expect("a scratch dir"));
+            ok(w.run(false));
+            w.fx.stage("trust", 7, &[ARM]);
+            let (o, _) = ok(w.run(false));
+            assert_eq!(o.published, Some(7));
+            let held = w.fx.held();
+            made = Some(w);
+            held
+        });
+        made.unwrap_or_else(|| Self::of(Fx::laid(tmp.take().expect("a scratch dir"), &held)))
     }
 
     fn dev(&self, repo: &str) -> PathBuf {

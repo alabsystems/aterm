@@ -747,15 +747,21 @@ impl ClassicWake {
         let mut scratch = std::mem::take(&mut self.bed_scratch);
         scratch.inks.clear();
         scratch.rails.clear();
+        let mut last: Option<(u32, u32, u32)> = None;
         for run in &self.comet_runs[..live] {
             for s in run {
                 let rgb = self.comet_color(cfg, s.pos);
-                scratch.inks.push(crate::cursor_glow::dark_bed_ink(
-                    rgb, page, budget, shape.sat,
-                ));
-                scratch
-                    .rails
-                    .push(crate::rainbow_kitty::ribbon::rail_ink(rgb & 0x00FF_FFFF));
+                let (bed_c, rail_c) = match last {
+                    Some((prev, b, r)) if prev == rgb => (b, r),
+                    _ => {
+                        let b = crate::cursor_glow::dark_bed_ink(rgb, page, budget, shape.sat);
+                        let r = crate::rainbow_kitty::ribbon::rail_ink(rgb & 0x00FF_FFFF);
+                        last = Some((rgb, b, r));
+                        (b, r)
+                    }
+                };
+                scratch.inks.push(bed_c);
+                scratch.rails.push(rail_c);
             }
         }
         lay_dark_bed(
@@ -881,16 +887,29 @@ impl ClassicWake {
             ..ground
         };
         let mut verts = std::mem::take(&mut self.light_verts);
+        let mut last_ink: Option<(u32, u32)> = None;
         for run in &self.comet_runs[..live] {
             if under.len() >= Self::MAX_QUADS {
                 break;
             }
             verts.clear();
-            let ink = |s: &CometSample| BeamVertex {
-                x: s.x,
-                y: s.y + drop,
-                color: ground.body_ink(self.comet_color(cfg, s.pos)),
-                cov: (f32::from(s.cov) * Self::LIGHT_STROKE_GAIN).min(LIGHT_BODY_ALPHA_CAP) as u8,
+            let mut ink = |s: &CometSample| {
+                let raw = self.comet_color(cfg, s.pos);
+                let color = match last_ink {
+                    Some((prev, c)) if prev == raw => c,
+                    _ => {
+                        let c = ground.body_ink(raw);
+                        last_ink = Some((raw, c));
+                        c
+                    }
+                };
+                BeamVertex {
+                    x: s.x,
+                    y: s.y + drop,
+                    color,
+                    cov: (f32::from(s.cov) * Self::LIGHT_STROKE_GAIN).min(LIGHT_BODY_ALPHA_CAP)
+                        as u8,
+                }
             };
             match run.as_slice() {
                 [] => continue,

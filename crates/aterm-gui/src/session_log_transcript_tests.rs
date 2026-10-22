@@ -816,6 +816,7 @@ fn set_rollout_claim(ctx: &crate::SessionCtx, target: &crate::self_claim::Rollou
                 cwd: None,
                 draft_empty: None,
                 frame: None,
+                initializing: false,
             }),
             resume: Err("captured-no-resume"),
         }),

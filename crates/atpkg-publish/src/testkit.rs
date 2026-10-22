@@ -6,8 +6,8 @@
 //! so every test verifies through the client's real chain with no key literal and no
 //! network. It lives in the library (never shipped) so unit and integration tests share it.
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::path::Path;
+use std::sync::Arc;
 
 use atpkg_keys::roster_ops::{add, empty, revoke};
 
@@ -16,45 +16,12 @@ use crate::host::fake::FakeHost;
 use crate::host::{Hosts, Slug};
 use crate::quad::{QUAD_FILES, index_tag};
 
-/// The executable a `git` from `PATH` ends up running, resolved once per process.
-///
-/// macOS's `/usr/bin/git` is xcode-select's trampoline: every call execs it, it looks up
-/// the developer directory, and it execs that directory's git with the same argv, adding
-/// only SDK variables git does not read. A fixture's git and the [`FakeHost`]'s clones and
-/// fetches run that git directly (`xcrun --find git`, what the trampoline asks). Where the
-/// `git` on `PATH` is no trampoline, or the lookup fails, it is that `git`.
-#[must_use]
-pub fn git_path() -> &'static Path {
-    static GIT: OnceLock<PathBuf> = OnceLock::new();
-    GIT.get_or_init(|| {
-        let on_path = std::env::var_os("PATH")
-            .and_then(|path| {
-                std::env::split_paths(&path)
-                    .map(|dir| dir.join("git"))
-                    .find(|candidate| candidate.is_file())
-            })
-            .unwrap_or_else(|| PathBuf::from("git"));
-        if !cfg!(target_os = "macos") || on_path != Path::new("/usr/bin/git") {
-            return on_path;
-        }
-        aterm_uds::spawnfd::command("/usr/bin/xcrun")
-            .args(["--find", "git"])
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
-            .filter(|found| found.is_file())
-            .unwrap_or(on_path)
-    })
-}
-
-/// `git` for a fixture or the [`FakeHost`]: [`git_path`], with automatic maintenance off
-/// (`maintenance.auto=false`) — every commit and fetch would otherwise start a `git
-/// maintenance run --auto` that does nothing in a repository this small.
+/// `git` for a fixture or the [`FakeHost`]: [`aterm_uds::fixture_git::git`], with
+/// automatic maintenance off, which every commit and fetch would otherwise start for nothing
+/// in a repository this small.
 #[must_use]
 pub fn git() -> aterm_uds::spawnfd::Command {
-    let mut git = aterm_uds::spawnfd::command(git_path());
+    let mut git = aterm_uds::fixture_git::git();
     git.args(["-c", "maintenance.auto=false"]);
     git
 }
@@ -142,9 +109,7 @@ impl Keys {
     /// When the scratch files cannot be written.
     #[must_use]
     pub fn ctx(&self, home: &Path, host: Arc<FakeHost>) -> Ctx {
-        let mut ctx = Ctx::new(home, None, None, NOW);
-        ctx.anchor = vec![self.master_pub.clone()];
-        ctx.hosts = Hosts::single(host);
+        let ctx = self.ctx_over(home, host);
         std::fs::create_dir_all(home.join(".aterm")).expect("mkdir ~/.aterm");
         std::fs::write(&ctx.identity.key, &self.machine_key).expect("write machine key");
         std::fs::write(
@@ -155,6 +120,16 @@ impl Keys {
             ),
         )
         .expect("write machine record");
+        ctx
+    }
+
+    /// [`Keys::ctx`], writing nothing: for a `home` laid down from one made earlier, which
+    /// holds the machine key and record as that world left them (or without the key, if
+    /// it ran keyless).
+    #[must_use]
+    pub fn ctx_over(&self, home: &Path, host: Arc<FakeHost>) -> Ctx {
+        let mut ctx = Ctx::new(home, None, None, NOW, Hosts::single(host));
+        ctx.anchor = vec![self.master_pub.clone()];
         ctx
     }
 

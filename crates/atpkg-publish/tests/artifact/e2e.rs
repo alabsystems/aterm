@@ -19,7 +19,9 @@ use atpkg_publish::artifact::bundle::PackBundle;
 use atpkg_publish::host::fake::FakeHost;
 use atpkg_publish::testkit::Keys;
 
-use super::fixture::{DORMANT_LEDGER, git, put, put_exe, scratch, set_mode, trust_repo};
+use super::fixture::{
+    DORMANT_LEDGER, checkout as fixture_checkout, put, put_exe, scratch, set_mode, trust_repo,
+};
 
 const COMMIT: &str = "1234567890abcdef1234567890abcdef12345678";
 const DRIVER: &str = "librustc_driver-0123456789abcdef";
@@ -161,10 +163,7 @@ fn a_cc_built_sysroot_ships_one_compiler_under_one_signature() {
     let ctx = keys.ctx(&home, Arc::new(FakeHost::new()));
     trust_repo(&home.join("trust"), DORMANT_LEDGER);
     let checkout = root.join("trust-mc");
-    put(&checkout.join("README"), b"trust-mc\n");
-    git(&checkout, &["init", "-q", "."]);
-    git(&checkout, &["add", "-A"]);
-    git(&checkout, &["commit", "-q", "-m", "one"]);
+    fixture_checkout(&checkout, &[("README", b"trust-mc\n")]);
     let out_dir: PathBuf = root.join("out");
     let request = BundleRequest {
         program: "trust-mc".into(),

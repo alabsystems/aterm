@@ -554,6 +554,7 @@ pub fn check_pack(
         let hooks = atpkg::install::StageHooks {
             pre_swap: Some(&gate),
             sidecars: None,
+            aliases: &[],
         };
         atpkg::verify_and_stage(artifact, &archive, &build_dir, &hooks).map_err(|e| {
             Error::refused(format!(

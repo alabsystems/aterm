@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 //! Windows local-file picker — the `IFileOpenDialog` behind Settings ▸ Wallpaper's
-//! "Choose Image…" and the File ▸ Open Markdown / Open File in Editor rows.
+//! "Choose Image…" and the File ▸ Open Markdown / Open File rows.
 //!
 //! Until this landed, `menu::choose_local_file` had a non-macOS arm that returned
 //! `None` unconditionally, and the three surfaces above split into two different

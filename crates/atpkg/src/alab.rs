@@ -195,15 +195,101 @@ pub fn package_version(root: &Path) -> Option<String> {
 /// this says ALab; a cross-check test holds that.
 #[must_use]
 pub fn exe_is_alab(exe: &Path) -> bool {
-    let Ok(exe) = std::fs::canonicalize(exe) else {
-        return false;
-    };
-    exe.ancestors().skip(1).take(2).any(|root| {
-        is_alab_package(root)
-            && entrypoint_of(root)
-                .and_then(|entry| std::fs::canonicalize(root.join(entry)).ok())
-                .is_some_and(|entry| entry == exe)
+    alab_root_of_exe(exe).is_some()
+}
+
+/// The ALab package root whose entrypoint IS `exe` ([`exe_is_alab`]'s reading), canonical.
+fn alab_root_of_exe(exe: &Path) -> Option<PathBuf> {
+    let exe = std::fs::canonicalize(exe).ok()?;
+    exe.ancestors()
+        .skip(1)
+        .take(2)
+        .find(|root| {
+            is_alab_package(root)
+                && entrypoint_of(root)
+                    .and_then(|entry| std::fs::canonicalize(root.join(entry)).ok())
+                    .is_some_and(|entry| entry == exe)
+        })
+        .map(Path::to_path_buf)
+}
+
+/// The upstream Codex an ALab build is based on, as its [`ALAB_BUILD_JSON`] records it:
+/// `"upstream": {"release": "rust-v0.163.0", "commit": "<40 hex>", "commit_date": "…"}`,
+/// the values `alab/package.sh` computes for `CODEX_ALAB_UPSTREAM_VERSION` (the newest
+/// stable upstream tag whose branch point the build has merged) and
+/// `CODEX_ALAB_UPSTREAM_COMMIT` (the upstream commit it merged last). Read off the record,
+/// never by running the binary; a package from before the field, or one whose field does
+/// not hold both facts in that shape, has none. `commit_date` is optional and not said.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Upstream {
+    /// The upstream release tag, verbatim (`rust-v0.163.0`).
+    pub release: String,
+    /// The upstream commit merged, 40 lowercase hex digits.
+    pub commit: String,
+}
+
+impl Upstream {
+    /// `based on upstream rust-v0.163.0+g0123456789ab`: the release, then the commit's
+    /// first twelve digits.
+    #[must_use]
+    pub fn words(&self) -> String {
+        format!(
+            "based on upstream {}+g{}",
+            self.release,
+            &self.commit[..UPSTREAM_SHORT_COMMIT]
+        )
+    }
+}
+
+/// How many digits of the upstream commit [`Upstream::words`] says.
+const UPSTREAM_SHORT_COMMIT: usize = 12;
+
+/// One `alab-build.json`'s [`Upstream`]: `None` unless `upstream` is an object whose
+/// `release` is a short printable name and whose `commit` is a full 40-digit hex sha. Never
+/// a partial answer from a malformed record.
+#[must_use]
+pub fn parse_upstream(text: &str) -> Option<Upstream> {
+    let v: aterm_json::Value = aterm_json::from_str(text).ok()?;
+    let upstream = v.get("upstream")?;
+    let release = upstream.get("release")?.as_str()?;
+    let commit = upstream.get("commit")?.as_str()?;
+    let printable = |s: &str| s.chars().all(|c| c.is_ascii_graphic());
+    let release_ok = !release.is_empty() && release.len() <= 128 && printable(release);
+    let commit_ok = commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit());
+    (release_ok && commit_ok).then(|| Upstream {
+        release: release.to_string(),
+        commit: commit.to_ascii_lowercase(),
     })
+}
+
+/// The [`Upstream`] the ALab package at `root` records ([`is_alab_package`], its record
+/// read bounded and never through a link).
+#[must_use]
+pub fn upstream_of(root: &Path) -> Option<Upstream> {
+    if !is_alab_package(root) {
+        return None;
+    }
+    let text = crate::metadata_io::read_bounded_regular_utf8(
+        &root.join(ALAB_BUILD_JSON),
+        MAX_PACKAGE_JSON_BYTES,
+    )
+    .ok()?;
+    parse_upstream(&text)
+}
+
+/// The [`Upstream`] of the ALab package whose entrypoint is `exe` ([`exe_is_alab`]): a
+/// store build's binary, or a dev-linked package's.
+#[must_use]
+pub fn upstream_of_exe(exe: &Path) -> Option<Upstream> {
+    upstream_of(&alab_root_of_exe(exe)?)
+}
+
+/// The [`Upstream`] of the copy `program`'s managed shim runs ([`crate::which`]): its store
+/// build, or the package a dev link names. `None` for a program ALab does not build.
+#[must_use]
+pub fn program_upstream(layout: &Layout, program: &str) -> Option<Upstream> {
+    agent(program)?;
+    upstream_of_exe(&crate::which(layout, program)?)
 }
 
 /// Whether `program`'s store build `build` is an ALab build: a program ALab builds, a build

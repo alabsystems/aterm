@@ -672,20 +672,34 @@ unsafe extern "C" {
     fn libc_kill(pid: i32, sig: i32) -> i32;
 }
 
-/// The binary every world runs: this package's own `aterm`, which cargo builds,
-/// and rebuilds after any edit below it, before this suite runs. It is the
-/// window (`--headless`) and the bridge (`link serve`) both.
-pub const ATERM: &str = env!("CARGO_BIN_EXE_aterm");
+#[path = "../support/aterm_under_test.rs"]
+mod aterm_under_test;
 
-/// [`ATERM`] for a launch about to happen, run once first with `--version`
+/// The binary every world runs: this package's own `aterm`, which cargo builds,
+/// and rebuilds after any edit below it, before this suite runs — or the build
+/// a private collector selected (`aterm_under_test`), the one every other launch
+/// fixture runs then too. It is the window (`--headless`) and the bridge (`link
+/// serve`) both.
+pub fn aterm() -> &'static str {
+    static ATERM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ATERM.get_or_init(|| {
+        aterm_under_test::aterm_executable()
+            .into_os_string()
+            .into_string()
+            .expect("the aterm under test at a UTF-8 path")
+    })
+}
+
+/// [`aterm`] for a launch about to happen, run once first with `--version`
 /// ([`aterm_spec::wait::first_exec`]): the system's first-exec wait on a
 /// just-built binary (a minute, measured for a debug build) is paid here,
 /// unclocked, and not inside [`DEADLINE`]. Call it right before the spawn:
 /// cargo puts a new file at the binary's path on every invocation, so only the
 /// file there now is the one launched.
 pub fn aterm_to_launch() -> &'static str {
-    aterm_spec::wait::first_exec(Path::new(ATERM), &["--version"]);
-    ATERM
+    let aterm = aterm();
+    aterm_spec::wait::first_exec(Path::new(aterm), &["--version"]);
+    aterm
 }
 
 impl World {
@@ -861,6 +875,8 @@ impl World {
         prepare_gui_environment(&mut cmd);
         cmd.arg("--headless")
             .env("HOME", scratch_home(&tmp))
+            // Every launch's TMPDIR is its scratch: a FIFO a SIGKILLed spawn left goes with it.
+            .env("TMPDIR", &tmp)
             .env("XDG_RUNTIME_DIR", tmp.join("run"))
             .env("XDG_CONFIG_HOME", tmp.join("cfg"))
             .env("SHELL", "/bin/sh")
@@ -1126,6 +1142,7 @@ impl World {
         prepare_gui_environment(&mut cmd);
         cmd.arg("--headless")
             .env("HOME", scratch_home(&self.tmp))
+            .env("TMPDIR", &self.tmp)
             .env("XDG_RUNTIME_DIR", self.tmp.join("run"))
             .env("XDG_CONFIG_HOME", self.tmp.join("cfg"))
             .env("SHELL", "/bin/sh")
@@ -1575,6 +1592,7 @@ impl World {
         prepare_gui_environment(&mut cmd);
         cmd.arg("--headless")
             .env("HOME", scratch_home(&w.tmp))
+            .env("TMPDIR", &w.tmp)
             .env("XDG_RUNTIME_DIR", w.tmp.join("run"))
             .env("XDG_CONFIG_HOME", w.tmp.join("cfg"))
             .env("SHELL", "/bin/sh")
@@ -2001,6 +2019,7 @@ impl Node {
         prepare_gui_environment(&mut cmd);
         cmd.arg("--headless")
             .env("HOME", scratch_home(&self.tmp))
+            .env("TMPDIR", &self.tmp)
             .env("XDG_RUNTIME_DIR", self.tmp.join("run"))
             .env("XDG_CONFIG_HOME", self.tmp.join("cfg"))
             .env("SHELL", "/bin/sh")

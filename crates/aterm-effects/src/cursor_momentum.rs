@@ -235,6 +235,14 @@ pub struct MomentumGlowFrame {
     pub fp: u64,
 }
 
+/// Cached light-page glow ink and text-alpha ceiling for `(hue, theme_fg, theme_bg)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LightInkMemo {
+    key: (u32, u32, u32),
+    ink: u32,
+    text_alpha: f32,
+}
+
 /// The engine: one integrator plus the fingerprint law that tells frame
 /// cadence from the cool-down's sparse steps.
 #[derive(Clone, Copy, Debug, Default)]
@@ -247,6 +255,8 @@ pub struct MomentumGlow {
     /// That tick's instant and τ, for the settle schedule.
     stamp: Option<Instant>,
     tau: f32,
+    /// Cached `(ink, text_alpha)` for the light-page glow.
+    light_ink_memo: Option<LightInkMemo>,
 }
 
 impl MomentumGlow {
@@ -392,7 +402,25 @@ impl MomentumGlow {
         if cfg.dark_theme {
             emit_halo((cr, cc), a, s, tint, geom, cfg, out);
         } else {
-            emit_light_halo((cr, cc), a, s, geom, cfg, under);
+            let key = (
+                cfg.hue & 0x00FF_FFFF,
+                cfg.theme_fg & 0x00FF_FFFF,
+                cfg.theme_bg & 0x00FF_FFFF,
+            );
+            let light_ink = match self.light_ink_memo {
+                Some(memo) if memo.key == key => (memo.ink, memo.text_alpha),
+                _ => {
+                    let ink = light_glow_ink(cfg.hue, cfg.theme_fg, cfg.theme_bg);
+                    let text_alpha = light_glow_text_alpha(ink, cfg.theme_fg, cfg.theme_bg);
+                    self.light_ink_memo = Some(LightInkMemo {
+                        key,
+                        ink,
+                        text_alpha,
+                    });
+                    (ink, text_alpha)
+                }
+            };
+            emit_light_halo((cr, cc), a, s, light_ink, geom, cfg, under);
         }
 
         // The light glow's hue is drawn too, so a hue that moves at one
@@ -554,6 +582,7 @@ fn emit_light_halo(
     (cr, cc): (u16, u16),
     a: f32,
     s: f32,
+    (ink, text_alpha): (u32, f32),
     geom: Geom,
     cfg: &MomentumGlowConfig,
     under: &mut Vec<GlowQuad>,
@@ -563,14 +592,12 @@ fn emit_light_halo(
     let (cx, cy) = geom.cell_center(cr, cc);
     let rx_full = cw * (0.55 + cfg.radius_cells * s);
     let ry_full = ch * (0.45 + 0.6 * cfg.radius_cells * s);
-    let ink = light_glow_ink(cfg.hue, cfg.theme_fg, cfg.theme_bg);
     let peak = LIGHT_GLOW_PEAK * a;
     let budget = under.len().saturating_add(LIGHT_MARK_QUADS);
     // Over the caret row's letters the glow keeps only the opacity that
     // leaves them their reading; a block caret's own cell is covered by the
     // block, so the glow lands whole under it.
-    let on_letters =
-        (light_glow_text_alpha(ink, cfg.theme_fg, cfg.theme_bg) / peak.max(1.0)).min(1.0);
+    let on_letters = (text_alpha / peak.max(1.0)).min(1.0);
     let ox = f32::from(geom.origin_x);
     let caret = i32::from(cc);
     let letters = cfg.glyph_span.map(|(first, end)| {

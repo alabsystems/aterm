@@ -510,6 +510,14 @@ pub(crate) fn paint_dark_masked_disc(
     let tile_w = tile.width();
     let mask_px = eye_mask.pixels();
     for y in y0..y1 {
+        let dy2: [f32; 4] = std::array::from_fn(|sy| {
+            let fy = y as f32 + (sy as f32 + 0.5) * 0.25;
+            let dy = fy - cy;
+            dy * dy
+        });
+        if dy2.iter().all(|&d| d > rr) {
+            continue;
+        }
         let row_base = (y as u32 * tile_w) as usize;
         for x in x0..x1 {
             let i = (row_base + x as usize) * 4;
@@ -523,10 +531,7 @@ pub(crate) fn paint_dark_masked_disc(
                 continue;
             }
             let mut hit = 0u32;
-            for sy in 0..4 {
-                let fy = y as f32 + (sy as f32 + 0.5) * 0.25;
-                let dy = fy - cy;
-                let dy2 = dy * dy;
+            for &dy2 in &dy2 {
                 if dy2 > rr {
                     continue;
                 }

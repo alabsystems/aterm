@@ -912,19 +912,20 @@ impl TailCache {
             {
                 read_to = Some(lo + nl as u64 + 1);
             }
+            let rows: Vec<&str> = rows_of(&window[from..]).collect();
             if !facts_done {
-                let (older, floored) = scan(&window[from..], Some(since));
+                let (older, floored) = scan(&rows, Some(since));
                 facts = facts.over(older);
                 resumed |= floored;
                 // The newest stamped row: a window of only oversized rows
                 // has none, so older windows are searched until one does.
                 if cwd.is_none() {
-                    cwd = last_cwd_since(&window[from..], Some(since));
+                    cwd = last_cwd_since(rows.iter().copied(), Some(since));
                 }
                 facts_done = floored || facts.settled();
             }
             if !excerpts.settled() {
-                excerpts = excerpts.over(super::excerpt::Scan::of(&window[from..]));
+                excerpts = excerpts.over(super::excerpt::Scan::of(&rows));
             }
             cut = if from > MAX_LINE_BYTES {
                 Vec::new()
@@ -1005,12 +1006,13 @@ impl TailCache {
             .iter()
             .rposition(|&b| b == b'\n')
             .map_or(0, |nl| nl + 1);
-        let (newer, floored) = scan(&appended[..whole], Some(since));
-        let cwd = last_cwd_since(&appended[..whole], Some(since));
+        let rows: Vec<&str> = rows_of(&appended[..whole]).collect();
+        let (newer, floored) = scan(&rows, Some(since));
+        let cwd = last_cwd_since(rows.iter().copied(), Some(since));
         // The conversation's excerpts, floor or no floor: the appended rows
         // over the carried ones.
-        let excerpts = super::excerpt::Scan::of(&appended[..whole])
-            .over(std::mem::take(&mut carry.facts.excerpts));
+        let excerpts =
+            super::excerpt::Scan::of(&rows).over(std::mem::take(&mut carry.facts.excerpts));
         // A row stamped before the floor in the append puts every row above
         // it — the carried ones too — before this process.
         let facts = if floored {
@@ -1791,20 +1793,17 @@ pub fn shell_cwds(claude_dir: &Path, launch: &Path) -> Vec<PathBuf> {
 /// stamps rows with its working directory, which follows the Bash tool.
 /// Sidechain rows are skipped; a relative or empty value is not a directory.
 pub fn last_cwd(body: &[u8]) -> Option<PathBuf> {
-    last_cwd_since(body, None)
+    last_cwd_since(rows_of(body), None)
 }
 
-/// [`last_cwd`] of the rows since `since` (unix seconds, the process's floor
-/// as [`scan`] takes it): a row stamped before it ends the search, and an
-/// unstamped row is skipped.
-fn last_cwd_since(body: &[u8], since: Option<u64>) -> Option<PathBuf> {
-    for raw in body.rsplit(|&b| b == b'\n') {
-        if raw.is_empty() || raw.len() > MAX_LINE_BYTES {
-            continue;
-        }
-        let Ok(line) = std::str::from_utf8(raw) else {
-            continue;
-        };
+/// [`last_cwd`] of `rows` ([`rows_of`]) since `since` (unix seconds, the
+/// process's floor as [`scan`] takes it): a row stamped before it ends the
+/// search, and an unstamped row is skipped.
+fn last_cwd_since<'a>(
+    rows: impl IntoIterator<Item = &'a str>,
+    since: Option<u64>,
+) -> Option<PathBuf> {
+    for line in rows {
         if !line.contains("\"cwd\"") {
             continue;
         }
@@ -2094,10 +2093,20 @@ fn fold_result(content: &str, facts: &mut TailFacts) -> bool {
 /// above belong to a predecessor. Unstamped rows are attributed to no one.
 /// `None` reads the tail as is; [`facts_for_entry_at`] does not show that.
 pub fn tail_facts(body: &[u8], since: Option<u64>) -> TailFacts {
-    scan(body, since).0
+    scan(&rows_of(body).collect::<Vec<_>>(), since).0
 }
 
-/// [`tail_facts`], and whether the scan stopped at a row before the floor.
+/// The rows of `body` a tail read scans, newest first: each whole row of at
+/// most [`MAX_LINE_BYTES`] that is UTF-8. A tail read collects them once for
+/// all its scans ([`scan`], [`last_cwd_since`], [`super::excerpt::Scan::of`]).
+fn rows_of(body: &[u8]) -> impl Iterator<Item = &str> {
+    body.rsplit(|&b| b == b'\n')
+        .filter(|raw| !raw.is_empty() && raw.len() <= MAX_LINE_BYTES)
+        .filter_map(|raw| std::str::from_utf8(raw).ok())
+}
+
+/// [`tail_facts`] of `rows` ([`rows_of`]), and whether the scan stopped at a
+/// row before the floor.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -2106,21 +2115,15 @@ pub fn tail_facts(body: &[u8], since: Option<u64>) -> TailFacts {
         project = "conformance_footer_model::project"
     )
 )]
-fn scan(body: &[u8], since: Option<u64>) -> (TailFacts, bool) {
+fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
     let mut facts = TailFacts::default();
     // The command or result row met last — the one directly under the next
     // command row up — was a readable model result: that command's own.
     let mut under = false;
-    for raw in body.rsplit(|&b| b == b'\n') {
+    for &line in rows {
         if facts.settled() {
             break;
         }
-        if raw.is_empty() || raw.len() > MAX_LINE_BYTES {
-            continue;
-        }
-        let Ok(line) = std::str::from_utf8(raw) else {
-            continue;
-        };
         // Cheap prefilters: most rows carry neither fact, and a parse per row
         // over half a MiB of tool output is the cost worth skipping.
         let command = line.contains(COMMAND_STDOUT) || line.contains(COMMAND_NAME);

@@ -1082,11 +1082,10 @@ fn dropping_carried_history_equals_the_engines_visible_only_carry() {
 #[cfg(unix)]
 fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
     use super::tests::{
-        ENV_LOCK, StageCarry, child_proof_from, pipe_pair, restore_env, stage_ladder_handoff,
+        StageCarry, child_proof_from, env_alone, pipe_pair, restore_env, stage_ladder_handoff,
     };
-    use std::sync::PoisonError;
 
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let mut healthy = Terminal::new(24, 80);
     healthy.process(b"\x1b[1;38;5;202muser@mac\x1b[0m ~ % ls\r\nCargo.toml\r\n% ");

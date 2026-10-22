@@ -775,7 +775,7 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
 #[test]
 fn a_held_claim_activates_the_successor_only_at_its_write() {
     /// The stand-in successor, killed (`SIGKILL`) and reaped however the
-    /// test ends; and the scratch rendezvous, put back.
+    /// test ends.
     struct StandIn(aterm_uds::spawnfd::Child);
     impl Drop for StandIn {
         fn drop(&mut self) {
@@ -783,17 +783,9 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
             let _ = self.0.wait();
         }
     }
-    struct Rendezvous;
-    impl Drop for Rendezvous {
-        fn drop(&mut self) {
-            crate::identity_claim::set_rendezvous_override(None);
-        }
-    }
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
-    let _rendezvous = crate::identity_claim::rendezvous_test_guard();
     let scratch = aterm_tempfile::tempdir().expect("a scratch rendezvous");
-    crate::identity_claim::set_rendezvous_override(Some(scratch.path().to_path_buf()));
-    let _put_back = Rendezvous;
+    let _rendezvous = crate::identity_claim::rendezvous_override(scratch.path());
     // (refused, focused at the park, focused at the write)
     for (refused, at_park, at_write) in [
         (false, true, true),
@@ -1091,7 +1083,9 @@ fn a_park_that_misses_keeps_a_live_take() {
 /// `App::video_answer_before_commit` aborts a live take, cancels an in-flight
 /// export, and waits until the connection threads have written both replies and
 /// released their [`ReplyWire`] guards (within the caller's bound) before
-/// returning for `_exit`.
+/// returning for `_exit`. Each stand-in connection writes only once the step
+/// waits on its wire (`ReplyWritten::awaited_within`), so a step that went on
+/// without waiting finds its reply unwritten on every run.
 ///
 /// [`ReplyWire`]: crate::control::ReplyWire
 #[test]
@@ -1099,14 +1093,18 @@ fn commit_waits_until_every_video_reply_is_written() {
     const BOUND: std::time::Duration = std::time::Duration::from_secs(600);
     let mut app = crate::App::headless_for_test();
     let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    // A connection thread: waits for its request's answer, writes it
-    // 150 ms later, and releases the wire as the write does.
+    // A connection thread: waits for its request's answer, writes it once
+    // Commit's step waits on its wire, and releases the wire as the write
+    // does.
     let connection = |answers: std::sync::mpsc::Receiver<String>| {
         let (wire, release) = crate::control::ReplyWire::new();
         let written = std::sync::Arc::clone(&written);
         let thread = std::thread::spawn(move || {
             let answer = answers.recv().expect("the request is answered");
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert!(
+                release.awaited_within(aterm_spec::wait::MUST_HAPPEN),
+                "Commit's step never waited on this reply"
+            );
             written.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             drop(release);
             answer
@@ -1127,8 +1125,8 @@ fn commit_waits_until_every_video_reply_is_written() {
     let (take_wire, take_connection) = connection(take_answered);
     app.video_reply_wires.push(take_wire);
 
-    // An export mid-frame: it answers at its next frame boundary, 200 ms
-    // after the cancel, and only then drops its permit.
+    // An export mid-frame: it answers at its next frame boundary, after the
+    // cancel, and only then drops its permit.
     let export = crate::VideoCancellation::new();
     let permit = app
         .video_export
@@ -1138,10 +1136,15 @@ fn commit_waits_until_every_video_reply_is_written() {
     let worker = {
         let export = export.clone();
         std::thread::spawn(move || {
-            while !export.is_cancelled() {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(
+                aterm_spec::wait::within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    std::time::Duration::from_millis(1),
+                    || export.is_cancelled().then_some(()),
+                )
+                .is_some(),
+                "Commit's step never cancelled the export"
+            );
             let _ = export_answers.send("ERR video: export failed".to_string());
             drop(permit);
         })

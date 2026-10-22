@@ -615,8 +615,9 @@ impl TakeRequest {
 /// THE ALIAS OF AN EDGE (ruling Q6): `e` and the first 8 hex digits of
 /// HMAC-SHA256(`key`, sid) — stable for a node's key, so one edge is one
 /// actor on the bus, and no reader without the key can tell which session it
-/// is. The bridge's key is the node's, minted once and kept in its pin
-/// (`logpin … key=`), never derived from its caps.
+/// is. The bridge's key is the node's, minted once and kept durably in its
+/// state dir (`logkey`, copied into `logpin … key=`), never derived from its
+/// caps.
 pub(crate) fn alias_of(key: &[u8; 16], sid: &ShortId) -> Option<ShortId> {
     let mut mac = aterm_digest::HmacSha256::new_from_slice(key).ok()?;
     mac.update(sid.as_str().as_bytes());

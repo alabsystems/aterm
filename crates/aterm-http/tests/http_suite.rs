@@ -8,6 +8,9 @@
 //! With `autotests = false` (`Cargo.toml`), a `tests/*.rs` file that is neither
 //! a `mod` line here nor a `[[test]]` of its own never compiles.
 
+mod golden_post;
 mod loopback;
+mod methods;
 mod signature_methods;
+mod streaming;
 mod tls_stream;

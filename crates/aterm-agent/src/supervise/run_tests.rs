@@ -9762,6 +9762,40 @@ fn the_folder_a_spawn_trusted_is_read_off_meta_decoded() {
     }
 }
 
+/// `meta`'s `worker=` — the agent a worker's spawn started — is read into
+/// the loop's `worker_agent`, which the approval rules get (`ApprovalCtx`:
+/// a Gemini CLI worker's folder-trust dialog is never pressed). NEGATIVE
+/// CONTROLS: `-` (no spawn's worker), a word no worker's agent is
+/// (`generic`, `vim`), and an older host that prints no such key name none,
+/// each over one that did.
+#[test]
+fn the_agent_a_spawn_started_is_read_off_meta() {
+    let mut m = Mock::new(vec![idle_screen()]);
+    let mut s = Session::new(&mut m, Some("@s-w".to_string()));
+    let meta = |worker: &str| {
+        format!("OK title=- cwd=/w agent_cwd=/w state=alive trusted_cwd=/w worker={worker}\n")
+    };
+    for program in [
+        aterm_phase::Program::Claude,
+        aterm_phase::Program::Gemini,
+        aterm_phase::Program::Agy,
+        aterm_phase::Program::Muse,
+    ] {
+        s.note_cwd(&meta(program.name()));
+        assert_eq!(s.worker_agent, Some(program));
+    }
+    for none in [
+        meta("-"),
+        meta("generic"),
+        meta("vim"),
+        "OK title=- cwd=/w agent_cwd=/w state=alive trusted_cwd=/w\n".to_string(),
+    ] {
+        s.note_cwd(&meta("gemini"));
+        s.note_cwd(&none);
+        assert_eq!(s.worker_agent, None, "{none}");
+    }
+}
+
 /// The engine's tests: the approval policy in the loop, the wake, the
 /// lifecycle and the escalation (`run_engine_tests.rs`).
 mod engine {

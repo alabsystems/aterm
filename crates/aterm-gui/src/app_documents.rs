@@ -3402,6 +3402,23 @@ impl App {
         )
     }
 
+    /// File > Save follows the active editor's own Save command. A terminal,
+    /// reader or unavailable editor never reaches a file write.
+    pub(crate) fn can_save_document(&self, wid: WindowId) -> bool {
+        self.active_native_view(wid)
+            .and_then(|(instance, _)| self.native_runtime.app(instance))
+            .is_some_and(|app| matches!(app, NativeApp::Editor(editor) if editor.can_save()))
+    }
+
+    pub(crate) fn save_front_document(&mut self) -> Result<(), String> {
+        let wid = self
+            .frontmost_window
+            .filter(|&wid| self.can_save_document(wid))
+            .ok_or_else(|| "Save is disabled for the active content".to_string())?;
+        self.dispatch_native_event(wid, AppEvent::EditorCommand(EditorCommand::Save))
+            .map(|_| ())
+    }
+
     pub(crate) fn save_document_checkpoint(
         &mut self,
         document: DocumentId,
@@ -4623,7 +4640,7 @@ impl App {
     }
 
     /// Two-phase open of one local document in the frontmost window (File ▸ Open
-    /// Markdown / Open File in Editor). See [`Self::request_document_tab_in_window`].
+    /// Markdown / Open File). See [`Self::request_document_tab_in_window`].
     pub(crate) fn request_document_tab(
         &mut self,
         kind: AppKind,
@@ -5122,7 +5139,7 @@ impl App {
         let state = match kind {
             AppKind::Markdown => AppViewState::Markdown(MarkdownViewState::default()),
             AppKind::Editor => AppViewState::Editor(Box::default()),
-            AppKind::Settings | AppKind::Recovery => {
+            AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
                 return Err("requested app is not a document app".to_string());
             }
         };
@@ -5143,7 +5160,7 @@ impl App {
                     AppKind::Editor => {
                         NativeApp::Editor(EditorApp::new_with_uri(document, title, uri.to_string()))
                     }
-                    AppKind::Settings | AppKind::Recovery => {
+                    AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
                         return Err("requested app is not a document app".to_string());
                     }
                 };
@@ -5249,7 +5266,7 @@ impl App {
                 state.buffer = Some(buffer);
                 Ok(())
             }
-            AppKind::Settings | AppKind::Recovery => {
+            AppKind::Settings | AppKind::SystemState | AppKind::Recovery => {
                 Err("requested app is not a document app".to_string())
             }
         }
@@ -5688,6 +5705,214 @@ mod tests {
             AppEvent::TextInput(TextInputEvent::Commit(text.to_string())),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn file_save_writes_only_the_active_edited_document() {
+        let dir = fresh_dir("aterm-file-save-active-document");
+        let first = dir.join("first.txt");
+        let second = dir.join("second.txt");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&first))
+            .unwrap();
+        commit(&mut app, wid, "draft ");
+        let (first_instance, _) = app.active_native_view(wid).unwrap();
+        let first_tab = app.windows[&wid].tab_set.active_index().unwrap();
+        let first_document = app.native_runtime.document_id(first_instance).unwrap();
+        app.open_document_tab(AppKind::Editor, &file_uri(&second))
+            .unwrap();
+        commit(&mut app, wid, "saved ");
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        let second_tab = app.windows[&wid].tab_set.active_index().unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let desired = app.document_store.snapshot(document).unwrap().text;
+        let palette = app.palette_snapshot(wid);
+        assert_eq!(
+            palette.action_by_name("Save"),
+            Ok(crate::menu::MenuAction::Save)
+        );
+        assert_eq!(
+            palette
+                .rows()
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        &row.action,
+                        crate::palette::PaletteTarget::Menu(crate::menu::MenuAction::Save)
+                    ) || matches!(&row.action, crate::palette::PaletteTarget::Native(target)
+                        if target.action.as_str() == "editor/save")
+                })
+                .count(),
+            1,
+            "one Save command in the editor palette"
+        );
+        assert!(app.can_save_document(wid));
+
+        // The selected Save still belongs to this document if a control tab switch
+        // is already queued ahead of its delivery. Neither the new front document
+        // nor the parked one may be written by that stale selection.
+        let save = palette
+            .rows()
+            .iter()
+            .find_map(|row| match &row.action {
+                crate::palette::PaletteTarget::Native(target)
+                    if target.action.as_str() == "editor/save" =>
+                {
+                    Some(target.clone())
+                }
+                _ => None,
+            })
+            .expect("the menu-labelled Save carries the exact editor target");
+        app.switch_tab_in(wid, first_tab);
+        assert!(app.activate_native_palette_target(&save).is_err());
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "second");
+        assert_eq!(app.document_store.dirty(first_document), Some(true));
+        assert_eq!(app.document_store.dirty(document), Some(true));
+        app.switch_tab_in(wid, 0);
+        assert!(app.activate_native_palette_target(&save).is_err());
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "second");
+
+        app.switch_tab_in(wid, second_tab);
+        app.palette_enter();
+        for c in "Save".chars() {
+            app.palette_filter_push(c);
+        }
+        assert_eq!(
+            app.windows[&wid]
+                .palette()
+                .and_then(crate::palette::PaletteState::selected_target),
+            Some(crate::palette::PaletteTarget::Native(save)),
+        );
+        // A current selection uses the shipping palette activation path. It saves
+        // synchronously, without posting an unscoped action for a later front tab.
+        app.palette_activate();
+
+        assert_eq!(fs::read_to_string(&second).unwrap(), desired.as_ref());
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first");
+        assert_eq!(app.document_store.dirty(first_document), Some(true));
+        assert_eq!(app.document_store.dirty(document), Some(false));
+        assert!(!app.can_save_document(wid));
+        assert!(app.palette_snapshot(wid).action_by_name("Save").is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_save_is_disabled_for_markdown_and_terminal_content() {
+        let dir = fresh_dir("aterm-file-save-non-editor");
+        let path = dir.join("reader.md");
+        fs::write(&path, "# Original\n").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        commit(&mut app, wid, "draft ");
+        app.open_document_tab(AppKind::Markdown, &file_uri(&path))
+            .unwrap();
+        assert!(!app.can_save_document(wid));
+        assert!(app.palette_snapshot(wid).action_by_name("Save").is_err());
+        assert!(app.save_front_document().is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# Original\n");
+
+        app.switch_tab_in(wid, 0);
+        assert!(app.active_native_view(wid).is_none());
+        assert!(!app.can_save_document(wid));
+        assert!(app.palette_snapshot(wid).action_by_name("Save").is_err());
+        assert!(app.save_front_document().is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# Original\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn find_navigation_uses_the_active_editor_query_after_enter_and_wraps() {
+        let dir = fresh_dir("aterm-editor-find-navigation");
+        let path = dir.join("first.txt");
+        let source = "α needle β needle γ needle";
+        fs::write(&path, source).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.search_last_query = "terminal-only".to_string();
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let original = app.document_store.snapshot(document).unwrap();
+        let matches: Vec<_> = source
+            .match_indices("needle")
+            .map(|(at, query)| at..at + query.len())
+            .collect();
+        assert!(app.search_find_again(true).is_err());
+        assert_eq!(editor_buffer(&app, view).primary_selection().range(), 0..0);
+
+        app.find_requested();
+        commit(&mut app, wid, "needle");
+        assert_eq!(
+            editor_buffer(&app, view).primary_selection().range(),
+            matches[0]
+        );
+        for (forward, index) in [(true, 1), (false, 0), (false, 2)] {
+            app.search_find_again(forward).unwrap();
+            assert_eq!(
+                editor_buffer(&app, view).primary_selection().range(),
+                matches[index]
+            );
+        }
+        drive_native(
+            &mut app,
+            key(Key::Named(NamedKey::Enter), Modifiers::empty()),
+        );
+        assert!(!editor_buffer(&app, view).minibuffer_active());
+        for (forward, index) in [(true, 0), (true, 1), (false, 0), (false, 2)] {
+            app.search_find_again(forward).unwrap();
+            assert_eq!(
+                editor_buffer(&app, view).primary_selection().range(),
+                matches[index]
+            );
+        }
+        assert!(app.windows[&wid].search.is_none());
+        assert_eq!(app.search_last_query, "terminal-only");
+        let after = app.document_store.snapshot(document).unwrap();
+        assert_eq!(after.seq, original.seq);
+        assert_eq!(after.text, original.text);
+
+        let second = dir.join("second.txt");
+        fs::write(&second, source).unwrap();
+        app.open_document_tab(AppKind::Editor, &file_uri(&second))
+            .unwrap();
+        let (_, second_view) = app.active_native_view(wid).unwrap();
+        assert!(app.search_find_again(false).is_err());
+        assert_eq!(
+            editor_buffer(&app, second_view).primary_selection().range(),
+            0..0
+        );
+        assert!(app.windows[&wid].search.is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn find_navigation_refuses_non_search_native_content_without_using_terminal_query() {
+        let dir = fresh_dir("aterm-native-find-refusal");
+        let path = dir.join("reader.md");
+        fs::write(&path, "# needle").unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.search_last_query = "terminal-only".to_string();
+        app.open_document_tab(AppKind::Markdown, &file_uri(&path))
+            .unwrap();
+        for forward in [true, false] {
+            assert!(app.search_find_again(forward).is_err());
+        }
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        for forward in [true, false] {
+            assert!(app.search_find_again(forward).is_err());
+        }
+        assert!(app.windows[&wid].search.is_none());
+        assert_eq!(app.search_last_query, "terminal-only");
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn file_uri(path: &std::path::Path) -> String {

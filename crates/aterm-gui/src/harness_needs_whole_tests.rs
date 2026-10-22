@@ -464,3 +464,107 @@ fn the_stamped_hover_follows_a_first_tell_beside_a_standing_entry() {
     );
     assert_eq!(stamps, 1, "one stamp for the first tell: {now}");
 }
+
+/// THE CHIP'S TITLE FOLLOWS THE NEED'S WORDS AND NOTHING ELSE (§12.2.3
+/// item 5; the W4 title slice): the title says the first need whole and how
+/// many more (`harness_glass::need_title`), so the session's trail
+/// generation — which rebuilds a title being read — moves where those move:
+/// the need's first tell, a new first need, the take-down. A set that moves
+/// under the same entry with its first need and its count kept moves the
+/// published verdict (CONTROL) but not the title's words, and a publish
+/// with nothing moved moves nothing; at rest the footer's term keys none of
+/// it. NEGATIVE CONTROL (as run): the bump on every verdict move
+/// (`set_need`'s `moved`) moves the generation at the kept set.
+#[test]
+fn the_title_follows_the_needs_words_and_nothing_else() {
+    use crate::claude_lights::glass_bits;
+    let (mut app, sid, ctx) = desk();
+    let generation = |app: &App| {
+        app.harness_glass
+            .get(&0)
+            .map_or(0, crate::harness_glass::SessionGlass::trail_gen)
+    };
+    let at_rest = |app: &App| glass_bits(app.chip_glass(0), false);
+    let (g0, rest) = (generation(&app), at_rest(&app));
+    tell(&mut app, &sid, &[NEED_A, NEED_B], ENTRY_AB);
+    land(&mut app, &ctx, Some(ENTRY_AB));
+    let g1 = generation(&app);
+    assert_ne!(g1, g0, "the need's first tell");
+    assert_eq!(at_rest(&app), rest, "at rest the term keys nothing new");
+    tell(&mut app, &sid, &[NEED_A, NEED_C], ENTRY_AB);
+    assert_eq!(
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .need()
+            .harness_ask()
+            .map(|a| a.others.clone()),
+        Some(set(&[NEED_C])),
+        "CONTROL: the published verdict moved with the set"
+    );
+    assert_eq!(generation(&app), g1, "the title's words did not");
+    assert!(!app.publish_need(0), "CONTROL: nothing moved");
+    assert_eq!(generation(&app), g1);
+    tell(&mut app, &sid, &[NEED_B], ENTRY_B);
+    land(&mut app, &ctx, Some(ENTRY_B));
+    let g2 = generation(&app);
+    assert_ne!(g2, g1, "a new first need");
+    land(&mut app, &ctx, None);
+    assert_ne!(generation(&app), g2, "the take-down");
+    assert_eq!(at_rest(&app), rest, "at rest still nothing");
+}
+
+/// THE CHIP'S DESCRIPTION BORROWS THE NEED IT SAYS (§12.2.1; the W4 title
+/// slice's review): a screen reader is sent the accessibility tree with
+/// each present, and the Autopilot chip's description with it
+/// (`App::autopilot_spoken`), so the need it reads is lent under the
+/// session's lock, never copied: nine needs told cost the description what
+/// two do, though it reads the nine (CONTROL: `And 8 more`). NEGATIVE
+/// CONTROL (as run): `autopilot_spoken` reading `title_words_of`'s copy
+/// costs one allocation more for each further need (25 for nine against
+/// 18 for two).
+#[test]
+fn the_chips_description_costs_no_more_for_nine_needs_than_for_two() {
+    use crate::autopilot::AutopilotView;
+    let (mut app, sid, ctx) = desk();
+    let described = |app: &App| {
+        let glass = app.chip_glass(0);
+        let ((_, description), allocations) = crate::work_counts::allocations_in(|| {
+            app.autopilot_spoken(0, AutopilotView::Cruise, &glass)
+        });
+        (description.expect("a need described"), allocations)
+    };
+    tell(&mut app, &sid, &[NEED_A, NEED_B], ENTRY_AB);
+    land(&mut app, &ctx, Some(ENTRY_AB));
+    let (two, two_cost) = described(&app);
+    assert!(
+        two.contains("And 1 more."),
+        "CONTROL: two needs read: {two}"
+    );
+    let nine: Vec<String> = std::iter::once(NEED_A.to_string())
+        .chain((1..9).map(|n| format!("{NEED_C}, part {n}")))
+        .collect();
+    let nine: Vec<&str> = nine.iter().map(String::as_str).collect();
+    let entry = ENTRY_AB.replace("(+1 more)", "(+8 more)");
+    tell(&mut app, &sid, &nine, &entry);
+    land(&mut app, &ctx, Some(&entry));
+    assert_eq!(
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .need()
+            .harness_ask()
+            .map(|a| a.others.len()),
+        Some(8),
+        "CONTROL: the eight further needs are told whole"
+    );
+    let (nine, nine_cost) = described(&app);
+    assert!(
+        nine.contains("And 8 more."),
+        "CONTROL: nine needs read: {nine}"
+    );
+    assert_eq!(
+        nine_cost, two_cost,
+        "the description's cost: {two:?} / {nine:?}"
+    );
+}

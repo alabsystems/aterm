@@ -96,6 +96,7 @@ pub const NOVA_PALETTES: [(u32, u32); 8] = [
 ];
 
 /// The `(core, fringe)` pair for a Gray-decoded palette index.
+#[inline]
 pub fn palette(idx: u8) -> (u32, u32) {
     NOVA_PALETTES[usize::from(idx & 7)]
 }
@@ -115,6 +116,7 @@ pub enum NovaPhase {
     Settled,
 }
 
+#[inline]
 pub fn phase(t_ms: i64, d_ms: u32) -> NovaPhase {
     let d = i64::from(d_ms);
     match t_ms {
@@ -130,6 +132,7 @@ pub fn phase(t_ms: i64, d_ms: u32) -> NovaPhase {
 
 /// The Dip's ink envelope multiplier at `t`: `1 − 0.35·smoothstep(p)` inside
 /// the dip window, `1.0` outside (rides the ink channel, no quads).
+#[inline]
 pub fn dip_envelope(t_ms: u64) -> f32 {
     if t_ms >= DIP_MS {
         return 1.0;
@@ -190,6 +193,7 @@ struct QuadSink<'a> {
 }
 
 impl QuadSink<'_> {
+    #[inline]
     fn push(&mut self, x: i32, y: i32, w: i32, h: i32, premul: u32) {
         if w <= 0 || h <= 0 || premul == 0 || self.cell_h <= 0 {
             return;
@@ -231,6 +235,7 @@ impl QuadSink<'_> {
     /// One uniform-coverage chord quad: fractional x-extent folded into the
     /// coverage, quantized once through `premul_rgb`, the single rounding
     /// point both backends then add.
+    #[inline]
     fn chord(&mut self, x0: f32, x1: f32, y0: i32, y1: i32, color: u32, cov: f32) {
         let xi0 = x0.floor() as i32;
         let xi1 = (x1.ceil() as i32).max(xi0 + 1);
@@ -242,6 +247,7 @@ impl QuadSink<'_> {
 
 /// `1 − (1 − q)²` — the shockwave's ease-out radius curve (invertible, which
 /// §6.5's analytic crossing time relies on).
+#[inline]
 fn ease_out(q: f32) -> f32 {
     let u = 1.0 - q.clamp(0.0, 1.0);
     1.0 - u * u
@@ -249,6 +255,7 @@ fn ease_out(q: f32) -> f32 {
 
 /// Ring radius + fade envelope at `t`, or `None` outside the ring window.
 /// Singularity time-reverses the radius (contracts from `r_max` to 0).
+#[inline]
 pub fn ring_radius(t_ms: u64, r_max: f32, singularity: bool) -> Option<(f32, f32)> {
     if !(FLASH_END_MS..RING_END_MS).contains(&t_ms) {
         return None;
@@ -268,6 +275,7 @@ pub fn ring_radius(t_ms: u64, r_max: f32, singularity: bool) -> Option<(f32, f32
 /// fringe's relative luminance to ≥ 0.42 by stepping toward the palette's own
 /// core (never white, keeping the pair's identity). Bright fringes pass
 /// through; deterministic (≤ 8 fixed steps), resolved once per emission.
+#[inline]
 pub fn vivid_fringe(core: u32, fringe: u32) -> u32 {
     const FLOOR: f32 = 0.42;
     let table = crate::color_math::relative_luminance_table();
@@ -284,6 +292,7 @@ pub fn vivid_fringe(core: u32, fringe: u32) -> u32 {
 /// Band count: exactly [`RING_BANDS`] when the extent admits ≥ 2 px bands
 /// (`2r ≥ 60 px`, true from `cell_h = 14` at genome radii); below that
 /// `⌊2r/2⌋`, fewer quads, so the closed form still bounds.
+#[inline]
 pub fn ring_band_count(extent_px: f32) -> usize {
     if extent_px >= 2.0 * RING_BANDS as f32 {
         RING_BANDS
@@ -355,6 +364,11 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
     }
     let fringe = vivid_fringe(env.core, env.fringe);
     let cxf = env.cx as f32;
+    let rings = [(r, env.core, 1.0f32), (r + chroma, fringe, 0.55)].map(|(rr, color, scale)| {
+        let ro = rr + 0.5 * thick;
+        let ri = (rr - 0.5 * thick).max(0.0);
+        (ro * ro, ri * ri, color, base_cov * scale)
+    });
     for i in 0..bands {
         let y0f = (extent * i as f32 / bands as f32).round();
         let y1f = (extent * (i + 1) as f32 / bands as f32).round();
@@ -364,16 +378,14 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
         let y0 = (top + y0f) as i32;
         let y1 = (top + y1f) as i32;
         let dy = (y0f + y1f) * 0.5 - re;
-        // (radius, tint, folded coverage scale): the main ring, then the fringe.
-        for (rr, color, scale) in [(r, env.core, 1.0f32), (r + chroma, fringe, 0.55)] {
-            let ro = rr + 0.5 * thick;
-            let ri = (rr - 0.5 * thick).max(0.0);
-            let wo = (ro * ro - dy * dy).max(0.0).sqrt();
-            let wi = (ri * ri - dy * dy).max(0.0).sqrt();
+        let dy2 = dy * dy;
+        // (ro², ri², tint, folded coverage): the main ring, then the fringe.
+        for (ro2, ri2, color, cov) in rings {
+            let wo = (ro2 - dy2).max(0.0).sqrt();
+            let wi = (ri2 - dy2).max(0.0).sqrt();
             if wo - wi < 0.05 {
                 continue;
             }
-            let cov = base_cov * scale;
             if wi < 0.5 {
                 // The band crosses the cap: the two chords merge into one.
                 sink.chord(cxf - wo, cxf + wo, y0, y1, color, cov);
@@ -676,6 +688,7 @@ pub fn emit_ring_arc(t_ms: u64, env: &NovaEnv, out: &mut Vec<WordDecoration>, ca
 /// centre, in ms since ignition: the analytic inverse of [`ring_radius`]'s
 /// ease-out, so the pulse needs no stored state. `None` when the ring never
 /// reaches `dist`.
+#[inline]
 pub fn crossing_ms(dist: f32, r_max: f32, singularity: bool) -> Option<u64> {
     if !(0.0..=r_max).contains(&dist) || r_max <= 0.0 {
         return None;
@@ -695,6 +708,7 @@ pub fn crossing_ms(dist: f32, r_max: f32, singularity: bool) -> Option<u64> {
 
 /// The ~150 ms smoothstep in/out pulse envelope at `t` for a crossing at
 /// `cross_ms`; `None` outside the window.
+#[inline]
 pub fn pulse_env(t_ms: u64, cross_ms: u64) -> Option<f32> {
     if t_ms < cross_ms || t_ms >= cross_ms + PULSE_MS {
         return None;
@@ -745,12 +759,14 @@ pub fn constant_lum_toward(anchor: u32, target: u32) -> u32 {
 /// to the anchor, so |ΔL| ≤ 5% by construction. The match runs on the mixed
 /// colour because gamma-space mixing alone bows luminance past the bound on
 /// bright anchors.
+#[inline]
 pub fn pulse_color(anchor: u32, fringe: u32, amp: f32) -> u32 {
     constant_lum_toward(anchor, mix_rgb(anchor, fringe, amp.clamp(0.0, PULSE_AMP)))
 }
 
 /// §6.1 ember ink anchors: the settled gradient shifted to the palette's ember
 /// tone; the Singularity ends in a dim violet ember instead.
+#[inline]
 pub fn ember_pair(pair: (u32, u32), magic: Option<NovaMagic>) -> (u32, u32) {
     if magic == Some(NovaMagic::Singularity) {
         return (0x002A_2040, 0x005A_48A8); // dim violet

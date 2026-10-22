@@ -28,7 +28,7 @@ fn only<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> +
 /// left for the display's opening. Negative control: a listening socket is a window start.
 #[test]
 fn a_display_variable_nothing_answers_is_no_window_start() {
-    let root = aterm_tempfile::TempDir::new().unwrap();
+    let root = crate::test_scratch::short_dir("a display server's socket");
     let socket = root.path().join("X99");
     let display = [("DISPLAY", ":99")];
     let at = |path: &std::path::Path| {
@@ -77,7 +77,7 @@ fn a_display_variable_nothing_answers_is_no_window_start() {
 /// absolute `WAYLAND_DISPLAY`); with no runtime directory there is nowhere to ask.
 #[test]
 fn a_wayland_display_is_asked_at_its_socket() {
-    let root = aterm_tempfile::TempDir::new().unwrap();
+    let root = crate::test_scratch::short_dir("a display server's socket");
     let runtime = root.path().to_str().unwrap();
     let vars = [
         ("WAYLAND_DISPLAY", "wayland-1"),
@@ -164,7 +164,7 @@ fn an_inherited_display_socket_answers_and_no_other_descriptor_does() {
 /// with the compositor live, so is the Wayland one.
 #[test]
 fn winits_choice_of_display_decides_whether_a_start_is_counted() {
-    let root = aterm_tempfile::TempDir::new().unwrap();
+    let root = crate::test_scratch::short_dir("a display server's socket");
     let runtime = root.path().to_str().unwrap();
     let x_server = root.path().join("X0");
     let _x_server = std::os::unix::net::UnixListener::bind(&x_server).unwrap();
@@ -236,7 +236,7 @@ fn winits_choice_of_display_decides_whether_a_start_is_counted() {
 /// the loop goes first.
 #[test]
 fn a_launch_whose_display_answers_forks_session_zero_before_the_loop() {
-    let root = aterm_tempfile::TempDir::new().unwrap();
+    let root = crate::test_scratch::short_dir("a display server's socket");
     let live = root.path().join("X0");
     let _server = std::os::unix::net::UnixListener::bind(&live).unwrap();
     let gone = root.path().join("X1");

@@ -168,6 +168,7 @@ pub struct CursorFxFrame {
 /// Where the streak's head attaches in its cell: a thin bar's insertion point,
 /// else the cell centre. With a bar shape (DECSCUSR bar / `cursor_style beam`)
 /// the light noses into the bar instead of overshooting it by half a cell.
+#[inline]
 #[must_use]
 pub fn head_dx_for(style: CursorStyle) -> f32 {
     if matches!(style, CursorStyle::BlinkingBar | CursorStyle::SteadyBar) {
@@ -179,6 +180,7 @@ pub fn head_dx_for(style: CursorStyle) -> f32 {
 
 /// The Fire style's decorative cursor-body fill, through the same gates in
 /// every render path. Lazy, so a disabled effect never samples forge state.
+#[inline]
 pub fn forge_cursor_fill(
     cursor_body_allowed: bool,
     glow_cfg: &GlowConfig,
@@ -221,6 +223,7 @@ pub struct BlockFillSplice {
 /// Every site that spells the caret's shape (native render paths, the
 /// introspection mirror, the web pipeline) calls this, so a capture cannot
 /// contradict the glass.
+#[inline]
 #[must_use]
 pub fn compose_caret_style_override(
     bolt: bool,
@@ -242,6 +245,7 @@ pub fn compose_caret_style_override(
 /// folded into `host_allows`), and not while the rainbow owns the caret. The
 /// rainbow already encodes momentum in its rim and halo, so the momentum
 /// engine gets `enabled: false`, paints nothing and reports `hot: false`.
+#[inline]
 #[must_use]
 pub fn momentum_glow_allowed(user_on: bool, host_allows: bool, rainbow_owns_caret: bool) -> bool {
     user_on && host_allows && !rainbow_owns_caret
@@ -328,6 +332,7 @@ pub const BED_INK_FLOOR: f32 = 10.0;
 /// comet is that style's cell tint, runs no cadence comet beside it (the
 /// tint would only box the letters under the tail). A page's separately
 /// configured trail is its own.
+#[inline]
 #[must_use]
 pub fn comet_tail_is_its_streak(glow: &GlowConfig) -> bool {
     glow.beam && matches!(glow.style, GlowStyle::Comet)
@@ -432,6 +437,7 @@ pub fn floor_block_fill(
 /// rainbow caret on a reverse-video or TUI-coloured cell is still lifted.
 /// (The momentum tint's floor also reads the live cursor, in
 /// [`floor_block_fill`].)
+#[inline]
 #[must_use]
 pub fn caret_page_floor(owner: BlockFillOwner) -> f32 {
     match owner {
@@ -445,6 +451,7 @@ pub fn caret_page_floor(owner: BlockFillOwner) -> f32 {
 /// way to white); on a light page it deepens instead
 /// ([`crate::color_math::light_body_fill`]), since a whitening bolt sinks
 /// into a white page. [`floor_block_fill`] then holds it to the page.
+#[inline]
 #[must_use]
 fn bolt_body(color: u32, blaze: f32, dark: bool) -> u32 {
     let blaze = blaze.clamp(0.0, 1.0);
@@ -518,6 +525,7 @@ impl GlowSpelling {
     /// face, [`GlowStyle::style_names_classic_mono`]). `off` is no style
     /// (disabled). An unknown spelling reads as Lumen, the page's documented
     /// fallback (the native host substitutes its default spelling instead).
+    #[inline]
     #[must_use]
     pub fn parse(raw: &str) -> Self {
         let token = crate::cursor_glow::spellings::canonical(raw).unwrap_or(raw);
@@ -534,6 +542,7 @@ impl GlowSpelling {
     /// The companion a page's raw spelling names: the resident pet's species,
     /// or `None` for the flying head and every style without a pet. Read
     /// through the same table as [`Self::parse`].
+    #[inline]
     #[must_use]
     pub fn pet_of(raw: &str) -> Option<crate::kitty_pet::PetSpecies> {
         GlowStyle::style_names_any_pet(raw).then(|| {
@@ -579,6 +588,7 @@ pub const CLASSIC_DEFAULT_INTENSITY: f32 = 0.7;
 /// Classic's one-colour face (`classic_mono`: a trail colour, or the old
 /// `classic mono` spelling), whose dark tracer lies under the letters as a
 /// bed and was designed at full brightness. A set brightness is read as set.
+#[inline]
 #[must_use]
 pub const fn default_trail_intensity(style: Option<GlowStyle>, classic_mono: bool) -> f32 {
     match style {
@@ -588,6 +598,7 @@ pub const fn default_trail_intensity(style: Option<GlowStyle>, classic_mono: boo
 }
 
 /// A non-finite knob is OFF, never NaN in the engine; a finite one clamps.
+#[inline]
 fn finite_clamp_or_off(value: f32, min: f32, max: f32) -> f32 {
     if value.is_finite() {
         value.clamp(min, max)
@@ -598,6 +609,7 @@ fn finite_clamp_or_off(value: f32, min: f32, max: f32) -> f32 {
 
 /// Brighten a packed `0x00RRGGBB` by `factor` (the auto-accent law: an
 /// automatic accent is the colour brightened 1.5×, in every host).
+#[inline]
 #[must_use]
 pub fn brighten(color: u32, factor: f32) -> u32 {
     let channel = |shift: u32| ((((color >> shift) & 0xff) as f32) * factor).min(255.0) as u32;
@@ -607,6 +619,7 @@ pub fn brighten(color: u32, factor: f32) -> u32 {
 /// The style's own hue, `0x00RRGGBB`, or `None` for the styles whose
 /// automatic colour is the cursor's: Laser storm violet, Beam photon ice,
 /// Comet glacial blue, Sparkle starlight gold (the 2026-07-22 live review).
+#[inline]
 #[must_use]
 pub const fn canonical_glow_color(style: GlowStyle) -> Option<u32> {
     use crate::cursor_glow::{
@@ -636,6 +649,7 @@ pub const fn canonical_glow_color(style: GlowStyle) -> Option<u32> {
 /// * Laser follows nothing: only an explicit `cursor_trail_color` recolours
 ///   the lightning (live review: a rosewater storm reads as a smudge, not a
 ///   strike).
+#[inline]
 #[must_use]
 pub const fn glow_color_follows_live_cursor(style: GlowStyle, cursor_color_pinned: bool) -> bool {
     match style {
@@ -649,6 +663,7 @@ pub const fn glow_color_follows_live_cursor(style: GlowStyle, cursor_color_pinne
 /// and the style's [`canonical_glow_color`]. [`resolve_glow_config`] asks it
 /// with the theme cursor and no pin; each host's frame asks it again with the
 /// live colour and its pinned verdict.
+#[inline]
 #[must_use]
 pub const fn automatic_glow_color(
     style: GlowStyle,
@@ -740,6 +755,7 @@ pub fn resolve_glow_config(
 /// Laser "Violet", Beam "Ice blue", Comet "Pale blue", Sparkle "Gold", and
 /// `None` for every style whose automatic colour is the cursor's. One
 /// exhaustive match, so a style that gains a hue of its own must gain a name.
+#[inline]
 #[must_use]
 pub const fn canonical_glow_color_name(style: GlowStyle) -> Option<&'static str> {
     match style {
@@ -762,6 +778,7 @@ pub const fn canonical_glow_color_name(style: GlowStyle) -> Option<&'static str>
 /// is. `None` when the automatic colour is the cursor's: every style without
 /// a hue of its own, and Beam, Comet and Sparkle once the cursor colour is
 /// pinned (Laser keeps its violet whatever is pinned).
+#[inline]
 #[must_use]
 pub fn own_trail_color(style: GlowStyle, cursor_color_pinned: bool) -> Option<(u32, &'static str)> {
     if glow_color_follows_live_cursor(style, cursor_color_pinned) {
@@ -779,6 +796,7 @@ pub fn own_trail_color(style: GlowStyle, cursor_color_pinned: bool) -> Option<(u
 /// Laser's violet, and Beam's ice blue, Comet's pale blue and Sparkle's gold
 /// while no cursor colour is pinned) or Classic's shifting spectrum, which a
 /// trail colour turns into its one-colour face.
+#[inline]
 #[must_use]
 pub fn trail_color_default_name(
     style: GlowStyle,
@@ -809,6 +827,7 @@ pub enum AccentBase {
 /// no trail colour is chosen, and on a style that does not draw the trail
 /// colour on a block ([`GlowStyle::draws_trail_color`]); else the colour
 /// chosen, the cursor's among them. Settings names an accent's Reset by it.
+#[inline]
 #[must_use]
 pub fn unset_accent_base(
     style: GlowStyle,
@@ -851,6 +870,7 @@ impl TrailColor {
     /// cursor colour the config resolves against (the per-frame step,
     /// [`follow_live_cursor`], moves a cursor-coloured trail with the live
     /// cursor after that).
+    #[inline]
     #[must_use]
     pub fn knob(self, cursor: u32) -> Option<u32> {
         match self {
@@ -861,6 +881,7 @@ impl TrailColor {
     }
 
     /// The same setting with a pinned colour masked to `0x00RRGGBB`.
+    #[inline]
     #[must_use]
     pub fn masked(self) -> Self {
         match self {
@@ -871,6 +892,7 @@ impl TrailColor {
 
     /// Whether a colour was chosen at all: the rod wears it
     /// ([`CursorFxInput::user_tinted`]) and Classic draws its one-colour face.
+    #[inline]
     #[must_use]
     pub fn chosen(self) -> bool {
         !matches!(self, Self::Automatic)
@@ -927,6 +949,7 @@ pub fn follow_live_cursor(
 struct OverInkShares(u64);
 
 impl OverInkShares {
+    #[inline]
     fn fold(&mut self, share: f32) {
         if share < 1.0 {
             self.0 = aterm_hash::fnv_mix_u64(self.0 | 1, u64::from(share.to_bits()));
@@ -946,6 +969,7 @@ impl CursorFx {
     /// other rows than the active grid the effects live in, so both engines
     /// retire there, except Rainbow Kitty, which is hidden (its clocks run,
     /// nothing is written). It also arms the fresh-ink pop's reduced motion.
+    #[inline]
     pub fn begin(&mut self, live_viewport: bool, animate: bool) {
         if !live_viewport {
             if !self.glow.hide_v2() {
@@ -960,6 +984,7 @@ impl CursorFx {
     /// cadence: Serious Mode's cursor drain, and the web pipeline's all-off arm
     /// and hidden-page edge. The aurora is the caller's (its drain is a `reset`
     /// that keeps cumulative sensors).
+    #[inline]
     pub fn retire_bodies(&mut self) {
         self.retire_body_geometry();
         self.momentum.reset();
@@ -971,6 +996,7 @@ impl CursorFx {
     /// cells retire with this frame's scratch. The aurora (whose law differs by
     /// seam), the cadence and the momentum rate (facts about the hand) are the
     /// caller's.
+    #[inline]
     pub fn retire_body_geometry(&mut self) {
         self.trail.reset();
         self.rainbow = CursorRainbow::default();
@@ -987,6 +1013,7 @@ impl CursorFx {
     /// leaves by decay, translation or reset, never by someone else's output).
     /// The row probe is fenced so pre-scroll bytes never compare against the
     /// new row.
+    #[inline]
     pub fn scroll_translate(&mut self, rows: u16) {
         self.glow.note_scroll(rows);
         self.trail.note_scroll(rows);
@@ -997,6 +1024,7 @@ impl CursorFx {
     /// snapshot was explained by the `count` row-band moves from `first_seq`
     /// (an inline viewport's region scroll), replayed oldest first. The row
     /// probe is fenced as under a whole-plane translation.
+    #[inline]
     pub fn scroll_bands(
         &mut self,
         current: &aterm_core::terminal::ContentScrollState,
@@ -1015,6 +1043,7 @@ impl CursorFx {
     /// share one transform, so every live point retires: Rainbow Kitty's ribbon
     /// through its 0.24 s curtain (a reset for other styles), and the comet at
     /// once.
+    #[inline]
     pub fn scroll_invalidate(&mut self, now: Instant) {
         self.glow.curtain(now);
         self.trail.reset();
@@ -1022,6 +1051,7 @@ impl CursorFx {
 
     /// Any body (not the aurora, not the comet) still animating — the part of
     /// the scheduler's frame-cadence set this step owns.
+    #[inline]
     #[must_use]
     pub fn bodies_active(&self) -> bool {
         self.rainbow.is_active()
@@ -1038,6 +1068,7 @@ impl CursorFx {
     /// cool-down ([`MomentumGlow::settling`]). Disjoint from
     /// [`Self::bodies_active`]; a host paces it by
     /// [`Self::bodies_next_change_deadline`] on its coarse one-shot arm.
+    #[inline]
     #[must_use]
     pub fn bodies_settling(&self) -> bool {
         self.rainbow.settling() || self.momentum.settling()
@@ -1063,7 +1094,10 @@ impl CursorFx {
         } else {
             None
         };
-        rainbow.into_iter().chain(momentum).min()
+        match (rainbow, momentum) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// The frame step: the aurora, then every block body off the aurora's

@@ -250,6 +250,7 @@ pub struct Spine {
 
 impl Spine {
     /// A fresh spine at rest.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -262,6 +263,7 @@ impl Spine {
     ///
     /// It also closes the erase run, so read [`Spine::mend`] first on a key that
     /// may be a fix. The flow run climbs in [`Spine::note_keys`], not here.
+    #[inline]
     pub fn advance(&mut self, now: Instant) {
         self.momentum.advance(now);
         self.mark = None;
@@ -492,6 +494,7 @@ impl Spine {
     /// A command succeeded after a while: open the door for
     /// [`VERDICT_WINDOW_S`]. Draws nothing; it buys a price paid only by a key
     /// the user types. The caller decides what "green" and "a while" mean.
+    #[inline]
     pub fn note_verdict(&mut self, now: Instant) {
         self.verdict = Some(now);
     }
@@ -520,6 +523,7 @@ impl Spine {
     /// delete, and the key is priced at [`Spine::birth_disp`] alone. A pure
     /// read: the engine prices births at `max(birth_disp, mark.disp)` and
     /// publishes the mark in `Ctx::mend`; metric and follower are untouched.
+    #[inline]
     #[must_use]
     pub fn mend(&self, now: Instant) -> Option<EraseMark> {
         self.mark.filter(|m| {
@@ -597,6 +601,7 @@ impl Spine {
     /// Back to rest (layout changes, style switches, `Engine::reset`). Drops the
     /// clock stamp too, so the next [`Spine::update`] latches rather than
     /// integrating across the gap.
+    #[inline]
     pub fn reset(&mut self) {
         *self = Self::default();
     }

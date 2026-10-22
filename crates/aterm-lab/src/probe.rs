@@ -13,7 +13,9 @@
 //!
 //! * this lab's `jail.sb`, against THIS machine: the owner's real paths and
 //!   live sockets (the lab's own profile when it is up, a fresh render of the
-//!   same rules otherwise);
+//!   same rules otherwise); refused under a scratch `HOME` (an agent's run:
+//!   its unjailed controls would stat and open the account's own protected
+//!   entries), where only `--replica` runs;
 //! * a replica home: the same rules rendered for a scratch home that holds
 //!   every entry of the protected list, a socket where the owner's live aterm
 //!   and Claude Code keep theirs, the socket of a second private instance, the
@@ -1523,7 +1525,8 @@ fn judge_worlds(worlds: &[World], base: &Path, o: &mut dyn std::io::Write) -> i3
 /// `probe [tag] [--replica]`: the lab's own jail when it is up, else a fresh
 /// render of the same profile, and the replica home; `--replica`: the replica
 /// home alone (the same rules, Codex's among them), which never touches the
-/// owner's tree.
+/// owner's tree. Under a scratch `HOME` only `--replica` runs
+/// ([`machine_probe_refused`]).
 pub fn cmd_probe(args: &[String]) -> Res {
     let mut a = args.to_vec();
     let tag = take_tag(&mut a)?;
@@ -1560,6 +1563,9 @@ fn probe(tag: &str, replica_only: bool, o: &mut dyn std::io::Write) -> Res {
         ));
     }
     let p = paths();
+    if let Some(why) = machine_probe_refused(p, replica_only) {
+        return Err(Fail::die(why));
+    }
     // the replica's sockets (its home, its Claude sockets, its socket dir) need short paths, in /tmp: unix socket
     // names are limited to 103 bytes; its run, state and temp dirs go into the lab's state dir
     let base = PathBuf::from(
@@ -1587,6 +1593,23 @@ fn probe(tag: &str, replica_only: bool, o: &mut dyn std::io::Write) -> Res {
     let _ = fs::remove_dir_all(&base);
     let _ = fs::remove_dir_all(&pst);
     result
+}
+
+/// Why the probe of THIS machine may not run (`None`: it may): the account's
+/// home is the owner's tree whatever `HOME` says, and the probe's unjailed
+/// controls stat and open every protected entry in it (an open without a
+/// read). A run under a scratch `HOME` ([`crate::paths::Paths::scratch_home`],
+/// every agent's) never touches that tree, so it gets the replica alone, which
+/// proves the same rules (what the selftests run).
+fn machine_probe_refused(p: &crate::paths::Paths, replica_only: bool) -> Option<String> {
+    (!replica_only && p.scratch_home()).then(|| {
+        format!(
+            "probe: HOME ({}) is not the account's home ({}): the probe of this machine stats and opens the \
+             account's own protected entries outside the jail, which a run under a scratch HOME never does; \
+             pass --replica (the same rules on a replica home), or run it from the account's own HOME",
+            p.caller_home, p.real_home
+        )
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1751,6 +1774,31 @@ fn probe_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// UNDER A SCRATCH `HOME` THE PROBE OF THIS MACHINE IS REFUSED: its
+    /// controls would stat and open the account's protected entries; the
+    /// replica alone runs. NEGATIVE CONTROLS: from the account's own `HOME`
+    /// (the owner's run) the probe of this machine runs, and `--replica` runs
+    /// under either.
+    #[test]
+    fn under_a_scratch_home_only_the_replica_is_probed() {
+        let top = aterm_tempfile::Builder::new()
+            .prefix("lab-probe-homes-")
+            .tempdir()
+            .unwrap();
+        let (account, scratch) = (top.path().join("account"), top.path().join("scratch"));
+        for d in [&account, &scratch] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let agent = crate::paths::Paths::resolve_with(Some(account.clone()), Some(scratch.into()));
+        let why = machine_probe_refused(&agent, false).expect("refused under a scratch HOME");
+        assert!(why.contains("--replica"), "{why}");
+        assert_eq!(machine_probe_refused(&agent, true), None);
+        // NEGATIVE CONTROLS
+        let owner = crate::paths::Paths::resolve_with(Some(account.clone()), Some(account.into()));
+        assert_eq!(machine_probe_refused(&owner, false), None);
+        assert_eq!(machine_probe_refused(&owner, true), None);
+    }
 
     fn world(replica: bool) -> World {
         World {

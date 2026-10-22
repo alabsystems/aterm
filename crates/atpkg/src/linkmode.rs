@@ -318,6 +318,19 @@ pub fn link(
     checkout: &Path,
     bins: &[PathBuf],
 ) -> Result<LinkOutcome, LinkError> {
+    let (marker, checkout) = requested_marker(program, checkout, bins)?;
+    apply_link(
+        layout,
+        marker,
+        bins.iter().map(|rel| link_bin(&checkout, rel)),
+    )
+}
+
+fn requested_marker(
+    program: &str,
+    checkout: &Path,
+    bins: &[PathBuf],
+) -> Result<(LinkMarker, PathBuf), LinkError> {
     if !safe_component(program) {
         return Err(LinkError::BadName(program.to_string()));
     }
@@ -345,6 +358,45 @@ pub fn link(
     // Validate the complete marker before mutating any shim, so a request
     // which cannot be recorded never leaves a partially linked dev loop.
     serialize_marker(&marker).map_err(|e| LinkError::Io(e.to_string()))?;
+    Ok((marker, checkout))
+}
+
+struct ReadyBin {
+    name: String,
+    tool: crate::store::ToolName,
+    src: PathBuf,
+}
+
+enum LinkBin {
+    Ready(ReadyBin),
+    Refused(String),
+    Missing(PathBuf),
+    Unnamed,
+}
+
+fn link_bin(checkout: &Path, rel: &Path) -> LinkBin {
+    let Some(name) = bin_tool_name(rel) else {
+        return LinkBin::Unnamed;
+    };
+    let Some(tool) = crate::store::ToolName::new(name) else {
+        return LinkBin::Refused(name.to_string());
+    };
+    let src = checkout.join(rel);
+    if !src.is_file() {
+        return LinkBin::Missing(src);
+    }
+    LinkBin::Ready(ReadyBin {
+        name: name.to_string(),
+        tool,
+        src,
+    })
+}
+
+fn apply_link(
+    layout: &Layout,
+    marker: LinkMarker,
+    bins: impl IntoIterator<Item = LinkBin>,
+) -> Result<LinkOutcome, LinkError> {
     layout
         .ensure_dir(&layout.bin_dir())
         .map_err(|e| LinkError::Io(e.to_string()))?;
@@ -357,22 +409,20 @@ pub fn link(
     // below. A name that already stood is somebody else's (a store shim, a hand-made file),
     // so undoing our own failure restores it and never deletes it.
     let mut replaced: Vec<(PathBuf, PriorShim)> = Vec::new();
-    for rel in bins {
-        let Some(name) = bin_tool_name(rel) else {
-            continue;
+    for bin in bins {
+        let ReadyBin { name, tool, src } = match bin {
+            LinkBin::Ready(bin) => bin,
+            LinkBin::Refused(name) => {
+                refused.push(name);
+                continue;
+            }
+            LinkBin::Missing(src) => {
+                // Ordinary links still skip a not-yet-built bin for refresh to pick up.
+                missing.push(src);
+                continue;
+            }
+            LinkBin::Unnamed => continue,
         };
-        // The sensitive-name deny-list holds for dev links too: `ToolName::new` is the only
-        // constructor of a name `Layout::shim` accepts.
-        let Some(tool) = crate::store::ToolName::new(name) else {
-            refused.push(name.to_string());
-            continue;
-        };
-        let src = checkout.join(rel);
-        if !src.is_file() {
-            // A not-yet-built bin is simply skipped (refresh picks it up later).
-            missing.push(src);
-            continue;
-        }
         let shim = layout.shim(&tool);
         // Captured before the overwrite — once the dev shim is laid, the store shim's own
         // bytes are gone and nothing could say what they were.
@@ -390,7 +440,7 @@ pub fn link(
             return Err(LinkError::Io(e.to_string()));
         }
         replaced.push((shim, prior));
-        linked.push(name.to_string());
+        linked.push(name);
     }
     if linked.is_empty() {
         roll_back(&replaced);
@@ -400,7 +450,7 @@ pub fn link(
     // The marker is what makes a dev link tracked: without it `is_linked` says no, so
     // `update`/`apply` would re-point the shims and `unlink` would have nothing to read. A
     // failed write rolls back every shim, so a link either stands recorded or does not stand.
-    if let Err(e) = write_marker(&layout.link_marker(program), &marker) {
+    if let Err(e) = write_marker(&layout.link_marker(&marker.program), &marker) {
         roll_back(&replaced);
         return Err(LinkError::Io(e.to_string()));
     }
@@ -410,6 +460,135 @@ pub fn link(
     // marker records, which is why it runs after the marker write.
     crate::activate::reconcile_agents(layout);
     Ok(LinkOutcome { linked, refused })
+}
+
+/// An admitted conditional selection keeps its store's kernel writer lock borrowed until
+/// application. The CLI may start its pass housekeeping only after this read-only admission.
+pub(crate) struct ConditionalLink<'a> {
+    guard: &'a mut crate::lock::StoreLock,
+    marker: LinkMarker,
+    bins: Vec<ReadyBin>,
+}
+
+impl ConditionalLink<'_> {
+    pub(crate) fn guard(&mut self) -> &mut crate::lock::StoreLock {
+        self.guard
+    }
+
+    pub(crate) fn apply(self) -> Result<LinkOutcome, LinkError> {
+        apply_link(
+            &self.guard.layout(),
+            self.marker,
+            self.bins.into_iter().map(LinkBin::Ready),
+        )
+    }
+}
+
+/// Admit the complete candidate and the exact observed selection under the same store
+/// writer lock used by ordinary link/install/update. A path alias is a different marker
+/// value even when it currently resolves to the same checkout.
+pub(crate) fn link_if_checkout<'a>(
+    guard: &'a mut crate::lock::StoreLock,
+    configured: &Layout,
+    program: &str,
+    checkout: &Path,
+    bins: &[PathBuf],
+    expected: &Path,
+    expected_prefix: &Path,
+) -> Result<ConditionalLink<'a>, LinkError> {
+    if !safe_component(program) {
+        return Err(LinkError::BadName(program.to_string()));
+    }
+    let layout = guard.layout();
+    check_link_prefix(&layout, expected_prefix).map_err(LinkError::Io)?;
+    // Configuration can change while the caller waits for the original store's lock.
+    check_link_prefix(configured, expected_prefix).map_err(LinkError::Io)?;
+    let links = fs::symlink_metadata(layout.links_dir())
+        .map_err(|e| LinkError::Io(format!("current development links are unavailable: {e}")))?;
+    if !links.is_dir() || crate::platform::is_reparse(&links) {
+        return Err(LinkError::Io(
+            "development links are not a regular directory".into(),
+        ));
+    }
+    let marker = read_marker_for_program(&layout, program)
+        .map_err(|e| LinkError::Io(format!("current development link is unavailable: {e}")))?;
+    let expected_bins: Vec<String> = bins.iter().map(|b| b.display().to_string()).collect();
+    if marker.schema != 1
+        || !Path::new(&marker.checkout).is_absolute()
+        || !expected.is_absolute()
+        || expected.as_os_str() != std::ffi::OsStr::new(&marker.checkout)
+        || marker.bins != expected_bins
+    {
+        return Err(LinkError::Io(
+            "development selection changed; leaving it in place".into(),
+        ));
+    }
+    let (marker, checkout) = requested_marker(program, checkout, bins)?;
+    let mut ready = Vec::with_capacity(bins.len());
+    for rel in bins {
+        if rel.as_os_str().is_empty()
+            || rel
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(LinkError::Io(format!(
+                "conditional bin is not checkout-relative: {}",
+                rel.display()
+            )));
+        }
+        match link_bin(&checkout, rel) {
+            LinkBin::Ready(bin) => ready.push(bin),
+            LinkBin::Missing(src) => {
+                return Err(LinkError::NoBins {
+                    missing: vec![src],
+                    refused: Vec::new(),
+                });
+            }
+            LinkBin::Refused(name) => {
+                return Err(LinkError::NoBins {
+                    missing: Vec::new(),
+                    refused: vec![name],
+                });
+            }
+            LinkBin::Unnamed => {
+                return Err(LinkError::Io(format!(
+                    "conditional bin has no tool name: {}",
+                    rel.display()
+                )));
+            }
+        }
+    }
+    if ready.is_empty() {
+        return Err(LinkError::NoBins {
+            missing: Vec::new(),
+            refused: Vec::new(),
+        });
+    }
+    Ok(ConditionalLink {
+        guard,
+        marker,
+        bins: ready,
+    })
+}
+
+/// A guarded producer must address the same physical store it inspected.
+pub(crate) fn check_link_prefix(layout: &Layout, expected: &Path) -> Result<(), String> {
+    let actual = fs::canonicalize(&layout.prefix).map_err(|e| {
+        format!(
+            "cannot inspect package prefix {}: {e}",
+            layout.prefix.display()
+        )
+    })?;
+    let expected = fs::canonicalize(expected).map_err(|e| {
+        format!(
+            "cannot inspect expected package prefix {}: {e}",
+            expected.display()
+        )
+    })?;
+    if actual != expected {
+        return Err("package prefix changed; leaving development selection in place".into());
+    }
+    Ok(())
 }
 
 /// Un-link `program`: remove the shims that still point into its recorded checkout (never a
@@ -704,6 +883,179 @@ fn write_marker(dest: &Path, marker: &LinkMarker) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guarded_link_replaces_only_the_still_selected_checkout() {
+        let root = crate::testdir::dir("atpkg-guarded-link-");
+        let layout = Layout {
+            prefix: root.join("pkg"),
+        };
+        let old = checkout("guard-old", &["ay"]);
+        let new = checkout("guard-new", &["ay"]);
+        let manual = checkout("guard-manual", &["ay"]);
+        let bins = vec![PathBuf::from("target/release/ay")];
+        let mut guard = crate::lock::try_lock_store(&layout).unwrap();
+        link(&layout, "ay", &old, &bins).unwrap();
+        // Physical aliases are not the exact marker value the producer observed.
+        let alias = PathBuf::from(format!("{}/.", old.display()));
+        let before = fs::read(layout.link_marker("ay")).unwrap();
+        assert!(
+            link_if_checkout(
+                &mut guard,
+                &layout,
+                "ay",
+                &new,
+                &bins,
+                &alias,
+                &layout.prefix
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(layout.link_marker("ay")).unwrap(), before);
+        let mut marker = read_marker_for_program(&layout, "ay").unwrap();
+        marker.checkout = alias.display().to_string();
+        write_marker(&layout.link_marker("ay"), &marker).unwrap();
+        assert!(
+            link_if_checkout(&mut guard, &layout, "ay", &new, &bins, &old, &layout.prefix).is_err()
+        );
+        link_if_checkout(
+            &mut guard,
+            &layout,
+            "ay",
+            &new,
+            &bins,
+            &alias,
+            &layout.prefix,
+        )
+        .unwrap()
+        .apply()
+        .unwrap();
+        assert_eq!(linked_checkout(&layout, "ay"), Some(new.to_path_buf()));
+        // A manual selection made after a producer's read wins.
+        link(&layout, "ay", &manual, &bins).unwrap();
+        let marker = fs::read(layout.link_marker("ay")).unwrap();
+        let shim = fs::read(layout.bin_dir().join("ay")).unwrap();
+        assert!(
+            link_if_checkout(&mut guard, &layout, "ay", &new, &bins, &old, &layout.prefix).is_err()
+        );
+        assert_eq!(fs::read(layout.link_marker("ay")).unwrap(), marker);
+        assert_eq!(fs::read(layout.bin_dir().join("ay")).unwrap(), shim);
+        let valid = read_marker_for_program(&layout, "ay").unwrap();
+        for kind in ["schema", "program", "relative", "malformed"] {
+            let mut invalid = valid.clone();
+            match kind {
+                "schema" => invalid.schema = 2,
+                "program" => invalid.program = "other".into(),
+                "relative" => invalid.checkout = "relative".into(),
+                _ => {}
+            }
+            let bytes = if kind == "malformed" {
+                "not a marker".into()
+            } else {
+                serialize_marker(&invalid).unwrap()
+            };
+            fs::write(layout.link_marker("ay"), bytes.as_bytes()).unwrap();
+            assert!(
+                link_if_checkout(
+                    &mut guard,
+                    &layout,
+                    "ay",
+                    &new,
+                    &bins,
+                    &manual,
+                    &layout.prefix
+                )
+                .is_err(),
+                "{kind}"
+            );
+            assert_eq!(
+                fs::read(layout.link_marker("ay")).unwrap(),
+                bytes.as_bytes()
+            );
+            assert_eq!(fs::read(layout.bin_dir().join("ay")).unwrap(), shim);
+        }
+    }
+
+    #[test]
+    fn guarded_link_requires_its_store_lock_and_original_bin_mapping() {
+        let root = crate::testdir::dir("atpkg-guarded-owner-");
+        let layout = Layout {
+            prefix: root.join("pkg"),
+        };
+        let old = checkout("guard-mapping", &["ay", "aux"]);
+        let new = checkout("guard-mapping-new", &["ay"]);
+        let bins = vec![PathBuf::from("target/release/ay")];
+        let both = vec![
+            PathBuf::from("target/release/ay"),
+            PathBuf::from("target/release/aux"),
+        ];
+        link(&layout, "ay", &old, &both).unwrap();
+        let marker = fs::read(layout.link_marker("ay")).unwrap();
+        let mut guard = crate::lock::try_lock_store(&layout).unwrap();
+        assert_eq!(guard.layout().prefix, layout.prefix);
+        assert!(
+            link_if_checkout(&mut guard, &layout, "ay", &new, &bins, &old, &layout.prefix).is_err()
+        );
+        let shim = fs::read(layout.bin_dir().join("ay")).unwrap();
+        // One built candidate cannot silently replace a two-bin selection.
+        assert!(
+            link_if_checkout(&mut guard, &layout, "ay", &new, &both, &old, &layout.prefix).is_err()
+        );
+        assert_eq!(fs::read(layout.link_marker("ay")).unwrap(), marker);
+        assert_eq!(fs::read(layout.bin_dir().join("ay")).unwrap(), shim);
+        fs::write(new.join("target/release/aux"), b"fixture\n").unwrap();
+        let outcome =
+            link_if_checkout(&mut guard, &layout, "ay", &new, &both, &old, &layout.prefix)
+                .unwrap()
+                .apply()
+                .unwrap();
+        assert_eq!(outcome.linked, ["ay", "aux"]);
+        assert_eq!(linked_checkout(&layout, "ay"), Some(new.to_path_buf()));
+        // Removing a link while the build ran is also a selection, not permission to restore it.
+        unlink(&layout, "ay").unwrap();
+        assert!(
+            link_if_checkout(&mut guard, &layout, "ay", &new, &bins, &new, &layout.prefix).is_err()
+        );
+        assert!(!layout.link_marker("ay").exists());
+        assert!(!layout.bin_dir().join("ay").exists());
+    }
+
+    #[test]
+    fn guarded_link_prefix_refuses_a_different_store() {
+        let root = crate::testdir::dir("atpkg-guarded-prefix-");
+        let layout = Layout {
+            prefix: root.join("a"),
+        };
+        let other = Layout {
+            prefix: root.join("b"),
+        };
+        let mut guard = crate::lock::try_lock_store(&layout).unwrap();
+        let mut other_guard = crate::lock::try_lock_store(&other).unwrap();
+        assert!(check_link_prefix(&guard.layout(), &layout.prefix).is_ok());
+        assert!(check_link_prefix(&guard.layout(), &other.prefix).is_err());
+        let old = checkout("guard-prefix-old", &["ay"]);
+        let new = checkout("guard-prefix-new", &["ay"]);
+        let bins = [PathBuf::from("target/release/ay")];
+        link(&layout, "ay", &old, &bins).unwrap();
+        let marker = fs::read(layout.link_marker("ay")).unwrap();
+        assert!(
+            link_if_checkout(
+                &mut other_guard,
+                &layout,
+                "ay",
+                &new,
+                &bins,
+                &old,
+                &layout.prefix
+            )
+            .is_err()
+        );
+        // A newly configured store cannot be mutated while the caller holds the old lock.
+        assert!(
+            link_if_checkout(&mut guard, &other, "ay", &new, &bins, &old, &layout.prefix).is_err()
+        );
+        assert_eq!(fs::read(layout.link_marker("ay")).unwrap(), marker);
+    }
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 

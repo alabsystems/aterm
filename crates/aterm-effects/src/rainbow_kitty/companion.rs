@@ -183,6 +183,7 @@ pub struct CompanionAdmission {
 /// (`Idle` ⇒ none, `Pet` ⇒ the pet, `FlyingHead { cell }` ⇒ the head escorting `cell`). No
 /// taste knob (intensity, duration, theme, reduced motion) may delete a companion, so this
 /// takes no [`super::Config`].
+#[inline]
 #[must_use]
 pub fn body_for(admitted: CompanionAdmission) -> Body {
     if admitted.body_claimed {
@@ -238,6 +239,7 @@ pub struct Flight {
 impl Flight {
     /// The spine value to force on frame 0 ([`FLYING_DISP_FLOOR`]), as a floor
     /// so a cat already at full momentum is not pulled down.
+    #[inline]
     #[must_use]
     pub fn disp_floor(&self) -> f32 {
         FLYING_DISP_FLOOR
@@ -246,6 +248,7 @@ impl Flight {
     /// The whip in cells at `now`: [`FLYING_LEAD_0`] springing to [`FLYING_LEAD_MAX`] on
     /// [`timing::spring_whip`] (overshoots, settled ≈ 180 ms in). A pure function of
     /// `now − t₀`, so every refresh rate shows the same lean at the same wall time.
+    #[inline]
     #[must_use]
     pub fn lead_at(&self, now: Instant) -> f32 {
         let age = now.saturating_duration_since(self.t0).as_secs_f32();
@@ -254,6 +257,7 @@ impl Flight {
 
     /// The squint (§7.2(a), row "Eyes") holds through the flight and
     /// [`FLYING_SQUINT_TAIL_MS`] past the arrival edge.
+    #[inline]
     #[must_use]
     pub fn squint_until(&self) -> Instant {
         add_ms(self.land_at, FLYING_SQUINT_TAIL_MS)
@@ -262,6 +266,7 @@ impl Flight {
     /// The 1-px look-back toward the launch ends here
     /// ([`FLYING_LOOKBACK_MS`] after arrival) — and this is the last thing v2
     /// itself still computes for the flight.
+    #[inline]
     #[must_use]
     pub fn settled_at(&self) -> Instant {
         add_ms(self.land_at, FLYING_LOOKBACK_MS)
@@ -304,6 +309,7 @@ impl BodyImpulse {}
 ///
 /// The three reactions are poses both animators already own; only the meteor
 /// forks, exactly once.
+#[inline]
 #[must_use]
 pub fn impulse_for(body: Body, impulse: CompanionImpulse) -> BodyImpulse {
     match (body, impulse) {
@@ -326,6 +332,7 @@ pub fn impulse_for(body: Body, impulse: CompanionImpulse) -> BodyImpulse {
 }
 
 /// The arrival edge `t₀ + T` (§6.7), derived once so the squash and the perk offer agree.
+#[inline]
 fn arrival(t0: Instant, t_flight: std::time::Duration) -> Instant {
     t0.checked_add(t_flight).unwrap_or(t0)
 }
@@ -335,6 +342,7 @@ fn arrival(t0: Instant, t_flight: std::time::Duration) -> Instant {
 /// [`super::Engine`]), not the body, so it cannot be double-counted and a
 /// frame whose body was vetoed still earns it. An earned hero is born as an m1
 /// and chimes only if the [`super::stardust::StarBudget`] has a token.
+#[inline]
 #[must_use]
 pub fn heroes_earned(impulse: CompanionImpulse) -> u8 {
     match impulse {
@@ -549,6 +557,7 @@ struct Census {
 
 impl Census {
     /// A seat this span may be taken at without yielding.
+    #[inline]
     fn clear(self) -> bool {
         !self.covers_caret && self.probe == Probe::Clear
     }
@@ -604,6 +613,7 @@ where
 /// The inclusive cell columns a body `w` px wide at `x` px covers, clamped
 /// into `0..cols`. A body 5.2 cells wide occludes six cells, and a fractional
 /// left edge one more.
+#[inline]
 fn cell_span(x: i32, w: i32, cw: i32, cols: u16) -> (u16, u16) {
     let last_col = i32::from(cols.saturating_sub(1));
     let first = x.div_euclid(cw).clamp(0, last_col);
@@ -618,6 +628,7 @@ fn cell_span(x: i32, w: i32, cw: i32, cols: u16) -> (u16, u16) {
 
 /// Build the [`Seat`] for a resolved `x`/`y`. `col` is read off the final `x`
 /// so the struct carries one position, not two.
+#[inline]
 fn seat(
     query: &SeatQuery,
     x: i32,
@@ -708,6 +719,7 @@ impl PetOnGlass {
     }
 
     /// The body's column span, `[left, right]`, in fractional grid columns.
+    #[inline]
     #[must_use]
     pub fn span(&self) -> (f32, f32) {
         (self.col, self.col + self.width.max(0.0))
@@ -716,6 +728,7 @@ impl PetOnGlass {
     /// The offer gate: settled and contented (the purr tell, or the ledger over the pet's own
     /// gate whatever the pose), both the pet's own verdicts. On the ledger the catch fires for
     /// the first slow key after any run of thirteen cells.
+    #[inline]
     #[must_use]
     pub fn contented(&self) -> bool {
         self.settled && (self.purr > 0.0 || self.contented)
@@ -723,6 +736,7 @@ impl PetOnGlass {
 
     /// Distance in columns from the body's nearest edge to grid column `col`; `0` under the
     /// body.
+    #[inline]
     #[must_use]
     pub fn columns_to(&self, col: i32) -> f32 {
         let (lo, hi) = self.span();
@@ -777,6 +791,7 @@ impl PetOffer {
 /// `at + ms`, saturating rather than panicking on an absurd offset. The one
 /// place milliseconds become an `Instant` in this module, so nobody rounds on
 /// the way and lands a frame early (§8.1's reasoning for [`timing::flight`]).
+#[inline]
 fn add_ms(at: Instant, ms: f32) -> Instant {
     at.checked_add(std::time::Duration::from_secs_f32(ms / 1000.0))
         .unwrap_or(at)

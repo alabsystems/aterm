@@ -106,7 +106,7 @@
 //! | `outbox [<max>]` (Bytes, bridge-only) | local posts' bodies, for the bridge's pipe | rendered |
 //! | `subscribe` (Push) | frames; `bytes` frames carry a program's raw output | rendered: raw it would drive the reader's terminal and could overwrite the `sub`/`EVENT` lines being watched; a frame parser reads a pipe, where `BYTES <len>` still counts raw bytes |
 //! | `text`, `screen`, `offscreen`, `search`, `selection`, `blocktext`, `line(s)` (Lines/Status) | screen text: C0/C1 already spaces (`visible_char`), bidi faithful | rendered (a screen's bidi override no longer reorders the reader's line) |
-//! | `blocks`, `timeline`, `history`, `sessions`, `who`, `exits`, `inbox`, `topic`, `trail`, `identities`, `family`, `edges`, `grants`, `flows`, `modes`, `resizes`, `turn`, `kitty`, `appstatus`, `messages`, `chrome`, `controls`, `panes`, `inspect`, `privacy`, `help`, `verbs` (Lines) | rows of pct-encoded or sanitized fields | rendered; the identity on an honest server's rows |
+//! | `blocks`, `timeline`, `history`, `sessions`, `who`, `exits`, `inbox`, `topic`, `trail`, `family`, `edges`, `grants`, `flows`, `modes`, `resizes`, `turn`, `kitty`, `appstatus`, `messages`, `chrome`, `controls`, `panes`, `inspect`, `privacy`, `help`, `verbs` (Lines) | rows of pct-encoded or sanitized fields | rendered; the identity on an honest server's rows |
 //! | every `--json` form, `cast frames`, `cast drift`, `video frames` (Lines) | JSON (escaped by `aterm_codec::json`), path and verdict rows | rendered; the identity on an honest server's rows |
 //! | `image read`, `image --bytes` (Lines) | PNGs as base64 | rendered; base64 is ASCII, so the identity |
 //! | every Status verb, every `OK`/`ERR` line and refusal tail | the server's one line | rendered: OUT-3 |
@@ -406,7 +406,7 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
     ls            every session of every live instance, one per line:
                   <pid> <local> <sid> <parent|-> <state> <title> meta=<0|1> nonce=<hex32>
                   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->
-                  identity=<name|-> path=<frozen|live> program=<name|-> agent=<word|->
+                  path=<frozen|live> program=<name|-> agent=<word|->
                   agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|->
                   agent_fp=<hex16|-> human_ms=<ms|-> role=<pct|-> attention=<pct|->
                   user_title=<pct|-> supervisor=<holder|->
@@ -424,10 +424,7 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
                   recently focused one (unchanged by a minimize or by the app
                   deactivating); detail= the sanitized running command, never
                   its arguments — e.g. claude, codex, targo%20test — so it says
-                  whether a peer is another agent; identity= the agent identity the
-                  session was spawned under (`spawn identity=<name>`: its
-                  agents' own login, kept apart from the human's), - for the
-                  human's own agent config — `identities` lists them; path=
+                  whether a peer is another agent; path=
                   whether `claude` and `codex` typed at that session's prompt
                   run aterm's managed builds: frozen = a foreign copy (a
                   native install, a brew cask) wins its PATH. Measured from a

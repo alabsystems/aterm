@@ -340,8 +340,18 @@ pub trait Registry: Send + Sync + 'static {
     /// The bridge that owns the link moved `files` state files it found torn
     /// after an unclean shutdown into its state dir's quarantine (`link
     /// set-aside`, [`cmd_link`]):
-    /// a fact for the owner's later look, never an alert.
-    fn torn_state_set_aside(&self, files: u64);
+    /// a fact for the owner's later look, never an alert. `told_when_empty`:
+    /// that bridge said in its `hello` a lane that says what its quarantine
+    /// still holds (`link quarantine`, at
+    /// [`aterm_types::control_verbs::LINK_QUARANTINE_LANE`] or later), so the
+    /// fact will end once the owner empties it ([`Registry::torn_state_held`]);
+    /// an older bridge never says, and the fact stands until dismissed.
+    fn torn_state_set_aside(&self, files: u64, told_when_empty: bool);
+    /// The bridge that owns the link says its quarantine still holds `files`
+    /// of the torn files it set aside (`link quarantine`, [`cmd_link`]): at 0
+    /// the owner has taken them away, and the fact filed for their look has
+    /// ended; any other count changes nothing.
+    fn torn_state_held(&self, files: u64);
 }
 
 /// The registry as the fabric holds it: one allocation per instance, whose
@@ -4590,9 +4600,12 @@ fn cmd_link_mirror<'a>(
 /// (`aterm_link::state::StateDir::set_aside_torn`) rather than refuse them at
 /// every attach. A fact for the owner's later look, handed to the registry
 /// ([`Registry::torn_state_set_aside`]) — once per line, from the bridge that
-/// owns the link; a ghost lane's is `OK stale=1` and hands nothing over. The
-/// registry is called with no link lock held; the bridge transition stays
-/// gated until the callback returns.
+/// owns the link; a ghost lane's is `OK stale=1` and hands nothing over — with
+/// whether that bridge will say when its quarantine is empty: the lane its
+/// recorded `hello` named, at
+/// [`aterm_types::control_verbs::LINK_QUARANTINE_LANE`] or later (no `hello`,
+/// none). The registry is called with no link lock held; the bridge
+/// transition stays gated until the callback returns.
 fn cmd_link_set_aside<'a>(
     store: &Store,
     mut toks: impl Iterator<Item = &'a str>,
@@ -4607,10 +4620,48 @@ fn cmd_link_set_aside<'a>(
         return LINK_USAGE.to_string();
     };
     with_current_bridge(generation, || {
+        let told_when_empty = LINK
+            .link
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .hello
+            .as_ref()
+            .is_some_and(|h| h.lane >= aterm_types::control_verbs::LINK_QUARANTINE_LANE);
         store
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .torn_state_set_aside(files);
+            .torn_state_set_aside(files, told_when_empty);
+        "OK\n".to_string()
+    })
+    .unwrap_or_else(|| "OK stale=1\n".to_string())
+}
+
+/// `link quarantine torn=<k>` from the lane whose generation `generation` is
+/// (LANE 5): how many of the torn state files set aside
+/// ([`cmd_link_set_aside`]) the bridge's quarantine still holds, said at its
+/// start and as the owner empties it. Handed to the registry
+/// ([`Registry::torn_state_held`]), which at 0 ends the fact it filed for the
+/// owner's look — the owner has taken the bytes away — from the bridge that
+/// owns the link; a ghost lane's is `OK stale=1` and hands nothing over. The
+/// registry is called with no link lock held; the bridge transition stays
+/// gated until the callback returns.
+fn cmd_link_quarantine<'a>(
+    store: &Store,
+    mut toks: impl Iterator<Item = &'a str>,
+    generation: Option<BridgeGeneration>,
+) -> String {
+    let torn = toks
+        .next()
+        .and_then(|tok| kv(tok, "torn"))
+        .and_then(|v| v.parse::<u64>().ok());
+    let (Some(torn), None) = (torn, toks.next()) else {
+        return LINK_USAGE.to_string();
+    };
+    with_current_bridge(generation, || {
+        store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .torn_state_held(torn);
         "OK\n".to_string()
     })
     .unwrap_or_else(|| "OK stale=1\n".to_string())
@@ -4648,7 +4699,8 @@ const LINK_USAGE: &str = "ERR usage: link up rtt=<ms> | link down reason=<token>
                           link log <identity> [continues=<off> was=<identity>] | \
                           link bye <quit|handoff> | \
                           link mirror on|stopped|capped [reason=<token>] | \
-                          link set-aside files=<n>\n";
+                          link set-aside files=<n> | \
+                          link quarantine torn=<k>\n";
 
 /// HOW MANY `bye`s THE LIVE BRIDGE HAS TAKEN — its `link bye <word>`, the
 /// answer to the `EVENT * bye <word>` this instance pushed before closing its
@@ -4705,9 +4757,10 @@ fn note_bye_taken(generation: Option<BridgeGeneration>) -> bool {
 
 /// `link up rtt=<ms>` / `link down reason=<token> [rtt=<ms>]` / `link log
 /// <identity>` / `link bye <quit|handoff>` / `link mirror …` / `link set-aside
-/// files=<n>`, from the bridge lane whose generation `generation` is. See
-/// [`link_report`], [`cmd_link_log`], [`note_bye_taken`], [`cmd_link_mirror`]
-/// and [`cmd_link_set_aside`].
+/// files=<n>` / `link quarantine torn=<k>`, from the bridge lane whose
+/// generation `generation` is. See [`link_report`], [`cmd_link_log`],
+/// [`note_bye_taken`], [`cmd_link_mirror`], [`cmd_link_set_aside`] and
+/// [`cmd_link_quarantine`].
 pub fn cmd_link(store: &impl AsStore, rest: &str, generation: Option<BridgeGeneration>) -> String {
     cmd_link_after_log_switch(store, rest, generation, || {})
 }
@@ -4765,6 +4818,7 @@ pub fn cmd_link_after_log_switch(
         }
         Some("mirror") => return cmd_link_mirror(toks, generation),
         Some("set-aside") => return cmd_link_set_aside(store, toks, generation),
+        Some("quarantine") => return cmd_link_quarantine(store, toks, generation),
         _ => return LINK_USAGE.to_string(),
     };
     let mut rtt: Option<u64> = None;
@@ -9137,6 +9191,12 @@ mod test_support {
         /// Every `link set-aside` count handed over
         /// ([`Registry::torn_state_set_aside`]), in order.
         pub(crate) set_aside: std::sync::Mutex<Vec<u64>>,
+        /// Whether each of those came from a bridge that says when its
+        /// quarantine is empty, in the same order.
+        pub(crate) told_when_empty: std::sync::Mutex<Vec<bool>>,
+        /// Every `link quarantine` count handed over
+        /// ([`Registry::torn_state_held`]), in order.
+        pub(crate) held: std::sync::Mutex<Vec<u64>>,
     }
 
     impl TestStore {
@@ -9169,8 +9229,18 @@ mod test_support {
                 .map(|c| Arc::clone(c) as Arc<dyn FabricSession>)
         }
         fn bridge_lost_advised(&self, _sessions: usize) {}
-        fn torn_state_set_aside(&self, files: u64) {
+        fn torn_state_set_aside(&self, files: u64, told_when_empty: bool) {
             self.set_aside
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(files);
+            self.told_when_empty
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(told_when_empty);
+        }
+        fn torn_state_held(&self, files: u64) {
+            self.held
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push(files);
@@ -10040,7 +10110,7 @@ mod inbox_hold {
                 None
             }
             fn bridge_lost_advised(&self, _: usize) {}
-            fn torn_state_set_aside(&self, files: u64) {
+            fn torn_state_set_aside(&self, files: u64, _: bool) {
                 let transition = match LINK.log_transition.try_lock() {
                     Ok(guard) => Some(guard),
                     Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
@@ -10055,6 +10125,7 @@ mod inbox_hold {
                     .unwrap()
                     .push((files, lane_owns(Some(self.owner))));
             }
+            fn torn_state_held(&self, _: u64) {}
         }
 
         with_link(|| {
@@ -10112,6 +10183,104 @@ mod inbox_hold {
             );
             assert_eq!(cmd_link(&store, "set-aside files=2", Some(next)), "OK\n");
             assert_eq!(taken(), vec![3, 2]);
+        });
+    }
+
+    /// A SET-ASIDE SAYS WHETHER ITS BRIDGE WILL TELL WHEN THE QUARANTINE IS
+    /// EMPTY (sim item S6, the review's finding on the entry's words): the
+    /// lane the owning bridge's recorded `hello` named, at
+    /// [`aterm_types::control_verbs::LINK_QUARANTINE_LANE`] or later, is one
+    /// that says `link quarantine`; a lane-4 bridge (a `[fabric] command` that
+    /// names an older aterm) never does, and neither does a bridge that said
+    /// no `hello` — so the entry it raises must not promise to end on its own.
+    /// A new attach forgets the last bridge's lane.
+    #[test]
+    fn a_set_aside_says_whether_its_bridge_tells_when_the_quarantine_is_empty() {
+        with_link(|| {
+            let store = new_store();
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let told = || {
+                store
+                    .read()
+                    .unwrap()
+                    .told_when_empty
+                    .lock()
+                    .unwrap()
+                    .clone()
+            };
+            assert_eq!(
+                cmd_link(&store, "set-aside files=1", Some(generation)),
+                "OK\n"
+            );
+            assert_eq!(told(), [false], "no hello: lane 1, which never tells");
+            assert!(cmd_hello("lane=4 build=x", Some(generation)).starts_with("OK "));
+            assert_eq!(
+                cmd_link(&store, "set-aside files=1", Some(generation)),
+                "OK\n"
+            );
+            assert_eq!(told(), [false, false], "lane 4 never tells");
+            let lane = aterm_types::control_verbs::LINK_QUARANTINE_LANE;
+            assert!(
+                cmd_hello(&format!("lane={lane} build=x"), Some(generation)).starts_with("OK ")
+            );
+            assert_eq!(
+                cmd_link(&store, "set-aside files=1", Some(generation)),
+                "OK\n"
+            );
+            assert_eq!(told(), [false, false, true], "lane {lane} tells");
+            let next = next_bridge_generation();
+            attach_up(&store, next);
+            assert_eq!(cmd_link(&store, "set-aside files=1", Some(next)), "OK\n");
+            assert_eq!(
+                told(),
+                [false, false, true, false],
+                "the next bridge has said no hello yet"
+            );
+        });
+    }
+
+    /// WHAT THE QUARANTINE STILL HOLDS IS THE OWNING BRIDGE'S TO SAY (lane 5):
+    /// the lane that owns the link hands every count to the registry, 0
+    /// included — the count that ends the owner's entry; a ghost lane's and
+    /// an unowned line's are `OK stale=1` and hand nothing over; a count that
+    /// is not a number, a word for it other than `torn=`, or a word after it,
+    /// is a usage error. The two lines are apart: a count held is never one
+    /// set aside.
+    #[test]
+    fn a_quarantine_count_reaches_the_registry_only_from_the_owning_lane() {
+        with_link(|| {
+            let store = new_store();
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let held = || store.read().unwrap().held.lock().unwrap().clone();
+            for (line, n) in [("quarantine torn=2", 2), ("quarantine torn=0", 0)] {
+                assert_eq!(cmd_link(&store, line, Some(generation)), "OK\n", "{line}");
+                assert_eq!(held().last(), Some(&n), "{line}");
+            }
+            let ghost = next_bridge_generation();
+            assert_eq!(
+                cmd_link(&store, "quarantine torn=1", Some(ghost)),
+                "OK stale=1\n"
+            );
+            assert_eq!(cmd_link(&store, "quarantine torn=1", None), "OK stale=1\n");
+            for bad in [
+                "quarantine",
+                "quarantine torn=-1",
+                "quarantine torn=x",
+                "quarantine files=0",
+                "quarantine torn=0 more",
+            ] {
+                assert!(
+                    cmd_link(&store, bad, Some(generation)).starts_with("ERR usage"),
+                    "{bad}"
+                );
+            }
+            assert_eq!(held(), vec![2, 0], "nothing but the owner's two lines");
+            assert!(
+                store.read().unwrap().set_aside.lock().unwrap().is_empty(),
+                "a count held is never one set aside"
+            );
         });
     }
 

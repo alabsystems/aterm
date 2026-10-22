@@ -51,11 +51,12 @@ const SENTINEL: &str = "SECRET-TRANSCRIPT-TEXT";
 /// session row under it stays retained at `state=live` forever.
 ///
 /// THE TWO ROWS THIS MUST TELL APART are both unhosted by THIS bridge. One
-/// carries an `inc=` at or below the bridge's own — an incarnation it
-/// succeeded, which is dead by construction. The other carries a higher one: a
+/// carries this bridge's writer mark and an `inc=` at or below its own. The
+/// other carries a higher one: a
 /// bridge that attached AFTER this one, on a node id they share, whose
 /// sessions are alive and none of this bridge's business. Retiring the second
 /// would take a live agent off the fleet, so the guard is not decoration.
+/// The same current number with another mark, or no mark, also stays live.
 #[test]
 fn an_unhosted_presence_row_is_retired_and_a_newer_incarnations_is_left_alone() {
     let w = World::boot_with(
@@ -65,6 +66,10 @@ fn an_unhosted_presence_row_is_retired_and_a_newer_incarnations_is_left_alone() 
     );
     w.wait_ready();
     let (a, _b) = w.two_sessions();
+    let mark = until("the hosted session's writer mark", || {
+        presence_body(&w, &a).and_then(|body| kv(&body, "statedir").map(str::to_owned))
+    });
+    let other_mark = format!("{:016x}", u64::from_str_radix(&mark, 16).unwrap() ^ 1);
 
     // TWO ROWS THIS BRIDGE DID NOT WRITE AND DOES NOT HOST. `inc=1` is at or
     // below any attached bridge's own; `inc=99999` is a successor's.
@@ -76,19 +81,30 @@ fn an_unhosted_presence_row_is_retired_and_a_newer_incarnations_is_left_alone() 
     // retirement of the sibling or of a hosted session in that sweep is too.
     let ghost = "s-fffffffffffffffffffe";
     let sibling = "s-cafecafecafecafecafe";
+    let legacy = "s-abababababababababab";
+    let same_inc_copy = "s-babababababababababa";
     let mut god = w.god();
-    for (n, (sid, inc)) in [(ghost, 1u64), (sibling, 99_999)].iter().enumerate() {
+    for (n, (sid, inc, mark)) in [
+        (ghost, 1u64, Some(mark.as_str())),
+        (sibling, 99_999, Some(mark.as_str())),
+        (legacy, 1, None),
+        (same_inc_copy, 1, Some(other_mark.as_str())),
+    ]
+    .iter()
+    .enumerate()
+    {
         let subject = format!("/f/{FLEET}/pub/{}/{sid}/presence", w.node);
+        let mark = mark.map_or_else(String::new, |mark| format!(" statedir={mark}"));
         god.publish(
             7_100 + n as u64,
             1,
             &subject,
-            format!("v=1 t=1 inc={inc} epoch=- gen=- state=live hold=0 holder=- attention=-")
+            format!("v=1 t=1 inc={inc} epoch=- gen=- state=live hold=0 holder=- attention=-{mark}")
                 .as_bytes(),
         )
         .expect("publish the retained row");
     }
-    for sid in [ghost, sibling] {
+    for sid in [ghost, sibling, legacy, same_inc_copy] {
         assert_eq!(
             presence_body(&w, sid)
                 .as_deref()
@@ -114,10 +130,13 @@ fn an_unhosted_presence_row_is_retired_and_a_newer_incarnations_is_left_alone() 
     // of theirs before this one.
     let second = "s-ffffffffffffffffffff";
     god.publish(
-        7_102,
+        7_104,
         1,
         &format!("/f/{FLEET}/pub/{}/{second}/presence", w.node),
-        b"v=1 t=1 inc=1 epoch=- gen=- state=live hold=0 holder=- attention=-",
+        format!(
+            "v=1 t=1 inc=1 epoch=- gen=- state=live hold=0 holder=- attention=- statedir={mark}"
+        )
+        .as_bytes(),
     )
     .expect("publish the second ghost");
     until("the second ghost to be retired", || {
@@ -138,6 +157,15 @@ fn an_unhosted_presence_row_is_retired_and_a_newer_incarnations_is_left_alone() 
         Some("live"),
         "a session this bridge actually hosts is never swept"
     );
+    for sid in [legacy, same_inc_copy] {
+        assert_eq!(
+            presence_body(&w, sid)
+                .as_deref()
+                .and_then(|body| kv(body, "state")),
+            Some("live"),
+            "the numeric current incarnation does not prove this writer: {sid}"
+        );
+    }
     std::fs::remove_file(&marker).expect("disarm the impatient sweep");
 
     // ONE RECORD PER GHOST, ONCE. Presence is a last-value face on an
@@ -154,6 +182,113 @@ fn an_unhosted_presence_row_is_retired_and_a_newer_incarnations_is_left_alone() 
             .count()
     };
     assert_eq!(retirements, 1, "exactly one retirement record");
+}
+
+/// **A LATER BRIDGE OF THE STATE DIR RETIRES WHAT AN EARLIER ONE LEFT, AND
+/// NEVER WHAT A COPY OF THE DIR LEFT UNDER THE SAME NUMBER** (the simulation's
+/// finding F4, decided), on a real broker and a real state dir.
+///
+/// The ghost: a `live` row at the node's FIRST incarnation, a session it
+/// carried that went with nobody to say so, carrying the state dir's mark
+/// (`statedir=`, read off the row of a session this dir's bridge hosts). The
+/// bridge is killed twice: the second incarnation's attach reads the first's
+/// will on the node face and may retire its rows, but it dies too; the THIRD
+/// reads only the second's will, so the first is a stranger to it but for the
+/// mark its rows carry — before the mark the row stood until `aterm fabric
+/// doctor --retire-ghosts`. The sweep's five-minute patience is collapsed by
+/// the marker and nothing else.
+///
+/// NEGATIVE CONTROL, in the same sweep: a row at that same first incarnation
+/// under ANOTHER mark — a copy of the state dir under the same node id, which
+/// takes its numbers as this dir does and so can take one of this dir's — is
+/// left `live`. Its sid sorts before the ghost's, so a wrong retirement of it
+/// is on the bus before the ghost's own (the sweep publishes in subject
+/// order). The copy that races an attach for one of this dir's numbers is the
+/// simulation's (`crates/aterm-link/src/sim`).
+#[test]
+fn a_later_bridge_of_the_state_dir_retires_an_earlier_ones_ghost() {
+    let w = World::boot_with(
+        "f4chain",
+        &[],
+        &[("ATERM_LINK_FAULT", "sweep-ghosts-at-once-while-marked")],
+    );
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    let node_inc = |w: &World| -> Option<u64> {
+        let body = presence_body(w, "node")?;
+        (kv(&body, "state") == Some("live"))
+            .then(|| kv(&body, "inc")?.parse().ok())
+            .flatten()
+    };
+    let first = until("the node's first live row", || node_inc(&w));
+    let mark = until(
+        "a hosted session's row to carry the state dir's mark",
+        || {
+            let body = presence_body(&w, &a)?;
+            kv(&body, "statedir").map(str::to_string)
+        },
+    );
+    let copied = format!(
+        "{:016x}",
+        u64::from_str_radix(&mark, 16).expect("the mark is sixteen hex digits") ^ 1
+    );
+    let (copy, ghost) = ("s-fffffffffffffffffffc", "s-fffffffffffffffffffd");
+    let mut god = w.god();
+    for (n, (sid, by)) in [(ghost, &mark), (copy, &copied)].iter().enumerate() {
+        god.publish(
+            7_200 + n as u64,
+            1,
+            &format!("/f/{FLEET}/pub/{}/{sid}/presence", w.node),
+            format!(
+                "v=1 t=1 inc={first} epoch=- gen=- state=live hold=0 holder=- attention=- \
+                 statedir={by}"
+            )
+            .as_bytes(),
+        )
+        .expect("publish a row of the first incarnation");
+    }
+    w.restart_bridge();
+    let second = until("the second incarnation", || {
+        node_inc(&w).filter(|inc| *inc > first)
+    });
+    w.restart_bridge();
+    let _third = until("the third incarnation", || {
+        node_inc(&w).filter(|inc| *inc > second)
+    });
+    for sid in [ghost, copy] {
+        assert_eq!(
+            presence_body(&w, sid)
+                .as_deref()
+                .and_then(|b| kv(b, "state")),
+            Some("live"),
+            "no sweep has had its five minutes yet: {sid}"
+        );
+    }
+    let marker = w.state.join("sweep-ghosts-now");
+    std::fs::write(&marker, b"1\n").expect("arm the impatient sweep");
+    until(
+        "the first incarnation's ghost to be retired by the third",
+        || {
+            let body = presence_body(&w, ghost)?;
+            (kv(&body, "state") == Some("exited")).then_some(())
+        },
+    );
+    assert_eq!(
+        presence_body(&w, copy)
+            .as_deref()
+            .and_then(|b| kv(b, "state")),
+        Some("live"),
+        "a copy of the state dir wrote this row, at one of this dir's own incarnations: \
+         not this bridge's to retire"
+    );
+    assert_eq!(
+        presence_body(&w, &a)
+            .as_deref()
+            .and_then(|b| kv(b, "state")),
+        Some("live"),
+        "a session this bridge hosts is never swept"
+    );
+    std::fs::remove_file(&marker).expect("disarm the impatient sweep");
 }
 
 /// Wait for the row to carry `key=value`, asserting on every read that no

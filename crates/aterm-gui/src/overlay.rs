@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The single modal-overlay slot for the in-grid surfaces: the command Palette, the
-//! identity picker and the Overview share one card slot, one
+//! The single modal-overlay slot for the in-grid surfaces: the command Palette and
+//! the Overview share one card slot, one
 //! rasterize/composite call, and one `RepaintKey::settings_fp` term. Rather than parallel `Option` fields on
 //! `WindowState` (whose mutual exclusion had to be enforced by hand, and whose on_key gate
 //! ordering was a latent "hidden overlay swallows keys" bug), they collapse into one
@@ -21,7 +21,6 @@ use crate::chrome_band::ChromePalette;
 use crate::app_introspect::AuxTarget;
 use crate::overview::OverviewState;
 use crate::palette::PaletteState;
-use crate::session_picker::SessionPickerState;
 use crate::settings::SettingsGeom;
 use crate::widget::TrayInput;
 
@@ -114,34 +113,11 @@ impl OverlayModel for OverviewState {
     }
 }
 
-impl OverlayModel for SessionPickerState {
-    fn fingerprint(&self) -> u64 {
-        SessionPickerState::fingerprint(self)
-    }
-    fn wanted_rows(&self, avail: usize) -> usize {
-        // Floats centred like the palette: the tray spans the whole viewport
-        // and `picker_layout` content-sizes the card within it.
-        avail
-    }
-    fn tray(&self, geom: &SettingsGeom, palette: ChromePalette) -> TrayInput {
-        crate::session_picker::picker_tray(self, geom, palette)
-    }
-    fn scroll_extent(&self) -> (usize, usize, usize) {
-        SessionPickerState::scroll_extent(self)
-    }
-    #[cfg(a11y_tree)]
-    fn a11y(&self) -> aterm_a11y::model::TreeUpdate {
-        crate::session_picker::picker_a11y(self)
-    }
-}
-
 /// Which surface a live [`Overlay`] holds: a cheap tag for the input gate and the
 /// `settings_card` cache key.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum OverlayKind {
     Palette,
-    /// The identity picker (File ▸ New Window / New Tab With Identity…).
-    SessionPicker,
     /// The Overview (`docs/DESIGN-owner-surfaces-2026-10-16.md` §6): every
     /// session of this aterm, Owner-gated on the wire like the map it replaced.
     Overview,
@@ -152,7 +128,6 @@ impl OverlayKind {
     pub(crate) const fn target(self) -> AuxTarget {
         match self {
             OverlayKind::Palette => AuxTarget::Menu,
-            OverlayKind::SessionPicker => AuxTarget::SessionPicker,
             OverlayKind::Overview => AuxTarget::Overview,
         }
     }
@@ -169,7 +144,6 @@ impl OverlayKind {
     fn tag(self) -> u64 {
         match self {
             OverlayKind::Palette => 3,
-            OverlayKind::SessionPicker => 6,
             OverlayKind::Overview => 7,
         }
     }
@@ -187,9 +161,6 @@ fn seal(tag: u64, inner: u64) -> u64 {
 /// hand-maintained "clear the other two" dance.
 pub(crate) enum Overlay {
     Palette(PaletteState),
-    /// The identity picker — palette-style filter over the identity roster;
-    /// its selection opens a window or tab under the identity.
-    SessionPicker(SessionPickerState),
     /// The Overview (design §6) — every session grouped by window with its
     /// need, phase, task and driver words, then who manages whom; every read
     /// of it is Owner-gated on the wire.
@@ -210,7 +181,6 @@ impl Overlay {
     pub(crate) fn model(&self) -> &dyn OverlayModel {
         match self {
             Overlay::Palette(p) => p,
-            Overlay::SessionPicker(p) => p,
             Overlay::Overview(m) => m,
         }
     }
@@ -219,7 +189,6 @@ impl Overlay {
     pub(crate) fn kind(&self) -> OverlayKind {
         match self {
             Overlay::Palette(_) => OverlayKind::Palette,
-            Overlay::SessionPicker(_) => OverlayKind::SessionPicker,
             Overlay::Overview(_) => OverlayKind::Overview,
         }
     }
@@ -250,11 +219,6 @@ mod tests {
     fn status_line_reports_open_kind_fp_and_extent() {
         let cases = [
             Overlay::Palette(PaletteState::new()),
-            Overlay::SessionPicker(SessionPickerState::new(
-                crate::WindowId(0),
-                crate::session_picker::PickerIntent::NewTabWithIdentity,
-                Vec::new(),
-            )),
             Overlay::Overview(OverviewState::new(
                 crate::WindowId(0),
                 Vec::new(),

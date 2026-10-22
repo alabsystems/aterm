@@ -598,6 +598,472 @@ fn log_mirror_conforms_across_a_bridge_crash_with_a_pin_outstanding() {
     assert_eq!(rows.len(), 1, "on the bus once: {rows:?}");
 }
 
+/// **A TORN PIN AFTER A POWER CUT, AT THE BRIDGE: THE NEXT BOOT SETS IT ASIDE
+/// AND THE MIRROR RESUMES** (rulings Q6, Q13) — the real bridge, a real broker
+/// and a real state dir. In boot 1, its run open, the mirror lands the
+/// session's open (the key on disk in `logkey` before the take named it, the
+/// floor raised past the batch before its pin), then pins and sends the next
+/// record, and the machine loses power: the pin cut short. In boot 2 the
+/// start's step sets the torn pin aside ([`Bridge::reconcile_logpin_state`],
+/// counted for aterm), and the hello resumes the mirror under the same alias
+/// key with its total at the floor — at or above what boot 1 counted. The
+/// record the torn pin held is taken again at a fresh sequence and lands: on
+/// the face twice, one record in the reader's view (ruling Q0), none lost.
+/// NEGATIVE CONTROLS: the same cut read again in boot 1 (a kill, which tears
+/// nothing: damage there is a bug's), and read in boot 2 with no copies beside
+/// it (a dir only an older build mirrored in, whose pin holds the only key and
+/// total), each stop the mirror for its pin, said to the endpoint; the pin is
+/// kept as it is, and the stop names the file to move aside and what resuming
+/// then costs.
+#[test]
+fn a_torn_pin_after_a_power_cut_is_set_aside_and_the_next_boots_mirror_resumes() {
+    for (reboot, copies) in [(true, true), (false, true), (true, false)] {
+        let (lane, mut first, _server) = rig_with_broker(&[]);
+        first.simulate_boot(crate::durability::test_boot(1), 0);
+        first.begin_run();
+        first.mirror = Some(MirrorRun::acked_for_tests(&first.state, 1));
+        lane.mirror
+            .lock()
+            .unwrap()
+            .logs
+            .insert(SID.to_string(), opened_log());
+        first.mirror_take();
+        first.mirror_send();
+        first.settle_acks();
+        first.mirror_settle();
+        let (key, counted) = first
+            .mirror
+            .as_deref()
+            .map(|m| (m.key().to_string(), m.total()))
+            .unwrap();
+        assert!(
+            counted > 0 && key.len() == 32,
+            "boot 1 landed the open, keyed"
+        );
+        assert_eq!(
+            first
+                .state
+                .logkey()
+                .unwrap()
+                .map(|k| aterm_codec::hex::encode_lower(&k)),
+            Some(key.clone()),
+            "the key's durable copy"
+        );
+        let floor = first.state.logfloor().unwrap().expect("the floor");
+        assert!(floor >= counted, "the floor covers what was counted");
+        lane.mirror
+            .lock()
+            .unwrap()
+            .logs
+            .get_mut(SID)
+            .unwrap()
+            .mark(
+                Mark::new(Kind::Seen, Src::Status, Conf::Strong),
+                Stamp::new(20, 20),
+            )
+            .expect("the next record");
+        first.mirror_take();
+        first.mirror_send();
+        first.settle_acks();
+        assert!(matches!(
+            first.mirror.as_deref().unwrap().batch().1[0],
+            Outcome::OnBus(_)
+        ));
+        let state = first.state.root().to_path_buf();
+        let (broker, node) = (first.cfg.broker.clone(), first.node.clone());
+        drop(first);
+        // THE POWER CUT: the pin cut short of its last bytes.
+        let pin = std::fs::read(state.join("logpin")).unwrap();
+        let cut = pin[..pin.len() - 9].to_vec();
+        std::fs::write(state.join("logpin"), &cut).unwrap();
+        if !copies {
+            // A dir only an older build mirrored in: no copy beside the pin.
+            std::fs::remove_file(state.join("logkey")).unwrap();
+            std::fs::remove_file(state.join("logfloor")).unwrap();
+        }
+        let (next_lane, mut next) = FakeVerbLane::bridge_with_state(&[], Some(&state));
+        next.simulate_boot(crate::durability::test_boot(if reboot { 2 } else { 1 }), 0);
+        next.reconcile_logpin_state();
+        let resumes = reboot && copies;
+        assert_eq!(
+            next.set_aside,
+            u64::from(resumes),
+            "reboot={reboot} copies={copies}"
+        );
+        next.cfg.broker = broker;
+        let (conn, _) = next.connect().unwrap();
+        next.conn = Some(conn.into());
+        let logs = std::mem::take(&mut lane.mirror.lock().unwrap().logs);
+        next_lane.mirror.lock().unwrap().logs = logs;
+        next.mirror = MirrorRun::new(
+            crate::mirror::LogMode::Turns,
+            &next.state,
+            Instant::now(),
+            crate::mirror::mint_alias_key,
+        );
+        next.mirror_hello_answered("OK lane=2 build=b log=turns");
+        let said = |l: &str| next_lane.links.lock().unwrap().iter().any(|x| x == l);
+        if !resumes {
+            let why = next
+                .mirror
+                .as_deref()
+                .unwrap()
+                .stopped()
+                .unwrap()
+                .to_string();
+            assert!(
+                why.starts_with("pin-unreadable"),
+                "CONTROL: a pin that does not read, and nothing explains, stops the mirror: {why}"
+            );
+            // What a person does: move the pin aside — resuming under the same
+            // key from the copies, or, with none, under a fresh one.
+            assert!(
+                why.contains(&format!("move {} aside", state.join("logpin").display()))
+                    && why.contains(if copies {
+                        "the same alias key"
+                    } else {
+                        "a FRESH alias key"
+                    }),
+                "and says what a person does: {why}"
+            );
+            assert!(said("link mirror stopped reason=pin"));
+            assert_eq!(
+                std::fs::read(state.join("logpin")).unwrap(),
+                cut,
+                "kept as it is"
+            );
+            continue;
+        }
+        assert!(said("link mirror on"));
+        assert_eq!(
+            std::fs::read(state.join("quarantine/logpin")).unwrap(),
+            cut,
+            "its exact bytes, kept"
+        );
+        // In its place, a whole pin from the copies (no batch, the key, the
+        // floor), of the version an older build refuses: one that ran here
+        // next would stop, not find no pin and mint a second key.
+        let placed = std::fs::read_to_string(state.join("logpin")).unwrap();
+        assert!(placed.starts_with("logpin v=2 "), "{placed:?}");
+        let placed = crate::mirror::Pin::parse(&placed).expect("whole");
+        assert_eq!(
+            (
+                placed.slots.len(),
+                placed.total,
+                placed.key.map(|k| aterm_codec::hex::encode_lower(&k))
+            ),
+            (0, floor, Some(key.clone())),
+            "written from logkey and logfloor"
+        );
+        let m = next.mirror.as_deref().unwrap();
+        assert!(m.stopped().is_none());
+        assert_eq!(m.key(), key, "the same alias key (ruling Q6)");
+        assert_eq!(m.total(), floor, "the total at the floor (ruling Q13)");
+        next.mirror_take();
+        next.mirror_send();
+        next.settle_acks();
+        next.mirror_settle();
+        let landed = next_lane.mirror.lock().unwrap().logs[SID].mirror_landed();
+        assert_eq!(
+            landed.map(|c| c.ms),
+            Some(2),
+            "the torn pin's record landed"
+        );
+        let face = subject::session_face("f", &node, SID, "ev");
+        let (mut conn, _) = next.connect().unwrap();
+        let (rows, _) = conn.fetch(0, &face, 100).unwrap();
+        let mut view: BTreeMap<u64, BTreeSet<(u32, u64)>> = BTreeMap::new();
+        let mut raw: BTreeMap<u64, usize> = BTreeMap::new();
+        for (_, _, bytes) in &rows {
+            let b = aterm_slog::decode_bus(&String::from_utf8_lossy(bytes)).expect("a body");
+            // A retake's snapshot carries no `ms`.
+            let Some(ms) = b.ms else { continue };
+            *raw.entry(ms).or_default() += 1;
+            view.entry(ms).or_default().insert((b.ep, b.rec.seq));
+        }
+        assert_eq!(
+            raw,
+            BTreeMap::from([(1, 1), (2, 2)]),
+            "the open once, the torn pin's record twice on the face"
+        );
+        assert!(
+            [1, 2]
+                .iter()
+                .all(|ms| view.get(ms).map(BTreeSet::len) == Some(1)),
+            "each ms one record in the reader's view: {view:?}"
+        );
+    }
+}
+
+/// **NO PIN BESIDE ITS COPIES: THE HELLO WRITES ONE AT ONCE** (rulings Q6,
+/// Q13). A dir whose pin a person moved aside, with `logkey` and `logfloor`
+/// on the media, resumes under the same key at the floor, and the hello
+/// writes that whole pin before any take — of the version an older build
+/// refuses, so one that ran here next stops rather than find no pin and mint
+/// a second key. NEGATIVE CONTROL: a dir that never mirrored (no copies) has
+/// nothing written until its first batch.
+/// A recovered older pin with a batch still outstanding is fenced too,
+/// before any durable copy is made, without waiting for its landing. A
+/// refused upgrade, including one that renamed but did not finish flushing,
+/// creates no copies and leaves the migration owed. Its retry must flush
+/// even when the failed attempt already left v=2 at the path.
+#[test]
+fn a_mirror_with_its_copies_and_no_pin_writes_one_at_its_hello() {
+    let key = [0x77; 16];
+    for copies in [true, false] {
+        let (_lane, mut b) = FakeVerbLane::bridge_with_state(&[], None);
+        let state = b.state.root().to_path_buf();
+        if copies {
+            b.state.set_logkey(&key).unwrap();
+            b.state.raise_logfloor(7000).unwrap();
+        }
+        b.mirror = MirrorRun::new(
+            crate::mirror::LogMode::Turns,
+            &b.state,
+            Instant::now(),
+            crate::mirror::mint_alias_key,
+        );
+        b.mirror_hello_answered("OK lane=2 build=b log=turns");
+        let m = b.mirror.as_deref().unwrap();
+        assert!(m.stopped().is_none(), "copies={copies}");
+        if !copies {
+            assert!(
+                !state.join("logpin").exists(),
+                "CONTROL: a dir that never mirrored has nothing written"
+            );
+            continue;
+        }
+        assert_eq!(
+            (m.key(), m.total()),
+            (aterm_codec::hex::encode_lower(&key).as_str(), 7000)
+        );
+        let placed = std::fs::read_to_string(state.join("logpin")).expect("written at the hello");
+        assert!(
+            crate::mirror::Pin::by_this_build(placed.as_bytes()),
+            "{placed:?}"
+        );
+        assert_eq!(
+            crate::mirror::Pin::parse(&placed),
+            Ok(crate::mirror::Pin {
+                key: Some(key),
+                total: 7000,
+                ..crate::mirror::Pin::default()
+            })
+        );
+    }
+
+    for (after_rename, copies, legacy) in [
+        (false, false, true),
+        (true, false, true),
+        (false, true, true),
+        (true, true, true),
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+    ] {
+        let (_lane, mut b) = FakeVerbLane::bridge_with_state(&[], None);
+        if copies {
+            b.state.set_logkey(&key).unwrap();
+            b.state.raise_logfloor(1000).unwrap();
+        }
+        let pin = crate::mirror::Pin {
+            inc: 1,
+            total: 7000,
+            key: Some(key),
+            slots: vec![crate::mirror::PinSlot {
+                pseq: 9,
+                sid: SID.to_string(),
+                at: aterm_slog::BusCursor::new(4, 2, 1),
+                body: "v=2 t=1 ep=4 seq=2 ms=1 op=open node=t1 k=turn src=screen conf=strong"
+                    .to_string(),
+            }],
+        };
+        let text = if legacy {
+            pin.render().replacen("logpin v=2", "logpin v=1", 1)
+        } else {
+            pin.render()
+        };
+        std::fs::write(b.state.root().join("logpin"), &text).unwrap();
+        b.mirror = MirrorRun::new(
+            crate::mirror::LogMode::Turns,
+            &b.state,
+            Instant::now(),
+            crate::mirror::mint_alias_key,
+        );
+        b.mirror_hello_answered("OK lane=2 build=b log=turns");
+        assert_eq!(b.mirror.as_deref().unwrap().batch().0, pin.slots);
+        if after_rename {
+            b.state.set_inc_seam(crate::state::IncSeam {
+                kill_at: Some(crate::state::IncStep::Renamed),
+                ..Default::default()
+            });
+        } else {
+            b.state.refuse_writes_of(Some("logpin"));
+        }
+        b.mirror_send();
+        let m = b.mirror.as_deref().unwrap();
+        assert!(m.retry_at().is_some(), "the existing retry is armed");
+        assert_eq!(b.state.logkey().unwrap(), copies.then_some(key));
+        assert_eq!(b.state.logfloor().unwrap(), copies.then_some(1000));
+
+        b.state.set_inc_seam(crate::state::IncSeam::default());
+        if !legacy {
+            // Reopening loses every in-memory hint about a failed first
+            // fence. A visible v=2 still cannot stand for a successful flush.
+            b.state = StateDir::open(b.state.root()).unwrap();
+        }
+        // A reconnect can read the v=2 left by the failed rename. It must
+        // not erase the still-owed durable admission.
+        b.mirror_hello_answered("OK lane=2 build=b log=turns");
+        // Hold the next step back to inspect the completed migration while
+        // the original batch is still outstanding, before any copy changes.
+        b.state
+            .refuse_writes_of(Some(if copies { "logfloor" } else { "logkey" }));
+        let before = b.state.ops();
+        b.mirror_send();
+        assert_eq!(
+            (b.state.ops() - before).fsyncs,
+            2,
+            "the successful fence flushed file and directory, even after a rename error"
+        );
+        let text = b.state.logpin().unwrap().unwrap();
+        assert!(crate::mirror::Pin::by_this_build(text.as_bytes()));
+        assert!(!crate::mirror::Pin::by_an_older_build(text.as_bytes()));
+        assert_eq!(crate::mirror::Pin::parse(&text), Ok(pin.clone()));
+        assert_eq!(b.state.logkey().unwrap(), copies.then_some(key));
+        assert_eq!(b.state.logfloor().unwrap(), copies.then_some(1000));
+
+        b.state.refuse_writes_of(None);
+        b.mirror_send();
+        assert_eq!(b.state.logkey().unwrap(), Some(key));
+        assert!(b.state.logfloor().unwrap().unwrap() >= pin.total);
+        let m = b.mirror.as_deref().unwrap();
+        assert_eq!(
+            m.batch().0,
+            pin.slots,
+            "no landing discarded the recovered batch"
+        );
+        assert!(m.batch().1.iter().all(|o| *o == Outcome::Owed));
+    }
+}
+
+/// **A STOPPED PIN'S REMEDY SAYS WHAT EACH CHOICE COSTS, AND NO CAUSE IT
+/// CANNOT SHOW** (rulings Q6, Q13) — the real bridge's hello over a real
+/// state dir. The last bridge ran in boot 1 under key K (`logkey`, a floor,
+/// a pin naming K), and the next boot finds the pin torn and stops:
+///
+/// - `logkey` REMOVED BY A HAND: the pin, which may hold the only copy of K,
+///   is kept, and the stop never says no key was named — moving the pin
+///   aside mints a fresh key, and every edge then takes a second alias;
+/// - `logkey` DAMAGED: putting it back is the remedy, and removing it is
+///   named for what it costs, a fresh key where no pin names K;
+/// - THE RECONCILE REFUSED (a planted quarantine link): the stop names that
+///   failure, never the damage as a bug's;
+/// - AN OLDER BUILD'S TORN PIN (`v=1`) over the copies: kept, and the stop
+///   says the floor may count less than that build mirrored;
+/// - within one boot (a kill), the stop claims no cause: it names each.
+#[test]
+fn a_stopped_pins_remedy_names_what_each_choice_costs_and_no_cause_it_cannot_show() {
+    let key = [0x3c; 16];
+    for world in [
+        "logkey removed",
+        "logkey damaged",
+        "reconcile refused",
+        "an older build's pin",
+        "within one boot",
+    ] {
+        let (lane, mut b) = FakeVerbLane::bridge_with_state(&[], None);
+        let state = b.state.root().to_path_buf();
+        b.simulate_boot(crate::durability::test_boot(1), 0);
+        b.begin_run();
+        b.state.set_logkey(&key).unwrap();
+        b.state.raise_logfloor(9000).unwrap();
+        let pin = crate::mirror::Pin {
+            key: Some(key),
+            total: 8000,
+            ..crate::mirror::Pin::default()
+        }
+        .render();
+        b.state.set_logpin(&pin).unwrap();
+        let mut torn = pin[..pin.len() - 5].to_string();
+        match world {
+            "logkey removed" => std::fs::remove_file(state.join("logkey")).unwrap(),
+            "logkey damaged" => std::fs::write(state.join("logkey"), b"3c3c\n").unwrap(),
+            "reconcile refused" => {
+                std::os::unix::fs::symlink(state.join("elsewhere"), state.join("quarantine"))
+                    .unwrap();
+            }
+            "an older build's pin" => torn = torn.replacen("logpin v=2", "logpin v=1", 1),
+            _ => {}
+        }
+        std::fs::write(state.join("logpin"), &torn).unwrap();
+        if world != "within one boot" {
+            b.simulate_boot(crate::durability::test_boot(2), 0);
+        }
+        b.reconcile_logpin_state();
+        assert_eq!(b.set_aside, 0, "{world}: nothing set aside");
+        b.mirror = MirrorRun::new(
+            crate::mirror::LogMode::Turns,
+            &b.state,
+            Instant::now(),
+            crate::mirror::mint_alias_key,
+        );
+        b.mirror_hello_answered("OK lane=2 build=b log=turns");
+        let why = b
+            .mirror
+            .as_deref()
+            .and_then(MirrorRun::stopped)
+            .unwrap_or_else(|| panic!("{world}: the mirror stops"))
+            .to_string();
+        assert!(
+            lane.links
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l == "link mirror stopped reason=pin"),
+            "{world}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.join("logpin")).unwrap(),
+            torn,
+            "{world}: kept as it is"
+        );
+        // No remedy claims what the bridge cannot show.
+        assert!(
+            !why.contains("No alias key was ever named")
+                && !why.contains("no power cut in an earlier boot explains"),
+            "{world}: {why}"
+        );
+        let says = |text: &str| assert!(why.contains(text), "{world}: {text:?} in {why}");
+        match world {
+            "logkey removed" => {
+                assert!(why.starts_with("pin-unreadable"), "{why}");
+                says("a FRESH key");
+                says("every edge takes a second alias on the bus");
+                says("put ");
+            }
+            "logkey damaged" => {
+                assert!(why.starts_with("key-unreadable"), "{why}");
+                says("put its whole bytes back");
+                says("every edge then taking a second alias on the bus");
+            }
+            "reconcile refused" => {
+                says("could not set it aside");
+                says("the same alias key");
+            }
+            "an older build's pin" => {
+                says("older aterm's pin (v=1)");
+                says("may count less than that build mirrored");
+            }
+            _ => {
+                says("cannot show a power cut tore it");
+                says("the same alias key");
+            }
+        }
+    }
+}
+
 /// NEGATIVE CONTROLS (ruling Q12): each mutant's witness replayed against
 /// the real system through the broken call it stands for, and the projected
 /// law breaks.

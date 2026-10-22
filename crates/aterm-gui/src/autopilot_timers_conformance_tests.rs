@@ -315,7 +315,6 @@ impl TimerDrive {
             autopilot: meta.autopilot,
             land_at: meta.land_at,
             autopilot_by: None,
-            identity: None,
             agent: None,
             supervised: None,
             lost: None,

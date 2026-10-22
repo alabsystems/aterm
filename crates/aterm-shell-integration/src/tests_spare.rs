@@ -37,7 +37,7 @@ fn signed_p(prop: &str) -> String {
 /// FIFO (made by [`Self::fifo`], or never, for a cold shell).
 #[cfg(unix)]
 struct SpareRig {
-    _root: aterm_tempfile::TempDir,
+    root: std::sync::Arc<std::sync::Mutex<Option<aterm_tempfile::TempDir>>>,
     home: PathBuf,
     dir: PathBuf,
     rekey: PathBuf,
@@ -51,7 +51,14 @@ impl SpareRig {
         let home = root.path().join("home");
         let dir = root.path().join("si").join(script_set_address());
         let ctl = root.path().join("ctl");
-        for d in [&home, &ctl.join("rekey"), &ctl.join(SPARE_DIR)] {
+        // The rig's fish reads its data dir in this home and its cache dir in
+        // the hermetic one, which holds fish 4's mark: this home needs fish 3's.
+        for d in [
+            home.clone(),
+            home.join(FISH3_COMPLETIONS_MADE),
+            ctl.join("rekey"),
+            ctl.join(SPARE_DIR),
+        ] {
             std::fs::create_dir_all(d).expect("rig dir");
         }
         ensure_scripts(&dir).expect("scripts");
@@ -60,7 +67,7 @@ impl SpareRig {
             fifo: ctl.join(SPARE_DIR).join(SPARE_SID),
             home,
             dir,
-            _root: root,
+            root: std::sync::Arc::new(std::sync::Mutex::new(Some(root))),
         }
     }
 
@@ -133,6 +140,21 @@ impl SpareRig {
     /// `spawn_pty_shell` it waits for nothing: a spare prints no prompt.
     fn spawn(&self, shell: ShellType, program: &str) -> LiveShell {
         self.spawn_from(shell, program, &self.dir)
+    }
+
+    /// An rc that leaves a job running lends its private PID file to the
+    /// shell guard before the first wait can fail. Unknown custody retains
+    /// this entire rig as well as the shell's hermetic home.
+    fn spawn_with_job(&self, shell: ShellType, program: &str, host: &std::fs::File) -> LiveShell {
+        let release = host.try_clone().expect("duplicate the rig's own FIFO");
+        let mut sh = self.spawn(shell, program);
+        sh.job = Some(ShellJob {
+            pid_file: self.home.join("job"),
+            root: std::sync::Arc::clone(&self.root),
+            script: OwnedShellPid::read(sh.child.id()),
+            release,
+        });
+        sh
     }
 
     /// [`Self::spawn`] started in folder `cwd`, as a tab asked for there, with
@@ -280,6 +302,10 @@ impl LiveShell {
     /// End a shell the test no longer needs: `script` killed, its pty closed,
     /// the shell hung up.
     fn kill_now(mut self) {
+        if self.job.is_some() {
+            self.stop_owned_job().expect("owned background job retired");
+            return;
+        }
         let _ = self.child.kill();
         self.wait_exit();
     }
@@ -568,25 +594,52 @@ fn a_warm_zsh_first_prompt_reads_as_a_cold_one() {
     }
 
     // The flags: a pending `sched` event, a job and a periodic hook.
-    let rig = SpareRig::new();
-    rig.rc(
-        ".zshrc",
-        "sched +600 :\nsleep 600 &\nPERIOD=600\nperiodic() { :; }\n",
-    );
-    let mut host = rig.fifo();
-    let mut sh = rig.spawn(ShellType::Zsh, zsh);
-    let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
-    tell(&mut host, "run");
-    sh.wait_for_after(&signed_p("AtermStart=spare"), parked);
+    for unwinding in [false, true] {
+        let rig = SpareRig::new();
+        rig.rc(
+            ".zshrc",
+            "sched +600 :\nsleep 600 &\necho $! >$HOME/job\nPERIOD=600\nperiodic() { :; }\n",
+        );
+        let mut host = rig.fifo();
+        let mut sh = rig.spawn_with_job(ShellType::Zsh, zsh, &host);
+        let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
+        tell(&mut host, "run");
+        sh.wait_for_after(&signed_p("AtermStart=spare"), parked);
+        assert!(
+            sh.output()
+                .contains(&signed_p("AtermStartFlags=pre:0,s:1,j:1,r:1")),
+            "{}",
+            sh.transcript()
+        );
+        assert_job_cleanup(sh, unwinding);
+    }
+}
+
+/// Observe the real job before normal cleanup or an assertion-like unwind.
+/// Both must retire that same process and close both pumps; killing `script`
+/// alone leaves the job-control process group and its pipe descriptors alive.
+#[cfg(unix)]
+fn assert_job_cleanup(sh: LiveShell, unwinding: bool) {
+    let job = sh.job.as_ref().expect("armed before the waits");
+    let owned = job.owned().expect("a current descendant job");
+    let (stdout, stderr) = (sh.stdout.clone(), sh.stderr.clone());
+    assert!(owned.current(), "the job really is running");
+    if unwinding {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _shell = sh;
+            panic!("injected assertion after the background job started");
+        }));
+        assert!(caught.is_err());
+    } else {
+        sh.kill_now();
+    }
     assert!(
-        sh.output()
-            .contains(&signed_p("AtermStartFlags=pre:0,s:1,j:1,r:1")),
-        "{}",
-        sh.transcript()
+        owned.ended(),
+        "the original job ended before its guard returned"
     );
-    let pid = sh.shell_pid();
-    sh.kill_now();
-    let _ = pid;
+    for pipe in [stdout, stderr] {
+        assert!(pipe.eof.load(std::sync::atomic::Ordering::SeqCst));
+    }
 }
 
 /// The history a shell holds and leaves, read back the same way for a cold tab
@@ -1292,19 +1345,22 @@ fn a_warm_fish_first_prompt_reads_as_a_cold_one() {
     );
     assert_eq!(warm, cold, "fish: (status, flags, the handler's reading)");
 
-    // The flags: a job the config left running.
-    let rig = SpareRig::new();
-    rig.fish_rc("config.fish", "sleep 600 &\n");
-    let _host = rig.fifo();
-    let mut sh = rig.spawn(ShellType::Fish, fish);
-    sh.wait_for_after(&signed_p("AtermStart=spare"), 0);
-    assert!(
-        sh.output()
-            .contains(&signed_p("AtermStartFlags=pre:0,s:0,j:1,r:0")),
-        "fish: the job is counted\n{}",
-        sh.transcript()
-    );
-    sh.kill_now();
+    // The flags: a job the config left running, retired on normal cleanup
+    // and on an assertion-like unwind while fish is still in its hold.
+    for unwinding in [false, true] {
+        let rig = SpareRig::new();
+        rig.fish_rc("config.fish", "sleep 600 &\necho $last_pid >$HOME/job\n");
+        let host = rig.fifo();
+        let mut sh = rig.spawn_with_job(ShellType::Fish, fish, &host);
+        sh.wait_for_after(&signed_p("AtermStart=spare"), 0);
+        assert!(
+            sh.output()
+                .contains(&signed_p("AtermStartFlags=pre:0,s:0,j:1,r:0")),
+            "fish: the job is counted\n{}",
+            sh.transcript()
+        );
+        assert_job_cleanup(sh, unwinding);
+    }
 }
 
 /// The prompt-event handlers a fish start record counts as ahead of aterm's
@@ -1470,9 +1526,22 @@ fn a_fish_start_record_names_the_roots_its_conf_d_loop_walks() {
 /// and a merge only marks the file to be read again at the next use. So the
 /// two a warm hold appends are stamped as a concurrent session stamps them,
 /// AFTER the hold began: the second after its start mark was seen. The release
-/// is sent only once the clock reads that second, so a merge made at the release
-/// shows them, and one made before the hold began (or none) never does, however
-/// fast the machine is. A cold start reads them stamped long ago.
+/// is sent only once fish's own clock has reached that second, so a merge made
+/// at the release shows them, and one made before the hold began (or none)
+/// never does, however fast the machine is. A cold start reads them stamped
+/// long ago.
+///
+/// fish's clock is not the test's. fish 3 stamps and merges by libc's `time()`,
+/// which glibc serves from `CLOCK_REALTIME_COARSE`, up to a tick behind the
+/// wall clock (`CLOCK_REALTIME`, fish 4's and [`unix_secs`]'s). Measured in the
+/// Linux lane's guest (fish 3.7.0, glibc 2.39), at the wall clock's turn of a
+/// second `time()` still read the old one 8 of 8 times, for 0.7-1.7 ms: a
+/// release sent at the turn merged a second early and missed the appends. And
+/// the test's own `time()` is no stand-in for fish's: an x86_64 test under
+/// Rosetta read the new second at the turn 8 of 8 times while the guest's
+/// coarse clock, fish's, still read the old one. So the release waits until the
+/// wall clock reads the second after the stamps': a clock fish reads trails it
+/// by a tick, far less than that second, so by then each has reached them.
 #[cfg(unix)]
 fn fish_history_reading(
     fish: &str,
@@ -1526,11 +1595,6 @@ fn fish_history_reading(
         if appended {
             let after_the_start = unix_secs() + 1;
             append(after_the_start);
-            // The release's `history merge` takes what was stamped before the
-            // second it runs in: fish 3.7 (the Linux lane's) left out entries of
-            // its own second, so a release in `after_the_start` read the warm
-            // tab without them in 3 of 4 lane runs. A cold start reads what was
-            // stamped before its start the same way.
             until_the_clock_reads(after_the_start + 1);
         }
         tell(host, "go");
@@ -1545,7 +1609,8 @@ fn fish_history_reading(
     reading
 }
 
-/// Whole seconds since the epoch, by the wall clock fish stamps its history with.
+/// Whole seconds since the epoch by the wall clock, which leads every clock
+/// fish stamps its history with.
 #[cfg(unix)]
 fn unix_secs() -> u64 {
     std::time::SystemTime::now()
@@ -1555,7 +1620,7 @@ fn unix_secs() -> u64 {
 }
 
 /// Return once the wall clock reads second `at` or later: a wait for the
-/// clock, which must happen (within a second here), never for a process.
+/// clock, which must happen (within two seconds here), never for a process.
 #[cfg(unix)]
 fn until_the_clock_reads(at: u64) {
     let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(at);

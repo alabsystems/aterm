@@ -37,7 +37,7 @@ use aterm_core::scrollback::Line;
 use aterm_core::terminal::Terminal;
 
 use super::tests::{
-    ENV_LOCK, ScratchEnv, child_proof_from, pipe_pair, restore_env, run_in_children,
+    ScratchEnv, child_proof_from, env_alone, pipe_pair, restore_env, run_in_children,
 };
 use super::*;
 
@@ -227,6 +227,25 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.108.0", "stalled-sequence"),
     ("v0.108.0", "twelve-panes"),
     ("v0.108.0", "variants"),
+    ("v0.109.0", "carried-state"),
+    ("v0.109.0", "claude-code-1049"),
+    ("v0.109.0", "colour-and-shell"),
+    ("v0.109.0", "engine-state"),
+    ("v0.109.0", "fold"),
+    ("v0.109.0", "held-failed"),
+    ("v0.109.0", "held-pane"),
+    ("v0.109.0", "held-withheld"),
+    ("v0.109.0", "history"),
+    ("v0.109.0", "history-carry"),
+    ("v0.109.0", "incident-55x149"),
+    ("v0.109.0", "link-dense"),
+    ("v0.109.0", "link-dense-history"),
+    ("v0.109.0", "policy-repaint"),
+    ("v0.109.0", "policy-visible"),
+    ("v0.109.0", "shell-integration"),
+    ("v0.109.0", "stalled-sequence"),
+    ("v0.109.0", "twelve-panes"),
+    ("v0.109.0", "variants"),
 ];
 
 /// The desk set, one `("vX.Y.0", "<desk>")` row per desk: every release from that floor on must
@@ -1774,16 +1793,8 @@ fn assert_settings_drafts_placed(desk: &Desk, incoming: &IncomingHandoff) -> usi
 /// ([`assert_history_imports`]), a held pane's too
 /// ([`assert_held_history_imports`]).
 ///
-/// FOUR CHILD PROCESSES, EVERY FOURTH DESK EACH (test-run speed), as
-/// `every_app_desk_the_gui_can_build_hands_every_session_over_exactly`. A
-/// desk sets the process's HOME and publishes the successor's handoff
-/// environment, so in one process the desks run one after another under
-/// [`ENV_LOCK`] — 3.0 s alone at load 60-90 (2026-10-18), and in the
-/// `-p aterm-gui --lib` binary the fifteen tests of this module the runner
-/// started meanwhile parked on the lock for 13 to 17 s against 0.01 to 0.1 s
-/// alone. Each shard checks its desks exactly as the single pass did, in a
-/// process whose environment is its own, and prints how many Settings drafts
-/// it placed; this test holds their sum to the same floor.
+/// FOUR CHILD PROCESSES, EVERY FOURTH DESK EACH ([`run_in_children`]), side by side: each shard
+/// prints how many Settings drafts it placed, and this test holds their sum to the same floor.
 #[test]
 fn every_shipped_producers_desk_adopts_exactly_and_proves() {
     const SHARDS: usize = 4;
@@ -1808,7 +1819,7 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
         );
         return;
     };
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let desks = every_desk();
     let mut drafts_carried = 0usize;
@@ -2007,7 +2018,7 @@ fn assert_desk_adopts_exactly_and_proves(desk: &Desk) -> usize {
 /// meta check.)
 #[test]
 fn a_consumer_that_drops_the_shell_state_fails_only_the_meta_check() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let desk = every_desk()
         .into_iter()
@@ -2095,7 +2106,7 @@ fn a_consumer_that_drops_the_shell_state_fails_only_the_meta_check() {
 /// fails [`assert_render_debt_crosses`].
 #[test]
 fn a_consumer_that_drops_column_debt_fails_the_exact_debt_check() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let desk = every_desk()
         .into_iter()
@@ -2161,7 +2172,7 @@ fn a_consumer_that_drops_column_debt_fails_the_exact_debt_check() {
 #[test]
 fn a_consumer_that_moves_a_full_clears_flags_or_rows_fails_the_mark_check() {
     type Checkpoint = aterm_core::terminal::TerminalCheckpoint;
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let desk = every_desk()
         .into_iter()
@@ -2313,7 +2324,7 @@ fn a_consumer_that_moves_a_full_clears_flags_or_rows_fails_the_mark_check() {
 #[test]
 fn a_consumer_that_decodes_a_meta_without_its_clear_flags_fails_the_flag_check() {
     type Checkpoint = aterm_core::terminal::TerminalCheckpoint;
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let desk = every_desk()
         .into_iter()
@@ -2418,7 +2429,7 @@ fn settings_leaf_with_drafts(
 ///   the layout, so only the leaf differs.
 #[test]
 fn a_consumer_that_loses_or_moves_a_settings_draft_fails_the_drafts_check() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let desk = every_desk()
         .into_iter()
@@ -2595,7 +2606,7 @@ fn every_release_since_the_floor_pins_the_required_desks() {
 /// no word about why.
 #[test]
 fn a_repainted_session_is_counted_for_the_landing_row() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let desk = every_desk()
         .into_iter()
@@ -3092,7 +3103,6 @@ fn replay_grant_to_this_successor(
 #[cfg(target_os = "macos")]
 #[test]
 fn every_shipped_producers_rendezvous_grants_this_successor() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let records = every_rendezvous_record();
     let releases = records
         .iter()
@@ -3103,10 +3113,8 @@ fn every_shipped_producers_rendezvous_grants_this_successor() {
         pinned_rendezvous(),
         "every pinned release's rendezvous.toml is checked in, and every checked-in one is pinned"
     );
-    let scratch = std::env::temp_dir().join(format!("aterm-rz-fixture-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&scratch);
-    std::fs::create_dir_all(&scratch).expect("scratch");
-    let this = capture_transport(&scratch);
+    let scratch = crate::test_scratch::short_dir("the claim's socket");
+    let this = capture_transport(scratch.path());
     for (release, record) in &records {
         let label = format!("{release}/rendezvous");
         assert_eq!(
@@ -3216,9 +3224,8 @@ fn every_shipped_producers_rendezvous_grants_this_successor() {
             }),
             "{label}: this build's proof over that release's device terms is its own"
         );
-        replay_grant_to_this_successor(&label, record, &scratch);
+        replay_grant_to_this_successor(&label, record, scratch.path());
     }
-    let _ = std::fs::remove_dir_all(&scratch);
 }
 
 /// A v0.97.0 policy desk is said as the policy's request. v0.97.0 follows a successor's
@@ -3239,7 +3246,7 @@ fn every_shipped_producers_rendezvous_grants_this_successor() {
 #[test]
 fn a_v097_policy_desk_is_said_as_the_policys_request() {
     use aterm_update_core::handoff_policy::{CarryCeiling, HandoffPolicy, ProducerRange};
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let desks = every_desk();
     // The band row for `desk` adopted under `own` as this build's policy, its

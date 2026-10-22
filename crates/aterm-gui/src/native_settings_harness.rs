@@ -2592,13 +2592,10 @@ const fn mode_label(mode: Autopilot) -> &'static str {
     }
 }
 
-/// What a mode does, for its button's description.
+/// What a mode does, for its button's description: its sentence from the
+/// one table (`autopilot::MODE_WORDS`, §12.4.1).
 const fn mode_description(mode: Autopilot) -> &'static str {
-    match mode {
-        Autopilot::Cruise => "keep the work going: nothing the agent says ends it",
-        Autopilot::Land => "land all of the work on the remote main branch, then stop",
-        Autopilot::Off => "the harness keeps its hands off this session",
-    }
+    crate::autopilot::mode_words(mode).button
 }
 
 /// The five faces of a SESSIONS row's buttons, in their order: the three

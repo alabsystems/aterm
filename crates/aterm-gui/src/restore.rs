@@ -185,22 +185,12 @@ pub(crate) struct TerminalLeafRestore {
     /// `restored`. An older build skips the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autopilot_by: Option<String>,
-    /// IDENTITY (session identities, 2026-09-17; additive, absent tolerated):
-    /// the agent identity the session was spawned under, so a cold restore
-    /// respawns the leaf's shell under it — `create = false`
-    /// (`agent_identity::restorable`): a forgotten identity falls back to a
-    /// default shell with one stderr line; restore never creates one. On a
-    /// seamless update the adopted shell keeps its env and the label rides the
-    /// handoff record instead.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<String>,
     /// THE SESSION'S OWN THEME (additive, absent tolerated, not written when
     /// unset): the selector `theme session set`, `spawn theme=` or a split
     /// gave this session ([`crate::session_theme::SessionTheme`]), so a
     /// restore and a seamless update keep the tab's colours. It comes back as
     /// origin `restored`; one that no longer draws keeps its selector and
-    /// draws the instance theme. An identity theme is not written: it
-    /// resolves from `identity` and the config.
+    /// draws the instance theme.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
     /// THE AGENT THIS LEAF HOSTED (2026-09-27; additive, absent tolerated):
@@ -1515,6 +1505,13 @@ pub(crate) struct NativeLeafRestore {
 }
 
 impl NativeLeafRestore {
+    pub(crate) fn system_state() -> Self {
+        let mut descriptor = Self::settings("/".into());
+        descriptor.restore_tag = "system-state".into();
+        descriptor.route = None;
+        descriptor
+    }
+
     pub(crate) fn settings(route: String) -> Self {
         Self {
             restore_tag: "settings".to_string(),
@@ -1611,6 +1608,8 @@ impl NativeLeafRestore {
             return Some("config-editor identity requires an Editor restore");
         }
         match self.restore_tag.as_str() {
+            "system-state" => (self.route.is_some() || self.uri.is_some())
+                .then_some("System State has no document or Settings route"),
             "settings" => self
                 .route
                 .as_deref()
@@ -1669,7 +1668,7 @@ pub(crate) struct PlaceholderLeafRestore {
     /// The terminal leaf this placeholder stands in for, when a seamless successor retired it
     /// because no session was handed for it ([`RestoreManifest::placed_for_handed`]). Its
     /// outgoing pool id matches a held pane's carried screen (`App::restore_held_leaf`), and
-    /// its user identity (`meta set` title, icon, role, description, spawn identity) is what
+    /// its user identity (`meta set` title, icon, role, description) is what
     /// that pane is shown with. Never on the wire: set only by the successor's own placement.
     #[serde(skip)]
     pub unhanded: Option<Box<TerminalLeafRestore>>,
@@ -1762,8 +1761,7 @@ impl RestoredView {
 #[serde(tag = "node", rename_all = "snake_case")]
 #[allow(
     clippy::large_enum_variant,
-    reason = "the leaf IS the tree's payload (a terminal leaf grew past the lint's 200-byte \
-              line with its `identity` field, 2026-09-17); every node below the root is \
+    reason = "the leaf IS the tree's payload; every node below the root is \
               already boxed by `Split`, so the inline leaf costs one root-sized slot per \
               tab, and boxing it would put a deref on every match over a restored view"
 )]
@@ -2117,16 +2115,24 @@ impl PaneLayout {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum NativeTabRestore {
-    Settings { route: String },
-    Markdown { uri: String },
-    Editor { uri: String },
+    #[serde(rename = "system-state")]
+    SystemState,
+    Settings {
+        route: String,
+    },
+    Markdown {
+        uri: String,
+    },
+    Editor {
+        uri: String,
+    },
 }
 
 impl NativeTabRestore {
     #[cfg(test)]
     pub(crate) fn document_uri(&self) -> Option<&str> {
         match self {
-            Self::Settings { .. } => None,
+            Self::Settings { .. } | Self::SystemState => None,
             Self::Markdown { uri } | Self::Editor { uri } => Some(uri),
         }
     }
@@ -2148,6 +2154,7 @@ impl NativeTabRestore {
 
     fn shape_is_valid(&self) -> bool {
         match self {
+            Self::SystemState => true,
             Self::Settings { route } => {
                 !route.is_empty()
                     && route.len() <= MAX_SETTINGS_ROUTE_BYTES
@@ -2318,15 +2325,6 @@ impl WindowLayout {
                 .cwd()
                 .map(str::to_owned),
         }
-    }
-
-    /// The agent identity of the pane this window's bootstrap session fills, by the same pick
-    /// as [`Self::bootstrap_cwd`], so the session runs under it from its first fork: a shell's
-    /// env cannot be re-injected afterwards, and the graft (`App::restore_terminal_leaf`)
-    /// refuses a bootstrap that does not wear what the pane names. Only the canonical tree
-    /// carries it.
-    pub(crate) fn bootstrap_identity(&self) -> Option<&str> {
-        self.bootstrap_terminal_leaf()?.identity.as_deref()
     }
 
     /// The canonical tree's first terminal leaf, in rebuild order: the leaf
@@ -2546,7 +2544,6 @@ impl RestoredTab {
                         autopilot: None,
                         land_at: None,
                         autopilot_by: None,
-                        identity: None,
                         theme: None,
                         agent: None,
                         supervised: None,
@@ -2593,6 +2590,7 @@ impl RestoredTab {
 
     pub(crate) fn from_legacy_native(descriptor: &NativeTabRestore) -> Option<Self> {
         let native = match descriptor {
+            NativeTabRestore::SystemState => NativeLeafRestore::system_state(),
             NativeTabRestore::Settings { route } => NativeLeafRestore::settings(route.clone()),
             NativeTabRestore::Markdown { uri } => {
                 NativeLeafRestore::document("markdown", uri.clone())
@@ -3155,7 +3153,6 @@ impl RestoreManifest {
                     icon: None,
                     role: None,
                     attention: None,
-                    identity: None,
                     theme: None,
                     questions: None,
                     autopilot: None,
@@ -3195,13 +3192,6 @@ impl RestoreManifest {
             }
         }
         max
-    }
-
-    /// The agent identity of the pane the bootstrap session 0 becomes — the
-    /// FIRST window's [`WindowLayout::bootstrap_identity`] — so its spawn can
-    /// run under it (`main_entry`, beside [`Self::first_leaf_cwd`]).
-    pub(crate) fn first_leaf_identity(&self) -> Option<&str> {
-        self.windows.first()?.bootstrap_identity()
     }
 
     pub(crate) fn to_toml(&self) -> Result<String, String> {
@@ -5439,7 +5429,6 @@ mod tests {
             autopilot: None,
             land_at: None,
             autopilot_by: None,
-            identity: None,
             theme: None,
             agent: None,
             supervised: None,
@@ -6502,6 +6491,30 @@ focused = true
     /// `NativeTabRestore::joins_mirror` refuses, the very rule the parse reads
     /// the mirror by.
     #[test]
+    fn system_state_restore_descriptors_round_trip_without_document_authority() {
+        let native = NativeLeafRestore::system_state();
+        assert_eq!(native.validation_error(), None);
+        let bytes = aterm_json::to_vec(&native).unwrap();
+        assert_eq!(
+            aterm_json::from_slice::<NativeLeafRestore>(&bytes).unwrap(),
+            native
+        );
+        let legacy = NativeTabRestore::SystemState;
+        let bytes = aterm_json::to_vec(&legacy).unwrap();
+        assert_eq!(
+            aterm_json::from_slice::<NativeTabRestore>(&bytes).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            RestoredTab::from_legacy_native(&legacy).unwrap().root,
+            RestoredSplitTree::leaf(RestoredView::Native(native.clone()))
+        );
+        let mut invalid = native;
+        invalid.uri = Some("file:///tmp/unrequested".into());
+        assert!(invalid.validation_error().is_some());
+    }
+
+    #[test]
     fn the_legacy_mirror_is_written_by_the_rule_the_parse_reads_it_by() {
         let settings = |route: &str| NativeTabRestore::Settings {
             route: route.to_string(),
@@ -6909,7 +6922,6 @@ metadata = "opaque=copy-me"
                     icon: None,
                     role: None,
                     attention: None,
-                    identity: None,
                     theme: None,
                     questions: None,
                     autopilot: None,
@@ -6949,7 +6961,7 @@ metadata = "opaque=copy-me"
         );
         let newer = wire.replace(
             "sid = \"s-0123abcd\"",
-            "sid = \"s-0123abcd\"\nfuture_field = \"from a newer peer\"",
+            "sid = \"s-0123abcd\"\nfuture_field = \"from a newer peer\"\nidentity = \"worker\"",
         );
         assert_ne!(newer, wire, "PRECONDITION: the unknown field is in");
         assert_eq!(
@@ -6957,6 +6969,11 @@ metadata = "opaque=copy-me"
             Some(leaf_of(&named)),
             "a field this build does not know is read past"
         );
+        let rewritten = RestoreManifest::from_toml(&newer)
+            .expect("read past unknown fields")
+            .to_toml()
+            .expect("serialize");
+        assert!(!rewritten.contains("identity ="), "{rewritten}");
         for (sid, lineage) in [
             ("s-ab\0cd".to_string(), format!("s-{}", "a".repeat(1 << 20))),
             (format!("s-{}", "0".repeat(48)), "s-xyz".to_string()),

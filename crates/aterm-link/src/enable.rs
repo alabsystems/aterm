@@ -4447,10 +4447,15 @@ pub fn fix_for(warning: &str, role: &Role) -> String {
          directory's permissions"
             .to_string()
     } else if s("the bus advertises") {
-        // Not "relaunch and it clears": a row left without a will survives every relaunch
-        // (`retire_ghosts_action`; §10's residual).
+        // Not "relaunch and it clears" alone: a bridge on the node's own state dir retires
+        // a row the dir's earlier runs in this boot left (the boot-bound mark, finding F4),
+        // five minutes after its attach first sees it; a row another state dir left — a
+        // copy's, under the same node id — only when that attach found the copy's will on
+        // the node face with the same writer mark. Unmarked rows need the operator.
         "`aterm fabric doctor --retire-ghosts` lists the row; `--yes` publishes `exited` for it \
-         (a relaunch does not clear it)"
+         now (a bridge on the node's own state dir retires a row its own earlier runs in \
+         this boot left after five minutes, and one a copy of the state dir left only once its \
+         attach finds that copy's writer-marked will on the bus; unmarked rows need the doctor)"
             .to_string()
     } else if s("fleet halt standing") || s("stands on this node with no row on the bus") {
         FLEET_HALT_LIFT.to_string()
@@ -4608,10 +4613,12 @@ fn instance_flag(pid: u32, sock: Option<&str>) -> String {
 /// nodes advertise live that no local instance hosts.
 ///
 /// The bridge's own sweep ([`crate::bridge::Bridge::retire_ghost_presence`]) retires only what
-/// it can prove unhosted (its own incarnation's rows, and one whose will it witnessed), so a row
-/// left by an incarnation that died without a will stays live for ever and mail to it is never
-/// delivered; only the operator can supply that fact. Dry by default: it lists, and publishes
-/// only on `y` or `--yes`.
+/// it can prove unhosted (this or a lower incarnation's rows carrying its boot-bound
+/// mark, and rows whose exact writer-marked will it witnessed). A row another
+/// state dir left (a copy of it under the same node id) without a matching will,
+/// or one whose writer cannot be named, stays live and mail to it is
+/// never delivered; only the operator can supply that fact. Dry by default: it lists, and
+/// publishes only on `y` or `--yes`.
 ///
 /// A running bridge of the row's own node publishes it: a record goes out
 /// under the node's producer id at a sequence reserved through the state dir,

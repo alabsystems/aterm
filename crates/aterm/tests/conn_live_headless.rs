@@ -50,7 +50,7 @@ fn run_client(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> Out
 
 /// One attempt of [`run_client`].
 fn run_client_once(inst: &Instance, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+    let mut cmd = Command::new(launch_isolation::aterm_executable());
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

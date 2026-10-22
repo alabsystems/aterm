@@ -24,7 +24,7 @@ fn scratch() -> aterm_tempfile::TempDir {
 
 /// git with nothing of this machine's own configuration in it, run as the developer
 /// directory's git, not macOS's `/usr/bin/git` trampoline
-/// ([`crate::ledger::testing::git_path`]). No template: a repository it makes carries no
+/// ([`crate::ledger::testing::git`]). No template: a repository it makes carries no
 /// sample hooks, description or info/exclude, files nothing here reads. No `git
 /// maintenance run --auto` after a commit or clone: it does nothing in a fixture this small.
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -50,8 +50,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "maintenance.auto=false",
         ])
         .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap();
     assert!(

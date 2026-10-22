@@ -88,6 +88,65 @@ fn a_batch_whose_last_key_is_three_seconds_old_is_lit_in_the_echoing_frame() {
     );
 }
 
+/// A stalled batch is judged by the share rule, not paid cell for cell: with
+/// every stamp stale, the presses in flight license a wider same-row echo on
+/// the two-press floor and the share rule weighs it. Three keys echoing four
+/// cells (an editor's auto-closed bracket: three quarters paid) and three
+/// keys echoing three wide glyphs (six columns, each press paying for its
+/// glyph's second half) are each laid whole by the late echo, nothing
+/// declined. CONTROL: two keys against the same four cells are refused
+/// `no-credits` and lay none of the cells they swept (the ribbon's head
+/// follows the caret to its landing either way, so the landing is not
+/// counted).
+#[test]
+fn a_stalled_batch_the_share_rule_pays_for_is_laid_whole_when_the_row_echoes() {
+    let g = wide_geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    // (declined, why, swept cells short of the landing left dark) for
+    // `keys` presses echoed 400 ms late as `cells` columns, wide glyphs or
+    // narrow.
+    let late_echo = |keys: u64, wide: bool, cells: u16| {
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        let pre = pre_roll(&mut glow, 27, t0, &c, g);
+        let declined_before = glow.admission_tally().declined;
+        let echo = stalled_keys(&mut glow, keys, pre) + Duration::from_millis(400);
+        let to = 5 + cells;
+        if wide {
+            let mut row = vec![' '; g.cols];
+            row[2..5].fill('x');
+            for at in (5..usize::from(to)).step_by(2) {
+                row[at] = '漢';
+                row[at + 1] = '\0';
+            }
+            glow.observe_row(27, to, &row, echo);
+        }
+        glow.tick(Some((27, to)), echo, &c, g, &mut out);
+        let tally = glow.admission_tally();
+        (
+            tally.declined - declined_before,
+            tally.last_decline_reason,
+            dark_in(&glow, 27, 5..to - 1).len(),
+        )
+    };
+    assert_eq!(
+        late_echo(3, false, 4),
+        (0, None, 0),
+        "three keys, four cells: (declined, why, cells left dark)"
+    );
+    assert_eq!(
+        late_echo(3, true, 6),
+        (0, None, 0),
+        "three wide glyphs: (declined, why, cells left dark)"
+    );
+    assert_eq!(
+        late_echo(2, false, 4),
+        (1, Some(CursorGlow::DECLINE_NO_CREDITS), 3),
+        "CONTROL: two keys, four cells: (declined, why, cells left dark)"
+    );
+}
+
 /// One key stalled three seconds: its own +1 echo is licensed by the press in flight
 /// (`licence=inflight`), its cell is lit on the echoing frame and one beat later, and the press
 /// is spent, so the next key echoed on time has nothing to bridge.

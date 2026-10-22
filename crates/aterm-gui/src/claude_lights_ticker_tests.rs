@@ -219,9 +219,10 @@ const SPLIT_PATH: &str = "/private/tmp/claude-502/-Users-person-aterm/\
 /// columns wide in a vertical split, its working directory too long for the
 /// rule, so the facts stand with the path cut to `…/proj-claude` and ninety
 /// cells of `─` free. An act lights `✓ approved` there, and hovering the
-/// Autopilot chip draws its title (v1's words: the whole, with the menu's
-/// line, does not fit), each beside the facts exactly as the rest rule
-/// draws them, the chips where they stood.
+/// Autopilot chip draws its title (a leaner form, `lean_titles`: the whole,
+/// with Cruise's sentence and the menu's line, does not fit), each beside
+/// the facts exactly as the rest rule draws them, the chips where they
+/// stood.
 ///
 /// RED before the fix: the label and the title were paired with the WHOLE
 /// facts only, so neither was drawn and a hover only underlined the chip.
@@ -260,11 +261,19 @@ fn a_split_panes_cut_path_leaves_the_label_and_the_hovered_title_room() {
     app.hover_claude_chip(wid, Some((session, Chip::Autopilot)));
     frame(&mut app, wid);
     let hovered = rule(&app, wid);
+    let (whole, _) = super::autopilot_title(
+        crate::autopilot::AutopilotView::Cruise,
+        &app.chip_glass(session),
+        "",
+        None,
+        super::TitleWords::default(),
+    );
     assert!(
-        hovered.contains(&format!(
-            "{CHIPS}  autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land "
-        )),
-        "the hovered title beside the cut facts: {hovered:?}"
+        super::lean_titles(&whole)
+            .iter()
+            .filter(|(head, _)| !head.is_empty())
+            .any(|(head, tail)| hovered.contains(&format!("{CHIPS}  {head}{tail} "))),
+        "a leaner form of the hovered title beside the cut facts: {hovered:?}"
     );
     assert!(hovered.contains(facts), "no fact gave way: {hovered:?}");
     app.hover_claude_chip(wid, None);
@@ -345,10 +354,10 @@ fn a_hovered_autopilot_chip_lists_the_trail_built_once_per_reading() {
     frame(&mut app, wid);
     let v1 = rule(&app, wid);
     assert!(
-        v1.contains(
-            "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} \
-             right-click: more"
-        ) && !v1.contains("last:"),
+        v1.contains(&format!(
+            "{} \u{b7} right-click: more",
+            crate::autopilot::AutopilotView::Cruise.title()
+        )) && !v1.contains("last:"),
         "CONTROL: {v1:?}"
     );
     app.hover_claude_chip(wid, None);
@@ -364,9 +373,10 @@ fn a_hovered_autopilot_chip_lists_the_trail_built_once_per_reading() {
     // turned between the act and the hover.
     let titled = rule(&app, wid);
     assert!(
-        titled.contains(
-            "autopilot: cruise \u{2014} keeps the work moving \u{b7} last: \u{2713} approved "
-        ) && titled.contains(&format!("{at} \u{b7} click: land")),
+        titled.contains(&format!(
+            "autopilot: cruise \u{2014} {} \u{b7} last: \u{2713} approved ",
+            crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip
+        )) && titled.contains(&format!("{at} \u{b7} click: land")),
         "the hover's title, not the label: {titled:?}"
     );
     assert!(!titled.contains("\u{2713} approved  "), "{titled:?}");
@@ -773,8 +783,10 @@ fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
     let (mut app, wid, session, _host) = ticker_app(241);
     let (act, at) = arrival_now(t0, 0);
     on_act_at(&mut app, session, Act::Approved, act);
-    let v1 = "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land";
+    let v1 = &crate::autopilot::AutopilotView::Cruise.title();
     let menu = format!("{v1} \u{b7} right-click: more");
+    // Cruise's sentence, from the one table (`autopilot::MODE_WORDS`).
+    let cruise = crate::autopilot::mode_words(aterm_agent::supervise::Autopilot::Cruise).chip;
     let click = "autopilot: cruise \u{b7} click: land";
     let clicks = format!("{click} \u{b7} right-click: more");
     let tail = format!("{at} \u{b7} click: land \u{b7} right-click: more");
@@ -787,9 +799,9 @@ fn a_hovered_title_gives_up_its_trail_then_its_menu_line_then_its_words() {
         app.hover_claude_chip(wid, Some((session, Chip::Autopilot)));
         frame(&mut app, wid);
         let rule = rule(&app, wid);
-        let form: u8 = if rule.contains(
-            "autopilot: cruise \u{2014} keeps the work moving \u{b7} last: \u{2713} approved ",
-        ) && rule.contains(&tail)
+        let form: u8 = if rule.contains(&format!(
+            "autopilot: cruise \u{2014} {cruise} \u{b7} last: \u{2713} approved "
+        )) && rule.contains(&tail)
         {
             6
         } else if rule.contains(&menu) {

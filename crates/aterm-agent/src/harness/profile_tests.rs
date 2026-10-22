@@ -1585,3 +1585,56 @@ fn a_login_answers_to_its_rows_address_alone() {
     .expect("own profile");
     assert_eq!(answers_to(&in_own, &home, row), Some(true));
 }
+
+/// [`muse_subscription_for`]: Muse Code's login store under the config
+/// home its environment names, the `meta` provider's `user_email` alone
+/// (MEASURED on 1.4.11-R6667.1). NEGATIVE CONTROLS: an API key in the
+/// environment, a store with no address, a non-oauth mechanism and no
+/// store at all name no account; a key another mechanism keeps in the
+/// store is never read out as one.
+#[test]
+fn a_muse_login_store_names_its_account_alone() {
+    let tmp = tmp_dir("muse-auth");
+    let home = tmp.path().join("home");
+    let store = home.join(".config/muse");
+    std::fs::create_dir_all(&store).expect("store");
+    let auth = store.join("auth.json");
+    let env = vec![format!("HOME={}", home.display())];
+    std::fs::write(
+        &auth,
+        r#"{"schema_version":2,"providers":{"meta":{"mechanism":"oauth","storage":"keychain","user_email":"owner@example.com","api_key":"[REDACTED]"}}}"#,
+    )
+    .expect("auth");
+    let shown = muse_subscription_for(&env, &home).expect("the account");
+    assert_eq!(shown.email.as_deref(), Some("owner@example.com"));
+    assert_eq!((shown.plan, shown.weekly), (None, None));
+    // NEGATIVE CONTROLS.
+    let mut keyed = env.clone();
+    keyed.push("META_API_KEY=[REDACTED]".to_owned());
+    assert_eq!(muse_subscription_for(&keyed, &home), None, "an API key");
+    for text in [
+        r#"{"providers":{"meta":{"mechanism":"api_key","user_email":"owner@example.com"}}}"#,
+        r#"{"providers":{"meta":{"mechanism":"oauth","storage":"keychain"}}}"#,
+        r#"{"providers":{"other":{"user_email":"owner@example.com"}}}"#,
+        "not JSON",
+    ] {
+        std::fs::write(&auth, text).expect("auth");
+        assert_eq!(muse_subscription_for(&env, &home), None, "{text}");
+    }
+    std::fs::remove_file(&auth).expect("gone");
+    assert_eq!(muse_subscription_for(&env, &home), None);
+    // An XDG config home of its own: its own store, never the home's.
+    let xdg = tmp.path().join("xdg");
+    std::fs::create_dir_all(xdg.join("muse")).expect("xdg store");
+    std::fs::write(
+        xdg.join("muse/auth.json"),
+        r#"{"providers":{"meta":{"mechanism":"oauth","user_email":"xdg@example.com"}}}"#,
+    )
+    .expect("xdg auth");
+    let mut in_xdg = env.clone();
+    in_xdg.push(format!("XDG_CONFIG_HOME={}", xdg.display()));
+    assert_eq!(
+        muse_subscription_for(&in_xdg, &home).and_then(|s| s.email),
+        Some("xdg@example.com".to_owned())
+    );
+}

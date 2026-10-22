@@ -283,14 +283,15 @@ fn a_drainer_parked_mid_chunk_counts_each_unread_byte_once() {
 /// a frozen program would be dated by when the SESSION started, not by the
 /// paste. The sink is aged first so the two dates are apart: the parked
 /// paste must read no more than the time since its paster was spawned — the
-/// sink's birth is `AGE` older than that.
+/// sink's birth is `AGE` older than that. Aged by its ledger's own clock
+/// (`backdate_input_for_testing`), not by sleeping `AGE`.
 #[test]
 fn a_metered_paste_is_dated_by_its_own_write() {
     const AGE: Duration = Duration::from_millis(100);
     const PASTE: usize = 64 * 1024;
     let (master, slave) = pty_pair(true);
     let sink = Arc::new(nonblocking_sink(master));
-    thread::sleep(AGE);
+    sink.backdate_input_for_testing(AGE);
 
     let meter = Arc::new(BulkMeter::new());
     let spawned_at = Instant::now();
@@ -355,15 +356,23 @@ fn read_within(fd: i32, max: usize) -> Vec<u8> {
 fn a_discard_drops_a_parked_spill_and_the_next_key_still_arrives() {
     let (master, slave) = pty_pair(true);
     let sink = nonblocking_sink(master);
+    let (parks_tx, parks) = mpsc::channel();
+    sink.seam_for_testing(move |seam| {
+        if seam == Seam::DrainPark {
+            let _ = parks_tx.send(());
+        }
+    });
     let mut paste = vec![b'#'; 1100];
     paste.extend_from_slice(b"\recho SPILLED\r");
     assert_eq!(paste.len(), 1114);
     assert_eq!(sink.write_frame_nonparking(&paste).expect("spill"), 1114);
     let parked = settle(&sink, |b| b.spilled.is_some() && b.unread() == 1114);
     assert_eq!(parked.queued, 1022, "the raw queue is full: {parked:?}");
-    // The spill is counted as soon as it is committed; give the drainer
-    // thread the moment it needs to peek its chunk and park on the queue.
-    thread::sleep(Duration::from_millis(200));
+    // The drainer then peeks its chunk and parks on the full queue
+    // (`Seam::DrainPark`): the discard must find it parked.
+    parks
+        .recv_timeout(MUST_HAPPEN)
+        .expect("the drainer parked on the full queue");
 
     assert_eq!(sink.discard_unread_input(Discard::Restart), Some(1114));
     let empty = settle(&sink, |b| b.spilled.is_some());

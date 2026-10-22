@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A WORKER'S START: `spawn agent=claude` (`docs/DESIGN-sessions-as-subagents-2026-10-15.md`
-//! §2.1). The newborn is the ordinary integrated login shell the spawn path
-//! opens for every tab; four facts make it a worker:
+//! A WORKER'S START: `spawn agent=<claude|gemini|agy|muse>`
+//! (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §2.1), one mechanism
+//! for every harness (`aterm_agent::harness::worker`'s table). The newborn is
+//! the ordinary integrated login shell the spawn path opens for every tab;
+//! four facts make it a worker:
 //!
 //! * its TASK — the bytes the request's frame carried, 1 byte to [`TASK_MAX`]
 //!   — is written, with one line of fact, to a 0600 file under
@@ -18,9 +20,13 @@
 //!   record reads `done why=landed` at that landing (FOREVER LAND);
 //! * at the shell's FIRST prompt (OSC 133 `B`: its line editor reads), ONE
 //!   line is typed through the session's canonical egress ([`launch_worker`]):
-//!   the window harness's relaunch builder's fresh start of Claude Code, its
-//!   task the fixed operand `-- "$(command cat -- "$ATERM_TASK_FILE")"`
-//!   (`aterm_agent::harness::relaunch::task_launch_line`). The task is argv —
+//!   the window harness's relaunch builder's fresh start of the agent, its
+//!   task the agent's fixed operand — `-- "$(command cat --
+//!   "$ATERM_TASK_FILE")"` for Claude Code and Muse Code, the attached
+//!   `"--prompt-interactive=$(…)"` for Gemini CLI and agy
+//!   (`aterm_agent::harness::worker::line`); a Gemini CLI worker's line
+//!   also names a trusted-folders file of its own ([`TaskSeed::with_trust_file`])
+//!   and a session id of its own. The task is argv —
 //!   the agent's first prompt, neither a paste nor a peer's mail — so no byte of
 //!   it is typed or parsed by the shell, and the shell stays under the agent:
 //!   the harness's relaunch, live upgrade and memory restart need exactly that,
@@ -69,9 +75,13 @@ pub(crate) const FIRST_PROMPT_WAIT: Duration = Duration::from_secs(20);
 /// capture also retains the helper's bounded drain/reap reserves.
 const VERSION_WAIT: Duration = Duration::from_secs(5);
 
-/// The reply to a worker's spawn that carried no task frame.
-const NO_FRAME: &str = "ERR spawn agent=claude: the task follows the line as a frame \
-                        (len=<n>, then n bytes); `aterm ctl spawn agent=claude -` reads it from stdin\n";
+/// The reply to a worker's spawn of `agent` that carried no task frame.
+fn no_frame(agent: &str) -> String {
+    format!(
+        "ERR spawn agent={agent}: the task follows the line as a frame (len=<n>, then n bytes); \
+         `aterm ctl spawn agent={agent} -` reads it from stdin\n"
+    )
+}
 
 thread_local! {
     /// The task frame the serve loop read for the request this thread is
@@ -107,17 +117,28 @@ pub(crate) fn take_frame() -> Option<Vec<u8>> {
 /// The bytes `len=<v>` announces, or the reply to a length the server will
 /// not read — past [`TASK_MAX`], or no length at all — after which the
 /// connection closes, since the client already sent what it announced.
-pub(crate) fn frame_len(v: &str) -> Result<usize, String> {
+/// `agent` is the spawn's `agent=` word, as its refusal names it.
+pub(crate) fn frame_len(v: &str, agent: &str) -> Result<usize, String> {
     match v.parse::<usize>() {
         Ok(n) if n <= TASK_MAX => Ok(n),
-        _ if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => Err(too_large(v)),
+        _ if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => Err(too_large(v, agent)),
         _ => Err(crate::control::control_media::SPAWN_USAGE.to_string()),
     }
 }
 
 /// The refusal of a task over [`TASK_MAX`].
-fn too_large(len: &str) -> String {
-    format!("ERR spawn agent=claude: the task is {len} bytes (max {TASK_MAX})\n")
+fn too_large(len: &str, agent: &str) -> String {
+    format!("ERR spawn agent={agent}: the task is {len} bytes (max {TASK_MAX})\n")
+}
+
+/// The worker word a spawn line's `agent=` names, for a refusal made before
+/// the line is parsed whole ([`frame_len`]): the word where a worker goes by
+/// it (`aterm_agent::harness::worker::WORKERS`), else `claude`.
+pub(crate) fn worker_word(agent: Option<&str>) -> &'static str {
+    aterm_agent::harness::worker::WORKERS
+        .iter()
+        .find(|w| Some(w.word) == agent)
+        .map_or("claude", |w| w.word)
 }
 
 /// What the control thread hands the main thread for a worker
@@ -126,12 +147,15 @@ fn too_large(len: &str) -> String {
 pub(crate) struct TaskOrder {
     /// The task as the frame carried it.
     pub(crate) task: Vec<u8>,
+    /// `agent=`: the harness the worker runs, one with a row in
+    /// `aterm_agent::harness::worker::WORKERS`.
+    pub(crate) agent: aterm_phase::Program,
     /// `model=`: the worker's `--model`.
     pub(crate) model: Option<String>,
     /// `from=`, the session that starts the worker (the client's own, which
     /// the spawn's `@<sid>` aim need not be): the task's `from=`, and the
-    /// Claude Code whose program, home and login the worker's line carries.
-    /// `None`: `from=ctl`.
+    /// agent of the worker's kind whose program and homes the worker's line
+    /// carries where the starter runs one. `None`: `from=ctl`.
     pub(crate) caller: Option<SessionId>,
     /// The `cwd=` named, canonical: the one folder the window harness's
     /// folder-trust rule trusts for this worker (`SessionMeta::trusted_cwd`).
@@ -175,30 +199,32 @@ impl TaskOrder {
     /// holding a NUL byte, which no argument can carry.
     pub(crate) fn of_frame(
         frame: Option<Vec<u8>>,
+        agent: aterm_phase::Program,
         model: Option<String>,
         cwd: Option<&str>,
         caller: Option<SessionId>,
     ) -> Result<Self, String> {
+        let word = agent.name();
         let Some(task) = frame else {
-            return Err(NO_FRAME.to_string());
+            return Err(no_frame(word));
         };
         if task.is_empty() {
-            return Err("ERR spawn agent=claude: the task is empty\n".to_string());
+            return Err(format!("ERR spawn agent={word}: the task is empty\n"));
         }
         if task.len() > TASK_MAX {
-            return Err(too_large(&task.len().to_string()));
+            return Err(too_large(&task.len().to_string(), word));
         }
         if task.contains(&0) {
-            return Err(
-                "ERR spawn agent=claude: the task holds a NUL byte, which no argument can carry\n"
-                    .to_string(),
-            );
+            return Err(format!(
+                "ERR spawn agent={word}: the task holds a NUL byte, which no argument can carry\n"
+            ));
         }
         // Bounded as the spawn's own folder check is: a folder on a hung
         // mount trusts nothing rather than park this control lane.
         let trusted_cwd = cwd.and_then(crate::spawn_folder::canonical_folder);
         Ok(Self {
             task,
+            agent,
             model,
             caller,
             trusted_cwd,
@@ -214,8 +240,8 @@ impl TaskOrder {
 /// work ends once all of it is on the remote main branch, defended in a few
 /// lines starting `Nothing left:`, and that report is the result; under
 /// Cruise no report ends it. No retired token (FOREVER CRUISE / FOREVER
-/// LAND).
-pub(crate) fn fact_line(from: &str, autopilot: Autopilot) -> String {
+/// LAND). `agent` is the spawn's `agent=` word.
+pub(crate) fn fact_line(from: &str, autopilot: Autopilot, agent: &str) -> String {
     let end = match autopilot {
         Autopilot::Cruise => format!(
             "under Autopilot Cruise: no report ends the work, and `{from}` reads its progress \
@@ -228,7 +254,7 @@ pub(crate) fn fact_line(from: &str, autopilot: Autopilot) -> String {
         ),
     };
     format!(
-        "(Started by `{from}` with `spawn agent=claude`, {end}. A line starting `NEEDS YOU:` \
+        "(Started by `{from}` with `spawn agent={agent}`, {end}. A line starting `NEEDS YOU:` \
          reaches `{from}` and the person while the work goes on.)"
     )
 }
@@ -236,18 +262,44 @@ pub(crate) fn fact_line(from: &str, autopilot: Autopilot) -> String {
 /// What a worker's task file holds: the task as given, its last line ended,
 /// then — with a starter `from` — a blank line and the [`fact_line`] naming
 /// it and its `autopilot`. The shell's `$(…)` trims the trailing newline, so
-/// the agent's argv is the task, the blank line and the fact.
-pub(crate) fn task_text(task: &[u8], from: Option<&str>, autopilot: Autopilot) -> Vec<u8> {
-    let mut text = task.to_vec();
-    if !text.ends_with(b"\n") {
+/// the agent's argv is the task, the blank line and the fact. For an
+/// `agent` whose screen cannot bound a message holding a blank line (agy:
+/// `WorkerCli::blank_lines`), the task's blank lines are dropped and the
+/// fact is the line under it, so the whole first prompt is drawn as one
+/// message and no row of it reads as the agent's reply.
+pub(crate) fn task_text(
+    task: &[u8],
+    from: Option<&str>,
+    autopilot: Autopilot,
+    agent: aterm_phase::Program,
+) -> Vec<u8> {
+    let blank_lines = aterm_agent::harness::worker::worker_cli(agent).is_none_or(|w| w.blank_lines);
+    let mut text = if blank_lines {
+        task.to_vec()
+    } else {
+        without_blank_lines(task)
+    };
+    if !text.is_empty() && !text.ends_with(b"\n") {
         text.push(b'\n');
     }
     if let Some(from) = from {
-        text.push(b'\n');
-        text.extend_from_slice(fact_line(from, autopilot).as_bytes());
+        if blank_lines {
+            text.push(b'\n');
+        }
+        text.extend_from_slice(fact_line(from, autopilot, agent.name()).as_bytes());
         text.push(b'\n');
     }
     text
+}
+
+/// `task` with every blank line (empty, or ASCII white space alone) left
+/// out, each other line as given.
+fn without_blank_lines(task: &[u8]) -> Vec<u8> {
+    task.split_inclusive(|&b| b == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .flatten()
+        .copied()
+        .collect()
 }
 
 /// A worker's task file, ready to be written once the newborn's sid is known
@@ -258,6 +310,7 @@ pub(crate) fn task_text(task: &[u8], from: Option<&str>, autopilot: Autopilot) -
 #[derive(Clone)]
 pub(crate) struct TaskSeed {
     text: Arc<[u8]>,
+    trust_text: Option<Arc<[u8]>>,
     /// The write and explicit discard share one decision across clones.
     written: Arc<Mutex<TaskFileState>>,
 }
@@ -266,6 +319,7 @@ pub(crate) struct TaskSeed {
 struct TaskFileState {
     discarded: bool,
     path: Option<PathBuf>,
+    trust_path: Option<PathBuf>,
 }
 
 impl TaskSeed {
@@ -273,25 +327,48 @@ impl TaskSeed {
     pub(crate) fn new(text: Vec<u8>) -> Self {
         Self {
             text: text.into(),
+            trust_text: None,
             written: Arc::default(),
         }
     }
 
-    /// Remove the task file this seed wrote, if it wrote one: its worker did
-    /// not start, so nothing will read it. One the close already removed
+    /// Prepare the worker's optional private trust sidecar in the same
+    /// spawner write and cancellation lifetime as its task, before the
+    /// session can be registered and closed. The launcher only reads its
+    /// resulting path; it never creates a file after a close.
+    pub(crate) fn with_trust_file(mut self, folder: &str) -> Self {
+        self.trust_text = Some(
+            aterm_agent::harness::worker::trusted_folders_text(folder)
+                .into_bytes()
+                .into(),
+        );
+        self
+    }
+
+    pub(crate) fn trust_file(&self) -> Option<PathBuf> {
+        self.written
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .trust_path
+            .clone()
+    }
+
+    /// Remove the task and optional trust file this seed wrote: its worker did
+    /// not start, so nothing will read them. One the close already removed
     /// ([`retire_task_file`]) is no error. Sticky even before a write: a
     /// spawner still running after cancellation must not leave a later file.
     pub(crate) fn discard(&self) {
         let written = {
             let mut state = self.written.lock().unwrap_or_else(|p| p.into_inner());
             state.discarded = true;
-            state.path.take()
+            [state.path.take(), state.trust_path.take()]
         };
-        if let Some(path) = written
-            && let Err(e) = std::fs::remove_file(&path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            aterm_log::warn!("task file {}: not removed: {e}", path.display());
+        for path in written.into_iter().flatten() {
+            if let Err(e) = std::fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                aterm_log::warn!("task file {}: not removed: {e}", path.display());
+            }
         }
     }
 
@@ -349,13 +426,29 @@ impl TaskSeed {
         let pinned = crate::pinned_dir::PinnedDir::open_resolved(dir)?;
         let file = write(&pinned, name, &self.text)?;
         let path = dir.join(name);
+        let trust_name = trust_file_name(sid);
+        let trust = self.trust_text.as_ref().and_then(|text| {
+            pinned
+                .write_new_private(std::ffi::OsStr::new(&trust_name), text)
+                .inspect_err(|e| {
+                    aterm_log::warn!(
+                        "worker {sid}: its trusted-folders file was not written ({e}): its \
+                         folder-trust dialog is the person's"
+                    );
+                })
+                .ok()
+        });
         let mut state = self.written.lock().unwrap_or_else(|p| p.into_inner());
         if state.discarded {
             drop(state);
-            file.remove_exact()?;
+            let task_removed = file.remove_exact();
+            let trust_removed = trust.map(|file| file.remove_exact()).transpose();
+            task_removed?;
+            trust_removed?;
             return Err(cancelled());
         }
         state.path = Some(path.clone());
+        state.trust_path = trust.map(|_| dir.join(trust_name));
         Ok(path)
     }
 }
@@ -364,6 +457,12 @@ impl TaskSeed {
 /// record is rev 1.
 fn task_file_name(sid: &SessionId) -> String {
     format!("{}-1.txt", sid.as_str())
+}
+
+/// The name of a Gemini CLI worker `sid`'s own trusted-folders file in the
+/// tasks directory ([`TaskSeed::with_trust_file`]).
+fn trust_file_name(sid: &SessionId) -> String {
+    format!("{}-1.trust.json", sid.as_str())
 }
 
 /// Whether `name` is one of session `sid`'s result files in the tasks
@@ -389,7 +488,8 @@ const TASKS_DIR_SCAN: usize = 65_536;
 /// Remove session `sid`'s task files once the session is gone
 /// (`App::retire_session_registration`, the tail of every close; a quit's
 /// [`retire_task_files_at_quit`]): its task file, whose task its agent took
-/// as argv at its start, and every result its harness snapshotted
+/// as argv at its start, a Gemini CLI worker's own trusted-folders file
+/// ([`TaskSeed::with_trust_file`]), and every result its harness snapshotted
 /// (`<sid>-<rev>.result.md` and `.result.src`, one pair per done), which
 /// `result` reads through the record and the record dies with the session.
 /// The worker's report can hold its tools' output, so none outlives it. A
@@ -467,6 +567,7 @@ fn retire_files_in(dir: &Path, sids: &[SessionId]) {
     };
     for sid in sids {
         remove(std::ffi::OsStr::new(&task_file_name(sid)));
+        remove(std::ffi::OsStr::new(&trust_file_name(sid)));
     }
     let names = match pinned.names_up_to(TASKS_DIR_SCAN) {
         Ok(names) => names,
@@ -513,15 +614,24 @@ pub(crate) struct Launch {
     /// The worker's shell and the dialect its line is written in.
     pub(crate) shell: PathBuf,
     pub(crate) dialect: Dialect,
+    /// `agent=`: the harness the line starts.
+    pub(crate) agent: aterm_phase::Program,
     /// `model=`.
     pub(crate) model: Option<String>,
-    /// The starter's session, whose Claude Code the line follows
-    /// ([`worker_claude_of`]); `None` for `from=ctl`, or a starter another
-    /// instance hosts.
+    /// The one folder the worker's starter trusted for it (the spawn's
+    /// canonical `cwd=`): where the shell stands in it, the line carries the
+    /// agent's own trust-for-this-run flag ([`trusted_here`]); a Gemini CLI
+    /// worker's line names a trusted-folders file of its own that trusts it
+    /// alone ([`TaskSeed::with_trust_file`]).
+    pub(crate) trusted_cwd: Option<String>,
+    /// The optional sidecar already written with the task before the
+    /// session was registered. Kept on ambiguous or successful launch;
+    /// the session's close/quit removes it with the task.
+    pub(crate) trust_file: Option<PathBuf>,
+    /// The starter's session, whose agent of the worker's kind the line
+    /// follows ([`worker_starter_of`]); `None` for `from=ctl`, or a starter
+    /// another instance hosts.
     pub(crate) caller: Option<Arc<SessionCtx>>,
-    /// Whether the line carries the starter's Claude home and login, or its
-    /// program alone ([`carries_starters_login`]).
-    pub(crate) carries_login: bool,
 }
 
 /// Start the worker's launcher: on a thread of its own, wait for the shell's
@@ -553,15 +663,33 @@ fn run_worker_launch(work: &Launch) {
             return;
         }
     };
-    let (caller, found) = worker_claude_of(work, work.carries_login);
-    let line = aterm_agent::harness::relaunch::task_launch_line(
-        work.dialect,
-        &caller.exe,
-        work.model.as_deref(),
-        caller.home.as_deref(),
-        caller.homedir.as_deref(),
-        caller.login.as_deref(),
+    let Some(cli) = aterm_agent::harness::worker::worker_cli(work.agent) else {
+        stall(work, "its agent has no worker line");
+        return;
+    };
+    let (caller, found) = worker_starter_of(work, cli);
+    let here = trusted_here(
+        cli.trust_flag.is_some(),
+        work.trusted_cwd.as_deref(),
+        || shell_cwd(&work.store, &work.ctx),
     );
+    let session = cli.session_flag.and_then(|_| {
+        aterm_agent::harness::worker::fresh_session_id()
+            .inspect_err(|e| {
+                aterm_log::warn!(
+                    "worker session {}: no session id of its own ({e})",
+                    work.local
+                );
+            })
+            .ok()
+    });
+    let fresh = aterm_agent::harness::worker::Fresh {
+        model: work.model.as_deref(),
+        trusted_here: here,
+        trust_file: work.trust_file.as_deref(),
+        session: session.as_deref(),
+    };
+    let line = aterm_agent::harness::worker::line(cli, work.dialect, &caller, &fresh);
     match line {
         Ok(line) => {
             let Some(proxy) = work.proxy.as_ref() else {
@@ -596,15 +724,23 @@ fn run_worker_launch(work: &Launch) {
                 }
             };
             let note = format!(
-                "typed ({} B, {written}): {} ({}{})",
+                "typed ({} B, {written}): {} ({}{}{}{})",
                 line.len() + 1,
                 caller.exe.display(),
-                found.words(),
-                if caller.home.is_some() || caller.homedir.is_some() || caller.login.is_some() {
-                    ", with its Claude home and login"
+                found.words(cli.agent),
+                if caller.env.is_empty() {
+                    String::new()
                 } else {
-                    ""
+                    format!(", with its {} homes and login", cli.agent.product())
                 },
+                cli.trust_flag
+                    .filter(|_| here)
+                    .map(|flag| format!(", trusting its folder for this run ({flag})"))
+                    .unwrap_or_default(),
+                work.trust_file
+                    .as_deref()
+                    .map(|f| format!(", trusting its folder alone by {}", f.display()))
+                    .unwrap_or_default(),
             );
             aterm_log::info!("worker session {}: launch line {note}", work.local);
             note_launch(&work.ctx, note);
@@ -757,59 +893,63 @@ pub(crate) fn stall_task(ctx: &SessionCtx, local: u64, why: &str) {
     }
 }
 
-/// Whether a worker's line carries its starter's Claude home, `HOME` and login: only
-/// when the worker runs under its starter's own identity, `worker` and
-/// `starter` the two sessions' identity labels (`None` for both is the
-/// human's own agent config). A worker under another one — `identity=<name>`,
-/// `identity=-`, or an aimed session's — has that identity's Claude home in
-/// its shell's env (`agent_identity::env`, or none), and the starter's, put
-/// in front of the line, would override it for the agent alone: the worker
-/// would run on the starter's account while `sessions` showed the identity
-/// asked for. Then the line carries the starter's program alone
-/// ([`line_claude`]), and the identity's own env stands.
-pub(crate) fn carries_starters_login(worker: Option<&str>, starter: Option<&str>) -> bool {
-    worker == starter
+/// What a worker's line carries of the agent of its kind its starter runs
+/// (`found`): its program, and its homes, login and config flags
+/// (`aterm_agent::harness::worker::Starter::args`: agy's data directories,
+/// Muse Code's provider);
+/// `cli`'s plain word under the shell's own when the starter runs none.
+pub(crate) fn line_starter(
+    cli: &aterm_agent::harness::worker::WorkerCli,
+    found: Option<aterm_agent::harness::worker::Starter>,
+) -> aterm_agent::harness::worker::Starter {
+    found.unwrap_or_else(|| cli.plain())
 }
 
-/// What a worker's line carries of the Claude Code its starter runs
-/// (`found`): its program, and its Claude home, `HOME` and login only when
-/// `login` ([`carries_starters_login`]); plain `claude` under the shell's own when
-/// the starter runs none.
-fn line_claude(
-    found: Option<aterm_agent::harness::relaunch::CallerClaude>,
-    login: bool,
-) -> aterm_agent::harness::relaunch::CallerClaude {
-    let mut claude = found.unwrap_or_else(|| aterm_agent::harness::relaunch::CallerClaude {
-        exe: PathBuf::from("claude"),
-        home: None,
-        homedir: None,
-        login: None,
-    });
-    if !login {
-        claude.home = None;
-        claude.homedir = None;
-        claude.login = None;
-    }
-    claude
+/// WHETHER THE WORKER'S LINE TRUSTS ITS FOLDER FOR THIS RUN (`flag`: the
+/// agent has such a flag, `aterm_agent::harness::worker::WorkerCli::trust_flag`,
+/// Muse Code's alone):
+/// only where its starter trusted a folder for it (`trusted`, the spawn's
+/// canonical `cwd=`) and the shell, at the prompt the line is typed at,
+/// stands in exactly that folder (`cwd`, read only then: the kernel's own
+/// account of the shell's directory, which an rc file's `cd` moves). A
+/// directory not read trusts nothing.
+pub(crate) fn trusted_here(
+    flag: bool,
+    trusted: Option<&str>,
+    cwd: impl FnOnce() -> Option<PathBuf>,
+) -> bool {
+    let Some(trusted) = trusted.filter(|_| flag) else {
+        return false;
+    };
+    cwd().is_some_and(|cwd| cwd == Path::new(trusted))
 }
 
-/// Where a worker's line looked for its starter's Claude Code
+/// The directory of the group in front of the worker's own terminal (its
+/// shell, at its first prompt), as the kernel tells it.
+fn shell_cwd(store: &Store, ctx: &SessionCtx) -> Option<PathBuf> {
+    let pid = u32::try_from(starter_front(store, ctx)?).ok()?;
+    aterm_sysprobe::process_cwd(pid)
+}
+
+/// Where a worker's line looked for its starter's agent of its kind
 /// ([`starter_group`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StarterGroup {
-    /// The status sweep named the starter's program Claude Code: its group.
+    /// The status sweep named the starter's program the worker's agent: its
+    /// group.
     Named(i32),
     /// The sweep had not named the starter's program yet: the group in front
-    /// of the starter's terminal now, followed only where it runs a Claude
-    /// Code (`aterm_agent::harness::relaunch::caller_claude` reads its argv).
+    /// of the starter's terminal now, followed only where it runs the
+    /// worker's agent (`aterm_agent::harness::worker::starter` reads its
+    /// argv).
     Front(i32),
 }
 
 /// THE STARTER'S GROUP a worker's line follows: the one the status sweep
-/// named, where its reader is Claude Code; none where it named another
-/// agent's program (a worker is a Claude Code, and follows a starter's own
-/// Claude Code alone); and where it has named NONE yet, the group in front
-/// of the starter's terminal now (`front`).
+/// named, where its reader is the worker's `agent`; none where it named
+/// another agent's program (a worker follows a starter's own agent of its
+/// kind alone); and where it has named NONE yet, the group in front of the
+/// starter's terminal now (`front`).
 ///
 /// WHY THE FRONT GROUP (the workers lab, 2026-10-18: 3 of 40 runs, and every
 /// run of `lab workers --early` on main's build): a manager whose first turn
@@ -822,21 +962,16 @@ pub(crate) fn starter_group(
     reader: Option<aterm_phase::Program>,
     named: i32,
     front: impl FnOnce() -> Option<i32>,
+    agent: aterm_phase::Program,
 ) -> Option<StarterGroup> {
     match reader {
-        Some(aterm_phase::Program::Claude) => Some(StarterGroup::Named(named)),
-        Some(
-            aterm_phase::Program::Codex
-            | aterm_phase::Program::Agy
-            | aterm_phase::Program::Muse
-            | aterm_phase::Program::Gemini
-            | aterm_phase::Program::Generic,
-        ) => None,
+        Some(reader) if reader == agent => Some(StarterGroup::Named(named)),
+        Some(_) => None,
         None => front().filter(|g| *g > 0).map(StarterGroup::Front),
     }
 }
 
-/// What a worker's line found of its starter's Claude Code, for the log.
+/// What a worker's line found of its starter's agent, for the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Found {
     /// The status sweep's group ran it.
@@ -844,48 +979,49 @@ enum Found {
     /// The starter's terminal's front group ran it; the sweep had not named
     /// it yet.
     Front,
-    /// None: plain `claude` under the shell's own.
+    /// None: the plain word under the shell's own.
     Plain,
 }
 
 impl Found {
-    /// The words the launch line's log names its program with.
-    fn words(self) -> &'static str {
+    /// The words the launch line's log names its program with, `agent` the
+    /// worker's.
+    fn words(self, agent: aterm_phase::Program) -> String {
+        let product = agent.product();
         match self {
-            Self::Named => "the starter's Claude Code",
-            Self::Front => {
-                "the starter's Claude Code, read from its terminal: the status sweep had not \
-                 named it yet"
-            }
-            Self::Plain => "no Claude Code of a starter's: plain `claude`",
+            Self::Named => format!("the starter's {product}"),
+            Self::Front => format!(
+                "the starter's {product}, read from its terminal: the status sweep had not named \
+                 it yet"
+            ),
+            Self::Plain => format!("no {product} of a starter's: plain `{}`", agent.name()),
         }
     }
 }
 
-/// The program, Claude home and login a worker's line carries: the starter's
-/// own Claude Code's when the starter's session runs one
-/// (`aterm_agent::harness::relaunch::caller_claude`, of [`starter_group`]),
-/// its home and login only when `login` ([`line_claude`]), else plain
-/// `claude` under the shell's own — with where it was found.
-fn worker_claude_of(
+/// The program, homes and login a worker's line carries: the starter's own
+/// agent of `cli`'s kind where the starter's session runs one
+/// (`aterm_agent::harness::worker::starter`, of [`starter_group`]), else
+/// `cli`'s plain word under the shell's own — with where it was found.
+fn worker_starter_of(
     work: &Launch,
-    login: bool,
-) -> (aterm_agent::harness::relaunch::CallerClaude, Found) {
+    cli: &aterm_agent::harness::worker::WorkerCli,
+) -> (aterm_agent::harness::worker::Starter, Found) {
     let found = work.caller.as_deref().and_then(|ctx| {
         let (reader, named) = {
             let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let agent = timeline.agent();
             (agent.reader, agent.program_pgid)
         };
-        let group = starter_group(reader, named, || starter_front(&work.store, ctx))?;
+        let group = starter_group(reader, named, || starter_front(&work.store, ctx), cli.agent)?;
         let pgid = match group {
             StarterGroup::Named(g) | StarterGroup::Front(g) => g,
         };
         let pid = u32::try_from(pgid).ok().filter(|p| *p > 0)?;
-        let claude =
-            aterm_agent::harness::relaunch::caller_claude(pid, &aterm_types::dirs::home_dir()?)?;
+        let starter =
+            aterm_agent::harness::worker::starter(cli, pid, &aterm_types::dirs::home_dir()?)?;
         Some((
-            claude,
+            starter,
             match group {
                 StarterGroup::Named(_) => Found::Named,
                 StarterGroup::Front(_) => Found::Front,
@@ -893,12 +1029,13 @@ fn worker_claude_of(
         ))
     });
     let how = found.as_ref().map_or(Found::Plain, |(_, how)| *how);
-    (line_claude(found.map(|(claude, _)| claude), login), how)
+    (line_starter(cli, found.map(|(s, _)| s)), how)
 }
 
-/// The group in front of the starter's terminal now (`tcgetpgrp` on its PTY
+/// The group in front of the session's terminal now (`tcgetpgrp` on its PTY
 /// master, read under the registry's read guard so the fd is the session's
-/// own); `None` for a starter that is gone, or where none can be read.
+/// own): the starter's, or the worker's own shell's; `None` for a session
+/// that is gone, or where none can be read.
 #[cfg(unix)]
 fn starter_front(store: &Store, ctx: &SessionCtx) -> Option<i32> {
     let g = store.read().unwrap_or_else(|p| p.into_inner());

@@ -1705,9 +1705,12 @@ fn digest_of(listing: &Listing) -> String {
 mod tests {
     use super::*;
 
-    /// git with nothing of this machine's own configuration in it.
+    /// git with nothing of this machine's own configuration in it
+    /// ([`crate::ledger::testing::git`]).
     fn git(dir: &Path, args: &[&str]) -> String {
-        let out = crate::ledger::object_git(dir)
+        let out = crate::ledger::testing::git()
+            .arg("-C")
+            .arg(dir)
             .args([
                 "-c",
                 "user.name=fixture",

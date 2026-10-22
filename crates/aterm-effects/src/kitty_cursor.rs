@@ -24,7 +24,7 @@ use aterm_render::{GlowQuad, HaloMode, RainHalo, premul_rgb};
 use crate::cat_baker::{CatColorKey, EyesFrame};
 use crate::cat_glyphs_gen::CatGlyphId;
 use crate::cursor_glow::{Geom, InkRole, push_halo_rows};
-use crate::effect_util::twinkle_rgb;
+use crate::effect_util::{push_fx_rect, twinkle_rgb};
 use crate::kitty_registry::KittyLook;
 use crate::rainbow_kitty::companion::{FLYING_LEAD_MAX, Flight};
 use crate::typing_momentum::TypingMomentum;
@@ -240,6 +240,7 @@ pub struct SingSync {
 }
 
 /// Smoothstep ramp of `x` across `[lo, hi]` → `0..=1` (eased at both ends).
+#[inline]
 fn smoothstep(lo: f32, hi: f32, x: f32) -> f32 {
     let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -386,6 +387,7 @@ impl CatFrame {
     /// cannot shift it). Precedence: the delete oops (S121), the exit flourishes, the singing
     /// head (S115), Enter's maneki celebration.
     #[must_use]
+    #[inline]
     pub fn render_look(&self) -> KittyLook {
         // The goodbye face waits until the fade is visible: the flourish is rolled at the LOW
         // crossing while alpha is still ~255 and a revive resets `exit`, so an immediate swap
@@ -410,6 +412,7 @@ impl CatFrame {
 
     /// Quantized fingerprint folded into the frame's repaint key so the fade +
     /// bob + exit fx invalidate frames while active and settle (0) when hidden.
+    #[inline]
     pub fn fp(&self) -> u64 {
         if self.alpha == 0 {
             return 0;
@@ -466,6 +469,7 @@ impl CatFrame {
 
 /// The inert hidden/retired frame: alpha 0, plain exit, no reaction, STILL
 /// pose — byte-identical across frames, so [`CatFrame::fp`] settles to 0.
+#[inline]
 fn hidden_frame(look: KittyLook) -> CatFrame {
     CatFrame {
         alpha: 0,
@@ -648,6 +652,7 @@ impl CursorCat {
     /// Forward pulses feed the momentum rule. Reverse folds do not call
     /// `on_key(false)`: the input seam already delivered that Backspace, and
     /// repeating it would double-drain momentum and double-kick the oops.
+    #[inline]
     pub fn on_motion_pulse(&mut self, pulse: crate::cursor_glow::CursorCatMotionPulse) {
         self.on_motion_pulse_with_owner(pulse, true);
     }
@@ -655,6 +660,7 @@ impl CursorCat {
     /// Feed the momentum and travel count the tenure pet mode's singing face
     /// needs without starting an ordinary flight: the held-key song still owes
     /// the real cursor-travel floor.
+    #[inline]
     pub fn on_pet_mode_motion_pulse(&mut self, pulse: crate::cursor_glow::CursorCatMotionPulse) {
         self.on_motion_pulse_with_owner(pulse, false);
     }
@@ -696,6 +702,7 @@ impl CursorCat {
     /// Sample the cat's geometry-free placement state. A sample past
     /// [`CURSOR_FOLD_DURATION`] reports no fold, so a sparse frame never replays stale travel.
     #[must_use]
+    #[inline]
     pub fn placement_frame(&self, now: Instant) -> CursorCatPlacementFrame {
         let fold_now = self.collection_sample_time(now);
         let fold = self.fold.and_then(|fold| {
@@ -721,6 +728,7 @@ impl CursorCat {
     /// Retire renderer-coordinate continuity only: drop an in-flight fold and the palette
     /// sampled under the old footprint. A collection hello or singing appearance continues
     /// at the live caret.
+    #[inline]
     pub fn rebase_placement(&mut self) {
         self.colors = None;
         self.fold = None;
@@ -729,6 +737,7 @@ impl CursorCat {
 
     /// Stamp one committed text keystroke: `forward` for a normal char / space /
     /// newline (the cursor advances), `!forward` for a backspace. Only text keys.
+    #[inline]
     pub fn on_key(&mut self, now: Instant, forward: bool) {
         self.on_key_with_owner(now, forward, true);
     }
@@ -1060,6 +1069,7 @@ impl CursorCat {
         };
     }
 
+    #[inline]
     fn collection_sample_time(&self, now: Instant) -> Instant {
         if self.collection_hello {
             self.collection_paused_at.unwrap_or(now)
@@ -1068,10 +1078,12 @@ impl CursorCat {
         }
     }
 
+    #[inline]
     fn discovery_active(&self, now: Instant) -> bool {
         self.discovery_until.is_some_and(|until| now < until)
     }
 
+    #[inline]
     fn reaction_at(&mut self, now: Instant) -> CatReaction {
         if self.reaction_until.is_some_and(|until| now >= until) {
             self.reaction = CatReaction::Cruise;
@@ -1088,6 +1100,7 @@ impl CursorCat {
 
     /// Drift the stride phase to `now` at [`STRIDE_IDLE_HZ`]. `dt` is clamped
     /// so a backgrounded window resumes with one ordinary frame's worth.
+    #[inline]
     fn stride_advance(&mut self, now: Instant) {
         if self.stride_at == Some(now) {
             return;
@@ -1116,6 +1129,7 @@ impl CursorCat {
     /// The airborne hover-bob (fraction of cell height), a pure read of the stride pump.
     /// No delight leap: the feline word's own cat (`word_decorations::CatIdlePose`)
     /// celebrates; the companion only gets happy eyes.
+    #[inline]
     fn bob(&self) -> f32 {
         match self.flight {
             Some(_) => (std::f32::consts::TAU * self.stride_shown).sin() * BOB_AMP,
@@ -1139,6 +1153,7 @@ impl CursorCat {
     /// Advance the eased display-momentum spine toward `target` (the live
     /// score) with time constant `DISP_TAU`. `disp_at == None` reseeds it to
     /// the target, so a fresh flight opens already banked.
+    #[inline]
     fn advance_spine(&mut self, now: Instant, target: f32) {
         let target = target.clamp(0.0, 1.0);
         match self.disp_at {
@@ -1156,6 +1171,7 @@ impl CursorCat {
 
     /// Deterministic idle blink: a `BLINK_DUR` closure once per `BLINK_PERIOD`,
     /// phased off the flight clock so it never fires the instant the cat appears.
+    #[inline]
     fn blink_active(&self, now: Instant) -> bool {
         match self.flight {
             Some(t0) => {
@@ -1351,6 +1367,7 @@ impl CursorCat {
     /// Settle the spine to fully idle: display momentum resets, the follower
     /// disarms and any landing bounce clears, so the next hidden frame is
     /// byte-identical.
+    #[inline]
     fn reset_spine(&mut self) {
         self.disp = 0.0;
         self.disp_at = None;
@@ -1512,6 +1529,7 @@ impl CursorCat {
 
     /// Freeze the first footprint palette sample of this visible episode, so later frames
     /// keep the same atlas tile when the colours beneath the cat change.
+    #[inline]
     pub fn colors_for_episode(&mut self, sampled: CatColorKey) -> CatColorKey {
         *self.colors.get_or_insert(sampled)
     }
@@ -1519,6 +1537,7 @@ impl CursorCat {
     /// The already-frozen palette, if any: the host checks it before its footprint walk,
     /// so every frame after the first is an O(1) hit.
     #[must_use]
+    #[inline]
     pub fn episode_colors(&self) -> Option<CatColorKey> {
         self.colors
     }
@@ -1647,6 +1666,7 @@ impl CursorCat {
     /// derived from the metric's decay ([`TypingMomentum::low_crossing`]) so
     /// the lifecycle is frame-rate independent. Only called after observing
     /// `decayed(now) < LOW`, so it is never in the future.
+    #[inline]
     fn low_crossing_at(&self, now: Instant) -> Instant {
         self.momentum.low_crossing(LOW).unwrap_or(now)
     }
@@ -1670,6 +1690,7 @@ impl CursorCat {
 
     /// On screen (fading or shown) ⇒ keep the host's 60 fps re-arm going.
     #[must_use]
+    #[inline]
     pub fn is_active(&self) -> bool {
         !matches!(self.state, State::Hidden)
     }
@@ -1677,13 +1698,16 @@ impl CursorCat {
     /// The canonical typing-momentum metric at `now` (lazily decayed), the
     /// same number the glow engine's spine chases.
     #[must_use]
+    #[inline]
     pub fn momentum(&self, now: Instant) -> f32 {
         self.momentum.value(now)
     }
 
+    #[inline]
     fn decayed(&self, now: Instant) -> f32 {
         self.momentum.value(now)
     }
+    #[inline]
     fn xorshift(&mut self) -> u32 {
         let mut x = self.rng;
         x ^= x << 13;
@@ -1693,6 +1717,7 @@ impl CursorCat {
         x
     }
     /// 20% star wink, 20% heart meow, else a plain fade.
+    #[inline]
     fn roll_exit(&mut self) -> CatExit {
         match self.xorshift() % 5 {
             0 => CatExit::StarWink,
@@ -1765,7 +1790,7 @@ pub fn emit_exit_fx(
                 let bumps = [(4, 5)]; // second top bump on row 0
                 let pink = premul_rgb(EXIT_HEART_PINK, cov);
                 for (ry, &(x0, x1)) in rows.iter().enumerate() {
-                    push_fx(
+                    push_fx_rect(
                         out,
                         geom,
                         hx + x0 * u,
@@ -1776,7 +1801,7 @@ pub fn emit_exit_fx(
                     );
                 }
                 for &(x0, x1) in &bumps {
-                    push_fx(out, geom, hx + x0 * u, hy, (x1 - x0 + 1) * u, u, pink);
+                    push_fx_rect(out, geom, hx + x0 * u, hy, (x1 - x0 + 1) * u, u, pink);
                 }
             } else {
                 // Light: one darkened-rose source-over veil on the heart, bounded
@@ -1812,10 +1837,10 @@ pub fn emit_exit_fx(
                 }
                 let star_rgb = twinkle_rgb(false);
                 let star = premul_rgb(star_rgb, cov);
-                push_fx(out, geom, sx - a, sy, 2 * a + 1, 1, star); // h arm
-                push_fx(out, geom, sx, sy - a, 1, 2 * a + 1, star); // v arm
+                push_fx_rect(out, geom, sx - a, sy, 2 * a + 1, 1, star); // h arm
+                push_fx_rect(out, geom, sx, sy - a, 1, 2 * a + 1, star); // v arm
                 let d = a / 2;
-                push_fx(
+                push_fx_rect(
                     out,
                     geom,
                     sx - d,
@@ -1847,6 +1872,7 @@ pub fn emit_exit_fx(
     clippy::too_many_arguments,
     reason = "centre + per-axis radii + ink + alpha; a param struct would obscure the geometry at the flourish call sites"
 )]
+#[inline]
 fn push_exit_veil(
     out: &mut Vec<RainHalo>,
     geom: Geom,
@@ -1862,44 +1888,6 @@ fn push_exit_veil(
     }
     let color = (u32::from(alpha) << 24) | (rgb & 0x00FF_FFFF);
     push_halo_rows(out, geom, (cx, cy), (rx, ry), color, HaloMode::Over);
-}
-
-/// Push one additive rect as per-cell-row [`GlowQuad`]s, clamped to the effects
-/// box.
-fn push_fx(out: &mut Vec<GlowQuad>, geom: Geom, x: i32, y: i32, w: i32, h: i32, premul: u32) {
-    if w <= 0 || h <= 0 || premul == 0 {
-        return;
-    }
-    // Effects box (grid + head band): identity-exact at head 0; a below-grid
-    // band would only be skipped by the renderers' row gates.
-    let (x0, x1) = (x.max(geom.fx_left()), (x + w).min(geom.fx_right()));
-    let (y0, y1) = (y.max(geom.fx_top()), (y + h).min(geom.fx_bot()));
-    if x1 <= x0 || y1 <= y0 {
-        return;
-    }
-    let ch = geom.ch as i32;
-    let oy = geom.origin_y as i32;
-    let x0_u16 = x0 as u16;
-    let w_u16 = (x1 - x0) as u16;
-    let mut yy = y0;
-    while yy < y1 {
-        // Grid-row damage hint anchored at origin_y (above-grid bands tag row 0).
-        let row = (yy - oy).div_euclid(ch);
-        let band_end = (oy + (row + 1) * ch).min(y1);
-        out.push(GlowQuad {
-            row: row.max(0) as u16,
-            x: x0_u16,
-            y: yy as u16,
-            w: w_u16,
-            h: (band_end - yy) as u16,
-            color: premul,
-            // Additive light (see `GlowQuad::alpha`).
-            alpha: 0,
-            color2: premul,
-            alpha2: 0,
-        });
-        yy = band_end;
-    }
 }
 
 /// Nearest-neighbour resample a straight-alpha RGBA8 image `src` (`sw×sh`) to

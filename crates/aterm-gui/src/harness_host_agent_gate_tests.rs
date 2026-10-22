@@ -655,84 +655,109 @@ fn revocation_fixture() -> (HostHandle, WorkerJob, Workers, Hooks) {
 }
 
 /// A WORKER IS REFUSED EXACTLY WHERE THIS HOST WOULD NOT CARRY IT
-/// ([`worker_unsupervised`]: `spawn agent=claude`'s `ERR unsupervised:
+/// ([`worker_unsupervised`]: `spawn agent=<word>`'s `ERR unsupervised:
 /// <switch>`). For each table the verdict is what the real host does with a
-/// newborn worker, a Claude Code session with no `autopilot` word of its
-/// own: under each switch named no worker runs for it — the master switch
-/// (and `headless = false` in a headless instance) starts no host at all,
-/// Claude Code's own table admits none, an Autopilot default of `off` reads
-/// it Off — while the same host carries the session beside it that the
-/// switch leaves on (a Codex tab; a Claude tab whose own word is `cruise`).
-/// NEGATIVE CONTROLS: the default, a headless instance under it, `headless =
-/// false` in a windowed one, another agent's table off and a `land` default
-/// all carry the worker.
+/// newborn worker — a Claude Code, Gemini CLI, agy or Muse Code session
+/// with no `autopilot` word of its own: under each switch named no worker
+/// runs for it — the master switch (and `headless = false` in a headless
+/// instance) starts no host at all, the worker's agent's own table admits
+/// none, an Autopilot default of `off` reads it Off — while the same host
+/// carries the session beside it that the switch leaves on (a Codex tab; a
+/// Claude tab whose own word is `cruise`). NEGATIVE CONTROLS: the default, a
+/// headless instance under it, `headless = false` in a windowed one,
+/// another agent's table off (Codex's, and another worker agent's) and a
+/// `land` default all carry the worker.
 #[test]
 fn a_worker_is_refused_exactly_where_the_host_would_not_carry_it() {
     const WORKER: &str = "s-worker";
     let codex = Some(("s-codex", Program::Codex, None));
     let opted = Some(("s-opted", Program::Claude, Some(Autopilot::Cruise)));
-    for (text, headless, refused, beside) in [
-        (
-            "[harness]\nenabled = false\n",
-            false,
-            Some("[harness] enabled = false"),
-            None,
-        ),
-        (
-            "[harness]\nheadless = false\n",
-            true,
-            Some("[harness] headless = false"),
-            None,
-        ),
-        (
-            "[harness.claude]\nenabled = false\n",
-            false,
-            Some("[harness.claude] enabled = false"),
-            codex,
-        ),
-        (
-            "[harness]\nautopilot = \"off\"\n",
-            false,
-            Some("[harness] autopilot = \"off\""),
-            opted,
-        ),
-        ("", false, None, None),
-        ("", true, None, None),
-        ("[harness]\nheadless = false\n", false, None, None),
-        ("[harness.codex]\nenabled = false\n", false, None, None),
-        ("[harness]\nautopilot = \"land\"\n", false, None, None),
+    let table = |agent: Program| format!("[harness.{}]\nenabled = false\n", agent.name());
+    let switch = |agent: Program| format!("[harness.{}] enabled = false", agent.name());
+    for agent in [
+        Program::Claude,
+        Program::Gemini,
+        Program::Agy,
+        Program::Muse,
     ] {
-        let case = format!("{text:?} headless={headless}");
-        let (cfg, notes) = SupervisorConfig::from_aterm_toml(text);
-        assert!(notes.is_empty(), "{case}: {notes:?}");
-        assert_eq!(worker_unsupervised(&cfg, headless), refused, "{case}");
-        let world = Arc::new(World::default());
-        let mut roster = vec![(WORKER, Program::Claude)];
-        if let Some((sid, program, word)) = beside {
-            roster.push((sid, program));
-            world.word(sid, word);
-        }
-        world.set(&roster);
-        let host = HostHandle::start(cfg, headless, false, hooks(&world, parking_body(&world)));
-        match (refused, beside) {
-            (None, _) => until(&format!("{case}: the worker carried"), || {
-                host.live() == [WORKER]
-            }),
-            (Some(_), Some((sid, ..))) => {
-                until(&format!("{case}: {sid} carried beside it"), || {
-                    host.live() == [sid]
-                });
-                world.passes();
-                assert_eq!(host.live(), [sid], "{case}: no worker for {WORKER}");
-                assert_eq!(world.runs.load(Ordering::SeqCst), 1, "{case}");
+        let other = if agent == Program::Claude {
+            Program::Gemini
+        } else {
+            Program::Claude
+        };
+        for (text, headless, refused, beside) in [
+            (
+                "[harness]\nenabled = false\n".to_string(),
+                false,
+                Some("[harness] enabled = false".to_string()),
+                None,
+            ),
+            (
+                "[harness]\nheadless = false\n".to_string(),
+                true,
+                Some("[harness] headless = false".to_string()),
+                None,
+            ),
+            (table(agent), false, Some(switch(agent)), codex),
+            (
+                "[harness]\nautopilot = \"off\"\n".to_string(),
+                false,
+                Some("[harness] autopilot = \"off\"".to_string()),
+                opted,
+            ),
+            (String::new(), false, None, None),
+            (String::new(), true, None, None),
+            (
+                "[harness]\nheadless = false\n".to_string(),
+                false,
+                None,
+                None,
+            ),
+            (table(Program::Codex), false, None, None),
+            (table(other), false, None, None),
+            (
+                "[harness]\nautopilot = \"land\"\n".to_string(),
+                false,
+                None,
+                None,
+            ),
+        ] {
+            let case = format!("{agent:?}: {text:?} headless={headless}");
+            let (cfg, notes) = SupervisorConfig::from_aterm_toml(&text);
+            assert!(notes.is_empty(), "{case}: {notes:?}");
+            assert_eq!(
+                worker_unsupervised(&cfg, headless, agent),
+                refused.as_deref(),
+                "{case}"
+            );
+            let world = Arc::new(World::default());
+            let mut roster = vec![(WORKER, agent)];
+            if let Some((sid, program, word)) = beside {
+                roster.push((sid, program));
+                world.word(sid, word);
             }
-            (Some(_), None) => {
-                assert!(!host.supervising(), "{case}: no host at all");
-                assert!(host.live().is_empty(), "{case}: {:?}", host.live());
-                assert_eq!(world.runs.load(Ordering::SeqCst), 0, "{case}");
+            world.set(&roster);
+            let host = HostHandle::start(cfg, headless, false, hooks(&world, parking_body(&world)));
+            match (refused, beside) {
+                (None, _) => until(&format!("{case}: the worker carried"), || {
+                    host.live() == [WORKER]
+                }),
+                (Some(_), Some((sid, ..))) => {
+                    until(&format!("{case}: {sid} carried beside it"), || {
+                        host.live() == [sid]
+                    });
+                    world.passes();
+                    assert_eq!(host.live(), [sid], "{case}: no worker for {WORKER}");
+                    assert_eq!(world.runs.load(Ordering::SeqCst), 1, "{case}");
+                }
+                (Some(_), None) => {
+                    assert!(!host.supervising(), "{case}: no host at all");
+                    assert!(host.live().is_empty(), "{case}: {:?}", host.live());
+                    assert_eq!(world.runs.load(Ordering::SeqCst), 0, "{case}");
+                }
             }
+            host.shutdown_and_join();
         }
-        host.shutdown_and_join();
     }
 }
 

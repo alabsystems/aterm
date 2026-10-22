@@ -1177,6 +1177,47 @@ fn pending_wrap_paid(
     k3 + ms(3)
 }
 
+/// A fold from a paid pending wrap that lands on the next row's start
+/// carries no cell: the anchored lane already paid the last column
+/// ([`CursorGlow::fold_origin_tail`]) and no head is laid, so nothing in
+/// flight is its echo ([`CursorGlow::unpaid_typed_echo`] pays one press per
+/// cell laid). With every stamp stale and no press in flight it is a keyless
+/// cross-row hop, declined `no-fresh-hint`, and lays nothing. CONTROL: a key
+/// 10 ms before the fold licenses it.
+#[test]
+fn a_keyless_fold_carrying_no_cell_from_a_paid_pending_wrap_is_declined() {
+    let g = wide_geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let ms = Duration::from_millis;
+    let mut out = Vec::new();
+    let t0 = Instant::now();
+    for key in [false, true] {
+        let mut glow = CursorGlow::default();
+        let paid = pending_wrap_paid(&mut glow, 11, t0, &c, g);
+        let fold = paid + ms(350);
+        if key {
+            glow.note_typed(fold - ms(10));
+        }
+        glow.tick(Some((12, 0)), fold, &c, g, &mut out);
+        let verdict = ring_rows(&glow)
+            .last()
+            .filter(|row| (row.2, row.3) == ((11, 99), (12, 0)))
+            .map(|row| (row.0, row.1));
+        assert_eq!(
+            (verdict, v2_cols(&glow, 12).is_empty()),
+            (
+                Some(if key {
+                    ("licensed", "key")
+                } else {
+                    (CursorGlow::DECLINE_NO_FRESH_HINT, "none")
+                }),
+                true
+            ),
+            "a key 10 ms before the fold {key}: (the fold's verdict and licence, row 12 dark)"
+        );
+    }
+}
+
 /// A fold after a paid pending-wrap glyph does not charge the last column
 /// twice. The row whose edge glyph the anchored lane paid is remembered
 /// (`wrap_paid_row`, consumed by the next observed caret move, carried across

@@ -73,7 +73,7 @@ struct Host {
 }
 
 fn host() -> Host {
-    let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+    let dir = crate::test_scratch::short_dir("the control socket");
     let path = dir.path().join("host.sock");
     std::fs::write(dir.path().join("host.sock.token"), "abcd\n").expect("the host's token");
     let listener = aterm_uds::CtlListener::bind(&path).expect("bind host");
@@ -193,7 +193,7 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
 
     // 3. No listener: the connect finds no hop, nothing is delivered, and the
     //    local dispatch reports it.
-    let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+    let dir = crate::test_scratch::short_dir("the control socket");
     let absent = dir.path().join("absent.sock");
     let (_client_app, client_relay) = CtlStream::pair().expect("pair");
     let (reported, error) = forward(
@@ -215,7 +215,7 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
 
     // 4. A host that never accepts: the connect probe goes unanswered,
     //    nothing is delivered, and the failure is reported.
-    let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+    let dir = crate::test_scratch::short_dir("the control socket");
     let wedged = dir.path().join("wedged.sock");
     std::fs::write(dir.path().join("wedged.sock.token"), "abcd\n").expect("token");
     let _listener = aterm_uds::CtlListener::bind(&wedged).expect("bind, never accept");
@@ -235,7 +235,7 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
 
     // 5. A host with no token beside its socket once the connection exists:
     //    no hop, the forward sends nothing, and the failure is reported.
-    let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+    let dir = crate::test_scratch::short_dir("the control socket");
     let tokenless = dir.path().join("aterm-77031.sock");
     let listener = aterm_uds::CtlListener::bind(&tokenless).expect("bind the host");
     let heard = std::thread::spawn(move || {

@@ -1716,7 +1716,7 @@ fn fabric_batch_does_not_wait_for_a_background_timeline_writer() {
 /// nowhere and an additive field cannot land on one arm only. Never
 /// classified is `observed=false`, distinct from `phase=unknown` ("looked
 /// and found no evidence"). The values a driver acts on come from their
-/// sources: the hold, the spawn identity, an adopted session's attribution
+/// sources: the hold, an adopted session's attribution
 /// and the `tab_status` switch.
 #[test]
 fn the_status_record_keeps_one_field_set_on_both_arms() {
@@ -1767,7 +1767,7 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
         format!(
             "schema sid subject subject_source observed phase since_ms outcome exit_code signal \
              detail confidence reasons attribution fs_consent conflict revision enabled hold \
-             hold_advisory fabric fabric_rtt_ms fabric_link_age_ms fleet identity hand hand_pid level story why \
+             hold_advisory fabric fabric_rtt_ms fabric_link_age_ms fleet hand hand_pid level story why \
              needs needs_n needs_told hold_by typed_by typed_ms path program agent agent_detail agent_rev \
              agent_since_ms agent_gen agent_fp \
              program_state last_act os_appearance theme_side reported_scheme scheme_from bg_dark \
@@ -1796,13 +1796,11 @@ fn the_status_record_keeps_one_field_set_on_both_arms_body() {
         }),
     );
     let pooled = &mut app.pool.sessions.get_mut(&0).expect("session 0").session;
-    pooled.identity = Some("worker".to_string());
     pooled.handoff_local_id = Some(11);
     app.config.tab_status = Some(false);
     let record = app.session_status_record(0).expect("live session");
     for field in [
         " hold=1 ",
-        " identity=worker ",
         " attribution=adopted fs_consent=unknown ",
         " enabled=false ",
     ] {

@@ -83,7 +83,7 @@ fn label(text: &str) -> bool {
     !text.trim().is_empty() && text.len() <= 200 && !text.chars().any(char::is_control)
 }
 
-fn program(ctx: &crate::SessionCtx) -> String {
+fn observed_program(ctx: &crate::SessionCtx) -> Option<String> {
     ctx.timeline
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -91,7 +91,61 @@ fn program(ctx: &crate::SessionCtx) -> String {
         .program
         .clone()
         .filter(|name| word(name))
-        .unwrap_or_else(|| "unknown".into())
+}
+
+fn program(ctx: &crate::SessionCtx) -> String {
+    program_by(
+        ctx,
+        || crate::quit_safety::foreground_pgrp(ctx.sink.master()),
+        crate::self_claim::Proven::alive,
+        crate::self_claim::runs_alab_build,
+    )
+}
+
+fn program_by(
+    ctx: &crate::SessionCtx,
+    mut foreground: impl FnMut() -> i32,
+    mut alive: impl FnMut(&crate::self_claim::Proven) -> bool,
+    mut image: impl FnMut(u32) -> bool,
+) -> String {
+    if let Some(name) = observed_program(ctx) {
+        return name;
+    }
+    let claim = {
+        let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+        meta.live_claim(crate::metrics::now_us())
+            .and_then(|claim| claim.proven.clone())
+            .map(|proof| (proof, meta.supervisor_revision))
+    };
+    let Some((proof, revision)) = claim else {
+        return observed_program(ctx).unwrap_or_else(|| "unknown".into());
+    };
+    // This fills only display metadata. Ownership still comes from the
+    // registration peer's kernel identity. Probe outside both leaf locks;
+    // the second look rejects an exit/exec/foreground change during the first.
+    let mut current = true;
+    for _ in 0..2 {
+        if !alive(&proof) || !image(proof.pid) || i64::from(foreground()) != i64::from(proof.pid) {
+            current = false;
+            break;
+        }
+    }
+    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let standing = meta.supervisor_revision == revision
+        && meta
+            .live_claim(crate::metrics::now_us())
+            .and_then(|claim| claim.proven.as_ref())
+            == Some(&proof);
+    // Follow the existing meta -> timeline lock order. A name resolved while
+    // the probes ran wins, including an observed shell or another agent.
+    observed_program(ctx).unwrap_or_else(|| {
+        if current && standing {
+            "codex"
+        } else {
+            "unknown"
+        }
+        .into()
+    })
 }
 
 /// Handle a session-resolved resource request after the control op gate.
@@ -585,6 +639,222 @@ mod tests {
                 reply
                     .split_whitespace()
                     .any(|part| part == format!("ai={expected}"))
+            );
+        }
+    }
+
+    fn claimed_session() -> crate::Session {
+        let session = crate::stub_session(0);
+        let mut meta = session.ctx.meta.lock().unwrap();
+        meta.supervisor = Some(crate::session_timeline::SupervisorClaim {
+            holder: "codex-alab@42".into(),
+            conn: Some(1),
+            expires_us: None,
+            proven: Some(crate::self_claim::Proven {
+                pid: 42,
+                start: "fixture birth".into(),
+            }),
+        });
+        meta.supervisor_revision = 1;
+        drop(meta);
+        session
+    }
+
+    #[test]
+    fn a_live_proven_foreground_claim_fills_an_unresolved_resource_program() {
+        let session = claimed_session();
+        let ctx = &session.ctx;
+        assert_eq!(
+            program_by(
+                ctx,
+                || {
+                    assert!(ctx.meta.try_lock().is_ok());
+                    assert!(ctx.timeline.try_lock().is_ok());
+                    42
+                },
+                |proof| {
+                    assert_eq!(proof.pid, 42);
+                    assert_eq!(proof.start, "fixture birth");
+                    assert!(ctx.meta.try_lock().is_ok());
+                    assert!(ctx.timeline.try_lock().is_ok());
+                    true
+                },
+                |pid| {
+                    assert_eq!(pid, 42);
+                    assert!(ctx.meta.try_lock().is_ok());
+                    assert!(ctx.timeline.try_lock().is_ok());
+                    true
+                },
+            ),
+            "codex"
+        );
+    }
+
+    #[test]
+    fn resource_program_needs_proof_and_a_current_process_image_and_foreground() {
+        for failure in [
+            "unproven",
+            "expired",
+            "dead",
+            "reused",
+            "image",
+            "background",
+            "unreadable",
+        ] {
+            let session = claimed_session();
+            let ctx = &session.ctx;
+            {
+                let mut meta = ctx.meta.lock().unwrap();
+                let claim = meta.supervisor.as_mut().unwrap();
+                match failure {
+                    "unproven" => claim.proven = None,
+                    "expired" => claim.expires_us = Some(0),
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                program_by(
+                    ctx,
+                    || match failure {
+                        "background" => 43,
+                        "unreadable" => -1,
+                        _ => 42,
+                    },
+                    |_| !matches!(failure, "dead" | "reused"),
+                    |_| failure != "image",
+                ),
+                "unknown",
+                "{failure}"
+            );
+        }
+        let session = crate::stub_session(0);
+        assert_eq!(
+            program_by(
+                &session.ctx,
+                || panic!("no proof"),
+                |_| panic!("no proof"),
+                |_| panic!("no proof")
+            ),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn resource_program_rejects_identity_image_or_foreground_lost_during_probes() {
+        for changed in ["birth", "image", "foreground"] {
+            let session = claimed_session();
+            let mut identities = 0;
+            let mut images = 0;
+            let mut foregrounds = 0;
+            assert_eq!(
+                program_by(
+                    &session.ctx,
+                    || {
+                        foregrounds += 1;
+                        if changed == "foreground" && foregrounds == 2 {
+                            43
+                        } else {
+                            42
+                        }
+                    },
+                    |_| {
+                        identities += 1;
+                        changed != "birth" || identities == 1
+                    },
+                    |_| {
+                        images += 1;
+                        changed != "image" || images == 1
+                    },
+                ),
+                "unknown",
+                "{changed}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_program_rechecks_claim_revision_proof_and_expiry_after_probes() {
+        for changed in ["renewed", "replaced", "released", "expired"] {
+            let session = claimed_session();
+            let ctx = &session.ctx;
+            assert_eq!(
+                program_by(
+                    ctx,
+                    || {
+                        let mut meta = ctx.meta.lock().unwrap();
+                        match changed {
+                            "renewed" => meta.supervisor_revision += 1,
+                            "replaced" => {
+                                meta.supervisor
+                                    .as_mut()
+                                    .unwrap()
+                                    .proven
+                                    .as_mut()
+                                    .unwrap()
+                                    .start = "another birth".into()
+                            }
+                            "released" => meta.supervisor = None,
+                            "expired" => meta.supervisor.as_mut().unwrap().expires_us = Some(0),
+                            _ => unreachable!(),
+                        }
+                        42
+                    },
+                    |_| true,
+                    |_| true,
+                ),
+                "unknown",
+                "{changed}"
+            );
+        }
+    }
+
+    #[test]
+    fn resource_program_preserves_observed_names_including_names_resolved_during_probes() {
+        for name in ["codex", "claude", "zsh"] {
+            let session = claimed_session();
+            let ctx = &session.ctx;
+            let observe = || {
+                let mut timeline = ctx.timeline.lock().unwrap();
+                timeline.note_foreground_group(42);
+                timeline.set_program(42, Some(name.into()));
+            };
+            assert_eq!(
+                program_by(
+                    ctx,
+                    || 42,
+                    |_| true,
+                    |_| {
+                        observe();
+                        true
+                    }
+                ),
+                name
+            );
+            assert_eq!(
+                program_by(
+                    ctx,
+                    || panic!("already observed"),
+                    |_| panic!("already observed"),
+                    |_| panic!("already observed")
+                ),
+                name
+            );
+            {
+                let mut timeline = ctx.timeline.lock().unwrap();
+                timeline.set_program(42, None);
+            }
+            assert_eq!(
+                program_by(
+                    ctx,
+                    || 42,
+                    |_| true,
+                    |_| {
+                        observe();
+                        false
+                    }
+                ),
+                name,
+                "a resolved name also wins when the proof's image is gone"
             );
         }
     }

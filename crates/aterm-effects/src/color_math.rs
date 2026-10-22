@@ -105,7 +105,11 @@ pub fn relative_luminance(rgb: u32) -> f32 {
 /// [`relative_luminance`].
 #[must_use]
 pub fn contrast_ratio(a: u32, b: u32) -> f32 {
-    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    let table = relative_luminance_table();
+    let (la, lb) = (
+        relative_luminance_with(table, a),
+        relative_luminance_with(table, b),
+    );
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
@@ -301,7 +305,8 @@ pub(crate) fn oklab(rgb: u32) -> [f32; 3] {
 /// The Euclidean OKLab distance between two `0x00RRGGBB` colours.
 pub(crate) fn oklab_distance(a: u32, b: u32) -> f32 {
     let (x, y) = (oklab(a), oklab(b));
-    ((x[0] - y[0]).powi(2) + (x[1] - y[1]).powi(2) + (x[2] - y[2]).powi(2)).sqrt()
+    let (dl, da, db) = (x[0] - y[0], x[1] - y[1], x[2] - y[2]);
+    (dl * dl + da * da + db * db).sqrt()
 }
 
 /// HSV (`h` degrees, `s`/`v` in `0..=1`) → `0x00RRGGBB`.

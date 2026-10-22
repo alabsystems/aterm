@@ -85,6 +85,10 @@ pub struct Run {
     /// Claude Code (`LAB_CLOCK=1`, [`crate::clock`]): its files sit at fixed
     /// places in the run directory ([`crate::clock::Layout`]).
     pub clock: String,
+    /// `1` when the lab's instance opens a window (`forever --window`,
+    /// [`crate::lab::windowed`]): every launch of it on this record is
+    /// windowed, in the same jail.
+    pub window: String,
 }
 
 impl Run {
@@ -141,6 +145,7 @@ impl Run {
             ("LAB_MARK", self.mark.clone()),
             ("INSTANCE_ENV", self.instance_env.clone()),
             ("CLOCK", self.clock.clone()),
+            ("WINDOW", self.window.clone()),
         ]
     }
 
@@ -195,6 +200,7 @@ impl Run {
                 "LAB_MARK" => r.mark = v,
                 "INSTANCE_ENV" => r.instance_env = v,
                 "CLOCK" => r.clock = v,
+                "WINDOW" => r.window = v,
                 _ => {}
             }
         }
@@ -390,6 +396,7 @@ mod tests {
             mark: "lab.jail.t1.0123456789abcdef".into(),
             instance_env: "TMPDIR=/tmp ATERM_DEBUG_PASTE_FILE=/s/runs/t1/paste.txt".into(),
             clock: "1".into(),
+            window: "1".into(),
         };
         assert_eq!(Run::parse(&r.render()), r);
         assert_eq!(r.fixture_prefix(), "codex-0.163.0");

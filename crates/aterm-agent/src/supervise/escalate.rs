@@ -944,7 +944,7 @@ mod tests {
 
     #[test]
     fn a_status_field_is_read_off_the_ok_line() {
-        let st = "OK schema=1 sid=- hold=0 fabric=absent identity=-\n";
+        let st = "OK schema=1 sid=- hold=0 fabric=absent\n";
         assert_eq!(status_field(st, "fabric"), Some("absent"));
         assert_eq!(status_field(st, "hold"), Some("0"));
         assert_eq!(status_field(st, "identity"), None);
@@ -970,6 +970,26 @@ mod tests {
             &turn(Phase::Prompt, f::bash_one_row()),
         );
         assert_eq!(kind, "bash");
+        // 2.1.307's breakers, all MEASURED: the `not ruled out — …` ones over
+        // a command with an rm and over ones with none (manual and bypass),
+        // and the mounted drive's (a `bash` box with a vendor note before
+        // MountedDrivePath). Controls: the same build's plain Bash box, and
+        // the nested shape inside the vendor's budget (a plain vendor note).
+        for (text, want) in [
+            (f::BOX_RM_TOO_MANY_2_1_307, "rm-breaker"),
+            (f::BOX_RM_TOO_MANY_NO_RM_2_1_307, "rm-breaker"),
+            (f::BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307, "rm-breaker"),
+            (f::BOX_RM_NESTED_2_1_307, "rm-breaker"),
+            (f::BOX_RM_MOUNTED_DRIVE_2_1_307, "rm-breaker"),
+            (f::BOX_BASH_TOUCH_2_1_307, "bash"),
+            (f::BOX_STATEMENT_FOLLOWS_16_2_1_307, "bash"),
+        ] {
+            let (kind, _) = kind_and_subject(
+                &aterm_phase::ClaudeReader,
+                &turn(Phase::Prompt, f::screen(text)),
+            );
+            assert_eq!(kind, want, "{}", text.lines().next().unwrap_or(""));
+        }
     }
 
     /// A `meta` reply's `attention_kinds=` names the `needs` owner's entry

@@ -137,6 +137,8 @@ pub struct ActRequest<'a> {
 /// A parsed `open app ...` request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenAppRequest<'a> {
+    /// Focus or create the System State native view.
+    SystemState,
     /// Focus or create the Settings view at `route`.
     Settings {
         /// Absolute Settings route; `/` is the default landing route.
@@ -280,17 +282,18 @@ pub fn parse_act(rest: &str) -> Result<ActRequest<'_>, ParseError> {
 }
 
 /// Parse the arguments following the `open` verb when its first token is `app`:
-/// `app settings [route]`, `app markdown <uri>`, or `app editor <uri>`. Parsing grants no file
+/// `app system-state`, `app settings [route]`, `app markdown <uri>`, or `app editor <uri>`. Parsing grants no file
 /// authority: the host must still canonicalize and authorize the URI.
 pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
     reject_line_break(rest, "open payload")?;
     let mut input = rest;
     if take_token(&mut input) != Some("app") {
         return Err(ParseError::Usage(
-            "open app <settings [route]|markdown <uri>|editor <uri>>",
+            "open app <system-state|settings [route]|markdown <uri>|editor <uri>>",
         ));
     }
     match take_token(&mut input) {
+        Some("system-state") if remainder(input).is_empty() => Ok(OpenAppRequest::SystemState),
         Some("settings") => {
             let route = remainder(input);
             let route = if route.is_empty() { "/" } else { route };
@@ -315,7 +318,7 @@ pub fn parse_open_app(rest: &str) -> Result<OpenAppRequest<'_>, ParseError> {
         }
         Some(_) => Err(ParseError::UnknownApp),
         None => Err(ParseError::Usage(
-            "open app <settings [route]|markdown <uri>|editor <uri>>",
+            "open app <system-state|settings [route]|markdown <uri>|editor <uri>>",
         )),
     }
 }
@@ -468,6 +471,12 @@ mod tests {
 
     #[test]
     fn open_request_is_parsed_but_not_canonicalized_or_authorized() {
+        assert_eq!(
+            parse_open_app("app system-state"),
+            Ok(OpenAppRequest::SystemState)
+        );
+        assert!(parse_open_app("app system-state /extra").is_err());
+        assert!(parse_open_app("app system-state\nact app/v1").is_err());
         assert_eq!(
             parse_open_app("app settings"),
             Ok(OpenAppRequest::Settings { route: "/" })

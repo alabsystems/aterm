@@ -219,6 +219,7 @@ pub mod upgrade_muse;
 pub mod upgrade_muse_live;
 pub mod upgrade_wake;
 pub mod usage;
+pub mod worker;
 
 /// The longest prefix of `s` that is at most `max` bytes and ends on a
 /// character boundary. A caller that wants an ellipsis appends its own.

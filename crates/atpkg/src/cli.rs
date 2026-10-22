@@ -283,7 +283,7 @@ const TABLE: &[Verb] = &[
     Verb {
         name: "link",
         tier: Tier::Plumbing,
-        usage: "aterm pkg link <program> <checkout> [rel-bin…]",
+        usage: "aterm pkg link <program> <checkout> [rel-bin…] [--if-checkout <current> --if-prefix <prefix>] [--wait-lock <secs>]",
         arity: Arity::Own,
         program_flags: Some(&[]),
         mutates_store: true,
@@ -627,28 +627,7 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         // otherwise refuse it (`cmd_seed`'s operand refusal, the flag gate below); read by
         // [`mutator_store_lock`].
         if let Some(bound) = take_wait_lock_flag(&mut args) {
-            // The spawner's pid is captured here, the last moment the parent is known to be
-            // the spawner: "my parent is gone" is a change of parent ([`parent_is_gone`]).
-            let _ = WAIT_LOCK.set(WaitLock {
-                bound,
-                spawner: spawner_pid(),
-            });
-            // Before any lock attempt: how many full passes had ended when this one was
-            // queued ([`pass_ended_while_we_waited`]).
-            if args.first().is_some_and(|verb| verb == "update")
-                && let Some(layout) = crate::store::resolve_configured()
-            {
-                let _ = QUEUED_AT_PASS_SEQ.set(crate::status::pass_seq(&layout));
-            }
-            // The orphan watch, armed for the whole process — not inside a progress pass,
-            // which the channel-apply lane never opens: a window that exits under this child
-            // (a self-update's successor, a quit-and-reopen) leaves its pipes unread, and the
-            // next print would kill the pass with EPIPE. The watch notices the parent change
-            // and re-points stdout/stderr at a log ([`crate::progress::watch_for_orphaning`]).
-            let log = crate::store::resolve_configured()
-                .map(|l| l.prefix.join(crate::progress::ORPHAN_LOG_NAME))
-                .unwrap_or_else(|| std::env::temp_dir().join(crate::progress::ORPHAN_LOG_NAME));
-            crate::progress::watch_for_orphaning(log);
+            configure_wait_lock(&args, bound);
         }
         if args.first().is_some_and(|verb| verb == "update") {
             PUBLISHED_INDEX_HINT.with(|hint| hint.set(take_published_index_hint_flag(&mut args)));
@@ -782,6 +761,17 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     // owner's Mac. It carries none; `aterm pkg machine apply`, typed, still applies. Nor a
     // pass the private window LED with its flag (ruling 410): this build may compile no
     // seam, and the window that spawned it knows ([`under_private_state_root`]).
+    let link_request = if verb == Some("link") {
+        match link_args(&args[1..]) {
+            Ok(request) => Some(request),
+            Err(why) => return usage_error("link", Some(&why)),
+        }
+    } else {
+        None
+    };
+    if let Some(bound) = link_request.as_ref().and_then(|request| request.wait_lock) {
+        configure_wait_lock(&args, bound);
+    }
     let machine_settings = verb.is_some_and(|v| {
         verb_applies_machine_settings(v)
             && !(v == "update"
@@ -792,13 +782,17 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
         && machine_table_changed();
     // Declared ahead of the store lock, so the lock is let go before the join.
     let mut machine_edit = machine_settings.then(MachineEdit::start);
-    let _store_lock = if verb.is_some_and(verb_mutates_store) {
-        match mutator_store_lock() {
+    let mut store_lock = if verb.is_some_and(verb_mutates_store) {
+        match mutator_store_lock(link_request.as_ref().and_then(|r| r.if_prefix)) {
             Ok(guard) => guard,
             Err(code) => {
                 // The package log hears a pass the store lock refused, too: a
                 // `claude update` behind a running pass, a window lane whose wait ran out.
-                if let Some(layout) = crate::store::resolve_configured() {
+                if !link_request
+                    .as_ref()
+                    .is_some_and(|r| r.if_checkout.is_some())
+                    && let Some(layout) = crate::store::resolve_configured()
+                {
                     PassRecord::refused(&layout, &args, exit_code_u8(code));
                 }
                 // A `[machine]` edit applies beside this refusal: say so on stderr (stdout
@@ -821,11 +815,22 @@ pub fn main_entry(mut argv: Vec<std::ffi::OsString>) -> ExitCode {
     } else {
         None
     };
+    // A conditional refusal must precede all pass writers, including the landing sweep,
+    // holder announcement and activation-notice directory. Lock-file coordination itself
+    // is the same vetted kernel namespace ordinary mutations use.
+    if let Some(request) = link_request.as_ref().filter(|r| r.if_checkout.is_some()) {
+        let Some(guard) = store_lock.as_mut() else {
+            eprintln!("atpkg: conditional link requires a configured package store");
+            return ExitCode::from(1);
+        };
+        return cmd_conditional_link(request, guard, &args);
+    }
+    if let Some(guard) = store_lock.as_mut() {
+        begin_store_mutation(guard);
+    }
     // The pass's store, resolved once under the lock: nothing from here to the dispatch
     // writes `aterm.toml`, HOME or the prefix, so each reader below gets the same answer.
-    let pass_layout = _store_lock
-        .as_ref()
-        .and_then(|_| crate::store::resolve_configured());
+    let pass_layout = store_lock.as_ref().map(crate::lock::StoreLock::layout);
     // Snapshot the LIVE agent twins under the store lock, before interrupted
     // activations are rolled forward. The final comparison below publishes a
     // wake only if this pass really moved a live-upgrade twin's executable
@@ -1511,6 +1516,26 @@ fn flip_policy() -> crate::quiet::FlipPolicy {
 struct WaitLock {
     bound: std::time::Duration,
     spawner: Option<u32>,
+}
+
+/// Arm the existing bounded store wait for either a provisioning pass or an explicit link.
+fn configure_wait_lock(args: &[String], bound: std::time::Duration) {
+    // Capture the spawner before the wait: orphaning is a change of parent.
+    let _ = WAIT_LOCK.set(WaitLock {
+        bound,
+        spawner: spawner_pid(),
+    });
+    if args.first().is_some_and(|verb| verb == "update")
+        && let Some(layout) = crate::store::resolve_configured()
+    {
+        let _ = QUEUED_AT_PASS_SEQ.set(crate::status::pass_seq(&layout));
+    }
+    // Keep the existing orphan handling: a departed spawner must not strand its waiter
+    // or leave a later write pointed at an unread pipe.
+    let log = crate::store::resolve_configured()
+        .map(|layout| layout.prefix.join(crate::progress::ORPHAN_LOG_NAME))
+        .unwrap_or_else(|| std::env::temp_dir().join(crate::progress::ORPHAN_LOG_NAME));
+    crate::progress::watch_for_orphaning(log);
 }
 
 /// The [`WaitLock`] this invocation carries, if any — set once by [`main_entry`], read
@@ -3431,10 +3456,18 @@ fn verb_mutates_store(verb: &str) -> bool {
 /// ([`a_person_typed_this`]), it waits up to [`TYPED_LOCK_WAIT`] — silent for
 /// [`crate::lock::WAIT_ANNOUNCE_GRACE`], then under a spinner — and a wait that runs out
 /// says so in one sentence and exits 75. Off a terminal, a typed verb refuses at once.
-fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
+fn mutator_store_lock(
+    expected_prefix: Option<&std::path::Path>,
+) -> Result<Option<crate::lock::StoreLock>, ExitCode> {
     let Some(layout) = crate::store::resolve_configured() else {
         return Ok(None);
     };
+    if let Some(expected) = expected_prefix
+        && let Err(why) = crate::linkmode::check_link_prefix(&layout, expected)
+    {
+        eprintln!("atpkg: {why}");
+        return Err(ExitCode::from(1));
+    }
     // Whether the wait announced itself: only then is it answered (`lock-acquired:`).
     let announced = std::cell::Cell::new(false);
     // The spinner a person on a terminal watches while the wait lasts, cleared when it
@@ -3493,19 +3526,6 @@ fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
                      running now"
                 ));
             }
-            // Every pass sweeps `landing/` and `optin/` ([`crate::landing::sweep`]): holding
-            // the lock this pass is the only one, and no pass of this client writes either,
-            // so what stands there is an older client's leftover.
-            crate::landing::sweep(&layout);
-            // Who holds it, for a Settings Check deciding whether to wait: a person is a
-            // terminal on stdin and no `--wait-lock` (a window started from a terminal hands
-            // its tty to children that do not null their stdin, so the flag decides).
-            let mut guard = guard;
-            use std::io::IsTerminal as _;
-            guard.announce_holder(
-                &layout,
-                wait_lock().is_none() && std::io::stdin().is_terminal(),
-            );
             Ok(Some(guard))
         }
         Err(e) => {
@@ -3553,6 +3573,17 @@ fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
             }))
         }
     }
+}
+
+/// Post-admission housekeeping shared by ordinary passes and an accepted conditional link.
+fn begin_store_mutation(guard: &mut crate::lock::StoreLock) {
+    let layout = guard.layout();
+    crate::landing::sweep(&layout);
+    use std::io::IsTerminal as _;
+    guard.announce_holder(
+        &layout,
+        wait_lock().is_none() && std::io::stdin().is_terminal(),
+    );
 }
 
 /// How long a verb a person typed waits for the store: long enough for a large background
@@ -3714,7 +3745,9 @@ fn cmd_which(tool: Option<&String>) -> ExitCode {
 /// * a managed shim otherwise ⇒
 ///   `<tool> → <prefix>/bin/<tool> → <store path> — managed <build> — pinned by index <N>`
 ///   (the index from the recorded row, else the durable floor) — or, for a vendor-direct
-///   program, `… — managed 2.1.280 — Anthropic latest` ([`vendor_state_of`]);
+///   program, `… — managed 2.1.280 — Anthropic latest` ([`vendor_state_of`]); an ALab
+///   build, store-installed or dev-linked, whose record names its upstream adds
+///   ` — based on upstream rust-v0.163.0+g<12 hex>` after its state ([`upstream_clause`]);
 /// * no shim but a system copy on `PATH` ⇒ `<tool> → <path> — system: <path> — not managed
 ///   by aterm`, with ` (managed copy retired <date>)` when the retirement marker (or the
 ///   recorded row) says so;
@@ -3788,9 +3821,10 @@ fn which_line_in(
     if let Some(target) = crate::which(layout, tool) {
         let Some((program, build)) = crate::ops::program_build_of_target(&target) else {
             return Ok(format!(
-                "{tool} → {} → {} — dev-linked (managed from that checkout, not the index)",
+                "{tool} → {} → {} — dev-linked (managed from that checkout, not the index){}",
                 shim.display(),
-                target.display()
+                target.display(),
+                upstream_clause(tool, &target)
             ));
         };
         // An agent program's reroute stub first on this PATH decides at exec time: the
@@ -3846,9 +3880,14 @@ fn which_line_in(
             }
             None => shim.display().to_string(),
         };
+        // …and, for an ALab build whose record names it, the upstream it is based on.
+        let based = upstream_clause(&program, &target);
         let mut line = match shim_env_fix(&shim, &program) {
-            Some(fix) => format!("{tool} → {runs} → {} — {state} — {fix}", target.display()),
-            None => format!("{tool} → {runs} → {} — {state}", target.display()),
+            Some(fix) => format!(
+                "{tool} → {runs} → {} — {state}{based} — {fix}",
+                target.display()
+            ),
+            None => format!("{tool} → {runs} → {} — {state}{based}", target.display()),
         };
         // …and, for a rostered agent program ([`crate::selfupdate`]), what the vendor's own
         // self-update verb does on this name (`` `claude update` here runs `aterm pkg update
@@ -4037,6 +4076,17 @@ fn which_line_in(
         return Err(line);
     }
     Err(not_runnable_line(layout, tool))
+}
+
+/// ` — based on upstream rust-v0.163.0+g0123456789ab` when `program` is one ALab builds and
+/// `exe` is the entrypoint of an ALab package whose record names its upstream
+/// ([`crate::alab::upstream_of_exe`]); empty otherwise, a package from before the field
+/// included. Read off the record, never by running `exe`.
+fn upstream_clause(program: &str, exe: &std::path::Path) -> String {
+    crate::alab::agent(program)
+        .and_then(|_| crate::alab::upstream_of_exe(exe))
+        .map(|upstream| format!(" — {}", upstream.words()))
+        .unwrap_or_default()
 }
 
 /// `which`'s answer for a name the cached `index` does not serve and no vendor program
@@ -15783,17 +15833,102 @@ fn cmd_verify(program: Option<&String>) -> ExitCode {
 /// checkout into `bin/` (through the sensitive-name deny-list), marking the program so
 /// `update`/`apply` hard-skip it until `atpkg unlink`. Default bin when none is given:
 /// `target/release/<program>`.
-fn cmd_link(rest: &[String]) -> ExitCode {
+struct LinkArgs<'a> {
+    program: &'a str,
+    checkout: &'a std::path::Path,
+    bins: Vec<std::path::PathBuf>,
+    if_checkout: Option<&'a std::path::Path>,
+    if_prefix: Option<&'a std::path::Path>,
+    wait_lock: Option<std::time::Duration>,
+}
+
+fn link_args(rest: &[String]) -> Result<LinkArgs<'_>, String> {
     let (Some(program), Some(checkout)) = (rest.first(), rest.get(1)) else {
-        return usage_error("link", None);
+        return Err("a program and checkout are required".into());
+    };
+    if program.starts_with('-') || checkout.starts_with('-') {
+        return Err("a program and checkout must precede link options".into());
+    }
+    let mut request = LinkArgs {
+        program,
+        checkout: std::path::Path::new(checkout),
+        bins: Vec::new(),
+        if_checkout: None,
+        if_prefix: None,
+        wait_lock: None,
+    };
+    let mut args = rest[2..].iter();
+    while let Some(arg) = args.next() {
+        if arg == "--wait-lock" {
+            if request.wait_lock.is_some() {
+                return Err(format!("duplicate link option {arg}"));
+            }
+            let secs = args
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| format!("{arg} requires a number of seconds"))?;
+            request.wait_lock = Some(std::time::Duration::from_secs(secs));
+            continue;
+        }
+        let slot = match arg.as_str() {
+            "--if-checkout" => Some(&mut request.if_checkout),
+            "--if-prefix" => Some(&mut request.if_prefix),
+            _ if arg.starts_with('-') => return Err(format!("unknown link option {arg:?}")),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            if slot.is_some() {
+                return Err(format!("duplicate link option {arg}"));
+            }
+            let value = args
+                .next()
+                .filter(|value| !value.starts_with('-') && !value.is_empty())
+                .ok_or_else(|| format!("{arg} requires a path"))?;
+            *slot = Some(std::path::Path::new(value));
+        } else {
+            request.bins.push(std::path::PathBuf::from(arg));
+        }
+    }
+    if request.if_checkout.is_some() != request.if_prefix.is_some() {
+        return Err("--if-checkout and --if-prefix must be supplied together".into());
+    }
+    Ok(request)
+}
+
+fn cmd_link(rest: &[String]) -> ExitCode {
+    let request = match link_args(rest) {
+        Ok(request) => request,
+        Err(why) => return usage_error("link", Some(&why)),
     };
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
-    let checkout_path = std::path::Path::new(checkout);
-    let bins: Vec<std::path::PathBuf> = if rest.len() > 2 {
-        rest[2..].iter().map(std::path::PathBuf::from).collect()
-    } else if let Some(sysroot) = sysroot_link_bins(&layout, program, checkout_path) {
+    // Conditional requests are admitted by main_entry before any pass writer starts.
+    if request.if_checkout.is_some() {
+        eprintln!("atpkg: conditional link requires its store-lock admission");
+        return ExitCode::from(1);
+    }
+    let bins = match requested_link_bins(&layout, &request) {
+        Ok(bins) => bins,
+        Err(code) => return code,
+    };
+    finish_link(
+        &layout,
+        request.program,
+        crate::link(&layout, request.program, request.checkout, &bins),
+    )
+}
+
+fn requested_link_bins(
+    layout: &crate::store::Layout,
+    request: &LinkArgs<'_>,
+) -> Result<Vec<std::path::PathBuf>, ExitCode> {
+    let program = request.program;
+    let checkout_path = request.checkout;
+    let checkout = checkout_path.display();
+    let bins = if !request.bins.is_empty() {
+        request.bins.clone()
+    } else if let Some(sysroot) = sysroot_link_bins(layout, program, checkout_path) {
         // A toolchain, not a cargo project: shim every exposed name out of `<root>/bin`
         // (`sysroot_link_bins`). An explicit rel-bin list still wins.
         match sysroot {
@@ -15811,7 +15946,7 @@ fn cmd_link(rest: &[String]) -> ExitCode {
                     missing.len(),
                     missing.join(", ")
                 );
-                return ExitCode::from(1);
+                return Err(ExitCode::from(1));
             }
         }
     } else {
@@ -15822,7 +15957,60 @@ fn cmd_link(rest: &[String]) -> ExitCode {
         // ALab-built program answers with its entrypoint instead ([`link_bins_for`]).
         link_bins_for(program, checkout_path)
     };
-    match crate::link(&layout, program, checkout_path, &bins) {
+    Ok(bins)
+}
+
+fn cmd_conditional_link(
+    request: &LinkArgs<'_>,
+    guard: &mut crate::lock::StoreLock,
+    args: &[String],
+) -> ExitCode {
+    let Some(configured) = layout() else {
+        return ExitCode::from(1);
+    };
+    let bins = match requested_link_bins(&configured, request) {
+        Ok(bins) => bins,
+        Err(code) => return code,
+    };
+    let (Some(expected), Some(expected_prefix)) = (request.if_checkout, request.if_prefix) else {
+        return usage_error("link", Some("both conditional guards are required"));
+    };
+    let mut admitted = match crate::linkmode::link_if_checkout(
+        guard,
+        &configured,
+        request.program,
+        request.checkout,
+        &bins,
+        expected,
+        expected_prefix,
+    ) {
+        Ok(admitted) => admitted,
+        Err(error) => return finish_link(&configured, request.program, Err(error)),
+    };
+    let layout = admitted.guard().layout();
+    begin_store_mutation(admitted.guard());
+    #[cfg(target_os = "macos")]
+    let before = {
+        let before = crate::activation_notice::agent_targets(&layout);
+        crate::activation_notice::prepare(&layout);
+        before
+    };
+    let _status_record = crate::status::hold(&layout);
+    let record = PassRecord::begin(layout.clone(), args);
+    let _meter = typed_pass_meter("link", &layout);
+    let code = finish_link(&layout, request.program, admitted.apply());
+    #[cfg(target_os = "macos")]
+    crate::activation_notice::note_if_changed(&layout, &before);
+    record.end(exit_code_u8(code));
+    code
+}
+
+fn finish_link(
+    layout: &crate::store::Layout,
+    program: &str,
+    result: Result<crate::linkmode::LinkOutcome, crate::linkmode::LinkError>,
+) -> ExitCode {
+    match result {
         Ok(out) => {
             println!(
                 "atpkg: dev-linked {program} ({}); `aterm pkg unlink {program}` to release it",
@@ -15834,7 +16022,7 @@ fn cmd_link(rest: &[String]) -> ExitCode {
             // The seam follows the link from this moment, not from the next pass: otherwise
             // `targo` on PATH and `cargo +trust` are two compilers under one name.
             if program == crate::seam::SEAM_PROGRAM {
-                reassert_rustup_seam(&layout);
+                reassert_rustup_seam(layout);
             }
             ExitCode::SUCCESS
         }

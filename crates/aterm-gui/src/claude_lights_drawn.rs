@@ -18,15 +18,17 @@
 //! a tab behind has no drawn cells, or for one frame stale ones, and says
 //! `drawn=- why=not-drawn`, never older cells. `spoken=` is what the drawn
 //! chip's accessibility node says (`App::claude_chips_a11y`'s label), `-`
-//! where no chip is drawn. `window=` tells apart the lines of a session
-//! co-viewed in two windows.
+//! where no chip is drawn, and `description=` its description (the W4 title
+//! slice: why Land holds, a harness's need, the pause, the newest act;
+//! `App::autopilot_spoken`), `-` where it has none or no chip is drawn.
+//! `window=` tells apart the lines of a session co-viewed in two windows.
 //!
 //! Composed only when `chrome` asks: the frame path gains nothing (no field,
 //! no copy, no count), and the block is read where the frame left it.
 
 use aterm_core::terminal::RenderCell;
 
-use super::{Chip, ChipFace, ChipGlass, SessionLights, WindowLights};
+use super::{Chip, ChipFace, SessionLights, WindowLights};
 use crate::App;
 use crate::autopilot::AutopilotView;
 
@@ -90,16 +92,17 @@ fn cells_text(cells: &[RenderCell]) -> String {
 
 /// One `autopilot` line of `chrome` (§12.5.3): `autopilot sid=<sid>
 /// window=<id> program=<name> face=<word|-> drawn="<cells>"|drawn=-
-/// why=<word> spoken="<label>"|spoken=-`. `window=` is the window's logical
-/// id, as `ls` prints it. The quoted values are quoted as the `statusmenu`
-/// lines' are.
+/// why=<word> spoken="<label>"|spoken=- description="<words>"|description=-`.
+/// `window=` is the window's logical id, as `ls` prints it. The quoted
+/// values are quoted as the `statusmenu` lines' are. `spoken` is the drawn
+/// chip's node's label and its description, `None` where no chip is drawn.
 pub(crate) fn drawn_chip_line(
     sid: &str,
     window: u64,
     program: aterm_phase::Program,
     face: Option<ChipFace>,
     drawn: &Drawn,
-    spoken: Option<&str>,
+    spoken: Option<(&str, Option<&str>)>,
 ) -> String {
     let face = face.map_or("-", face_word);
     let mut line = format!(
@@ -117,8 +120,14 @@ pub(crate) fn drawn_chip_line(
         }
     }
     match spoken {
-        Some(spoken) => line.push_str(&format!(" spoken={spoken:?}")),
-        None => line.push_str(" spoken=-"),
+        Some((spoken, description)) => {
+            line.push_str(&format!(" spoken={spoken:?}"));
+            match description {
+                Some(description) => line.push_str(&format!(" description={description:?}")),
+                None => line.push_str(" description=-"),
+            }
+        }
+        None => line.push_str(" spoken=- description=-"),
     }
     line
 }
@@ -189,15 +198,11 @@ impl App {
     /// session whose agent the host supervises or watches
     /// ([`App::session_agent`]) — in every window, its tabs in order and each
     /// tab's panes in their layout's order. Composed only for a `chrome`
-    /// call: one wall read at most, and only where a face's clock or a pause
-    /// is told, for the spoken label's day.
+    /// call: for each drawn chip what its accessibility node says
+    /// ([`App::autopilot_spoken`]: a wall read only where a face's clock, a
+    /// pause or a hold is told, for its day).
     pub(crate) fn drawn_chip_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
-        let mut today = None;
-        let mut day = |glass: &ChipGlass| {
-            (glass.task_at.is_some() || glass.pause.is_some())
-                .then(|| *today.get_or_insert_with(|| crate::harness_glass::wall_today().1))
-        };
         for (&wid, ws) in &self.windows {
             // Only the front tab is painted, and only the leaves of its plan:
             // a pane of a tab behind, or one a zoom hides, is in none of them.
@@ -262,7 +267,7 @@ impl App {
                             .get(&session)
                             .and_then(|s| s.autopilot)
                             .unwrap_or(AutopilotView::Unhosted);
-                        ChipFace::of(noted, &glass).spoken(&glass, day(&glass))
+                        self.autopilot_spoken(session, noted, &glass)
                     });
                     lines.push(drawn_chip_line(
                         sid,
@@ -270,7 +275,9 @@ impl App {
                         program,
                         Some(face),
                         &drawn,
-                        spoken.as_deref(),
+                        spoken
+                            .as_ref()
+                            .map(|(label, description)| (label.as_str(), description.as_deref())),
                     ));
                 }
             }

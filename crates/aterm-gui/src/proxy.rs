@@ -74,10 +74,71 @@ fn entry_path(sock_dir: &Path, sid: &SessionId) -> Option<std::path::PathBuf> {
     Sid::parse(sid.as_str()).map(|sid| graph_path(sock_dir, sid))
 }
 
-/// This instance's own bound control socket `(sock_dir, sock_path)`, recorded by
-/// the control server at bind time. `None` until (or unless) a socket is bound.
-/// An `RwLock<Option<..>>` (not a `OnceLock`) so tests can set and clear it.
-static SELF_SOCK: RwLock<Option<(std::path::PathBuf, String)>> = RwLock::new(None);
+/// This instance's discovery state: its own bound control socket, the thread
+/// that writes its graph entries, and (under test) where its mirror goes. One
+/// per process ([`PROCESS_DISCOVERY`]); a test may hold one of its own
+/// ([`self_sock_test_guard`]).
+struct Discovery {
+    /// This instance's own bound control socket `(sock_dir, sock_path)`, recorded
+    /// by the control server at bind time. `None` until (or unless) a socket is
+    /// bound. An `RwLock<Option<..>>` (not a `OnceLock`): a quit takes it back
+    /// ([`retire_own_sessions`]).
+    self_sock: RwLock<Option<(PathBuf, String)>>,
+    /// The `aterm-publish` thread ([`publisher`]).
+    publisher: std::sync::OnceLock<Option<Publisher>>,
+    /// Test-only override for the mirror target dir ([`set_mirror_dir_override`]).
+    #[cfg(test)]
+    mirror_dir_override: RwLock<Option<PathBuf>>,
+}
+
+impl Discovery {
+    const fn new() -> Self {
+        Self {
+            self_sock: RwLock::new(None),
+            publisher: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            mirror_dir_override: RwLock::new(None),
+        }
+    }
+}
+
+/// THE process's discovery state.
+static PROCESS_DISCOVERY: Discovery = Discovery::new();
+
+/// The discovery state this thread's calls answer to: [`PROCESS_DISCOVERY`], in
+/// every build. A test thread may hold one of its own ([`self_sock_test_guard`])
+/// and lend it to a thread it spawns ([`OwnDiscovery::lend`]); a publication
+/// thread answers to the state that started it. So a test that binds or
+/// publishes is seen by no other test: another test's sessions publish nothing
+/// into its dir, and another test's Commit (`flush_publications`) never waits
+/// behind its queue — the production rule, one state per process, unbent.
+fn discovery() -> &'static Discovery {
+    #[cfg(test)]
+    if let Some(own) = OWN_DISCOVERY.get() {
+        return own;
+    }
+    &PROCESS_DISCOVERY
+}
+
+#[cfg(test)]
+thread_local! {
+    /// TESTS ONLY: the state [`discovery`] answers on this thread, when not the
+    /// process's.
+    static OWN_DISCOVERY: std::cell::Cell<Option<&'static Discovery>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// TESTS ONLY: a test sets discovery state only on a state of its own
+/// ([`self_sock_test_guard`], lent to the thread that binds): the process's is
+/// every other test's, whose Commit would wait behind this one's writes.
+#[cfg(test)]
+fn assert_own_discovery(what: &str) {
+    assert!(
+        OWN_DISCOVERY.get().is_some(),
+        "a test {what} on the process's discovery state: hold `self_sock_test_guard()` \
+         and lend it to the thread that does (`OwnDiscovery::lend`)"
+    );
+}
 
 /// Record this instance's bound control socket so session registration can
 /// publish per-session graph entries ([`publish_session`]) and the sibling
@@ -102,7 +163,12 @@ pub(crate) fn set_self_sock(sock_dir: &Path, sock_path: &str) {
                 _ => sock_path.to_string(),
             }
         });
-    *SELF_SOCK.write().unwrap_or_else(|p| p.into_inner()) = Some((sock_dir.to_path_buf(), canon));
+    #[cfg(test)]
+    assert_own_discovery("binds");
+    *discovery()
+        .self_sock
+        .write()
+        .unwrap_or_else(|p| p.into_inner()) = Some((sock_dir.to_path_buf(), canon));
     // Sessions publish from here on: their writes' thread starts now, on the
     // binder's thread, not in a tab's landing turn.
     let _ = publisher();
@@ -111,27 +177,93 @@ pub(crate) fn set_self_sock(sock_dir: &Path, sock_path: &str) {
 /// This instance's own bound socket path, or `None` when no socket is bound.
 #[must_use]
 pub(crate) fn self_sock_path() -> Option<String> {
-    SELF_SOCK
+    discovery()
+        .self_sock
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
         .map(|(_, p)| p.clone())
 }
 
-/// Test-only: clear the recorded self socket so tests that set it cannot leak
-/// state into other tests in the same process.
+/// Test-only: clear the recorded self socket (this thread's state's,
+/// [`discovery`]): no session registered after it publishes.
 #[cfg(test)]
 pub(crate) fn clear_self_sock() {
-    *SELF_SOCK.write().unwrap_or_else(|p| p.into_inner()) = None;
+    *discovery()
+        .self_sock
+        .write()
+        .unwrap_or_else(|p| p.into_inner()) = None;
 }
 
-/// Test-only: serializes every test that touches the process-global
-/// [`SELF_SOCK`]. Acquire it first, hold it for the test's whole self-sock
-/// window, and `clear_self_sock` before dropping it.
+/// TESTS ONLY: give this thread discovery state of its own until the guard
+/// drops — its own self socket, publication queue and thread, and mirror
+/// override ([`discovery`]) — so no other test sees what this one binds,
+/// publishes or holds, and this one sees none of theirs. A thread the test
+/// spawns that binds or publishes takes it along ([`OwnDiscovery::lend`]).
+/// Such tests also run one at a time. The state is leaked (a few words per
+/// test); its publication thread, if one started, ends after what was queued.
 #[cfg(test)]
-pub(crate) fn self_sock_test_guard() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn self_sock_test_guard() -> OwnDiscovery {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    let serial = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let own: &'static Discovery = Box::leak(Box::new(Discovery::new()));
+    OwnDiscovery {
+        own,
+        previous: OWN_DISCOVERY.replace(Some(own)),
+        _serial: serial,
+    }
+}
+
+/// TESTS ONLY: the guard [`self_sock_test_guard`] returns.
+#[cfg(test)]
+pub(crate) struct OwnDiscovery {
+    own: &'static Discovery,
+    previous: Option<&'static Discovery>,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(test, unix))]
+impl OwnDiscovery {
+    /// This test's discovery state, for a thread it spawns
+    /// ([`LentDiscovery::enter`] there).
+    pub(crate) fn lend(&self) -> LentDiscovery {
+        LentDiscovery(self.own)
+    }
+}
+
+#[cfg(test)]
+impl Drop for OwnDiscovery {
+    fn drop(&mut self) {
+        OWN_DISCOVERY.set(self.previous);
+        if let Some(Some(p)) = self.own.publisher.get() {
+            let _ = p.tx.send(Publication::Stop);
+        }
+    }
+}
+
+/// TESTS ONLY: a test's discovery state ([`OwnDiscovery::lend`]), sent to a
+/// thread it spawns. Only the unix conformance suites lend one.
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy)]
+pub(crate) struct LentDiscovery(&'static Discovery);
+
+#[cfg(all(test, unix))]
+impl LentDiscovery {
+    /// This thread answers to the lender's state until the guard drops.
+    pub(crate) fn enter(self) -> EnteredDiscovery {
+        EnteredDiscovery(OWN_DISCOVERY.replace(Some(self.0)))
+    }
+}
+
+/// TESTS ONLY: the guard [`LentDiscovery::enter`] returns.
+#[cfg(all(test, unix))]
+pub(crate) struct EnteredDiscovery(Option<&'static Discovery>);
+
+#[cfg(all(test, unix))]
+impl Drop for EnteredDiscovery {
+    fn drop(&mut self) {
+        OWN_DISCOVERY.set(self.0);
+    }
 }
 
 /// Publish the discovery graph entry for a session this instance hosts, so a
@@ -151,7 +283,10 @@ pub(crate) fn self_sock_test_guard() -> std::sync::MutexGuard<'static, ()> {
 /// (a test's reset) finds it queued, and a [`flush_publications`] after that
 /// waits for it.
 pub(crate) fn publish_session(sid: &SessionId, nonce: &LaunchNonce) {
-    let guard = SELF_SOCK.read().unwrap_or_else(|p| p.into_inner());
+    let guard = discovery()
+        .self_sock
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
     let Some((dir, sock)) = guard.as_ref() else {
         return;
     };
@@ -189,6 +324,10 @@ enum Publication {
     /// Answered once every write queued before it has been processed (a rendezvous
     /// channel holds the thread until the answer is taken: a test's).
     Flush(std::sync::mpsc::SyncSender<()>),
+    /// TESTS ONLY: a test's publication thread ends here, behind every write
+    /// queued before it ([`OwnDiscovery`]'s drop).
+    #[cfg(test)]
+    Stop,
 }
 
 impl Publication {
@@ -222,6 +361,8 @@ impl Publication {
             Self::Flush(done) => {
                 let _ = done.send(());
             }
+            #[cfg(test)]
+            Self::Stop => {}
         }
     }
 }
@@ -233,13 +374,14 @@ struct Publisher {
     pending: std::sync::atomic::AtomicUsize,
 }
 
-static PUBLISHER: std::sync::OnceLock<Option<Publisher>> = std::sync::OnceLock::new();
-
-/// The publication thread, started with the bind ([`set_self_sock`], on the
-/// control thread), so no tab's landing pays for the thread. `None` when it
-/// could not start: then each write runs where it is asked, as before.
+/// The publication thread of this thread's discovery state ([`discovery`]),
+/// started with the bind ([`set_self_sock`], on the control thread), so no
+/// tab's landing pays for the thread. `None` when it could not start: then each
+/// write runs where it is asked, as before.
 fn publisher() -> Option<&'static Publisher> {
-    PUBLISHER
+    let state = discovery();
+    state
+        .publisher
         .get_or_init(|| {
             let (tx, rx) = std::sync::mpsc::channel::<Publication>();
             let spawned = crate::qos::spawn_lane_thread(
@@ -248,9 +390,16 @@ fn publisher() -> Option<&'static Publisher> {
                 // (`aterm ctl`'s self-location), so it lands promptly.
                 crate::qos::Role::Responsive,
                 move || {
+                    // Its writes read the state that started it (a test's own).
+                    #[cfg(test)]
+                    OWN_DISCOVERY.set(Some(state));
                     for publication in rx {
+                        #[cfg(test)]
+                        if matches!(publication, Publication::Stop) {
+                            break;
+                        }
                         publication.write();
-                        if let Some(Some(p)) = PUBLISHER.get() {
+                        if let Some(Some(p)) = state.publisher.get() {
                             p.pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                         }
                     }
@@ -290,7 +439,7 @@ fn queue_publication(publication: Publication) {
 /// even if the wait expires and process exit leaves cleanup to the stale sweep.
 /// Free when nothing is queued. `false` when the operations were still behind.
 pub(crate) fn flush_publications(within: std::time::Duration) -> bool {
-    let Some(Some(p)) = PUBLISHER.get() else {
+    let Some(Some(p)) = discovery().publisher.get() else {
         return true;
     };
     if p.pending.load(std::sync::atomic::Ordering::Acquire) == 0 {
@@ -311,7 +460,10 @@ pub(crate) fn retire_own_sessions(
     sessions: impl IntoIterator<Item = SessionId>,
 ) {
     let recorded_sock = {
-        let mut guard = SELF_SOCK.write().unwrap_or_else(|p| p.into_inner());
+        let mut guard = discovery()
+            .self_sock
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         guard.take().map(|(_, recorded)| recorded)
     };
     for sid in sessions {
@@ -348,7 +500,10 @@ fn published_sock_spelling(sock: &str) -> String {
 /// `ERR no such session`, never a wrong target. Queued behind the session's
 /// publish ([`publish_session`]).
 pub(crate) fn unpublish_session(sid: &SessionId) {
-    let guard = SELF_SOCK.read().unwrap_or_else(|p| p.into_inner());
+    let guard = discovery()
+        .self_sock
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
     let Some((dir, _)) = guard.as_ref() else {
         return;
     };
@@ -418,20 +573,17 @@ pub(crate) fn write_graph_entry(
     }
 }
 
-/// Test-only override for the mirror target dir. Production leaves it `None`
-/// and the mirror lands in `aterm_uds::control_socket_dir()`; a test points it
-/// at a scratch dir so it never touches the user's real control dir.
-/// Serialized with the self-sock state via [`self_sock_test_guard`], so a
-/// concurrent [`rendezvous_mirror_dir`] reader never sees a transient override.
-#[cfg(test)]
-static MIRROR_DIR_OVERRIDE: RwLock<Option<PathBuf>> = RwLock::new(None);
-
 /// Test-only: redirect the rendezvous mirror target to `dir` (or clear it with
-/// `None`). The caller must hold [`self_sock_test_guard`] and clear it before
-/// dropping the guard.
+/// `None`). Production leaves it `None` and the mirror lands in
+/// `aterm_uds::control_socket_dir()`; a test points it at a scratch dir so it
+/// never touches the user's real control dir. It is the test's own discovery
+/// state's ([`self_sock_test_guard`]), so no other test's [`rendezvous_mirror_dir`]
+/// reads it.
 #[cfg(test)]
 pub(crate) fn set_mirror_dir_override(dir: Option<PathBuf>) {
-    *MIRROR_DIR_OVERRIDE
+    assert_own_discovery("redirects the mirror");
+    *discovery()
+        .mirror_dir_override
         .write()
         .unwrap_or_else(|p| p.into_inner()) = dir;
 }
@@ -448,7 +600,7 @@ fn rendezvous_mirror_dir(sock_dir: &Path) -> Option<PathBuf> {
     {
         // Receiver named on the acquisition line: the lock-order census
         // resolves identities from the `.read()` line's receiver.
-        let over_guard = MIRROR_DIR_OVERRIDE.read();
+        let over_guard = discovery().mirror_dir_override.read();
         if let Some(over) = over_guard.unwrap_or_else(|p| p.into_inner()).clone() {
             return if same_dir(sock_dir, &over) {
                 None
@@ -1468,17 +1620,6 @@ mod tests {
             .unwrap_or_else(|e| panic!("{}: no hop: {e:?}", sock.display()))
     }
 
-    /// A private scratch dir short enough for a socket path: under `/tmp` where
-    /// the platform temporary root outruns `sun_path` (macOS), under the
-    /// temporary root on Windows, which has no `/tmp`.
-    fn sock_scratch() -> aterm_tempfile::TempDir {
-        #[cfg(unix)]
-        let dir = aterm_tempfile::TempDir::new_in("/tmp");
-        #[cfg(not(unix))]
-        let dir = aterm_tempfile::tempdir();
-        dir.expect("scratch")
-    }
-
     /// The published spelling of a Windows socket path drops the verbatim
     /// prefix and nothing else, so the bind-time entry and every later
     /// session entry spell one socket the same way.
@@ -1546,8 +1687,8 @@ mod tests {
     /// The mirror targets the default rendezvous dir only for an instance whose
     /// own socket dir is not the default; a default instance already lives
     /// there and writes once. Reads the environment-derived default dir without
-    /// mutating the environment, holding [`self_sock_test_guard`] so a
-    /// concurrent publish test's `MIRROR_DIR_OVERRIDE` cannot shadow it.
+    /// mutating the environment, on a discovery state of its own
+    /// ([`self_sock_test_guard`]) with no mirror override.
     #[test]
     fn mirror_dir_only_for_out_of_default_instances() {
         let _guard = self_sock_test_guard();
@@ -1593,7 +1734,7 @@ mod tests {
     /// id's entry is written where the reader finds it.
     #[test]
     fn an_id_that_is_no_sid_is_never_joined_into_a_path() {
-        let dir = aterm_tempfile::TempDir::new_in("/tmp").expect("scratch");
+        let dir = crate::test_scratch::short_dir("the graph dir");
         let nonce = LaunchNonce::generate();
         let minted = SessionId::generate();
         write_graph_entry(dir.path(), &minted, "/x/aterm-1.sock", &nonce);
@@ -1621,7 +1762,7 @@ mod tests {
     /// `relay_hop_pipes_handshake_and_response` is the negative control.
     #[test]
     fn a_child_that_accepts_nothing_fails_the_forward_fast() {
-        let dir = sock_scratch();
+        let dir = crate::test_scratch::short_dir("a hop's socket");
         let sock = dir.path().join("wedged.sock");
         let _listener = aterm_uds::CtlListener::bind(&sock).expect("bind, never accept");
         let (_client_app, client_relay) = CtlStream::pair().expect("pair");
@@ -1656,7 +1797,7 @@ mod tests {
     /// the forward before the verb is sent.
     #[test]
     fn a_child_that_refuses_the_probe_never_receives_the_verb() {
-        let dir = sock_scratch();
+        let dir = crate::test_scratch::short_dir("a hop's socket");
         let sock = dir.path().join("refuse.sock");
         let listener = aterm_uds::CtlListener::bind(&sock).expect("bind");
         let child = std::thread::spawn(move || {
@@ -1694,7 +1835,7 @@ mod tests {
     #[test]
     fn a_probe_surplus_is_refused_before_delivery() {
         for surplus in [true, false] {
-            let dir = sock_scratch();
+            let dir = crate::test_scratch::short_dir("a hop's socket");
             let sock = dir.path().join("surplus.sock");
             let listener = aterm_uds::CtlListener::bind(&sock).expect("bind");
             let host = std::thread::spawn(move || {
@@ -1751,7 +1892,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_busy_line_left_behind_answers_a_probe_whose_write_failed() {
-        let dir = sock_scratch();
+        let dir = crate::test_scratch::short_dir("a hop's socket");
         let sock = dir.path().join("busy.sock");
         let listener = aterm_uds::CtlListener::bind(&sock).expect("bind");
         let look = CtlStream::connect(&sock).expect("connect");
@@ -1783,7 +1924,7 @@ mod tests {
             ServesOn,
         }
         for case in [Host::Gone, Host::Reopened, Host::ServesOn] {
-            let dir = sock_scratch();
+            let dir = crate::test_scratch::short_dir("a hop's socket");
             let sock = dir.path().join("host.sock");
             let sock_s = sock.to_string_lossy().into_owned();
             let listener = aterm_uds::CtlListener::bind(&sock).expect("bind host");
@@ -1874,10 +2015,8 @@ mod tests {
     /// in for the hosting aterm.
     #[test]
     fn relay_hop_pipes_handshake_and_response() {
-        let dir = std::env::temp_dir().join(format!("aterm-relay-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let sock = dir.join("child.sock");
-        let _ = std::fs::remove_file(&sock);
+        let dir_guard = crate::test_scratch::short_dir("the child's socket");
+        let sock = dir_guard.path().join("child.sock");
         let listener = aterm_uds::CtlListener::bind(&sock).expect("bind child");
 
         // The fake child: answer the TOKEN handshake's connect probe, read the
@@ -1940,7 +2079,6 @@ mod tests {
         hang_up(client_app);
         join_after_hang_up(relay, "the relay to end on its client's hang-up");
         join_after_hang_up(child, "the stand-in child to finish serving");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2487,11 +2625,13 @@ mod tests {
     /// turn: held behind a write the thread cannot finish, a publish has not
     /// landed when `publish_session` returns, and lands once the thread moves.
     /// The queue keeps order: a session closed while its publish waits is
-    /// retired after it, so no entry is left behind.
+    /// retired after it, so no entry is left behind. The queue is this test's
+    /// own (`self_sock_test_guard`): another test, on the process's state,
+    /// publishes nothing into it and its Commit never waits behind it.
     #[test]
     fn a_session_publication_is_queued_off_the_caller_and_kept_in_order() {
-        /// The process-global discovery state, cleared on every exit path: the
-        /// queue drained while the scratch mirror still stands.
+        /// This test's discovery state, cleared on every exit path: the queue
+        /// drained while the scratch mirror still stands.
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -2521,6 +2661,28 @@ mod tests {
             read_graph_entry(&dir, sid_of(&kept)).is_none(),
             "publish_session wrote in the caller's turn"
         );
+        // ANOTHER TEST'S APP, on a thread of its own (the process's state),
+        // sees none of this while the queue is held: a session it registers
+        // publishes nowhere, and its Commit's flush is free — never "discovery
+        // publications did not settle" over a write it never queued.
+        let stranger = SessionId::generate();
+        let elsewhere = {
+            let stranger = stranger.clone();
+            std::thread::spawn(move || {
+                publish_session(&stranger, &LaunchNonce::generate());
+                (
+                    self_sock_path(),
+                    flush_publications(std::time::Duration::ZERO),
+                )
+            })
+            .join()
+            .expect("another test's thread")
+        };
+        assert_eq!(
+            elsewhere,
+            (None, true),
+            "another test read this one's socket or waited behind its queue"
+        );
         release
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("the publication thread reached the held write");
@@ -2540,6 +2702,10 @@ mod tests {
             read_graph_entry(&dir, sid_of(&closed)).is_none()
                 && read_graph_entry(&mirror, sid_of(&closed)).is_none(),
             "a session retired behind its publish leaves no entry"
+        );
+        assert!(
+            read_graph_entry(&dir, sid_of(&stranger)).is_none(),
+            "another test's session was published into this one's dir"
         );
     }
 
@@ -2569,7 +2735,7 @@ mod tests {
     /// ids, whose entries must survive. Negative control: its own entry goes.
     #[test]
     fn a_quit_retires_only_its_own_graph_entries() {
-        let dir = sock_scratch();
+        let dir = crate::test_scratch::short_dir("a hop's socket");
         let ours = dir.path().join("aterm-cand.sock");
         let theirs = dir.path().join("aterm-parent.sock");
         let (mine, parents) = (SessionId::generate(), SessionId::generate());

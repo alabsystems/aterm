@@ -1226,7 +1226,9 @@ impl CursorRainbow {
                 .sum::<f32>()
                 + aterm_render::hdr::HDR_GLOW_BOOST * aurora
         };
-        let target = pile_light(quads, &|i| premul_rgb(RIM_LIGHT_GREY, rings[i].1));
+        let grey_rings: [u32; HALO_LAYERS as usize] =
+            std::array::from_fn(|i| rings.get(i).map_or(0, |r| premul_rgb(RIM_LIGHT_GREY, r.1)));
+        let target = pile_light(quads, &|i| grey_rings[i]);
         let have = pile_light(quads, &|i| rings[i].3);
         if target <= 0.0 || (have - target).abs() <= target * Self::RIM_LIGHT_SLACK {
             self.rim_scratch = scratch;
@@ -1465,6 +1467,9 @@ pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
     let light = |c: u32| crate::color_math::relative_luminance_with(table, c) * 255.0;
     if light(rgb) >= floor {
         return rgb;
+    }
+    if floor >= 255.0 {
+        return 0x00FF_FFFF;
     }
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     for _ in 0..20 {
@@ -2288,6 +2293,161 @@ mod tests {
         assert!(
             s > 0.7,
             "the light caret stays saturated, got {on_light:06x}"
+        );
+    }
+
+    /// THE BLOCK OUTSHINES ITS OWN RIM (§8 d) on a dark page: at full paint,
+    /// steady and at a flare's peak, wherever the family's sweep parks the
+    /// caret, on every shipped cursor colour, the opaque block's light leads
+    /// every pixel its rings, arms and dots put on a fully spent sparkle
+    /// field ([`RAINBOW_FIELD_LEVEL`]) by the margin the caret's floor
+    /// promises over that field (`RAINBOW_CARET_LIGHT_FLOOR · (1 -
+    /// RAINBOW_SPARKLE_LIGHT_SHARE)` less two levels of byte rounding, the
+    /// brightest-pixel law's margin), painted by the renderer's own glow
+    /// path ([`aterm_render::fx::paint_quads`]). CONTROL: some of
+    /// those rims are brighter than the caret's plain light floor
+    /// ([`RAINBOW_CARET_LIGHT_FLOOR`]), so the floor alone would not keep
+    /// the block on top. A cell so large its rim's box is past
+    /// [`CursorRainbow::CARET_RASTER_MAX`] (160 × 320 px, steady: a flare's
+    /// white arm there reaches white itself) keeps the law by failing bright.
+    #[test]
+    fn the_block_outshines_its_own_rim_on_a_spent_field() {
+        const POSITIONS: u32 = 24;
+        let (row, col) = (2u16, 17u16);
+        let light = |rgb: u32| crate::color_math::relative_luminance(rgb) * 255.0;
+        let level = RAINBOW_FIELD_LEVEL.round() as u32;
+        let field_grey = (level << 16) | (level << 8) | level;
+        let giant = Geom {
+            cw: 160,
+            ch: 320,
+            win_w: 40 * 160,
+            win_h: 6 * 320,
+            ..geom()
+        };
+        let polar = vec![("<none: theme-polar>".to_string(), None)];
+        let cases = [
+            (geom(), shipped_caret_bases(), POSITIONS, &[false, true][..]),
+            (giant, polar, 4, &[false][..]),
+        ];
+        // A margin, not a tie: the lead the caret's floor promises over the
+        // sparkle field, less a level for each composite's byte rounding
+        // (`the_brightest_pixel_in_the_frame_is_under_the_cursor`'s margin).
+        let promised = RAINBOW_CARET_LIGHT_FLOOR * (1.0 - RAINBOW_SPARKLE_LIGHT_SHARE) - 2.0;
+        let mut checked = 0usize;
+        let mut past_the_floor = 0usize;
+        let mut past_the_raster = 0usize;
+        for (g, bases, positions, flares) in cases {
+            let cell = (
+                usize::from(col) * g.cw,
+                usize::from(row) * g.ch,
+                usize::from(col + 1) * g.cw,
+                usize::from(row + 1) * g.ch,
+            );
+            for (name, base) in bases {
+                for step in 0..=positions {
+                    let field = step as f32 / positions as f32;
+                    for &flare in flares {
+                        let c = RainbowConfig {
+                            base,
+                            paint: Some(1.0),
+                            blinking: flare,
+                            ..cfg()
+                        };
+                        let mut caret = CursorRainbow::default();
+                        let mut out = Vec::new();
+                        let now = Instant::now();
+                        let mut tick = |blink: bool, at: Instant, out: &mut Vec<GlowQuad>| {
+                            out.clear();
+                            caret
+                                .tick_with_family_phase(
+                                    Some((row, col)),
+                                    at,
+                                    1.0,
+                                    0.0,
+                                    field,
+                                    blink,
+                                    true,
+                                    g,
+                                    &c,
+                                    out,
+                                )
+                                .fill
+                                .expect("an enabled block fills")
+                        };
+                        let fill = if flare {
+                            // Steady, a charged flip that arms the flare, then
+                            // its peak.
+                            tick(false, now, &mut out);
+                            tick(true, now, &mut out);
+                            tick(true, now + Duration::from_millis(70), &mut out)
+                        } else {
+                            tick(false, now, &mut out)
+                        };
+                        // The rim's box, painted over the spent field.
+                        let x0 = out.iter().map(|q| usize::from(q.x)).min().unwrap_or(0);
+                        let y0 = out.iter().map(|q| usize::from(q.y)).min().unwrap_or(0);
+                        let x1 = out
+                            .iter()
+                            .map(|q| usize::from(q.x + q.w))
+                            .max()
+                            .unwrap_or(0);
+                        let y1 = out
+                            .iter()
+                            .map(|q| usize::from(q.y + q.h))
+                            .max()
+                            .unwrap_or(0);
+                        assert!(x1 > x0 && y1 > y0, "{name}: no rim at full paint");
+                        let (w, h) = (x1 - x0, y1 - y0);
+                        let moved: Vec<GlowQuad> = out
+                            .iter()
+                            .map(|q| GlowQuad {
+                                x: q.x - x0 as u16,
+                                y: q.y - y0 as u16,
+                                ..*q
+                            })
+                            .collect();
+                        let mut px = vec![field_grey; w * h];
+                        aterm_render::fx::paint_quads(&mut px, w, h, &moved, (0, 0));
+                        let mut peak = (0.0f32, 0usize, 0usize, 0u32);
+                        for (i, &p) in px.iter().enumerate() {
+                            let (x, y) = (x0 + i % w, y0 + i / w);
+                            let in_cell =
+                                (cell.0..cell.2).contains(&x) && (cell.1..cell.3).contains(&y);
+                            if !in_cell && light(p) > peak.0 {
+                                peak = (light(p), x, y, p);
+                            }
+                        }
+                        // The lift binds at the promise exactly (a lead of
+                        // 6.00 on this sweep), so the comparison allows the
+                        // two sums' f32 rounding and nothing more.
+                        let lead = light(fill) - peak.0;
+                        assert!(
+                            lead + 1e-3 >= promised,
+                            "{name} at a {}x{} cell, sweep {step}/{positions}, flare {flare}: \
+                             the block #{fill:06X} (luminance {:.1}) leads its rim's #{:06X} \
+                             (luminance {:.1}) at ({}, {}) by {lead:.1}, under the {promised:.0} \
+                             the caret's floor promises",
+                            g.cw,
+                            g.ch,
+                            light(fill),
+                            peak.3,
+                            peak.0,
+                            peak.1,
+                            peak.2
+                        );
+                        past_the_floor += usize::from(peak.0 > RAINBOW_CARET_LIGHT_FLOOR);
+                        past_the_raster += usize::from(w * h > CursorRainbow::CARET_RASTER_MAX);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 12 * 2 * (POSITIONS as usize + 1) + 5
+                && past_the_floor > 0
+                && past_the_raster == 5,
+            "CONTROL: {past_the_floor} of {checked} rims past the plain floor, \
+             {past_the_raster} past the raster"
         );
     }
 

@@ -47,7 +47,7 @@ fn at_1402(day: i64) -> Option<Stamp> {
 
 /// The hold §12.3.1 reads: a land act's yield, read, held by a need, two
 /// unpushed commits and two open words, three nudges since the act.
-fn held() -> LandHeld {
+pub(crate) fn held() -> LandHeld {
     LandHeld {
         since_ms: Some(SINCE_S * 1000),
         nudges: 3,
@@ -66,7 +66,7 @@ fn held() -> LandHeld {
 
 /// The same hold before any yield was read: Land's instruction typed,
 /// nothing judged since.
-fn unread() -> LandHeld {
+pub(crate) fn unread() -> LandHeld {
     LandHeld {
         read: false,
         legs: 0,
@@ -77,7 +77,7 @@ fn unread() -> LandHeld {
 }
 
 /// `held`'s glass, its `since` at 14:02 on `day`.
-fn glass(held: LandHeld, day: i64) -> HeldGlass {
+pub(crate) fn glass(held: LandHeld, day: i64) -> HeldGlass {
     HeldGlass {
         held,
         since: at_1402(day),
@@ -86,7 +86,7 @@ fn glass(held: LandHeld, day: i64) -> HeldGlass {
 
 /// The need a hold's first leg names, as the needs store holds it: a
 /// worker's words with the separators a title cuts at.
-fn ask() -> crate::needs::HarnessAsk {
+pub(crate) fn ask() -> crate::needs::HarnessAsk {
     crate::needs::HarnessAsk {
         first: "sign 0.48.0 \u{b7} the release credential \u{2014} on this Mac".to_string(),
         more: 1,
@@ -1004,7 +1004,8 @@ fn a_gone_sessions_hold_goes_with_its_glass() {
 }
 
 /// A LAND HOLD DOES NOT GROW THE WAKE (§12.3.3 item 3): its fact carries
-/// nothing, so `HarnessFact` stays main's 24 bytes and `Wake` main's size.
+/// nothing, so `HarnessFact` stays main's 24 bytes and `Wake` does not grow
+/// beyond the recorded main size. Unrelated field removals may shrink it.
 /// NEGATIVE CONTROL (as run): a fact carrying the hold inline
 /// (`LandHeld(Option<LandHeld>)`) grows `HarnessFact` to 40 bytes.
 #[test]
@@ -1016,5 +1017,5 @@ fn a_land_hold_does_not_grow_the_wake() {
     fn copy<T: Copy>() {}
     copy::<crate::HarnessFact>();
     assert_eq!(std::mem::size_of::<crate::HarnessFact>(), MAIN_FACT_BYTES);
-    assert_eq!(std::mem::size_of::<crate::Wake>(), MAIN_WAKE_BYTES);
+    assert!(std::mem::size_of::<crate::Wake>() <= MAIN_WAKE_BYTES);
 }

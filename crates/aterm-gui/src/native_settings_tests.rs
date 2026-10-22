@@ -10700,6 +10700,58 @@ fn packages_page_semantics(
     out
 }
 
+/// An ALab build's row says the upstream it is based on among its facts, in `which`'s
+/// words, whole at every width; a row whose record names none (an older package, any
+/// other program) says nothing of it.
+#[test]
+fn an_alab_codex_row_says_the_upstream_it_is_based_on() {
+    const BUILD: u64 = 2_026_101_601;
+    let words = "based on upstream rust-v0.163.0+g0123456789ab";
+    let status = atpkg_status(
+        "2026-10-21T00:00:00Z",
+        "up to date (index build 75)",
+        vec![
+            ("codex", Some(BUILD), atpkg::state::managed(BUILD, 75)),
+            ("ay", Some(1971), atpkg::state::managed(1971, 75)),
+        ],
+    );
+    let projection = |upstream: Option<&str>| {
+        let mut report = packages_report(&status, true);
+        for row in &mut report.programs {
+            if row.name == "codex" {
+                row.upstream = upstream.map(str::to_string);
+            }
+        }
+        packages_service(report)
+            .state(true, true, true)
+            .projection()
+    };
+    let text = |lines: &[ProgramLine], name: &str| {
+        let key = format!("packages/programs/{name}");
+        lines
+            .iter()
+            .filter(|l| l.key == key || l.key.starts_with(&format!("{key}/")))
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let based = projection(Some(words));
+    let older = projection(None);
+    for width in [
+        SettingsWidth::Compact,
+        SettingsWidth::Medium,
+        SettingsWidth::Wide,
+    ] {
+        let lines = packages_program_lines(&based, width);
+        let codex = text(&lines, "codex");
+        assert!(codex.contains(words), "{width:?}: {codex}");
+        let ay = text(&lines, "ay");
+        assert!(!ay.contains("based on upstream"), "{width:?}: {ay}");
+        let codex = text(&packages_program_lines(&older, width), "codex");
+        assert!(!codex.contains("based on upstream"), "{width:?}: {codex}");
+    }
+}
+
 /// The program list says each row's facts: version and source, when it was updated,
 /// the latest known, relative, never raw UTC. A state those words say is not
 /// repeated; a refusal keeps its own words under its row, a hold its canonical words,

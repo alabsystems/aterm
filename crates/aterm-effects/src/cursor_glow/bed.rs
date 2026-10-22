@@ -63,6 +63,7 @@ const DARK_BED_LUMA_MAX: f32 = 0.150;
 /// The bed's luminance budget for the theme's ink `ink`: the most relative
 /// luminance a bed may composite at and leave `ink` [`DARK_BED_BAR`] over
 /// it, clamped as [`DARK_BED_LUMA_MIN`] says.
+#[inline]
 #[must_use]
 pub(crate) fn dark_bed_budget(ink: u32) -> f32 {
     let bar =
@@ -191,6 +192,7 @@ impl BedShape {
     /// streak is a vein over its flames; water's wake is its own under-ink
     /// body; the rainbow kitty's ribbon is its own bed). `beam_pw` is the
     /// beam's power envelope, which thins its tube.
+    #[inline]
     pub(super) fn of(style: GlowStyle, beam_pw: f32) -> Option<Self> {
         let shape = |reach, thin, sat, full| {
             Some(Self {
@@ -245,6 +247,7 @@ impl BedShape {
     /// `cov` in a cell `ch` tall, its spine [`DARK_BED_DY`] below the
     /// middle, times `k` (the wedge's and the tail's taper): the reach never
     /// crosses the row's edges.
+    #[inline]
     fn at(self, cov: u8, ch: f32, k: f32) -> (f32, f32) {
         let share = (f32::from(cov) / self.full).clamp(0.0, 1.0) * k.clamp(0.0, 1.0);
         let reach = ch * self.reach * (1.0 - self.thin * (1.0 - share));
@@ -293,6 +296,7 @@ const LEAP_SPREAD: f32 = 1.4;
 /// olive), so a rolling hue rolls smoothly: green → azure, cyan → blue,
 /// blue → violet, magenta → violet-magenta, red → magenta, orange →
 /// magenta-pink, yellow back toward violet.
+#[inline]
 #[must_use]
 pub(crate) fn night_hue(h: f32) -> f32 {
     let u = (h - 90.0).rem_euclid(360.0);
@@ -306,6 +310,7 @@ pub(crate) fn night_hue(h: f32) -> f32 {
 }
 
 /// `rgb` on the night arc ([`night_hue`]), its saturation and value kept.
+#[inline]
 #[must_use]
 pub(crate) fn night_rgb(rgb: u32) -> u32 {
     let (h, s, v) = crate::color_math::rgb2hsv(rgb & 0x00FF_FFFF);
@@ -315,6 +320,7 @@ pub(crate) fn night_rgb(rgb: u32) -> u32 {
 /// `budget` (a relative luminance, [`dark_bed_budget`]) dimmed to `dim` of
 /// its rise over the page `page`, so a dimmed bed is still solved against
 /// what lies under it.
+#[inline]
 #[must_use]
 pub(crate) fn dim_budget(budget: f32, page: u32, dim: f32) -> f32 {
     let floor = crate::color_math::relative_luminance(page & 0x00FF_FFFF);
@@ -789,9 +795,6 @@ pub(crate) fn split_air_runs(
             pos: a.pos,
         }
     };
-    for r in air.iter_mut() {
-        r.clear();
-    }
     let mut n = 0usize;
     for (ri, run) in runs.iter().enumerate() {
         let head = caret && ri + 1 == runs.len();
@@ -810,6 +813,7 @@ pub(crate) fn split_air_runs(
                 air.push(Vec::new());
             }
             let out = &mut air[n];
+            out.clear();
             if start > 0 {
                 out.push(knee(&run[start - 1], &run[start]));
             }

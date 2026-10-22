@@ -8,7 +8,12 @@
 //! The child is this same binary, so libtest dispatches it by the test's full
 //! path, `<module>::<test>`: the caller passes its `module_path!()` and the
 //! test's name, and the child runs that test alone with `env` set, which is
-//! how the test knows to run its fatal body instead of re-spawning.
+//! how the test knows to run its fatal body instead of re-spawning
+//! ([`is_child`]).
+//!
+//! A child's abort ends it with exit status [`ABORTED`], never a death by
+//! `SIGABRT`: the abort is the subject, and dying of the signal would have
+//! macOS write a crash report for every run of the suite.
 
 #![allow(
     clippy::disallowed_types,
@@ -16,6 +21,35 @@
 )]
 
 use std::process::{Command, Output};
+
+/// What an aborted child exits with: `128 + SIGABRT`, as a shell reports one.
+pub const ABORTED: i32 = 128 + SIGABRT;
+
+const SIGABRT: i32 = 6;
+
+unsafe extern "C" {
+    fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+    fn _exit(status: i32) -> !;
+}
+
+/// Whether this process is the child [`rerun`] started with `var` set; if so,
+/// an `abort(3)` from here on ends it with [`ABORTED`]. Only `SIGABRT` reaches
+/// the handler, and `_exit` runs nothing else of the process, so the parent
+/// reads exactly what the abort left: the stderr written before it.
+pub fn is_child(var: &str) -> bool {
+    if std::env::var_os(var).is_none() {
+        return false;
+    }
+    // SAFETY: `signal` takes an integer and a handler that is async-signal-safe
+    // (it calls `_exit` alone).
+    unsafe { signal(SIGABRT, exit_aborted) };
+    true
+}
+
+extern "C" fn exit_aborted(_: i32) {
+    // SAFETY: `_exit` is async-signal-safe and does not return.
+    unsafe { _exit(ABORTED) }
+}
 
 /// Run `test`, a test of the module whose `module_path!()` is `module`, alone
 /// in a child (`--exact --nocapture`) with `env` set, and wait for it.

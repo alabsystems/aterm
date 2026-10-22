@@ -40,6 +40,7 @@ pub struct Genome {
 pub const MAGIC_SALT: u64 = 0x5EED_CA71_5EED_CA71;
 
 /// splitmix64 finalizer — decorrelates adjacent seeds and never returns 0.
+#[inline]
 pub fn mix(seed: u64) -> u64 {
     let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -88,6 +89,7 @@ pub enum SimhashKernel {
 
 /// §3.2 context fingerprint — the live entry point. Dispatches on
 /// [`SIMHASH_KERNEL`]; the reference kernel is the default (§7.5 gating rule).
+#[inline]
 pub fn simhash_ctx(
     chars: &[char],
     start: usize,
@@ -152,6 +154,7 @@ pub fn simhash_ctx_reference(
 }
 
 /// Accumulate one voter's 64 bit votes at weight `w`.
+#[inline]
 fn cast_vote(votes: &mut [i32; 64], h: u64, w: i32) {
     for (i, v) in votes.iter_mut().enumerate() {
         if (h >> i) & 1 == 1 {
@@ -165,6 +168,7 @@ fn cast_vote(votes: &mut [i32; 64], h: u64, w: i32) {
 /// Fold one candidate token, apply the filter (votes only if alphabetic with
 /// ≥ 2 folded chars, so digits, punctuation, clocks and spinners are silent),
 /// then cast `h_t = mix(fnv(folded chars))` at weight `w`.
+#[inline]
 fn vote_token(
     tok_chars: &[char],
     w: i32,
@@ -179,6 +183,7 @@ fn vote_token(
 
 /// The fold, filter and FNV/mix shared by both kernels: `Some(h_t)` when the
 /// token votes, `None` when silent. One implementation, so the kernels agree.
+#[inline]
 fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) -> Option<u64> {
     tok.clear();
     tok.extend(tok_chars.iter().copied());
@@ -187,7 +192,7 @@ fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) ->
     let mut len = 0usize;
     let mut h = aterm_hash::FNV64_OFFSET;
     for c in folded.chars() {
-        if !c.is_alphabetic() {
+        if !c.is_ascii_alphabetic() && (c.is_ascii() || !c.is_alphabetic()) {
             return None;
         }
         len += 1;
@@ -203,6 +208,7 @@ fn token_vote_hash(tok_chars: &[char], tok: &mut String, folded: &mut String) ->
 /// maximal token run using the scanner's predicate and interior-joiner rule
 /// (`cat's` / `cat-like` are one token, as in aterm-lexicon's `token_end`).
 /// Returns `[s, e)` or `None` past end-of-row.
+#[inline]
 fn token_right(chars: &[char], mut pos: usize) -> Option<(usize, usize)> {
     let n = chars.len();
     while pos < n && !is_token_char(chars[pos]) {
@@ -227,6 +233,7 @@ fn token_right(chars: &[char], mut pos: usize) -> Option<(usize, usize)> {
 }
 
 /// Next token to the left of char index `pos` (mirror of [`token_right`]).
+#[inline]
 fn token_left(chars: &[char], mut pos: usize) -> Option<(usize, usize)> {
     while pos > 0 && !is_token_char(chars[pos - 1]) {
         pos -= 1;
@@ -400,6 +407,7 @@ fn collect_ctx_voters(
 
 /// Context fingerprint, bit-sliced kernel: the reference's walk and filter,
 /// majority by [`simhash_majority_bitsliced`]. Selected by [`SIMHASH_KERNEL`].
+#[inline]
 pub fn simhash_ctx_bitsliced(
     chars: &[char],
     start: usize,
@@ -416,6 +424,7 @@ pub fn simhash_ctx_bitsliced(
 // ───────────────────────────── §3.3 Gray decode ──────────────────────────────
 
 /// §3.3 inverse-Gray decode, verbatim: `b_i = ⊕_{j ≥ i} g_j`.
+#[inline]
 pub const fn gray_decode(mut g: u64) -> u64 {
     g ^= g >> 1;
     g ^= g >> 2;
@@ -428,6 +437,7 @@ pub const fn gray_decode(mut g: u64) -> u64 {
 
 /// §3.3 field extractor, verbatim: the `n`-bit field of `gkey` at bit `lo`,
 /// inverse-Gray decoded. No flip ever crosses a field boundary.
+#[inline]
 pub fn field(gkey: u64, lo: u32, n: u32) -> u64 {
     gray_decode((gkey >> lo) & ((1u64 << n) - 1))
 }
@@ -451,6 +461,7 @@ pub enum CatAge {
 
 impl CatAge {
     /// §3.4 body scale: 0.82 / 0.93 / 1.04 / 1.15.
+    #[inline]
     pub fn scale(self) -> f32 {
         match self {
             CatAge::Kitten => 0.82,
@@ -495,6 +506,7 @@ pub struct NovaFeatures {
 }
 
 /// §3.4 NOVA layout decode.
+#[inline]
 pub fn nova_features(g: u64) -> NovaFeatures {
     NovaFeatures {
         palette: field(g, 0, 3) as u8,
@@ -515,16 +527,19 @@ pub fn nova_features(g: u64) -> NovaFeatures {
 /// radius `radius`, instead of the full [`nova_features`] decode. The
 /// expressions match the rows above and are pinned bit-for-bit by
 /// `nova_single_field_accessors_match_full_decode`.
+#[inline]
 pub fn nova_duration_ms(g: u64) -> u32 {
     1000 + field(g, 9, 2) as u32 * 400 / 3
 }
 
 /// See [`nova_duration_ms`]: the `palette` row of [`nova_features`], alone.
+#[inline]
 pub fn nova_palette(g: u64) -> u8 {
     field(g, 0, 3) as u8
 }
 
 /// See [`nova_duration_ms`]: the `radius` row of [`nova_features`], alone.
+#[inline]
 pub fn nova_radius(g: u64) -> f32 {
     1.6 + field(g, 5, 2) as f32 * 0.2
 }
@@ -533,6 +548,7 @@ pub fn nova_radius(g: u64) -> f32 {
 /// nova window (bits 19..26); every other ink-bearing class, `emphasis`
 /// included, reads the cat window (bits 26..33). Each 4-bit code maps to a hue
 /// rotation in `-18°..=+18°`.
+#[inline]
 pub fn ink_pair_nudges(class: Class, gkey: u64) -> (u8, u8) {
     let lo = if class == Class::Profanity { 19 } else { 26 };
     (field(gkey, lo, 4) as u8, field(gkey, lo + 4, 4) as u8)
@@ -566,6 +582,7 @@ pub enum NovaMagic {
 
 /// §3.5 cat window. Cats consume the LOW window; a genome is never two magics
 /// at once because novas read the shifted window and the classes are disjoint.
+#[inline]
 pub fn cat_magic(magic: u64) -> Option<CatMagic> {
     match magic % 4096 {
         0..=7 => Some(CatMagic::Fortune),
@@ -579,6 +596,7 @@ pub fn cat_magic(magic: u64) -> Option<CatMagic> {
 }
 
 /// §3.5 nova window (shifted 12 bits so it is independent of the cat window).
+#[inline]
 pub fn nova_magic(magic: u64) -> Option<NovaMagic> {
     match (magic >> 12) % 4096 {
         0..=7 => Some(NovaMagic::Quasar),
@@ -659,6 +677,7 @@ fn cat_variant_index_v4(gkey: u64) -> usize {
 }
 
 /// v4 §3: resolve the bounded unbiased head index to its authored glyph.
+#[inline]
 #[must_use]
 pub fn cat_variant_v4(gkey: u64) -> CatGlyphId {
     HEADS[cat_variant_index_v4(gkey)]
@@ -667,6 +686,7 @@ pub fn cat_variant_v4(gkey: u64) -> CatGlyphId {
 /// The `(coat, iris)` ramp indices: `coat = field(6,4)` (0..=15, a `COAT_RAMP`
 /// stop) and `iris = field(10,3)` (0..=7, an `EYE_RAMP` stop). The baker
 /// resolves them via `ResolvedFills::from_indices`.
+#[inline]
 #[must_use]
 pub fn cat_fills_v4(gkey: u64) -> (u8, u8) {
     (field(gkey, 6, 4) as u8, field(gkey, 10, 3) as u8)
@@ -674,6 +694,7 @@ pub fn cat_fills_v4(gkey: u64) -> (u8, u8) {
 
 /// v4 §3: the age band — `AGES[field(13,2)]`, whose `scale()` drives the body
 /// size (0.82 / 0.93 / 1.04 / 1.15). Unchanged role from v2/v3.
+#[inline]
 #[must_use]
 pub fn cat_age_v4(gkey: u64) -> CatAge {
     AGES[field(gkey, 13, 2) as usize]
@@ -686,6 +707,7 @@ pub fn cat_age_v4(gkey: u64) -> CatAge {
 ///
 /// Windows over `magic % 4096`: Maneki `0..=7` (1/512), then the seven at
 /// 4/4096 (1/1024) each in `8..=35`.
+#[inline]
 #[must_use]
 pub fn special_variant_v4(magic: u64) -> Option<CatGlyphId> {
     match magic % 4096 {
@@ -707,6 +729,7 @@ pub fn special_variant_v4(magic: u64) -> Option<CatGlyphId> {
 ///
 /// Windows: Bow `0..=127` (1/32), Crown `128..=131` (1/1024), Bell `132..=147`
 /// (1/256).
+#[inline]
 #[must_use]
 pub fn accessory_variant_v4(magic: u64) -> Option<CatGlyphId> {
     if special_variant_v4(magic).is_some() {

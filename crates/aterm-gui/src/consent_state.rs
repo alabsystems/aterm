@@ -1521,6 +1521,22 @@ impl ConsentState {
         self.fda_read(gate, interval, false, SlotLock::Try)
     }
 
+    /// A fresh cached grant's observation instant. This passive read uses the
+    /// same epoch, policy and freshness rules as `fda_cached`; its age is
+    /// measured against this exact `now`, so reconstruction adds no clock skew.
+    pub(crate) fn fda_grant_observed_at(
+        &self,
+        gate: ProbeGate,
+        interval: Duration,
+    ) -> Option<Instant> {
+        let now = Instant::now();
+        let ((probe, age), _) = self.fda_at(gate, interval, now, false, SlotLock::Try);
+        if probe.state != FdaState::Granted {
+            return None;
+        }
+        now.checked_sub(age)
+    }
+
     fn fda_read(
         &self,
         gate: ProbeGate,

@@ -6,7 +6,7 @@
 //! (gap #36 — a `./aterm-before --headless` whose harness died had run for eleven
 //! days holding a shell, reachable by no `aterm ctl ls`).
 //!
-//! Every instance here is the real binary (`CARGO_BIN_EXE_aterm`) under a scratch
+//! Every instance here is the real binary (`launch_isolation::aterm_executable`) under a scratch
 //! world (`support/launch_isolation.rs`) and is itself armed with a lifeline, so a
 //! failing assertion — or this test process being killed — cannot leak one. None
 //! of these tests skips: an instance that does not boot is a failure, with its log.
@@ -95,7 +95,7 @@ fn read_log(log: &Path) -> String {
 fn headless(root: &Path, sock: Option<&Path>, log: &Path) -> Command {
     let out = std::fs::File::create(log).expect("the instance log");
     let err = out.try_clone().expect("the instance log, twice");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+    let mut cmd = Command::new(launch_isolation::aterm_executable());
     launch_isolation::apply(&mut cmd, root);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
         .args(["--lines", "24", "--columns", "100"]);
@@ -119,7 +119,7 @@ fn wait_listening(child: &mut Child, ready: &mut aterm_agent::ready::Ready, log:
 /// own 10 s accept budget is a person's, and a loaded machine can miss it.
 fn ctl(root: &Path, sock: &Path, args: &[&str], stdin: &[u8]) -> Output {
     ctl_accept::until_served(|| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+        let mut cmd = Command::new(launch_isolation::aterm_executable());
         launch_isolation::apply(&mut cmd, root);
         cmd.arg("ctl")
             .arg("--sock")
@@ -253,7 +253,7 @@ fn a_killed_launcher_takes_its_instance_with_it() {
         .arg(script)
         .arg("launcher")
         .arg(&root)
-        .arg(env!("CARGO_BIN_EXE_aterm"))
+        .arg(launch_isolation::aterm_executable())
         .arg(&sock)
         .arg(&log)
         .stdin(Stdio::null())
@@ -325,7 +325,7 @@ fn the_doctor_names_an_unreachable_instance_and_not_a_reachable_one() {
     let mut b = Started(cmd.spawn().expect("launch B"));
     wait_listening(&mut b.0, &mut ready_b, &log_b);
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+    let mut cmd = Command::new(launch_isolation::aterm_executable());
     launch_isolation::apply(&mut cmd, &root_b);
     let out = cmd
         .arg("doctor")

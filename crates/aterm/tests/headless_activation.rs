@@ -106,7 +106,7 @@ fn bounded_wait(mut child: Child, what: &str, deadline: Duration) -> Result<Outp
 /// ([`headless_boot::until_served`]); any other failure ends the test.
 fn client_ok(inst: &Instance, args: &[&str]) -> String {
     let out = headless_boot::until_served(|| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+        let mut cmd = Command::new(launch_isolation::aterm_executable());
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

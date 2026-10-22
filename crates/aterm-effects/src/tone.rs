@@ -56,6 +56,7 @@ impl Tone {
     ];
 
     /// The model output index (softmax slot) of this tone.
+    #[inline]
     pub fn index(self) -> usize {
         match self {
             Tone::Calm => 0,
@@ -68,11 +69,13 @@ impl Tone {
 
     /// Inverse of [`Tone::index`]; out-of-range folds to the neutral
     /// [`Tone::Technical`] rather than panicking on an audio-adjacent path.
+    #[inline]
     pub fn from_index(i: usize) -> Tone {
         *Tone::ALL.get(i).unwrap_or(&Tone::Technical)
     }
 
     /// Corpus label string (the TSV files' first column).
+    #[inline]
     pub fn label(self) -> &'static str {
         match self {
             Tone::Calm => "calm",
@@ -85,6 +88,7 @@ impl Tone {
 
     /// Parse a corpus label. Unknown labels are `None` (the trainer treats
     /// that as a data error, not a silent class).
+    #[inline]
     pub fn parse_label(s: &str) -> Option<Tone> {
         Tone::ALL.iter().copied().find(|t| t.label() == s)
     }
@@ -117,9 +121,11 @@ pub fn for_each_ngram_bucket(text: &str, mut f: impl FnMut(usize)) -> usize {
     /// distinct hash streams.
     const ORDER_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
 
+    #[inline]
     fn fold(h: u64, cb: &[u8; 4]) -> u64 {
         fnv1a_64_extend(h, cb)
     }
+    #[inline]
     fn bucket(h: u64) -> usize {
         (h as usize) & (BUCKETS - 1)
     }
@@ -131,7 +137,7 @@ pub fn for_each_ngram_bucket(text: &str, mut f: impl FnMut(usize)) -> usize {
     let mut prev2_h3: Option<u64> = None;
     let mut last_was_space = false;
     for raw in text.chars() {
-        let c = if raw.is_whitespace() {
+        let c = if matches!(raw, ' ' | '\t'..='\r') || (!raw.is_ascii() && raw.is_whitespace()) {
             if last_was_space {
                 continue; // collapse runs — indentation is not a mood
             }
@@ -214,6 +220,7 @@ const HEADER_LEN: usize = 8 + 16 + 12;
 /// Exact asset length: header, i8 tensors, f32 biases, u32 checksum.
 const ASSET_LEN: usize = HEADER_LEN + EMB_LEN + W1_LEN + W2_LEN + (HIDDEN + TONE_COUNT) * 4 + 4;
 
+#[inline]
 fn fnv1a32(bytes: &[u8]) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
     for &b in bytes {
@@ -391,6 +398,7 @@ impl ToneModel {
     /// evidence is too thin ([`MIN_NGRAMS`]). Ties resolve to the lowest index.
     /// A host that caches a mood uses this, so an evidence-thin window (a
     /// one-char line after Enter) leaves the prior verdict standing.
+    #[inline]
     pub fn classify_opt(&self, text: &str, s: &mut ToneScratch) -> Option<Tone> {
         if !self.compute_logits(text, s) {
             return None;
@@ -406,6 +414,7 @@ impl ToneModel {
 
     /// The verdict: argmax tone, or the neutral [`Tone::Technical`] when the
     /// evidence is too thin. Ties resolve to the lowest index.
+    #[inline]
     pub fn classify(&self, text: &str, s: &mut ToneScratch) -> Tone {
         self.classify_opt(text, s).unwrap_or(Tone::Technical)
     }
@@ -460,6 +469,7 @@ pub fn encode_model(emb: &[f32], w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32])
 /// The shipped weights (`data/tone_model.atn`, from `targo --unverified run -p
 /// aterm-effects --example tone_train`), loaded once. `None` if the embedded
 /// asset fails verification; callers fall back to the neutral tone.
+#[inline]
 pub fn builtin() -> Option<&'static ToneModel> {
     static MODEL: OnceLock<Option<ToneModel>> = OnceLock::new();
     MODEL
@@ -605,6 +615,17 @@ mod tests {
         for_each_ngram_bucket("    ls -la", |x| a.push(x));
         for_each_ngram_bucket(" ls -la", |x| b.push(x));
         assert_eq!(a, b);
+        // Unicode White_Space also includes ASCII vertical tab, which
+        // is_ascii_whitespace deliberately excludes. Keep every ASCII
+        // whitespace character equivalent to the normalized space.
+        for ch in (0..=0x7f)
+            .filter_map(char::from_u32)
+            .filter(|ch| ch.is_whitespace())
+        {
+            a.clear();
+            for_each_ngram_bucket(&format!("{ch}{ch}ls -la"), |x| a.push(x));
+            assert_eq!(a, b, "whitespace {ch:?}");
+        }
     }
 
     /// The trainer's encode/decode path round-trips onto the i8 lattice.

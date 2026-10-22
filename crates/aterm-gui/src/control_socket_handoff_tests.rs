@@ -15,8 +15,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 fn fixture() -> (aterm_tempfile::TempDir, control_auth::SocketPlan) {
-    // Keep sun_path short even when the platform temporary root is long.
-    let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+    let dir = crate::test_scratch::short_dir("the control socket");
     let sock = dir.path().join("control.sock");
     let plan = control_auth::SocketPlan {
         sock_path: sock.to_str().unwrap().to_string(),

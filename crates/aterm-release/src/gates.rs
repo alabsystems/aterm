@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::changelog;
 use crate::channel;
-use crate::ledger::{Error, GitRunner, Result, git_ok, rev_parse};
+use crate::ledger::{BYTE_EXACT, Error, GitRunner, Result, git_ok, rev_parse};
 use crate::release::Refusal;
 
 /// Free-disk floor for the release's build and its cut: the build keeps two full
@@ -847,8 +847,9 @@ pub struct CutTree {
 
 /// Put the cut tree ([`cut_tree_path`]) at `commit`, detached, creating it as a linked
 /// worktree of `repo`'s repository when absent. `git` runs in `repo`, the operator's
-/// checkout, which this never changes. A resume puts it back at its journaled release
-/// commit the same way.
+/// checkout, which this never changes. Every checkout it makes is [`BYTE_EXACT`], whatever
+/// the operator's config. A resume puts it back at its journaled release commit the same
+/// way.
 ///
 /// # Errors
 /// A path that exists but is not a worktree of this repository (it is never touched),
@@ -861,11 +862,8 @@ pub fn place_cut_tree(git: &dyn GitRunner, repo: &Path, commit: &str) -> Result<
         // registered path until the stale entry is pruned.
         git_ok(git, &["worktree", "prune"])?;
         let spelled = path.to_string_lossy().into_owned();
-        git_ok(
-            git,
-            &["worktree", "add", "-q", "--detach", &spelled, commit],
-        )
-        .map_err(|e| {
+        let add = ["worktree", "add", "-q", "--detach", &spelled, commit];
+        git_ok(git, &[&BYTE_EXACT[..], &add].concat()).map_err(|e| {
             Error::new(format!(
                 "cannot create the cut tree {}: {e}. Nothing was claimed.",
                 path.display()
@@ -911,16 +909,14 @@ pub fn place_cut_tree(git: &dyn GitRunner, repo: &Path, commit: &str) -> Result<
     require_clean_cut_tree(&path)?;
     let moved = rev_parse(&tree, "HEAD")? != commit;
     if moved {
-        git_ok(
-            &tree,
-            &[
-                "checkout",
-                "-q",
-                "--detach",
-                "--no-overwrite-ignore",
-                commit,
-            ],
-        )?;
+        let checkout = [
+            "checkout",
+            "-q",
+            "--detach",
+            "--no-overwrite-ignore",
+            commit,
+        ];
+        git_ok(&tree, &[&BYTE_EXACT[..], &checkout].concat())?;
     }
     let path = checked_head(&path, commit)?;
     // Moved or not: a tree created before its commit carried a submodule, or one an
@@ -1545,8 +1541,10 @@ pub fn channel_version_gate(repo: &Path, version: &str, offline: bool) -> Result
 }
 
 /// One `gh api` call against the public channel, credentialed for the release org: the
-/// channel is a different org than the dev remote, whose `gh auth` account cannot read
-/// it. The token goes in the environment, never argv, so no process listing shows it.
+/// channel is a different org than the dev remote, whose `gh auth` account can read it
+/// (a pull) but has no push there; the release org's token, when present, reads it as
+/// the publisher. The token goes in the environment, never argv, so no process listing
+/// shows it.
 fn channel_api(path: &str) -> Result<std::process::Output> {
     let mut command = command("gh");
     command
@@ -1715,7 +1713,8 @@ pub fn submodules_off_gitlink(status: &str) -> Vec<&str> {
 /// against no astream, or the previous commit's. (A claim needs no such step: the release
 /// commit's gitlinks are the published commit's.) Fails loudly, naming what is left.
 pub fn align_submodules(git: &dyn GitRunner) -> Result<()> {
-    let out = git.git(&["submodule", "update", "--init", "--recursive", "--checkout"])?;
+    let update = ["submodule", "update", "--init", "--recursive", "--checkout"];
+    let out = git.git(&[&BYTE_EXACT[..], &update].concat())?;
     if !out.success() {
         return Err(Error::new(format!(
             "the cut tree is at its commit, but its submodules could not be checked out at \
@@ -4284,7 +4283,7 @@ mod published_commit_tests {
                 "a still-ignored build stays byte for byte"
             );
             let expected_head = if replacement { &first } else { &second };
-            let actual_head = rev_parse(&crate::ledger::GitCli::new(&tree), "HEAD").unwrap();
+            let actual_head = rev_parse(&testing::Git::new(&tree), "HEAD").unwrap();
             if actual_head != *expected_head {
                 failures.push(format!(
                     "{case}: moved HEAD despite an ignored-file replacement"
@@ -4307,7 +4306,7 @@ mod published_commit_tests {
             assert!(error.contains("has changes"), "{error}");
             assert_eq!(fs::read_to_string(tree.join("NOTES")).unwrap(), "mine");
             assert_eq!(
-                rev_parse(&crate::ledger::GitCli::new(&tree), "HEAD").unwrap(),
+                rev_parse(&testing::Git::new(&tree), "HEAD").unwrap(),
                 actual_head
             );
             failures

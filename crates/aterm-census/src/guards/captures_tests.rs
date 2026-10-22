@@ -66,7 +66,13 @@ const NO_BASELINE: &str = "no engine baseline in tests";
 
 fn rows() -> Vec<Row> {
     let mut found = Vec::new();
-    let mut rows = file_rows(&format!("# synthetic\n{WORD}\n"), EXTRA, EXTRA, &mut found);
+    let mut rows = file_rows(
+        &format!("# synthetic\n{WORD}\n"),
+        EXTRA,
+        EXTRA,
+        CAPTURE_PRIVACY.id,
+        &mut found,
+    );
     assert!(found.is_empty(), "{found:?}");
     rows.extend(capture_rows());
     rows
@@ -208,7 +214,7 @@ fn the_exports_rows_compile_and_every_capture_row_does() {
         Err(e) => panic!("{EXTRA}: {e}"),
     };
     let mut found = Vec::new();
-    let rows = file_rows(&text, EXTRA, EXTRA, &mut found);
+    let rows = file_rows(&text, EXTRA, EXTRA, CAPTURE_PRIVACY.id, &mut found);
     assert!(found.is_empty(), "{found:#?}");
     assert!(rows.len() >= 2, "{} rows", rows.len());
 }

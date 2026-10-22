@@ -685,4 +685,138 @@ fn a_point_left_to_a_person_reopens_at_their_next_turn() {
             tab.done();
         }
     }
+
+    // A user's submission already reports Working while native startup is
+    // waiting behind the holder's publication gate. Its eventual acceptance
+    // need not move that count again. Conditional LEFT must not include such
+    // a report in the point it leaves to the person. Blocked and clear/reset
+    // also retain the previous in-turn count, so only explicit rest admits it.
+    const BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=codex:kind=question\x1b\\";
+    const CLEAR: &[u8] = b"\x1b]7501;state=clear:app=codex\x1b\\";
+    const ERROR: &[u8] = b"\x1b]7501;state=error:app=codex\x1b\\";
+    let bounded = |tab: &Tab, conn, prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>| {
+        let until = crate::metrics::now_us() + 5_000_000;
+        crate::control::meta_wakes_proving_for_test(
+            &tab.app.store,
+            &tab.term,
+            tab.session,
+            &tab.ctx,
+            &format!("set harness_act left-to-person@v1 until_us={until}"),
+            conn,
+            prove,
+        )
+    };
+    for (case, report) in [
+        ("pending Working", Some(WORKING)),
+        ("Blocked", Some(BLOCKED)),
+        ("clear", Some(CLEAR)),
+        ("reset", Some(b"\x1bc".as_slice())),
+        ("unknown", None),
+    ] {
+        let mut tab = Tab::new();
+        let wakes = tab.act("continue@v1");
+        tab.apply(wakes);
+        if let Some(report) = report {
+            tab.says(IDLE);
+            tab.says(WORKING);
+            tab.says(report);
+        }
+        let reported = crate::term_lock(&tab.term).program_state();
+        if matches!(case, "clear" | "reset" | "unknown") {
+            assert!(reported.state.is_none(), "{case} clears the current report");
+        } else {
+            use aterm_core::terminal::program_state::ProgramStateWord as W;
+            let expected = if case == "Blocked" {
+                W::Blocked
+            } else {
+                W::Working
+            };
+            assert_eq!(
+                reported.state.map(|state| state.state),
+                Some(expected),
+                "{case}"
+            );
+        }
+        if case != "unknown" {
+            assert_eq!(reported.turns, 1, "{case} retains the in-turn count");
+        }
+        let before = {
+            let timeline = tab.ctx.timeline.lock().unwrap();
+            (
+                timeline.last_act().map(str::to_owned),
+                timeline.landing_mark(),
+                timeline
+                    .since(None)
+                    .filter(|row| row.kind == crate::session_timeline::HARNESS_ACT)
+                    .count(),
+            )
+        };
+        let (reply, wakes) = bounded(&tab, Some(1), &|_| None);
+        assert_eq!(reply, "ERR busy harness_act\n", "{case}");
+        assert!(wakes.is_empty(), "a refused {case} posts no wake");
+        let timeline = tab.ctx.timeline.lock().unwrap();
+        assert_eq!(
+            (
+                timeline.last_act().map(str::to_owned),
+                timeline.landing_mark(),
+                timeline
+                    .since(None)
+                    .filter(|row| row.kind == crate::session_timeline::HARNESS_ACT)
+                    .count()
+            ),
+            before
+        );
+        drop(timeline);
+        assert!(
+            tab.ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .take_self_tasks()
+                .is_empty()
+        );
+        assert_eq!(tab.face(), Some(TaskFace::Open));
+        // Native work repeating the pending report cannot repair an admitted
+        // stale face by adding another turn; the refusal keeps it open.
+        if case == "pending Working" {
+            let turns = crate::term_lock(&tab.term).program_state().turns;
+            tab.says(WORKING);
+            assert_eq!(crate::term_lock(&tab.term).program_state().turns, turns);
+            tab.sweep();
+            assert_eq!(tab.face(), Some(TaskFace::Open));
+        }
+        let (reply, wakes) = bounded(&tab, Some(2), &|_| None);
+        assert_eq!(reply, "ERR denied\n", "proof precedes the {case} refusal");
+        assert!(wakes.is_empty());
+        tab.done();
+    }
+    for at_rest in [IDLE, DONE, ERROR] {
+        let mut tab = Tab::new();
+        tab.says(WORKING);
+        tab.says(at_rest);
+        let (reply, wakes) = bounded(&tab, Some(1), &|_| None);
+        assert_eq!(reply, "OK\n", "explicit rest admits conditional LEFT");
+        tab.apply(wakes);
+        assert_eq!(tab.face(), Some(TaskFace::Theirs));
+        // A pending report parsed during the off-lock proof stays beyond the
+        // SAME earlier snapshot. Even if the sweep sees it before the wake,
+        // the conditional face must reopen when it is applied.
+        let wakes = tab.act("continue@v1");
+        tab.apply(wakes);
+        let term = Arc::clone(&tab.term);
+        let proven = crate::self_claim::stand_in::running();
+        let (reply, wakes) = bounded(&tab, Some(2), &|_| {
+            crate::term_lock(&term).process(WORKING);
+            Some(proven.clone())
+        });
+        assert_eq!(reply, "OK\n");
+        tab.sweep();
+        tab.apply(wakes);
+        assert_eq!(
+            tab.face(),
+            Some(TaskFace::Open),
+            "later counted input reopens the earlier mark"
+        );
+        tab.done();
+    }
 }

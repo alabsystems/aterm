@@ -32,10 +32,21 @@
 //!   (`StateDir::clear_rewound_log`'s, `StateDir::drop_in_flight`'s) and as
 //!   the second half of every durable replace, which flushes the replaced
 //!   file's directory for its SIBLINGS as much as for it (`replace_bytes`'s
-//!   `sync_dir`): an unlink made before a durable write beside it is kept.
+//!   `sync_dir`): an unlink made before a durable write beside it is kept;
+//! * an ORDERED write (`aterm_durable::ordered`, `F_BARRIERFSYNC`: a clean
+//!   stop's, `StateDir::end_run_clean`) is a FLUSH POINT: what it flushed —
+//!   a file's bytes as they stand (an in-place flush), an ordered replace's
+//!   bytes, whose rename comes after it, or an ordered directory's entry
+//!   changes — reaches the media before ANY write issued after it, flushed
+//!   or not. A full flush is one too, and puts every write
+//!   flushed before it on the media ("a successful full flush also persists
+//!   the earlier, already-flushed I/O on its device"). So a power cut draws
+//!   how many of the flush points since the last full flush the media holds
+//!   (`k`): what the first `k` flushed is kept, and nothing issued after the
+//!   `k`-th's successor is ([`Journal::points`]).
 //!
-//! Within what the directory flushes fixed, each file's image is drawn on its
-//! own: nothing orders two files' unflushed writes against each other, and no
+//! Within what the flushes fixed, each file's image is drawn on its own:
+//! nothing orders two files' unflushed writes against each other, and no
 //! cross-log/state ordering of a real device is modelled. A process kill (not
 //! a power cut) keeps everything: the page cache outlives the process.
 //!
@@ -66,12 +77,21 @@
 //! watermark that re-answers, a `seq` the durable `inc` fences), and every
 //! reader that refuses damage is one of `StateDir::set_aside_torn`'s kinds —
 //! but `logpin`, the mirror's pin, which holds what no reboot ends (the alias
-//! key and the lifetime total, rulings Q6 and Q13): a torn one is kept, and
-//! the mirror stops for good (`world::World::mirror_stopped_by_its_torn_pin`).
+//! key and the lifetime total, rulings Q6 and Q13). It used to be kept torn,
+//! and the mirror stopped for good. Both now have durable copies, `logkey`
+//! and `logfloor`, on the media before each atomic batch pin or send. The
+//! current version fence is first written durably, before those copies;
+//! a new open reestablishes it. So the next boot's first bridge sets a torn
+//! pin aside too and the mirror resumes
+//! (`StateDir::reconcile_logpin`); the world holds it to the key and to a
+//! total never below the highest one a pin was written with
+//! ([`Device::pin_total`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+use aterm_durable::Flush;
 
 use super::{lock, Rng};
 use crate::fx::Write;
@@ -91,13 +111,27 @@ enum Op {
     Remove,
 }
 
+/// One write since the file was last on the media, and where it stands
+/// against the device's flush points ([`Journal::points`]).
+#[derive(Clone, Debug)]
+struct Pending {
+    op: Op,
+    /// The flush points issued before it: it can be on the media only if the
+    /// writes flushed before the last of them are.
+    epoch: u64,
+    /// The flush point that flushed its bytes, for an ordered replace: they
+    /// are on the media whole once that point is, whether or not its rename
+    /// (issued after it) is.
+    data_at: Option<u64>,
+}
+
 /// One file's journal.
 #[derive(Clone, Debug)]
 struct File {
     /// What the media holds for sure.
     durable: Version,
     /// Every write since, oldest first.
-    pending: Vec<Op>,
+    pending: Vec<Pending>,
     /// How many of `pending`'s versions a flushed directory entry rules out:
     /// an image may hold version `k` only for `k + 1 >= floor` (`durable` is
     /// version `-1`).
@@ -105,18 +139,25 @@ struct File {
 }
 
 impl File {
-    /// The versions an image may hold, oldest first, each with how it may be
-    /// torn: `(version, torn_from)` — a torn image of a replace is empty, of
-    /// an append any prefix at or above `torn_from` bytes.
-    fn versions(&self) -> Vec<(Version, Option<usize>, bool)> {
+    /// The versions an image may hold, oldest first, of the first `keep`
+    /// writes with `floor` ruled out, each with how it may be torn:
+    /// `(version, torn_from, torn_whole)` — a torn image of a replace is cut
+    /// anywhere short of its last byte (`torn_whole`: one whose bytes no
+    /// flush point at or below `cut` put on the media), of an append any
+    /// prefix at or above `torn_from` bytes.
+    fn versions(&self, keep: usize, floor: usize, cut: u64) -> Vec<(Version, Option<usize>, bool)> {
         let mut out = Vec::new();
-        if self.floor == 0 {
+        if floor == 0 {
             out.push((self.durable.clone(), None, false));
         }
         let mut now = self.durable.clone();
-        for (k, op) in self.pending.iter().enumerate() {
-            let (next, torn_from, replace) = match (op, &now) {
-                (Op::Replace(bytes, mode), _) => (Version::Bytes(bytes.clone(), *mode), None, true),
+        for (k, p) in self.pending[..keep].iter().enumerate() {
+            let (next, torn_from, replace) = match (&p.op, &now) {
+                (Op::Replace(bytes, mode), _) => (
+                    Version::Bytes(bytes.clone(), *mode),
+                    None,
+                    p.data_at.is_none_or(|at| at >= cut),
+                ),
                 (Op::Remove, _) => (Version::Absent, None, false),
                 (Op::Append(bytes), Version::Bytes(have, mode)) => {
                     let mut joined = have.clone();
@@ -128,7 +169,7 @@ impl File {
                 }
             };
             now = next.clone();
-            if k + 1 >= self.floor {
+            if k + 1 >= floor {
                 out.push((next, torn_from, replace));
             }
         }
@@ -136,31 +177,76 @@ impl File {
     }
 }
 
-/// A FLUSH OF DIRECTORY `dir` (the module doc): each file in it keeps its
-/// newest ENTRY change — a rename's version, an unlink, the file an append
-/// created — and the versions before it can no longer come back; the appends
-/// after it are data, and still may be lost.
-fn flush_dir(files: &mut BTreeMap<PathBuf, File>, dir: &Path) {
-    for (p, f) in files.iter_mut() {
-        if p.parent() != Some(dir) {
-            continue;
+/// The newest ENTRY change among `pending` (a rename's version, an unlink,
+/// the file an append created), over a file whose media holds `durable`:
+/// what a flush of its directory puts on the media.
+fn newest_entry(durable: &Version, pending: &[Pending]) -> Option<usize> {
+    let mut absent = *durable == Version::Absent;
+    let mut entry = None;
+    for (k, p) in pending.iter().enumerate() {
+        if !matches!(p.op, Op::Append(_)) || absent {
+            entry = Some(k);
         }
-        let mut absent = f.durable == Version::Absent;
-        let mut entry = None;
-        for (k, op) in f.pending.iter().enumerate() {
-            if !matches!(op, Op::Append(_)) || absent {
-                entry = Some(k);
+        absent = matches!(p.op, Op::Remove);
+    }
+    entry
+}
+
+/// The whole journal under one lock: every file's, and the flush points.
+#[derive(Debug, Default)]
+struct Journal {
+    files: BTreeMap<PathBuf, File>,
+    /// FLUSH POINTS issued since the last power cut: every ordered write and
+    /// every full flush is one, numbered from 0 in the order issued.
+    points: u64,
+    /// How many of them are on the media for sure: every one up to the newest
+    /// full flush.
+    persisted: u64,
+    /// Each ordered directory flush: its flush point, the directory, and how
+    /// many of each of its files' pending writes it covers.
+    dir_points: Vec<(u64, PathBuf, BTreeMap<PathBuf, usize>)>,
+}
+
+impl Journal {
+    /// A FULL FLUSH OF DIRECTORY `dir` (the module doc): each file in it keeps
+    /// its newest ENTRY change, and the versions before it can no longer come
+    /// back; the appends after it are data, and still may be lost.
+    fn flush_dir(&mut self, dir: &Path) {
+        let mut cleared = Vec::new();
+        for (p, f) in &mut self.files {
+            if p.parent() != Some(dir) {
+                continue;
             }
-            absent = matches!(op, Op::Remove);
+            let Some(j) = newest_entry(&f.durable, &f.pending) else {
+                continue;
+            };
+            if j + 1 == f.pending.len() && matches!(f.pending[j].op, Op::Remove) {
+                f.durable = Version::Absent;
+                f.pending.clear();
+                f.floor = 0;
+                cleared.push(p.clone());
+            } else {
+                f.floor = f.floor.max(j + 1);
+            }
         }
-        let Some(j) = entry else { continue };
-        if j + 1 == f.pending.len() && matches!(f.pending[j], Op::Remove) {
-            f.durable = Version::Absent;
-            f.pending.clear();
-            f.floor = 0;
-        } else {
-            f.floor = f.floor.max(j + 1);
+        for p in cleared {
+            self.forget(&p);
         }
+    }
+
+    /// `path`'s pending writes were settled on the media: no ordered
+    /// directory flush covers any of them any more.
+    fn forget(&mut self, path: &Path) {
+        for (_, _, lens) in &mut self.dir_points {
+            lens.remove(path);
+        }
+    }
+
+    /// A full flush was issued: it is a flush point, and every one before it
+    /// is on the media.
+    fn full_flush(&mut self) {
+        self.points += 1;
+        self.persisted = self.points;
     }
 }
 
@@ -168,30 +254,40 @@ fn flush_dir(files: &mut BTreeMap<PathBuf, File>, dir: &Path) {
 #[derive(Debug)]
 pub(crate) struct Device {
     root: PathBuf,
-    files: Mutex<BTreeMap<PathBuf, File>>,
+    journal: Mutex<Journal>,
     /// A CONTROL: a device that keeps every write (no power cut loses
     /// anything), so a failure only a lossy cut can cause vanishes under it.
     pub(crate) lossless: bool,
     /// POSIX's worst case: a power cut may also TEAR an unflushed file (the
     /// module doc's finding F1). On in the committed worlds.
     pub(crate) tears: bool,
+    /// THE HIGHEST TOTAL any write of `logpin` named, in any boot: what the
+    /// node's mirror had counted (ruling Q13), which no later bridge's total
+    /// may fall below, whatever a power cut did to the pin.
+    pin_total: Mutex<u64>,
 }
 
 impl Device {
     pub(crate) fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
-            files: Mutex::new(BTreeMap::new()),
+            journal: Mutex::new(Journal::default()),
             lossless: false,
             tears: false,
+            pin_total: Mutex::new(0),
         }
+    }
+
+    /// The highest total any write of `logpin` named ([`Device::pin_total`]).
+    pub(crate) fn pin_total(&self) -> u64 {
+        *lock(&self.pin_total)
     }
 
     /// A file the world wrote before the bridge ever ran (the provisioned
     /// node id), on the media.
     pub(crate) fn seed(&self, path: &Path, bytes: &[u8]) {
         std::fs::write(path, bytes).expect("seed a state file");
-        lock(&self.files).insert(
+        lock(&self.journal).files.insert(
             path.to_path_buf(),
             File {
                 durable: Version::Bytes(bytes.to_vec(), 0o666),
@@ -203,48 +299,136 @@ impl Device {
 
     /// Journal one write the state dir made ([`crate::fx::Disk::after`]).
     pub(crate) fn journal(&self, w: Write<'_>) {
-        let mut files = lock(&self.files);
+        if let Write::Replace { path, bytes, .. } = &w {
+            if *path == self.root.join(crate::state::LOGPIN) {
+                if let Some(pin) = std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|t| crate::mirror::Pin::parse(t).ok())
+                {
+                    let mut max = lock(&self.pin_total);
+                    *max = (*max).max(pin.total);
+                }
+            }
+        }
+        let mut j = lock(&self.journal);
         let blank = || File {
             durable: Version::Absent,
             pending: Vec::new(),
             floor: 0,
         };
+        let epoch = j.points;
+        let push = |j: &mut Journal, path: &Path, p: Pending| {
+            j.files
+                .entry(path.to_path_buf())
+                .or_insert_with(blank)
+                .pending
+                .push(p);
+        };
         match w {
             Write::Replace {
                 path,
                 bytes,
-                durable,
+                flush: Some(Flush::Durable),
                 mode,
             } => {
-                let f = files.entry(path.to_path_buf()).or_insert_with(blank);
-                if durable {
-                    f.durable = Version::Bytes(bytes.to_vec(), mode);
-                    f.pending.clear();
-                    f.floor = 0;
-                    // The replace's directory flush is the directory's, for
-                    // every entry in it.
-                    if let Some(dir) = path.parent() {
-                        flush_dir(&mut files, dir);
-                    }
-                } else {
-                    f.pending.push(Op::Replace(bytes.to_vec(), mode));
+                j.full_flush();
+                let f = j.files.entry(path.to_path_buf()).or_insert_with(blank);
+                f.durable = Version::Bytes(bytes.to_vec(), mode);
+                f.pending.clear();
+                f.floor = 0;
+                j.forget(path);
+                // The replace's directory flush is the directory's, for
+                // every entry in it.
+                if let Some(dir) = path.parent() {
+                    j.flush_dir(dir);
                 }
             }
-            Write::Append { path, bytes } => {
-                files
-                    .entry(path.to_path_buf())
-                    .or_insert_with(blank)
-                    .pending
-                    .push(Op::Append(bytes.to_vec()));
+            Write::Replace {
+                path,
+                bytes,
+                flush: Some(Flush::Ordered),
+                mode,
+            } => {
+                // The barrier flushed the temp's bytes; the rename comes
+                // after it, a write of the next epoch.
+                j.points += 1;
+                push(
+                    &mut j,
+                    path,
+                    Pending {
+                        op: Op::Replace(bytes.to_vec(), mode),
+                        epoch: epoch + 1,
+                        data_at: Some(epoch),
+                    },
+                );
             }
-            Write::Remove { path } => {
-                files
-                    .entry(path.to_path_buf())
-                    .or_insert_with(blank)
-                    .pending
-                    .push(Op::Remove);
+            Write::Replace {
+                path,
+                bytes,
+                flush: None,
+                mode,
+            } => push(
+                &mut j,
+                path,
+                Pending {
+                    op: Op::Replace(bytes.to_vec(), mode),
+                    epoch,
+                    data_at: None,
+                },
+            ),
+            Write::Append { path, bytes } => push(
+                &mut j,
+                path,
+                Pending {
+                    op: Op::Append(bytes.to_vec()),
+                    epoch,
+                    data_at: None,
+                },
+            ),
+            Write::Remove { path } => push(
+                &mut j,
+                path,
+                Pending {
+                    op: Op::Remove,
+                    epoch,
+                    data_at: None,
+                },
+            ),
+            Write::Flush { path, flush } => {
+                // The file's bytes as they stand — its newest version's, a
+                // replace's whose rename came before — reach the media with
+                // this flush point; its name is still its directory's.
+                let at = j.points;
+                match flush {
+                    Flush::Durable => j.full_flush(),
+                    Flush::Ordered => j.points += 1,
+                }
+                if let Some(last) = j.files.get_mut(path).and_then(|f| f.pending.last_mut()) {
+                    if matches!(last.op, Op::Replace(..)) && last.data_at.is_none() {
+                        last.data_at = Some(at);
+                    }
+                }
             }
-            Write::SyncDir { path } => flush_dir(&mut files, path),
+            Write::SyncDir {
+                path,
+                flush: Flush::Durable,
+            } => {
+                j.full_flush();
+                j.flush_dir(path);
+            }
+            Write::SyncDir {
+                path,
+                flush: Flush::Ordered,
+            } => {
+                let lens = j
+                    .files
+                    .iter()
+                    .filter(|(p, _)| p.parent() == Some(path))
+                    .map(|(p, f)| (p.clone(), f.pending.len()))
+                    .collect();
+                j.dir_points.push((epoch, path.to_path_buf(), lens));
+                j.points += 1;
+            }
         }
     }
 
@@ -252,11 +436,50 @@ impl Device {
     /// media may hold (the module doc), drawn from `rng`; each image is then
     /// what the media holds. Answers one line per file whose image is not its
     /// newest version, for the trace.
+    ///
+    /// First how many flush points since the last full flush reached the
+    /// media, `cut` (drawn only where any ordered write left one in doubt, so
+    /// a world that orders nothing draws what it always drew): what the first
+    /// `cut` flushed is kept — an ordered replace's bytes whole, an ordered
+    /// directory's entries — and no write issued after the next one is.
     pub(crate) fn power_cut(&self, rng: &mut Rng) -> Vec<String> {
-        let mut files = lock(&self.files);
+        let mut j = lock(&self.journal);
+        let open = j.points - j.persisted;
+        let cut = if self.lossless || open == 0 {
+            j.points
+        } else {
+            j.persisted + rng.below(open + 1)
+        };
         let mut notes = Vec::new();
-        for (path, f) in files.iter_mut() {
-            let versions = f.versions();
+        if cut < j.points {
+            notes.push(format!(
+                "power-cut flush points {}/{open} on the media",
+                cut - j.persisted
+            ));
+        }
+        notes.extend(self.cut_files(&mut j, rng, cut));
+        notes
+    }
+
+    /// The image of every file once `cut` flush points are on the media
+    /// ([`Device::power_cut`]).
+    fn cut_files(&self, j: &mut Journal, rng: &mut Rng, cut: u64) -> Vec<String> {
+        let dir_points = std::mem::take(&mut j.dir_points);
+        let mut notes = Vec::new();
+        for (path, f) in &mut j.files {
+            // Nothing issued after the flush point past the cut's last.
+            let keep = f.pending.iter().take_while(|p| p.epoch <= cut).count();
+            let mut floor = f.floor;
+            for (at, dir, lens) in &dir_points {
+                if *at >= cut || path.parent() != Some(dir.as_path()) {
+                    continue;
+                }
+                let covered = lens.get(path).copied().unwrap_or(0).min(keep);
+                if let Some(e) = newest_entry(&f.durable, &f.pending[..covered]) {
+                    floor = floor.max(e + 1);
+                }
+            }
+            let versions = f.versions(keep, floor, cut);
             if versions.is_empty() {
                 continue;
             }
@@ -284,11 +507,16 @@ impl Device {
                 }
                 (_, v) => v,
             };
-            if pick != newest || torn {
+            if pick != newest || torn || keep < f.pending.len() {
                 let rel = path.strip_prefix(&self.root).unwrap_or(path);
                 notes.push(format!(
-                    "power-cut {} -> version {pick}/{newest}{}",
+                    "power-cut {} -> version {pick}/{newest}{}{}",
                     rel.display(),
+                    if keep < f.pending.len() {
+                        " (later writes past the cut)"
+                    } else {
+                        ""
+                    },
                     if torn { " torn" } else { "" }
                 ));
             }
@@ -312,6 +540,8 @@ impl Device {
             f.pending.clear();
             f.floor = 0;
         }
+        j.points = 0;
+        j.persisted = 0;
         notes
     }
 }

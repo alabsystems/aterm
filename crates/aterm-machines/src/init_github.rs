@@ -12,7 +12,23 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+mod native;
 mod repos;
+
+/// Reconcile repositories after the selected secrets stage has synchronized.
+/// Uses the admitted explicit profile, or the known development token source;
+/// no GitHub CLI login is needed. Plan performs no keychain/config/clone writes.
+///
+/// # Errors
+/// A source, identity, inventory, destination or native operation is unsafe or
+/// incomplete. Credential values and child credential output are never included.
+pub fn run_initial_repositories(
+    sys: &dyn System,
+    ctx: &Ctx,
+    mode: crate::model::Mode,
+) -> Result<Vec<crate::model::ItemReport>, String> {
+    native::run(sys, ctx, mode)
+}
 
 const INPUT_MAX: usize = 64 * 1024;
 const GIT: &str = crate::items::github::CLT_GIT;

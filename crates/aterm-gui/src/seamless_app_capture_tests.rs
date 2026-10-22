@@ -23,7 +23,7 @@ use aterm_window::dpi::PhysicalSize;
 
 use super::ladder_tests::{assert_only_over_cap_links_dropped, hostile_walk_step, xorshift};
 use super::tests::{
-    ENV_LOCK, ScratchEnv, child_proof_from, pipe_pair, restore_env, run_in_children,
+    ScratchEnv, child_proof_from, env_alone, pipe_pair, restore_env, run_in_children,
 };
 use super::*;
 use crate::WindowId;
@@ -810,7 +810,7 @@ impl DeskCensus {
 
 /// One desk of the capture property: case `case`'s seeded desk built, walked,
 /// parked and handed over, every assertion made, its census added to `census`.
-/// The caller holds [`ENV_LOCK`] and the restore of every variable a handoff
+/// The caller holds `ENV_LOCK` and the restore of every variable a handoff
 /// sets.
 fn app_capture_case(case: usize, census: &mut DeskCensus) {
     const BASE_SEED: u64 = 0x00A7_E5C0_91D6_5EED;
@@ -945,17 +945,8 @@ fn app_capture_case(case: usize, census: &mut DeskCensus) {
 /// column-bounded attribute check of the line decoder (plan P0-4b) carries a
 /// case-2 session blank.
 ///
-/// FOUR CHILD PROCESSES, TEN DESKS EACH (test-run speed). A desk sets
-/// the process's HOME and publishes the successor's handoff environment, so
-/// in one process the forty run one after another under [`ENV_LOCK`] — 7.9 s
-/// alone, and every other test of this module the runner starts meanwhile
-/// parks a test thread on the lock: in the `-p aterm-gui --lib` binary at
-/// `RUST_TEST_THREADS=7`, the owner's desk and four carry tests took 4.6 to
-/// 14.3 s there against 0.005 to 0.2 s alone. Each
-/// shard runs its desks (every fourth case) exactly as the single pass did, in
-/// a process whose environment is its own, and prints its census; this test
-/// sums the four and holds the sum to the same floor. The lock is held here
-/// only while the shards are spawned ([`run_in_children`]).
+/// FOUR CHILD PROCESSES, TEN DESKS EACH ([`run_in_children`]), side by side: each shard runs
+/// every fourth case and prints its census, and this test holds their sum to the same floor.
 #[test]
 fn every_app_desk_the_gui_can_build_hands_every_session_over_exactly() {
     const CASES: usize = 40;
@@ -978,7 +969,8 @@ fn every_app_desk_the_gui_can_build_hands_every_session_over_exactly() {
             (None, Some(shard)) => (shard..CASES).step_by(SHARDS).collect(),
             (None, None) => unreachable!(),
         };
-        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        // A shard is its own child already; a replay asked for by hand is run in one.
+        let Some(_env) = env_alone() else { return };
         let _restore = restore_env();
         for case in cases {
             app_capture_case(case, &mut total);
@@ -1042,7 +1034,7 @@ fn every_app_desk_the_gui_can_build_hands_every_session_over_exactly() {
 /// message in the window carry, the digest and the proof equal.
 #[test]
 fn the_owners_desk_hands_both_sessions_over_at_the_full_rung() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let _scratch = enter_scratch("owner");
     let mut app = crate::App::headless_for_test();
@@ -1226,7 +1218,7 @@ fn seed_passed_preverification(
 /// * A verdict that did not pass is never a policy the park follows.
 #[test]
 fn a_successor_policy_of_repaint_carries_every_session_blank_and_every_one_adopts() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let _scratch = enter_scratch("policy");
     let (desk, _next) = build_desk(0x0005_0CA5_E7B0_11C7, false);
@@ -1553,13 +1545,13 @@ fn attempt_files(nonce: &str, suffix: &str) -> Vec<std::path::PathBuf> {
 /// process, `Exited`. Typing into it goes nowhere; closing it closes it. It is
 /// drawn in the successor's configured theme, reports `Exited` with its
 /// command's exit status (2) in the status observer, and keeps the `meta set`
-/// and spawn identity the person gave it.
+/// the person gave it.
 ///
 /// AND AS THE PANE IT WAS (round six of the update audit, findings 46, 49 and
 /// 35): drawn in the successor's configured theme, not the engine's built-in
 /// colours; exited in the status observer, with the exit status its command
 /// ended with (2), not re-read from its screen as an idle prompt; and wearing
-/// the `meta set` identity and spawn identity the person gave it. RED before
+/// the `meta set` metadata the person gave it. RED before
 /// the fix on each: the engine's default background, a phase that was not
 /// `Exited`, and no user title.
 ///
@@ -1569,7 +1561,7 @@ fn attempt_files(nonce: &str, suffix: &str) -> Vec<std::path::PathBuf> {
 /// not the one it had.
 #[test]
 fn a_held_exited_pane_keeps_its_screen() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let _scratch = enter_scratch("held");
     let mut app = crate::App::headless_for_test();
@@ -1631,7 +1623,6 @@ fn a_held_exited_pane_keeps_its_screen() {
         pooled
             .child_reaped
             .store(true, std::sync::atomic::Ordering::Release);
-        pooled.identity = Some("worker".to_string());
         let mut meta = pooled
             .ctx
             .meta
@@ -1844,11 +1835,6 @@ fn a_held_exited_pane_keeps_its_screen() {
             "{at}: THE NAME THE PERSON GAVE IT CROSSED"
         );
     }
-    assert_eq!(
-        session.identity.as_deref(),
-        Some("worker"),
-        "{at}: and its spawn identity"
-    );
     // ROUND EIGHT, FINDING 21: and its session id, so `aterm ctl @<sid>`
     // read/status reach the pane after the update as they did before it.
     // RED before the fix: a freshly minted sid, and `@<old sid>` unknown.
@@ -2067,7 +2053,7 @@ fn a_held_exited_pane_keeps_its_screen() {
 /// older producer, a carry left out) says which turn ids it cannot vouch for.
 #[test]
 fn a_held_panes_turn_ledger_crosses_the_update() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let _scratch = enter_scratch("held-ledger");
     let mut app = crate::App::headless_for_test();
@@ -2186,7 +2172,7 @@ fn a_held_panes_turn_ledger_crosses_the_update() {
 /// placeholder, and the restore places everything else exactly.
 #[test]
 fn an_older_producers_held_pane_is_still_its_placeholder() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let _scratch = enter_scratch("held-old");
     let mut app = crate::App::headless_for_test();
@@ -2311,7 +2297,7 @@ fn an_older_producers_held_pane_is_still_its_placeholder() {
 /// before the carried exit named its block, unseen again after the first sweep.
 #[test]
 fn a_held_panes_seen_failure_stays_seen_across_the_update() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let _scratch = enter_scratch("held-seen");
     let mut app = crate::App::headless_for_test();
@@ -2519,7 +2505,7 @@ fn a_held_panes_seen_failure_stays_seen_across_the_update() {
 fn what_the_owner_was_told_and_has_seen_crosses_the_update() {
     use crate::status_item::StatusCarry;
     use crate::task_record::TaskState;
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let _scratch = enter_scratch("status-seen");
     let mut app = crate::App::headless_for_test();
@@ -2639,7 +2625,7 @@ fn the_autopilot_end_rides_the_park_and_the_intake_to_the_successor() {
     use crate::harness_end_carry::{CarriedEnd, EndCarry};
     use crate::harness_glass::EndFace;
     use aterm_agent::harness::acts::TaskFace;
-    let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let _scratch = enter_scratch("autopilot-end");
     let mut app = crate::App::headless_for_test();

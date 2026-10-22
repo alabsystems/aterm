@@ -11,7 +11,9 @@
 /// `[workspace.metadata.aterm] update_channel` equal to `DEFAULT_OWNER/DEFAULT_REPO`. It is
 /// the public mirror, readable with no credential, so a fresh install updates before anyone
 /// provisions it a token.
-pub const DEFAULT_OWNER: &str = "alabsystems";
+/// Defined from `aterm_types::channel::PUBLIC_OWNER`, which agh's release floor reads; it
+/// stays its own constant.
+pub const DEFAULT_OWNER: &str = aterm_types::channel::PUBLIC_OWNER;
 
 /// Default GitHub repository name the updater pulls releases from (`[update] repo`).
 pub const DEFAULT_REPO: &str = "aterm";
@@ -20,7 +22,9 @@ pub const DEFAULT_REPO: &str = "aterm";
 /// index's trust is account-bound, so it must not move when [`DEFAULT_OWNER`] (the app
 /// channel) is repointed, and the workspace `repository` owner is private, so a tokenless
 /// install 404s there.
-pub const ATPKG_INDEX_OWNER: &str = "alabsystems";
+/// Defined from `aterm_types::channel::PUBLIC_OWNER`, which agh's release floor reads; it
+/// stays its own constant.
+pub const ATPKG_INDEX_OWNER: &str = aterm_types::channel::PUBLIC_OWNER;
 
 /// Whether this build honours a repointed update source (`[update]` owner/repo): only a
 /// development build does (`debug_assertions` or the `dev-seams` feature, which the release

@@ -357,9 +357,9 @@ impl View {
 /// One pattern a capture is held to.
 pub(super) struct Row {
     /// Where it comes from, as a finding names it.
-    source: String,
+    pub(super) source: String,
     /// The pattern as grep runs it, on one line.
-    line: Regex,
+    pub(super) line: Regex,
     /// The same with `(?m)`: a whole view without a match of it holds no line
     /// with one.
     any: Regex,
@@ -370,7 +370,7 @@ pub(super) struct Row {
 const VIEW_STEPS: u64 = 1 << 32;
 
 impl Row {
-    fn new(source: String, pattern: &str) -> Result<Self, String> {
+    pub(super) fn new(source: String, pattern: &str) -> Result<Self, String> {
         let line = Regex::new(pattern).map_err(|e| e.to_string())?;
         let any = RegexBuilder::new(&format!("(?m){pattern}"))
             .step_limit(VIEW_STEPS)
@@ -382,12 +382,13 @@ impl Row {
 
 /// The rows of a pattern file (grep -E, one per line, `#` lines and blanks
 /// skipped after trimming, as the engine reads them), named `<label>:<line>`.
-/// A row that does not compile here is a finding at `finding_path`: no capture
-/// would be held to it.
+/// A row that does not compile here is a finding of `rule` at `finding_path`:
+/// nothing would be held to it.
 pub(super) fn file_rows(
     text: &str,
     label: &str,
     finding_path: &str,
+    rule: &'static str,
     out: &mut Vec<Finding>,
 ) -> Vec<Row> {
     let mut rows = Vec::new();
@@ -399,12 +400,11 @@ pub(super) fn file_rows(
         match Row::new(format!("{label}:{}", i + 1), pattern) {
             Ok(row) => rows.push(row),
             Err(why) => out.push(Finding {
-                rule: CAPTURE_PRIVACY.id,
+                rule,
                 path: finding_path.to_string(),
                 line: i + 1,
                 detail: format!(
-                    "this row does not compile in aterm-regex ({why}), so no capture is held \
-                     to it"
+                    "this row does not compile in aterm-regex ({why}), so nothing is held to it"
                 ),
             }),
         }
@@ -432,8 +432,8 @@ fn baseline_path() -> Option<PathBuf> {
         .map(|engine| engine.join(BASELINE))
 }
 
-/// The engine's baseline text, or why the rule judges without it.
-fn baseline() -> Result<(String, String), String> {
+/// The engine's baseline `(where, text)`, or why the rules judge without it.
+pub(super) fn baseline() -> Result<(String, String), String> {
     let path = baseline_path().ok_or("neither PUBLICATION_ENGINE nor HOME names the engine")?;
     let shown = path.display().to_string();
     std::fs::read_to_string(&path)
@@ -441,10 +441,11 @@ fn baseline() -> Result<(String, String), String> {
         .map_err(|e| format!("{shown}: {e}"))
 }
 
-/// The census's notes on what the rule judged without: the engine's baseline
-/// when this host does not have it, and the export's own rows when the
-/// checkout has none (a public snapshot withholds `publish/`, and the engine
-/// reads an absent extras file as no rows). [`CAPTURE_ROWS`] always hold.
+/// The census's notes on what this rule and `export-content` judged without:
+/// the engine's baseline when this host does not have it, and the export's own
+/// rows when the checkout has none (a public snapshot withholds `publish/`, and
+/// the engine reads an absent extras file as no rows). [`CAPTURE_ROWS`] always
+/// hold.
 pub(super) fn notes(root: &Path) -> Vec<String> {
     let mut without = Vec::new();
     if let Err(why) = baseline() {
@@ -457,7 +458,7 @@ pub(super) fn notes(root: &Path) -> Vec<String> {
         return Vec::new();
     }
     vec![format!(
-        "capture-privacy judged the captures without {}; the capture rows still held",
+        "capture-privacy and export-content judged without {}; the capture rows still held",
         without.join(" or ")
     )]
 }
@@ -491,9 +492,15 @@ fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mu
             String::new()
         }
     };
-    let mut rows = file_rows(&extra, EXTRA, EXTRA, out);
+    let mut rows = file_rows(&extra, EXTRA, EXTRA, CAPTURE_PRIVACY.id, out);
     if let Ok((path, text)) = baseline {
-        rows.extend(file_rows(&text, "the engine's baseline", &path, out));
+        rows.extend(file_rows(
+            &text,
+            "the engine's baseline",
+            &path,
+            CAPTURE_PRIVACY.id,
+            out,
+        ));
     }
     rows.extend(capture_rows());
     for rel in captures {

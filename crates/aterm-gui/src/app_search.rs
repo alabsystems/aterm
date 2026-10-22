@@ -833,22 +833,60 @@ impl App {
         }
     }
 
-    /// A user-level "Find" request (the Edit ▸ Find… menu item / a rebound Find
+    /// Whether the focused content in `wid` can open its own search. Shared
+    /// by the native menu and palette; a parked terminal supplies no capability.
+    pub(crate) fn can_find(&self, wid: crate::WindowId) -> bool {
+        if let Some((instance, view)) = self.active_native_view(wid) {
+            return match self.native_runtime.app(instance).map(|app| app.kind()) {
+                Some(crate::native_app::AppKind::Settings) => true,
+                Some(crate::native_app::AppKind::Editor) => matches!(
+                    self.native_runtime.view_state(view),
+                    Some(crate::native_app::AppViewState::Editor(state)) if state.buffer.is_some()
+                ),
+                _ => false,
+            };
+        }
+        self.front_terminal(wid).is_some()
+    }
+
+    /// Whether Find Next/Previous has a query in the focused content. An
+    /// empty open terminal search does not resume an older accepted query.
+    pub(crate) fn can_find_again(&self, wid: crate::WindowId) -> bool {
+        if let Some((_, view)) = self.active_native_view(wid) {
+            return matches!(
+                self.native_runtime.view_state(view),
+                Some(crate::native_app::AppViewState::Editor(state))
+                    if state.buffer.as_ref().is_some_and(
+                        crate::native_editor::EditorBufferView::has_search_query
+                    )
+            );
+        }
+        self.front_terminal(wid).is_some()
+            && self.windows.get(&wid).is_some_and(|ws| {
+                ws.search.as_ref().map_or_else(
+                    || !self.search_last_query.is_empty(),
+                    |search| !search.query.is_empty(),
+                )
+            })
+    }
+
+    /// A user-level "Find" request (the Edit ▸ Find ▸ Find… menu item / a rebound Find
     /// action), routed by the canonical focused content.
     pub(crate) fn find_requested(&mut self) {
         let Some(wid) = self.frontmost_window else {
             return;
         };
         if let Some((instance, _)) = self.active_native_view(wid) {
-            let action =
-                self.native_runtime
-                    .app(instance)
-                    .and_then(|app| match app.kind() {
-                        crate::native_app::AppKind::Settings => Some("settings/search"),
-                        crate::native_app::AppKind::Editor => Some("editor/find"),
-                        crate::native_app::AppKind::Markdown
-                        | crate::native_app::AppKind::Recovery => None,
-                    });
+            let action = self
+                .native_runtime
+                .app(instance)
+                .and_then(|app| match app.kind() {
+                    crate::native_app::AppKind::Settings => Some("settings/search"),
+                    crate::native_app::AppKind::Editor => Some("editor/find"),
+                    crate::native_app::AppKind::Markdown
+                    | crate::native_app::AppKind::SystemState
+                    | crate::native_app::AppKind::Recovery => None,
+                });
             if let Some(action) = action {
                 let _ = self.dispatch_native_event(
                     wid,
@@ -1509,13 +1547,37 @@ impl App {
         self.search_apply_current_in(wid);
     }
 
-    /// Edit ▸ Find Next/Previous (⌘G/⇧⌘G). With the bar open, an ordinary step; after
+    /// Edit ▸ Find ▸ Find Next/Previous (⌘G/⇧⌘G). With the bar open, an ordinary step; after
     /// ⏎ closed it, reopen the last accepted query and resume strictly after/before
     /// its match anchor, wrapping when the content changed or at an edge.
     ///
     /// Returns why it declined when there is nothing to step (no bar, no remembered
     /// query) so the menu seam reports it; key-path callers discard it.
     pub(crate) fn search_find_again(&mut self, forward: bool) -> Result<(), &'static str> {
+        if let Some(wid) = self.frontmost_window
+            && let Some((_, view)) = self.active_native_view(wid)
+        {
+            let Some(crate::native_app::AppViewState::Editor(state)) =
+                self.native_runtime.view_state(view)
+            else {
+                return Err("the active app does not support Find Next or Find Previous");
+            };
+            if !state
+                .buffer
+                .as_ref()
+                .is_some_and(crate::native_editor::EditorBufferView::has_search_query)
+            {
+                return Err("there is no editor search to step — find something first");
+            }
+            let command = if forward {
+                crate::native_editor::EditorCommand::SearchNext
+            } else {
+                crate::native_editor::EditorCommand::SearchPrevious
+            };
+            self.dispatch_native_event(wid, crate::native_app::AppEvent::EditorCommand(command))
+                .map_err(|_| "the editor could not navigate its search")?;
+            return Ok(());
+        }
         if self.front().is_some_and(|ws| ws.search.is_some()) {
             self.search_step(forward);
             return Ok(());
@@ -1895,7 +1957,7 @@ impl App {
 /// thread, reaches the main thread through a `Wake`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FindAction {
-    /// Edit ▸ Find… (⌘F).
+    /// Edit ▸ Find ▸ Find… (⌘F).
     Open,
     /// Insert text at the caret — a printable keypress, or an IME commit.
     Type(String),

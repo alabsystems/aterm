@@ -4676,7 +4676,8 @@ mod tests {
         assert_eq!(filed.len(), 1, "{said}");
         assert!(said.contains("\nFACTS: "), "{said}");
         let plan = fs::read_to_string(root_of(&s).join("logs/.plan")).unwrap();
-        let head = crate::ledger::rev_parse(&GitCli::new(&s.repo), "HEAD").unwrap();
+        let head =
+            crate::ledger::rev_parse(&crate::ledger::testing::Git::new(&s.repo), "HEAD").unwrap();
         assert!(plan.contains(&format!("\ncommit {head}\n")), "{plan}");
         assert!(
             plan.contains("\nfile \n"),
@@ -4882,7 +4883,7 @@ mod tests {
         assert_eq!(filed.len(), 1, "{said}");
         let original = filed_facts(&s, &filed[0]);
         let prover = trust_facts::Prover::at(&s.driver.bin);
-        let git = GitCli::new(&s.repo);
+        let git = crate::ledger::testing::Git::new(&s.repo);
         assert_eq!(
             trust_facts::pending_for(&git, &prover, "HEAD")
                 .unwrap()
@@ -4932,7 +4933,7 @@ mod tests {
         assert_eq!(outcome, Outcome::Undecided(vec!["alpha".into()]), "{said}");
         assert_eq!(filed.len(), 1, "{said}");
         let original = filed_facts(&s, &filed[0]);
-        let git = GitCli::new(&s.repo);
+        let git = crate::ledger::testing::Git::new(&s.repo);
         let measured = crate::ledger::rev_parse(&git, "HEAD").unwrap();
         fs::write(
             s.repo.join("crates/alpha/src/lib.rs"),

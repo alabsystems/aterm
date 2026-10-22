@@ -927,6 +927,7 @@ fn still_actionable(intent: &Intent, live: bool, host: &impl Host) -> bool {
         | Intent::OpenSettings { .. }
         | Intent::OpenConfigEditor { .. }
         | Intent::OpenSystemPane { .. }
+        | Intent::OpenLink { .. }
         | Intent::NewWindow => host.performs_navigation(),
     }
 }
@@ -998,6 +999,8 @@ pub fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
         (Intent::OpenPath { .. }, false) => "Could not open the log".to_string(),
         (Intent::OpenSystemPane { .. }, true) => "Opened System Settings".to_string(),
         (Intent::OpenSystemPane { .. }, false) => "System Settings did not open".to_string(),
+        (Intent::OpenLink { .. }, true) => "Opened the page in your browser".to_string(),
+        (Intent::OpenLink { .. }, false) => "Could not open the page".to_string(),
         (Intent::ApplyUpdate { .. }, true) if applies => "Installing the update".to_string(),
         (Intent::ApplyUpdate { .. }, true) => {
             "Opened Settings \u{25b8} Software Update".to_string()

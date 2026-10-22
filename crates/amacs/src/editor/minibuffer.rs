@@ -87,7 +87,7 @@ impl EditorWorkspace {
             }
         };
         if search {
-            let mut effects = self.update_incremental_search(store, view, false)?;
+            let mut effects = self.update_incremental_search(store, view)?;
             if !complete {
                 effects.push(EditorEffect::Status(format!(
                     "Minibuffer input is limited to {MINIBUFFER_QUERY_LIMIT} bytes"
@@ -128,7 +128,7 @@ impl EditorWorkspace {
         let boundary = previous_boundary(query, query.len());
         query.truncate(boundary);
         if search {
-            self.update_incremental_search(store, view, false)
+            self.update_incremental_search(store, view)
         } else {
             Ok(Vec::new())
         }
@@ -159,16 +159,21 @@ impl EditorWorkspace {
             }
             // The selected match is the result; an empty status clears the
             // `I-search:` line rather than echoing the query back.
-            Minibuffer::Search { query, .. } => Ok(vec![EditorEffect::Status(
-                if query.is_empty() {
-                    "Search cancelled"
-                } else if view.primary_selection().range().is_empty() {
-                    "Not found"
-                } else {
-                    ""
+            Minibuffer::Search { query, .. } => {
+                if !query.is_empty() {
+                    view.last_search_query.clone_from(&query);
                 }
-                .to_string(),
-            )]),
+                Ok(vec![EditorEffect::Status(
+                    if query.is_empty() {
+                        "Search cancelled"
+                    } else if view.primary_selection().range().is_empty() {
+                        "Not found"
+                    } else {
+                        ""
+                    }
+                    .to_string(),
+                )])
+            }
             // A macro being defined keeps each answer with the command its
             // key recorded, as for a command prompt below.
             Minibuffer::Buffer { query } => {
@@ -498,6 +503,76 @@ mod tests {
             .unwrap();
         assert_eq!(view.primary_selection(), &Selection::caret(4));
         assert!(matches!(view.minibuffer, Minibuffer::Inactive));
+    }
+
+    /// A modal return point belongs to the shared document, like its selection.
+    /// Edits from another view move it before Cancel restores it, including an
+    /// insertion at the origin and replacement that removes it altogether.
+    #[test]
+    fn external_edits_rebase_search_and_goto_line_cancel_origins() {
+        use crate::store::DocumentViewId;
+
+        let source = "xα needle";
+        let prefixed = "long prefix\nxα needle";
+        for command in [EditorCommand::IncrementalSearch, EditorCommand::GotoLine] {
+            for (text, origin, changed, inserted, expected) in [
+                (source, "xα".len(), 0..0, "🦀", "🦀xα".len()),
+                (source, "xα".len(), 3..3, "🦀", "xα🦀".len()),
+                (
+                    prefixed,
+                    "long prefix\nxα".len(),
+                    0.."long prefix\n".len(),
+                    "",
+                    "xα".len(),
+                ),
+                (source, "xα".len(), 0..source.len(), "λ", "λ".len()),
+            ] {
+                let (mut store, mut workspace, mut view, document) = editor(text);
+                let mut writer = workspace
+                    .attach(&mut store, document, DocumentViewId(92))
+                    .unwrap();
+                view.selections = vec![Selection::caret(origin)];
+                workspace.execute(&mut store, &mut view, command).unwrap();
+                let query = if command == EditorCommand::IncrementalSearch {
+                    "needle"
+                } else {
+                    "invalid line"
+                };
+                workspace
+                    .insert_minibuffer_text(&store, &mut view, query)
+                    .unwrap();
+                writer.selections = vec![Selection {
+                    anchor: changed.start,
+                    head: changed.end,
+                }];
+                workspace
+                    .insert_text(&mut store, &mut writer, inserted)
+                    .unwrap();
+                let (seq, deltas) = workspace.take_last_commit(document).unwrap();
+                view.observe_external(seq, &deltas);
+                let before_cancel = store.snapshot(document).unwrap();
+                assert!(before_cancel.text.is_char_boundary(expected));
+
+                workspace
+                    .handle_chord(&mut store, &mut view, KeyChord::parse("C-g").unwrap())
+                    .unwrap();
+                assert_eq!(
+                    view.primary_selection(),
+                    &Selection::caret(expected),
+                    "{command:?}: {text:?}, insertion {inserted:?}"
+                );
+                assert!(
+                    before_cancel
+                        .text
+                        .is_char_boundary(view.primary_selection().head)
+                );
+                assert!(matches!(view.minibuffer, Minibuffer::Inactive));
+                assert_eq!(view.anchor_seq(), seq);
+                let after_cancel = store.snapshot(document).unwrap();
+                assert_eq!(after_cancel.seq, before_cancel.seq);
+                assert_eq!(after_cancel.text, before_cancel.text);
+            }
+        }
     }
 
     #[test]

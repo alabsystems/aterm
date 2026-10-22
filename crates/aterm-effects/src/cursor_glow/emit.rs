@@ -967,7 +967,15 @@ impl CursorGlow {
         };
         // Under the letters: the ink is solved against the theme's own text.
         let ground = self.light_ground(cfg);
-        let ink = |rgb: u32| ground.body_ink(rgb);
+        let ink_memo = std::cell::Cell::new(None::<(u32, u32)>);
+        let ink = |rgb: u32| match ink_memo.get() {
+            Some((prev, solved)) if prev == rgb => solved,
+            _ => {
+                let solved = ground.body_ink(rgb);
+                ink_memo.set(Some((rgb, solved)));
+                solved
+            }
+        };
         let clip = geom.beam_clip();
         // Eighth-cell slabs: a slab carries one coverage, so a wider one
         // would show the falloff as steps.
@@ -2085,6 +2093,10 @@ impl CursorGlow {
                     n_slab += 1;
                 }
                 let active_tongues = &slab_tongues[..n_slab];
+                if active_tongues.is_empty() {
+                    y += h;
+                    continue;
+                }
                 // The union of the tongues at a knot: the most opaque, in
                 // the colour of the paint there weighted by its opacity, under
                 // the cell's ceiling.
@@ -2539,12 +2551,14 @@ impl CursorGlow {
     /// The water's crest colour at path position `pos` (tail 0, head 1) and
     /// heat `heat`: a clear cyan, deeper toward the tail (a slate at the
     /// ramp's middle read as dull grey water).
+    #[inline]
     pub(super) fn water_crest_color(pos: f32, heat: f32) -> u32 {
         water_ramp(0.66 + 0.24 * pos + 0.10 * heat)
     }
 
     /// The first sample of the run of adjacent samples that ends just
     /// before `end` in `samples`.
+    #[inline]
     fn water_run_start(samples: &[WaterSample], end: usize) -> usize {
         let mut start = end - 1;
         while start > 0 {
@@ -2850,6 +2864,7 @@ impl CursorGlow {
     /// seam point 3): [`Self::MAX_QUADS`] for `under` and `out`,
     /// [`Self::MAX_HALOS`] for `halos`. A capacity compare per frame after
     /// the first; `reserve` is exact-or-more, never a shrink.
+    #[inline]
     pub(super) fn reserve_v2_scratch(
         under: &mut Vec<GlowQuad>,
         out: &mut Vec<GlowQuad>,
@@ -2868,6 +2883,7 @@ impl CursorGlow {
 
     /// Cap the halo stream to [`Self::MAX_HALOS`]; v2's quads are self-capped at
     /// the emitter.
+    #[inline]
     pub(super) fn cap_and_clear_v2_streams(halos: &mut Vec<RainHalo>) {
         halos.truncate(Self::MAX_HALOS);
     }
@@ -3453,6 +3469,9 @@ impl CursorGlow {
         halos: &mut Vec<RainHalo>,
         under: &mut Vec<GlowQuad>,
     ) {
+        if self.particles.is_empty() {
+            return;
+        }
         let sz = (geom.ch as f32 * 0.18).max(2.0) as i32;
         let water = matches!(cfg.style, GlowStyle::Water);
         let dark = cfg.dark_theme;
@@ -3462,21 +3481,14 @@ impl CursorGlow {
         let beam = matches!(cfg.style, GlowStyle::Beam);
         let lawful = !matches!(cfg.style, GlowStyle::Fire | GlowStyle::Beam);
         let light_fire = !dark && matches!(cfg.style, GlowStyle::Fire);
-        let ch = geom.ch as f32;
+        let (cwf, ch) = (geom.cw as f32, geom.ch as f32);
+        let (oxf, oyf) = (f32::from(geom.origin_x), f32::from(geom.origin_y));
         // Read the frame's text once a frame, and only when a grain that
         // keeps off it flies.
-        let fire = matches!(cfg.style, GlowStyle::Fire);
-        let text = TextView::new(
-            if (lawful || fire || beam) && !self.particles.is_empty() {
-                self.probed_text_spans()
-            } else {
-                TextSpans::default()
-            },
-            Some(&self.frame_text),
-        );
+        let text = TextView::new(self.probed_text_spans(), Some(&self.frame_text));
         let covers = |x: f32, y: f32| {
-            let row = ((y - f32::from(geom.origin_y)) / ch).floor() as i32;
-            let col = ((x - f32::from(geom.origin_x)) / geom.cw as f32).floor() as i32;
+            let row = ((y - oyf) / ch).floor() as i32;
+            let col = ((x - oxf) / cwf).floor() as i32;
             text.covers_cell(row, col)
         };
         // A mark's reach past its centre: a grain whose centre sits just off
@@ -3491,7 +3503,6 @@ impl CursorGlow {
         };
         // The glyph band of a row holding text (from above its ascenders to
         // its descenders' feet): its top's window y when `y` lies in it.
-        let oyf = f32::from(geom.origin_y);
         let glyph_band = |y: f32| -> Option<(i32, f32)> {
             let row = ((y - oyf) / ch).floor() as i32;
             let top = oyf + row as f32 * ch;
@@ -3519,6 +3530,11 @@ impl CursorGlow {
         let sparkle = matches!(cfg.style, GlowStyle::Sparkle);
         let base_cov = if water { 112.0 } else { 230.0 };
         let laser_thick = (ch * 0.11).max(1.5);
+        let mini_comet_girth = if dark {
+            (ch * 0.09).max(1.2)
+        } else {
+            (ch * 0.13).max(2.0)
+        };
         let fine_star_arm = star_arm_px(star_arm(ch, STAR_ARM_FINE));
         let sparkle_gold_rgb = (sparkle && dark).then(|| Self::sparkle_gold(cfg));
         'flying: for p in self.particles.iter().rev() {
@@ -3573,7 +3589,7 @@ impl CursorGlow {
             if (sparkle || beam)
                 && (near_text(x, y)
                     || glyph_band(y).is_some_and(|(row, _)| {
-                        let col = ((x - f32::from(geom.origin_x)) / geom.cw as f32).floor() as i32;
+                        let col = ((x - oxf) / cwf).floor() as i32;
                         Some(row) != caret_row && (-2..=2).any(|d| text.covers_cell(row, col + d))
                     }))
             {
@@ -4039,12 +4055,7 @@ impl CursorGlow {
                             // On paper the dash is a stroke of ink, which
                             // needs a little more girth than a line of
                             // light to register.
-                            let girth = if dark {
-                                (ch * 0.09).max(1.2)
-                            } else {
-                                (ch * 0.13).max(2.0)
-                            };
-                            let (thick, vy) = (girth, p.vy + p.gy * age);
+                            let (thick, vy) = (mini_comet_girth, p.vy + p.gy * age);
                             if dark {
                                 push_velocity_dash(
                                     out, geom, x, y, p.vx, vy, 0.08, thick, dash, dash, cov,
@@ -4148,6 +4159,7 @@ impl CursorGlow {
     /// ([`LightGround::of`]). Its ink is unsolved (the bare vivid ink, never
     /// lifted for the theme's text) only when a test asks: the negative
     /// control of the light-body legibility tests.
+    #[inline]
     pub(super) fn light_ground(&self, cfg: &GlowConfig) -> LightGround {
         let ground = LightGround::of(cfg);
         #[cfg(test)]
@@ -4282,6 +4294,7 @@ impl CursorGlow {
     /// Sparkle's gold on a dark ground: its configured colour (starlight
     /// gold by default) at a warm gold's chroma, so the comet reads gold, not
     /// cream.
+    #[inline]
     pub(super) fn sparkle_gold(cfg: &GlowConfig) -> u32 {
         crate::spectrum::spectrum_with_min_saturation(cfg.color & 0x00FF_FFFF, 0.72)
     }
@@ -4289,6 +4302,7 @@ impl CursorGlow {
     /// Sparkle's gold along its tail, `pos` 0 (tail) to 1 (head): its gold
     /// at the head, a shade deeper at the tail, never leaving the gold
     /// family (a warmer tail fading over the dark read as rust and brown).
+    #[inline]
     pub(super) fn sparkle_gold_at(cfg: &GlowConfig, pos: f32) -> u32 {
         let gold = Self::sparkle_gold(cfg);
         let (h, s, v) = crate::color_math::rgb2hsv(gold);
@@ -4300,6 +4314,7 @@ impl CursorGlow {
     /// A sparkle mark's opacity on paper for a dark coverage request: a
     /// fresh mark is all but opaque (it is never laid over the text, so it
     /// needs no may-touch-text ceiling), and a fading one thins with it.
+    #[inline]
     pub(super) fn paper_gold_alpha(cov: u8) -> u8 {
         (f32::from(cov) * 1.25).min(240.0) as u8
     }
@@ -4310,6 +4325,7 @@ impl CursorGlow {
 /// of cells a cell apart sum to one, so the heat between two burning cells
 /// runs smoothly from one's to the other's and a run's ends fall off over a
 /// cell, never standing square on a cell edge ([`flame_heat`]).
+#[inline]
 fn flame_kernel(d: f32) -> f32 {
     let d = d.abs();
     if d >= 1.0 {
@@ -4321,6 +4337,7 @@ fn flame_kernel(d: f32) -> f32 {
 
 /// The fire's heat at column position `u` (cells, from the grid's left
 /// edge) along the burning `cells` of one row ([`flame_kernel`]).
+#[inline]
 fn flame_heat<'a>(cells: impl Iterator<Item = &'a (u16, u16, f32)>, u: f32) -> f32 {
     cells
         .map(|c| c.2 * flame_kernel(u - (f32::from(c.1) + 0.5)))
@@ -4331,6 +4348,7 @@ fn flame_heat<'a>(cells: impl Iterator<Item = &'a (u16, u16, f32)>, u: f32) -> f
 /// The dark flame field's ceiling as a share of its whole, at `rise` (0 at
 /// the root, 1 at the tallest tongue's tip): whole over the lower third,
 /// thinning to a quarter at the tips, so the light dies upward.
+#[inline]
 fn flame_tip_fade(rise: f32) -> f32 {
     const HOLD: f32 = 0.33;
     if rise <= HOLD {
@@ -4352,6 +4370,7 @@ const FLAME_LIGHT_STOPS: [(f32, u32); 4] = [
 /// Channel bounds of the actual ramp stops: interpolation and the tongues'
 /// opacity-weighted colour mixture stay in the same box. Derived from the
 /// ramp itself, so a different or nonmonotone palette keeps the admission.
+#[inline]
 fn flame_light_paint_bounds() -> (u32, u32) {
     FLAME_LIGHT_STOPS
         .iter()
@@ -4364,6 +4383,7 @@ fn flame_light_paint_bounds() -> (u32, u32) {
 /// tip), interpolated within the same stops the cap's envelope reads: a
 /// warm orange root going amber and gold toward the tip (a pale yellow tip
 /// vanished on white, so the tongue read a row shorter than it stood).
+#[inline]
 fn flame_light_ramp(rise: f32) -> u32 {
     let rise = rise.clamp(0.0, 1.0);
     let i = FLAME_LIGHT_STOPS
@@ -4406,6 +4426,7 @@ fn fire_band_lifts(
 
 /// The bloom-layer stack `style` draws its streak with (and charges its
 /// over-ink budget against): each beam style's own, the comet's for the rest.
+#[inline]
 fn streak_layers(style: GlowStyle) -> &'static [(f32, f32, u32, f32, f32, usize)] {
     match style {
         GlowStyle::Phaser => &PHASER_LAYERS,
@@ -4420,6 +4441,7 @@ fn streak_layers(style: GlowStyle) -> &'static [(f32, f32, u32, f32, f32, usize)
 /// watermark `runs_len`, `run` the open one): a cell more than one step from
 /// `prev` publishes the open run first, so a hide/show gap or a stale older
 /// group never connects across empty space.
+#[inline]
 fn chain_comet_sample(
     runs: &mut Vec<Vec<CometSample>>,
     run: &mut Vec<CometSample>,
@@ -4442,6 +4464,7 @@ fn chain_comet_sample(
 /// Publish the open comet `run`, when it holds a sample, at the pool
 /// watermark `runs_len`. Swapped rather than taken, so the next run reuses
 /// the pooled buffer's capacity.
+#[inline]
 fn publish_comet_run(
     runs: &mut Vec<Vec<CometSample>>,
     run: &mut Vec<CometSample>,

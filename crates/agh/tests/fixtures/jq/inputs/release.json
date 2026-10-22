@@ -1,0 +1,52 @@
+{
+  "id": 190000101,
+  "tag_name": "v0.97.0",
+  "name": "aterm 0.97.0",
+  "draft": false,
+  "prerelease": false,
+  "immutable": false,
+  "target_commitish": "main",
+  "created_at": "2026-10-01T09:00:00Z",
+  "published_at": "2026-10-01T09:30:00Z",
+  "html_url": "https://github.com/alabsystems/aterm/releases/tag/v0.97.0",
+  "body": "First line of the notes.\nSecond line.",
+  "author": {"login": "fixture-release-bot", "id": 9000001, "type": "Bot"},
+  "assets": [
+    {
+      "id": 300000201,
+      "name": "SHA256SUMS",
+      "size": 512,
+      "digest": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "state": "uploaded",
+      "content_type": "text/plain",
+      "created_at": "2026-10-01T09:10:00Z",
+      "updated_at": "2026-10-01T09:11:00Z",
+      "browser_download_url": "https://github.com/alabsystems/aterm/releases/download/v0.97.0/SHA256SUMS",
+      "download_count": 12
+    },
+    {
+      "id": 300000202,
+      "name": "aterm-0.97.0.dmg",
+      "size": 48123456,
+      "digest": null,
+      "state": "uploaded",
+      "content_type": "application/x-apple-diskimage",
+      "created_at": "2026-10-01T09:12:00Z",
+      "updated_at": "2026-10-01T09:20:00Z",
+      "browser_download_url": "https://github.com/alabsystems/aterm/releases/download/v0.97.0/aterm-0.97.0.dmg",
+      "download_count": 40
+    },
+    {
+      "id": 300000203,
+      "name": "aterm-appcast.toml",
+      "size": 2048,
+      "digest": "sha256:2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+      "state": "uploaded",
+      "content_type": "application/toml",
+      "created_at": "2026-10-01T09:21:00Z",
+      "updated_at": "2026-10-01T09:22:00Z",
+      "browser_download_url": "https://github.com/alabsystems/aterm/releases/download/v0.97.0/aterm-appcast.toml",
+      "download_count": 3
+    }
+  ]
+}

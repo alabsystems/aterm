@@ -4226,7 +4226,7 @@ pub(crate) fn footnote_of(key: &str) -> Option<&'static str> {
         // rows says only theirs and never points at rows it does not show.
         EDIT_HARNESS_ENABLED => HARNESS_NOTE,
         k if agent_switch(k).is_some() => HARNESS_AGENT_NOTE,
-        EDIT_HARNESS_AUTOPILOT => HARNESS_AUTOPILOT_NOTE,
+        EDIT_HARNESS_AUTOPILOT => HARNESS_AUTOPILOT_NOTE.as_str(),
         EDIT_HARNESS_LAND_AT => HARNESS_LAND_AT_NOTE,
         EDIT_HARNESS_APPROVE => HARNESS_APPROVE_NOTE,
         EDIT_HARNESS_ANSWER_QUESTIONS | EDIT_HARNESS_QUESTION_PRIORITY => HARNESS_QUESTIONS_NOTE,
@@ -4277,10 +4277,25 @@ pub(crate) const HARNESS_NOTE: &str = "aterm keeps your coding agents working by
 pub(crate) const HARNESS_AGENT_NOTE: &str = "Off, aterm leaves that agent's sessions alone; \
      Supervise coding agents turns supervision off for all of them.";
 /// What the default autopilot's modes mean, for a session with none of its
-/// own.
-pub(crate) const HARNESS_AUTOPILOT_NOTE: &str = "For sessions with no autopilot of their own: \
-     Cruise keeps the work going, and nothing the agent says ends it; Land lands all of the work \
-     on the remote main branch, then stops; Off leaves the session alone.";
+/// own: each mode, named as its segment says it, then its record's sentence
+/// from the one table (`autopilot::MODE_WORDS`,
+/// `docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.1), so Settings ▸
+/// Harness says a mode the one way the chip's title, the records and the
+/// SESSIONS buttons do. Composed once, at its first read.
+pub(crate) static HARNESS_AUTOPILOT_NOTE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        let mut note = String::from("For sessions with no autopilot of their own.");
+        for words in &crate::autopilot::MODE_WORDS {
+            let mut word = words.mode.word().chars();
+            note.push_str(" Under ");
+            note.extend(word.next().into_iter().flat_map(char::to_uppercase));
+            note.push_str(word.as_str());
+            note.push_str(", ");
+            note.push_str(words.record);
+            note.push('.');
+        }
+        note
+    });
 /// What the Land at time does: offered, never armed.
 pub(crate) const HARNESS_LAND_AT_NOTE: &str = "A time, HH:MM, that each session's Autopilot \
      menu offers: cruise until then, then land. Nothing changes until you pick it.";

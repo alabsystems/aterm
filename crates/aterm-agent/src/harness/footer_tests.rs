@@ -825,7 +825,7 @@ fn the_floor_second_is_the_processs_and_the_first_row_before_it_ends_the_scan() 
     let before = answer_at("claude-fable-5-1", "2026-09-28T14:59:59.900Z", None);
     let above = answer_at("claude-sonnet-5", "2026-09-28T15:10:00.000Z", Some("low"));
     let read = |rows: &[&str]| {
-        let (facts, floored) = scan(body(rows).as_bytes(), floor);
+        let (facts, floored) = scan(&rows_of(body(rows).as_bytes()).collect::<Vec<_>>(), floor);
         (facts.model, facts.effort, floored)
     };
     assert_eq!(
@@ -4500,10 +4500,13 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
     };
     // Cruise's hovered title with no act taken (§9.2.1): the whole, v1's
     // words (no trail to give up first), the phrase with both clicks, with
-    // the click alone, and the mode phrase.
-    let whole_title = "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land \u{b7} \
-                       right-click: more";
-    let v1 = "autopilot: cruise \u{2014} keeps the work moving \u{b7} click: land";
+    // the click alone, and the mode phrase. Its explanation is the one the
+    // window draws (aterm-gui's `autopilot::MODE_WORDS`, which this crate
+    // cannot read), so the widths are the real title's.
+    let whole_title = "autopilot: cruise \u{2014} keeps going for ever, finding more to do \u{b7} \
+                       click: land \u{b7} right-click: more";
+    let v1 =
+        "autopilot: cruise \u{2014} keeps going for ever, finding more to do \u{b7} click: land";
     let clicks = "autopilot: cruise \u{b7} click: land \u{b7} right-click: more";
     let click = "autopilot: cruise \u{b7} click: land";
     let hover = LightsWidth {
@@ -4573,7 +4576,9 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
         );
     }
     // The Together run's pane, 120 columns: the path cut, the label and the
-    // title drawn beside it. RED without the fix.
+    // title drawn beside it — the hover's phrase with both clicks, since
+    // Cruise's sentence grew too long for v1's words there. RED without the
+    // fix.
     let room = rule_room(&(0..120));
     let cut = |fit: &RuleFit| {
         fit.segments
@@ -4587,8 +4592,8 @@ fn a_title_stands_beside_the_facts_as_they_fit_without_it() {
     );
     let hovered = fit_rule(&facts, room, Some(hover));
     assert!(
-        cut(&hovered) && hovered.title == TitleFit::Lean(1),
-        "v1's words beside `…/proj-claude`: {hovered:?}"
+        cut(&hovered) && hovered.title == TitleFit::Lean(2),
+        "the phrase and its clicks beside `…/proj-claude`: {hovered:?}"
     );
     // Where the label does not fit beside what fits, it goes cleanly: the
     // chips stand with the facts and no title. In no room, nothing at all.

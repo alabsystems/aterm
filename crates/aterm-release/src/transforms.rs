@@ -24,26 +24,17 @@
 //!   nothing the export withholds ([`prune_lock`]).
 //! * The private org becomes the public one, and developer homes are anonymized to
 //!   exactly the guards' shapes — nothing wider: a bare `/Users/` is behaviour
-//!   (relocate.rs's machine-local prefix) and ships as written.
+//!   (relocate.rs's machine-local prefix) and ships as written. The rewrite is
+//!   `aterm_census::export::rewrite`, defined once: the census's `export-content`
+//!   guard reads the checkout through it, so a line the engine would refuse is a
+//!   finding before a push.
 //!
 //! The version and rust-toolchain.toml ship as committed. No content rule refuses
 //! here: every rule is a guard pattern, reported together by the engine.
 
 use std::path::{Path, PathBuf};
 
-// Each needle is spelled in halves: written whole, the export's own rewrite would
-// change it in the exported copy of this file, and the account word would trip the
-// export's guard (publish/forbidden-extra.txt).
-
-/// The developer account the export renames.
-const ACCOUNT: &str = concat!("aya", "tes");
-
-/// The private org, which becomes the public one.
-const PRIVATE_ORG: &str = concat!("andrew", "yatesai");
-
-/// The toolchain checkouts a home path names.
-const TILDE_TRUST: &str = concat!("~", "/trust");
-const TILDE_CLEAN: &str = concat!("~", "/clean");
+use aterm_census::export::rewrite;
 
 /// What the engine hands the transforms.
 #[derive(Debug, Clone)]
@@ -845,50 +836,6 @@ fn strip_targets(export: &Path) -> Result<Vec<(String, String, String)>, String>
     Ok(dropped)
 }
 
-/// Replace every `from` in `text` with `to`.
-fn replace_all(text: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(text.len());
-    let mut i = 0;
-    while i < text.len() {
-        if text[i..].starts_with(from) {
-            out.extend_from_slice(to);
-            i += from.len();
-        } else {
-            out.push(text[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
-/// The text rewrites, in order, over one file's bytes.
-#[must_use]
-pub fn rewrite(text: &[u8]) -> Vec<u8> {
-    let home = format!("/Users/{ACCOUNT}");
-    let at = format!("{ACCOUNT}@");
-    // the public org, never the private one
-    let mut t = replace_all(text, PRIVATE_ORG.as_bytes(), b"alabsystems");
-    // the developer's home becomes an example one
-    t = replace_all(&t, home.as_bytes(), b"/Users//example");
-    // every /Users/<letter> gets a doubled separator: still an absolute macOS Users
-    // path, but no account the central guard's `/Users/[A-Za-z]` can name
-    let mut doubled = Vec::with_capacity(t.len());
-    let mut i = 0;
-    while i < t.len() {
-        if t[i..].starts_with(b"/Users/") && t.get(i + 7).is_some_and(u8::is_ascii_alphabetic) {
-            doubled.extend_from_slice(b"/Users//");
-            i += 7;
-        } else {
-            doubled.push(t[i]);
-            i += 1;
-        }
-    }
-    t = replace_all(&doubled, TILDE_TRUST.as_bytes(), b"$HOME/trust");
-    t = replace_all(&t, TILDE_CLEAN.as_bytes(), b"$HOME/clean");
-    // the account written without a /Users/ prefix (a prompt captured as bytes)
-    replace_all(&t, at.as_bytes(), b"user@")
-}
-
 /// [`rewrite`] over every text file of the tree (a file holding a NUL is binary and
 /// left alone; symlinks are not followed).
 fn rewrite_tree(dir: &Path) -> Result<(), String> {
@@ -915,37 +862,6 @@ fn rewrite_tree(dir: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_rewrites_take_exactly_the_guards_shapes() {
-        let acct = ACCOUNT;
-        let case = |input: String, want: &str| {
-            assert_eq!(
-                String::from_utf8(rewrite(input.as_bytes())).unwrap(),
-                want,
-                "{input}"
-            );
-        };
-        case(
-            format!("https://github.com/{PRIVATE_ORG}/aterm"),
-            "https://github.com/alabsystems/aterm",
-        );
-        case(
-            format!("/Users/{acct}/aterm/target"),
-            "/Users//example/aterm/target",
-        );
-        case("/Users//someone/Library".into(), "/Users//someone/Library");
-        case(format!("{TILDE_TRUST}/build"), "$HOME/trust/build");
-        case(format!("{TILDE_CLEAN}/bin"), "$HOME/clean/bin");
-        case(format!("b\"{acct}@mac ~ % \""), "b\"user@mac ~ % \"");
-        // a bare "/Users/" is behaviour (relocate.rs's machine-local prefix): as written
-        case(
-            "path.starts_with(\"/Users/\")".into(),
-            "path.starts_with(\"/Users/\")",
-        );
-        // the version is not a rewrite: a patch slot other than 0 reaches the engine
-        case("version = \"0.104.7\"".into(), "version = \"0.104.7\"");
-    }
 
     #[test]
     fn astreams_root_keeps_what_its_crates_inherit_and_names_no_member() {

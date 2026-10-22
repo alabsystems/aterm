@@ -11,7 +11,8 @@
 //! own section; those rows keep the exact window, instance, view, lifecycle generation and
 //! reducer action that produced them. A `query` narrows the list (fuzzy subsequence over
 //! `label` + `section`, plus a theme row's appearance). Menu activation converges on
-//! `Wake::MenuAction`; native activation is generation-checked before it becomes
+//! `Wake::MenuAction`; a shared menu row supplied by a native command keeps that
+//! native destination. Native activation is generation-checked before it becomes
 //! `AppEvent::Action`.
 //!
 //! A Theme section follows the menu rows: one row per theme the catalog can draw
@@ -131,6 +132,20 @@ pub(crate) struct NativeCommandTarget {
     pub(crate) action: ActionId,
 }
 
+impl NativeCommandTarget {
+    /// A native command may supply the exact destination of a shared menu command.
+    /// Derive that overlap from the canonical command identities, not display labels.
+    fn menu_action(&self) -> Option<MenuAction> {
+        let native = crate::command_registry::native_document_action(self.action.as_str())?;
+        MENU_MODEL
+            .iter()
+            .flat_map(|section| section.entries)
+            .flat_map(|entry| entry.items())
+            .map(|(_, action, _, _)| action)
+            .find(|action| crate::command_registry::menu_command(*action).id == native.id)
+    }
+}
+
 /// The command domains share pixels, filtering, controls, and accessibility while
 /// keeping their dispatch authorities distinct.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +208,7 @@ impl PaletteTheme {
             section: Cow::Borrowed(THEME_SECTION),
             label: Cow::Owned(self.label),
             action: PaletteTarget::Theme(self.id),
+            menu_alias: None,
             key: "",
             mods: MenuMods::None,
             shortcut: Cow::Borrowed(match self.appearance {
@@ -224,8 +240,11 @@ pub(crate) struct PaletteRow {
     /// The command label. `Cow` because [`PaletteState::resolve`] writes some live ones:
     /// the update row's version, a fleet hold's reason.
     pub label: Cow<'static, str>,
-    /// The command this row dispatches. Menu and native authority never alias.
+    /// The command this row dispatches. A shared menu label may carry an exact native target.
     pub action: PaletteTarget,
+    /// A shared menu row's identity while its dispatch target is native. Recovery-only
+    /// native rows have no alias and retain their reducer-supplied labels and ordering.
+    menu_alias: Option<MenuAction>,
     /// The visual key-equivalent character ("" for none), right-aligned as an accelerator.
     pub key: &'static str,
     /// The accelerator's modifier mask (rendered ⌘ / ⇧⌘ / ⌃⌘ before `key`).
@@ -239,6 +258,12 @@ pub(crate) struct PaletteRow {
     pub enabled: bool,
     /// A checkbox state for toggle commands (e.g. Serious Mode); `None` for plain commands.
     pub checked: Option<bool>,
+}
+
+impl PaletteRow {
+    fn menu(&self) -> Option<MenuAction> {
+        self.menu_alias.or_else(|| self.action.menu())
+    }
 }
 
 /// Native command snapshot prepended to the shared command surface. The section is owned
@@ -261,6 +286,12 @@ pub(crate) struct NativeCommandScope {
 pub(crate) struct PaletteLive {
     /// A text selection exists (gates Copy).
     pub has_selection: bool,
+    /// The active editor has changes its file grant can save.
+    pub can_save: bool,
+    /// The focused content can open a search.
+    pub can_find: bool,
+    /// The focused content has a query Find Next/Previous can navigate.
+    pub can_find_again: bool,
     /// The front session's effective matrix-rain state (its runtime override, else the
     /// config bit): the checkmark on Matrix Rain. False with no front terminal.
     pub rain_on: bool,
@@ -399,6 +430,7 @@ impl PaletteState {
                         section: Cow::Borrowed(section.title),
                         label: Cow::Borrowed(label),
                         action: PaletteTarget::Menu(action),
+                        menu_alias: None,
                         key,
                         mods,
                         shortcut: Cow::Borrowed(""),
@@ -408,14 +440,15 @@ impl PaletteState {
                 }
             }
             // The palette-only rows sit right after the bar menu whose matter
-            // they are (the message bus's three, Show Identity, Fleet
-            // Machines: no bar item each).
+            // they are (the message bus's three and Fleet Machines: no bar
+            // item each).
             if section.title == crate::menu::PALETTE_ONLY_SECTION {
                 for (label, action) in crate::menu::PALETTE_ONLY {
                     rows.push(PaletteRow {
                         section: Cow::Borrowed(crate::menu::PALETTE_ONLY_SECTION),
                         label: Cow::Borrowed(label),
                         action: PaletteTarget::Menu(*action),
+                        menu_alias: None,
                         key: "",
                         mods: MenuMods::None,
                         shortcut: Cow::Borrowed(""),
@@ -449,6 +482,7 @@ impl PaletteState {
             section: Cow::Borrowed(THEME_SECTION),
             label: Cow::Borrowed(BROWSE_THEMES_LABEL),
             action: PaletteTarget::Menu(MenuAction::BrowseThemes),
+            menu_alias: None,
             key: "",
             mods: MenuMods::None,
             shortcut: Cow::Borrowed(""),
@@ -512,10 +546,9 @@ impl PaletteState {
     /// the recovery capabilities supplied by `CloseReadiness::Blocked`; global
     /// menu rows cannot push the explanation/actions out of the visible band.
     pub(crate) fn native_close_recovery(scope: NativeCommandScope) -> Self {
-        let mut state = Self::new().with_native_commands(scope);
-        state
-            .rows
-            .retain(|row| matches!(&row.action, PaletteTarget::Native(_)));
+        let mut state = Self::new();
+        state.rows.clear();
+        state.replace_native_commands(Some(scope));
         state.selected = 0;
         state.scroll = 0;
         state.clamp_scroll();
@@ -547,6 +580,13 @@ impl PaletteState {
     pub(crate) fn replace_native_commands(&mut self, scope: Option<NativeCommandScope>) {
         self.pointer_over = None;
         self.pointer_armed = None;
+        // Restore shared menu rows before removing the previous native scope. Their
+        // labels, positions and accelerators survive switching back to a terminal.
+        for row in &mut self.rows {
+            if let Some(action) = row.menu_alias.take() {
+                row.action = PaletteTarget::Menu(action);
+            }
+        }
         self.rows
             .retain(|row| !matches!(&row.action, PaletteTarget::Native(_)));
         let Some(scope) = scope else {
@@ -557,16 +597,29 @@ impl PaletteState {
         };
         let mut native = Vec::with_capacity(scope.commands.len());
         for command in scope.commands {
+            let target = NativeCommandTarget {
+                window: scope.window,
+                instance: scope.instance,
+                view: scope.view,
+                generation: scope.generation,
+                action: command.id,
+            };
+            if let Some(action) = target.menu_action()
+                && let Some(row) = self.rows.iter_mut().find(|row| row.action == action)
+            {
+                // One menu-labelled row, with the native view's captured custody. It
+                // must not become an unscoped MenuAction queued for a later front tab.
+                row.action = PaletteTarget::Native(target);
+                row.menu_alias = Some(action);
+                row.enabled = command.enabled;
+                row.checked = None;
+                continue;
+            }
             native.push(PaletteRow {
                 section: Cow::Owned(scope.section.clone()),
                 label: Cow::Owned(command.title),
-                action: PaletteTarget::Native(NativeCommandTarget {
-                    window: scope.window,
-                    instance: scope.instance,
-                    view: scope.view,
-                    generation: scope.generation,
-                    action: command.id,
-                }),
+                action: PaletteTarget::Native(target),
+                menu_alias: None,
                 key: "",
                 mods: MenuMods::None,
                 shortcut: Cow::Owned(command.shortcut.unwrap_or_default()),
@@ -627,6 +680,7 @@ impl PaletteState {
                         section: Cow::Borrowed("Version"),
                         label,
                         action: PaletteTarget::Menu(MenuAction::ApplyUpdate),
+                        menu_alias: None,
                         key: "",
                         mods: MenuMods::None,
                         shortcut: Cow::Borrowed(""),
@@ -641,19 +695,24 @@ impl PaletteState {
             (None, None) => {}
         }
         for row in &mut self.rows {
-            let Some(action) = row.action.menu() else {
+            let Some(action) = row.menu() else {
                 // Native enabled state is reducer-owned command metadata. It is revalidated
                 // immediately before dispatch as well as represented faithfully here.
                 continue;
             };
-            row.checked = None;
-            row.enabled = true;
             // Off macOS the effective chord fills `shortcut`, so `row_accel` and the accessibility
             // description show the chord that works here, not the "" [`accel`] blanks ⌘ to.
             row.shortcut = match live.menu_accels.iter().find(|(a, _)| *a == action) {
                 Some((_, chord)) => Cow::Owned(chord.clone()),
                 None => Cow::Borrowed(""),
             };
+            // A shared menu label retains the captured native view's enabled state,
+            // not the global front window's. Dispatch refreshes that view's metadata.
+            if matches!(row.action, PaletteTarget::Native(_)) {
+                continue;
+            }
+            row.checked = None;
+            row.enabled = true;
             match action {
                 // The verb carries the state, as the native View item does.
                 MenuAction::ToggleFullScreen => {
@@ -691,6 +750,9 @@ impl PaletteState {
                 // listed at all (`Self::new` drops the rows this platform does not
                 // offer) the action always at least opens the Software Update route.
                 MenuAction::Copy => row.enabled = live.has_selection,
+                MenuAction::Save => row.enabled = live.can_save,
+                MenuAction::Find => row.enabled = live.can_find,
+                MenuAction::FindNext | MenuAction::FindPrev => row.enabled = live.can_find_again,
                 MenuAction::NextTab | MenuAction::PrevTab => row.enabled = live.multi_tab,
                 MenuAction::ReopenClosedTab => row.enabled = live.can_reopen_closed_tab,
                 MenuAction::ReopenClosedView => row.enabled = live.can_reopen_closed_view,
@@ -702,12 +764,9 @@ impl PaletteState {
                 | MenuAction::ViewSessionInNewWindow => {
                     row.enabled = !live.native_tab_active;
                 }
-                // The focused session's own rows: its harness log, identity,
+                // The focused session's own rows: its harness log,
                 // reset and tab theme.
-                MenuAction::HarnessLog
-                | MenuAction::ShowIdentity
-                | MenuAction::ResetTerminal
-                | MenuAction::ChooseTabTheme => {
+                MenuAction::HarnessLog | MenuAction::ResetTerminal | MenuAction::ChooseTabTheme => {
                     row.enabled = live.terminal_front;
                 }
                 // Only a tab with a theme of its own has one to clear.
@@ -1038,7 +1097,9 @@ impl PaletteState {
     /// [`Self::selected_target`] narrowed to a menu action, for the menu-model tests.
     #[cfg(test)]
     pub(crate) fn selected_action(&self) -> Option<MenuAction> {
-        self.selected_target()?.menu()
+        let idx = self.filtered_indices().nth(self.selected)?;
+        let row = &self.rows[idx];
+        row.enabled.then(|| row.menu()).flatten()
     }
 
     /// The overlay height (rows) the card wants: chrome plus the capped command band, never
@@ -1176,7 +1237,7 @@ pub(crate) fn palette_a11y(state: &PaletteState) -> aterm_a11y::model::TreeUpdat
         };
         // The row's help sentence: the words the native item carries as its tool tip,
         // so a screen reader hears what a hover shows.
-        if let Some(action) = row.action.menu() {
+        if let Some(action) = row.menu() {
             description.push_str(": ");
             description.push_str(action.help());
         }
@@ -1337,7 +1398,7 @@ impl PaletteState {
         let name = crate::menu::canonical_invoke_name(name);
         let mut seen_disabled = false;
         for r in &self.rows {
-            let Some(action) = r.action.menu() else {
+            let Some(action) = r.menu() else {
                 continue;
             };
             if format!("{action:?}") == name {
@@ -1508,8 +1569,7 @@ pub(crate) fn palette_row_hit(
 
 /// True iff every char of `needle` appears in `haystack` in order (both already
 /// lowercased); an empty needle always matches. The haystack is an iterator so
-/// [`PaletteState::filtered`] lowercases lazily. The session picker
-/// ([`crate::session_picker`]) filters with the same match.
+/// [`PaletteState::filtered`] lowercases lazily.
 pub(crate) fn fuzzy_subsequence(needle: &str, haystack: impl Iterator<Item = char>) -> bool {
     let mut hay = haystack;
     'outer: for nc in needle.chars() {
@@ -2196,7 +2256,7 @@ mod tests {
     /// with a local need, Overview only with a window, Read the Fleet and
     /// Fleet Machines only in a fleet, Summarize greyed with its block and
     /// titled for the fleet or this Mac; the session rows (Take Over, Hand
-    /// Back, Harness Log, Set Role…, Show Identity, Reset Terminal) need a
+    /// Back, Harness Log, Set Role…, Reset Terminal) need a
     /// front terminal; the reads and the bus commands never grey for want of
     /// one. Each greyed row refuses `invoke` as disabled.
     #[test]
@@ -2219,7 +2279,6 @@ mod tests {
             MenuAction::HandBack,
             MenuAction::HarnessLog,
             MenuAction::SetRole,
-            MenuAction::ShowIdentity,
             MenuAction::ResetTerminal,
         ] {
             assert!(!row(&s, a).enabled, "{a:?} greys without its fact");
@@ -2485,7 +2544,13 @@ mod tests {
         let window = crate::WindowId(7);
         let instance = crate::tab_model::AppInstanceId::from_stored(11);
         let view = crate::tab_model::ViewId::from_stored(13);
-        let s = PaletteState::new().with_native_commands(NativeCommandScope {
+        let menu = PaletteState::new();
+        let menu_save = menu
+            .rows
+            .iter()
+            .find(|row| row.action == MenuAction::Save)
+            .unwrap();
+        let scope = NativeCommandScope {
             window,
             instance,
             view,
@@ -2505,20 +2570,27 @@ mod tests {
                     enabled: false,
                 },
             ],
-        });
+        };
+        let mut s = PaletteState::new().with_native_commands(scope.clone());
+        s.resolve(&PaletteLive::default());
 
         assert_eq!(s.rows[0].section, "Editor App");
-        assert_eq!(s.rows[0].label, "Save");
-        // The metadata is kept verbatim; the projection is platform-aware, so a lone
-        // macOS key-equivalent leaves nothing off macOS.
-        let expect_accel = if cfg!(target_os = "macos") {
-            "Cmd-S"
-        } else {
-            ""
-        };
-        assert_eq!(row_accel(&s.rows[0]), expect_accel);
+        assert_eq!(s.rows[0].label, "Unavailable");
+        assert!(!s.rows[0].enabled);
+        let saves: Vec<_> = s
+            .rows
+            .iter()
+            .filter(|row| row.menu() == Some(MenuAction::Save))
+            .collect();
+        assert_eq!(saves.len(), 1, "the shared command is offered only once");
+        let save = saves[0];
+        assert_eq!(save.section, menu_save.section);
+        assert_eq!(save.label, menu_save.label);
+        assert_eq!(row_accel(save), row_accel(menu_save));
+        assert!(save.enabled, "the captured view owns its enabled metadata");
+        assert_eq!(s.action_by_name("Save"), Ok(MenuAction::Save));
         assert!(matches!(
-            &s.rows[0].action,
+            &save.action,
             PaletteTarget::Native(target)
                 if target.window == window
                     && target.instance == instance
@@ -2527,17 +2599,71 @@ mod tests {
                     && target.action.as_str() == "editor/save"
         ));
         assert!(
-            matches!(&s.rows[2].action, PaletteTarget::Menu(_)),
+            matches!(&s.rows[1].action, PaletteTarget::Menu(_)),
             "global menu order follows the scoped app section"
         );
 
         let controls = s.controls_lines();
-        let expect_line = format!("accel={expect_accel:?}");
+        let expect_line = format!("accel={:?}", row_accel(menu_save));
         assert!(controls.iter().any(|line| {
             line.contains("target=native window=7 instance=11 view=13 generation=17")
                 && line.contains("action=editor/save")
                 && line.contains(&expect_line)
         }));
+
+        let old_save = save.action.clone();
+        let before = s.fingerprint();
+        let save_slot = s
+            .filtered()
+            .iter()
+            .position(|&index| s.rows[index].menu() == Some(MenuAction::Save))
+            .unwrap();
+        let _ = s.pointer_press(Some(save_slot));
+        s.replace_native_commands(None);
+        s.resolve(&PaletteLive::default());
+        assert!(!s.pointer_release(Some(save_slot)).1);
+        let save = s
+            .rows
+            .iter()
+            .find(|row| row.menu() == Some(MenuAction::Save))
+            .unwrap();
+        assert_eq!(save.action, PaletteTarget::Menu(MenuAction::Save));
+        assert_eq!(save.section, menu_save.section);
+        assert_eq!(save.label, menu_save.label);
+        assert!(!save.enabled, "a terminal has no document to save");
+        assert!(
+            s.rows
+                .iter()
+                .all(|row| !matches!(row.action, PaletteTarget::Native(_)))
+        );
+
+        s.replace_native_commands(Some(NativeCommandScope {
+            view: crate::tab_model::ViewId::from_stored(19),
+            generation: 23,
+            ..scope.clone()
+        }));
+        let save = s
+            .rows
+            .iter()
+            .find(|row| row.menu() == Some(MenuAction::Save))
+            .unwrap();
+        assert!(save.enabled);
+        assert_ne!(
+            save.action, old_save,
+            "replacement owns a fresh native target"
+        );
+        assert_ne!(s.fingerprint(), before);
+
+        let recovery = PaletteState::native_close_recovery(NativeCommandScope {
+            view,
+            generation: 17,
+            ..scope
+        });
+        assert_eq!(recovery.rows.len(), 2);
+        assert!(recovery.is_native_close_recovery_for(window, view));
+        assert_eq!(recovery.rows[0].section, "Editor App");
+        assert_eq!(recovery.rows[0].label, "Save");
+        assert_eq!(recovery.rows[0].menu_alias, None);
     }
 
     fn themes() -> Vec<PaletteTheme> {

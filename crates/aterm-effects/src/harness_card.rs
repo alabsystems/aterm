@@ -1158,6 +1158,7 @@ impl LineInks {
 
     /// The ink at palette position `at` (`0..=1`; clamps, and a NaN reads as
     /// `0`) on `ground`: the nearest step's.
+    #[inline]
     fn at(&self, palette: CardPalette, ground: u32, at: f32) -> u32 {
         // `as` saturates, and a NaN reads as step 0.
         let step =
@@ -1225,6 +1226,7 @@ pub enum CardPalette {
 
 impl CardPalette {
     /// The palette at position `t` (`0..=1`; clamps).
+    #[inline]
     fn at(self, t: f32) -> u32 {
         match self {
             Self::Cruise => spectrum(t),
@@ -1236,6 +1238,7 @@ impl CardPalette {
     /// [`at`](Self::at) on dark, its print twin on light
     /// ([`PRINT_CRUISE_RAMP`], so a hue sits where it does on dark;
     /// [`PRINT_LAND`] evenly, each stripe its own ink).
+    #[inline]
     fn art_at(self, t: f32, dark: bool) -> u32 {
         match (self, dark) {
             (_, true) => self.at(t),
@@ -1245,6 +1248,7 @@ impl CardPalette {
     }
 
     /// Trail stripe `k` (0 top … 5 bottom) on a dark or a light ground.
+    #[inline]
     fn stripe(self, k: usize, dark: bool) -> u32 {
         let k = k % TRAIL_STOPS.len();
         match (self, dark) {
@@ -1257,6 +1261,7 @@ impl CardPalette {
 
     /// A point mark's colour on a dark ground (a burst star, a sparkle): a
     /// named stop, never a between colour.
+    #[inline]
     fn mark(self, k: usize) -> u32 {
         match self {
             Self::Cruise => spectrum_stop(k % 7),
@@ -1267,6 +1272,7 @@ impl CardPalette {
     /// A point mark's print ink on a light ground's paper: the trail's
     /// stripe inks in turn, held to the border's luma bar ([`print_line`]),
     /// a star's arms being as thin as the border's line.
+    #[inline]
     fn star_ink(self, k: usize) -> u32 {
         print_line(self.stripe(k, false))
     }
@@ -1274,18 +1280,21 @@ impl CardPalette {
     /// The line's letter at position `t` (`0..=1`; clamps) on the light
     /// `ground`: the print ramp's ink there as the paper law's point-mark
     /// ink ([`paper_mark_ink`]), text at 4.5:1 or more against `ground`.
+    #[inline]
     fn text_at(self, t: f32, ground: u32) -> u32 {
         paper_mark_ink(self.art_at(t, false), ground)
     }
 }
 
 /// The sunset ramp at `t` (`0..=1`; clamps, and a NaN reads as `0`).
+#[inline]
 fn sunset(t: f32) -> u32 {
     even_ramp(&SUNSET, t)
 }
 
 /// The ramp through evenly spaced `stops` at `t` (`0..=1`; clamps, and a NaN
 /// reads as `0`).
+#[inline]
 fn even_ramp(stops: &[u32], t: f32) -> u32 {
     let t = if t.is_finite() {
         t.clamp(0.0, 1.0)
@@ -1300,6 +1309,7 @@ fn even_ramp(stops: &[u32], t: f32) -> u32 {
 /// The ramp through `knots` (`(spectrum table index, colour)`, in order from
 /// index `0` to the table's last) at `t` (`0..=1`; clamps, and a NaN reads as
 /// `0`): the two knots about `t`'s table index, mixed straight.
+#[inline]
 fn knot_ramp(knots: &[(usize, u32)], t: f32) -> u32 {
     let t = if t.is_finite() {
         t.clamp(0.0, 1.0)
@@ -1317,6 +1327,7 @@ fn knot_ramp(knots: &[(usize, u32)], t: f32) -> u32 {
 /// A light ground's one-pixel line in `rgb`: darkened toward black (hue and
 /// saturation kept) until its Rec. 709 luma is at most
 /// [`LIGHT_LINE_MAX_LUMA`]; a colour under the bar is unchanged.
+#[inline]
 fn print_line(rgb: u32) -> u32 {
     let ch = |sh: u32| ((rgb >> sh) & 0xff) as f32;
     let y = 0.2126 * ch(16) + 0.7152 * ch(8) + 0.0722 * ch(0);
@@ -1419,6 +1430,7 @@ pub struct CardScene {
 
 /// The border's stroke at cell height `ch`: a fourteenth of the cell, at
 /// least one pixel.
+#[inline]
 fn stroke_px(ch: u16) -> u16 {
     (ch / 14).max(1)
 }
@@ -1431,6 +1443,7 @@ fn stroke_px(ch: u16) -> u16 {
 /// from the whole band (`ch / 7`) it would reach into the stroke whenever
 /// `ch % 7` is under the stroke (14, 21, 28, 29, 35, 36, 42 to 44 px …).
 /// `0` when the cell is too short to hold the art.
+#[inline]
 fn kitty_px(ch: u16) -> u16 {
     ch.saturating_sub(stroke_px(ch)) / KITTY_HALF as u16
 }
@@ -1440,6 +1453,7 @@ fn kitty_px(ch: u16) -> u16 {
 /// stroke), rounded up to whole cells. `0` when the cells are too short for
 /// the art (under [`KITTY_HALF`] px plus the stroke), or `cw` is `0`.
 #[must_use]
+#[inline]
 pub fn kitty_cols(cw: u16, ch: u16) -> u16 {
     let p = u32::from(kitty_px(ch));
     if p == 0 || cw == 0 {
@@ -1557,6 +1571,7 @@ impl Clock {
     }
 
     /// The episode's progress, `0..1`; `1` when settled.
+    #[inline]
     fn u(self) -> f32 {
         self.t_ms
             .map_or(1.0, |t| (t as f32 / EPISODE_MS as f32).min(1.0))
@@ -1564,6 +1579,7 @@ impl Clock {
 
     /// The border's (and line's) drift phase offset: `−drift·(1 − u)²`, which
     /// starts at one trip per [`TRIP_MS`] and eases to zero at the end.
+    #[inline]
     fn drift(self, drift: f32) -> f32 {
         let v = 1.0 - self.u();
         -drift * v * v
@@ -1571,6 +1587,7 @@ impl Clock {
 
     /// The head's strength: ramps in over the first 4 % and out over the last
     /// 12 % of the episode; `0` when settled.
+    #[inline]
     fn head_env(self) -> f32 {
         if self.t_ms.is_none() {
             return 0.0;
@@ -1581,6 +1598,7 @@ impl Clock {
 }
 
 /// `smoothstep` on `0..=1`, clamped.
+#[inline]
 fn smooth(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
@@ -1596,6 +1614,7 @@ struct Rect {
 }
 
 impl Rect {
+    #[inline]
     fn meet(self, o: Self) -> Self {
         Self {
             x0: self.x0.max(o.x0),
@@ -1605,10 +1624,12 @@ impl Rect {
         }
     }
 
+    #[inline]
     fn is_empty(self) -> bool {
         self.x1 <= self.x0 || self.y1 <= self.y0
     }
 
+    #[inline]
     fn contains(self, x: i64, y: i64) -> bool {
         (self.x0..self.x1).contains(&x) && (self.y0..self.y1).contains(&y)
     }
@@ -1711,11 +1732,13 @@ impl Geo {
     }
 
     /// The top pixel of grid row `r`'s band.
+    #[inline]
     fn band(&self, r: i64) -> i64 {
         self.oy + r * self.ch
     }
 
     /// The left pixel of grid column `c`.
+    #[inline]
     fn col(&self, c: u16) -> i64 {
         self.ox + i64::from(c) * self.cw
     }
@@ -1723,6 +1746,7 @@ impl Geo {
     /// The box inside the border's stroke as it stands with no air (inside
     /// [`Self::core`]), where the trail, the kitty, its rim and the stars
     /// are laid: the air moves the border and nothing else.
+    #[inline]
     fn inner(&self) -> Rect {
         Rect {
             x0: self.core.x0 + self.t,
@@ -1756,6 +1780,7 @@ trait Ramps {
 /// The ends of the ramp `l` → `rt` over `r` once a clip has cut it to `c`:
 /// read off the ramp at `c`'s edges where the clip moved them (a horizontal
 /// clip keeps a ramp's colours where it cuts it), else `l` and `rt`.
+#[inline]
 fn clip_ramp(r: Rect, c: Rect, l: Paint, rt: Paint) -> (Paint, Paint) {
     if (c.x0, c.x1) == (r.x0, r.x1) {
         (l, rt)
@@ -1769,6 +1794,7 @@ fn clip_ramp(r: Rect, c: Rect, l: Paint, rt: Paint) -> (Paint, Paint) {
 /// A ramp's value at fraction `f` between its ends (per channel, rounded).
 /// The mode is per quad: two additive ends stay additive, two source-over ends
 /// stay at least 1.
+#[inline]
 fn ramp(a: Paint, b: Paint, f: f32) -> Paint {
     let f = f.clamp(0.0, 1.0);
     let ch = |x: u32, y: u32| ((x as f32 + (y as f32 - x as f32) * f).round() as u32).min(255);
@@ -1789,6 +1815,7 @@ fn ramp(a: Paint, b: Paint, f: f32) -> Paint {
 }
 
 /// Light that adds `rgb` at coverage `cov` (dark theme).
+#[inline]
 fn light(rgb: u32, cov: f32) -> Paint {
     Paint {
         color: premul_rgb(rgb, cov.clamp(0.0, 255.0) as u8),
@@ -1798,6 +1825,7 @@ fn light(rgb: u32, cov: f32) -> Paint {
 
 /// Ink laid source-over at opacity `alpha` (light theme), floored at 1 so the
 /// quad stays source-over.
+#[inline]
 fn ink(rgb: u32, alpha: f32) -> Paint {
     let a = (alpha.clamp(1.0, 255.0)) as u8;
     Paint {
@@ -1823,6 +1851,7 @@ struct KittyInk {
 }
 
 impl KittyInk {
+    #[inline]
     fn new(coat: u32, eye: u32, dark: bool) -> Self {
         let coat = coat & 0x00FF_FFFF;
         // The outline has to part the cat from the ground: a deeper coat on
@@ -1845,6 +1874,7 @@ impl KittyInk {
     }
 
     /// The colour of palette character `c`; `None` is transparent.
+    #[inline]
     fn of(self, c: u8) -> Option<u32> {
         match c {
             b'o' => Some(self.outline),
@@ -1862,6 +1892,7 @@ impl KittyInk {
 /// Which frame of its art the kitty shows `t_ms` into an episode (the open
 /// frame when settled): a blink every [`BLINK_PERIOD_MS`], a tail flick
 /// between them. [`KittyArt::frame`] reads it.
+#[inline]
 fn kitty_frame(clock: Clock) -> KittyPose {
     let Some(t) = clock.t_ms else {
         return KittyPose::Open;
@@ -1877,6 +1908,7 @@ fn kitty_frame(clock: Clock) -> KittyPose {
 }
 
 /// A deterministic fraction in `0..1` from `(seed, salt)`.
+#[inline]
 fn unit(seed: u64, salt: u64) -> f32 {
     (mix(seed ^ mix(salt)) >> 40) as f32 / (1u64 << 24) as f32
 }
@@ -1899,6 +1931,7 @@ struct StarSpot {
 /// blank on both rows (`claude_card.rs`'s `layout`: `cols <= limit`, and
 /// column `limit` may hold a glyph), so no opaque mark ever lies on a
 /// letter; on dark, added light, it runs to the stroke.
+#[inline]
 fn star_region(g: &Geo, s: &CardScene) -> Option<Rect> {
     if g.rows < 2 {
         return None;
@@ -1936,6 +1969,7 @@ struct KittyAt {
 
 impl KittyAt {
     /// The pixel rows of the art's body band, the trail's stripes' span.
+    #[inline]
     fn body(&self) -> (i64, i64) {
         let (first, rows) = self.art.body;
         let y0 = self.rect.y0 + first as i64 * self.p;
@@ -1948,6 +1982,7 @@ impl KittyAt {
     /// Ended at the art's left edge instead, the trail would stop short of
     /// the haunch by the art's transparent columns, a strip of ground with
     /// the rim's line in it between the rainbow and the cat.
+    #[inline]
     fn rear(&self) -> i64 {
         self.rect.x0 + self.art.rear() as i64 * self.p
     }
@@ -1957,11 +1992,13 @@ impl KittyAt {
 /// stroke, at most half a kitty pixel — so a rim strip never reaches another
 /// across a transparent pixel ([`Emit::rim`]) — and `0`, no rim, for art of
 /// one-pixel pixels.
+#[inline]
 fn rim_px(p: i64, t: i64) -> i64 {
     t.min(p / 2)
 }
 
 /// Whether pixel `(r, c)` of `frame` is art (not transparent, and inside it).
+#[inline]
 fn art_at(frame: &[&str], r: i64, c: i64) -> bool {
     usize::try_from(r)
         .ok()
@@ -1977,12 +2014,14 @@ fn art_at(frame: &[&str], r: i64, c: i64) -> bool {
 /// art alone, not under the notch ([`Emit::rim`]): a toe's gap stays the
 /// ground and opens onto it, so the paws read as paws on either ground
 /// rather than as holes boxed in by a line beneath them.
+#[inline]
 fn rim_solid(frame: &[&str], r: i64, c: i64) -> bool {
     art_at(frame, r, c) || (art_at(frame, r, c - 1) && art_at(frame, r, c + 1))
 }
 
 /// Which art a scene's kitty wears: the tall kitty where the host asked for
 /// three rows and the box holds them, else the two-row kitty.
+#[inline]
 fn kitty_art(g: &Geo, s: &CardScene) -> KittyArt {
     if s.kitty_rows >= 3 && g.rows >= 3 {
         kitty_tall()
@@ -1993,6 +2032,7 @@ fn kitty_art(g: &Geo, s: &CardScene) -> KittyArt {
 
 /// The tall kitty ([`KITTY_TALL`]), or in a test the art standing in for it
 /// ([`stand_in`]).
+#[inline]
 fn kitty_tall() -> KittyArt {
     #[cfg(test)]
     if let Some(art) = TALL_STAND_IN.with(std::cell::Cell::get) {
@@ -2027,6 +2067,7 @@ fn stand_in_active() -> bool {
 /// row straddles that boundary, and the tall kitty's head sits where the
 /// two-row kitty's does (a card that gains or loses its third row's room
 /// stands the cat up or down; its head does not move).
+#[inline]
 fn kitty_place(g: &Geo, art: KittyArt, p: i64, x0: i64) -> KittyAt {
     let y0 = g.band(g.top + 1) - KITTY_HALF as i64 * p;
     KittyAt {
@@ -2047,6 +2088,7 @@ fn kitty_place(g: &Geo, art: KittyArt, p: i64, x0: i64) -> KittyAt {
 /// Art cut by the scene's [`clip`](CardScene::clip) or by the box would read
 /// as a broken cat, so the kitty is drawn whole or not at all; the border,
 /// trail and stars stay either way.
+#[inline]
 fn kitty_rect(g: &Geo, s: &CardScene) -> Option<KittyAt> {
     let col = s.kitty_col?;
     let p = i64::from(kitty_px(s.ch));
@@ -2061,6 +2103,7 @@ fn kitty_rect(g: &Geo, s: &CardScene) -> Option<KittyAt> {
 /// at `u` of [`RIDE_MS`] — quick off the line, settling into its seat — and
 /// `1`, seated, from [`RIDE_MS`] on, when settled, and all through an
 /// episode that does not ride ([`Ride`]).
+#[inline]
 fn ride(clock: Clock) -> f32 {
     match clock.ride_ms {
         Some(t) if t < RIDE_MS => {
@@ -2073,6 +2116,7 @@ fn ride(clock: Clock) -> f32 {
 
 /// When, in ms into an episode, the ride has come `f` of the way: [`ride`]
 /// inverted.
+#[inline]
 fn ride_at(f: f32) -> f32 {
     RIDE_MS as f32 * (1.0 - (1.0 - f.clamp(0.0, 1.0)).cbrt())
 }
@@ -2080,6 +2124,7 @@ fn ride_at(f: f32) -> f32 {
 /// Where the ride starts and how far it runs, in pixels: from the trail's
 /// first pixel inside the box and the clip to the seat's left edge. `None`
 /// with no trail, or no way to go.
+#[inline]
 fn ride_span(g: &Geo, s: &CardScene, seat: &KittyAt) -> Option<(i64, i64)> {
     let (c0, _) = s.trail?;
     let from = g.col(c0).max(g.inner().x0).max(g.clip.x0);
@@ -2091,6 +2136,7 @@ fn ride_span(g: &Geo, s: &CardScene, seat: &KittyAt) -> Option<(i64, i64)> {
 /// seat's rows and art that far from the ride's start ([`ride_span`]) —
 /// every pixel of the way inside the box and the clip, which hold the trail
 /// and the seat — and the seat itself from [`RIDE_MS`] on.
+#[inline]
 fn ridden(g: &Geo, s: &CardScene, seat: KittyAt, clock: Clock) -> KittyAt {
     let f = ride(clock);
     match ride_span(g, s, &seat) {
@@ -2105,6 +2151,7 @@ fn ridden(g: &Geo, s: &CardScene, seat: KittyAt, clock: Clock) -> KittyAt {
 /// seats ([`KittyAt::body`]) — where it is drawn, and where it would sit when
 /// it is not (left out of a box too small, or cells too short for the art,
 /// at a pixel of one) — kept inside the rows the kitty stands on.
+#[inline]
 fn trail_band(g: &Geo, s: &CardScene) -> (i64, i64) {
     let art = kitty_art(g, s);
     let p = i64::from(kitty_px(s.ch)).max(1);
@@ -2160,6 +2207,7 @@ fn trail_rect(g: &Geo, s: &CardScene, seat: Option<KittyAt>) -> Option<(Rect, i6
 /// and ink off it ([`lay_toned`]), and with the wave its edge between them
 /// would step through the star; a steady star keeps one tone, so the field
 /// is placed off it.
+#[inline]
 fn across_trail(b: Rect, (t, amp): (Rect, i64)) -> bool {
     let outer = Rect {
         y0: t.y0 - amp,
@@ -2190,6 +2238,7 @@ struct Glints {
 
 impl Glints {
     /// The glints laid.
+    #[inline]
     fn spots(&self) -> &[GlintSpot] {
         &self.spots[..self.n]
     }
@@ -2201,6 +2250,7 @@ impl Glints {
 /// ground), each held to the largest whose reach lies inside the band at
 /// every step of the wave, so a glint never pokes off the rainbow; `0`, no
 /// glint, where not even a one-pixel arm fits.
+#[inline]
 fn glint_arms(g: &Geo, dark: bool, h: i64, amp: i64) -> (i64, i64) {
     let tax = if dark { 1.0 } else { STAR_ARM_INK };
     // A reach of `2·(arm + 1) + 1` rows inside `h − 2·amp`.
@@ -2337,20 +2387,19 @@ fn field_spots(
             x1: room.x0 + span * (i as i64 + 1) / want as i64,
             ..room
         };
+        let kitty_pad = kitty.map(|r| Rect {
+            x0: r.x0 - m,
+            y0: r.y0 - m,
+            x1: r.x1 + m,
+            y1: r.y1 + m,
+        });
+        let room_h = (room.y1 - room.y0) as f32;
         for k in 0..STAR_TRIES {
             let salt = ((i as u64) << 8) | k;
             let within = if k < STAR_TRIES / 2 { slice } else { room };
             let x = within.x0 + (unit(seed, salt * 2) * (within.x1 - within.x0) as f32) as i64;
-            let y = room.y0 + (unit(seed, salt * 2 + 1) * (room.y1 - room.y0) as f32) as i64;
-            let on_kitty = kitty.is_some_and(|r| {
-                Rect {
-                    x0: r.x0 - m,
-                    y0: r.y0 - m,
-                    x1: r.x1 + m,
-                    y1: r.y1 + m,
-                }
-                .contains(x, y)
-            });
+            let y = room.y0 + (unit(seed, salt * 2 + 1) * room_h) as i64;
+            let on_kitty = kitty_pad.is_some_and(|r| r.contains(x, y));
             let crowded = spots[..n]
                 .iter()
                 .map(|o| (o.x, o.y))
@@ -2389,6 +2438,7 @@ impl HarnessCard {
     /// asks for the frame whose tick learns the new one: a card armed under
     /// reduced motion costs that one frame, and one armed as motion came back
     /// (focus regained) is never left waiting on an unrelated wake.
+    #[inline]
     pub fn arm(&mut self, now: Instant, seed: u64) {
         self.episode = Episode::Armed(now);
         self.seed = seed;
@@ -2409,6 +2459,7 @@ impl HarnessCard {
     /// rest, so a settled card costs its host's repaint key and wake judge
     /// no clock read.
     #[must_use]
+    #[inline]
     pub fn at_rest(&self) -> bool {
         self.still || !matches!(self.episode, Episode::Armed(_) | Episode::Playing(_))
     }
@@ -2417,6 +2468,7 @@ impl HarnessCard {
     /// is armed or playing (none armed, one owed, one played out). Its
     /// [`Self::line_ink`] is then the settled gradient at every instant.
     #[must_use]
+    #[inline]
     pub fn is_still(&self) -> bool {
         !matches!(self.episode, Episode::Armed(_) | Episode::Playing(_))
     }
@@ -2432,6 +2484,7 @@ impl HarnessCard {
     /// its host may replay the last one ([`Self::replay`]). An owed episode
     /// whose debt lapsed meanwhile ([`OWED_MAX_MS`]) is let go by the next
     /// frame that draws, which starts nothing either way.
+    #[inline]
     fn holds(&self, serious: bool, drawable: bool, animate: bool) -> bool {
         match self.episode {
             Episode::Idle => true,
@@ -2482,6 +2535,7 @@ impl HarnessCard {
     /// How far into a running episode `now` falls, in ms; `None` when no
     /// episode's clock is running at `now` (none armed, one owed, one played
     /// out).
+    #[inline]
     fn running(&self, now: Instant) -> Option<u64> {
         let (Episode::Armed(start) | Episode::Playing(start)) = self.episode else {
             return None;
@@ -2511,6 +2565,7 @@ impl HarnessCard {
     /// registers no deadline, else the last episode's frames would be asked
     /// for after the card left the screen. [`SETTLE_GRACE_MS`] is the
     /// backstop for a host that breaks this, not the rule.
+    #[inline]
     #[must_use]
     pub fn deadline(&self, now: Instant) -> Option<Instant> {
         if self.at_rest() {
@@ -2667,6 +2722,7 @@ impl HarnessCard {
     /// a relative luminance floor; on light it is the print ramp's ink in
     /// the paper law's point-mark ink ([`paper_mark_ink`], 4.5:1 or more
     /// against `ground`), opaque, and the sweep only deepens it.
+    #[inline]
     #[must_use]
     pub fn line_ink(
         &self,
@@ -2793,6 +2849,7 @@ fn lift_to_luminance(rgb: u32, floor: f32) -> u32 {
 /// relative luminance under one half. The card's polarity, for the host's
 /// scene and the line alike.
 #[must_use]
+#[inline]
 pub fn dark_ground(bg: u32) -> bool {
     relative_luminance(bg) < 0.5
 }
@@ -3005,6 +3062,7 @@ impl<'a> Emit<'a> {
     /// the cat's outline where its art leaves the ground open beside the
     /// trail's band (above the tail swept flat in the flick, under the
     /// haunch).
+    #[inline]
     fn wave(&self, lay: &TrailLay, k: i64) -> i64 {
         let amp = lay.amp;
         if lay.tx0 + (k + 1) * lay.seg > lay.held {
@@ -3023,6 +3081,7 @@ impl<'a> Emit<'a> {
     }
 
     /// The shimmer's weight at trail fraction `x`.
+    #[inline]
     fn shimmer(&self, x: f32) -> f32 {
         if self.clock.t_ms.is_none() {
             return 0.0;
@@ -3035,6 +3094,7 @@ impl<'a> Emit<'a> {
     /// `w` on both grounds, light on dark and a gloss on a light ground's
     /// print ink, where the top and bottom stripes take
     /// [`LIGHT_GLINT_EDGE`] of it.
+    #[inline]
     fn stripe_paint(&self, k: usize, w: f32) -> Paint {
         let base = self.scene.palette.stripe(k, self.scene.dark);
         if self.scene.dark {
@@ -3234,6 +3294,7 @@ impl<'a> Emit<'a> {
     /// ground (added light), on a light one its print ink
     /// ([`CardPalette::star_ink`]), which each pixel its own tone turns the paper's
     /// white where it lies on the trail.
+    #[inline]
     fn mark_ink(&self, k: usize, dark: u32) -> u32 {
         if self.scene.dark {
             dark
@@ -3680,6 +3741,20 @@ mod tests {
 
     /// A clip that cuts nothing: the whole stream.
     const WHOLE_STREAM: (i32, i32, i32, i32) = (i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+
+    /// [`scene`] in a box wider than [`MAX_EDGE_SEGMENTS`] cells round a
+    /// trail longer than [`MAX_TRAIL_SEGMENTS`] of its two-cell segments
+    /// (columns 8 to 100): longer than the host lays one (`claude_card`'s
+    /// `TRAIL_MAX`), but a scene any caller may hand the library, where both
+    /// segment caps bind.
+    pub(super) fn widest() -> CardScene {
+        CardScene {
+            cols: 120,
+            trail: Some((8, 100)),
+            kitty_col: Some(100),
+            ..scene()
+        }
+    }
 
     /// [`scene`]'s pane, cut short of the box: the right border's column and
     /// the left padding fall outside it, and the line's row is cut through
@@ -4557,15 +4632,21 @@ mod tests {
     /// trail's ink is the paper's white (a glint cut out of the print) and
     /// every other is print ink: no ink star ever lies on a stripe, where it
     /// would vanish into its own hue, nor white on the paper. Both kinds are
-    /// drawn. NEGATIVE CONTROL: an ink star laid at a trail star's centre
+    /// drawn. The longest trail ([`widest`]) too, where the ink is every one
+    /// of [`MAX_TRAIL_SEGMENTS`] segments. NEGATIVE CONTROL: an ink star laid at a trail star's centre
     /// with the region alone for its clip (the old placement) prints ink on
     /// the trail.
     #[test]
     fn light_marks_print_on_the_paper_and_glint_on_the_trail() {
         let (mut glints, mut inked) = (0usize, 0usize);
+        let longest = CardScene {
+            dark: false,
+            ..widest()
+        };
         for s in scenes()
             .into_iter()
             .filter(|s| !s.dark && s.trail.is_some())
+            .chain([longest])
         {
             for t in (0..=EPISODE_MS).step_by(30).map(Some).chain([None]) {
                 for ride_ms in [t, None] {

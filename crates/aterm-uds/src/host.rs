@@ -28,6 +28,102 @@ pub use tools::TOOLS;
 /// `libtest::environment_refusals`, whose `COULD_NOT_RUN_SENTINEL` is this constant).
 pub const COULD_NOT_RUN: &str = "aterm-gate: COULD NOT RUN";
 
+/// The descriptor room a host preflight actually obtained. The hard limit is
+/// observed again after the attempt; a refused soft raise is kept as evidence.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct OpenFileRoom {
+    pub before: u64,
+    pub after: u64,
+    pub hard: u64,
+    pub target: u64,
+    pub refusal: Option<std::io::Error>,
+}
+
+#[cfg(unix)]
+fn open_file_room_with(
+    want: u64,
+    ceiling: u64,
+    mut read: impl FnMut() -> std::io::Result<(u64, u64)>,
+    write: impl FnOnce(u64, u64) -> std::io::Result<()>,
+) -> std::io::Result<OpenFileRoom> {
+    let (before, hard) = read()?;
+    let target = before.max(want.min(hard).min(ceiling));
+    let refusal = if target > before {
+        write(target, hard).err()
+    } else {
+        None
+    };
+    let (after, hard) = read().map_err(|error| {
+        std::io::Error::other(format!(
+            "could not read descriptor limit after preflight (before {before}, target {target}): {error}"
+        ))
+    })?;
+    Ok(OpenFileRoom {
+        before,
+        after,
+        hard,
+        target,
+        refusal,
+    })
+}
+
+/// Raise only this process's soft descriptor limit toward `want`, bounded by
+/// its inherited hard limit and the platform ceiling. Never lower either
+/// limit. Children inherit the result; a test's own low-limit child can still
+/// lower its soft limit afterwards.
+///
+/// # Errors
+/// A limit read failed. A refused raise is reported in the returned room,
+/// alongside the actual readback, rather than mistaken for an applied limit.
+#[cfg(unix)]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn open_file_room(want: u64) -> std::io::Result<OpenFileRoom> {
+    #[cfg(target_vendor = "apple")]
+    let ceiling = u64::try_from(crate::spawnfd::descriptor_bound())
+        .unwrap_or(0)
+        // Darwin's SDK sys/syslimits.h: OPEN_MAX. A finite kernel ceiling
+        // can be lower even where the inherited hard limit is infinity.
+        .min(10_240);
+    #[cfg(not(target_vendor = "apple"))]
+    let ceiling = u64::MAX;
+    open_file_room_with(
+        want,
+        ceiling,
+        || {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            // SAFETY: a valid resource and exclusively owned out-storage.
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok((limit.rlim_cur, limit.rlim_max))
+        },
+        |soft, hard| {
+            let limit = libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: hard,
+            };
+            // SAFETY: a valid resource and initialized storage; only the
+            // soft value changes, within the observed hard ceiling.
+            if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        },
+    )
+}
+
+/// This test process's actual soft descriptor room after a bounded raise,
+/// or zero when it cannot be read. Suites can size their admission by it.
+#[cfg(unix)]
+#[must_use]
+pub fn raise_open_files(want: u64) -> u64 {
+    open_file_room(want).map_or(0, |room| room.after)
+}
+
 /// End the calling test as COULD NOT RUN: `why` names what this host lacks and, where
 /// there is one, the fix.
 ///

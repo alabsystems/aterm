@@ -30,8 +30,8 @@
 //! ([`control_refusal`]). A spare whose shell shows anything the gate cannot
 //! vouch for is killed and never adopted.
 //!
-//! Who never gets a spare: every ask that is not plain (`identity=`,
-//! `observe=`/connected, operator, create-identity, `folder_of`), pwsh, `-e`,
+//! Who never gets a spare: every ask that is not plain (`observe=`/connected,
+//! operator, `folder_of`), pwsh, `-e`,
 //! `integrate = false`, `temporal_recording`, and Windows. They take today's
 //! cold path, unchanged. Linux (2026-10-19) keeps both tiers as macOS does,
 //! its escape scan reading `/proc` ([`escape_scan`]); where the shell reads a
@@ -3577,7 +3577,6 @@ fn run_spawn(job: SpawnJob) {
                     &proxy,
                     cwd.as_deref(),
                     None,
-                    None,
                     None, // no worker's task: a worker never adopts a spare
                     None,
                 )
@@ -3857,6 +3856,11 @@ impl Wake {
             Wake::CommitSessionRename { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::CancelSessionRename { .. } => None,
+            #[cfg(target_os = "macos")]
+            Wake::OpenSystemState => None,
+            Wake::WorkstationSetup(_)
+            | Wake::InitialSetupStatus { .. }
+            | Wake::InitialSetupApplyResolved => None,
         }
     }
 }
@@ -5189,8 +5193,6 @@ impl App {
         }
         // G2
         if !matches!(ask.admission, crate::tab_spawn::SpawnAdmission::Plain)
-            || ask.identity.is_some()
-            || ask.identity_prep == crate::tab_spawn::IdentityPrep::Create
             || ask.observe.is_some()
             || ask.folder_of.is_some()
             // Its own theme (`spawn theme=`): a warm spare's rc read the
@@ -5431,10 +5433,7 @@ impl App {
         let Some(s) = self.pool.get(id) else {
             return;
         };
-        if !aterm_core::shell_integration::has_spare_hold(inputs.shell)
-            || !s.rekey_channel
-            || s.identity.is_some()
-        {
+        if !aterm_core::shell_integration::has_spare_hold(inputs.shell) || !s.rekey_channel {
             return;
         }
         let w = &s.ctx.witness;

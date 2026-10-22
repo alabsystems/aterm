@@ -6,7 +6,9 @@
 //!
 //! * **The jail** ([`jail_policy`]): the instance runs under `sandbox-exec`
 //!   with all network denied but one loopback port, where the lab answers as
-//!   the model: no key, no account, no byte off the machine.
+//!   the model: no key, no account, no byte off the machine; and the owner's
+//!   homes fenced ([`home_guards`]): none of the protected list read or
+//!   written, and no write anywhere in them.
 //! * **The fake model** ([`serve`]): the Responses API on that port, every
 //!   request answered by the caller's [`Answer`] and logged one JSON object a
 //!   line (`t` its unix milliseconds, `tag` what the answer named it, `u` the
@@ -14,7 +16,11 @@
 //!   items and `turn` the Codex turn it belongs to, [`request_marks`]: a
 //!   request sent again carries the same both, a second turn another turn and
 //!   more items; `said` the reply's text, [`said_of`], and `hold_ms` how long
-//!   the answer was held), with the item and
+//!   the answer was held). A separate `.responses.log` `event=response_written` row, bound
+//!   by `request_id`, witnesses a successful full HTTP write and flush, not
+//!   that the client read it. Both events carry `mono_ms` from the run's
+//!   shared monotonic clock; response events have no `tag`, so request-only
+//!   readers remain request-only. With the item and
 //!   stream builders an answer is made of ([`message_item`], [`call_item`],
 //!   [`sse`]).
 //! * **The stand-ins**: `/bin/ps` is setuid, which the sandbox refuses to
@@ -26,21 +32,55 @@ use std::io::{BufRead as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::pyjson::{J, PY};
 
 // ------------------------------------------------------------------ the jail
 
-/// The instance's `sandbox-exec` profile: everything allowed but the
-/// network, of which only `localhost:<port>` (the fake model) is reachable.
+/// The instance's `sandbox-exec` profile: only `localhost:<port>` (the fake
+/// model) is reachable over IP, and the regular lab's preferences channels
+/// are denied too. A scratch HOME does not move the UID account's daemons.
 #[must_use]
 pub fn jail_policy(port: u16) -> String {
     format!(
         "(version 1)(allow default)(deny network-outbound (remote ip))(deny network-inbound (local ip))\
          (deny network-outbound (literal \"/private/var/run/mDNSResponder\"))\
-         (allow network-outbound (remote ip \"localhost:{port}\"))"
+         (allow network-outbound (remote ip \"localhost:{port}\"))\n{}",
+        crate::jail::PREFERENCES
     )
+}
+
+/// The owner's homes fenced, for a profile that otherwise allows every file
+/// ([`jail_policy`]): in each of `homes` (every home the lab guards: the
+/// account's, whatever `HOME` says, and the caller's,
+/// [`crate::paths::Paths::guarded_homes`]) each entry of the lab jail's
+/// protected list ([`crate::protected::protected_paths`]: the agents' data,
+/// aterm's package store, keys, browser profiles) neither read nor written,
+/// each rule once, and no write anywhere in the home.
+///
+/// # Errors
+/// No home, or one that is not an absolute non-root path a profile can quote.
+pub fn home_guards(homes: &[String]) -> Result<String, String> {
+    if homes.is_empty() {
+        return Err("no home to fence".into());
+    }
+    let mut rules: Vec<String> = Vec::new();
+    for h in homes {
+        if !Path::new(h).is_absolute() || h == "/" || !crate::paths::profile_safe(h) {
+            return Err(format!(
+                "{h} cannot be fenced: a home must be an absolute non-root path a profile can quote"
+            ));
+        }
+        for (kind, path) in crate::protected::protected_paths(h, crate::protected::CCSOCKS) {
+            let rule = format!("(deny file-read* file-write* ({} \"{path}\"))", kind.word());
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        }
+        rules.push(format!("(deny file-write* (subpath \"{h}\"))"));
+    }
+    Ok(rules.concat())
 }
 
 /// Lay the stand-ins into `bin`: a copy of this program as `bin/aterm-lab`
@@ -248,22 +288,111 @@ pub fn sse(items: Vec<J>) -> String {
 
 /// The fake Responses API on `listener`: every POST answered by `answer` and
 /// logged to `log` (module header); a GET lists one model.
-pub fn serve(listener: TcpListener, log: PathBuf, answer: Answer) {
-    let log = Arc::new(Mutex::new(log));
+pub fn serve(listener: TcpListener, log: Arc<Mutex<ApiLog>>, answer: Answer) {
     for conn in listener.incoming().flatten() {
         let (log, answer) = (Arc::clone(&log), Arc::clone(&answer));
         std::thread::spawn(move || serve_one(conn, &log, &answer));
     }
 }
 
-fn serve_one(conn: TcpStream, log: &Mutex<PathBuf>, answer: &Answer) {
+/// Owned request and successful-response journals, sharing one monotonic
+/// clock and one mutex for identity allocation, append and observation.
+pub struct ApiLog {
+    path: PathBuf,
+    clock: Instant,
+    next_request: i64,
+}
+
+impl ApiLog {
+    /// Start a fresh proof's journal. The world and clock outlive all of
+    /// its packaged processes and their re-execs.
+    #[must_use]
+    pub fn new(path: PathBuf, clock: Instant) -> Self {
+        Self {
+            path,
+            clock,
+            next_request: 1,
+        }
+    }
+
+    /// Called while holding the same mutex as every append: neither a
+    /// partial line nor a request stamped before an unfinished append can
+    /// disappear from a quiet verdict. Malformed evidence is not skipped.
+    ///
+    /// # Errors
+    /// A journal cannot be read or contains malformed JSON.
+    pub fn snapshot(&self) -> std::io::Result<(Vec<J>, Vec<J>)> {
+        let read = |path: &Path| {
+            let text = match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(e),
+            };
+            text.lines()
+                .map(|line| {
+                    J::parse(line)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                })
+                .collect()
+        };
+        Ok((read(&self.path)?, read(&response_log(&self.path))?))
+    }
+
+    fn append(path: &Path, row: &J) -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(f, "{}", row.dump(PY))
+    }
+
+    fn request(&mut self, mut fields: Vec<(String, J)>) -> std::io::Result<i64> {
+        let id = self.next_request;
+        self.next_request = id
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("model request identity exhausted"))?;
+        fields.extend([
+            ("event".into(), J::s("request")),
+            ("request_id".into(), J::Int(id)),
+            ("mono_ms".into(), J::Int(monotonic_ms(self.clock))),
+        ]);
+        Self::append(&self.path, &J::Obj(fields))?;
+        Ok(id)
+    }
+
+    fn response_written(&self, id: i64, status: u16) -> std::io::Result<()> {
+        Self::append(
+            &response_log(&self.path),
+            &J::obj([
+                ("event", J::s("response_written")),
+                ("request_id", J::Int(id)),
+                ("status", J::Int(i64::from(status))),
+                ("mono_ms", J::Int(monotonic_ms(self.clock))),
+            ]),
+        )
+    }
+}
+
+/// Reply witnesses live beside the unchanged one-row-per-request journal.
+#[must_use]
+pub fn response_log(request_log: &Path) -> PathBuf {
+    request_log.with_extension("responses.log")
+}
+
+/// Milliseconds on the clock shared by the model server and its observer.
+#[must_use]
+pub fn monotonic_ms(clock: Instant) -> i64 {
+    i64::try_from(clock.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+fn serve_one(conn: TcpStream, log: &Mutex<ApiLog>, answer: &Answer) {
     let Ok(w) = conn.try_clone() else {
         return;
     };
     let mut w = w;
     let mut r = std::io::BufReader::new(conn);
     while let Ok(Some(req)) = crate::stub::read_request(&mut r) {
-        let a = if req.method == "POST" {
+        let (a, request_id) = if req.method == "POST" {
             let parsed = J::parse_bytes(&req.body).unwrap_or(J::Obj(Vec::new()));
             let (user, tool) = request_view(&parsed);
             let a = answer(&parsed);
@@ -282,7 +411,7 @@ fn serve_one(conn: TcpStream, log: &Mutex<PathBuf>, answer: &Answer) {
             let at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis());
-            let line = J::obj([
+            let J::Obj(fields) = J::obj([
                 ("t", J::Int(i64::try_from(at).unwrap_or(0))),
                 ("tag", J::s(a.tag.clone())),
                 ("u", J::s(tail)),
@@ -292,47 +421,68 @@ fn serve_one(conn: TcpStream, log: &Mutex<PathBuf>, answer: &Answer) {
                 ("turn", J::s(turn)),
                 ("said", J::s(said)),
                 ("hold_ms", J::Int(hold_ms)),
-            ])
-            .dump(PY);
-            if let Ok(path) = log.lock() {
-                let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&*path)
-                    .and_then(|mut f| writeln!(f, "{line}"));
-            }
-            a
+            ]) else {
+                unreachable!()
+            };
+            let Some(id) = log.lock().ok().and_then(|mut l| l.request(fields).ok()) else {
+                return;
+            };
+            (a, Some(id))
         } else {
-            Answered::now((
-                200,
-                "application/json",
-                r#"{"object":"list","data":[{"id":"fake-model"}],"models":[]}"#.to_string(),
-            ))
+            (
+                Answered::now((
+                    200,
+                    "application/json",
+                    r#"{"object":"list","data":[{"id":"fake-model"}],"models":[]}"#.to_string(),
+                )),
+                None,
+            )
         };
         if !a.delay.is_zero() {
             std::thread::sleep(a.delay);
         }
-        let reason = match a.status {
-            200 => "OK",
-            429 => "Too Many Requests",
-            _ => "Error",
-        };
-        let extra: String = a
-            .headers
-            .iter()
-            .map(|(k, v)| format!("{k}: {v}\r\n"))
-            .collect();
-        let head = format!(
-            "HTTP/1.1 {} {reason}\r\ncontent-type: {}\r\n{extra}content-length: {}\r\n\r\n",
-            a.status,
-            a.kind,
-            a.body.len()
-        );
-        if w.write_all(head.as_bytes()).is_err() || w.write_all(a.body.as_bytes()).is_err() {
+        if write_response(&mut w, &a, || {
+            if let Some(id) = request_id {
+                log.lock()
+                    .map_err(|_| std::io::Error::other("model log poisoned"))?
+                    .response_written(id, a.status)?;
+            }
+            Ok(())
+        })
+        .is_err()
+        {
             return;
         }
-        let _ = w.flush();
     }
+}
+
+/// The witness is published only after the complete response and flush
+/// succeeded. A flush is a server write witness, not a client-read receipt.
+fn write_response(
+    w: &mut impl std::io::Write,
+    a: &Answered,
+    written: impl FnOnce() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let reason = match a.status {
+        200 => "OK",
+        429 => "Too Many Requests",
+        _ => "Error",
+    };
+    let extra: String = a
+        .headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect();
+    let head = format!(
+        "HTTP/1.1 {} {reason}\r\ncontent-type: {}\r\n{extra}content-length: {}\r\n\r\n",
+        a.status,
+        a.kind,
+        a.body.len()
+    );
+    w.write_all(head.as_bytes())?;
+    w.write_all(a.body.as_bytes())?;
+    w.flush()?;
+    written()
 }
 
 /// The text of the assistant messages a streamed answer ([`sse`]) holds, one
@@ -677,6 +827,80 @@ mod tests {
             .map_or(0, <[J]>::len);
         assert_eq!(output, 2);
         assert!(jail_policy(4242).contains("localhost:4242"));
+
+        // Only a complete write AND flush publishes the exact request's
+        // witness. Partial headers/bodies and failed flushes prove nothing.
+        struct Broken {
+            left: usize,
+            fail_flush: bool,
+        }
+        impl std::io::Write for Broken {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.left == 0 {
+                    return Err(std::io::Error::other("injected write failure"));
+                }
+                let n = self.left.min(bytes.len());
+                self.left -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.fail_flush {
+                    Err(std::io::Error::other("injected flush failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let dir = aterm_tempfile::tempdir().expect("exclusive response journal");
+        let mut log = ApiLog::new(dir.path().join("api.log"), Instant::now());
+        let answer = Answered::now((200, "text/event-stream", body));
+        let mut bytes = Vec::new();
+        let first = log
+            .request(vec![
+                ("tag".into(), J::s("same")),
+                ("status".into(), J::Int(200)),
+            ])
+            .unwrap();
+        write_response(&mut bytes, &answer, || {
+            log.response_written(first, answer.status)
+        })
+        .unwrap();
+        assert!(bytes.ends_with(answer.body.as_bytes()));
+        for (left, fail_flush) in [(0, false), (bytes.len() - 1, false), (usize::MAX, true)] {
+            let id = log
+                .request(vec![
+                    ("tag".into(), J::s("same")),
+                    ("status".into(), J::Int(200)),
+                ])
+                .unwrap();
+            assert_ne!(id, first, "repeated tags have distinct identities");
+            let mut broken = Broken { left, fail_flush };
+            assert!(
+                write_response(&mut broken, &answer, || log
+                    .response_written(id, answer.status))
+                .is_err()
+            );
+        }
+        let (requests, witnesses) = log.snapshot().unwrap();
+        assert_eq!(requests.len(), 4, "the legacy log remains request-only");
+        assert_eq!(witnesses.len(), 1);
+        assert_eq!(witnesses[0].get("request_id"), Some(&J::Int(first)));
+        assert_eq!(
+            witnesses[0].get("event").and_then(J::as_str),
+            Some("response_written")
+        );
+        assert_eq!(witnesses[0].get("status"), Some(&J::Int(200)));
+        assert!(
+            witnesses[0]
+                .get("mono_ms")
+                .and_then(J::as_i64)
+                .is_some_and(|t| t >= 0)
+        );
+        std::fs::write(&log.path, "torn request\n").unwrap();
+        assert!(
+            log.snapshot().is_err(),
+            "bad evidence must not vanish from a quiet verdict"
+        );
     }
 
     #[test]

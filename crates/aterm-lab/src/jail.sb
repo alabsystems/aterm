@@ -45,20 +45,14 @@
 ;; (a bare-name open call lands on the lab's recorder instead)
 @MACH_DENY_OPEN@
 (deny process-exec (literal "/usr/bin/open"))
-;; PREFERENCES: moving HOME does not move the UID account's CFPreferences daemons, shared memory or domains.
-;; Deny the channels themselves without asking a daemon for the owner's preferences.
-(deny mach-lookup
-    (global-name "com.apple.cfprefsd.daemon")
-    (global-name "com.apple.cfprefsd.agent")
-    (local-name "com.apple.cfprefsd.agent"))
-(deny ipc-posix-shm-read*
-    (ipc-posix-name-prefix "apple.cfprefs.")
-    (ipc-posix-name-prefix "/apple.cfprefs."))
-(deny user-preference-read)
+@PREFERENCES@
 ;; HOME CONTENTS: guard the actual UID account independently of the caller's HOME. Reopen only the selected lab's
 ;; state/source/builds and scratch/project, then let the narrower protected-data rules below deny their contents.
 @HOME_READ_DENY@
 (allow file-read-data @TRUSTED@ (subpath "@RUN@/scratch") (subpath "@SOCKDIR@/proj"))
+;; ... and each directory from a fenced home down to the run directory, alone (its names, nothing under it): the
+;; harness's tape store opens every one on its way to the instance's state root, and keeps no tape when one is refused
+@RUN_WALK@
 ;; THE OWNER'S DATA, neither read nor written: one rule for each entry of the protected list
 @PROTECTED@
 @AGENT_STORE@

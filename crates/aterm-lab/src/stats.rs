@@ -213,17 +213,26 @@ const PRETTY: Style = Style {
 };
 
 /// `text` with the lab's own paths named, never spelled: the scratch, the
-/// socket dir (the project sits in it) and the owner's home.
+/// socket dir (the project sits in it) and the owner's homes (the account's,
+/// and `$HOME` when it names another; the deeper first).
 #[must_use]
 pub fn scrub(run: &Run, text: &str) -> String {
+    scrub_in(paths(), run, text)
+}
+
+/// [`scrub`] with the homes of the lab's facts `p` (the seam a test hands a
+/// fake account home: [`crate::paths::Paths::resolve_with`]).
+fn scrub_in(p: &crate::paths::Paths, run: &Run, text: &str) -> String {
     let mut out = text.to_string();
     let w = run.w.to_string_lossy().into_owned();
-    let p = paths();
-    for (from, to) in [
+    let mut homes = p.guarded_homes();
+    homes.sort_by_key(|h| std::cmp::Reverse(h.len()));
+    let mut pairs = vec![
         (w.as_str(), "<scratch>"),
         (run.sockdir.as_str(), "<sockdir>"),
-        (p.real_home.as_str(), "<home>"),
-    ] {
+    ];
+    pairs.extend(homes.iter().map(|h| (h.as_str(), "<home>")));
+    for (from, to) in pairs {
         if from.len() > 1 {
             out = out.replace(from, to);
             // the same directory as the kernel spells it under /private
@@ -568,6 +577,44 @@ pub fn cmd_debuglog(args: &[String]) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A STATS PRINT NAMES EVERY HOME THE LAB GUARDS, NEVER SPELLS IT: under
+    /// a scratch `HOME` (a fake account home handed in through
+    /// [`crate::paths::Paths::resolve_with`]) the account's home and the
+    /// scratch one both become `<home>`, the run's scratch (inside the
+    /// scratch home here, so the deeper path wins) `<scratch>`. NEGATIVE
+    /// CONTROL: the facts of a run from the account's own `HOME` leave the
+    /// scratch home spelled.
+    #[test]
+    fn the_stats_scrub_names_the_account_home_and_a_scratch_home_both() {
+        let top = aterm_tempfile::Builder::new()
+            .prefix("lab-stats-")
+            .tempdir()
+            .unwrap();
+        let real = std::fs::canonicalize(top.path()).unwrap();
+        let (account, scratch) = (real.join("account"), real.join("scratch"));
+        for d in [&account, &scratch] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (a, s) = (account.display().to_string(), scratch.display().to_string());
+        let run = Run {
+            w: scratch.join("w"),
+            sockdir: "/private/tmp/at.sock".into(),
+            ..Run::default()
+        };
+        let text = format!("{a}/.claude.json {s}/.zshrc {s}/w/x /private/tmp/at.sock/proj");
+        let p = crate::paths::Paths::resolve_with(Some(account.clone()), Some(scratch.into()));
+        assert_eq!(
+            scrub_in(&p, &run, &text),
+            "<home>/.claude.json <home>/.zshrc <scratch>/x <sockdir>/proj"
+        );
+        // NEGATIVE CONTROL
+        let own = crate::paths::Paths::resolve_with(Some(account.clone()), Some(account.into()));
+        assert_eq!(
+            scrub_in(&own, &run, &text),
+            format!("<home>/.claude.json {s}/.zshrc <scratch>/x <sockdir>/proj")
+        );
+    }
 
     #[test]
     fn key_paths_name_every_leaf_and_no_value() {

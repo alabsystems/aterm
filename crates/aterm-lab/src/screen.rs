@@ -56,11 +56,17 @@ pub fn is_done_row(r: &str) -> bool {
     })
 }
 
-/// A full-width rule of the composer's frame.
+/// A full-width rule of the composer's frame: at least 40 columns of `─`
+/// (or `━`), or a rule with a label inside it as Claude Code draws its top
+/// one (`──── <the mode's name> ─` once the top-effort mode is on, which a
+/// windowed aterm's harness sets as an unset default:
+/// `aterm_primer::CLAUDE_DEFAULTS`),
+/// the product's own reading of a rule (`aterm_phase::phase::is_rule`).
 #[must_use]
 pub fn is_rule(r: &str) -> bool {
     let s = r.trim();
-    s.chars().count() >= 40 && s.chars().all(|c| c == '─' || c == '━')
+    s.chars().count() >= 40
+        && (s.chars().all(|c| c == '─' || c == '━') || aterm_phase::phase::is_rule(s))
 }
 
 /// Whether the survey card is on the screen.
@@ -221,6 +227,75 @@ mod tests {
         assert_eq!(composer_of(&rows("no frame here")), None);
     }
 
+    /// CLAUDE CODE'S LABELLED TOP RULE (`──── <the mode's name> ─`, drawn
+    /// once the top-effort mode is on: a windowed aterm's harness writes it as
+    /// an unset default, measured on 2.1.306 in `forever --window`,
+    /// 2026-10-21) frames the composer as a bare rule does, from 40 columns.
+    /// NEGATIVE CONTROLS: a short labelled run, a labelled run the product
+    /// reads as a rule but 39 columns or fewer wide, a table's border with a
+    /// joint in it, and a row of words are no rule, so no frame stands on
+    /// them.
+    #[test]
+    fn claude_code_s_labelled_top_rule_frames_its_composer() {
+        // The mode's name, spelled from parts as `aterm_primer` spells it: the
+        // publication baseline bans the joined word in an exported file.
+        let mode = concat!("ultra", "code");
+        let rule = "─".repeat(140);
+        let label = format!("{} {mode} ─", "─".repeat(128));
+        let nbsp = '\u{a0}';
+        let screen = |top: &str, draft: &str| {
+            format!(
+                " ▐▛███▛█▄╱✦  Claude Code v2.1.306\n{top}\n❯{nbsp}{draft}\n{rule}\n  ⏵⏵ auto mode on (shift+tab to cycle)"
+            )
+        };
+        assert!(is_rule(&label) && is_rule(&rule));
+        // the lab's 40-column floor holds for a labelled rule too: 40 columns
+        // is a rule, 39 is not, and neither is a 23-column one the product's
+        // own reading (ten `─` or more) takes for a rule
+        let labelled = |dashes: usize| format!("{} {mode} ─", "─".repeat(dashes));
+        assert_eq!(labelled(28).chars().count(), 40);
+        assert!(is_rule(&labelled(28)));
+        assert!(
+            aterm_phase::phase::is_rule(&labelled(27))
+                && aterm_phase::phase::is_rule(&labelled(11))
+        );
+        assert_eq!(
+            composer_row("claude", &screen(&label, "")).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            composer_row("claude", &screen(&label, "FOREVERLAB-LAND-P. tell me")).as_deref(),
+            Some("FOREVERLAB-LAND-P. tell me")
+        );
+        assert_eq!(
+            composer_of(&rows(&screen(&label, "hi"))).as_deref(),
+            Some("hi")
+        );
+        // CONTROL: the bare rule reads the same
+        assert_eq!(
+            composer_row("claude", &screen(&rule, "hi")).as_deref(),
+            Some("hi")
+        );
+        for no_rule in [
+            format!("──── {mode} ─"),
+            labelled(27),
+            labelled(11),
+            format!("{}┬{}", "─".repeat(60), "─".repeat(60)),
+            format!(
+                "{} words in the middle of a row {}",
+                "─".repeat(5),
+                "x".repeat(40)
+            ),
+        ] {
+            assert!(!is_rule(&no_rule), "{no_rule}");
+            assert_eq!(
+                composer_row("claude", &screen(&no_rule, "hi")),
+                None,
+                "{no_rule}"
+            );
+        }
+    }
+
     #[test]
     fn a_turn_stands_in_the_agents_own_composer() {
         let rule = "─".repeat(60);
@@ -358,8 +433,13 @@ mod tests {
         );
         assert_eq!(composer_row("muse", &body(f::BOX_TRUST)), None);
         assert_eq!(composer_row("muse", &body(f::EXITED)), None);
-        // Claude Code's reading of the same screen takes the labelled rule for no rule: no frame at all
-        assert_eq!(composer_row("claude", &body(f::DRAFT)), None);
+        // Claude Code's reading of the same screen frames it too: a labelled
+        // rule is a rule (Claude Code draws `──── <the mode's name> ─`), and the row
+        // under it is the same draft
+        assert_eq!(
+            composer_row("claude", &body(f::DRAFT)).as_deref(),
+            Some("hello there")
+        );
     }
 
     #[test]

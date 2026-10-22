@@ -588,15 +588,6 @@ fn line_after_probe(conn: &CtlStream) -> Option<String> {
     }
 }
 
-/// A scratch directory, removed when the test ends, failed or not.
-struct ScratchDir(std::path::PathBuf);
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// The relayed subscription: `subscribe @<sid>` for a session another
 /// instance hosts is relayed to it for as long as the subscription lives.
 /// Here the genuine lanes, classifier, forward and relay carry one such
@@ -617,10 +608,8 @@ fn relay_one_subscription(run: u32, spell: fn(&str) -> String) {
     use aterm_session::LaunchNonce;
     // Short: the socket path, canonicalized under `/private`, must fit a
     // `sockaddr_un`.
-    let dir = std::env::temp_dir().join(format!("aterm-rl{run}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("the socket dir");
-    let _scratch = ScratchDir(dir.clone());
+    let scratch = crate::test_scratch::short_dir(&format!("run {run}'s sibling socket"));
+    let dir = scratch.path().to_path_buf();
     let sock = dir.join("aterm-77101.sock");
     let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind the sibling");
     std::fs::write(dir.join("aterm-77101.token"), "cafe0123\n").expect("its token");

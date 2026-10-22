@@ -149,6 +149,7 @@ pub fn wrap_fold_cells_in_pane(
 /// pane: final pane column -> first pane column on the next row. Morphology
 /// only; callers must still require their normal fresh input license before
 /// minting light.
+#[inline]
 #[must_use]
 pub fn physical_margin_fold(prev: (u16, u16), cur: (u16, u16), col0: u16, cols: u16) -> bool {
     if cols == 0 {

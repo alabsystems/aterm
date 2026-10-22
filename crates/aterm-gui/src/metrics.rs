@@ -4367,9 +4367,6 @@ pub(crate) fn emit_summary(
     // closed tab's master nothing will close.
     emit_pty_census(ctx, s);
     if ctx.reads_process() {
-        // THE IDENTITY PRIMER (2026-10-17): the re-prime passes still writing
-        // into an identity's folder, off the spawn that handed them off.
-        crate::agent_identity::emit_metrics(s);
         // THE WARM SPARE (`crate::spare`): its state and age, its PTY, the
         // learned gate, adoptions, misses, discards and budgets.
         crate::spare::emit_metrics(s);

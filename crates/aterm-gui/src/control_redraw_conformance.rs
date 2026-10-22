@@ -172,7 +172,6 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
         term: term.clone(),
         master: -1,
         ctx,
-        identity: None,
     }
 }
 

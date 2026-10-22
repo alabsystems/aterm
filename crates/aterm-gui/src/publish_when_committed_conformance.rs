@@ -70,8 +70,9 @@ fn every_invariant_holds(model: &Model, s: &State) -> bool {
         .all(|inv| model.check_invariant(inv.name, s))
 }
 
-/// Clears the process-global discovery state this test sets, even when an
-/// assertion fails, so no other test in the binary inherits it.
+/// Clears the discovery state this test sets (its own,
+/// `proxy::self_sock_test_guard`), even when an assertion fails: its queue
+/// drains while its mirror override still stands.
 struct ProcessDiscoveryReset;
 
 impl Drop for ProcessDiscoveryReset {
@@ -101,11 +102,10 @@ struct Candidate {
 }
 
 fn candidate() -> Candidate {
-    let mirror = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+    let mirror = crate::test_scratch::short_dir("the mirror dir");
     crate::proxy::set_mirror_dir_override(Some(mirror.path().to_path_buf()));
     crate::proxy::clear_self_sock();
-    // Keep sun_path short even when the platform temporary root is long.
-    let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+    let dir = crate::test_scratch::short_dir("the candidate's socket");
     let sock = dir
         .path()
         .join(format!("aterm-{}.sock", std::process::id()));
@@ -156,6 +156,15 @@ fn candidate() -> Candidate {
     }
 }
 
+/// The listener ends and the discovery state is reset ([`ProcessDiscoveryReset`])
+/// before the directories drop, so no queued write lands in a removed one.
+impl Drop for Candidate {
+    fn drop(&mut self) {
+        drop(self.bound.take());
+        drop(ProcessDiscoveryReset);
+    }
+}
+
 impl Candidate {
     fn ids(&self) -> [SessionId; 2] {
         [self.root.0.clone(), self.carried.clone()]
@@ -168,7 +177,7 @@ impl Candidate {
 /// `Commit` then `SuccessorPublishes`, into a state every invariant holds.
 #[test]
 fn a_candidates_entries_name_it_only_after_the_commit() {
-    let _guard = crate::proxy::self_sock_test_guard();
+    let guard = crate::proxy::self_sock_test_guard();
     let _reset = ProcessDiscoveryReset;
     let model = handoff_address_owner_model();
     let mut c = candidate();
@@ -191,7 +200,9 @@ fn a_candidates_entries_name_it_only_after_the_commit() {
         let (gate, root, store) = (gate.clone(), c.root.clone(), c.store.clone());
         let link = c.link.clone();
         let bound = c.bound.take().expect("bound");
+        let lent = guard.lend();
         std::thread::spawn(move || {
+            let _state = lent.enter();
             publish_when_committed(bound, Some(&gate), Some(&link), Some(&root), &store)
         })
     };

@@ -7,6 +7,14 @@
 use aterm_json::{Value, json};
 use aterm_machines::init::WorkstationGroup;
 use aterm_machines::{model::PValue, plist};
+use aterm_types::macos_setup::{Selection, Setting};
+
+mod initial;
+pub use initial::{
+    InitialSetupSnapshot, InitialSetupSnapshotError, apply_initial_setup, authorize_initial_setup,
+    automatic_plan, check_initial_setup, initial_setup_finished, initial_setup_revision,
+    initial_setup_snapshot, initial_setup_status, restart_initial_setup,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -118,11 +126,117 @@ pub fn run(action: Action) -> Result<Report, String> {
     }
     ensure_person_scope()?;
     let _lock = HeldLock::take(&root)?;
+    if action == Action::Apply {
+        initial::save_explicit_workstation_plan(&root)?;
+    }
     execute(&mut host, &root, action)
 }
 
-/// Apply once on the first real interactive launch. A restored or successfully
-/// configured machine is left alone on later launches; explicit apply repairs drift.
+/// The saved checklist, or every box checked when no plan has been authorized.
+/// Reads only aterm's state and establishes the durability of an existing plan.
+pub fn automatic_selection() -> Result<Selection, String> {
+    Ok(authorized_selection(&state_root()?)?.unwrap_or_default())
+}
+
+/// Persist the person's exact choice before any OS probes or changes. An empty
+/// selection finishes setup immediately; retrying this operation is idempotent.
+/// A completed decision made while the checklist was open takes precedence.
+pub fn authorize_automatic_setup(selected: Selection) -> Result<(), String> {
+    ensure_person_scope()?;
+    let root = state_root()?;
+    let _lock = HeldLock::take(&root)?;
+    authorize_automatic_setup_at(&root, selected)
+}
+
+fn authorize_automatic_setup_at(root: &Path, selected: Selection) -> Result<(), String> {
+    // The public caller holds the profile lock: an explicit apply or restore may
+    // have finished since the coordinator last checked the marker.
+    if first_run_complete(root)? {
+        return Ok(());
+    }
+    save_automatic_plan(root, selected)?;
+    write_json(
+        &root.join("first-run.json"),
+        &if selected.is_empty() {
+            json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true })
+        } else {
+            json!({ "profile": PROFILE, "state": "pending" })
+        },
+    )
+}
+
+fn save_automatic_plan(root: &Path, selected: Selection) -> Result<(), String> {
+    write_json(
+        &root.join("automatic-plan.json"),
+        &json!({ "profile": PROFILE, "selection": selected.bits() }),
+    )
+}
+
+fn authorized_selection(root: &Path) -> Result<Option<Selection>, String> {
+    authorized_selection_with_flush(root, durable_directory)
+}
+
+fn authorized_selection_with_flush(
+    root: &Path,
+    flush: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<Option<Selection>, String> {
+    let path = root.join("automatic-plan.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let plan: Value = aterm_json::from_slice(&bytes).map_err(|e| format!("automatic plan: {e}"))?;
+    if plan["profile"].as_str() != Some(PROFILE) {
+        return Err("unrecognized automatic setup profile".into());
+    }
+    let bits = plan["selection"]
+        .as_u64()
+        .and_then(|bits| u16::try_from(bits).ok());
+    let selected = bits
+        .and_then(Selection::from_bits)
+        .ok_or("unrecognized automatic setup selection")?;
+    flush_record_with(&path, flush)?;
+    Ok(Some(selected))
+}
+
+/// Exclusive ownership of the automatic countdown and its subsequent retry
+/// worker. Keep this alive until the worker ends; dropping it permits another
+/// aterm process to offer setup. Explicit doctor operations use a separate lock.
+#[must_use = "keep the claim alive until the automatic setup worker ends"]
+pub struct AutomaticSetupClaim {
+    _lock: HeldLock,
+}
+
+/// Claim the automatic countdown without inspecting preferences or accounts.
+/// Returns `None` when another process owns it or setup has already ended.
+pub fn claim_automatic_setup() -> Result<Option<AutomaticSetupClaim>, String> {
+    ensure_person_scope()?;
+    claim_automatic_setup_at(&state_root()?)
+}
+
+/// Claim an explicit System State rerun, including a plan that already ended.
+/// Acquire this before restarting the plan so an older worker cannot retain its
+/// password and continue against the new selection.
+pub fn claim_initial_setup_rerun() -> Result<Option<AutomaticSetupClaim>, String> {
+    ensure_person_scope()?;
+    Ok(HeldLock::try_take_named(&state_root()?, "automatic.lock")?
+        .map(|lock| AutomaticSetupClaim { _lock: lock }))
+}
+
+fn claim_automatic_setup_at(root: &Path) -> Result<Option<AutomaticSetupClaim>, String> {
+    let Some(lock) = HeldLock::try_take_named(root, "automatic.lock")? else {
+        return Ok(None);
+    };
+    if initial::finished_at(root)? {
+        return Ok(None);
+    }
+    Ok(Some(AutomaticSetupClaim { _lock: lock }))
+}
+
+/// Apply after the first-launch offer authorizes setup. A cancelled,
+/// restored or successfully configured machine is left alone on later launches;
+/// explicit apply supersedes cancellation and repairs drift.
 pub fn apply_on_first_run() -> Result<Option<Report>, String> {
     if aterm_types::dirs::runs_under_private_state_root() {
         return Ok(None);
@@ -132,12 +246,30 @@ pub fn apply_on_first_run() -> Result<Option<Report>, String> {
     let Some(_lock) = HeldLock::try_take(&root)? else {
         return Ok(None);
     };
-    if first_run_complete(&root)? {
+    apply_on_first_run_at(&root)
+}
+
+fn apply_on_first_run_at(root: &Path) -> Result<Option<Report>, String> {
+    if first_run_complete(root)? {
+        return Ok(None);
+    }
+    let Some(selected) = authorized_selection(root)? else {
+        // An old pending marker or a new launch alone cannot authorize changes.
+        return Ok(None);
+    };
+    if selected.is_empty() {
+        authorize_automatic_setup_at(root, selected)?;
         return Ok(None);
     }
     let sys = aterm_machines::port::Live::new();
-    let accessibility = aterm_machines::init_accounts::accessibility_ready(&sys).ok();
-    if !automatic_retry_due(&root, accessibility)? {
+    let accounts_selected =
+        selected.contains(Setting::Messages) || selected.contains(Setting::FaceTime);
+    let accessibility = if accounts_selected {
+        aterm_machines::init_accounts::accessibility_ready(&sys).ok()
+    } else {
+        None
+    };
+    if !automatic_retry_due(root, accessibility)? {
         return Ok(None);
     }
     write_json(
@@ -146,11 +278,13 @@ pub fn apply_on_first_run() -> Result<Option<Report>, String> {
     )?;
     let consent = root.join("accessibility-request.json");
     let mut request_failure = None;
-    if accessibility != Some(true)
+    if accounts_selected
+        && accessibility != Some(true)
         && !consent
             .try_exists()
             .map_err(|e| format!("{}: {e}", consent.display()))?
-        && aterm_machines::init_accounts::accessibility_needed(&sys).unwrap_or(false)
+        && aterm_machines::init_accounts::accessibility_needed_selected(&sys, selected)
+            .unwrap_or(false)
     {
         // Record the request before showing native consent. Crashes and the
         // retry worker must not keep reopening the same permission prompt.
@@ -162,7 +296,7 @@ pub fn apply_on_first_run() -> Result<Option<Report>, String> {
             request_failure = Some(detail);
         }
     }
-    let mut report = execute(&mut NativeHost::new(), &root, Action::Apply)?;
+    let mut report = execute(&mut NativeHost::selected(selected), root, Action::Apply)?;
     if report.needs_attention()
         && let Some(detail) = request_failure
     {
@@ -175,13 +309,41 @@ pub fn apply_on_first_run() -> Result<Option<Report>, String> {
     Ok(Some(report))
 }
 
-/// Whether first-run setup was fully verified or explicitly restored. This
-/// reads only aterm's marker, so a background worker can await a pending retry.
+/// Permanently cancel automatic setup until the owner explicitly runs doctor
+/// with `--apply`. This writes only aterm's marker; it does not inspect or alter
+/// preferences, account registration, or permissions. A profile pass that has
+/// already started holds the same lock, so cancellation then returns an error.
+pub fn cancel_automatic_setup() -> Result<(), String> {
+    ensure_person_scope()?;
+    cancel_automatic_setup_at(&state_root()?)
+}
+
+fn cancel_automatic_setup_at(root: &Path) -> Result<(), String> {
+    let _lock = HeldLock::take(root)?;
+    if initial::finished_at(root)? {
+        return Ok(());
+    }
+    write_json(
+        &root.join("first-run.json"),
+        &json!({ "profile": PROFILE, "state": "cancelled" }),
+    )
+}
+
+/// Whether automatic setup was fully verified, explicitly restored, or cancelled.
+/// Reads aterm's marker and confirms its namespace durability, before a countdown
+/// or any preference/account probes.
 pub fn first_run_finished() -> Result<bool, String> {
     first_run_complete(&state_root()?)
 }
 
 fn first_run_complete(root: &Path) -> Result<bool, String> {
+    first_run_complete_with_flush(root, durable_directory)
+}
+
+fn first_run_complete_with_flush(
+    root: &Path,
+    flush: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<bool, String> {
     let path = root.join("first-run.json");
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -193,9 +355,15 @@ fn first_run_complete(root: &Path) -> Result<bool, String> {
     if marker["profile"].as_str() != Some(PROFILE) {
         return Err("unrecognized first-run profile".into());
     }
-    Ok(marker["state"].as_str() == Some("restored")
+    let finished = matches!(marker["state"].as_str(), Some("restored" | "cancelled"))
         || (marker["state"].as_str() == Some("applied")
-            && marker["accounts_verified"].as_bool() == Some(true)))
+            && marker["accounts_verified"].as_bool() == Some(true));
+    if finished {
+        // A previous writer can have published this marker but failed to flush
+        // its namespace. Visibility alone never certifies a durable decision.
+        flush_record_with(&path, flush)?;
+    }
+    Ok(finished)
 }
 
 // A permission refusal should not reopen account settings on each launch. An
@@ -355,6 +523,10 @@ impl HeldLock {
     }
 
     fn try_take(root: &Path) -> Result<Option<Self>, String> {
+        Self::try_take_named(root, "profile.lock")
+    }
+
+    fn try_take_named(root: &Path, name: &str) -> Result<Option<Self>, String> {
         use std::os::unix::fs::OpenOptionsExt as _;
         std::fs::create_dir_all(root).map_err(|e| format!("{}: {e}", root.display()))?;
         let file = std::fs::OpenOptions::new()
@@ -364,7 +536,7 @@ impl HeldLock {
             .truncate(false)
             .mode(0o600)
             .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
-            .open(root.join("profile.lock"))
+            .open(root.join(name))
             .map_err(|e| format!("doctor lock: {e}"))?;
         #[expect(
             clippy::disallowed_methods,
@@ -412,6 +584,9 @@ impl Target {
 }
 
 trait Host {
+    fn selection(&self) -> Selection {
+        Selection::all().workstation()
+    }
     fn read(&mut self, target: &Target) -> Result<Option<PValue>, String>;
     fn write(&mut self, target: &Target, value: Option<&PValue>) -> Result<(), String>;
     fn preference_changes(&mut self) -> Result<Vec<Saved>, String>;
@@ -422,6 +597,7 @@ trait Host {
 }
 
 struct NativeHost {
+    selected: Selection,
     domains: BTreeMap<(String, bool), plist::Entries>,
     prepared: Option<aterm_machines::init::Workstation>,
     attempted: Vec<Saved>,
@@ -429,7 +605,12 @@ struct NativeHost {
 
 impl NativeHost {
     fn new() -> Self {
+        Self::selected(Selection::all().workstation())
+    }
+
+    fn selected(selected: Selection) -> Self {
         Self {
+            selected: selected.workstation(),
             domains: BTreeMap::new(),
             prepared: None,
             attempted: Vec::new(),
@@ -455,6 +636,9 @@ impl NativeHost {
 }
 
 impl Host for NativeHost {
+    fn selection(&self) -> Selection {
+        self.selected
+    }
     fn attempted_preferences(&mut self) -> Vec<Saved> {
         std::mem::take(&mut self.attempted)
     }
@@ -462,8 +646,11 @@ impl Host for NativeHost {
         use aterm_machines::items::defaults::Scope;
         use aterm_machines::model::Read;
         let sys = aterm_machines::port::Live::new();
-        let mut prepared =
-            aterm_machines::init::prepare_workstation(&sys, WorkstationGroup::Preferences)?;
+        let mut prepared = aterm_machines::init::prepare_workstation_selected(
+            &sys,
+            WorkstationGroup::Preferences,
+            self.selected,
+        )?;
         let changes = prepared
             .preference_changes(&sys)?
             .into_iter()
@@ -541,10 +728,12 @@ impl Host for NativeHost {
         let prepared = if group == WorkstationGroup::Preferences {
             match self.prepared.take() {
                 Some(prepared) => prepared,
-                None => aterm_machines::init::prepare_workstation(&sys, group)?,
+                None => {
+                    aterm_machines::init::prepare_workstation_selected(&sys, group, self.selected)?
+                }
             }
         } else {
-            aterm_machines::init::prepare_workstation(&sys, group)?
+            aterm_machines::init::prepare_workstation_selected(&sys, group, self.selected)?
         };
         self.domains.clear();
         let rows = if apply && group == WorkstationGroup::Preferences {
@@ -730,9 +919,26 @@ fn save_backup(path: &Path, keys: &[Saved]) -> Result<(), String> {
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
+    write_json_with_flush(path, value, durable_directory)
+}
+
+fn durable_directory(directory: &Path) -> std::io::Result<()> {
     use aterm_machines::port::System as _;
     let sys = aterm_machines::port::Live::new();
-    write_json_with_flush(path, value, |directory| sys.durable_dir(directory))
+    sys.durable_dir(directory)
+}
+
+fn flush_record_with(
+    path: &Path,
+    mut flush: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or("doctor record has no parent directory")?;
+    for directory in parent.ancestors() {
+        flush(directory).map_err(|e| format!("{}: {e}", directory.display()))?;
+    }
+    Ok(())
 }
 
 // The backup precedes writes outside this filesystem. Every namespace entry,
@@ -741,7 +947,7 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
 fn write_json_with_flush(
     path: &Path,
     value: &Value,
-    mut flush: impl FnMut(&Path) -> std::io::Result<()>,
+    flush: impl FnMut(&Path) -> std::io::Result<()>,
 ) -> Result<(), String> {
     let parent = path
         .parent()
@@ -750,10 +956,7 @@ fn write_json_with_flush(
     let bytes = aterm_json::to_vec(value).map_err(|e| e.to_string())?;
     aterm_machines::port::write_atomic(path, &bytes, 0o600)
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    for directory in parent.ancestors() {
-        flush(directory).map_err(|e| format!("{}: {e}", directory.display()))?;
-    }
-    Ok(())
+    flush_record_with(path, flush)
 }
 
 fn append_workstation(
@@ -762,6 +965,9 @@ fn append_workstation(
     apply: bool,
     report: &mut Report,
 ) {
+    if group.selected(host.selection()).is_empty() {
+        return;
+    }
     let name = match group {
         WorkstationGroup::Accounts => "Messages and FaceTime sign-out",
         WorkstationGroup::Preferences => "Workstation preferences",
@@ -794,7 +1000,29 @@ fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, S
     if action == Action::Restore {
         return restore(host, root, report);
     }
-    let previous_activation = pending_refresh(root)?;
+    if host.selection().is_empty() {
+        if action == Action::Apply {
+            write_json(
+                &root.join("first-run.json"),
+                &json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true }),
+            )?;
+        }
+        report.rows.push(Row {
+            name: "Selected Mac settings".into(),
+            status: "ok".into(),
+            detail: "no settings selected; macOS was left unchanged".into(),
+        });
+        return Ok(report);
+    }
+    let full_profile = host.selection().workstation() == Selection::all().workstation();
+    // Subset passes leave the legacy full-profile activation obligation intact:
+    // explicit doctor --apply/--restore handles it without restarting unchecked
+    // settings here. Selected modern items own precise per-family markers.
+    let previous_activation = if full_profile {
+        pending_refresh(root)?
+    } else {
+        Vec::new()
+    };
     if action == Action::Check {
         if !previous_activation.is_empty() {
             report.rows.push(Row {
@@ -808,7 +1036,14 @@ fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, S
         return Ok(report);
     }
     let mut saved = load_backup(&report.backup)?;
-    let before = host.preference_changes()?;
+    let before = if WorkstationGroup::Preferences
+        .selected(host.selection())
+        .is_empty()
+    {
+        Vec::new()
+    } else {
+        host.preference_changes()?
+    };
     for setting in &before {
         if !saved.iter().any(|s| s.target == setting.target) {
             saved.push(setting.clone());
@@ -825,7 +1060,9 @@ fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, S
             activation.push(setting.target.clone());
         }
     }
-    save_pending_refresh(root, &activation)?;
+    if full_profile {
+        save_pending_refresh(root, &activation)?;
+    }
     // An explicit repair also supersedes an earlier completion/restoration.
     // Failed account work must remain retryable until the shared pass verifies it.
     write_json(
@@ -855,18 +1092,20 @@ fn execute(host: &mut dyn Host, root: &Path, action: Action) -> Result<Report, S
                 detail: errors.join("; "),
             });
         }
-        if refresh(host, &activation.iter().collect::<Vec<_>>(), &mut report) {
+        if refresh(host, &activation.iter().collect::<Vec<_>>(), &mut report) && full_profile {
             clear_pending_refresh(root)?;
         }
         return Ok(report);
     }
     // The common desktop items already activate their own writes. An old
     // doctor's recovery record may predate those items, so discharge it once.
-    if refresh(
-        host,
-        &previous_activation.iter().collect::<Vec<_>>(),
-        &mut report,
-    ) {
+    if full_profile
+        && refresh(
+            host,
+            &previous_activation.iter().collect::<Vec<_>>(),
+            &mut report,
+        )
+    {
         clear_pending_refresh(root)?;
     }
     append_workstation(host, WorkstationGroup::Accounts, true, &mut report);
@@ -1068,6 +1307,8 @@ mod tests {
 
     #[derive(Default)]
     struct Fake {
+        selected: Option<Selection>,
+        preference_passes: usize,
         values: BTreeMap<Target, PValue>,
         writes: Vec<Target>,
         fail_once: bool,
@@ -1093,6 +1334,9 @@ mod tests {
     }
 
     impl Host for Fake {
+        fn selection(&self) -> Selection {
+            self.selected.unwrap_or_default()
+        }
         fn attempted_preferences(&mut self) -> Vec<Saved> {
             std::mem::take(&mut self.attempted)
         }
@@ -1116,9 +1360,18 @@ mod tests {
             Ok(())
         }
         fn preference_changes(&mut self) -> Result<Vec<Saved>, String> {
+            self.preference_passes += 1;
             self.attempted.clear();
             Ok(wanted()
                 .into_iter()
+                .filter(|(target, _)| {
+                    self.selection()
+                        .contains(if target.domain == "com.apple.dock" {
+                            Setting::Dock
+                        } else {
+                            Setting::Widgets
+                        })
+                })
                 .filter(|(t, v)| !self.values.get(t).is_some_and(|now| now.same(v)))
                 .map(|(target, _)| Saved {
                     value: self.values.get(&target).cloned(),
@@ -1142,6 +1395,16 @@ mod tests {
             let mut rows = Vec::new();
             if group != WorkstationGroup::Accounts {
                 for (target, value) in wanted() {
+                    if !self
+                        .selection()
+                        .contains(if target.domain == "com.apple.dock" {
+                            Setting::Dock
+                        } else {
+                            Setting::Widgets
+                        })
+                    {
+                        continue;
+                    }
                     let correct = self.values.get(&target).is_some_and(|now| now.same(&value));
                     let mut status = if correct { "ok" } else { "drift" };
                     if apply && !correct {
@@ -1164,7 +1427,11 @@ mod tests {
                     });
                 }
             }
-            if matches!(group, WorkstationGroup::Accounts | WorkstationGroup::All) {
+            if matches!(group, WorkstationGroup::Accounts | WorkstationGroup::All)
+                && !WorkstationGroup::Accounts
+                    .selected(self.selection())
+                    .is_empty()
+            {
                 self.account_passes += 1;
                 rows.push(Row {
                     name: "Account sign-out".into(),
@@ -1179,6 +1446,182 @@ mod tests {
             }
             Ok(rows)
         }
+    }
+
+    #[test]
+    fn selected_preferences_leave_unchecked_accounts_and_recovery_targets_untouched() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut selected = Selection::none();
+        selected.set(Setting::Widgets, true);
+        authorize_automatic_setup_at(root.path(), selected).unwrap();
+        assert_eq!(authorized_selection(root.path()).unwrap(), Some(selected));
+        let dock = wanted()[0].0.clone();
+        save_pending_refresh(root.path(), std::slice::from_ref(&dock)).unwrap();
+        let old_activation = std::fs::read(root.path().join("pending-refresh.json")).unwrap();
+        let mut host = Fake {
+            selected: Some(selected),
+            accounts_blocked: true,
+            ..Fake::default()
+        };
+        let report = execute(&mut host, root.path(), Action::Apply).unwrap();
+        assert!(!report.needs_attention(), "{}", report.to_text());
+        assert_eq!(
+            host.account_passes, 0,
+            "unchecked account operations never run"
+        );
+        assert_eq!(host.writes, [wanted()[1].0.clone()]);
+        assert!(!host.values.contains_key(&dock));
+        assert!(
+            host.restarts.is_empty(),
+            "do not activate an unchecked old Dock obligation"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("pending-refresh.json")).unwrap(),
+            old_activation
+        );
+        let saved = load_backup(&report.backup).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].target, wanted()[1].0);
+    }
+
+    #[test]
+    fn account_only_and_empty_selections_never_probe_preferences() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut selected = Selection::none();
+        selected.set(Setting::Messages, true);
+        let mut host = Fake {
+            selected: Some(selected),
+            ..Fake::default()
+        };
+        let report = execute(&mut host, root.path(), Action::Apply).unwrap();
+        assert!(!report.needs_attention());
+        assert_eq!(host.preference_passes, 0);
+        assert_eq!(host.account_passes, 1);
+        assert!(host.writes.is_empty());
+        assert!(!report.backup.exists());
+
+        let empty_root = aterm_tempfile::tempdir().unwrap();
+        authorize_automatic_setup_at(empty_root.path(), Selection::none()).unwrap();
+        assert!(first_run_complete(empty_root.path()).unwrap());
+        assert_eq!(
+            authorized_selection(empty_root.path()).unwrap(),
+            Some(Selection::none())
+        );
+        let mut host = Fake {
+            selected: Some(Selection::none()),
+            ..Fake::default()
+        };
+        let report = execute(&mut host, empty_root.path(), Action::Apply).unwrap();
+        assert!(!report.needs_attention());
+        assert_eq!(host.preference_passes, 0);
+        assert_eq!(host.account_passes, 0);
+        assert!(host.writes.is_empty());
+        assert!(host.restarts.is_empty());
+        assert!(!report.backup.exists());
+    }
+
+    #[test]
+    fn authorization_survives_reopen_and_missing_or_unknown_plans_are_refused() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        assert_eq!(authorized_selection(root.path()).unwrap(), None);
+        let mut selected = Selection::all();
+        selected.set(Setting::Messages, false);
+        selected.set(Setting::FaceTime, false);
+        authorize_automatic_setup_at(root.path(), selected).unwrap();
+        assert_eq!(authorized_selection(root.path()).unwrap(), Some(selected));
+        assert!(!first_run_complete(root.path()).unwrap());
+        save_automatic_plan(root.path(), Selection::all()).unwrap();
+        assert_eq!(
+            authorized_selection(root.path()).unwrap(),
+            Some(Selection::all())
+        );
+        write_json(
+            &root.path().join("automatic-plan.json"),
+            &json!({"profile": PROFILE, "selection": 65535}),
+        )
+        .unwrap();
+        assert!(authorized_selection(root.path()).is_err());
+    }
+
+    #[test]
+    fn stale_automatic_authorization_preserves_every_completed_decision() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let marker_path = root.path().join("first-run.json");
+        let mut original = Selection::none();
+        original.set(Setting::Widgets, true);
+        save_automatic_plan(root.path(), original).unwrap();
+        let plan = std::fs::read(root.path().join("automatic-plan.json")).unwrap();
+        for marker in [
+            json!({"profile": PROFILE, "state": "cancelled"}),
+            json!({"profile": PROFILE, "state": "restored"}),
+            json!({"profile": PROFILE, "state": "applied", "accounts_verified": true}),
+        ] {
+            write_json(&marker_path, &marker).unwrap();
+            let before = std::fs::read(&marker_path).unwrap();
+            let _lock = HeldLock::take(root.path()).unwrap();
+            authorize_automatic_setup_at(root.path(), Selection::all()).unwrap();
+            assert_eq!(std::fs::read(&marker_path).unwrap(), before);
+            assert_eq!(
+                std::fs::read(root.path().join("automatic-plan.json")).unwrap(),
+                plan
+            );
+        }
+    }
+
+    #[test]
+    fn visible_finish_and_authorization_markers_must_discharge_failed_namespace_flushes() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let marker = root.path().join("first-run.json");
+        for value in [
+            json!({"profile": PROFILE, "state": "cancelled"}),
+            json!({"profile": PROFILE, "state": "restored"}),
+            json!({"profile": PROFILE, "state": "applied", "accounts_verified": true}),
+        ] {
+            assert!(
+                write_json_with_flush(&marker, &value, |_| Err(std::io::Error::other(
+                    "failed directory flush"
+                )))
+                .is_err()
+            );
+            assert!(marker.exists(), "the rename is visible even on failure");
+            assert!(
+                first_run_complete_with_flush(root.path(), |_| Err(std::io::Error::other(
+                    "still not durable"
+                )))
+                .is_err()
+            );
+            let mut reached_root = false;
+            assert!(
+                first_run_complete_with_flush(root.path(), |directory| {
+                    reached_root |= directory.parent().is_none();
+                    Ok(())
+                })
+                .unwrap()
+            );
+            assert!(
+                reached_root,
+                "the retry flushes the complete namespace chain"
+            );
+        }
+        let plan = root.path().join("automatic-plan.json");
+        assert!(
+            write_json_with_flush(
+                &plan,
+                &json!({"profile":PROFILE,"selection":Selection::all().bits()}),
+                |_| Err(std::io::Error::other("failed plan flush"))
+            )
+            .is_err()
+        );
+        assert!(
+            authorized_selection_with_flush(root.path(), |_| Err(std::io::Error::other(
+                "still not durable"
+            )))
+            .is_err()
+        );
+        assert_eq!(
+            authorized_selection_with_flush(root.path(), |_| Ok(())).unwrap(),
+            Some(Selection::all())
+        );
     }
 
     #[test]
@@ -1213,6 +1656,105 @@ mod tests {
         assert_eq!(host.values.len(), 1);
         assert_eq!(host.values[&unowned], PValue::Str("right".into()));
         assert!(first_run_complete(root.path()).expect("restore disables automatic setup"));
+    }
+
+    #[test]
+    fn cancellation_is_durable_until_explicit_apply_and_check_leaves_it_alone() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        assert!(!first_run_complete(root.path()).expect("new profile"));
+        cancel_automatic_setup_at(root.path()).expect("cancel");
+        assert!(first_run_complete(root.path()).expect("cancelled profile"));
+        let marker_path = root.path().join("first-run.json");
+        let cancelled = std::fs::read(&marker_path).expect("durable cancellation");
+        assert_eq!(
+            aterm_json::from_slice::<Value>(&cancelled).unwrap()["state"].as_str(),
+            Some("cancelled")
+        );
+        let mut host = Fake {
+            accounts_blocked: true,
+            ..Fake::default()
+        };
+        execute(&mut host, root.path(), Action::Check).expect("check cancellation");
+        assert!(host.writes.is_empty());
+        assert_eq!(std::fs::read(&marker_path).unwrap(), cancelled);
+        assert!(!root.path().join("original-preferences.json").exists());
+
+        let report = execute(&mut host, root.path(), Action::Apply).expect("explicit apply");
+        assert!(report.needs_attention(), "blocked account remains visible");
+        assert!(
+            !host.writes.is_empty(),
+            "explicit apply supersedes cancellation"
+        );
+        assert!(!first_run_complete(root.path()).expect("pending explicit apply"));
+        assert_eq!(
+            aterm_json::from_slice::<Value>(&std::fs::read(marker_path).unwrap()).unwrap()["state"]
+                .as_str(),
+            Some("pending")
+        );
+    }
+
+    #[test]
+    fn cancellation_preserves_completed_decisions_and_cannot_race_an_apply() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let marker_path = root.path().join("first-run.json");
+        for marker in [
+            json!({ "profile": PROFILE, "state": "restored" }),
+            json!({ "profile": PROFILE, "state": "applied", "accounts_verified": true }),
+        ] {
+            write_json(&marker_path, &marker).expect("completed state");
+            let before = std::fs::read(&marker_path).unwrap();
+            cancel_automatic_setup_at(root.path()).expect("already finished");
+            assert_eq!(std::fs::read(&marker_path).unwrap(), before);
+        }
+
+        write_json(
+            &marker_path,
+            &json!({ "profile": PROFILE, "state": "pending" }),
+        )
+        .expect("pending state");
+        let held = HeldLock::take(root.path()).expect("active apply");
+        assert!(cancel_automatic_setup_at(root.path()).is_err());
+        assert!(!first_run_complete(root.path()).expect("cancellation refused"));
+        drop(held);
+        cancel_automatic_setup_at(root.path()).expect("cancel after apply");
+        assert!(first_run_complete(root.path()).expect("cancelled after release"));
+    }
+
+    #[test]
+    fn automatic_worker_claim_is_exclusive_and_does_not_hold_the_profile_lock() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let claim = claim_automatic_setup_at(root.path())
+            .expect("claim worker")
+            .expect("first worker");
+        assert!(claim_automatic_setup_at(root.path()).unwrap().is_none());
+        let profile = HeldLock::take(root.path()).expect("explicit apply remains available");
+        drop(profile);
+        cancel_automatic_setup_at(root.path()).expect("cancel during countdown");
+        drop(claim);
+        assert!(
+            claim_automatic_setup_at(root.path()).unwrap().is_none(),
+            "a cancelled setup never starts another countdown"
+        );
+
+        write_json(
+            &root.path().join("first-run.json"),
+            &json!({ "profile": PROFILE, "state": "pending" }),
+        )
+        .expect("explicit retry pending");
+        let claim = claim_automatic_setup_at(root.path())
+            .unwrap()
+            .expect("retry worker");
+        drop(claim);
+        let replacement = claim_automatic_setup_at(root.path())
+            .unwrap()
+            .expect("released claim can be acquired again");
+        let mut host = Fake::default();
+        execute(&mut host, root.path(), Action::Apply).expect("explicit apply during countdown");
+        drop(replacement);
+        assert!(
+            claim_automatic_setup_at(root.path()).unwrap().is_none(),
+            "a completed explicit apply ends automatic setup too"
+        );
     }
 
     #[test]

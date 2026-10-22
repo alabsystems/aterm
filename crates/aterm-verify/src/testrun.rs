@@ -655,6 +655,23 @@ pub fn run_tests(
     serial: &Cmd,
     exes: Result<Vec<TestExe>, String>,
 ) {
+    // A launcher can hand verify a small descriptor table. Concurrent
+    // fixtures and process-lifetime custody leases need room even after an
+    // earlier fixture ends. Raise before the recorder or any test child,
+    // including the serial fallback; low-limit tests constrain their own child.
+    #[cfg(unix)]
+    match aterm_uds::host::open_file_room(4096) {
+        Ok(room) => {
+            r.raw(format!(
+                "  test descriptors: soft {} -> {}, hard {}, target {} (requested 4096)",
+                room.before, room.after, room.hard, room.target
+            ));
+            if let Some(error) = room.refusal {
+                r.raw(format!("  test descriptor raise refused: {error}"));
+            }
+        }
+        Err(error) => r.raw(format!("  test descriptor room unavailable: {error}")),
+    }
     let env = crate::findings::rerun_env(serial, ctx.test_threads);
     let serially = |r: &mut Report, why: &str| {
         r.raw(format!(

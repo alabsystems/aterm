@@ -4,7 +4,7 @@
 //! Shared support for this crate's integration tests and benches. `effects_suite`, the
 //! crate's one test binary, mounts it once (its files reach it as `crate::common`); a bench
 //! mounts it (or a suite file) by path. An item some binary leaves unused carries
-//! `#[allow(dead_code)]`.
+//! `#[allow(dead_code)]` (a re-export, `#[allow(unused_imports)]`).
 //!
 //! It holds the budget-scale knob of the release perf gates (`benches/cursor_bench.rs` and
 //! `benches/rainbow_kitty_v2_frame_cost.rs`); the ribbon host's pieces: the rainbow-kitty
@@ -383,50 +383,7 @@ pub fn recording(src: &str, per_ms: u64) -> Vec<(u64, Rec)> {
         .collect()
 }
 
-// The replay pool.
+// The replay pool: the library's, so the unit tests and this suite share one.
 
-/// `f` over every item on a pool as wide as `RUST_TEST_THREADS` (as libtest reads it, else the
-/// machine's parallelism), results in `items`' order. Each item is one independent replay (its
-/// own `Terminal`, engine and clock), so where it runs changes nothing it reads. A panicking
-/// item does not stop the others; once all have run, the first panic in `items`' order is
-/// re-raised with its own payload, as a serial loop would raise it.
-#[allow(dead_code)]
-pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let threads = std::env::var("RUST_TEST_THREADS")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
-        .min(items.len());
-    let next = AtomicUsize::new(0);
-    let slots: Vec<Mutex<Option<std::thread::Result<R>>>> =
-        items.iter().map(|_| Mutex::new(None)).collect();
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(item) = items.get(i) else { break };
-                    let out = catch_unwind(AssertUnwindSafe(|| f(item)));
-                    *slots[i].lock().unwrap_or_else(|p| p.into_inner()) = Some(out);
-                }
-            });
-        }
-    });
-    slots
-        .into_iter()
-        .map(|slot| {
-            match slot
-                .into_inner()
-                .unwrap_or_else(|p| p.into_inner())
-                .expect("every item ran")
-            {
-                Ok(r) => r,
-                Err(payload) => resume_unwind(payload),
-            }
-        })
-        .collect()
-}
+#[allow(unused_imports)]
+pub use aterm_effects::test_pool::par_map;

@@ -1004,13 +1004,15 @@ fn held_dirs(tools: &Toolchain) -> Vec<PathBuf> {
 const LOGS_KEPT: usize = 20;
 
 /// Open this run's log: `--log <path>` (read from `cwd`), else
-/// `<target>/verify/logs/<epoch>-<pid>.log`, keeping the newest
+/// `<target>/verify/logs.noindex/<epoch>-<pid>.log`, keeping the newest
 /// [`LOGS_KEPT`]. A log that cannot be opened costs the record, never the run.
+/// `.noindex`, as every other folder of the run's: Spotlight skips the folder, so
+/// the megabytes of test output each run writes are never content-indexed.
 fn open_log(chosen: Option<&Path>, cwd: &Path, ctx: &Ctx) -> Option<(PathBuf, std::fs::File)> {
     let path = match chosen {
         Some(p) => cwd.join(p),
         None => {
-            let dir = ctx.state_dir().join("logs");
+            let dir = ctx.state_dir().join("logs.noindex");
             prune_logs(&dir);
             let secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

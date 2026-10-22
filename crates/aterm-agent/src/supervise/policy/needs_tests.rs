@@ -537,24 +537,28 @@ fn none_list<'b, 'a>(
 /// names none in, or none carrying the row's words (a lost need).
 fn misread_by(by: &NoneWords<'_>) -> Vec<String> {
     needs_table()
-        .into_iter()
-        .filter_map(|(row, report)| {
-            let named: Vec<String> = needs_lines_by(&report, by)
-                .needs
-                .iter()
-                .map(|n| sanitized(n))
-                .filter(|n| !n.is_empty())
-                .collect();
-            let misread = match &row {
-                NeedsRow::None => !named.is_empty(),
-                NeedsRow::Need(words) => !named
-                    .iter()
-                    .any(|n| n.to_lowercase().contains(&words.to_lowercase())),
-                NeedsRow::Headless(_) => false,
-            };
-            misread.then(|| format!("{row:?} {report:?} -> {named:?}"))
-        })
+        .iter()
+        .filter_map(|(row, report)| misread(row, report, by))
         .collect()
+}
+
+/// How the needs reader misreads the table's `report`, labelled `row`, with
+/// the word lists `by` ([`misread_by`]), if it does.
+fn misread(row: &NeedsRow, report: &str, by: &NoneWords<'_>) -> Option<String> {
+    let named: Vec<String> = needs_lines_by(report, by)
+        .needs
+        .iter()
+        .map(|n| sanitized(n))
+        .filter(|n| !n.is_empty())
+        .collect();
+    let misread = match row {
+        NeedsRow::None => !named.is_empty(),
+        NeedsRow::Need(words) => !named
+            .iter()
+            .any(|n| n.to_lowercase().contains(&words.to_lowercase())),
+        NeedsRow::Headless(_) => false,
+    };
+    misread.then(|| format!("{row:?} {report:?} -> {named:?}"))
 }
 
 /// EVERY WORD OF THE NONE READER'S LISTS IS LOAD-BEARING (the mutation
@@ -563,13 +567,16 @@ fn misread_by(by: &NoneWords<'_>) -> Vec<String> {
 /// (`fixtures/needs-table.txt`) reads some row otherwise — a none it held
 /// becomes a phantom need, or a need it kept is lost — so no word is dead
 /// weight, and none can be dropped without the table naming the report it
-/// changes. The reader's own lists misread nothing. NEGATIVE CONTROL: a
-/// reader that takes words a person is asked for (`just`, `please`,
-/// `publish`, `key`, `tag`, `approve`) as a time a none is said for loses
-/// needs on the table.
+/// changes. The reader's own lists misread nothing. Each word's search is
+/// the whole table, the rows that spell the word tried first: one of them
+/// is usually the row it bears. NEGATIVE CONTROL: a reader that takes words
+/// a person is asked for (`just`, `please`, `publish`, `key`, `tag`,
+/// `approve`) as a time a none is said for loses needs on the table.
 #[test]
 fn every_none_word_is_load_bearing() {
     assert_eq!(misread_by(&NONE_WORDS), Vec::<String>::new());
+    let table = needs_table();
+    let lowered: Vec<String> = table.iter().map(|(_, r)| r.to_lowercase()).collect();
     let mut dead = Vec::new();
     for k in 0.. {
         let mut by = NONE_WORDS;
@@ -588,7 +595,13 @@ fn every_none_word_is_load_bearing() {
             if let Some((_, list)) = none_list(&mut by, k) {
                 *list = &kept;
             }
-            if misread_by(&by).is_empty() {
+            let (first, rest): (Vec<usize>, Vec<usize>) =
+                (0..table.len()).partition(|&r| lowered[r].contains(word));
+            let bears = first.iter().chain(&rest).any(|&r| {
+                let (row, report) = &table[r];
+                misread(row, report, &by).is_some()
+            });
+            if !bears {
                 dead.push(format!("{name}: {word:?}"));
             }
         }

@@ -432,7 +432,7 @@ impl Drop for World {
 /// `root/state` the state directory — with `stdin` piped in (or none); its
 /// output once it exits, within the hang detector.
 fn fleet(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
-    let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+    let aterm = crate::launch_isolation::aterm_executable();
     #[expect(
         clippy::disallowed_types,
         reason = "the binary under test, isolated by launch_isolation::apply (it inherits nothing)"
@@ -470,7 +470,7 @@ fn ctl_in(root: &Path, args: &[&str]) -> Output {
 /// is a person's, and a loaded machine can miss it.
 fn ctl_fed(root: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
     headless_boot::until_served(|| {
-        let aterm = Path::new(env!("CARGO_BIN_EXE_aterm"));
+        let aterm = crate::launch_isolation::aterm_executable();
         #[expect(
             clippy::disallowed_types,
             reason = "the binary under test, isolated by launch_isolation::apply (it inherits nothing)"

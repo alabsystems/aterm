@@ -610,7 +610,7 @@ fn an_outcome_under_another_home_is_recorded_nowhere() {
         budget: Duration::from_secs(5),
         level: Level::Yolo,
     };
-    let other = |k: &str| (k == "CODEX_HOME").then(|| "/identities/w/.codex".to_string());
+    let other = |k: &str| (k == "CODEX_HOME").then(|| "/profiles/w/.codex".to_string());
     let host = Host {
         runner: &runner,
         var: &other,

@@ -354,13 +354,50 @@ fn setenv(run: &Run, key: &str, value: Option<&str>) -> Res {
     Ok(0)
 }
 
-/// `survey [tag] on|off`: `CLAUDE_FORCE_DISPLAY_SURVEY` in the running Claude's settings env.
+/// `survey [tag] on|off [--reread]`: `CLAUDE_FORCE_DISPLAY_SURVEY` in the running Claude's settings env. With
+/// `--reread` the write is made as `selftest` arms the flag: again every 3 s until Claude Code reports re-reading
+/// the file ([`crate::settings_witness`]), then the writes and the seconds to that report are printed.
 pub fn cmd_survey(args: &[String]) -> Res {
+    const KEY: &str = "CLAUDE_FORCE_DISPLAY_SURVEY";
     let (run, a) = lab(args)?;
-    match a.first().map(String::as_str) {
-        Some("on") => setenv(&run, "CLAUDE_FORCE_DISPLAY_SURVEY", Some("1")),
-        Some("off") => setenv(&run, "CLAUDE_FORCE_DISPLAY_SURVEY", None),
-        _ => Err(Fail::die("survey: on|off")),
+    let (value, reread) = survey_words(&a)?;
+    if !reread {
+        return setenv(&run, KEY, value);
+    }
+    let r = crate::settings_witness::set_env_reread(
+        &run,
+        KEY,
+        value,
+        (
+            crate::settings_witness::REWRITE_EVERY,
+            crate::settings_witness::HANG,
+        ),
+    )?;
+    println!(
+        "survey {}: Claude Code reported a re-read {:.2} s after the first write ({} write(s))",
+        if value.is_some() { "on" } else { "off" },
+        r.after.as_secs_f64(),
+        r.writes
+    );
+    Ok(0)
+}
+
+/// `survey`'s words after the tag: the flag's value (`on`: `1`, `off`: none)
+/// and whether the write waits for Claude Code's re-read (`--reread`).
+///
+/// # Errors
+/// Anything else.
+fn survey_words(a: &[String]) -> Result<(Option<&'static str>, bool), Fail> {
+    let words: Vec<&str> = a.iter().map(String::as_str).collect();
+    let (value, rest) = match words.split_first() {
+        Some((&"on", rest)) => (Some("1"), rest),
+        Some((&"off", rest)) => (None, rest),
+        _ => return Err(Fail::die("survey: on|off [--reread]")),
+    };
+    match rest {
+        [] => Ok((value, false)),
+        ["--reread"] => Ok((value, true)),
+        _ => Err(Fail::die("survey: on|off [--reread]")),
     }
 }
 
@@ -1078,17 +1115,11 @@ pub fn capture(
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    for bad in [
-        paths().user.as_str(),
-        host.as_str(),
-        paths().real_home.as_str(),
-    ] {
-        if !bad.is_empty() && text.contains(bad) {
-            eprintln!(
-                "aterm-lab: WARNING: {} contains '{bad}' -- redact before it goes near the repo",
-                out.display()
-            );
-        }
+    for bad in pii_found(paths(), &host, &text) {
+        eprintln!(
+            "aterm-lab: WARNING: {} contains '{bad}' -- redact before it goes near the repo",
+            out.display()
+        );
     }
     println!(
         "{} ({} lines){}",
@@ -1099,6 +1130,18 @@ pub fn capture(
             .unwrap_or_default()
     );
     Ok((out, png))
+}
+
+/// What of the owner's a capture's `text` carries, by the PII guard: the
+/// login name, the host's short name, and every home the lab guards (the
+/// account's, whatever `HOME` says, and the caller's `HOME` when it names
+/// another: [`crate::paths::Paths::guarded_homes`]).
+fn pii_found(p: &crate::paths::Paths, host: &str, text: &str) -> Vec<String> {
+    [p.user.clone(), host.to_string()]
+        .into_iter()
+        .chain(p.guarded_homes())
+        .filter(|bad| !bad.is_empty() && text.contains(bad.as_str()))
+        .collect()
 }
 
 /// `capture [tag] <name> "<what>"`: the screen as it is NOW, in the repo's fixture shape.
@@ -1279,6 +1322,75 @@ pub fn security_masked(run: &Run) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE CAPTURE'S PII GUARD LOOKS FOR EVERY HOME THE LAB GUARDS: under a
+    /// scratch `HOME` (a fake account home handed in through
+    /// [`crate::paths::Paths::resolve_with`]) a capture naming the account's
+    /// home or the scratch one is flagged, as is the login name. NEGATIVE
+    /// CONTROLS: a capture naming none is clean, and the facts of a run from
+    /// the account's own `HOME` do not take the scratch home for the owner's.
+    #[test]
+    fn the_capture_pii_guard_looks_for_the_account_home_and_a_scratch_home() {
+        let top = aterm_tempfile::Builder::new()
+            .prefix("lab-pii-")
+            .tempdir()
+            .unwrap();
+        let real = fs::canonicalize(top.path()).unwrap();
+        let (account, scratch) = (real.join("account"), real.join("scratch"));
+        for d in [&account, &scratch] {
+            fs::create_dir_all(d).unwrap();
+        }
+        let (a, s) = (account.display().to_string(), scratch.display().to_string());
+        let mut p = crate::paths::Paths::resolve_with(Some(account.clone()), Some(scratch.into()));
+        p.user = "lab-owner-name".into();
+        let host = "lab-host-name";
+        assert_eq!(
+            pii_found(&p, host, &format!("cwd {a}/x")),
+            std::slice::from_ref(&a)
+        );
+        assert_eq!(
+            pii_found(&p, host, &format!("cwd {s}/x")),
+            std::slice::from_ref(&s)
+        );
+        assert_eq!(
+            pii_found(&p, host, "lab-owner-name@lab-host-name"),
+            ["lab-owner-name", "lab-host-name"]
+        );
+        // NEGATIVE CONTROLS
+        assert!(pii_found(&p, host, "cwd ~/x").is_empty());
+        let mut own =
+            crate::paths::Paths::resolve_with(Some(account.clone()), Some(account.into()));
+        own.user = "lab-owner-name".into();
+        assert!(pii_found(&own, host, &format!("cwd {s}/x")).is_empty());
+    }
+
+    /// `survey on|off [--reread]`: `on` sets the flag, `off` removes it, and
+    /// `--reread` after either waits for Claude Code's re-read. NEGATIVE
+    /// CONTROLS: no word, another word, `--reread` alone or first, and a word
+    /// past the flag are refused.
+    #[test]
+    fn survey_takes_on_or_off_and_reread_after_it() {
+        let w = |s: &str| -> Vec<String> { s.split_whitespace().map(str::to_string).collect() };
+        for (words, want) in [
+            ("on", (Some("1"), false)),
+            ("off", (None, false)),
+            ("on --reread", (Some("1"), true)),
+            ("off --reread", (None, true)),
+        ] {
+            assert_eq!(survey_words(&w(words)).ok(), Some(want), "{words}");
+        }
+        for bad in [
+            "",
+            "yes",
+            "--reread",
+            "--reread on",
+            "on --reread x",
+            "on off",
+        ] {
+            let e = survey_words(&w(bad)).expect_err(bad);
+            assert_eq!(e.msg.as_deref(), Some("survey: on|off [--reread]"), "{bad}");
+        }
+    }
 
     #[test]
     fn harness_keys_are_set_in_their_table_and_replaced_when_there() {

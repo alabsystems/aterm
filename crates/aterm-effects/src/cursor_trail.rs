@@ -90,6 +90,7 @@ pub const NAV_BRIDGE_LANDING_MS: u64 = 150;
 /// earlier state, and one more than [`NAV_NOOP_SETTLE_MS`] after the press proves the key moved
 /// nothing.
 #[must_use]
+#[inline]
 pub fn nav_bridge_source_ok(key: Instant, seen: Instant) -> bool {
     key.saturating_duration_since(seen).as_millis() as u64 <= HIDE_BRIDGE_MS
         && seen.saturating_duration_since(key).as_millis() as u64 <= NAV_NOOP_SETTLE_MS
@@ -99,6 +100,7 @@ pub fn nav_bridge_source_ok(key: Instant, seen: Instant) -> bool {
 /// moved from ([`nav_bridge_source_ok`]), and the landing arrives while the echo could still be
 /// outstanding ([`NAV_BRIDGE_LANDING_MS`]).
 #[must_use]
+#[inline]
 pub fn nav_bridge_admits(key: Instant, seen: Instant, now: Instant) -> bool {
     nav_bridge_source_ok(key, seen)
         && now.saturating_duration_since(key).as_millis() as u64 <= NAV_BRIDGE_LANDING_MS
@@ -128,6 +130,7 @@ impl BridgeReach {
     /// Does this reach admit a hidden→visible landing at `to` from `from`
     /// (`(row, col)` each)?
     #[must_use]
+    #[inline]
     pub fn admits(self, from: (u16, u16), to: (u16, u16)) -> bool {
         let dr = to.0.abs_diff(from.0);
         let dc = to.1.abs_diff(from.1);
@@ -143,6 +146,7 @@ impl BridgeReach {
         }
     }
 
+    #[inline]
     const fn ball(d: u16) -> Self {
         Self {
             cols: d,
@@ -160,6 +164,7 @@ impl BridgeReach {
 /// motion cannot leave the pane, and a landing two or more rows off must be Home's, at the
 /// pane's first column ([`BridgeReach::line_start`]).
 #[must_use]
+#[inline]
 pub fn hide_bridge_reach(
     typed_hint_fresh: bool,
     nav_hint_fresh: bool,
@@ -194,6 +199,7 @@ pub struct BridgeTally {
 
 /// Integer linear interpolation `a + (b-a)*q` for `q` in `0..=1` (endpoints
 /// inclusive). `a`/`b` are small coverage values, so `f32` is exact enough.
+#[inline]
 fn lerp_u32(a: u32, b: u32, q: f32) -> u32 {
     let q = q.clamp(0.0, 1.0);
     (a as f32 + (b as f32 - a as f32) * q).round() as u32
@@ -390,6 +396,7 @@ impl CursorTrail {
     /// Last visible source owned by this engine. Hosts compare it with CursorGlow's before
     /// arming a candidate; an unseeded or reset pair fails closed.
     #[must_use]
+    #[inline]
     pub fn cursor_anchor(&self) -> Option<(u16, u16)> {
         self.last
             .or_else(|| self.last_visible.map(|(cell, _)| cell))
@@ -401,6 +408,7 @@ impl CursorTrail {
     /// A typed press closes nothing here: the nav and generic-move one-shots survive it, since
     /// their echoes are still owed (a glyph typed before an Enter's response lands is
     /// type-ahead).
+    #[inline]
     pub fn note_typed(&mut self, now: Instant) {
         self.type_hint.stamp(now);
     }
@@ -424,18 +432,21 @@ impl CursorTrail {
     /// terminal's `repaint_blink_epoch` advanced (the app brackets redraws in
     /// DECTCEM-hide-inside-DEC-2026, as Claude Code does per keystroke).
     /// Feeds the alt-screen re-anchor classifier; not movement evidence.
+    #[inline]
     pub fn note_repaint_blink(&mut self, now: Instant) {
         self.blink_hint = Some(now);
     }
 
     /// Drop the blink hint: a tab/pane switch pointed this window at a
     /// different terminal.
+    #[inline]
     pub fn clear_blink(&mut self) {
         self.blink_hint = None;
     }
 
     /// Host per-frame context (see `CursorGlow::note_context`): whether the
     /// probed terminal is on the alt screen this frame.
+    #[inline]
     pub fn note_context(&mut self, alt: bool) {
         self.ctx_alt = alt;
     }
@@ -453,6 +464,7 @@ impl CursorTrail {
     /// Disarm dangling movement state (see `CursorGlow::clear_typed`): a newer
     /// key with its own semantics (plain Enter, nav, kills, Tab) supersedes a
     /// swallowed typed or generic move.
+    #[inline]
     pub fn clear_typed(&mut self) {
         self.type_hint.clear();
         self.nav_hint = None;
@@ -461,12 +473,14 @@ impl CursorTrail {
 
     /// Arm the navigation veto (see `CursorGlow::note_navigation`): it licenses the following
     /// move and classifies it as scrubbing, which the comet does not paint.
+    #[inline]
     pub fn note_navigation(&mut self, now: Instant) {
         self.clear_typed();
         self.nav_hint = Some(now);
     }
 
     /// Arm one generic movement license, superseding any swallowed typed/navigation classifier.
+    #[inline]
     fn note_move(&mut self, now: Instant) {
         self.clear_typed();
         self.move_hint = Some(now);
@@ -476,6 +490,7 @@ impl CursorTrail {
     /// `CursorGlow::note_user_gesture`: banked typed stamps are real keys with echoes in
     /// flight, so the bank is kept. It closes the nav class, where the glow keeps its nav
     /// one-shot; the two differ only for an arrow whose hop is in flight when Tab is pressed.
+    #[inline]
     pub fn note_user_gesture(&mut self, now: Instant) {
         self.nav_hint = None;
         self.move_hint = Some(now);
@@ -483,6 +498,7 @@ impl CursorTrail {
 
     /// Classify a plain Return, bank-preserving like
     /// [`Self::note_user_gesture`], in lockstep with `CursorGlow::note_return`.
+    #[inline]
     pub fn note_return(&mut self, now: Instant) {
         self.move_hint = Some(now);
     }
@@ -569,6 +585,7 @@ impl CursorTrail {
     }
 
     /// Whether any spark is still alive (the host keeps the animation timer armed).
+    #[inline]
     pub fn is_active(&self) -> bool {
         !self.sparks.is_empty()
     }
@@ -578,6 +595,7 @@ impl CursorTrail {
     /// coordinate space changes.
     pub fn reset(&mut self) {
         self.sparks.clear();
+        self.spawn_path.clear();
         self.last = None;
         self.last_visible = None;
         self.clear_typed();
@@ -755,6 +773,7 @@ impl CursorTrail {
     ///
     /// Peeks, never consumes: `spawn` owns consumption (one hint, one echo).
     #[must_use]
+    #[inline]
     pub fn move_licensed(&self, now: Instant) -> bool {
         self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH)
             || hint_fresh(self.nav_hint, now, Self::NAV_HINT_FRESH)
@@ -914,6 +933,7 @@ impl Default for CadenceParams {
 
 /// Decay `heat` forward by `dt` under a `half_life` (exponential). A non-positive half-life is
 /// floored so the power is finite.
+#[inline]
 fn decay_heat(heat: f32, dt: Duration, half_life: Duration) -> f32 {
     if heat <= 0.0 || dt.is_zero() {
         return heat.max(0.0);
@@ -925,6 +945,7 @@ fn decay_heat(heat: f32, dt: Duration, half_life: Duration) -> f32 {
 /// The cadence→intensity mapping: a smoothstep of `heat` between the two knees, `0.0` below
 /// `knee_lo` (a few keys never ignite) and `1.0` above `knee_hi`.
 #[must_use]
+#[inline]
 pub fn ignition_intensity(heat: f32, knee_lo: f32, knee_hi: f32) -> f32 {
     // A positive valid-interval test: NaN, inverted or equal knees fall to the
     // `else` and step at the single threshold rather than dividing by zero.
@@ -982,6 +1003,7 @@ impl TypingCadence {
 
     /// The standing heat decayed forward to `now`, the one lazy read every accessor derives
     /// from.
+    #[inline]
     fn heat_at(&self, now: Instant) -> f32 {
         match self.last {
             Some(last) => {
@@ -994,6 +1016,7 @@ impl TypingCadence {
 
     /// The heat→warmth mapping shared by [`Self::warmth`] and [`Self::sample`];
     /// see [`Self::warmth`].
+    #[inline]
     fn warmth_of(&self, heat: f32) -> f32 {
         let span = (self.params.knee_lo - self.params.gain).max(f32::EPSILON);
         ((heat - self.params.gain) / span).clamp(0.0, 1.0)
@@ -1002,6 +1025,7 @@ impl TypingCadence {
     /// The ignition intensity `0.0..=1.0` as of `now`: the decayed heat through
     /// [`ignition_intensity`]. Non-mutating, so safe to call every frame.
     #[must_use]
+    #[inline]
     pub fn intensity(&self, now: Instant) -> f32 {
         ignition_intensity(self.heat_at(now), self.params.knee_lo, self.params.knee_hi)
     }
@@ -1011,6 +1035,7 @@ impl TypingCadence {
     /// it into trail lifetime only, so human-cadence typing chains into a continuous bed while
     /// colour and alpha stay gentle. Non-mutating.
     #[must_use]
+    #[inline]
     pub fn warmth(&self, now: Instant) -> f32 {
         self.warmth_of(self.heat_at(now))
     }
@@ -1018,6 +1043,7 @@ impl TypingCadence {
     /// Both per-frame channels, `(intensity, warmth)`, bit-for-bit what the two accessors
     /// return for the same `now`, with one `powf` instead of two.
     #[must_use]
+    #[inline]
     pub fn sample(&self, now: Instant) -> (f32, f32) {
         let heat = self.heat_at(now);
         (
@@ -1037,6 +1063,7 @@ impl TypingCadence {
 /// nucleus freezes toward, so the bed and the head of one comet never
 /// disagree in temperature. (The warm amber target predated the icy comet
 /// and was never retuned with it.)
+#[inline]
 fn heat_color(base: u32, q: f32) -> u32 {
     /// The tint an ignited trail heats toward: the comet's own ice white.
     const HOT: u32 = crate::cursor_comet::ICE_WHITE;
@@ -1062,6 +1089,7 @@ fn heat_color(base: u32, q: f32) -> u32 {
 /// ignites the comet, while normal cadence only chains spark lifetimes. Pure
 /// and total; intensity `0.0` leaves the colour untouched, warmth `0.0` leaves
 /// the base life.
+#[inline]
 pub fn ignite(cfg: &mut TrailConfig, intensity: f32, warmth: f32) {
     let q = intensity.clamp(0.0, 1.0);
     cfg.intensity = q;

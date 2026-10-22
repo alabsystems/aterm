@@ -26,8 +26,6 @@
 //!   connected preset's tab is connected to its origin before the reply;
 //! * a new window does not exist while its spawn is held, and once released
 //!   its session lands in it, answering `status`;
-//! * a wire spawn's agent identity is checked on the spawner too, before the
-//!   fork: one it refuses is the caller's reply only once the hold is released.
 //!
 //! NEGATIVE CONTROL: with the spawn back on the event loop (the hold then runs
 //! in the turn, or not at all), `status` cannot answer while the hold stands,
@@ -234,61 +232,5 @@ fn a_held_new_window_leaves_the_loop_answering_and_lands_once_spawned() {
     assert!(
         field(&born, "phase").is_some(),
         "the new window's session answers: {born}"
-    );
-}
-
-/// A wire spawn's agent identity is checked where its shell starts, on the
-/// spawner, before the fork: never in the request's event-loop turn, since the
-/// identities folder can sit on a volume that stops answering. `@<worker>
-/// spawn` passes the worker's identity down; with that identity's folder gone,
-/// the spawner refuses it, and the caller, which waited while the spawn was
-/// held, hears `ERR identity worker: ...` once it is released.
-///
-/// NEGATIVE CONTROL: with the check back in the turn, the refusal is the reply
-/// before the spawner ever takes the spawn, and `held_call` fails on "the
-/// spawner never took the spawn".
-#[test]
-fn a_wire_spawns_identity_is_refused_on_the_spawner_not_in_the_turn() {
-    let inst = boot_with(
-        "aterm-idspawn",
-        |tmp: &Path, cmd| {
-            cmd.env("ATERM_DEBUG_SPAWN_HOLD", tmp.join("hold"))
-                .env("ATERM_STATE_HOME", tmp.join("state"));
-        },
-        |_| true,
-    );
-    let (_, boot_sid) = boot_session(&inst);
-    let reply = held_round(&inst, &boot_sid, &["spawn", "identity=worker"]);
-    let worker = named_sid(&reply).to_string();
-    // The identity's primer files are written by a re-prime pass its spawn
-    // handed off before replying; a removal racing that pass can find a folder
-    // still filling, or see it remade. Remove it once no pass is writing.
-    let give_up = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    loop {
-        let metrics = ctl_ok(&inst, &["metrics"]);
-        match field(&metrics, "identity_primes_running") {
-            Some("0") => break,
-            Some(_) => {}
-            None => panic!("metrics names no identity_primes_running=: {metrics}"),
-        }
-        assert!(
-            Instant::now() < give_up,
-            "the worker's prime never finished: {metrics}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    std::fs::remove_dir_all(inst.tmp.join("state/identities/worker"))
-        .expect("the worker's identity, made by its spawn");
-
-    let aimed = format!("@{worker}");
-    let out = held_call(&inst, &boot_sid, &[&aimed, "spawn"]);
-    let said = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        !out.status.success() && said.contains("identity worker: "),
-        "refused, in the request's words: {said}"
     );
 }

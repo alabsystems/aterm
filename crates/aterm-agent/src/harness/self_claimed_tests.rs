@@ -19,6 +19,7 @@ fn record(argv: &[&str], env: &[(&str, &str)]) -> Record {
         cwd: Some("/work".to_string()),
         draft_empty: None,
         frame: None,
+        initializing: false,
     }
 }
 
@@ -419,6 +420,159 @@ fn a_never_written_record_inherits_only_the_line_its_relaunch_typed() {
     assert_eq!(
         inherited(Some(&path), 4242, &relaunched),
         Err("launch-path")
+    );
+}
+
+/// The startup writer publishes its schema before the resumed native thread
+/// registers. A crash in that interval must keep the exact line this host
+/// already started, just as a crash before the first write does.
+#[cfg(unix)]
+#[test]
+fn an_initial_record_inherits_only_its_proven_relaunch_line() {
+    let mut relaunched = live();
+    relaunched.argv = [
+        "codex",
+        "--search",
+        "-m",
+        "gpt-5",
+        "-s",
+        "read-only",
+        "resume",
+        UUID,
+    ]
+    .map(str::to_string)
+    .to_vec();
+    let typed = Resume {
+        argv: line("/store/codex-alab/bin/codex", &ROOT)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        session: UUID.to_string(),
+        codex_home: relaunched.codex_home.clone(),
+        cwd: Some("/work".into()),
+    };
+    let initial = r#"{"v":1,"pid":4242,"sessionId":null,"resumeArgv":null,"cwd":null,"state":null,"status":"busy","exit":null,"draftEmpty":true,"env":{"CODEX_HOME":"/Users//u/.codex"}}"#;
+    let make = |text: Option<&str>, live: &Live, typed: Option<&Resume>| {
+        copy_of(4242, "start", "/h".into(), text, live, typed)
+    };
+    let copy = make(Some(initial), &relaunched, Some(&typed));
+    assert!(matches!(copy.seen, Seen::Present(_)));
+    assert_eq!(copy.resume, Ok(typed.clone()));
+    assert_eq!(verdict(&copy, false), Verdict::Crash);
+    assert_eq!(
+        fold(Some(&copy), make(Some(initial), &relaunched, Some(&typed))).resume,
+        Ok(typed.clone()),
+        "another initial frame adds no authority"
+    );
+    assert!(make(Some(initial), &relaunched, None).resume.is_err());
+    assert!(make(Some(initial), &live(), Some(&typed)).resume.is_err());
+    let mut changed = relaunched.clone();
+    changed.argv.retain(|arg| arg != "--search");
+    assert!(make(Some(initial), &changed, Some(&typed)).resume.is_err());
+    let mut foreign = relaunched.clone();
+    *foreign.argv.last_mut().unwrap() = "0199f2a4-6c1e-7a52-9d3b-000000000000".into();
+    assert!(make(Some(initial), &foreign, Some(&typed)).resume.is_err());
+    let mut elsewhere = typed.clone();
+    elsewhere.cwd = Some("/other".into());
+    assert!(
+        make(Some(initial), &relaunched, Some(&elsewhere))
+            .resume
+            .is_err()
+    );
+    elsewhere = typed.clone();
+    elsewhere.argv[0] = "/other/codex".into();
+    assert!(
+        make(Some(initial), &relaunched, Some(&elsewhere))
+            .resume
+            .is_err()
+    );
+
+    // Missing fields are legacy/partial records, not the explicit initial
+    // frame. Wrong types and concrete identities must not become absence.
+    for (from, to) in [
+        ("\"pid\":4242", "\"pid\":4243"),
+        ("\"sessionId\":null,", ""),
+        ("\"resumeArgv\":null,", ""),
+        ("\"cwd\":null,", ""),
+        ("\"state\":null,", ""),
+        ("\"exit\":null,", ""),
+        ("\"draftEmpty\":true,", ""),
+        (
+            "\"sessionId\":null",
+            "\"sessionId\":\"0199f2a4-6c1e-7a52-9d3b-000000000000\"",
+        ),
+        ("\"sessionId\":null", "\"sessionId\":7"),
+        ("\"resumeArgv\":null", "\"resumeArgv\":[]"),
+        (
+            "\"resumeArgv\":null",
+            "\"resumeArgv\":[\"/store/codex-alab/bin/codex\",\"resume\",\"0199f2a4-6c1e-7a52-9d3b-000000000000\"]",
+        ),
+        ("\"resumeArgv\":null", "\"resumeArgv\":7"),
+        ("\"cwd\":null", "\"cwd\":\"/other\""),
+        ("\"cwd\":null", "\"cwd\":7"),
+        ("\"state\":null", "\"state\":\"working\""),
+        ("\"state\":null", "\"state\":\"idle\""),
+        ("\"state\":null", "\"state\":7"),
+        ("\"status\":\"busy\"", "\"status\":\"idle\""),
+        ("\"status\":\"busy\"", "\"status\":\"upgrading\""),
+        ("\"exit\":null", "\"exit\":\"signal:15\""),
+        ("\"draftEmpty\":true", "\"draftEmpty\":false"),
+        ("\"draftEmpty\":true", "\"draftEmpty\":\"true\""),
+        ("/Users//u/.codex", "/other/home"),
+        ("\"CODEX_HOME\"", "\"OTHER_ENV\""),
+        ("\"v\":1", "\"v\":2"),
+    ] {
+        let text = initial.replace(from, to);
+        assert_ne!(text, initial, "the control changes {from}");
+        assert!(
+            make(Some(&text), &relaunched, Some(&typed)).resume.is_err(),
+            "{text}"
+        );
+    }
+    let asserted = initial.replace("\"state\":null,", "\"initializing\":true,");
+    assert!(
+        make(Some(&asserted), &relaunched, Some(&typed))
+            .resume
+            .is_err(),
+        "a writer cannot assert the derived initialization fact"
+    );
+
+    let gone = fold(Some(&copy), make(None, &relaunched, Some(&typed)));
+    assert_eq!(gone.seen, Seen::Removed, "initializers are real records");
+    assert_eq!(verdict(&gone, false), Verdict::Orderly("removed"));
+    let materialized = Copy {
+        seen: Seen::Present(record(&line("/store/codex-alab/bin/codex", &ROOT), &[])),
+        ..copy.clone()
+    };
+    let unreadable = Copy {
+        seen: Seen::Unreadable("not-json"),
+        ..copy.clone()
+    };
+    for before in [&gone, &materialized, &unreadable] {
+        let refused = fold(Some(before), make(Some(initial), &relaunched, Some(&typed)));
+        assert_eq!(refused.resume, Err("record-regressed"));
+        assert_eq!(
+            fold(
+                Some(&refused),
+                make(Some(initial), &relaunched, Some(&typed))
+            )
+            .resume,
+            Err("record-regressed"),
+            "another blank cannot revive the original launch"
+        );
+    }
+    let other_identity = Copy {
+        start: "earlier kernel start".into(),
+        ..materialized
+    };
+    assert_eq!(
+        fold(
+            Some(&other_identity),
+            make(Some(initial), &relaunched, Some(&typed))
+        )
+        .resume,
+        Ok(typed),
+        "another identity's observations do not taint this proven launch"
     );
 }
 

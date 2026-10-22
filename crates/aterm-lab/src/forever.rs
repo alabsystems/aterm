@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! `forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid]
-//! [--chains a,b] [--no-surfaces] [tag] [--keep]`: FOREVER LAND AND FOREVER CRUISE, LIVE, on every harness
+//! [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]`: FOREVER LAND AND FOREVER CRUISE, LIVE, on every harness
 //! aterm supervises — the real Claude Code, Gemini CLI, agy and Muse Code TUIs
 //! under a private headless aterm with the harness ON (its defaults), against
 //! the stub, each conversation scripted turn by turn
@@ -148,7 +148,13 @@
 //!   human_ms=` a stamp after the Enter), UNOBSERVED, said so, where the seam
 //!   took the keys and no stamp followed. An aterm without the seam cannot run
 //!   the chain: one that refuses it, or one older than it that types the word
-//!   into the composer, ends the run COULD NOT RUN, naming the seam.
+//!   into the composer, ends the run COULD NOT RUN, naming the seam. With
+//!   `--window` the lab's instance OPENS A WINDOW (the same jail,
+//!   [`crate::lab::windowed`]) and the person types through `hwkey` instead
+//!   ([`person_keys`]): each key a real `NSEvent` in the window's own event
+//!   queue, the path a key press takes, at an idle desk, the tab raised;
+//!   judged only where `status human_seq=` moved by exactly the keys posted
+//!   ([`cover::keys_unaccounted`]), else UNOBSERVED.
 //! * `land-w`, `wrote-c`: L14 and C3, P2 LIVE — replies opening `Wrote the …`
 //!   (Muse Code's reader once read such a head as its own tool row, with no
 //!   last words): the words read, and L1, L3, L5 (Land) and C1, C2 (Cruise)
@@ -157,12 +163,20 @@
 //!   agent starts) read `working` past its startup deadline (120 s) and half
 //!   a minute more (land@v1 answered as work: a 4 min step before the nudge
 //!   lands it), never `stalled why=startup`, no need, no "never started".
-//! * `mgr`, `worker` (Claude Code only: `spawn agent=claude` starts Claude Code
-//!   alone): L15 a worker the lab starts with `@<mgr> spawn agent=claude
-//!   from=<mgr> -` from a manager tab's Claude Code: its record `working
-//!   from=<mgr>`, Land's landing (`done why=landed`, quiet after), the
-//!   manager's `await task` returning at the landing with `state=done`, and
-//!   `result` its report and defense byte for byte.
+//! * `mgr`, `worker`: L15 a worker of the harness under test, which the lab
+//!   starts with `@<mgr> spawn agent=<harness> from=<mgr> -` aimed at a
+//!   manager tab running that same harness (its launcher's agent, idle at its
+//!   composer: [`Cover::starter`]), so the manager's program and homes ride
+//!   the worker's line ([`worker_shell`] gives the worker's new shell what a
+//!   person's has: the provider's environment, and for agy and Muse Code
+//!   atpkg's managed twin of the lab's build): the spawn named that agent,
+//!   `meta worker=` it, its record `working from=<mgr>`, Land's landing (`done
+//!   why=landed`, quiet after), the manager's `await task` returning at the
+//!   landing with `state=done`, and `result` its report and defense byte for
+//!   byte, from its transcript (Claude Code) or its screen (`source=screen
+//!   program=<harness>`). On Gemini CLI the lab's folder trust is ON for the
+//!   run (the project trusted in the home's file), so the worker starts
+//!   trusted by its own trusted-folders file alone.
 //!
 //! `--mode cap` runs `cap` alone (and Off) on a lab whose `[harness]` says
 //! `continue_per_hour = 1`: CAP the land act is the hour's one act, the next
@@ -410,6 +424,10 @@ const ORCHESTRATED_KEY: &str = "now write the parser";
 /// is no hand once it is sent: the turn is a person's only by their window
 /// gesture's stamp (`status human_ms=`, [`Cover::person_stamp`]).
 const PERSON_STAND_MS: u64 = 8_000;
+/// The hang detector of the wait for the draft a person's keys type
+/// ([`person_keys`]): something that must happen, so a minute, never a
+/// latency budget.
+const DRAFT_HANG: Duration = Duration::from_secs(60);
 /// How long after the person's Enter the orchestrator's turn is typed: past
 /// [`QUIET_UNDER_OFF_MS`], the quiet L13 needs.
 const EXCHANGE_WATCH_MS: i64 = QUIET_UNDER_OFF_MS + 30_000;
@@ -792,7 +810,8 @@ pub enum Chain {
     WroteC,
     /// P5 (a worker's record past its startup deadline).
     LandT,
-    /// The manager tab whose Claude Code starts L15's worker.
+    /// The manager tab, running the harness under test, whose spawn starts
+    /// L15's worker.
     Mgr,
     /// L16 (an end past the work floor, seen by a look at its tab).
     LandJ,
@@ -800,7 +819,7 @@ pub enum Chain {
     LandK,
     /// N1–N4 (Cruise, its needs moving: two, none, one, two).
     CruiseN,
-    /// L15 (a worker given by `spawn agent=claude`).
+    /// L15 (a worker given by `spawn agent=<harness>`).
     Worker,
     /// CAP (`continue_per_hour`).
     Cap,
@@ -1034,14 +1053,13 @@ impl Chain {
         }
     }
 
-    /// The chains of `mode` harness `h` runs: L15's two only on Claude Code
-    /// (`spawn agent=claude` starts Claude Code alone), W2's only where a
-    /// local command takes the notice away ([`wall_out_of_reach`]).
+    /// The chains of `mode` harness `h` runs: W2's only where a local command
+    /// takes the notice away ([`wall_out_of_reach`]). L15's two run on every
+    /// harness (`spawn agent=<harness>`).
     #[must_use]
     pub fn of_mode_on(mode: Mode, h: Harness) -> Vec<Chain> {
         Chain::of_mode(mode)
             .into_iter()
-            .filter(|c| h == Harness::Claude || !matches!(c, Chain::Mgr | Chain::Worker))
             .filter(|c| match c {
                 Chain::WallHid => wall_out_of_reach(h, Mode::WallHid).is_none(),
                 _ => true,
@@ -1557,8 +1575,13 @@ pub struct Cover {
     /// L13: `status human_ms=` read once their Enter took the draft: how long
     /// ago a person's gesture reached the session (`-`: none ever). A plain
     /// control verb never stamps it (`help status`); the lab's person types
-    /// through the development seam `as=person`, which does.
+    /// through the development seam `as=person`, which does, or (`forever
+    /// --window`) through `hwkey`, the key press's own path ([`Keyed`]).
     pub person_stamp: Option<String>,
+    /// L13 typed through `hwkey` in a windowed lab ([`person_keys`]): what
+    /// the real key path posted and counted. `None`: the `as=person` seam
+    /// typed it.
+    pub keyed: Option<Keyed>,
     /// L13, CAP: when the lab's orchestrator turn went in.
     pub turn_ms: Option<i64>,
     /// The stub's witness of a window no harness turn may fall in: L13's
@@ -1572,8 +1595,17 @@ pub struct Cover {
     /// L15: when the manager's `await task @<w> since=0` returned, its exit
     /// status and what it printed.
     pub awaited: Option<(i64, i32, String)>,
-    /// L15: the worker's `result`, as printed.
+    /// L15: the worker's `result`, as printed (its standard output).
     pub result: Option<String>,
+    /// L15: the agent the lab's spawn named (`agent=<word>`): the harness
+    /// under test's.
+    pub agent: Option<String>,
+    /// L15: the `result` reply's header (`OK <n> source=… bytes=<n>`, on its
+    /// standard error).
+    pub result_head: Option<String>,
+    /// L15: the agent the worker's spawn started, as `meta worker=` names it
+    /// once the watch is over.
+    pub worker: Option<String>,
     /// W1: when the lab raised the stub's usage wall, and the unix second
     /// it resets at ([`wall_step`]).
     pub wall: Option<(i64, i64)>,
@@ -1591,6 +1623,24 @@ pub struct Cover {
     pub hidden: Option<Hidden>,
     /// W2: why the notice was not taken off the screen, where it was not.
     pub hide_gave_up: Option<String>,
+}
+
+/// L13's prompt typed through `hwkey` (`forever --window`, [`person_keys`]):
+/// each key a real `NSEvent` posted into the windowed instance's own event
+/// queue, and the session's count of a person's gestures around them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Keyed {
+    /// The presses `hwkey` handed to the window's event queue (`OK
+    /// posted=<n>`): the text's characters and each Enter.
+    pub posted: u64,
+    /// How many of them it posted while the window was the key window of
+    /// the active app (`key=1`): none in the jail, whose instance is no
+    /// Launch Services application, so nothing can activate it.
+    pub key_window: u64,
+    /// `status human_seq=` before the first key.
+    pub seq_before: u64,
+    /// `status human_seq=` once the Enter took the draft (`None`: unread).
+    pub seq_after: Option<u64>,
 }
 
 /// W2's hide ([`hide_step`]): the notice out of sight while the wait stands.
@@ -1949,7 +1999,7 @@ fn judge_scenarios(chain: Chain, seen: &Seen, program: &str, t0: i64) -> Vec<(Sc
             Scenario::L14 => cover::judge_wrote_land(seen, land, &land_nudge_after, program, t0),
             Scenario::C3 => cover::judge_wrote_cruise(seen, done, t0),
             Scenario::P5 => cover::judge_startup(seen, t0),
-            Scenario::L15 => cover::judge_spawned(seen, land, t0),
+            Scenario::L15 => cover::judge_spawned(seen, land, program, t0),
             Scenario::Cap => cover::judge_cap(seen, t0),
             Scenario::W1 => cover::judge_wall(seen, land, program, t0),
             Scenario::L16 | Scenario::L17 => judge_long_landing(seen, land, t0),
@@ -3600,7 +3650,28 @@ fn trust_for_claude(run: &Run, dirs: &[PathBuf]) -> Result<(), Fail> {
 /// on its subscriber path (`claude --subscriber`'s fake claude.ai login, the
 /// key helper out of the settings), the one on which it reads the stub's
 /// usage limit off the unified-limit headers and draws its own usage wall.
-fn launcher(run: &Run, h: Harness, dirs: &[PathBuf], walled: bool) -> Result<PathBuf, Fail> {
+/// Gemini CLI's `trustedFolders.json` trusting the lab's project (`proj`, as
+/// named and as resolved) and every folder under it: the manager's and the
+/// other chains' folders, under L15's folder trust ([`launcher`]).
+#[must_use]
+pub fn gemini_trusted_project(proj: &str) -> String {
+    let real = std::fs::canonicalize(proj)
+        .map_or_else(|_| proj.to_string(), |p| p.to_string_lossy().into_owned());
+    let mut rows = vec![(proj.to_string(), J::s("TRUST_FOLDER"))];
+    if real != proj {
+        rows.push((real, J::s("TRUST_FOLDER")));
+    }
+    J::Obj(rows).dump(crate::pyjson::PY)
+}
+
+/// The script each chain's tab runs: the harness's launcher, its seeds laid
+/// (Gemini CLI's folder trust on for a run with L15's `worker`).
+fn launcher(
+    run: &Run,
+    h: Harness,
+    dirs: &[PathBuf],
+    (walled, worker): (bool, bool),
+) -> Result<PathBuf, Fail> {
     use crate::gemini::Agent;
     let put = |p: &Path, mode: u32, text: &str| {
         crate::sys::put(p, mode, &crate::sys::PutSrc::Bytes(text.as_bytes()))
@@ -3621,6 +3692,21 @@ fn launcher(run: &Run, h: Harness, dirs: &[PathBuf], walled: bool) -> Result<Pat
         }
         Harness::Gemini => {
             crate::gemini::seed(run, Agent::Gemini, &crate::gemini::Launch::default())?;
+            if worker {
+                // L15: the folder trust on, the project trusted in the home's
+                // own file; the worker's line names a file of its own instead
+                let home = run.w.join(Agent::Gemini.home()).join(".gemini");
+                put(
+                    &home.join("settings.json"),
+                    0o600,
+                    &crate::gemini::gemini_settings(true),
+                )?;
+                put(
+                    &home.join("trustedFolders.json"),
+                    0o600,
+                    &gemini_trusted_project(&run.proj),
+                )?;
+            }
             crate::gemini::launcher(run, Agent::Gemini, &[], &[])
         }
         Harness::Agy => {
@@ -3769,18 +3855,214 @@ fn person_turn(
     Ok(None)
 }
 
+/// A turn typed into tab `sid` WITH A PERSON'S KEYS (`forever --window`):
+/// each character, then Enter, pressed through `hwkey`, a real `NSEvent`
+/// posted into the windowed instance's own event queue, so each key takes
+/// the path a key press takes (`sendEvent:`, winit's `keyDown:`, the
+/// `KeyboardInput` arm, the App input seam with a person's source): no
+/// seam, no control write. The desk idle first
+/// ([`crate::meta_keys::await_idle`]), then the tab raised (`raise <sid>`:
+/// its tab selected in the window `hwkey` posts to; the jail's instance is no
+/// Launch Services application, so nothing makes it the active app and
+/// `hwkey` answers `key=0`). The text stands in the composer for
+/// [`PERSON_STAND_MS`], then Enter, once more while it still stands there:
+/// when the Enter that took it went in, `status human_ms=` then, and what
+/// the keys did ([`Keyed`]: `status human_seq=` before the first key and
+/// after the Enter, which the judge holds to the keys posted). The wait for
+/// the draft is a one-minute hang detector ([`DRAFT_HANG`]), never a latency
+/// budget: one client per key makes the typing take seconds. `None` where
+/// the composer did not take the text; a refused `hwkey` (no window: a
+/// headless lab) or `raise` is the run's end, named.
+fn person_keys(
+    door: &Door<'_>,
+    sid: &str,
+    agent: &str,
+    text: &str,
+) -> Result<Option<(i64, String, Keyed)>, Fail> {
+    if let Err(why) = crate::meta_keys::await_idle()? {
+        return Err(could_not(&format!(
+            "hwkey presses keys at an idle desk: {why}"
+        )));
+    }
+    let raised = door.ctl(&["raise", sid])?;
+    if raised.code != 0 {
+        return Err(could_not(&format!(
+            "raise {sid}: {}{}",
+            raised.stdout.trim(),
+            raised.stderr.trim()
+        )));
+    }
+    let seq = |status: &str| word(status, "human_seq").and_then(|n| n.parse::<u64>().ok());
+    let Some(seq_before) = seq(&on(door, sid, &["status"])) else {
+        return Err(could_not(&format!(
+            "status @{sid} says no human_seq= before the keys"
+        )));
+    };
+    let mut keyed = Keyed {
+        seq_before,
+        ..Keyed::default()
+    };
+    let press = |key: &str, keyed: &mut Keyed| -> Result<(), Fail> {
+        let r = door.ctl(&["hwkey", key])?;
+        let said = r.stdout.trim();
+        match word(said, "posted").and_then(|n| n.parse::<u64>().ok()) {
+            Some(n) if r.code == 0 && said.starts_with("OK ") => {
+                keyed.posted += n;
+                if word(said, "key").as_deref() == Some("1") {
+                    keyed.key_window += n;
+                }
+                Ok(())
+            }
+            _ => Err(could_not(&format!(
+                "hwkey {key}: {said}{}: the person's keys need a windowed lab (forever --window)",
+                r.stderr.trim()
+            ))),
+        }
+    };
+    let first = now_ms();
+    for c in text.chars() {
+        press(&hwkey_name(c), &mut keyed)?;
+    }
+    let last = now_ms();
+    let standing = |door: &Door<'_>| at_composer(door, sid, agent).as_deref() == Some(text);
+    if !crate::wait_until(DRAFT_HANG, || standing(door)) {
+        // what the keys came to, for the COULD NOT RUN that follows: whether
+        // the window counted them as a person's, and what the composer holds
+        let after = seq(&on(door, sid, &["status"]));
+        println!(
+            "  keys      @{sid}: no draft stood within {} s of {} key(s) posted by hwkey ({} to the key window); status human_seq= {} -> {}; the composer held {}",
+            DRAFT_HANG.as_secs(),
+            keyed.posted,
+            keyed.key_window,
+            keyed.seq_before,
+            after.map_or_else(|| "-".to_string(), |a| a.to_string()),
+            at_composer(door, sid, agent)
+                .map_or_else(|| "no frame".to_string(), |c| format!("{c:?}"))
+        );
+        return Ok(None);
+    }
+    println!(
+        "  keys      @{sid}: {} character(s) pressed through hwkey in {}; the draft stood {} after the last",
+        keyed.posted,
+        at(first, last),
+        at(last, now_ms())
+    );
+    stop::sleep(Duration::from_millis(PERSON_STAND_MS))?;
+    for _ in 0..2 {
+        let pressed = now_ms();
+        press("enter", &mut keyed)?;
+        for _ in 0..20 {
+            stop::sleep(Duration::from_millis(250))?;
+            if !standing(door) {
+                let status = on(door, sid, &["status"]);
+                keyed.seq_after = seq(&status);
+                let stamp = word(&status, "human_ms").unwrap_or_else(|| "?".to_string());
+                return Ok(Some((pressed, stamp, keyed)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The `hwkey` name of the key that types `c`: `space` for a space (the verb
+/// splits its words on it), the character itself otherwise.
+#[must_use]
+pub fn hwkey_name(c: char) -> String {
+    if c == ' ' {
+        "space".to_string()
+    } else {
+        c.to_string()
+    }
+}
+
 /// What a manager's wait on its worker came to: when it returned, its exit
 /// status and what it printed.
 type Awaited = Arc<Mutex<Option<(i64, i32, String)>>>;
 
-/// L15: the worker the manager tab's Claude Code starts, `@<mgr> spawn
-/// agent=claude from=<mgr> cwd=<wdir> -` with its task on stdin (the worker's
-/// line follows the starter's Claude Code: its program and its Claude home,
-/// whose settings point it at the stub), and the manager's wait on it, `await
-/// task @<w> since=0`, on a thread of its own (a client of its own: it
-/// returns when the record has news, which the lab reads at the end).
+/// L15: THE WORKER'S SHELL, as a person's is where the harness under test
+/// runs: the shell startup file (`<scratch>/home/.zshrc`) exports what the
+/// lab's launcher gives the agent but its homes, which the worker's line
+/// carries from its starter (the relaunch lanes' labs' own `shell_exports`:
+/// the provider's key and base URL at the stub, the black hole, no browser),
+/// and for agy and Muse Code, whose manager runs a store build, atpkg's
+/// managed twin of the lab's build is laid where the instance's prefix names
+/// it (`<scratch>/home/Library/Application Support/aterm/pkg/agents/<word>`),
+/// the program a worker's line types for a store-build starter (as their
+/// relaunch lines do); for Gemini CLI, whose line types the word `gemini`,
+/// the lab's wrapper of its build leads the startup file's `PATH`. Written
+/// just before the spawn, so only the worker's new shell reads it (every
+/// other tab's shell started before). Claude Code's worker needs none of it:
+/// its line carries its Claude home, whose settings name the stub. `None`
+/// for Claude Code, else what was laid, for the report.
+///
+/// # Errors
+/// A file could not be written.
+fn worker_shell(run: &Run, h: Harness) -> Result<Option<String>, Fail> {
+    let put = |p: &Path, mode: u32, text: &str| {
+        crate::sys::put(p, mode, &crate::sys::PutSrc::Bytes(text.as_bytes()))
+            .map_err(|e| could_not(&format!("{}: {e}", p.display())))
+    };
+    let pkg = run
+        .w
+        .join("home/Library/Application Support/aterm/pkg/agents");
+    let (rc, laid) = match h {
+        Harness::Claude => return Ok(None),
+        Harness::Gemini => {
+            let wrapper = run.run.join("gbin/gemini");
+            put(&wrapper, 0o755, &gemini_wrapper(&run.gemini_bin))?;
+            (
+                crate::relaunch_gemini::shell_exports(run),
+                format!("{} -> {}", wrapper.display(), run.gemini_bin),
+            )
+        }
+        Harness::Agy => {
+            let twin = pkg.join("agy");
+            put(
+                &twin,
+                0o755,
+                &crate::relaunch_agy::twin_script(&run.agy_bin),
+            )?;
+            (
+                crate::relaunch_agy::shell_exports(run),
+                format!("{} -> {}", twin.display(), run.agy_bin),
+            )
+        }
+        Harness::Muse => {
+            let twin = pkg.join("muse");
+            put(
+                &twin,
+                0o755,
+                &crate::relaunch_muse::twin_script(&run.muse_bin),
+            )?;
+            (
+                crate::relaunch_muse::shell_exports(run),
+                format!("{} -> {}", twin.display(), run.muse_bin),
+            )
+        }
+    };
+    put(&run.w.join("home/.zshrc"), 0o644, &rc)?;
+    Ok(Some(laid))
+}
+
+/// The lab's `gemini` on the worker shell's `PATH` (`<run>/gbin`, out of the
+/// jail's reach): `exec` the lab's build, so the process is `node` running
+/// its script, as the manager's is.
+#[must_use]
+pub fn gemini_wrapper(bin: &str) -> String {
+    format!(
+        "#!/bin/sh\n# aterm-lab forever: the worker shell's gemini\nexec {} \"$@\"\n",
+        shell_quote(bin)
+    )
+}
+
+/// L15: the worker the manager tab's agent starts, `@<mgr> spawn agent=<h>
+/// from=<mgr> cwd=<wdir> -` with its task on stdin (the worker's line follows
+/// the starter's agent of its kind: its program and its homes; its shell is
+/// [`worker_shell`]'s), and the manager's wait on it, `await task @<w>
+/// since=0`, on a thread of its own (a client of its own: it returns when the
+/// record has news, which the lab reads at the end).
 fn spawn_worker(
-    tag: &str,
+    (tag, run, h): (&str, &Run, Harness),
     door: &Door<'_>,
     tabs: &[Tab],
     wdir: &Path,
@@ -3790,25 +4072,30 @@ fn spawn_worker(
         .find(|t| t.chain == Chain::Mgr)
         .map(|t| t.sid.clone())
         .ok_or_else(|| could_not("no manager tab for the worker's spawn"))?;
+    if let Some(laid) = worker_shell(run, h)? {
+        println!(
+            "  shell     the worker's: {}/home/.zshrc exports {}'s provider at the stub; {laid}",
+            run.w.display(),
+            h.name()
+        );
+    }
     let task = Chain::Worker.prompt();
-    let (at, from, cwd) = (
+    let (at, agent, from, cwd) = (
         format!("@{mgr}"),
+        format!("agent={}", h.name()),
         format!("from={mgr}"),
         format!("cwd={}", wdir.display()),
     );
-    let r = door.ctl_input(
-        &[&at, "spawn", "agent=claude", &from, &cwd, "-"],
-        task.as_bytes(),
-    )?;
+    let r = door.ctl_input(&[&at, "spawn", &agent, &from, &cwd, "-"], task.as_bytes())?;
     let reply = r.stdout.lines().next().unwrap_or("").trim().to_string();
     let sid = reply
         .strip_prefix("OK ")
         .and_then(|l| l.split_whitespace().next())
         .map(str::to_string)
-        .ok_or_else(|| could_not(&format!("spawn agent=claude: {}{}", r.stdout, r.stderr)))?;
+        .ok_or_else(|| could_not(&format!("spawn {agent}: {}{}", r.stdout, r.stderr)))?;
     let t0 = now_ms();
     println!(
-        "  worker    {} @{sid} in {}: spawned from @{mgr} ({reply}), its task \"{task}\"",
+        "  worker    {} @{sid} in {}: spawned {agent} from @{mgr} ({reply}), its task \"{task}\"",
         Chain::Worker.name(),
         wdir.display()
     );
@@ -3839,6 +4126,7 @@ fn spawn_worker(
             cover: Cover {
                 starter: Some(mgr),
                 spawn: Some(reply),
+                agent: Some(h.name().to_string()),
                 ..Cover::default()
             },
             ..Seen::default()
@@ -4606,7 +4894,7 @@ fn run_check(
     tag: &str,
     h: Harness,
     chains: &[Chain],
-    surfaces_on: bool,
+    (surfaces_on, window): (bool, bool),
 ) -> Result<Vec<(Scenario, Verdict)>, Fail> {
     let mut run = Run::load(tag)?;
     let (bin, ver) = h.bin_ver(&run);
@@ -4642,7 +4930,15 @@ fn run_check(
         );
         dirs.push(d);
     }
-    let script = launcher(&run, h, &dirs, chains.iter().any(|c| c.walled()))?;
+    let script = launcher(
+        &run,
+        h,
+        &dirs,
+        (
+            chains.iter().any(|c| c.walled()),
+            chains.contains(&Chain::Worker),
+        ),
+    )?;
     crate::verbs::set_custom_mode(&run, MODE, &spec(chains))?;
     println!(
         "  stub      mode {MODE}: {} rule(s)",
@@ -4820,6 +5116,15 @@ fn run_check(
         tab.t0 = now_ms();
         let took = match opening {
             Opening::Prompt => tab_turn(&door, &tab.sid, h.name(), &tab.chain.prompt())?,
+            Opening::Person if window => {
+                let enter = person_keys(&door, &tab.sid, h.name(), &tab.chain.prompt())?;
+                tab.seen.cover.person_ms = enter.as_ref().map(|(t, _, _)| *t);
+                if let Some((_, stamp, keyed)) = enter {
+                    tab.seen.cover.person_stamp = Some(stamp);
+                    tab.seen.cover.keyed = Some(keyed);
+                }
+                tab.seen.cover.person_ms.is_some()
+            }
             Opening::Person => {
                 let enter = person_turn(&door, &tab.sid, h.name(), &tab.chain.prompt())?;
                 tab.seen.cover.person_ms = enter.as_ref().map(|(t, _)| *t);
@@ -4845,7 +5150,7 @@ fn run_check(
             )));
         }
         println!(
-            "  prompt    {} @{}: \"{}\"{}",
+            "  prompt    {} @{}: \"{}\"{}{}",
             tab.chain.name(),
             tab.sid,
             tab.chain.prompt(),
@@ -4854,17 +5159,22 @@ fn run_check(
                 PERSON_STAND_MS / 1000,
                 at(tab.t0, p),
                 tab.seen.cover.person_stamp.as_deref().unwrap_or("?")
-            ))
+            )),
+            tab.seen
+                .cover
+                .keyed
+                .as_ref()
+                .map_or_else(String::new, |k| format!("; {}", cover::keyed_line(k)))
         );
     }
-    // ---- L15: the manager's Claude Code starts the worker; the manager's wait on it
+    // ---- L15: the manager's agent starts the worker; the manager's wait on it
     let mut awaiting = None;
     if let Some((_, wdir)) = chains
         .iter()
         .zip(&dirs)
         .find(|(c, _)| c.opening() == Opening::Spawned)
     {
-        let (tab, slot) = spawn_worker(tag, &door, &tabs, wdir)?;
+        let (tab, slot) = spawn_worker((tag, &run, h), &door, &tabs, wdir)?;
         tabs.push(tab);
         awaiting = Some(slot);
     }
@@ -4948,7 +5258,18 @@ fn run_check(
                 tab.seen.cover.window_stub = window_witness(&run, tab);
                 tab.seen.cover.went_on_ms = went_on_witness(&run, tab);
                 if tab.chain == Chain::Worker {
-                    tab.seen.cover.result = Some(on(&door, &tab.sid, &["result"]));
+                    let aim = format!("@{}", tab.sid);
+                    let r = door.ctl(&[&aim, "result"]);
+                    tab.seen.cover.result =
+                        Some(r.as_ref().map_or_else(Clone::clone, |r| r.stdout.clone()));
+                    tab.seen.cover.result_head = r.ok().map(|r| r.stderr.trim().to_string());
+                    tab.seen.cover.worker = word(&on(&door, &tab.sid, &["meta"]), "worker");
+                    println!(
+                        "  [{}] result  {} (meta worker={})",
+                        tab.chain.name(),
+                        tab.seen.cover.result_head.as_deref().unwrap_or("not read"),
+                        tab.seen.cover.worker.as_deref().unwrap_or("?")
+                    );
                     tab.seen.cover.awaited = awaiting.as_ref().and_then(|slot| {
                         slot.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5043,26 +5364,19 @@ fn run_lab(
     mode: Mode,
     chains: &[Chain],
     keep: bool,
-    surfaces_on: bool,
+    (surfaces_on, window): (bool, bool),
 ) -> Result<Vec<(Scenario, Verdict)>, Fail> {
     if is_run(tag) {
         return Err(Fail::usage(format!(
             "forever: lab '{tag}' is up: forever brings up a lab of its own (another tag, or {LAB} down {tag})"
         )));
     }
-    let mut u = crate::lab::UpOpts::from_env();
-    u.trust = true;
-    u.lifeline = !keep;
-    if surfaces_on && !u.instance_env.contains(PERSON_SEAM) {
-        // the person's stand-in (`person look`, `person menubar press`), armed at launch
-        u.instance_env = format!("{} {PERSON_SEAM}", u.instance_env)
-            .trim()
-            .to_string();
-    }
-    if mode == Mode::Cap {
-        // the cap is the instance's: set before it starts
-        u.harness_keys = format!("{}\ncontinue_per_hour = {CAP_PER_HOUR}", u.harness_keys);
-    }
+    let u = lab_opts(
+        crate::lab::UpOpts::from_env(),
+        mode,
+        keep,
+        (surfaces_on, window),
+    )?;
     if let Some(w) = mode.walled()
         && let Some(why) = wall_out_of_reach(h, mode)
     {
@@ -5083,13 +5397,56 @@ fn run_lab(
             f.msg.unwrap_or_default()
         )));
     }
-    let verdicts = run_check(tag, h, chains, surfaces_on);
+    if window {
+        let r = Run::load(tag).ok();
+        println!(
+            "forever: lab '{tag}' OPENED A WINDOW on this desk (instance pid {}): L13's person types through hwkey",
+            r.map_or(0, |r| r.instance_pid)
+        );
+    }
+    let verdicts = run_check(tag, h, chains, (surfaces_on, window));
     if keep {
         println!("forever: lab '{tag}' left up ({LAB} down {tag})");
     } else {
         let _ = crate::lab::down(tag, true);
     }
     verdicts
+}
+
+/// The lab's options for one harness's run, on top of what the environment
+/// set (`base`): its folder trust seeded, the lifeline unless `keep`, the
+/// window (`--window`: the instance OPENS A WINDOW on this desk, in the same
+/// jail, for `hwkey`), the person's seam where the window is read, and the
+/// cap's rate under `--mode cap`.
+///
+/// # Errors
+/// A usage error, before any lab is made, where the options conflict
+/// ([`crate::lab::opts_refused`]: `--window` under `LAB_RESTORE=1`), never a
+/// harness's COULD NOT RUN.
+fn lab_opts(
+    base: crate::lab::UpOpts,
+    mode: Mode,
+    keep: bool,
+    (surfaces_on, window): (bool, bool),
+) -> Result<crate::lab::UpOpts, Fail> {
+    let mut u = base;
+    u.trust = true;
+    u.lifeline = !keep;
+    u.window = window;
+    if surfaces_on && !u.instance_env.contains(PERSON_SEAM) {
+        // the person's stand-in (`person look`, `person menubar press`), armed at launch
+        u.instance_env = format!("{} {PERSON_SEAM}", u.instance_env)
+            .trim()
+            .to_string();
+    }
+    if mode == Mode::Cap {
+        // the cap is the instance's: set before it starts
+        u.harness_keys = format!("{}\ncontinue_per_hour = {CAP_PER_HOUR}", u.harness_keys);
+    }
+    match crate::lab::opts_refused(&u) {
+        Some(why) => Err(Fail::usage(format!("forever: {why}"))),
+        None => Ok(u),
+    }
 }
 
 /// The development seam that arms `person` (the stand-in for the person at
@@ -5107,6 +5464,9 @@ struct Asked {
     keep: bool,
     /// The window read (`--no-surfaces`: not, its wants named skips).
     surfaces: bool,
+    /// `--window`: the lab's instance opens a window, and L13's person types
+    /// through `hwkey` ([`person_keys`]) instead of the `as=person` seam.
+    window: bool,
 }
 
 impl Asked {
@@ -5151,6 +5511,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
     let mut tag = None;
     let mut keep = false;
     let mut surfaces = true;
+    let mut window = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -5203,23 +5564,41 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
             }
             "--keep" => keep = true,
             "--no-surfaces" => surfaces = false,
+            "--window" => window = true,
             "-h" | "--help" => return Ok(None),
             s if s.starts_with('-') => return Err(usage(&format!("unknown option '{s}'"))),
             s => tag = Some(s.to_string()),
         }
     }
     let harnesses = harnesses.ok_or_else(|| usage("say --harness claude|gemini|agy|muse|all"))?;
-    Ok(Some(Asked {
+    let asked = Asked {
         harnesses,
         mode,
         chains,
         tag,
         keep,
         surfaces,
-    }))
+        window,
+    };
+    // A window is opened for a person's keys only: a run with no chain a
+    // person opens (L13's `land-p`, `--mode cover`) has nothing to press.
+    if asked.window
+        && !asked.harnesses.iter().any(|&h| {
+            asked
+                .chains(h)
+                .iter()
+                .any(|c| c.opening() == Opening::Person)
+        })
+    {
+        return Err(usage(
+            "--window opens a window for a person's keys (hwkey): the run needs land-p (--mode cover, \
+             --chains land-p)",
+        ));
+    }
+    Ok(Some(asked))
 }
 
-/// `forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid] [--chains a,b] [--no-surfaces] [tag] [--keep]`.
+/// `forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]`.
 pub fn cmd_forever(args: &[String]) -> Res {
     let Some(a) = parse_args(args)? else {
         print!("{}", crate::USAGE);
@@ -5250,15 +5629,15 @@ pub fn cmd_forever(args: &[String]) -> Res {
         }
         let chains = a.chains(h);
         if chains.is_empty() && a.mode.walled().is_none() {
-            // `--chains` names none this harness runs of the mode's (L15's
-            // two run on Claude Code alone): nothing here to bring up
+            // `--chains` names none this harness runs of the mode's: nothing
+            // here to bring up
             println!(
                 "forever: {} runs none of the chains --chains asks of its mode",
                 h.name()
             );
             continue;
         }
-        match run_lab(&tag, h, a.mode, &chains, a.keep, a.surfaces) {
+        match run_lab(&tag, h, a.mode, &chains, a.keep, (a.surfaces, a.window)) {
             Ok(v) => lines.extend(v.into_iter().map(|(s, v)| (h, s, v))),
             Err(f) if f.code == 3 => {
                 eprintln!("aterm-lab: {}", f.msg.unwrap_or_default());

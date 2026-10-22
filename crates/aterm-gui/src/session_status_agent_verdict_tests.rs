@@ -2268,9 +2268,19 @@ fn a_box_raises_one_menu_row_and_one_notification_per_transition() {
 /// timer wakes at the expiry, removes the claim with a `meta-change
 /// field=supervisor value=-` record (the `EVENT meta` push), and the box
 /// posts exactly one notice. NEGATIVE CONTROL: while the claim is live the
-/// same box posts nothing, and a tick before the expiry changes nothing.
+/// same box posts nothing, and a tick a millisecond short of the expiry
+/// changes nothing. On the presence driver's clock (`set_presence_clock_for_test`), so no
+/// second of the claim is waited out.
 #[test]
 fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
+    use crate::app_presence::set_presence_clock_for_test;
+    /// The thread's presence clock goes back to the wall however the test ends.
+    struct Wall;
+    impl Drop for Wall {
+        fn drop(&mut self) {
+            set_presence_clock_for_test(None);
+        }
+    }
     let (mut app, sid) = app_with_stub();
     app.headless = false;
     // The desktop notice is what these count (`desktop_alerts` is opt-in).
@@ -2278,52 +2288,51 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
     let ctx = app.pool.get(sid).expect("pooled").ctx.clone();
     let _ = take_posts();
     looking_at(&app, &[]);
-    // Long enough that the negative controls below — a presence refresh,
-    // two debug-build paints and sweeps — finish inside it on a loaded
-    // machine: at 120 ms they could outlast the claim and read a correct
-    // lapse as a notice posted while supervised. The lapse is then waited
-    // for, not slept for.
+    // A whole microsecond, so the claim's stamps and the driver's instants map exactly.
+    let now_us = crate::metrics::us_at(Instant::now());
+    let t0 = crate::metrics::instant_at_us(now_us).expect("in range");
+    let _wall = Wall;
+    let at = |t: Instant| set_presence_clock_for_test(Some(t));
+    at(t0);
     let ttl = Duration::from_secs(2);
-    let now_us = crate::metrics::now_us();
+    let expiry_us = now_us + u64::try_from(ttl.as_micros()).expect("a short ttl");
     assert_eq!(
-        crate::session_timeline::claim_supervisor(
-            &ctx,
-            "sup",
-            None,
-            Some(now_us + ttl.as_micros() as u64),
-            now_us
-        ),
+        crate::session_timeline::claim_supervisor(&ctx, "sup", None, Some(expiry_us), now_us),
         Ok(true)
     );
     // The `meta set` arm's `Wake::MetaChanged` refresh.
     app.refresh_presence_session(sid);
     let step = Duration::from_millis(300);
-    let mut t = Instant::now();
+    let mut t = t0;
     paint(&app, sid, &busy_screen(0));
     sweep(&mut app, t);
     t += step;
+    at(t);
     paint(&app, sid, &box_screen(1));
     sweep(&mut app, t);
     assert_eq!(published(&app, sid).word, "prompt");
     assert!(take_posts().is_empty(), "NEGATIVE CONTROL: supervised");
-    let deadline = app.presence_deadline(Instant::now()).expect("armed");
-    assert!(deadline <= Instant::now() + ttl + Duration::from_millis(5));
-    let _ = app.presence_tick(Instant::now());
+    // The wake the lapse arms: a millisecond past the expiry.
+    let lapse =
+        crate::metrics::instant_at_us(expiry_us).expect("in range") + Duration::from_millis(1);
+    let deadline = app.presence_deadline(t).expect("armed");
+    assert!(
+        deadline <= lapse,
+        "the wake {deadline:?} comes after the lapse {lapse:?}"
+    );
+    let short = lapse - Duration::from_millis(2);
+    at(short);
+    let _ = app.presence_tick(short);
     assert!(take_posts().is_empty(), "NEGATIVE CONTROL: not lapsed yet");
+    assert_eq!(
+        ctx.meta.lock().unwrap().supervisor_expiry(),
+        Some(expiry_us),
+        "NEGATIVE CONTROL: the claim stands short of its expiry"
+    );
 
-    let lapsed_by = Instant::now() + ttl + aterm_spec::wait::MUST_HAPPEN;
-    let posts = loop {
-        std::thread::sleep(Duration::from_millis(20));
-        let _ = app.presence_tick(Instant::now());
-        let posts = take_posts();
-        if !posts.is_empty() {
-            break posts;
-        }
-        assert!(
-            Instant::now() < lapsed_by,
-            "the lapsed claim never handed its box to the human"
-        );
-    };
+    at(lapse);
+    let _ = app.presence_tick(lapse);
+    let posts = take_posts();
     assert_eq!(posts.len(), 1, "exactly one notice: {posts:?}");
     assert_eq!(posts[0].session, sid);
     let meta_events: Vec<String> = ctx
@@ -2340,7 +2349,7 @@ fn a_lapsed_supervisor_claim_hands_its_box_to_the_human() {
         "{meta_events:?}"
     );
     assert!(ctx.meta.lock().unwrap().supervisor_expiry().is_none());
-    let _ = app.presence_tick(Instant::now());
+    let _ = app.presence_tick(lapse);
     assert!(take_posts().is_empty(), "announced once");
 }
 

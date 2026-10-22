@@ -647,7 +647,23 @@ impl App {
         if tl.need().held != held {
             self.agents.long_holds_moved = true;
         }
-        tl.set_need(verdict)
+        // What the Autopilot chip's title says of a harness's need (its
+        // first need and how many more, `harness_glass::need_title`).
+        let title_moved = {
+            let (was, now) = (tl.need().harness_ask(), verdict.harness_ask());
+            was.map(|a| (a.first.as_str(), a.more)) != now.map(|a| (a.first.as_str(), a.more))
+        };
+        let moved = tl.set_need(verdict);
+        drop(tl);
+        // THE CHIP'S TITLE READS THE NEED (§12.2.3 item 5; the W4 title
+        // slice): where its words moved, the session's trail generation
+        // moves, as the pause's does (`harness_glass::on_pause`), so a title
+        // being read is built again and a frame at rest keys nothing new.
+        if title_moved {
+            crate::harness_glass::on_need_words(self, session);
+            self.redraw_autopilot_title_readers(session);
+        }
+        moved
     }
 
     /// A session that is gone (closed, or no longer in the registry) needs
@@ -1212,6 +1228,8 @@ impl App {
         };
         let front = ws.tab_set.active_index();
         let tab_count = ws.tab_set.len();
+        let denial_marks =
+            self.effective_observer_mode() == crate::consent_observer::ObserverMode::Full;
         for (index, (tab, item)) in ws
             .tab_set
             .tabs()
@@ -1230,6 +1248,11 @@ impl App {
                     .copied()
                     .and_then(crate::tab_model::View::terminal_session)
                 {
+                    if self.consent_observer.marks_session(session)
+                        || (denial_marks && self.consent_attention.marks_session(session))
+                    {
+                        level = level.max(presence::ChipLevel::Note);
+                    }
                     if let Some(slot) = self.presence.slot(session) {
                         level = level.max(slot.chip());
                     }
@@ -2145,6 +2168,8 @@ impl App {
     /// publication runs for it again, so nothing else would).
     pub(crate) fn retire_presence(&mut self, session: u64) {
         self.presence.retire(session);
+        self.consent_observer.retire_session(session);
+        self.consent_attention.retire_session(session);
         for ws in self.windows.values_mut() {
             ws.presence.watermarks.remove(&session);
         }
@@ -2244,7 +2269,8 @@ impl Desk for App {
     }
 
     /// The claim's lapse on the microsecond clock, mapped onto `now`'s: one
-    /// millisecond past it, so the wake's lapse check sees it lapsed.
+    /// millisecond past it, so the wake's lapse check sees it lapsed; `now` is placed by
+    /// [`crate::metrics::us_at`], as [`Self::lapse_supervisor`] judges it.
     fn supervisor_lapse(&self, session: u64, now: Instant) -> Option<Instant> {
         let at_us = self.pool.get(session).and_then(|s| {
             s.ctx
@@ -2253,7 +2279,7 @@ impl Desk for App {
                 .unwrap_or_else(|p| p.into_inner())
                 .supervisor_expiry()
         })?;
-        let now_us = crate::metrics::now_us();
+        let now_us = crate::metrics::us_at(now);
         Some(now + Duration::from_micros(at_us.saturating_sub(now_us)) + Duration::from_millis(1))
     }
 
@@ -2390,12 +2416,13 @@ impl Desk for App {
     /// Remove and record the lapsed claim (`meta-change field=supervisor
     /// value=-`, pushed as `EVENT meta`); the driver's re-read re-heralds the
     /// session, so a box the dead supervisor held reaches the menu row and the
-    /// notification.
+    /// notification. Judged at the driver's clock ([`Desk::clock`]), the wall outside a test.
     fn lapse_supervisor(&mut self, session: u64) {
         let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) else {
             return;
         };
-        if crate::session_timeline::lapse_supervisor(&ctx, crate::metrics::now_us()) {
+        let now_us = crate::metrics::us_at(Desk::clock(self));
+        if crate::session_timeline::lapse_supervisor(&ctx, now_us) {
             // The footer's Autopilot chip and the harness card read the live
             // claim: a lapsed one repaints them, as a released one does
             // (`Wake::MetaChanged`, `App::on_meta_changed`). So does the

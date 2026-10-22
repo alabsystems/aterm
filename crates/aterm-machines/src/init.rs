@@ -9,6 +9,7 @@ use crate::items::{Ctx, Item};
 use crate::model::{Effect, HostFacts, ItemReport, Mode, Outcome, PValue, Probe, Read};
 use crate::port::{Cmd, Live, System};
 use aterm_converge::{Class, Layer, Remedy, Report, ReportMode, Requires};
+use aterm_types::macos_setup::{Selection, Setting};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -221,6 +222,30 @@ pub enum WorkstationGroup {
     All,
 }
 
+impl WorkstationGroup {
+    /// The selected rows belonging to this part of the pass.
+    #[must_use]
+    pub fn selected(self, mut selection: Selection) -> Selection {
+        for setting in Setting::ALL {
+            let belongs = match self {
+                Self::All => setting.is_workstation(),
+                Self::Accounts => matches!(setting, Setting::Messages | Setting::FaceTime),
+                Self::Preferences => {
+                    setting.is_workstation()
+                        && !matches!(setting, Setting::Messages | Setting::FaceTime)
+                }
+                Self::InputActivation => {
+                    matches!(setting, Setting::CapsLock | Setting::NaturalScrolling)
+                }
+            };
+            if !belongs {
+                selection.set(setting, false);
+            }
+        }
+        selection
+    }
+}
+
 /// Run the same workstation items used by `aterm init` for the console account.
 /// The caller decides plan/apply and, before applying, enforces its own isolated
 /// instance and first-launch policy. Plan only probes; it never opens either app.
@@ -233,6 +258,19 @@ pub fn run_workstation(
     mode: Mode,
 ) -> Result<Vec<ItemReport>, String> {
     prepare_workstation(sys, group)?.run(sys, mode)
+}
+
+/// Run only the chosen workstation groups, without probing unchecked settings.
+///
+/// # Errors
+/// The console account or required selected input facts cannot be resolved.
+pub fn run_workstation_selected(
+    sys: &dyn System,
+    group: WorkstationGroup,
+    mode: Mode,
+    selected: Selection,
+) -> Result<Vec<ItemReport>, String> {
+    prepare_workstation_selected(sys, group, selected)?.run(sys, mode)
 }
 
 /// A workstation pass whose before-images and apply share one resolved account
@@ -470,13 +508,40 @@ pub fn prepare_workstation(
     sys: &dyn System,
     group: WorkstationGroup,
 ) -> Result<Workstation, String> {
-    let ctx = context_for(sys, group)?;
+    prepare_workstation_selected(sys, group, Selection::all())
+}
+
+/// Prepare only the chosen rows. An empty group reads no host facts.
+///
+/// # Errors
+/// The console account or required selected input facts cannot be resolved.
+pub fn prepare_workstation_selected(
+    sys: &dyn System,
+    group: WorkstationGroup,
+    selected: Selection,
+) -> Result<Workstation, String> {
+    let selected = group.selected(selected);
+    if selected.is_empty() {
+        return Ok(Workstation {
+            ctx: Ctx {
+                facts: HostFacts::default(),
+                users: Vec::new(),
+                console: None,
+                host_name: String::new(),
+                cache_dir: PathBuf::new(),
+                disrupt: true,
+            },
+            items: Vec::new(),
+            snapshots: None,
+        });
+    }
+    let ctx = context_for_selected(sys, group, selected)?;
     // Doctor and first launch run these items unscoped, so they need the console here;
     // `aterm init` scopes them instead (`Requires::Console`).
     if ctx.console.is_none() {
         return Err("run as the user currently logged in at this Mac's console".into());
     }
-    let items = workstation_items(&ctx, group)?;
+    let items = workstation_items_selected(&ctx, group, selected)?;
     Ok(Workstation {
         ctx,
         items,
@@ -484,21 +549,65 @@ pub fn prepare_workstation(
     })
 }
 
-fn workstation_items(ctx: &Ctx, group: WorkstationGroup) -> Result<Vec<Box<dyn Item>>, String> {
+/// Resolve this login's console context for independent initial-setup stages,
+/// without inventorying keyboards or reading any preference/account service.
+///
+/// # Errors
+/// The login's console account cannot be established.
+pub fn initial_setup_context(sys: &dyn System) -> Result<Ctx, String> {
+    let ctx = context_for_selected(sys, WorkstationGroup::Accounts, Selection::none())?;
+    if ctx.console.is_none() {
+        return Err("run as the user currently logged in at this Mac's console".into());
+    }
+    Ok(ctx)
+}
+
+/// Run the selected Spotlight policy through the same probe/apply/read-back engine.
+///
+/// # Errors
+/// Its items or account journal cannot be prepared.
+pub fn run_initial_spotlight(
+    sys: &dyn System,
+    ctx: &Ctx,
+    mode: Mode,
+) -> Result<Vec<ItemReport>, String> {
+    Workstation {
+        ctx: ctx.clone(),
+        items: crate::init_spotlight::items(ctx)?,
+        snapshots: None,
+    }
+    .run(sys, mode)
+}
+
+fn workstation_items_selected(
+    ctx: &Ctx,
+    group: WorkstationGroup,
+    selected: Selection,
+) -> Result<Vec<Box<dyn Item>>, String> {
     let mut items = Vec::new();
     match group {
         WorkstationGroup::All | WorkstationGroup::Preferences => {
-            items.extend(crate::init_preferences::items(ctx)?);
-            items.extend(crate::init_trackpad::items(ctx)?);
-            items.extend(crate::init_trackpad::behavior_items(ctx)?);
+            items.extend(crate::init_preferences::selected_items(ctx, selected)?);
+            if selected.contains(Setting::NaturalScrolling) {
+                items.extend(crate::init_trackpad::items(ctx)?);
+            }
+            if selected.contains(Setting::TrackpadScrolling) {
+                items.extend(crate::init_trackpad::behavior_items(ctx)?);
+            }
             if group == WorkstationGroup::All {
-                items.extend(crate::init_accounts::items(ctx)?);
+                items.extend(crate::init_accounts::selected_items(ctx, selected)?);
             }
         }
-        WorkstationGroup::Accounts => items.extend(crate::init_accounts::items(ctx)?),
+        WorkstationGroup::Accounts => {
+            items.extend(crate::init_accounts::selected_items(ctx, selected)?)
+        }
         WorkstationGroup::InputActivation => {
-            items.extend(crate::init_preferences::attached_keyboard_items(ctx)?);
-            items.extend(crate::init_trackpad::items(ctx)?);
+            if selected.contains(Setting::CapsLock) {
+                items.extend(crate::init_preferences::attached_keyboard_items(ctx)?);
+            }
+            if selected.contains(Setting::NaturalScrolling) {
+                items.extend(crate::init_trackpad::items(ctx)?);
+            }
         }
     }
     Ok(items)
@@ -630,6 +739,14 @@ fn local_context(sys: &dyn System) -> Result<Ctx, String> {
 }
 
 fn context_for(sys: &dyn System, group: WorkstationGroup) -> Result<Ctx, String> {
+    context_for_selected(sys, group, Selection::all())
+}
+
+fn context_for_selected(
+    sys: &dyn System,
+    group: WorkstationGroup,
+    selected: Selection,
+) -> Result<Ctx, String> {
     if sys.euid() == 0 {
         return Err("run as the logged-in user, without sudo".into());
     }
@@ -669,7 +786,8 @@ fn context_for(sys: &dyn System, group: WorkstationGroup) -> Result<Ctx, String>
             disrupt: true,
         });
     }
-    let keyboards = if group == WorkstationGroup::Accounts {
+    let keyboards = if group == WorkstationGroup::Accounts || !selected.contains(Setting::CapsLock)
+    {
         Vec::new()
     } else {
         let command = crate::facts::hidutil_keyboards();
@@ -790,6 +908,102 @@ mod tests {
         Probe::Change {
             from: "a".into(),
             to: "b".into(),
+        }
+    }
+
+    #[test]
+    fn an_empty_selection_prepares_and_runs_without_any_host_probe() {
+        let sys = Fake::root();
+        let pass =
+            prepare_workstation_selected(&sys, WorkstationGroup::All, Selection::none()).unwrap();
+        let rows = pass
+            .run_recording_with(&sys, Mode::Plan, &mut NoJournal)
+            .unwrap()
+            .rows;
+        assert!(rows.is_empty());
+        assert!(
+            sys.calls().is_empty(),
+            "even account and input facts remain unread"
+        );
+    }
+
+    #[test]
+    fn selected_widgets_do_not_read_keyboard_dock_trackpad_or_accounts() {
+        let who = user("alice", 501);
+        let context = ctx(&[who]);
+        let sys = Fake::root();
+        sys.on(
+            "alice$ /usr/bin/defaults export com.apple.WindowManager -",
+            export("<dict/>"),
+        );
+        sys.on(
+            "alice$ /usr/bin/defaults export com.apple.notificationcenterui -",
+            export("<dict/>"),
+        );
+        let mut selected = Selection::none();
+        selected.set(Setting::Widgets, true);
+        let items = workstation_items_selected(&context, WorkstationGroup::All, selected).unwrap();
+        assert_eq!(items.len(), 1);
+        let snapshots = items[0].preference_changes(&sys, &context).unwrap();
+        assert_eq!(snapshots.len(), 3);
+        assert!(matches!(
+            items[0].probe(&sys, &context),
+            Probe::Change { .. } | Probe::Deferred { .. }
+        ));
+        for call in sys.calls() {
+            assert!(
+                call.contains("com.apple.WindowManager")
+                    || call.contains("com.apple.notificationcenterui")
+                    || call.contains("/init-activation/widgets.pending"),
+                "unchecked setting queried: {call}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_selected_account_needs_no_keyboard_inventory_or_other_service_read() {
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
+        sys.on(
+            "/usr/bin/dscl . -read /Groups/admin GroupMembership",
+            Ran::ok("GroupMembership: alice\n"),
+        );
+        sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+        sys.stat_of(
+            "/dev/console",
+            Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 0,
+            },
+        );
+        sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
+        sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
+        sys.on(
+            "alice$ /usr/bin/defaults export com.apple.imservice.ids.iMessage -",
+            export("<dict/>"),
+        );
+        let mut selected = Selection::none();
+        selected.set(Setting::Messages, true);
+        let pass = prepare_workstation_selected(&sys, WorkstationGroup::All, selected).unwrap();
+        let rows = pass
+            .run_recording_with(&sys, Mode::Plan, &mut NoJournal)
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, Outcome::Ok, "{:?}", rows[0].why);
+        for call in sys.calls() {
+            assert!(
+                !call.contains("hidutil")
+                    && !call.contains("FaceTime")
+                    && !call.contains("osascript")
+                    && !call.contains("scroll-direction"),
+                "unchecked setting queried: {call}"
+            );
         }
     }
 

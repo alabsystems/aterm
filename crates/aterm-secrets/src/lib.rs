@@ -43,7 +43,7 @@ pub use secret::SecretBytes;
 
 /// The ALab vault: what `aterm init` offers when Enter is pressed. A name, never an
 /// address: the server registers `alab-secrets.local` over mDNS wherever it runs.
-pub const ALAB_DEFAULT_URL: &str = "http://alab-secrets.local:7484/v1/alab";
+pub const ALAB_DEFAULT_URL: &str = aterm_types::macos_setup::DEFAULT_VAULT_URL;
 
 /// The ALab vault's signing key (standard padded base64 of the Ed25519 public key), the
 /// pin a machine that accepts [`ALAB_DEFAULT_URL`] uses instead of trusting on first use,

@@ -270,7 +270,8 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
             "codex-selftest: no managed Codex here (aterm pkg install codex, or LAB_CODEX=/path/to/codex)",
         ));
     }
-    let real_home = paths().real_home.clone();
+    // the owner's homes: the account's, whatever HOME says, and HOME's when it names another
+    let watched = crate::selftest::Watched::of(paths());
     let decoy0 = decoy_state(run);
     // The decoy's control: a jailed Codex started with NO CODEX_HOME and HOME a second scratch home writes into
     // that home's .codex at once (it makes tmp/arg0 there at every start, --version too), so a lab Codex that fell
@@ -302,18 +303,7 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
         &[codex, "--version"],
         JailOut::Capture,
     );
-    let shim_path = format!("{}:/usr/bin:/bin", run.run.join("shim").display());
-    let open_control = run.w.join("open-control.log");
-    let _ = crate::procs::jailed(
-        run,
-        &run.w,
-        &[
-            ("PATH", &shim_path),
-            ("LAB_OPEN_LOG", &open_control.to_string_lossy()),
-        ],
-        &["open", "x-lab-control://selftest"],
-        JailOut::Capture,
-    );
+    let open_control = crate::recorder::control(run);
     println!(
         "== codex {} in lab '{}' (the lab provider: base_url http://127.0.0.1:{}/v1, a fake env_key)",
         run.codex_ver, run.tag, run.port
@@ -449,20 +439,8 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
     {
         println!("  {l}");
     }
-    let opened = scratch_text(&run.w.join("open.log"));
-    let ctl_open = scratch_text(&open_control);
-    println!(
-        "== the open recorder (a URL or app something tried to open; its control: {})",
-        ctl_open.chars().take(80).collect::<String>().trim_end()
-    );
-    println!(
-        "  {}",
-        if opened.trim().is_empty() {
-            "(nothing)"
-        } else {
-            opened.trim_end()
-        }
-    );
+    let opened = crate::recorder::Witness::read(run, &open_control);
+    opened.print();
     // ~/.codex: what the kernel refused naming it, what Codex holds open, and the decoy of the scratch HOME
     let mut klog = String::new();
     let mut control = false;
@@ -481,11 +459,11 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
         .iter()
         .map(ToString::to_string)
         .collect();
-    let owner_codex = format!("{real_home}/.codex");
+    let owner_codex = watched.dirs(".codex");
     let denied: Vec<String> = klog
         .lines()
         .filter_map(|l| crate::verbs::refusal_of(l, &pat))
-        .filter(|l| l.contains(&owner_codex))
+        .filter(|l| owner_codex.iter().any(|c| l.contains(c.as_str())))
         .take(5)
         .collect();
     let held: Vec<String> = pids
@@ -497,7 +475,7 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
                 .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
                 .unwrap_or_default()
                 .lines()
-                .filter(|l| l.starts_with(&format!("n{owner_codex}")))
+                .filter(|l| owner_codex.iter().any(|c| l.starts_with(&format!("n{c}"))))
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         })
@@ -570,10 +548,7 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
     } else {
         Verdict::Unproven
     };
-    let open_ok = opened.trim().is_empty()
-        && ctl_open
-            .lines()
-            .any(|l| l.ends_with(" open x-lab-control://selftest"));
+    let open_ok = opened.ok();
     let egress = fs::read_to_string(run.run.join("egress.log")).unwrap_or_default();
     let egress_ok = codex_talked(run, &pids) && !egress.contains("EXTERNAL");
     println!("== checks");
@@ -621,10 +596,7 @@ fn selftest_checks(run: &Run) -> Result<Before, Fail> {
         ),
         refused,
     );
-    t.check(
-        "nothing was opened on the desktop: the open recorder logged nothing from the lab (its control, a bare-name open in the jail, was logged)",
-        ok(open_ok),
-    );
+    t.check(crate::recorder::NOTHING_OPENED, ok(open_ok));
     t.check(
         "the isolation probes passed on a replica home with this lab's rules (loopback only, ~/.codex and the owner's data denied, the desktop, the store, the scratch's directories, the lab's state dir)",
         ok(iso == 0),

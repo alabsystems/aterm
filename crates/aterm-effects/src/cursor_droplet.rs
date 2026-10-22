@@ -336,20 +336,23 @@ impl CursorDroplet {
 
         // Ripple rings: two flattened ellipses half a life apart, scaled by the
         // surge (invisible on still water).
-        let ring_rgb = water_ramp(0.74 + 0.10 * e);
-        let y0 = cy + radius * 0.88;
-        for half in [0.0f32, 0.5] {
-            let u = (self.ripple + half).fract();
-            let env = (1.0 - u) * (1.0 - u).sqrt() * e;
-            let cov = (cov_core * 0.55 * env).min(COV_CAP) as u8;
-            if cov == 0 {
-                continue;
+        if e > 0.0 {
+            let ring_rgb = water_ramp(0.74 + 0.10 * e);
+            let y0 = cy + radius * 0.88;
+            for half in [0.0f32, 0.5] {
+                let u = (self.ripple + half).fract();
+                let one_minus_u = 1.0 - u;
+                let env = one_minus_u * one_minus_u.sqrt() * e;
+                let cov = (cov_core * 0.55 * env).min(COV_CAP) as u8;
+                if cov == 0 {
+                    continue;
+                }
+                let rx = radius * (0.9 + RIPPLE_REACH * u);
+                let ry = (rx * 0.22).max(2.0);
+                let thick = (rx * 0.12).max(1.5);
+                let ring = premul_rgb(ring_rgb, cov);
+                push_ripple_ring(out, geom, (cx, y0), (rx, ry), thick, ring);
             }
-            let rx = radius * (0.9 + RIPPLE_REACH * u);
-            let ry = (rx * 0.22).max(2.0);
-            let thick = (rx * 0.12).max(1.5);
-            let ring = premul_rgb(ring_rgb, cov);
-            push_ripple_ring(out, geom, (cx, y0), (rx, ry), thick, ring);
         }
 
         // Drips: one lazy drip at rest, rain as the surge wakes the outer lanes.

@@ -126,6 +126,15 @@ pub struct VendorSpec {
     pub apple_team: &'static str,
     /// The tools the build exposes; never taken from the index.
     pub exposes: &'static [&'static str],
+    /// `(name, target)`: an exposed `name` whose executable the vendor ships under another
+    /// name, laid in the build as `bin/<name>`, a REGULAR-FILE clone of the vendor's own
+    /// `bin/<target>`, before the Developer ID gate judges the tree
+    /// ([`crate::install::StageHooks::aliases`]) — never a symlink, which the gate refuses
+    /// (`crate::macho::find_macho`), and never a shim into another program's store, which
+    /// would make this program's `current`, rollback and gc another's. Each `name` is one
+    /// of [`Self::exposes`] and each `target` is not. Compiled only, never taken from the
+    /// index. Empty: the build runs every exposed tool under its own name.
+    pub aliases: &'static [(&'static str, &'static str)],
     /// Every first-hop fetch URL must start with one of these (https, trailing `/`).
     pub url_prefixes: &'static [&'static str],
     /// The one query a fetch URL may carry: these keys, in this order, each with a value,
@@ -307,6 +316,92 @@ pub(crate) const LEGACY_CEILING: u64 = 2_026_092_401;
 /// unread, until a person asks.
 pub const NEVER_INDEX_PINNED: u64 = 0;
 
+/// OpenAI's Codex CLI: the row of `codex`, and of `codex-old` beside it.
+const OPENAI_CODEX: VendorSpec = VendorSpec {
+    program: "codex",
+    vendor: "OpenAI",
+    product: "Codex CLI",
+    description: "OpenAI Codex CLI — Apache-2.0, ~110 MB (~290 MB on disk), downloaded \
+                  from github.com/openai/codex",
+    head_url: "https://releases.openai.com/codex/channels/latest",
+    anchor: Anchor::OpenAiTwoHost,
+    apple_team: "2DC432GLL2",
+    exposes: &["codex"],
+    aliases: &[],
+    url_prefixes: &[
+        "https://releases.openai.com/codex/",
+        "https://github.com/openai/codex/releases/download/",
+    ],
+    url_query: &[],
+    digest_docs: &[
+        // The release JSON: releases.openai.com itself, never redirected — else both
+        // halves of the two-host agreement could come from GitHub.
+        DocPin {
+            prefix: "https://releases.openai.com/codex/",
+            redirect_hosts: &[],
+        },
+        // `SHA256SUMS`: github.com answers with a redirect to its release-asset
+        // storage (measured for rust-v0.156.0).
+        DocPin {
+            prefix: "https://github.com/openai/codex/releases/download/",
+            redirect_hosts: &[
+                "release-assets.githubusercontent.com",
+                "objects.githubusercontent.com",
+            ],
+        },
+    ],
+    shim_env: &[],
+    warm: Some(Warm {
+        // Lists the served models headless and rewrites `~/.codex/models_cache.json`,
+        // with no model turn (measured on 0.156.1). A debug subcommand: a release
+        // that drops it fails the warm, silently.
+        argv: &["debug", "models"],
+        // The config home (an aterm identity session sets it after its own strip).
+        keep: &["CODEX_HOME"],
+        env: &[],
+        opt_out: None,
+        state: Some(AccountState {
+            dir_var: "CODEX_HOME",
+            under_home: &[".codex"],
+        }),
+    }),
+    self_update_verbs: &["update"],
+    // codex 0.163 parses `--yolo` itself (measured 2026-10-19); the expansion is
+    // still spelled in full so the echo names the posture exactly.
+    yolo_flags: &["--dangerously-bypass-approvals-and-sandbox"],
+    // The bypass flag repeated is a clap refusal (exit 2, measured 0.163), so
+    // its presence must suppress any second copy, by the flag or by default.
+    // The sandbox/approval words (attached short spellings included, by
+    // `yolo::marker_matches` — `-sread-only` is `-s read-only` to clap),
+    // and the two config carriers: a `-c` override or a `--profile` can
+    // spell the launch's whole posture (`sandbox_mode=`, measured in the
+    // harness's own relaunch corpus), so either leaves the launch typed.
+    yolo_markers: &[
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--sandbox",
+        "--sandbox=",
+        "-s",
+        "--ask-for-approval",
+        "--ask-for-approval=",
+        "-a",
+        "--approve-for-me",
+        "--config",
+        "--config=",
+        "-c",
+        "--profile",
+        "--profile=",
+        "-p",
+    ],
+    yolo_after: &[],
+    // A resumed or forked thread keeps its own settings; the default
+    // never overrides them (an explicit `--yolo` still expands).
+    yolo_skip: &["resume", "fork"],
+    live_upgrade: true,
+    revision_versions: false,
+    floor: floor(0, 156, 1),
+    legacy_ceiling: LEGACY_CEILING,
+};
+
 /// The agent programs, each fetched from its own vendor: the one roster of them
 /// ([`crate::stub::AGENT_PROGRAMS`] is its names, in this order).
 pub const VENDORS: &[VendorSpec] = &[
@@ -320,6 +415,7 @@ pub const VENDORS: &[VendorSpec] = &[
         anchor: Anchor::AnthropicOpenPgp,
         apple_team: "Q6L2SF6YDW",
         exposes: &["claude"],
+        aliases: &[],
         url_prefixes: &["https://downloads.claude.ai/claude-code-releases/"],
         url_query: &[],
         // `<v>/manifest.json` and its `.sig`, answered in place.
@@ -412,89 +508,7 @@ pub const VENDORS: &[VendorSpec] = &[
         floor: floor(2, 1, 281),
         legacy_ceiling: LEGACY_CEILING,
     },
-    VendorSpec {
-        program: "codex",
-        vendor: "OpenAI",
-        product: "Codex CLI",
-        description: "OpenAI Codex CLI — Apache-2.0, ~110 MB (~290 MB on disk), downloaded \
-                      from github.com/openai/codex",
-        head_url: "https://releases.openai.com/codex/channels/latest",
-        anchor: Anchor::OpenAiTwoHost,
-        apple_team: "2DC432GLL2",
-        exposes: &["codex"],
-        url_prefixes: &[
-            "https://releases.openai.com/codex/",
-            "https://github.com/openai/codex/releases/download/",
-        ],
-        url_query: &[],
-        digest_docs: &[
-            // The release JSON: releases.openai.com itself, never redirected — else both
-            // halves of the two-host agreement could come from GitHub.
-            DocPin {
-                prefix: "https://releases.openai.com/codex/",
-                redirect_hosts: &[],
-            },
-            // `SHA256SUMS`: github.com answers with a redirect to its release-asset
-            // storage (measured for rust-v0.156.0).
-            DocPin {
-                prefix: "https://github.com/openai/codex/releases/download/",
-                redirect_hosts: &[
-                    "release-assets.githubusercontent.com",
-                    "objects.githubusercontent.com",
-                ],
-            },
-        ],
-        shim_env: &[],
-        warm: Some(Warm {
-            // Lists the served models headless and rewrites `~/.codex/models_cache.json`,
-            // with no model turn (measured on 0.156.1). A debug subcommand: a release
-            // that drops it fails the warm, silently.
-            argv: &["debug", "models"],
-            // The config home (an aterm identity session sets it after its own strip).
-            keep: &["CODEX_HOME"],
-            env: &[],
-            opt_out: None,
-            state: Some(AccountState {
-                dir_var: "CODEX_HOME",
-                under_home: &[".codex"],
-            }),
-        }),
-        self_update_verbs: &["update"],
-        // codex 0.163 parses `--yolo` itself (measured 2026-10-19); the expansion is
-        // still spelled in full so the echo names the posture exactly.
-        yolo_flags: &["--dangerously-bypass-approvals-and-sandbox"],
-        // The bypass flag repeated is a clap refusal (exit 2, measured 0.163), so
-        // its presence must suppress any second copy, by the flag or by default.
-        // The sandbox/approval words (attached short spellings included, by
-        // `yolo::marker_matches` — `-sread-only` is `-s read-only` to clap),
-        // and the two config carriers: a `-c` override or a `--profile` can
-        // spell the launch's whole posture (`sandbox_mode=`, measured in the
-        // harness's own relaunch corpus), so either leaves the launch typed.
-        yolo_markers: &[
-            "--dangerously-bypass-approvals-and-sandbox",
-            "--sandbox",
-            "--sandbox=",
-            "-s",
-            "--ask-for-approval",
-            "--ask-for-approval=",
-            "-a",
-            "--approve-for-me",
-            "--config",
-            "--config=",
-            "-c",
-            "--profile",
-            "--profile=",
-            "-p",
-        ],
-        yolo_after: &[],
-        // A resumed or forked thread keeps its own settings; the default
-        // never overrides them (an explicit `--yolo` still expands).
-        yolo_skip: &["resume", "fork"],
-        live_upgrade: true,
-        revision_versions: false,
-        floor: floor(0, 156, 1),
-        legacy_ceiling: LEGACY_CEILING,
-    },
+    OPENAI_CODEX,
     VendorSpec {
         program: "agy",
         vendor: "Google",
@@ -505,6 +519,7 @@ pub const VENDORS: &[VendorSpec] = &[
         anchor: Anchor::GoogleTwoHost,
         apple_team: "EQHXZ8M8AV",
         exposes: &["agy"],
+        aliases: &[],
         url_prefixes: &[
             agy_manifests!(),
             "https://storage.googleapis.com/antigravity-public/antigravity-cli/",
@@ -559,6 +574,7 @@ pub const VENDORS: &[VendorSpec] = &[
         anchor: Anchor::MetaDeveloperId,
         apple_team: "V9WTTPBFK9",
         exposes: &["muse"],
+        aliases: &[],
         url_prefixes: &[
             "https://api.meta.ai/muse-code/channels/",
             "https://lookaside.facebook.com/lookaside/muse/download/",
@@ -646,6 +662,30 @@ pub const VENDORS: &[VendorSpec] = &[
         floor: revision_floor(1, 4, 9, 6297, Some(1)),
         legacy_ceiling: NEVER_INDEX_PINNED,
     },
+    // OPENAI'S OWN CODEX BESIDE `codex` (owner ruling 2026-10-20: `codex` is codex-alab
+    // where ALab builds it, upstream Codex is `codex-old`, and both are bundled). Its own
+    // program — store, `current`, stamp, digest log and shims — so the source rule that
+    // hands `codex` to the ALab index never reaches it ([`crate::alab`] has no row for
+    // it): it is always the vendor's lane and the vendor's bytes. The build is OpenAI's
+    // package as it ships, its entry cloned to `bin/codex-old` ([`VendorSpec::aliases`]),
+    // so the gate judges the file the shim runs and the argv0 aterm reads names it.
+    VendorSpec {
+        program: "codex-old",
+        description: "OpenAI Codex CLI, OpenAI's own build beside codex — Apache-2.0, ~110 MB \
+                      (~290 MB on disk), downloaded from github.com/openai/codex",
+        exposes: &["codex-old"],
+        aliases: &[("codex-old", "codex")],
+        // One warm per `CODEX_HOME`: it shares `~/.codex` with `codex`, whose row warms it.
+        warm: None,
+        // No harness supervises a vendor Codex (shown, never driven), so no session waits
+        // on its landing.
+        live_upgrade: false,
+        // OpenAI's head when the row was written (`rust-v0.163.0`, read 2026-10-21); no
+        // index ever pinned it.
+        floor: floor(0, 163, 0),
+        legacy_ceiling: NEVER_INDEX_PINNED,
+        ..OPENAI_CODEX
+    },
 ];
 
 /// The row for `program`, or `None` for a program the index manages.
@@ -694,6 +734,56 @@ mod tests {
                 "{arg:?} would be a prompt"
             );
         }
+    }
+
+    /// THE ALIASES ARE THE ROW'S OWN: each `(name, target)` names one of the row's exposed
+    /// tools and a target it does not expose — a clone inside the program's own build, never
+    /// a shim into another program's — both admissible tool names; and no tool is exposed by
+    /// two rows, so every `bin/` name is one program's. `codex-old` is the one aliased row:
+    /// OpenAI's lane pin for pin (one vendor's word, read under one set of rules), under its
+    /// own name, with no warm of the `~/.codex` it shares, no live upgrade, a floor of its
+    /// own, and no ALab row — so the source rule can never hand it to the index.
+    ///
+    /// NEGATIVE CONTROL: `codex` keeps its warm, its live upgrade and its ALab row.
+    #[test]
+    fn every_alias_is_a_clone_inside_its_own_rows_build() {
+        let mut seen = std::collections::BTreeSet::new();
+        for row in VENDORS {
+            for tool in row.exposes {
+                assert!(seen.insert(*tool), "{tool} exposed by two rows");
+                assert!(crate::store::ToolName::new(tool).is_some(), "{tool}");
+            }
+            for (name, target) in row.aliases {
+                assert!(row.exposes.contains(name), "{}: {name}", row.program);
+                assert!(!row.exposes.contains(target), "{}: {target}", row.program);
+                assert!(crate::store::ToolName::new(target).is_some(), "{target}");
+            }
+        }
+        let aliased: Vec<&str> = VENDORS
+            .iter()
+            .filter(|row| !row.aliases.is_empty())
+            .map(|row| row.program)
+            .collect();
+        assert_eq!(aliased, ["codex-old"]);
+        let (old, codex) = (spec("codex-old").unwrap(), spec("codex").unwrap());
+        assert_eq!(old.exposes, &["codex-old"]);
+        assert_eq!(old.aliases, &[("codex-old", "codex")]);
+        let lane = |s: &VendorSpec| {
+            (
+                (s.vendor, s.product, s.head_url, s.anchor, s.apple_team),
+                (s.url_prefixes, s.url_query, s.digest_docs, s.shim_env),
+                (s.self_update_verbs, s.yolo_flags, s.yolo_markers),
+                (s.yolo_after, s.yolo_skip, s.revision_versions),
+            )
+        };
+        assert_eq!(lane(old), lane(codex));
+        assert!(old.warm.is_none() && !old.live_upgrade);
+        assert_eq!(old.legacy_ceiling, NEVER_INDEX_PINNED);
+        assert!(old.floor >= codex.floor);
+        assert!(old.description.starts_with("OpenAI Codex CLI"));
+        assert!(crate::alab::agent("codex-old").is_none());
+        assert!(codex.warm.is_some() && codex.live_upgrade);
+        assert!(crate::alab::agent("codex").is_some());
     }
 
     /// The `anchor` key of a `.vendor` record an earlier client wrote: each spelling is

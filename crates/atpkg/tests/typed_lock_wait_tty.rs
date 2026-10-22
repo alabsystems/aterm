@@ -6,10 +6,10 @@
 //! `store_lock_wait.rs` pins the verbs nobody watches: a typed verb whose stdin is not a
 //! terminal still refuses at once with exit 75. This is the other half. A verb whose
 //! stdin and stderr are a terminal — a pseudo-terminal here, which `isatty` cannot tell
-//! from a person's — meets a held store, says nothing for the 2 s grace, then draws ONE
-//! spinner line on stderr ("Waiting for aterm's background update to finish…"), and runs
-//! when the holder lets go, the line cleared and nothing on stdout. The negative control
-//! is the same verb with stdin off the terminal: exit 75 at once, the old sentence.
+//! from a person's — meets a held store, says nothing for the grace (none here), then
+//! draws ONE spinner line on stderr ("Waiting for aterm's background update to finish…"),
+//! and runs when the holder lets go, the line cleared and nothing on stdout. The negative
+//! control is the same verb with stdin off the terminal: exit 75 at once, the old sentence.
 //!
 //! NEVER THE REAL STORE: the child's HOME is a temp directory, its XDG_CONFIG_HOME an
 //! absent one, and `<prefix>/declined` makes `seed` exit 0 with one sentence before any
@@ -70,6 +70,7 @@ impl Fixture {
                 "ATPKG_REGISTRY",
                 format!("dir:{}", self.root.path().join("registry").display()),
             )
+            .env(atpkg::lock::WAIT_ANNOUNCE_GRACE_SEAM, "0")
             .env("TERM", "xterm-256color")
             .env("LANG", "en_US.UTF-8")
             .stdout(Stdio::piped());

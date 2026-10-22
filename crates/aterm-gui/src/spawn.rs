@@ -107,9 +107,8 @@ fn first_sighting(
 // coding-agent primer (`aterm agents install`) on a detached thread, throttled
 // and fail-soft, so an agent launched anywhere knows what aterm is — and knows
 // it in this build's words, in a tab the launch adopted or restored too, under
-// an agent identity or not. No pass starts before the launch's first frame is
-// on glass ([`PrimeSchedule`]), and the identities are primed at the first
-// launch of each build ([`prime_identities_once_per_build`]). A seamless
+// the user's configured agent home. No pass starts before the launch's first
+// frame is on glass ([`PrimeSchedule`]). A seamless
 // update's candidate writes nothing before its Commit. `agents_auto_prime =
 // false` turns it off.
 
@@ -136,10 +135,7 @@ pub(crate) enum PrimeCue {
     /// is a shell this build did not spawn: the context files its agents read
     /// were written by the build before, whose primer an update supersedes.
     /// Its pass stands in for session 0's fresh spawn, which finds the
-    /// throttle taken. At the first launch of a build it primes every agent
-    /// identity too ([`prime_identities_once_per_build`]): a tab under one
-    /// reads that identity's copy, which only a spawner's admission under it
-    /// primes, and an adopted or restored shell's own hold on it primes nothing.
+    /// throttle taken.
     Launch,
     /// A session spawn: `adopted` when it re-adopts a running shell (a
     /// seamless update's handoff, the keeper), `spare` when it is a warm spare
@@ -283,51 +279,6 @@ impl PrimeSchedule {
     }
 }
 
-/// `<state>/agents-primed-build`: the build whose launch last primed every
-/// agent identity ([`prime_identities_once_per_build`]), in the state
-/// directory beside the identities it speaks for.
-fn primed_build_marker() -> Option<std::path::PathBuf> {
-    aterm_types::dirs::state_dir().map(|dir| dir.join("agents-primed-build"))
-}
-
-/// The marker holds one build number and its newline.
-const PRIMED_BUILD_MAX_BYTES: usize = 64;
-
-/// The launch pass's identity half, at most once per build: unless `marker`
-/// already records `build`, every agent identity is primed (`identities`) and,
-/// when every one was primed whole (`identities` answers `true`), `build` is
-/// recorded; `true` when it primed. An identity's copy holds the block of the
-/// build that last primed it, which only a new build supersedes, so a later
-/// launch of the same build primes none (a spawn admitted under one still
-/// primes it). A pass with a failed row records nothing, so the next launch
-/// tries the roster again, and a marker that cannot be read or written primes
-/// them at every launch.
-fn prime_identities_once_per_build(
-    marker: Option<&Path>,
-    build: &str,
-    identities: impl FnOnce() -> bool,
-) -> bool {
-    let recorded = marker
-        .and_then(|path| crate::config_marker::read_marker(path, PRIMED_BUILD_MAX_BYTES))
-        .is_some_and(|text| text.trim_end() == build);
-    if recorded {
-        return false;
-    }
-    if !identities() {
-        return true;
-    }
-    if let Some(path) = marker {
-        // Ordered: a lost record only primes the identities once more.
-        let _ = crate::config_marker::write_marker(
-            path,
-            &format!("{build}\n"),
-            PRIMED_BUILD_MAX_BYTES,
-            crate::durable::Flush::Ordered,
-        );
-    }
-    true
-}
-
 /// One pass with its inputs injected (the knob, the home), so a test drives it
 /// against a scratch directory: runs the installer, returns the outcome, logs
 /// a change at `info` and each failed agent at `warn` — and nothing when the
@@ -358,29 +309,12 @@ fn run_agent_prime(
     }
 }
 
-/// The pass a cue started ([`prime_agents_if_due`]), on its thread, with its
-/// world injected so a test drives it over scratch folders: once this process
-/// may write the agents' files (`committed`, [`handoff_committed`] in a run),
-/// the human's pass (`human`, [`run_agent_prime`]), then, at the launch and
-/// when that pass ran (the knob, the bundle and the home allow it), the
-/// identities' (`identities`: in a run, [`prime_identities_once_per_build`]
-/// over [`crate::agent_identity::reprime_roster`]).
-/// `None`, and nothing read or written, when the seamless handoff this process
-/// came in on was never committed.
+/// Run the primer only after the seamless handoff commits.
 fn agent_prime_pass(
-    cue: PrimeCue,
     committed: impl FnOnce() -> bool,
-    human: impl FnOnce() -> AgentPrimeOutcome,
-    identities: impl FnOnce(),
+    prime: impl FnOnce() -> AgentPrimeOutcome,
 ) -> Option<AgentPrimeOutcome> {
-    if !committed() {
-        return None;
-    }
-    let outcome = human();
-    if cue == PrimeCue::Launch && matches!(outcome, AgentPrimeOutcome::Ran(_)) {
-        identities();
-    }
-    Some(outcome)
+    committed().then(prime)
 }
 
 /// Whether this process may write the agents' files, waiting until it may: a
@@ -447,28 +381,17 @@ pub(crate) fn release_held_prime() {
 /// Commit ([`handoff_committed`]). The handle is dropped: nothing joins it, and
 /// the pass writes whole files only, so an agent starting meanwhile reads the
 /// block before it or the one after, never a torn file.
-fn start_agent_prime(cue: PrimeCue) {
+fn start_agent_prime(_cue: PrimeCue) {
     let spawned = std::thread::Builder::new()
         .name("aterm-agent-prime".to_string())
         .spawn(move || {
-            let _ = agent_prime_pass(
-                cue,
-                handoff_committed,
-                || {
-                    run_agent_prime(
-                        crate::app_config::agents_auto_prime_setting(),
-                        atpkg::hooks::runs_from_non_release_bundle(),
-                        aterm_primer::home_dir(),
-                    )
-                },
-                || {
-                    let _ = prime_identities_once_per_build(
-                        primed_build_marker().as_deref(),
-                        crate::build_info::build_number(),
-                        crate::agent_identity::reprime_roster,
-                    );
-                },
-            );
+            let _ = agent_prime_pass(handoff_committed, || {
+                run_agent_prime(
+                    crate::app_config::agents_auto_prime_setting(),
+                    atpkg::hooks::runs_from_non_release_bundle(),
+                    aterm_primer::home_dir(),
+                )
+            });
         });
     if let Err(e) = spawned {
         aterm_log::warn!("agent primer: could not start the installer thread: {e}");
@@ -1724,10 +1647,6 @@ pub(crate) struct Adopted {
     /// (absent means predates) or the record's `frozen_path`; marked on the
     /// registry at `App::register_session` and carried by the next handoff.
     pub frozen_path: bool,
-    /// The agent identity this shell was spawned under (`spawn identity=<name>`),
-    /// from the handoff record. The shell keeps that identity's env; only the
-    /// label rides here, onto `Session::identity` and the registry handle.
-    pub identity: Option<String>,
     /// Broadcast opt-ins: the record's `topic add` set as `"<topic> <since>"`
     /// rows, already validated, re-seeded onto the adopted `SessionFabric` so a
     /// seamless update does not unsubscribe an agent from its topics.
@@ -2247,15 +2166,6 @@ pub(crate) fn spawn_session(
     // (identity only, see [`provision_observe_env`]). `None` for every
     // non-connected spawn.
     observe: Option<&SessionId>,
-    // `Some(name)` spawns the shell under that agent identity: each agent's home
-    // variable points into `<state>/identities/<name>/<agent dir>` via `env_add`,
-    // which the pty seam applies after the deny pass. The identity must already
-    // exist and no forget may be taking it (`agent_identity::admit_existing`);
-    // otherwise the spawn fails. The session keeps that admission, which holds
-    // the identity against `identities forget` while it lives. `None` is the
-    // user's own agent config. Ignored on an adopted shell (its label comes from
-    // `Adopted::identity`).
-    identity: Option<&str>,
     // A WORKER's task (`spawn agent=claude`, `task_launch`): written to its
     // task file once the newborn's sid is known, the file named to the shell
     // as `ATERM_TASK_FILE`. `None` for every other spawn; ignored on an
@@ -2349,13 +2259,6 @@ pub(crate) fn spawn_session(
     let adopt_end: Option<String> = adopt
         .as_ref()
         .and_then(|adopted| adopted.autopilot_end.clone());
-    // The identity LABEL this session wears: the name it is spawned under, or —
-    // for an adopted shell, whose env is what it was — the one its record
-    // carried across the handoff.
-    let identity_label: Option<String> = match &adopt {
-        Some(adopted) => adopted.identity.clone(),
-        None => identity.map(str::to_owned),
-    };
     // A fresh interactive shell that cannot start — a `$SHELL` or `shell` naming
     // nothing this user can run — is replaced by the account's login shell, else
     // `/bin/sh`, and the pane says so ([`substitute_shell`]): a launch from the
@@ -2492,14 +2395,6 @@ pub(crate) fn spawn_session(
     // `status integration_rev=` says `frozen` (the typed upgrade can still reach
     // it — `shell_rekey::typed`).
     let integration_frozen = adopt.is_some() && !body_loader;
-    // The shell's admission under its agent identity, kept on the session. An
-    // adopted shell's env is what it was: its label is held all the same, never
-    // waiting and never failing the adoption (`agent_identity::hold_adopted`),
-    // since the process that admitted it may have exited.
-    let mut identity_admission = match (&adopt, identity_label.as_deref()) {
-        (Some(_), Some(name)) => crate::agent_identity::hold_adopted(name),
-        _ => None,
-    };
     // Identity is unconditional (except on adoption, where env cannot be
     // re-injected), so `@self` resolves from any descendant. Not gated on
     // `exec_command`: `aterm -e claude` needs it for the agent CLI's hooks.
@@ -2508,16 +2403,6 @@ pub(crate) fn spawn_session(
         // Controller spawn: hand the supervisor the sid it observes (identity only).
         if let Some(origin) = observe {
             env_add.extend(provision_observe_env(origin));
-        }
-        // Identity env, applied by `build_child_env` after its deny pass, so the
-        // parent's `CLAUDE_CONFIG_DIR`/`CODEX_HOME` never reach the child. Not
-        // gated on `exec_command`. The dir must exist; a missing one fails the
-        // spawn. Admitted first, so the folder the env names is held from here.
-        if let Some(name) = identity {
-            let admission = crate::agent_identity::admit_existing(name)
-                .map_err(|e| std::io::Error::new(e.kind(), format!("identity {name}: {e}")))?;
-            env_add.extend(crate::agent_identity::env(admission.dir()));
-            identity_admission = Some(admission);
         }
         // A WORKER: its task file, written now that the sid naming it is
         // known. A file that cannot be written fails the spawn: a worker
@@ -3019,8 +2904,6 @@ pub(crate) fn spawn_session(
         rekey_channel,
         body_loader,
         integration_frozen,
-        identity: identity_label,
-        _identity_admission: identity_admission,
         ctx,
         child_proxy,
         output_wake_pending,
@@ -4055,125 +3938,27 @@ mod shell_integration_warn_tests {
 mod agent_prime_tests {
     use super::{
         AgentPrimeOutcome, PrimeCue, PrimeSchedule, agent_prime_pass, agent_prime_permitted,
-        prime_identities_once_per_build, run_agent_prime, take_pass,
+        run_agent_prime, take_pass,
     };
-    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
-    /// A scratch home with Codex detected, and an identity `worker` whose
-    /// Claude file holds the block an older build wrote: `(home, the identity's
-    /// root, the identity's Claude file)`.
-    fn after_an_update(scratch: &Path) -> (PathBuf, PathBuf, PathBuf) {
-        let home = scratch.join("home");
-        std::fs::create_dir_all(home.join(".codex")).expect("detect codex");
-        let root = scratch.join("identities");
-        let claude = root.join("worker/.claude/CLAUDE.md");
-        std::fs::create_dir_all(claude.parent().expect("the agent dir")).expect("the identity");
-        std::fs::write(
-            &claude,
-            "<!-- aterm primer v1 — managed by `aterm agents`; `aterm agents remove` \
-             uninstalls -->\nthe build before's words\n<!-- /aterm primer -->\n",
-        )
-        .expect("the older block");
-        (home, root, claude)
-    }
-
-    /// The pass `cue` starts over the scratch world, `committed` or not, with
-    /// the knob `enabled` and `$XDG_CONFIG_HOME` unset (the human's pass reads
-    /// it, and a parallel test that scopes it would lend this pass its tree).
-    fn pass_over(
-        cue: PrimeCue,
-        committed: bool,
-        enabled: bool,
-        home: &Path,
-        root: &Path,
-    ) -> Option<AgentPrimeOutcome> {
-        crate::test_env::scoped_unset("XDG_CONFIG_HOME", || {
-            agent_prime_pass(
-                cue,
-                || committed,
-                || run_agent_prime(enabled, false, Some(home.to_path_buf())),
-                || {
-                    let _ = crate::agent_identity::reprime_roster_in(root);
-                },
-            )
-        })
-    }
-
-    /// A SEAMLESS UPDATE'S CANDIDATE writes no agent's file before its
-    /// Commit: the outgoing process may still reject it and keep every
-    /// session, under a build that never rolls a newer block back. Its
-    /// launch's pass, never committed, reads and writes nothing, in the home or
-    /// in an identity. NEGATIVE CONTROL: the same pass, committed, primes both.
     #[test]
     fn an_uncommitted_candidate_writes_no_agents_file() {
         let scratch = aterm_tempfile::tempdir().expect("scratch");
-        let (home, root, claude) = after_an_update(scratch.path());
-        let older = std::fs::read_to_string(&claude).expect("the older block");
-        assert_eq!(pass_over(PrimeCue::Launch, false, true, &home, &root), None);
-        assert!(
-            !home.join(".codex/AGENTS.md").exists(),
-            "the home is untouched"
-        );
-        assert_eq!(std::fs::read_to_string(&claude).unwrap(), older);
-
-        let Some(AgentPrimeOutcome::Ran(pass)) =
-            pass_over(PrimeCue::Launch, true, true, &home, &root)
-        else {
-            panic!("a committed launch primes");
+        let home = scratch.path();
+        std::fs::create_dir_all(home.join(".codex")).expect("detect codex");
+        let prime = || {
+            crate::test_env::scoped_unset("XDG_CONFIG_HOME", || {
+                run_agent_prime(true, false, Some(home.to_path_buf()))
+            })
         };
-        assert!(pass.changed(), "{}", pass.summary);
-        assert_eq!(
-            std::fs::read_to_string(home.join(".codex/AGENTS.md")).unwrap(),
-            aterm_primer::primer_block(Some("codex"))
-        );
-        assert_eq!(
-            std::fs::read_to_string(&claude).unwrap(),
-            aterm_primer::primer_block(Some("claude"))
-        );
-    }
-
-    /// THE LAUNCH PRIMES EVERY AGENT IDENTITY: a tab under one reads that
-    /// identity's copy, which only a spawner's admission under it primes, so an
-    /// update's adopted shell, a restored one, and an agent the harness
-    /// relaunches in either with `--resume` read this build's block once the
-    /// launch's pass ran. NEGATIVE CONTROL: a fresh spawn's pass, the only
-    /// pass after an update before this, primes the home and leaves the
-    /// identity's older block; and a launch with `agents_auto_prime = false`
-    /// writes no identity either.
-    #[test]
-    fn the_launch_primes_every_identity() {
-        let fresh = PrimeCue::Spawn {
-            adopted: false,
-            spare: false,
-        };
-        let scratch = aterm_tempfile::tempdir().expect("scratch");
-        let (home, root, claude) = after_an_update(scratch.path());
-        let older = std::fs::read_to_string(&claude).expect("the older block");
-        assert_eq!(
-            pass_over(PrimeCue::Launch, true, false, &home, &root),
-            Some(AgentPrimeOutcome::Disabled)
-        );
-        assert_eq!(std::fs::read_to_string(&claude).unwrap(), older, "off");
+        assert_eq!(agent_prime_pass(|| false, prime), None);
+        assert!(!home.join(".codex/AGENTS.md").exists());
         assert!(matches!(
-            pass_over(fresh, true, true, &home, &root),
+            agent_prime_pass(|| true, prime),
             Some(AgentPrimeOutcome::Ran(_))
         ));
-        assert!(
-            home.join(".codex/AGENTS.md").is_file(),
-            "the home's pass ran"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&claude).unwrap(),
-            older,
-            "a spawn's pass is the home's alone"
-        );
-        let _ = pass_over(PrimeCue::Launch, true, true, &home, &root);
-        assert_eq!(
-            std::fs::read_to_string(&claude).unwrap(),
-            aterm_primer::primer_block(Some("claude")),
-            "the launch put this build's block under the identity's agent"
-        );
+        assert!(home.join(".codex/AGENTS.md").is_file());
     }
 
     /// Which of `cues`, each at its second on one clock, start a pass.
@@ -4294,101 +4079,6 @@ mod agent_prime_tests {
             [(0, PrimeCue::Launch), (4, PrimeCue::SpareAdopted)],
             "the control: unheld, the launch's pass starts at its cue"
         );
-    }
-
-    /// THE IDENTITIES ARE PRIMED AT THE FIRST LAUNCH OF EACH BUILD, ONCE: that
-    /// launch replaces an identity's older block and records the build; a later
-    /// launch of the same build primes the human's agents and no identity (the
-    /// identity's file put back to the older block is the probe: a pass would
-    /// replace it); the next build's first launch primes it again. A launch
-    /// whose pass failed on one identity (a file with an unterminated block,
-    /// which the primer refuses to touch) still primes the others but records
-    /// nothing, so the launch after it tries the roster again and records the
-    /// build once the roster is whole. NEGATIVE CONTROLS: a launch with
-    /// `agents_auto_prime = false` primes no identity and records nothing, so
-    /// turning the knob back on primes them at the next launch; with no marker
-    /// (no state directory) every launch primes them.
-    #[test]
-    fn the_first_launch_of_each_build_primes_the_identities_once() {
-        let scratch = aterm_tempfile::tempdir().expect("scratch");
-        let (home, root, claude) = after_an_update(scratch.path());
-        let older = std::fs::read_to_string(&claude).expect("the older block");
-        let current = aterm_primer::primer_block(Some("claude"));
-        let marker = scratch.path().join("state/agents-primed-build");
-        let launch = |build: &str, enabled: bool| {
-            crate::test_env::scoped_unset("XDG_CONFIG_HOME", || {
-                agent_prime_pass(
-                    PrimeCue::Launch,
-                    || true,
-                    || run_agent_prime(enabled, false, Some(home.clone())),
-                    || {
-                        let _ = prime_identities_once_per_build(Some(&marker), build, || {
-                            crate::agent_identity::reprime_roster_in(&root)
-                        });
-                    },
-                )
-            })
-        };
-        let read = |path: &Path| std::fs::read_to_string(path).unwrap();
-
-        assert_eq!(launch("100", false), Some(AgentPrimeOutcome::Disabled));
-        assert_eq!(read(&claude), older, "off: no identity");
-        assert!(!marker.exists(), "off: nothing recorded");
-
-        assert!(matches!(
-            launch("100", true),
-            Some(AgentPrimeOutcome::Ran(_))
-        ));
-        assert_eq!(read(&claude), current, "the build's first launch");
-        assert_eq!(read(&marker), "100\n");
-
-        std::fs::write(&claude, &older).unwrap();
-        std::fs::remove_file(home.join(".codex/AGENTS.md")).unwrap();
-        assert!(matches!(
-            launch("100", true),
-            Some(AgentPrimeOutcome::Ran(_))
-        ));
-        assert!(
-            home.join(".codex/AGENTS.md").is_file(),
-            "a later launch still primes the human's agents"
-        );
-        assert_eq!(read(&claude), older, "and no identity");
-
-        let _ = launch("101", true);
-        assert_eq!(read(&claude), current, "the next build's first launch");
-        assert_eq!(read(&marker), "101\n");
-
-        let broken = root.join("broken/.claude/CLAUDE.md");
-        std::fs::create_dir_all(broken.parent().expect("the agent dir")).unwrap();
-        std::fs::write(&broken, "<!-- aterm primer v1 -->\nno end marker\n").unwrap();
-        std::fs::write(&claude, &older).unwrap();
-        let _ = launch("102", true);
-        assert_eq!(read(&claude), current, "a failed identity stops no other");
-        assert_eq!(
-            read(&marker),
-            "101\n",
-            "a failed row: the build is not recorded"
-        );
-        std::fs::remove_file(&broken).unwrap();
-        std::fs::write(&claude, &older).unwrap();
-        let _ = launch("102", true);
-        assert_eq!(
-            read(&claude),
-            current,
-            "the next launch tries the roster again"
-        );
-        assert_eq!(read(&broken), current);
-        assert_eq!(
-            read(&marker),
-            "102\n",
-            "and records the build once it is whole"
-        );
-
-        std::fs::write(&claude, &older).unwrap();
-        assert!(prime_identities_once_per_build(None, "102", || {
-            crate::agent_identity::reprime_roster_in(&root)
-        }));
-        assert_eq!(read(&claude), current, "no marker: primed at every launch");
     }
 
     /// A headless instance never primes, and neither does a unit test; a
@@ -10177,9 +9867,6 @@ impl crate::App {
             term: session.term.clone(),
             master: session.master,
             ctx: session.ctx.clone(),
-            // The identity label rides the handle (a field, not a side table):
-            // every roster reads handles, and the next handoff record projects it.
-            identity: session.identity.as_deref().map(Arc::from),
         };
         crate::fabric::register_on_log(&session.ctx, || {
             let mut registry = store.write().unwrap_or_else(|p| p.into_inner());
@@ -13610,6 +13297,36 @@ mod kitty_transfer_tests {
         Scratch(dir)
     }
 
+    /// A fresh directory outside every temporary one [`kitty_temp_dirs`] names, and its
+    /// resolved path: in the build's target directory, else (unix) `/var/tmp`.
+    fn outside_temp_dirs(tag: &str) -> (aterm_tempfile::TempDir, std::path::PathBuf) {
+        let temps = kitty_temp_dirs();
+        let target = std::env::current_exe()
+            .ok()
+            .and_then(|exe| Some(exe.parent()?.parent()?.to_path_buf()));
+        let var_tmp = cfg!(unix).then(|| std::path::PathBuf::from("/var/tmp"));
+        for parent in [target, var_tmp].into_iter().flatten() {
+            let Ok(resolved) = std::fs::canonicalize(&parent) else {
+                continue;
+            };
+            if temps.iter().any(|temp| resolved.starts_with(temp)) {
+                continue;
+            }
+            let Ok(dir) = aterm_tempfile::Builder::new()
+                .prefix(&format!("aterm-kft-{tag}-"))
+                .tempdir_in(&resolved)
+            else {
+                continue;
+            };
+            let canonical = std::fs::canonicalize(dir.path()).unwrap();
+            return (dir, canonical);
+        }
+        aterm_spec::host::could_not_run(format!(
+            "no writable directory outside the temporary ones ({temps:?}): neither the \
+             build's target directory nor /var/tmp"
+        ))
+    }
+
     /// A one-cell (10x20) RGBA image file at `dir/name`.
     fn cell_file(dir: &Path, name: &str) -> std::path::PathBuf {
         let path = dir.join(name);
@@ -13635,22 +13352,8 @@ mod kitty_transfer_tests {
         const MARKER: &str = "tty-graphics-protocol";
         let temp_scratch = scratch_in(&std::env::temp_dir(), "t");
         let temp = &temp_scratch.0;
-        // Outside every temporary directory: beside the test binary, in the
-        // build's target directory (kept off /tmp).
-        let exe = std::env::current_exe().unwrap();
-        let target = exe.parent().and_then(Path::parent).unwrap();
-        let outside_scratch = scratch_in(target, "kept");
-        let outside = &outside_scratch.0;
-        let canonical = std::fs::canonicalize(outside).unwrap();
-        // `/tmp` where the host has one (Windows has none).
-        let temp_dirs: Vec<_> = [std::path::PathBuf::from("/tmp"), std::env::temp_dir()]
-            .into_iter()
-            .filter_map(|dir| std::fs::canonicalize(dir).ok())
-            .collect();
-        assert!(
-            !temp_dirs.iter().any(|tmp| canonical.starts_with(tmp)),
-            "the target directory must not be a temporary directory"
-        );
+        let (_outside_scratch, canonical) = outside_temp_dirs("kept");
+        let outside = &canonical;
 
         // No marker, in a temporary directory: read and placed, as kitty reads
         // it, but kept.
@@ -13719,22 +13422,18 @@ mod kitty_transfer_tests {
     fn a_directory_swapped_after_the_judgement_moves_no_delete() {
         const MARKER: &str = "tty-graphics-protocol";
         let temp_scratch = scratch_in(&std::env::temp_dir(), "swap");
-        // Outside every temporary directory: the build's target directory, as
-        // in the test above.
-        let exe = std::env::current_exe().unwrap();
-        let target = exe.parent().and_then(Path::parent).unwrap();
-        let outside_scratch = scratch_in(target, "swap-kept");
+        let (_outside_scratch, outside) = outside_temp_dirs("swap-kept");
         let marked = temp_scratch.0.join(MARKER);
         std::fs::create_dir_all(&marked).unwrap();
         let sent = cell_file(&marked, "victim.rgba");
-        let victim = cell_file(&outside_scratch.0, "victim.rgba");
+        let victim = cell_file(&outside, "victim.rgba");
         let held = temp_scratch.0.join("held");
 
         let mut swapped = false;
         let read = read_kitty_file(&sent);
         consume_kitty_temp_file_with(&sent, || {
             std::fs::rename(&marked, &held).unwrap();
-            std::os::unix::fs::symlink(&outside_scratch.0, &marked).unwrap();
+            std::os::unix::fs::symlink(&outside, &marked).unwrap();
             swapped = true;
         });
 

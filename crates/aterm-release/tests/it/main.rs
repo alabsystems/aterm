@@ -140,6 +140,7 @@ mod resume;
 mod signconf;
 mod site_sync;
 mod snapshot_take;
+mod template;
 mod trust_facts_model;
 
 /// This process's `PATH` with git's exec-path first, as git itself puts it for its own

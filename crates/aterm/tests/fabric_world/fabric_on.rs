@@ -29,8 +29,6 @@ use std::process::{Child, Command, Output, Stdio};
 use aterm_link::ctl::Ctl;
 use aterm_link::fabric::kv;
 
-const BIN: &str = harness::ATERM;
-
 /// The scratch world. Short, under `/tmp`: the broker's socket path has to fit
 /// `sun_path`, and a per-user `$TMPDIR` does not.
 struct Scratch {
@@ -81,7 +79,7 @@ impl Scratch {
             .env("XDG_CONFIG_HOME", self.path("cfg"))
             .env("XDG_RUNTIME_DIR", self.path("run"))
             .env("ATERM_FABRIC_HOME", self.path("root"))
-            .env("ATERM_BIN", BIN)
+            .env("ATERM_BIN", harness::aterm())
             .stdin(Stdio::null());
         cmd
     }
@@ -249,6 +247,8 @@ impl Gui {
         prepare_gui_environment(&mut cmd);
         cmd.arg("--headless")
             .env("HOME", s.path("home"))
+            // The scratch's own, as every harness launch names it (`World`'s launch says why).
+            .env("TMPDIR", &s.dir)
             .env("XDG_RUNTIME_DIR", s.path("run"))
             .env("XDG_CONFIG_HOME", s.path("cfg"))
             .env("SHELL", "/bin/sh")
@@ -340,7 +340,7 @@ fn on_with_an_aterm_path_holding_a_space_runs_it_through_a_link() {
     let spaced_dir = s.dir.join("bin/aterm (dev).app");
     std::fs::create_dir_all(&spaced_dir).expect("a spaced dir");
     let spaced = spaced_dir.join("aterm");
-    std::os::unix::fs::symlink(BIN, &spaced).expect("link aterm under a spaced path");
+    std::os::unix::fs::symlink(harness::aterm(), &spaced).expect("link aterm under a spaced path");
     let spaced = spaced.to_string_lossy().into_owned();
     let gui = Gui::boot(&s);
     let session = gui.boot_session();
@@ -455,6 +455,7 @@ fn on_with_an_aterm_path_holding_a_space_runs_it_through_a_link() {
 /// need no flags; `off` removes what changes behaviour and keeps the identity.
 #[test]
 fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
+    let bin = harness::aterm();
     let s = Scratch::new("on");
     let gui = Gui::boot(&s);
     let sid = gui.boot_session();
@@ -486,7 +487,7 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     }
     assert!(
         step(&out, "broker").iter().any(|l| l.contains(&format!(
-            "{BIN} link broker {} {} --secret-file {}",
+            "{bin} link broker {} {} --secret-file {}",
             s.sock(),
             s.path("root/bus.log"),
             s.path("root/mint.secret")
@@ -559,7 +560,7 @@ fn on_provisions_arms_proves_and_a_second_on_changes_nothing() {
     assert_eq!(
         command,
         aterm_types::fabric_command::split_line(&format!(
-            "{BIN} link serve --fleet local --broker {} --cap-file {} --state {} --accept-from {node}",
+            "{bin} link serve --fleet local --broker {} --cap-file {} --state {} --accept-from {node}",
             s.sock(),
             s.path("root/node.cap"),
             s.path("root/link-state")
@@ -994,6 +995,7 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
 /// launchd's own pid, and `off` boots the job out.
 #[test]
 fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
+    let bin = harness::aterm();
     let s = Scratch::new("launchd");
     let calls = s.path("launchctl.calls");
     let pidfile = s.path("launchd.pid");
@@ -1020,7 +1022,7 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
                  [ -f \"$d/no-gui\" ] && exit 125\n\
                  basename \"$3\" .plist > \"$d/launchd.label\"\n\
                  rm -f \"$d/root/bus.sock\"\n\
-                 nohup '{BIN}' link broker \"$d/root/bus.sock\" \"$d/root/bus.log\" --secret-file \"$d/root/mint.secret\" >/dev/null 2>&1 &\n\
+                 nohup '{bin}' link broker \"$d/root/bus.sock\" \"$d/root/bus.log\" --secret-file \"$d/root/mint.secret\" >/dev/null 2>&1 &\n\
                  printf '%s' \"$!\" > \"$d/launchd.pid\"\n\
                  exit 0 ;;\n\
                bootout)\n\
@@ -1253,7 +1255,7 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     // GUARDED by the root's secret.
     assert!(
         text.contains(&format!(
-            "<string>{BIN}</string>\n    <string>link</string>\n    <string>broker</string>\n    <string>{sock}</string>\n    \
+            "<string>{bin}</string>\n    <string>link</string>\n    <string>broker</string>\n    <string>{sock}</string>\n    \
              <string>{root}/bus.log</string>\n    <string>--secret-file</string>\n    \
              <string>{root}/mint.secret</string>",
             sock = s.sock()
@@ -1367,6 +1369,7 @@ fn a_usage_error_is_refused_before_anything_is_written() {
 /// node and its cap untouched and mint no secret of its own.
 #[test]
 fn role_identity_unreadable_state_never_writes() {
+    let bin = harness::aterm();
     let mut outcomes = Vec::new();
     for bad in [
         "config-toml",
@@ -1386,7 +1389,7 @@ fn role_identity_unreadable_state_never_writes() {
             "config-directory" => std::fs::create_dir(s.config()).unwrap(),
             "bridge-flags" => std::fs::write(
                 s.config(),
-                format!("[fabric]\ncommand = \"{BIN} link serve --fleet work --no-such-flag\"\n"),
+                format!("[fabric]\ncommand = \"{bin} link serve --fleet work --no-such-flag\"\n"),
             )
             .unwrap(),
             "rendezvous" => {
@@ -1531,6 +1534,7 @@ fn role_identity_conflicting_fleet_is_refused_before_writes() {
 /// nothing written — metadata `on` cannot read is never taken for a fresh root.
 #[test]
 fn a_bare_on_runs_the_unix_broker_and_refuses_a_job_it_cannot_read() {
+    let bin = harness::aterm();
     let s = Scratch::new("role");
     let root = s.path("root");
     let label = format!(
@@ -1556,7 +1560,7 @@ fn a_bare_on_runs_the_unix_broker_and_refuses_a_job_it_cannot_read() {
     let log = s.path("root/bus.log");
     // ---- the control: a Unix job, and the bare `on` runs the Unix broker
     job(&[
-        BIN,
+        bin,
         "link",
         "broker",
         &s.sock(),
@@ -1566,13 +1570,13 @@ fn a_bare_on_runs_the_unix_broker_and_refuses_a_job_it_cannot_read() {
     ]);
     let (code, out, err) = s.fabric(&["on", "--service", "none", "--dry-run"]);
     assert_eq!(code, 1, "no broker answers:\n{out}{err}");
-    let unix = format!("{BIN} link broker {} {log}", s.sock());
+    let unix = format!("{bin} link broker {} {log}", s.sock());
     assert!(
         step(&out, "broker").iter().any(|l| l.contains(&unix)) && !out.contains("--tcp"),
         "{out}"
     );
     // ---- a job that names no broker command: refused, nothing written
-    job(&[BIN, "link", "serve", "--fleet", "local"]);
+    job(&[bin, "link", "serve", "--fleet", "local"]);
     let (code, out, err) = s.fabric(&["on", "--service", "none"]);
     assert_eq!(code, 2, "a job naming no broker ran `on`:\n{out}{err}");
     assert!(
@@ -1610,6 +1614,7 @@ fn a_bare_on_runs_the_unix_broker_and_refuses_a_job_it_cannot_read() {
 /// print.
 #[test]
 fn a_bare_on_keeps_the_tier_and_only_a_named_one_restarts_for_it() {
+    let bin = harness::aterm();
     let s = Scratch::new("tier");
     let root = s.path("root");
     let label = format!(
@@ -1620,7 +1625,7 @@ fn a_bare_on_keeps_the_tier_and_only_a_named_one_restarts_for_it() {
     let secret = s.path("root/mint.secret");
     let log = s.path("root/bus.log");
     let words: String = [
-        BIN,
+        bin,
         "link",
         "broker",
         &s.sock(),
@@ -1642,7 +1647,7 @@ fn a_bare_on_keeps_the_tier_and_only_a_named_one_restarts_for_it() {
     )
     .expect("plist");
     let relaxed_argv = format!(
-        "{BIN} link broker {} {log} --secret-file {secret} --durability relaxed",
+        "{bin} link broker {} {log} --secret-file {secret} --durability relaxed",
         s.sock()
     );
     let (code, out, err) = s.fabric(&["on", "--service", "none", "--dry-run"]);
@@ -1670,7 +1675,7 @@ fn a_bare_on_keeps_the_tier_and_only_a_named_one_restarts_for_it() {
     assert_eq!(code, 1, "no broker answers:\n{out}{err}");
     assert!(
         step(&out, "broker").iter().any(|l| l.contains(&format!(
-            "{BIN} link broker {} {log} --secret-file {secret} --durability strict",
+            "{bin} link broker {} {log} --secret-file {secret} --durability strict",
             s.sock()
         ))),
         "a named strict is WRITTEN, so a later build whose default differs keeps it:\n{out}"

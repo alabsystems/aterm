@@ -633,6 +633,16 @@ fn footer_tick_in_a_hesitated_keys_window(
     before_i: BeforeI,
     scroll_before_i: ScrollBeforeI,
 ) -> FooterTick {
+    status_tick_in_a_hesitated_keys_window(before_i, scroll_before_i, 12)
+}
+
+/// [`footer_tick_in_a_hesitated_keys_window`] with the ticking status row on
+/// `status` (row 12 below the composer, the footer; row 8 above it, a spinner).
+fn status_tick_in_a_hesitated_keys_window(
+    before_i: BeforeI,
+    scroll_before_i: ScrollBeforeI,
+    status: u16,
+) -> FooterTick {
     let g = Geom {
         rows: 24,
         cols: 60,
@@ -646,7 +656,7 @@ fn footer_tick_in_a_hesitated_keys_window(
     let mut glow = CursorGlow::default();
     let mut out = Vec::new();
     let mut composer: u16 = 10;
-    let mut footer: u16 = 12;
+    let mut footer: u16 = status;
     let mut seq = 0u64;
     let mut frame =
         |glow: &mut CursorGlow, print: Option<(u16, u16, char)>, caret: (u16, u16), ms: u64| {
@@ -751,6 +761,22 @@ fn a_status_tick_below_the_caret_forgets_no_press_while_the_hand_types() {
     assert_eq!(
         m.forgotten, 1,
         "after a different-class press, a refused run below the caret is the minibuffer's echo"
+    );
+}
+
+/// A status row above the caret (Claude Code's spinner) is never the keys'
+/// echo ([`CursorGlow::refused_below_the_caret`]): its tick in a hesitated
+/// key's window is refused `program-row` and forgets nothing, even with the
+/// hand off the caret's row, where the same tick below the caret is the
+/// minibuffer's echo and forgets the press (the control of
+/// [`a_status_tick_below_the_caret_forgets_no_press_while_the_hand_types`]).
+#[test]
+fn a_status_tick_above_the_caret_forgets_no_press_with_the_hand_off_its_row() {
+    let m = status_tick_in_a_hesitated_keys_window(BeforeI::CtrlR, ScrollBeforeI::None, 8);
+    assert_eq!(
+        (m.verdict, m.forgotten),
+        (Some(CursorGlow::DECLINE_PROGRAM_ROW), 0),
+        "(the spinner's verdict, forgotten presses)"
     );
 }
 
@@ -884,7 +910,8 @@ fn the_first_key_after_a_submit_into_a_program_s_composer_is_guarded() {
 /// A press the hand's-row hold kept ([`PressCredits::held_through`]) pays only for a move on the
 /// hand's row. In Emacs `C-u 8` echoes `C-u 8-` below the caret, refused `program-row` without
 /// forgetting the press; the caret's keyless fold to the next row 600 ms later then finds no
-/// credit and is refused.
+/// credit and is refused. The hold keeps every press banked through its frame: `8` stamped 3 ms
+/// before the echo area's frame or in that frame's own instant.
 #[test]
 fn a_press_the_hold_kept_pays_for_no_hop_off_the_hand_s_row() {
     let g = Geom {
@@ -895,56 +922,59 @@ fn a_press_the_hold_kept_pays_for_no_hop_off_the_hand_s_row() {
         ..geom()
     };
     let c = cfg(GlowStyle::RainbowKitty, true);
-    let t0 = Instant::now();
-    let at = |ms: u64| t0 + Duration::from_millis(ms);
-    let mut glow = CursorGlow::default();
-    let mut out = Vec::new();
-    const BUFFER: u16 = 10;
-    const ECHO_AREA: u16 = 23;
-    let mut seq = 0u64;
-    let mut frame =
-        |glow: &mut CursorGlow, print: Option<(u16, u16, char)>, caret: (u16, u16), ms: u64| {
-            if let Some((row, end, glyph)) = print {
-                seq += 1;
-                glow.observe_print_anchor_glyph(Some((row, end, seq)), Some(glyph));
-            }
-            glow.observe_caret_drawn(true);
-            glow.tick(Some(caret), at(ms), &c, g, &mut out);
-        };
-    frame(&mut glow, Some((BUFFER, 58, ' ')), (BUFFER, 58), 0);
-    // `a` typed at the caret, to the row's last column: the hand is on its row.
-    glow.note_typed_expected(at(1000), 1, false, rk::TypedClass::Glyph, 'a');
-    frame(&mut glow, Some((BUFFER, 59, 'a')), (BUFFER, 59), 1012);
-    // C-u, as the host sends it (a kill: the line-editing close, then the
-    // kill class); after `echo-keystrokes` Emacs prints `C-u-`.
-    glow.clear_typed_keeping_hand(at(1100));
-    glow.note_kill(at(1100), true);
-    frame(&mut glow, Some((ECHO_AREA, 4, '-')), (BUFFER, 59), 2100);
-    // `8`, and the echo area's `C-u 8-` 3 ms later.
-    glow.note_typed_expected(at(2500), 1, false, rk::TypedClass::Glyph, '8');
-    frame(&mut glow, Some((ECHO_AREA, 6, '-')), (BUFFER, 59), 2503);
-    let verdict = glow
-        .admission_log()
-        .find(|r| r.origin == (ECHO_AREA, 4) && r.target == (ECHO_AREA, 6))
-        .map(|r| r.reason);
-    for ms in (2519..=3000).step_by(16) {
-        frame(&mut glow, None, (BUFFER, 59), ms);
+    for key_ms in [2500u64, 2503] {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        const BUFFER: u16 = 10;
+        const ECHO_AREA: u16 = 23;
+        let mut seq = 0u64;
+        let mut frame =
+            |glow: &mut CursorGlow, print: Option<(u16, u16, char)>, caret: (u16, u16), ms: u64| {
+                if let Some((row, end, glyph)) = print {
+                    seq += 1;
+                    glow.observe_print_anchor_glyph(Some((row, end, seq)), Some(glyph));
+                }
+                glow.observe_caret_drawn(true);
+                glow.tick(Some(caret), at(ms), &c, g, &mut out);
+            };
+        frame(&mut glow, Some((BUFFER, 58, ' ')), (BUFFER, 58), 0);
+        // `a` typed at the caret, to the row's last column: the hand is on its row.
+        glow.note_typed_expected(at(1000), 1, false, rk::TypedClass::Glyph, 'a');
+        frame(&mut glow, Some((BUFFER, 59, 'a')), (BUFFER, 59), 1012);
+        // C-u, as the host sends it (a kill: the line-editing close, then the
+        // kill class); after `echo-keystrokes` Emacs prints `C-u-`.
+        glow.clear_typed_keeping_hand(at(1100));
+        glow.note_kill(at(1100), true);
+        frame(&mut glow, Some((ECHO_AREA, 4, '-')), (BUFFER, 59), 2100);
+        // `8`, and the echo area's `C-u 8-` at 2503 ms.
+        glow.note_typed_expected(at(key_ms), 1, false, rk::TypedClass::Glyph, '8');
+        frame(&mut glow, Some((ECHO_AREA, 6, '-')), (BUFFER, 59), 2503);
+        let verdict = glow
+            .admission_log()
+            .find(|r| r.origin == (ECHO_AREA, 4) && r.target == (ECHO_AREA, 6))
+            .map(|r| r.reason);
+        for ms in (2519..=3000).step_by(16) {
+            frame(&mut glow, None, (BUFFER, 59), ms);
+        }
+        // A keyless fold of the caret off the hand's row, no key behind it.
+        frame(&mut glow, None, (BUFFER + 1, 0), 3100);
+        let hop = glow
+            .admission_log()
+            .find(|r| r.origin == (BUFFER, 59) && r.target == (BUFFER + 1, 0))
+            .map(|r| r.reason);
+        assert_eq!(
+            (verdict, hop, v2_cols(&glow, BUFFER).contains(&59)),
+            (
+                Some(CursorGlow::DECLINE_PROGRAM_ROW),
+                Some(CursorGlow::DECLINE_NO_FRESH_HINT),
+                false
+            ),
+            "`8` at {key_ms} ms: (the echo area's verdict, the fold's verdict, \
+             ink laid by the fold)"
+        );
     }
-    // A keyless fold of the caret off the hand's row, no key behind it.
-    frame(&mut glow, None, (BUFFER + 1, 0), 3100);
-    let hop = glow
-        .admission_log()
-        .find(|r| r.origin == (BUFFER, 59) && r.target == (BUFFER + 1, 0))
-        .map(|r| r.reason);
-    assert_eq!(
-        (verdict, hop, v2_cols(&glow, BUFFER).contains(&59)),
-        (
-            Some(CursorGlow::DECLINE_PROGRAM_ROW),
-            Some(CursorGlow::DECLINE_NO_FRESH_HINT),
-            false
-        ),
-        "(the echo area's verdict, the fold's verdict, ink laid by the fold)"
-    );
 }
 
 /// A press the hand's-row hold kept is paid by its own late echo on the hand's

@@ -94,6 +94,7 @@ pub struct ProgramClaim {
 impl ProgramClaim {
     /// `session`'s raw program claim from its current shell block, re-derived only
     /// when the key moves.
+    #[inline]
     pub fn resolve(&mut self, session: u64, block: Option<&OutputBlock>) -> Option<&AppIdentity> {
         let key = block.map(|b| (session, b.id, b.state, b.commandline.is_some()));
         if key != self.key {
@@ -169,12 +170,14 @@ impl KittyTenure {
     }
 
     /// The claim on glass (`None` = the base cat), without advancing the gate.
+    #[inline]
     pub fn worn(&self) -> Option<&AppIdentity> {
         self.worn.as_ref()
     }
 
     /// When the pending candidate earns its tenure, for the host's wake deadline;
     /// `None` while nothing is pending, so the gate never pins the event loop.
+    #[inline]
     pub fn deadline(&self) -> Option<Instant> {
         self.candidate
             .as_ref()
@@ -249,6 +252,7 @@ impl KittyTenure {
 
     /// `Ceremony` if no hello was performed yet or the last was at least
     /// [`HELLO_FLOOR`] ago; else `Quiet`, with the debt kept.
+    #[inline]
     fn floor(&self, now: Instant) -> PetArrival {
         if self
             .last_hello
@@ -261,6 +265,7 @@ impl KittyTenure {
     }
 
     /// How loudly the most recent landing arrived; read, never advanced.
+    #[inline]
     pub fn arrival(&self) -> PetArrival {
         self.arrival
     }
@@ -269,6 +274,7 @@ impl KittyTenure {
     /// (`companion_verdict` also runs for unfocused windows). Marks the worn id
     /// `greeted`, stamps `last_hello` and resets the latch, so a pair the
     /// flying-kitty latch re-delivers cannot replay the ceremony.
+    #[inline]
     pub fn commit_hello(&mut self, now: Instant) {
         if let Some(id) = self.worn.as_ref()
             && let Some(h) = self.roster.iter_mut().flatten().find(|h| h.id == id.id)
@@ -282,6 +288,7 @@ impl KittyTenure {
     /// Reset the arrival latch when a non-program rung wins. Unpinning a favourite
     /// can reveal an already-worn program cat, which must not then perform a
     /// ceremony authorised minutes ago. The roster and `last_hello` are kept.
+    #[inline]
     pub fn note_non_program_verdict(&mut self) {
         self.arrival = PetArrival::Quiet;
     }
@@ -313,6 +320,7 @@ fn insert_lru(roster: &mut [Option<Homecoming>; HOMECOMING_SLOTS], id: &str, now
 
 /// The dwell a candidate claim must hold before it lands: a program arrives
 /// after [`TENURE`]; falling back to the base cat waits [`RELEASE`].
+#[inline]
 fn dwell_for(candidate: Option<&AppIdentity>) -> Duration {
     if candidate.is_some() { TENURE } else { RELEASE }
 }
@@ -325,6 +333,7 @@ fn dwell_for(candidate: Option<&AppIdentity>) -> Duration {
 /// A pinned favourite is the user's choice (and how a liked launch kitty is kept
 /// across launches); `app` is the claim after [`KittyTenure`], never the raw block
 /// state. Returns the winning look and its [`CompanionRung`].
+#[inline]
 #[must_use]
 pub fn companion_precedence(
     favourite: Option<KittyLook>,
@@ -362,6 +371,7 @@ impl Default for LookPolicy {
 impl LookPolicy {
     /// The focused pane's raw program claim, read off `block` (the pane's
     /// current block, else its last) under the host's terminal lock.
+    #[inline]
     pub fn claim(&mut self, session: u64, block: Option<&OutputBlock>) -> Option<AppIdentity> {
         self.claim.resolve(session, block).cloned()
     }
@@ -370,6 +380,7 @@ impl LookPolicy {
     /// gate, then [`companion_precedence`]. Records the winning rung; a non-program
     /// win resets the gate's arrival latch. Idempotent for a stable claim at a
     /// stable time, so a re-resolve in the same frame lands nothing new.
+    #[inline]
     pub fn verdict(
         &mut self,
         raw: Option<&AppIdentity>,
@@ -387,18 +398,21 @@ impl LookPolicy {
     }
 
     /// Which rung won the most recent verdict (`Launch` before any).
+    #[inline]
     #[must_use]
     pub fn rung(&self) -> CompanionRung {
         self.rung
     }
 
     /// The tenure gate, for its readers.
+    #[inline]
     #[must_use]
     pub fn tenure(&self) -> &KittyTenure {
         &self.tenure
     }
 
     /// The tenure gate, for [`KittyTenure::poll`] and [`KittyTenure::commit_hello`].
+    #[inline]
     pub fn tenure_mut(&mut self) -> &mut KittyTenure {
         &mut self.tenure
     }

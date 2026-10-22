@@ -96,6 +96,7 @@ fn note_open_attempt(path: &Path) {
 /// placing a hard bound on both file I/O and parser input.
 pub const MAX_SPARKLE_LEXICON_BYTES: usize = 256 * 1024;
 
+#[inline]
 fn limit_plus_sentinel(max_bytes: usize) -> io::Result<usize> {
     max_bytes.checked_add(1).ok_or_else(|| {
         io::Error::new(
@@ -182,6 +183,7 @@ fn open_regular(path: &Path) -> io::Result<(std::fs::File, u64)> {
     Ok((file, metadata.len()))
 }
 
+#[inline]
 fn check_observed_size(observed_len: u64, max_bytes: usize) -> io::Result<usize> {
     if observed_len > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
         return Err(too_large(max_bytes));
@@ -226,6 +228,7 @@ pub fn read_bounded_regular_utf8(path: &Path, max_bytes: usize) -> io::Result<St
 
 /// Delimit and fold the byte count so the result is a content fingerprint,
 /// not merely the raw streaming hasher state.
+#[inline]
 fn seal_fingerprint(mut hash: Fnv1a64, len: u64) -> u64 {
     hash.write_u8(0xff);
     hash.write(&len.to_le_bytes());
@@ -236,6 +239,7 @@ fn seal_fingerprint(mut hash: Fnv1a64, len: u64) -> u64 {
 /// [`read_bounded_regular_utf8`]. This is the in-memory twin of
 /// [`fingerprint_bounded_regular_utf8`]: hosts can parse and identify the exact
 /// same-handle bytes without reopening a pathname and introducing an ABA race.
+#[inline]
 #[must_use]
 pub fn fingerprint_admitted_utf8(contents: &str) -> u64 {
     let mut hash = Fnv1a64::new();

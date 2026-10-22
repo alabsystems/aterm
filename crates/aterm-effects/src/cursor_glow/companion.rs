@@ -49,6 +49,7 @@ impl CursorGlow {
     /// The erase-momentum mirror of [`Self::typing_momentum`] at `now`: how
     /// hard a delete run is going, on the same law. Drives the poof's energy
     /// (`erase_poof_drive`).
+    #[inline]
     #[must_use]
     pub fn erase_momentum(&self, now: Instant) -> f32 {
         self.erase_mom.value(now)
@@ -57,6 +58,7 @@ impl CursorGlow {
     /// The canonical typing-momentum metric at `now` ([`crate::typing_momentum`])
     /// every Rainbow Kitty "earned drama" consumer keys off; the same metric as
     /// [`crate::kitty_cursor::CursorCat::momentum`].
+    #[inline]
     #[must_use]
     pub fn typing_momentum(&self, now: Instant) -> f32 {
         self.momentum.value(now)
@@ -79,6 +81,7 @@ impl CursorGlow {
     /// Unlike `Self::take_momentum_pulse`, this preserves the authenticated
     /// forward/reverse fold shape so the placement layer never infers a wrap
     /// from an arbitrary large cursor relocation.
+    #[inline]
     #[must_use]
     pub fn take_cursor_cat_motion_pulse(&mut self) -> Option<CursorCatMotionPulse> {
         self.momentum_pulse.take()
@@ -90,6 +93,7 @@ impl CursorGlow {
     /// earned `Delight`). Whichever body owns the frame consumes it
     /// ([`rk::companion`]). `None` whenever v2 is not engaged; the stride
     /// pulse still comes from [`Self::take_cursor_cat_motion_pulse`].
+    #[inline]
     #[must_use]
     pub fn take_companion_impulse(&mut self) -> Option<CompanionImpulse> {
         if self.v2.engaged() {
@@ -104,6 +108,7 @@ impl CursorGlow {
     /// [`crate::kitty_pet::PetBrain::note_v2_offer`]. A pure read; call it
     /// before [`Self::take_companion_impulse`] drains the frame's impulse,
     /// where the perk edge lives. `PetOffer::default()` unless v2 is engaged.
+    #[inline]
     #[must_use]
     pub fn pet_offer(
         &self,
@@ -122,12 +127,14 @@ impl CursorGlow {
     /// [`crate::kitty_pet::PetBrain::note_v2_offer`] handed back and `at` the
     /// paw's landing instant. Returns whether the star was still there; inert,
     /// and `false`, unless v2 is engaged. Nothing is drawn.
+    #[inline]
     pub fn catch_star(&mut self, star: rk::companion::StarCatch, at: Instant) -> bool {
         self.v2.engaged() && self.v2.catch_star(star, at)
     }
 
     /// The kitty's Delight edge (§5.8, §7.2): mints [`CompanionImpulse::Delight`]
     /// and buffers the earned m1 hero at `(row, col)` for the next engaged tick.
+    #[inline]
     pub fn earn_hero(&mut self, now: Instant, row: u16, col: u16) {
         if self.v2.engaged() {
             self.unsettle();
@@ -140,6 +147,7 @@ impl CursorGlow {
     /// dedupes. Not an [`rk::Event`]; inert unless v2 is engaged, and mints
     /// no light: it only prices the next key typed
     /// ([`rk::spine::Spine::note_verdict`]).
+    #[inline]
     pub fn note_command_verdict(&mut self, now: Instant) {
         if self.v2.engaged() {
             self.v2.note_verdict(now);
@@ -151,6 +159,7 @@ impl CursorGlow {
     /// not engaged. The host copies it into
     /// [`crate::cursor_rainbow::RainbowConfig::flare_at`]; v2 does not own
     /// the block fill.
+    #[inline]
     #[must_use]
     pub fn caret_flare_at(&self) -> Option<Instant> {
         if self.v2.engaged() {
@@ -163,6 +172,7 @@ impl CursorGlow {
     /// The caret's paint at `now` for `RainbowConfig::paint` (§7.1): under v2
     /// the display spine floored by the landing re-light
     /// ([`rk::Engine::caret_paint`]); `0.0` when v2 is not engaged.
+    #[inline]
     #[must_use]
     pub fn caret_paint(&self, now: Instant) -> f32 {
         if self.v2.engaged() {
@@ -178,6 +188,7 @@ impl CursorGlow {
     /// [`crate::kitty_pet::PetBrain::note_flow`]. An edge over the engine's
     /// counter with one `bool` of memo: a run that opens, breaks and opens
     /// again is two entries. It requests no frame and spawns nothing.
+    #[inline]
     pub fn take_flow_entry(&mut self) -> bool {
         let open = self.flow_status().open();
         let entered = open && !self.flow_open;
@@ -212,6 +223,7 @@ impl CursorGlow {
     /// stars thrown ROYGBIV from the caret, the shockwave `ring` on every
     /// fourth bar) or the armed celebration's drop fan. Reaches v2 only;
     /// every other style is unaffected.
+    #[inline]
     pub fn party(&mut self, now: Instant, n: u8, ring: bool) {
         if self.v2.engaged() {
             self.v2.party(now, n, ring);

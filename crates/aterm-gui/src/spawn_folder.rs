@@ -209,9 +209,7 @@ fn start_fault_in(
 /// that is not local whose look did not answer in time, could not start with
 /// the cap full, or sits beside another check that did not answer
 /// ([`beside_silent`]). For a reader that must not wait out a network
-/// volume's own timeout — the agent identities' folder, read on the spawner
-/// ahead of every later tab and on the event loop for the identity picker and
-/// a restore (`agent_identity`). A look that answered says nothing of the
+/// volume's own timeout, such as the state folder checked before a spawn. A look that answered says nothing of the
 /// next read: a volume that stops answering between the two still holds it.
 /// Off unix nothing is judged: `true`.
 pub(crate) fn volume_answers(dir: &Path) -> bool {
@@ -1534,7 +1532,7 @@ mod tests {
     }
 
     /// A VOLUME ANSWERS BY A LOOK IN TIME, AND A LOCAL ONE IS READ ANYWAY
-    /// (`volume_answers`, the agent identities' folder): a look that answers —
+    /// (`volume_answers`, the state folder): a look that answers —
     /// whatever it found — says a network volume answers; one that does not
     /// answer in time says it does not, and the same question again is
     /// answered at once, with no second look; a local volume is read with no

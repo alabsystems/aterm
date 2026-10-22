@@ -136,6 +136,7 @@ pub const RAINBOW_SPAN_DEG: f32 = 300.0;
 pub const RAINBOW_DRIFT_MS: u32 = 2500;
 
 /// The default rainbow ink spec.
+#[inline]
 #[must_use]
 pub fn rainbow_ink() -> InkSpec {
     InkSpec {
@@ -170,6 +171,7 @@ pub const MAX_TOY_WORD_BYTES: usize = 128;
 /// allocation. Hosts should use this before [`compile_toy_pack_toml`] so a
 /// FIFO/device cannot stall startup and an oversized file costs at most the
 /// compiler ceiling plus one sentinel byte.
+#[inline]
 pub fn read_toy_pack_file(path: &std::path::Path) -> std::io::Result<String> {
     crate::file_feed::read_bounded_regular_utf8(path, MAX_TOY_PACK_BYTES)
 }
@@ -211,6 +213,7 @@ pub struct SpecConsumerCapabilities {
 impl SpecTable {
     /// Whether any custom spec is registered: a term of the emphasis-class
     /// resolve gate (`enabled && (ink_enabled || has_custom_specs)`).
+    #[inline]
     #[must_use]
     pub fn has_custom(&self) -> bool {
         !self.specs.is_empty()
@@ -252,6 +255,7 @@ impl SpecTable {
 
     /// The per-word override for a scan match, if any; it wins over the class
     /// default whatever the match's class.
+    #[inline]
     #[must_use]
     pub fn override_for(&self, form_hash: u64) -> Option<&WordEffectSpec> {
         self.overrides
@@ -382,6 +386,7 @@ pub struct RawGraphic {
 }
 
 /// Parse a `#RRGGBB` / `RRGGBB` color into packed `0x00RRGGBB`.
+#[inline]
 fn parse_hex(s: &str) -> Option<u32> {
     let h = s.trim().trim_start_matches('#');
     if h.len() != 6 {
@@ -393,12 +398,14 @@ fn parse_hex(s: &str) -> Option<u32> {
 /// Whether a custom ink colorway is one of the two runtime-supported shapes.
 /// Two-tone is deliberately exact: a third comma-separated color is not an
 /// ignored extension but an invalid value that falls back to rainbow.
+#[inline]
 #[must_use]
 pub fn custom_colorway_is_valid(s: &str) -> bool {
     let s = s.trim();
     s == "rainbow" || parse_two_tone(s).is_some()
 }
 
+#[inline]
 fn parse_two_tone(s: &str) -> Option<(u32, u32)> {
     let rest = s.strip_prefix("twotone:")?;
     let mut colors = rest.split(',');
@@ -409,6 +416,7 @@ fn parse_two_tone(s: &str) -> Option<(u32, u32)> {
 
 /// Resolve a colorway string: `"rainbow"` (default) or
 /// `"twotone:#RRGGBB,#RRGGBB"`. Unknown values fall back to rainbow.
+#[inline]
 fn parse_colorway(s: &str) -> Colorway {
     let s = s.trim();
     if let Some((c0, c1)) = parse_two_tone(s) {

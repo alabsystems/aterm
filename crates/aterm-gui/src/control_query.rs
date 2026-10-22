@@ -1990,11 +1990,12 @@ pub(crate) fn cmd_messages(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// `notice <post|progress|done|ask|dismiss|act> …` -> one status line: the message
+/// `notice <post|progress|done|ask|later|dismiss|act> …` -> one status line: the message
 /// band's WRITE face (design §5.2, rulings 163-179). The outside world's voice under
 /// the attention rule — an info/success `post` is a record (ruling 163), a warn/error
 /// `post` a row, `progress` a script's animated work in flight on one row per key
-/// (`wire.<key>`, ruling 167), `done` its finish; `dismiss` and `act` do what a
+/// (`wire.<key>`, ruling 167), `done` its finish; `later` one keyed entry of the
+/// exceptions digest, never a row; `dismiss` and `act` do what a
 /// person's click would. Every usage, key, lane-tag and title-form refusal is
 /// answered HERE by the engine (`wire::NoticeRequest::parse`, ruling 177), so junk
 /// is never a wake; the caps, the mint budget, the paint pacing and every reply word

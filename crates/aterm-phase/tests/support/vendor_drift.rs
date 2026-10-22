@@ -85,7 +85,7 @@ pub(crate) fn contains(bytes: &[u8], needle: &str) -> bool {
 /// confirmation or every answer of the reset read as none of its own:
 /// refused, the wall's one attempt with it, or a spent reset recorded as
 /// failed.
-pub(crate) fn reset_templates() -> Vec<(&'static str, String)> {
+pub(crate) fn reset_templates() -> Vec<(&'static str, Vec<String>)> {
     use crate::reset::ResetKind;
     let escaped = |id: &str| anchor(id).replace('·', "\\xB7");
     let limit_name = |limit_type: &str| {
@@ -113,7 +113,7 @@ pub(crate) fn reset_templates() -> Vec<(&'static str, String)> {
         .join(";");
         format!("{cases}}}")
     };
-    vec![
+    let mut templates: Vec<(&'static str, Vec<String>)> = [
         (
             "grant row",
             format!(
@@ -217,26 +217,50 @@ pub(crate) fn reset_templates() -> Vec<(&'static str, String)> {
             ),
         ),
         (
-            "model limit names' strip",
-            ".replace(/ limit$/,\"\"));break;case\"seven_day_sonnet\":".to_string(),
-        ),
-        (
             "limits join",
             "if(m===void 0)return\"limits\";return d.length===0?`${m} limit`:`${d.join(\", \")} \
              and ${m} limits`}"
                 .to_string(),
         ),
     ]
+    .into_iter()
+    .map(|(name, text)| (name, vec![text]))
+    .collect();
+    // `Yn`'s strip of ` limit` off the model limits' names, in either of the
+    // bundle's spellings: 2.1.306 and older strip it at the call,
+    // `.replace(/ limit$/,"")`; 2.1.307 calls a suffix helper,
+    // `Iy(<name>," limit")`, whose body strips exactly that suffix. Each row
+    // holds in a build that holds one of its spellings: the call row by the
+    // strip at the call or the helper's argument there, the helper row by the
+    // strip at the call or the helper's body (the helper's name is the
+    // minifier's, so the two rows are not tied by it).
+    const REPLACE: &str = ".replace(/ limit$/,\"\")";
+    let call = |strip: &str| format!("{strip});break;case\"seven_day_sonnet\":");
+    templates.extend([
+        (
+            "model limit names' strip",
+            vec![call(REPLACE), call(",\" limit\")")],
+        ),
+        (
+            "model limit names' strip helper",
+            vec![
+                REPLACE.to_string(),
+                "{return t.endsWith(n)?t.slice(0,t.length-n.length):t}".to_string(),
+            ],
+        ),
+    ]);
+    templates
 }
 
-/// The names of the `templates` that `bytes` do not hold whole.
+/// The names of the `templates` that `bytes` hold whole in none of their
+/// spellings.
 pub(crate) fn missing_templates(
     bytes: &[u8],
-    templates: &[(&'static str, String)],
+    templates: &[(&'static str, Vec<String>)],
 ) -> Vec<&'static str> {
     templates
         .iter()
-        .filter(|(_, template)| !contains(bytes, template))
+        .filter(|(_, spellings)| !spellings.iter().any(|t| contains(bytes, t)))
         .map(|(name, _)| *name)
         .collect()
 }

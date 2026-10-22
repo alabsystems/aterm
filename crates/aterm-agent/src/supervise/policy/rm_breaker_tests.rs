@@ -1175,7 +1175,44 @@ impl Lanes {
         }
         None
     }
+
+    /// Each of `lines` in `shell`, its stdout and its stderr, in order, or
+    /// `None`, noted, where `shell` is not installed. One shell reads them
+    /// all, as [`in_shell_both`] runs a line, each line in a subshell of its
+    /// own (`( eval '…' )`): a copy of a shell that has run nothing, so what a
+    /// line assigns, and its errors, a parse error among them, end with it.
+    fn run_each(&mut self, shell: &'static str, lines: &[String]) -> Option<Vec<(String, String)>> {
+        let mut script = String::new();
+        for line in lines {
+            script.push_str("( eval '");
+            script.push_str(&line.replace('\'', "'\\''"));
+            script.push_str("' )\nprintf '\\036'; printf '\\036' >&2\n");
+        }
+        let (out, err) = self.run(shell, &script)?;
+        let split = |all: &str| -> Vec<String> {
+            let mut each: Vec<String> = all.split(LINE_END).map(str::to_string).collect();
+            assert_eq!(
+                each.pop().as_deref(),
+                Some(""),
+                "{shell}: past the last line: {all:?}"
+            );
+            each
+        };
+        let (outs, errs) = (split(&out), split(&err));
+        assert!(
+            outs.len() == lines.len() && errs.len() == lines.len(),
+            "{shell}: {} lines, {} outputs, {} error streams:\n{out}\n{err}",
+            lines.len(),
+            outs.len(),
+            errs.len()
+        );
+        Some(outs.into_iter().zip(errs).collect())
+    }
 }
+
+/// What [`Lanes::run_each`] prints after each line, on both streams: an
+/// ASCII record separator, which no line prints.
+const LINE_END: char = '\u{1e}';
 
 impl Drop for Lanes {
     fn drop(&mut self) {
@@ -1267,19 +1304,23 @@ fn a_command_that_can_assign_what_it_names_is_no_plain_consumer() {
     // option's name or arithmetic, leaves `S` as it was. External members
     // cannot touch the shell's variables; they are not run.
     let mut lanes = Lanes::default();
+    let (mut zsh, mut bash) = (Vec::new(), Vec::new());
     for member in PLAIN_CONSUMERS {
-        let zsh = format!(
+        zsh.push(format!(
             "S=/x/y; if [[ $(whence -w -- '{member}') == *': builtin' ]]; then \
              '{member}' S -v S -A S S=5 -t 'a[S=5]' >/dev/null 2>&1; fi; print -r -- \"$S\""
-        );
-        let bash = format!(
+        ));
+        bash.push(format!(
             "S=/x/y; if [ \"$(type -t -- '{member}')\" = builtin ]; then \
              '{member}' S -v S -A S S=5 -t 'a[S=5]' >/dev/null 2>&1; fi; echo \"$S\""
-        );
-        for (sh, line) in [("/bin/zsh", zsh), ("/bin/bash", bash)] {
-            if let Some((out, _)) = lanes.run(sh, &line) {
-                assert_eq!(out.trim(), "/x/y", "{sh}: {member}");
-            }
+        ));
+    }
+    for (sh, lines) in [("/bin/zsh", zsh), ("/bin/bash", bash)] {
+        let Some(read) = lanes.run_each(sh, &lines) else {
+            continue;
+        };
+        for (member, (out, _)) in PLAIN_CONSUMERS.iter().zip(read) {
+            assert_eq!(out.trim(), "/x/y", "{sh}: {member}");
         }
     }
 }
@@ -1871,18 +1912,24 @@ fn a_quoted_test_operand_names_nothing() {
         "test \"$x\" = \"$y\"",
         "[ -n \"$1\" ]",
     ];
-    let mut lanes = Lanes::default();
+    let mut lines = Vec::new();
     for x in values {
         for y in [values[0], x] {
             for form in forms {
-                let line = format!("S=/x/y; x='{x}'; y='{y}'; set -- '{x}'; {form}; echo \"$S\"");
-                for sh in ["/bin/zsh", "/bin/bash"] {
-                    if let Some((out, err)) = lanes.run(sh, &line) {
-                        assert_eq!(out.trim(), "/x/y", "{sh}: {line}");
-                        assert!(!err.contains("RAN_42"), "{sh}: {line}");
-                    }
-                }
+                lines.push(format!(
+                    "S=/x/y; x='{x}'; y='{y}'; set -- '{x}'; {form}; echo \"$S\""
+                ));
             }
+        }
+    }
+    let mut lanes = Lanes::default();
+    for sh in ["/bin/zsh", "/bin/bash"] {
+        let Some(read) = lanes.run_each(sh, &lines) else {
+            continue;
+        };
+        for (line, (out, err)) in lines.iter().zip(read) {
+            assert_eq!(out.trim(), "/x/y", "{sh}: {line}");
+            assert!(!err.contains("RAN_42"), "{sh}: {line}");
         }
     }
 }

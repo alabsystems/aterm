@@ -250,6 +250,7 @@ impl MotionPolicy {
     /// * `system_reduce`: the live OS Reduce Motion flag,
     /// * `focused`: an unfocused window always demotes to static effects,
     ///   whatever the config.
+    #[inline]
     #[must_use]
     pub fn resolve(mode: MotionMode, system_reduce: bool, focused: bool) -> Self {
         let animate = focused
@@ -265,6 +266,7 @@ impl MotionPolicy {
     /// `0.0` under [`Self::Reduced`]. The `Reduced` arm matches every effect
     /// explicitly, so a new variant needs a decision and the totality test
     /// rejects anything nonzero.
+    #[inline]
     #[must_use]
     pub fn amplitude(self, effect: MotionEffect) -> f32 {
         match self {
@@ -285,6 +287,7 @@ impl MotionPolicy {
 
     /// Whether `effect` may animate at all (`amplitude > 0`) — the boolean
     /// convenience for consumers that gate rather than scale.
+    #[inline]
     #[must_use]
     pub fn animate(self, effect: MotionEffect) -> bool {
         self.amplitude(effect) > 0.0

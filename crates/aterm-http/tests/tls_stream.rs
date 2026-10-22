@@ -309,3 +309,96 @@ fn authority_revoked_during_a_tls_read_stops_it() {
         "{error}"
     );
 }
+
+/// A TLS server that completes the handshake, waits for the first plaintext
+/// the client sends, answers `answer` and closes over everything else unread,
+/// so the client's later writes meet a reset. Unix only, as its one test is.
+#[cfg(unix)]
+fn answering_tls_server(answer: &'static [u8]) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .expect("default protocol versions")
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(CERT)],
+                PrivateKeyDer::try_from(KEY).expect("a PKCS#8 key"),
+            )
+            .expect("the loopback credentials pair"),
+    );
+    std::thread::spawn(move || {
+        let Ok((mut tcp, _)) = listener.accept() else {
+            return;
+        };
+        let _ = tcp.set_read_timeout(Some(HANG_DETECTOR));
+        // The answer leaves at once: under Nagle it would wait behind the
+        // session tickets' unacknowledged segment, and the close's reset
+        // would discard it unsent.
+        let _ = tcp.set_nodelay(true);
+        let Ok(mut conn) = rustls::ServerConnection::new(config) else {
+            return;
+        };
+        let mut first = [0u8; 1];
+        loop {
+            match conn.reader().read(&mut first) {
+                Ok(1) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                _ => return,
+            }
+            if conn.complete_io(&mut tcp).is_err() {
+                return;
+            }
+        }
+        if conn.writer().write_all(answer).is_err() {
+            return;
+        }
+        while conn.wants_write() {
+            if conn.write_tls(&mut tcp).is_err() {
+                return;
+            }
+        }
+    });
+    port
+}
+
+/// The TLS arm of an early answer (RFC 9112 §9.5): once a write has failed,
+/// a read takes the records the peer sent before it closed, rather than
+/// retrying the write rustls still holds and failing on it again. Unix only:
+/// Windows discards the bytes a socket received once a reset arrives.
+#[cfg(unix)]
+#[test]
+fn an_answer_sent_before_the_peer_closed_over_a_failed_write_is_read() {
+    const ANSWER: &[u8] = b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
+    let port = answering_tls_server(ANSWER);
+    let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut stream = Stream::start_tls(
+        tcp,
+        client_config(),
+        "loopback.test",
+        Arc::new(aterm_http::AlwaysAuthorized),
+        Deadline::after(HANG_DETECTOR),
+    )
+    .expect("the handshake with the pinned loopback server completes");
+    // Far more than the socket buffers hold: the server's close lands while
+    // these writes are still going out.
+    let chunk = vec![0u8; 64 * 1024];
+    let failed = (0..1024)
+        .find_map(|_| stream.write_all(&chunk).err())
+        .expect("a write fails once the server has closed");
+    assert_ne!(failed.kind(), std::io::ErrorKind::TimedOut, "{failed}");
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    while !got.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(error) => panic!(
+                "the answer was lost to {error} after {:?}",
+                String::from_utf8_lossy(&got)
+            ),
+        }
+    }
+    assert_eq!(got, ANSWER);
+}

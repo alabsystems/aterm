@@ -197,6 +197,13 @@ pub fn inside_protected(path: &str, home: &str, ccsocks: &str) -> bool {
         })
 }
 
+/// Whether `path` is, or lies below, an entry of the list of any of `homes`
+/// (every home the lab guards: [`crate::paths::Paths::guarded_homes`]).
+#[must_use]
+pub fn inside_any(path: &str, homes: &[String], ccsocks: &str) -> bool {
+    homes.iter().any(|h| inside_protected(path, h, ccsocks))
+}
+
 /// `protected HOME CCSOCKS`: the list as `<kind> TAB <path>` lines.
 #[must_use]
 pub fn render_lines(home: &str, ccsocks: &str) -> String {

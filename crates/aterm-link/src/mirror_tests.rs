@@ -71,12 +71,32 @@ fn a_pin_round_trips_and_a_damaged_one_reads_as_damage() {
     let text = pin.render();
     assert!(
         text.starts_with(&format!(
-            "logpin v=1 inc=7 n=3 total=12345 key={}\n",
+            "logpin v=2 inc=7 n=3 total=12345 key={}\n",
             "ab".repeat(16)
         )),
         "{text}"
     );
     assert_eq!(Pin::parse(&text), Ok(pin.clone()));
+    // An older build's pin (`v=1`, before the durable copies) reads the same;
+    // it is told from this build's, whole or cut short, and a prefix too short
+    // to name its version is neither's.
+    let older = text.replacen("v=2", "v=1", 1);
+    assert_eq!(Pin::parse(&older), Ok(pin.clone()));
+    for (bytes, older_build, this_build) in [
+        (older.as_bytes(), true, false),
+        (&older.as_bytes()[..10], true, false),
+        (text.as_bytes(), false, true),
+        (&text.as_bytes()[..11], false, true),
+        (&text.as_bytes()[..9], false, false),
+        (&b""[..], false, false),
+    ] {
+        assert_eq!(
+            (Pin::by_an_older_build(bytes), Pin::by_this_build(bytes)),
+            (older_build, this_build),
+            "{:?}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
     // A pin written before the key reads with none; a key that does not
     // read, or a word past it, is damage.
     let keyless = Pin {
@@ -85,7 +105,7 @@ fn a_pin_round_trips_and_a_damaged_one_reads_as_damage() {
     };
     assert!(keyless
         .render()
-        .starts_with("logpin v=1 inc=7 n=3 total=12345\n"));
+        .starts_with("logpin v=2 inc=7 n=3 total=12345\n"));
     assert_eq!(Pin::parse(&keyless.render()), Ok(keyless));
     assert!(Pin::parse(&text.replace(" key=abab", " key=zzab")).is_err());
     assert_eq!(
@@ -100,7 +120,7 @@ fn a_pin_round_trips_and_a_damaged_one_reads_as_damage() {
     assert_eq!(Pin::parse(&empty.render()), Ok(empty));
     let short = text.lines().take(3).collect::<Vec<_>>().join("\n");
     assert!(Pin::parse(&short).is_err(), "a slot missing");
-    assert!(Pin::parse(&text.replace("v=1", "v=2")).is_err());
+    assert!(Pin::parse(&text.replacen("v=2", "v=3", 1)).is_err());
     assert!(Pin::parse(&text.replace("\n641 ", "\nx ")).is_err());
     assert!(Pin::parse("").is_err());
 }

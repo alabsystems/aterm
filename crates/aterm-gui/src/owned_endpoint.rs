@@ -470,19 +470,13 @@ mod tests {
 
     use super::imp::{Owned, Published, claim_quit, hold_for_exec};
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("atxs-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// The handler's removal removes the published socket, token and alias. Negative
     /// controls: a socket another listener rebound, a token replaced by rename, and an
     /// alias a newer instance repointed all stay.
     #[test]
     fn a_terminating_signal_removes_only_what_this_instance_still_owns() {
-        let dir = scratch("own");
+        let scratch = crate::test_scratch::short_dir("the own test's socket");
+        let dir = scratch.path().to_path_buf();
         let sock = dir.join("aterm-1.sock");
         let token = dir.join("aterm-1.token");
         let link = dir.join("latest");
@@ -530,7 +524,6 @@ mod tests {
             std::fs::read_link(&link).unwrap(),
             PathBuf::from("aterm-2.sock")
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A rebind at the same path renames a fresh socket over the published one, and
@@ -539,7 +532,8 @@ mod tests {
     #[test]
     fn the_exit_removes_the_socket_a_rebind_put_at_the_same_path() {
         use crate::control_listener::{rebind_socket, socket_file_id};
-        let dir = scratch("rebind");
+        let scratch = crate::test_scratch::short_dir("the rebind test's socket");
+        let dir = scratch.path().to_path_buf();
         let sock = dir.join("aterm-1.sock");
         let _first = aterm_uds::CtlListener::bind(&sock).unwrap();
         let plan = crate::control_auth::SocketPlan {
@@ -562,7 +556,6 @@ mod tests {
         assert!(!published.rebound(previous, other));
         published.remove();
         assert!(sock.exists(), "another instance's socket at the path stays");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// With no record (nothing published by this process), the loop's exit
@@ -570,7 +563,8 @@ mod tests {
     /// token at the same explicit path stay.
     #[test]
     fn the_graceful_exit_removes_nothing_it_did_not_record() {
-        let dir = scratch("grace");
+        let scratch = crate::test_scratch::short_dir("the grace test's socket");
+        let dir = scratch.path().to_path_buf();
         let sock = dir.join("aterm.sock");
         let token = dir.join("aterm.token");
         let _other = std::os::unix::net::UnixListener::bind(&sock).unwrap();
@@ -585,7 +579,6 @@ mod tests {
         // Negative control: the record of those same files removes them.
         Published::capture(&plan).remove();
         assert!(!sock.exists() && !token.exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A COLD `exec` AND A TERMINATING SIGNAL NEVER BOTH WIN THE ONE CLAIM: a quit a

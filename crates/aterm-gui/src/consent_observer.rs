@@ -1187,16 +1187,23 @@ pub(crate) struct ObserverState {
     /// verdict pass found it: the pass's deadline on a loop nothing else
     /// wakes.
     verdict_due: Option<Instant>,
-    /// `msgID`s already announced to the human, so one observed prompt pages
-    /// once. Bounded like everything else fed by the stream; an evicted id can
-    /// at worst be announced a second time, long after the first.
-    announced: VecDeque<String>,
+    /// Announced prompts and their tab owner. Only a matching result answers
+    /// a pending prompt; lost observations and expired correlations do not.
+    announced: VecDeque<AnnouncedPrompt>,
+    /// A tab contribution moved since the host last pushed its chrome.
+    attention_dirty: bool,
     /// Observed dialogs waiting for the host ([`Self::take_prompting`]).
     prompts: VecDeque<PromptNeed>,
     /// `msgID`s of dialogs already queued, so one dialog is one need however
     /// often its line repeats. Separate from `announced` (Full mode's banner).
     #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
     prompt_seen: VecDeque<String>,
+}
+
+struct AnnouncedPrompt {
+    id: String,
+    session: u64,
+    pending: bool,
 }
 
 impl ObserverState {
@@ -1215,6 +1222,7 @@ impl ObserverState {
             judged_roster: None,
             verdict_due: None,
             announced: VecDeque::new(),
+            attention_dirty: false,
             prompts: VecDeque::new(),
             prompt_seen: VecDeque::new(),
         }
@@ -1360,6 +1368,10 @@ impl ObserverState {
         self.rx = None;
         self.requested = ObserverMode::Off;
         self.running = ObserverMode::Off;
+        for prompt in &mut self.announced {
+            self.attention_dirty |= prompt.pending;
+            prompt.pending = false;
+        }
         if self.availability.is_live() {
             self.availability = ObserverAvailability::Unavailable(UnavailableReason::StreamEnded);
         }
@@ -1444,7 +1456,17 @@ impl ObserverState {
                 self.availability = ObserverAvailability::Unavailable(reason);
             }
             #[cfg(any(target_os = "macos", test))]
-            ObserverEvent::Line(line) => self.table.note(line, now),
+            ObserverEvent::Line(line) => {
+                if let TccEvent::Result { msg_id } = &line {
+                    for prompt in &mut self.announced {
+                        if &prompt.id == msg_id && prompt.pending {
+                            prompt.pending = false;
+                            self.attention_dirty = true;
+                        }
+                    }
+                }
+                self.table.note(line, now);
+            }
             #[cfg(any(target_os = "macos", test))]
             ObserverEvent::Prompt(need) => {
                 // Counted as understood for format drift, then queued once per dialog.
@@ -1507,6 +1529,23 @@ impl ObserverState {
     /// them inert even when a fixture changes App's windowed-policy boolean.
     pub(crate) fn session_for_pid(&self, pid: i32, sessions: &[(u64, i32)]) -> Option<u64> {
         session_of_pid(pid, sessions, self.probe.parent_of, self.probe.pgid_of)
+    }
+
+    /// This observer's current tab contribution. No OS question is asked.
+    pub(crate) fn marks_session(&self, session: u64) -> bool {
+        self.announced
+            .iter()
+            .any(|p| p.session == session && p.pending)
+    }
+
+    pub(crate) fn take_attention_changed(&mut self) -> bool {
+        std::mem::take(&mut self.attention_dirty)
+    }
+
+    /// A retired session cannot own a prompt in a later tab.
+    pub(crate) fn retire_session(&mut self, session: u64) {
+        self.attention_dirty |= self.marks_session(session);
+        self.announced.retain(|p| p.session != session);
     }
 
     /// [`Self::take_new_verdicts`] through this instance's own process-group
@@ -1577,7 +1616,7 @@ impl ObserverState {
             .table
             .pending_prompts(now, PENDING_PROMPT_THRESHOLD)
             .into_iter()
-            .filter(|prompt| !announced.iter().any(|id| id == prompt.msg_id))
+            .filter(|prompt| !announced.iter().any(|p| p.id == prompt.msg_id))
             .collect();
         if open.is_empty() {
             return Vec::new();
@@ -1592,9 +1631,20 @@ impl ObserverState {
                 continue;
             };
             if self.announced.len() >= ANNOUNCED_CAP {
-                self.announced.pop_front();
+                // Retain unanswered prompts under pressure: eviction is no
+                // evidence that their owner answered. An eventual result
+                // makes room for the next unannounced prompt.
+                let Some(done) = self.announced.iter().position(|p| !p.pending) else {
+                    continue;
+                };
+                self.announced.remove(done);
             }
-            self.announced.push_back(prompt.msg_id.to_owned());
+            self.announced.push_back(AnnouncedPrompt {
+                id: prompt.msg_id.to_owned(),
+                session,
+                pending: true,
+            });
+            self.attention_dirty = true;
             fresh.push(ObservedPrompt {
                 session,
                 blocked_on: blocked_on_token(prompt.service),
@@ -1923,16 +1973,56 @@ const PROMPT_TITLE: &str = "aterm · permission waiting";
 
 /// The `EPERM` rate limit: one notification per instance however many denials; a fresh `App`
 /// starts armed.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct AttentionGate {
     /// Whether the one notification has been spent.
     spent: bool,
+    /// Live sessions whose own protected read was refused. This contribution
+    /// ends on a verified grant or session retirement, not on a dismissal.
+    denied_sessions: Vec<(u64, Instant)>,
 }
 
 impl AttentionGate {
     /// A fresh, armed gate.
     pub(crate) const fn new() -> Self {
-        Self { spent: false }
+        Self {
+            spent: false,
+            denied_sessions: Vec::new(),
+        }
+    }
+
+    pub(crate) fn mark_session(&mut self, session: u64, now: Instant) -> bool {
+        if let Some((_, at)) = self
+            .denied_sessions
+            .iter_mut()
+            .find(|(id, _)| *id == session)
+        {
+            // A repeated refusal is a new fact even while the same mark
+            // stands: an older queued grant cannot answer it.
+            *at = now;
+            return false;
+        }
+        self.denied_sessions.push((session, now));
+        true
+    }
+
+    pub(crate) fn marks_session(&self, session: u64) -> bool {
+        self.denied_sessions.iter().any(|(id, _)| *id == session)
+    }
+
+    pub(crate) fn has_denials(&self) -> bool {
+        !self.denied_sessions.is_empty()
+    }
+
+    pub(crate) fn recover(&mut self, observed: Instant) -> bool {
+        let before = self.denied_sessions.len();
+        self.denied_sessions
+            .retain(|(_, denied)| *denied > observed);
+        self.denied_sessions.len() != before
+    }
+
+    pub(crate) fn retire_session(&mut self, session: u64) {
+        self.denied_sessions.retain(|(id, _)| *id != session);
     }
 
     /// Whether the notification has been spent.
@@ -2957,6 +3047,24 @@ mod tests {
     // -----------------------------------------------------------------------
     // The attention path
     // -----------------------------------------------------------------------
+
+    /// A global grant answers each session only through its observation time.
+    /// Repeated refusals advance that session's fence without a new visible mark.
+    #[test]
+    fn consent_marks_recover_only_denials_the_grant_observed_after() {
+        let now = Instant::now();
+        let mut gate = AttentionGate::new();
+        assert!(gate.mark_session(1, now));
+        assert!(gate.mark_session(2, now + Duration::from_secs(2)));
+        assert!(gate.recover(now + Duration::from_secs(1)));
+        assert!(!gate.marks_session(1));
+        assert!(gate.marks_session(2));
+        assert!(!gate.mark_session(2, now + Duration::from_secs(4)));
+        assert!(!gate.recover(now + Duration::from_secs(3)));
+        assert!(gate.marks_session(2), "the repeated refusal is newer");
+        assert!(gate.recover(now + Duration::from_secs(4)));
+        assert!(!gate.has_denials(), "an equal-time observation suffices");
+    }
 
     /// One notification per instance, not one per `EPERM`; the tab mark repeats.
     #[test]

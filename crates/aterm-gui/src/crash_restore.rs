@@ -623,6 +623,68 @@ impl JournalSlot {
 // The writer side
 // ---------------------------------------------------------------------------
 
+/// A journal's clock, in milliseconds since it started: what the keyframe policy is
+/// handed (K1's quiet, K2's period, K3's gap), and what the history ring's ticks, the
+/// shed's replacement, a replaced region's custody retry and the control slot's carry are
+/// stamped and due on. The journal worker's shed policy keeps one of its own
+/// ([`HistoryWorker::shed_now_ms`]).
+///
+/// Real time, plus what a test moved it on by ([`Self::pass`]), so a test reaches K1's
+/// quiet, the ring's settle or the next tick without sleeping. A test's clock may be HELD
+/// from its start ([`Self::held`]): it then reads only what the test moved it on by, so no
+/// decision the policy or a tick takes, and no stamp a test reads against the clock,
+/// depends on how long a loaded machine took between two of the test's steps. Outside a
+/// test it is `epoch.elapsed()` and nothing else: the skew stays 0, and a held clock
+/// cannot be built.
+#[cfg(unix)]
+struct JournalClock {
+    epoch: Instant,
+    /// Milliseconds a test moved the clock on. Always 0 outside a test.
+    skew_ms: AtomicU64,
+    /// The clock stands still but for [`Self::pass`].
+    #[cfg(test)]
+    held: bool,
+}
+
+#[cfg(unix)]
+impl JournalClock {
+    /// A clock that starts now, on real time.
+    fn start() -> Self {
+        Self {
+            epoch: Instant::now(),
+            skew_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            held: false,
+        }
+    }
+
+    /// A test's clock, held at 0 from its start: only [`Self::pass`] moves it.
+    #[cfg(test)]
+    fn held() -> Self {
+        Self {
+            held: true,
+            ..Self::start()
+        }
+    }
+
+    /// Milliseconds since the clock started (none, held), plus a test's skew.
+    fn now_ms(&self) -> u64 {
+        #[cfg(test)]
+        if self.held {
+            return self.skew_ms.load(Ordering::Relaxed);
+        }
+        u64::try_from(self.epoch.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .saturating_add(self.skew_ms.load(Ordering::Relaxed))
+    }
+
+    /// Move the clock on by `ms`.
+    #[cfg(test)]
+    fn pass(&self, ms: u64) {
+        self.skew_ms.fetch_add(ms, Ordering::Relaxed);
+    }
+}
+
 /// The parse thread's state for one session's region: the writer, the keyframe policy
 /// and the resize watermark. Behind [`SessionJournal`]'s lock, which only the parse
 /// thread (and the spawn, before the reader starts) takes.
@@ -633,11 +695,8 @@ struct Writer {
     /// The journal's own resize watermark (never the temporal recorder's): seeded at
     /// creation, caught up before each slice's bytes and before each keyframe.
     mark: SpineMark,
-    /// The clock the policy is handed (milliseconds since this journal's creation).
-    epoch: Instant,
-    /// Milliseconds a test has moved the clock on ([`SessionJournal::pass_ms`]), so a
-    /// quiet keyframe is reached without sleeping. Always 0 outside a test.
-    skew_ms: u64,
+    /// The clock the policy is handed: the journal's ([`SessionJournal::clock`]).
+    clock: Arc<JournalClock>,
     /// The seam policy the session's engine resizes under (`pty_resize_policy`), which
     /// every RESIZE record replays under.
     resize_policy: ResizePolicy,
@@ -750,9 +809,7 @@ impl Writer {
     }
 
     fn now_ms(&self) -> u64 {
-        u64::try_from(self.epoch.elapsed().as_millis())
-            .unwrap_or(u64::MAX)
-            .saturating_add(self.skew_ms)
+        self.clock.now_ms()
     }
 
     /// Take the host's newest fingerprint: a change forces a keyframe (K4).
@@ -1016,13 +1073,9 @@ pub(crate) struct SessionJournal {
     /// The worker this session's ring is exported by, once [`Self::start_export`] gave it
     /// one: notified when the history grows, at quiescence and at a clear.
     worker: OnceLock<Arc<HistoryWorker>>,
-    /// The ring's clock (milliseconds since this journal's creation), and what a test has
-    /// moved it on by ([`Self::pass_ms`]).
-    ring_epoch: Instant,
-    ring_skew_ms: AtomicU64,
-    /// Where a test stopped the ring's clock ([`Self::hold_ring_clock`]).
-    #[cfg(test)]
-    ring_held_ms: OnceLock<u64>,
+    /// The journal's clock (milliseconds since its creation), which the parse thread's
+    /// keyframe policy ([`Writer::clock`]) and the ring's worker read.
+    clock: Arc<JournalClock>,
     // -- the memory shed (increment 6; section "THE MEMORY SHED" below) ---------------
     /// The session's history ring is SHED: memory pressure took it away. Nothing is
     /// exported, keyframes carry their bridge of history as a region with no ring does,
@@ -1097,6 +1150,33 @@ impl SessionJournal {
         cfg: Option<&TerminalConfig>,
         lane: Arc<crate::manual_reset::ResetLane>,
     ) -> Result<Arc<Self>, String> {
+        Self::create_on(id, sid, term, master, cfg, lane, JournalClock::start())
+    }
+
+    /// [`Self::create`] on a held clock ([`JournalClock::held`]): only [`Self::pass_ms`]
+    /// moves it, from the first keyframe on.
+    #[cfg(test)]
+    pub(crate) fn create_held(
+        id: u64,
+        sid: &str,
+        term: &Mutex<Terminal>,
+        master: i32,
+        cfg: Option<&TerminalConfig>,
+        lane: Arc<crate::manual_reset::ResetLane>,
+    ) -> Result<Arc<Self>, String> {
+        Self::create_on(id, sid, term, master, cfg, lane, JournalClock::held())
+    }
+
+    /// [`Self::create`] on `clock`.
+    fn create_on(
+        id: u64,
+        sid: &str,
+        term: &Mutex<Terminal>,
+        master: i32,
+        cfg: Option<&TerminalConfig>,
+        lane: Arc<crate::manual_reset::ResetLane>,
+        clock: JournalClock,
+    ) -> Result<Arc<Self>, String> {
         let (region, custody) = new_region()?;
         let store = Shared::new(region);
         let pid = std::process::id();
@@ -1117,15 +1197,14 @@ impl SessionJournal {
         // Asked before the term lock: the answer takes the PTY registry's own lock.
         let resize_policy = crate::app_render::pty_resize_policy(master);
         let cfg_hash = config_hash(cfg);
-        let epoch = Instant::now();
+        let clock = Arc::new(clock);
         let journal = Arc::new(Self {
             store,
             writer: Mutex::new(Writer {
                 writer,
                 policy: KeyframePolicy::new(aterm_restore::layout::TAIL_CAP_V1, 0, 0),
                 mark: SpineMark::attach(Arc::new(SpineWatermark::default())),
-                epoch,
-                skew_ms: 0,
+                clock: Arc::clone(&clock),
                 resize_policy,
                 config_fp: 0,
                 slice_marks: 0,
@@ -1157,10 +1236,7 @@ impl SessionJournal {
             seen_oldest: AtomicU64::new(0),
             renumbered: AtomicBool::new(false),
             worker: OnceLock::new(),
-            ring_epoch: epoch,
-            ring_skew_ms: AtomicU64::new(0),
-            #[cfg(test)]
-            ring_held_ms: OnceLock::new(),
+            clock,
             history_shed: AtomicBool::new(false),
             replace_owed: AtomicBool::new(false),
             custody_owed: AtomicBool::new(false),
@@ -1621,13 +1697,14 @@ impl SessionJournal {
         }
     }
 
-    /// Move the policy's clock, and the ring's, on by `ms` (a test reaches K1's quiet or
-    /// the ring's settle without sleeping).
+    /// Move the journal's clock (the policy's and the ring's) on by `ms`, so a test reaches
+    /// K1's quiet, the ring's settle or the next tick without sleeping. It wakes nobody: a
+    /// worker thread reads the moved clock at its next wake, which only the session's own
+    /// signals (a growth, a nudge, a clear, a ledger record) bring early, so a test that
+    /// leaves the ticks to the worker still needs those signals to work.
     #[cfg(test)]
     pub(crate) fn pass_ms(&self, ms: u64) {
-        let mut w = self.lock();
-        w.skew_ms = w.skew_ms.saturating_add(ms);
-        self.ring_skew_ms.fetch_add(ms, Ordering::Relaxed);
+        self.clock.pass(ms);
     }
 
     /// Keyframes written and captures deferred, for a test's view of the policy.
@@ -1847,30 +1924,9 @@ impl SessionJournal {
         self.seen_end.store(fence.end, Ordering::Relaxed);
     }
 
-    /// The ring's clock: milliseconds since the journal's creation (or where a test
-    /// stopped it, [`Self::hold_ring_clock`]), plus a test's skew.
+    /// The ring's clock: the journal's ([`JournalClock`]).
     fn ring_now_ms(&self) -> u64 {
-        #[cfg(test)]
-        if let Some(&held) = self.ring_held_ms.get() {
-            return held.saturating_add(self.ring_skew_ms.load(Ordering::Relaxed));
-        }
-        self.ring_elapsed_ms()
-            .saturating_add(self.ring_skew_ms.load(Ordering::Relaxed))
-    }
-
-    /// Milliseconds since the journal's creation.
-    fn ring_elapsed_ms(&self) -> u64 {
-        u64::try_from(self.ring_epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
-    }
-
-    /// Stop the ring's clock where it reads now: from here only [`Self::pass_ms`] moves
-    /// it, so the stamps a test reads against it ([`Self::ring_due`], the custody's and
-    /// the control slot's dues) do not depend on how long a loaded machine took between
-    /// two of the test's steps. For a test that runs the ring's ticks itself: a worker
-    /// thread waits on the clock moving.
-    #[cfg(test)]
-    pub(crate) fn hold_ring_clock(&self) {
-        let _ = self.ring_held_ms.set(self.ring_elapsed_ms());
+        self.clock.now_ms()
     }
 
     fn notify_worker(&self) {
@@ -3408,10 +3464,9 @@ pub(crate) struct HistoryWorker {
     ring_queue: Mutex<WorkerState>,
     wake: std::sync::Condvar,
     ring_joiner: Mutex<Option<std::thread::JoinHandle<()>>>,
-    /// The shed policy's clock (milliseconds since the worker started), and what a test has
-    /// moved it on by ([`Self::pass_shed_ms`]).
-    shed_epoch: Instant,
-    shed_skew_ms: AtomicU64,
+    /// The shed policy's clock (milliseconds since the worker started; a test moves it on
+    /// with [`Self::pass_shed_ms`]).
+    shed_clock: JournalClock,
     /// What the `pressure` verb reads of the policy, published at the end of each pass: the
     /// level last reported ([`level_code`]), and when the next shed ring comes back (on the
     /// shed clock; `u64::MAX` for none).
@@ -3490,12 +3545,26 @@ impl HistoryWorker {
     ///
     /// The thread's spawn refusal.
     pub(crate) fn start_ring_worker() -> std::io::Result<Arc<Self>> {
+        Self::start_ring_worker_on(JournalClock::start())
+    }
+
+    /// [`Self::start_ring_worker`] with its shed clock held ([`JournalClock::held`]): only
+    /// [`Self::pass_shed_ms`] moves it.
+    ///
+    /// # Errors
+    ///
+    /// The thread's spawn refusal.
+    #[cfg(test)]
+    pub(crate) fn start_held_ring_worker() -> std::io::Result<Arc<Self>> {
+        Self::start_ring_worker_on(JournalClock::held())
+    }
+
+    fn start_ring_worker_on(shed_clock: JournalClock) -> std::io::Result<Arc<Self>> {
         let worker = Arc::new(Self {
             ring_queue: Mutex::new(WorkerState::default()),
             wake: std::sync::Condvar::new(),
             ring_joiner: Mutex::new(None),
-            shed_epoch: Instant::now(),
-            shed_skew_ms: AtomicU64::new(0),
+            shed_clock,
             shed_level: AtomicU8::new(0),
             shed_back_at: AtomicU64::new(u64::MAX),
         });
@@ -3555,16 +3624,14 @@ impl HistoryWorker {
 
     /// The shed policy's clock: milliseconds since the worker started, plus a test's skew.
     fn shed_now_ms(&self) -> u64 {
-        u64::try_from(self.shed_epoch.elapsed().as_millis())
-            .unwrap_or(u64::MAX)
-            .saturating_add(self.shed_skew_ms.load(Ordering::Relaxed))
+        self.shed_clock.now_ms()
     }
 
     /// Move the shed policy's clock on by `ms` and wake the worker (a test reaches the hold
     /// before shed rings come back without sleeping).
     #[cfg(test)]
     pub(crate) fn pass_shed_ms(&self, ms: u64) {
-        self.shed_skew_ms.fetch_add(ms, Ordering::Relaxed);
+        self.shed_clock.pass(ms);
         self.wake_ring_worker();
     }
 

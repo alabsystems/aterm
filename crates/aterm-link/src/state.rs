@@ -24,15 +24,19 @@
 //! of several milliseconds, so it is spent only where a power loss would outlive
 //! what the file pairs with:
 //!
-//! - Durable: `node`, `inc`, `pins`, `halts`, `rewound-log`. The node id is the mail
+//! - Durable: `node`, `inc`, `pins`, `halts`, `rewound-log`, `logkey`, `logfloor`.
+//!   The node id is the mail
 //!   address and what its caps were minted for; the incarnation lease's top fences
 //!   every incarnation and sequence the next boot uses (written once per lease of
 //!   [`INC_LEASE`], not once per attach: see the next section); a pin is the T15
 //!   first sight of a remote sid, which outlives this host's reboot; a standing halt
 //!   is a human's, and the bus row it stands in for may be gone; a rewound identity
 //!   stays refused even if its head grows again, and releasing it first flushes the
-//!   replacement log's witness. Each is written once, or when its set changes, never
-//!   per message.
+//!   replacement log's witness; the bus mirror's alias key is every edge's alias for
+//!   the node's life (ruling Q6), and the floor of its lifetime total is what a
+//!   total resumes at when its pin cannot say (ruling Q13, raised once per
+//!   [`crate::mirror::FLOOR_LEASE_BYTES`] of bodies). Each is written once, or when
+//!   its set changes, never per message.
 //! - Atomic only: everything else (`logpin`, the bus mirror's one batch in
 //!   flight, written only by a bridge with `[fabric] log = "turns"`, among it). A power loss ends what those files pair with
 //!   anyway: the outbox, the owed receipts and the inbox ring live in aterm's memory
@@ -129,6 +133,38 @@
 //! `Last` read can be served first) beside an `inc` that never moved: the next
 //! attach takes the same incarnation. The model's `Buggy = 4` is that overlap.
 //!
+//! ## Whose row it is
+//!
+//! A session whose instance went with nobody to say so (a tab closed while no
+//! bridge ran, an instance gone in a power cut) leaves its presence row `live`,
+//! and the bridge's ghost sweep retires it once five minutes of its own sight
+//! find nothing hosting it (`Bridge::retire_ghost_presence`). Which rows a bridge
+//! may retire is the question: a SIBLING under a shared node id (a copy of this
+//! dir, run by another aterm) may be alive, and its rows are not this bridge's.
+//! An incarnation number does not answer it. A copy takes its numbers as this
+//! dir does, `max(local, Last) + 1`, so it can take one this dir took too: one an
+//! attach here took and never presented (its will refused, or the attach killed
+//! before it), or one whose rows a log that lost power no longer shows. Finding
+//! F4 of the simulation, and its review, are those two halves: retire only by
+//! this incarnation and a witnessed will, and a ghost whose writer's successors
+//! all died inside the five minutes stands until the operator retires it; retire
+//! by every incarnation this dir took, and a copy that took one of the same
+//! numbers has its live sessions retired.
+//!
+//! So the ROW says whose it is. Every session row this dir's bridges write
+//! carries the dir's mark ([`StateDir::mark`], under [`PRESENCE_MARK`]): a hash
+//! of the kernel boot identity, node and the dir's own device and inode. Device
+//! and inode alone are local names: a cloned disk on another machine can repeat
+//! both. A different boot therefore never grants adoption by the mark, even
+//! when every directory byte and both local names match.
+//! One state dir is one bridge ([`StateDir::lock_bridge`]), so while a bridge
+//! holds the lock, every other bridge that wrote a row with its mark is dead,
+//! and such a row at or below this incarnation in THIS BOOT is the bridge's to
+//! retire, under the rules its own are. The mark is never stored and costs no
+//! write. After a reboot, or without a kernel boot identity, only the own
+//! exact writer-marked will rules apply; an incarnation number alone grants
+//! no retirement, and unmarked legacy ghosts may need the operator.
+//!
 //! ## A torn file after a power cut
 //!
 //! "Atomic" is a promise against a `kill -9`, not against a power loss: POSIX
@@ -160,15 +196,27 @@
 //! [`StateDir::end_run_clean`]), damage is refused as it always was.
 //!
 //! The other files cannot wedge torn: `node`, `inc`, `pins`, `halts`,
-//! `rewound-log`, `run` and `quarantine/` are durable (on the media before
-//! anything rests on them), and every other reader takes an empty file as
-//! absent and a cut number as a lower one — `inc-lease` as no lease (the attach
-//! leases afresh), `seq` as a lower one the durable `inc` fences, `acked`'s torn
-//! tail as no offset ([`AckedLog`]) — save `logpin`, which holds what no reboot
-//! ends (the node's alias key, ruling Q6, and its lifetime mirrored total,
-//! ruling Q13): a pin that does not read, a cut one included
-//! ([`crate::mirror::Pin::parse`]), stops the mirror and stays where it is,
-//! never set aside.
+//! `rewound-log`, `logkey`, `logfloor`, `run` and `quarantine/` are durable (on
+//! the media before anything rests on them), and every other reader takes an
+//! empty file as absent and a cut number as a lower one — `inc-lease` as no
+//! lease (the attach leases afresh), `seq` as a lower one the durable `inc`
+//! fences, `acked`'s torn tail as no offset ([`AckedLog`]) — save `logpin`,
+//! the mirror's pin, which holds what no reboot ends: the node's alias key
+//! (ruling Q6) and its lifetime mirrored total (ruling Q13). Each has a DURABLE
+//! COPY a bridge of this build writes before it is needed: `logkey` before the
+//! first take that names the key, `logfloor` — at or above every byte the
+//! mirror sent — before any byte of a batch is sent. The copies hold only while
+//! no build that keeps neither writes the pin, so this build's pins are of a
+//! version an older build refuses (`v=2`, [`crate::mirror::Pin`]), the first
+//! one written durably. So the same first bridge RECONCILES the pin with them
+//! ([`StateDir::reconcile_logpin`]): a torn one is moved into the quarantine
+//! like the rest, a whole one written from the copies in its place, and the
+//! mirror resumes with the same key and the floor as its total; a whole one a
+//! cut may have rolled back to a lower total is raised to the floor. A pin
+//! that does not read where the copies cannot be shown to cover it (no floor
+//! or no key on the media, or an older build's pin), within one boot or after
+//! a clean stop (which flushed it) stops the mirror and stays where it is, and
+//! the bridge says what a person does (`Bridge::mirror_hello_answered`).
 //!
 //! ## An in-flight entry a power cut brought back
 //!
@@ -231,9 +279,11 @@
 //! | `deadlines` | atomic | each `ask`/`task` published with `dl=` and not yet answered, newest [`DEADLINES_KEEP`] | no `expired` for those asks; the bus is checked before any verdict, so never a false one |
 //! | `topics/<sid>` | atomic | `<topic> <next>` per broadcast opt-in ([`StateDir::topics`]) | the topic restarts from the session's `since=`, and `head` skips what was published meanwhile, so it is written every step |
 //! | `unhandled/<sid>` | atomic | `<topic> <off>`: per topic, the lowest offset of a broadcast the endpoint took as new and `inbox seen` has not passed, written before the cursor moves past it ([`StateDir::topic_floors`]) | a successor that keeps the sid (a seamless update, a PTY keeper's recovery) is not offered those broadcasts again, though they are gone from its inbox; no successor keeps a sid across a reboot. TORN, set aside |
-//! | `logpin` | atomic | the bus mirror's one batch in flight, the node's total of mirrored bytes and its alias key ([`StateDir::logpin`]); only with `[fabric] log = "turns"` | an older whole version: one batch taken again at fresh sequences, a second copy each reader dedupes, and a lower total. Torn: the key and the total have no other copy, so the mirror stops and keeps it as it is (rulings Q6, Q13); never set aside |
-//! | `run` | durable | the boot the last bridge ran in and whether it stopped cleanly, every file of a [`TornKind`] it wrote flushed first ([`LastRun`]): written once per boot by the first bridge, after its sweep, and at a clean stop | a dir without one is judged by its lease's boot, as a build before it was; a torn file found after a stop it cannot call unclean is refused where it is read |
-//! | `quarantine/` | durable | the exact bytes of each file found torn after an unclean stop in an earlier boot, moved aside by the first bridge after it ([`StateDir::set_aside_torn`], [`QUARANTINE`]), and of each whole in-flight entry it retired then, as `retired.inflight.<seq>` ([`StateDir::retire_in_flight_of_an_earlier_boot`]) | nothing reads it: it is the owner's, to read or remove |
+//! | `logpin` | atomic, flushed at a clean stop; durable where it replaces none of this build's | the bus mirror's one batch in flight, the node's total of mirrored bytes and its alias key ([`StateDir::logpin`]), `v=2`, which an older build refuses ([`crate::mirror::Pin`]); only with `[fabric] log = "turns"` | an older whole version: one batch taken again at fresh sequences, a second copy each reader dedupes; after an unclean stop in an earlier boot, its total raised to `logfloor` ([`StateDir::reconcile_logpin`]), which counts the floor's lease as mirrored. TORN there, with `logfloor` and `logkey` on the media: set aside, a whole pin written from them in its place, and the mirror resumes (rulings Q6, Q13). Torn with no floor or no key (an older build's pin, the only copy), torn as an older build's `v=1`, within one boot or after a clean stop: the mirror stops, keeps it as it is, and says what a person does |
+//! | `logkey` | durable | the bus mirror's alias key (ruling Q6), 32 hex digits, written once, before the first take that names it ([`StateDir::logkey`]); only with `[fabric] log = "turns"` | load-bearing: a fresh key is a second alias for every edge on the bus, so a torn pin is never set aside without it. Missing in a dir only an older build mirrored in, whose pin's `key=` is copied here before the next take |
+//! | `logfloor` | durable | the floor of the bus mirror's lifetime total (ruling Q13): at or above every body byte it sent, raised by [`crate::mirror::FLOOR_LEASE_BYTES`] past a batch before any byte of it is sent ([`StateDir::logfloor`]); only with `[fabric] log = "turns"` | the total a mirror resumes at when its pin is gone or may be rolled back: the lease's unused rest and the batch in flight are counted as mirrored, never a byte less. Missing: no bridge of this build sent a batch, and a torn pin stops the mirror |
+//! | `run` | durable | the boot the last bridge ran in and whether it stopped cleanly, every file of a [`TornKind`] it wrote flushed first ([`LastRun`]): written once per boot by the first bridge, after its sweep, and at a clean stop (a quit: a seamless update's handoff leaves it open for the successor that goes on with the run) | a dir without one is judged by its lease's boot, as a build before it was; a torn file found after a stop it cannot call unclean is refused where it is read |
+//! | `quarantine/` | durable | the exact bytes of each file found torn after an unclean stop in an earlier boot, moved aside by the first bridge after it ([`StateDir::set_aside_torn`], [`QUARANTINE`]) — the mirror's pin among them, as `logpin`, once its copies are on the media ([`StateDir::reconcile_logpin`]) — and of each whole in-flight entry it retired then, as `retired.inflight.<seq>` ([`StateDir::retire_in_flight_of_an_earlier_boot`]) | nothing reads it: it is the owner's, to read or remove. Only its count is read: how many torn files it still holds ([`StateDir::quarantined_torn`]), which at none ends aterm's entry for the owner's look |
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -561,6 +611,14 @@ pub(crate) const fn flushes_media() -> bool {
 /// gone (`NotFound`). The file's bytes are flushed already, and refusing here would
 /// refuse a state dir that works.
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
+    sync_dir_as(dir, aterm_durable::Flush::Durable)
+}
+
+/// [`sync_dir`] with `flush` (`aterm_durable`'s two): the full flush, or the
+/// barrier that orders the directory's entry changes ahead of every later
+/// write on its device ([`StateDir::end_run_clean`]'s). The same errors are
+/// tolerated; a directory so tolerated was not flushed, and orders nothing.
+pub(crate) fn sync_dir_as(dir: &Path, flush: aterm_durable::Flush) -> io::Result<()> {
     let dir = if dir.as_os_str().is_empty() {
         Path::new(".")
     } else {
@@ -568,13 +626,9 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     };
     // The open, and what its error is taken for, run in every build: only the
     // flush is skipped in this crate's tests ([`flushes_media`]).
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "aterm-link's flushes are the Ordered-tier work's to classify; the full flush is kept until then"
-    )]
     match std::fs::File::open(dir).and_then(|d| {
         if flushes_media() {
-            d.sync_all()
+            flush.file(&d)
         } else {
             Ok(())
         }
@@ -636,6 +690,10 @@ fn incarnation_of_seq(seq: u64) -> u64 {
 /// is written once per block, and a crash burns the block's unused rest.
 pub const INC_LEASE: u64 = 64;
 const _: () = assert!(INC_LEASE >= 1 && INC_LEASE <= INC_MAX);
+
+/// The token a session's presence row carries this state dir's mark under
+/// ([`StateDir::mark`], the module doc's "Whose row it is"): `statedir=<16 hex>`.
+pub(crate) const PRESENCE_MARK: &str = "statedir";
 
 /// What `inc-lease` holds: the incarnation the last attach took (`used`), the top of
 /// the lease it took it under — what `inc` held, FLUSHED, when this was written —
@@ -858,6 +916,11 @@ pub struct StateDir {
     /// ([`StateDir::begin_run`]) — by path inside the dir: what a clean stop
     /// flushes before it says it stopped cleanly ([`StateDir::end_run_clean`]).
     unflushed: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Retain the current own-written pin once this open established its
+    /// v=2 fence durably, preventing removal/recreation from reusing its
+    /// identity. Atomic successors preserve that durable-version baseline;
+    /// a new open, error or replacement does not.
+    logpin_fence: std::sync::Mutex<Option<std::fs::File>>,
     /// TEST-ONLY: what this dir's writers did to the filesystem ([`FileOps`]).
     #[cfg(test)]
     ops: std::sync::Mutex<FileOps>,
@@ -886,6 +949,10 @@ pub(crate) struct FileOps {
     /// `fsync`s (`F_FULLFSYNC` on macOS): a durable replace flushes its file
     /// and its directory.
     pub fsyncs: u64,
+    /// Barriers (`F_BARRIERFSYNC` on macOS, `aterm_durable::ordered`): a
+    /// file flushed where it is, an ordered replace's temp, and an ordered
+    /// flush of a directory (a clean stop's).
+    pub barriers: u64,
     /// Unlinks of a journal entry or a reservation.
     pub unlinks: u64,
     /// Appends to an append-only file.
@@ -902,6 +969,7 @@ impl std::ops::Sub for FileOps {
             replaces: self.replaces - before.replaces,
             renames: self.renames - before.renames,
             fsyncs: self.fsyncs - before.fsyncs,
+            barriers: self.barriers - before.barriers,
             unlinks: self.unlinks - before.unlinks,
             appends: self.appends - before.appends,
         }
@@ -1205,7 +1273,9 @@ impl AckedLog {
 /// which a reboot ends: every sid is minted afresh at aterm's launch, and the
 /// outbox, the owed receipts and the rings live in aterm's memory. The module
 /// doc's table says what losing each costs; after a reboot, nothing a later
-/// boot reads. (`logpin` is not one: what it holds outlives a reboot.)
+/// boot reads. (`logpin` is not one: what it holds outlives a reboot, so it is
+/// set aside only once its durable copies are on the media,
+/// [`StateDir::reconcile_logpin`]; a clean stop flushes it as it flushes these.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TornKind {
     /// `inflight/<seq>` ([`StateDir::in_flight`]).
@@ -1302,6 +1372,59 @@ impl TornKind {
     }
 }
 
+/// WHAT A RUN RECORD'S WRITE FLUSHED ([`StateDir::begin_run`],
+/// [`StateDir::end_run_clean`]): the files flushed, the directories flushed,
+/// and the flushes asked for of each of `aterm_durable`'s two — the barriers
+/// (`F_BARRIERFSYNC` on macOS) and the full flushes (`F_FULLFSYNC`), the
+/// record's own included — what the bridge says a stop or a start cost
+/// (`Bridge::end_run`, `Bridge::begin_run`). Counted as asked, in every
+/// build: this crate's own tests skip the flush itself ([`flushes_media`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Flushed {
+    /// Files of a [`TornKind`], and the mirror's pin, flushed where they are.
+    pub files: u64,
+    /// Directories whose entries moved, flushed before the record (the
+    /// root's full flush for the record not counted).
+    pub dirs: u64,
+    /// Barriers: a file's, a directory's, the record's bytes'.
+    pub ordered: u64,
+    /// Full flushes: a file's or a directory's on another device than the
+    /// root, the record's (two at a run's start, temp and directory).
+    pub full: u64,
+}
+
+impl Flushed {
+    /// One write finished by `flush`: a barrier, or `full` full flushes.
+    fn note(&mut self, flush: Option<aterm_durable::Flush>, full: u64) {
+        match flush {
+            Some(aterm_durable::Flush::Ordered) => self.ordered += 1,
+            Some(aterm_durable::Flush::Durable) => self.full += full,
+            None => {}
+        }
+    }
+}
+
+/// The rules [`StateDir::end_run_clean`] keeps; the clean-stop law's negative
+/// controls switch one off ([`StateDir::end_run_clean_with`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StopRules {
+    /// Each file the run left unflushed is flushed where it is.
+    pub flush_files: bool,
+    /// Every directory whose entries moved is flushed before the record.
+    pub flush_dirs: bool,
+    /// The record is written after what it vouches for.
+    pub record_last: bool,
+}
+
+impl StopRules {
+    /// Every rule on: what ships.
+    pub(crate) const ALL: Self = Self {
+        flush_files: true,
+        flush_dirs: true,
+        record_last: true,
+    };
+}
+
 /// HOW THE LAST BRIDGE OF THIS DIR STOPPED, AND IN WHICH BOOT (`run`, durable):
 /// what tells the first bridge of a boot whether a power cut can have torn a
 /// file of a [`TornKind`] ([`StateDir::torn_files_possible`]) — astream's own
@@ -1359,6 +1482,50 @@ pub(crate) struct SetAside {
 /// Where [`StateDir::set_aside_torn`] keeps what it moves aside, inside the dir.
 pub const QUARANTINE: &str = "quarantine";
 
+/// The bus mirror's pin ([`StateDir::logpin`]).
+pub(crate) const LOGPIN: &str = "logpin";
+/// The bus mirror's alias key, its durable copy ([`StateDir::logkey`]).
+pub(crate) const LOGKEY: &str = "logkey";
+/// The floor of the bus mirror's lifetime total ([`StateDir::logfloor`]).
+pub(crate) const LOGFLOOR: &str = "logfloor";
+
+/// What [`StateDir::reconcile_logpin`] did with the mirror's pin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Reconciled {
+    /// Nothing: no unclean stop in an earlier boot, no floor, a whole pin at
+    /// or above the floor, or a torn one the copies cannot be shown to cover.
+    Kept,
+    /// A whole pin's total, below the floor, rewritten at it.
+    Raised { from: u64, to: u64 },
+    /// A torn pin moved into the quarantine, and a whole one written from
+    /// the copies in its place.
+    SetAside(SetAside),
+    /// No pin: a whole one written from the copies.
+    Restored,
+}
+
+/// The rules [`StateDir::reconcile_logpin`] applies; the simulation's negative
+/// controls switch one off ([`StateDir::reconcile_logpin_with`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PinRules {
+    /// A torn pin is moved aside.
+    pub set_aside_torn: bool,
+    /// Where the pin cannot say, the total is the floor's: a whole pin's
+    /// below it raised to it, a pin written from the copies at it.
+    pub total_from_floor: bool,
+    /// A torn pin is moved aside only where `logkey` holds a key.
+    pub need_key: bool,
+}
+
+impl PinRules {
+    /// Every rule on: what ships.
+    pub(crate) const ALL: Self = Self {
+        set_aside_torn: true,
+        total_from_floor: true,
+        need_key: true,
+    };
+}
+
 /// What a whole in-flight entry retired after an unclean stop in an earlier
 /// boot ([`StateDir::retire_in_flight_of_an_earlier_boot`], finding F2) is
 /// named with in [`QUARANTINE`], before its path: `retired.inflight.<seq>`.
@@ -1409,6 +1576,7 @@ impl StateDir {
             root,
             disk,
             unflushed: std::sync::Mutex::default(),
+            logpin_fence: std::sync::Mutex::default(),
             #[cfg(test)]
             ops: std::sync::Mutex::default(),
             #[cfg(test)]
@@ -1530,26 +1698,346 @@ impl StateDir {
     /// THE BUS MIRROR'S PIN (`logpin`, session log phase 4,
     /// [`crate::mirror::Pin`]): the one batch in flight and the node's total
     /// of mirrored bytes. Absent on a node that never mirrored; a bridge with
-    /// `[fabric] log = "off"` never reads or writes it. Read with the
-    /// missing-versus-damaged rule every reservation is.
+    /// `[fabric] log = "off"` never reads or writes it (save the first bridge
+    /// after an unclean stop in an earlier boot, [`StateDir::reconcile_logpin`]).
+    /// Read with the missing-versus-damaged rule every reservation is.
     ///
     /// # Errors
     ///
     /// A pin that exists and cannot be read.
     pub(crate) fn logpin(&self) -> io::Result<Option<String>> {
-        self.read_reservation("logpin")
+        self.read_reservation(LOGPIN)
     }
 
     /// Replace `logpin` whole, atomically, 0600 (it holds record bytes, as
-    /// `inflight/` does). Not flushed: a power loss ends what it pairs with
-    /// (the endpoint's rings), and losing it costs at most one batch taken
-    /// again at fresh sequences — a second copy each reader dedupes.
+    /// `inflight/` does). Not flushed, but at a clean stop
+    /// ([`StateDir::end_run_clean`]): a power loss ends what its batch pairs
+    /// with (the endpoint's rings), and losing it costs at most one batch taken
+    /// again at fresh sequences — a second copy each reader dedupes. What it
+    /// holds that no reboot ends has its durable copies, `logkey` and
+    /// `logfloor`.
+    ///
+    /// SAVE THE FIRST OF THIS OPEN: a pin this open has not established as
+    /// this build's (`v=2`, [`crate::mirror::Pin::by_this_build`]) durably —
+    /// or one removed, replaced or left uncertain by an error — is written
+    /// DURABLY, so no power cut can bring back a pin an older build reads (it refuses a `v=2`
+    /// one): an older build that ran next would mirror under its key past a
+    /// floor it never raises, or mint a second key where it found none. Once
+    /// per open and after uncertainty; later own replacements stay atomic.
     ///
     /// # Errors
     ///
     /// The write's.
     pub(crate) fn set_logpin(&self, text: &str) -> io::Result<()> {
-        self.replace_bytes("logpin", text.as_bytes(), false, 0o600)
+        let mut known = self.logpin_fence.lock().unwrap_or_else(|e| e.into_inner());
+        let durable = !self.logpin_fence_known(&mut known);
+        self.replace_logpin(text, &mut known, durable)
+    }
+
+    /// Establish the current pin's v=2 fence before a copy, take or send.
+    /// A visible v=2, even across a reopen, may be a failed post-rename
+    /// flush. Render/write only when this open lacks successful admission.
+    pub(crate) fn ensure_logpin_durable(&self, text: impl FnOnce() -> String) -> io::Result<()> {
+        let mut known = self.logpin_fence.lock().unwrap_or_else(|e| e.into_inner());
+        if self.logpin_fence_known(&mut known) {
+            return Ok(());
+        }
+        self.replace_logpin(&text(), &mut known, true)
+    }
+
+    fn logpin_fence_known(&self, known: &mut Option<std::fs::File>) -> bool {
+        use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+        let matches = known.as_ref().is_some_and(|held| {
+            let Ok(meta) = held.metadata() else {
+                return false;
+            };
+            let mut head = [0u8; crate::mirror::PIN_HEADER.len() + 1];
+            meta.is_file()
+                && Some((meta.dev(), meta.ino())) == self.logpin_identity()
+                && held
+                    .read_at(&mut head, 0)
+                    .ok()
+                    .is_some_and(|n| crate::mirror::Pin::by_this_build(&head[..n]))
+        });
+        if matches {
+            return true;
+        }
+        *known = None;
+        false
+    }
+
+    fn logpin_identity(&self) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::symlink_metadata(self.path(LOGPIN)).ok()?;
+        meta.is_file().then(|| (meta.dev(), meta.ino()))
+    }
+
+    fn retained_logpin(&self) -> Option<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(self.path(LOGPIN))
+            .ok()?;
+        file.metadata().ok()?.is_file().then_some(file)
+    }
+
+    fn replace_logpin(
+        &self,
+        text: &str,
+        known: &mut Option<std::fs::File>,
+        durable: bool,
+    ) -> io::Result<()> {
+        // Keep the predecessor's inode alive through the whole replace and
+        // successor admission. Every error still leaves the cache empty.
+        let previous = known.take();
+        self.replace_bytes(LOGPIN, text.as_bytes(), durable, 0o600)?;
+        if crate::mirror::Pin::by_this_build(text.as_bytes()) {
+            *known = self.retained_logpin();
+        }
+        drop(previous);
+        Ok(())
+    }
+
+    /// Whether `logpin`, whole or torn, begins as an OLDER BUILD'S pin
+    /// ([`crate::mirror::Pin::by_an_older_build`]), which the durable copies
+    /// need not cover; a file that is not there or does not read is not one.
+    pub(crate) fn logpin_by_an_older_build(&self) -> bool {
+        self.logpin_head()
+            .is_some_and(|head| crate::mirror::Pin::by_an_older_build(&head))
+    }
+
+    /// The first bytes of `logpin`, enough to name its version; `None` where
+    /// it is not a regular file or does not read.
+    fn logpin_head(&self) -> Option<Vec<u8>> {
+        use std::io::Read as _;
+        let path = self.path(LOGPIN);
+        if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+            return None;
+        }
+        let file = std::fs::File::open(&path).ok()?;
+        let mut head = Vec::new();
+        file.take(crate::mirror::PIN_HEADER.len() as u64 + 1)
+            .read_to_end(&mut head)
+            .ok()?;
+        Some(head)
+    }
+
+    /// THE BUS MIRROR'S ALIAS KEY, its durable copy (`logkey`, ruling Q6):
+    /// 32 hex digits and a newline, written once ([`StateDir::set_logkey`])
+    /// before the first take that names the key, so no alias derived from it
+    /// is on the bus before the key is on the media. `None` where no bridge
+    /// of this build has named one yet (a pin an older build wrote may hold
+    /// it, `key=`).
+    ///
+    /// # Errors
+    ///
+    /// One that exists and cannot be read, or does not read as one key: it is
+    /// written durably, so no power cut tears it, and damage is a bug's or a
+    /// hand's — the mirror stops on it rather than mint a second key.
+    pub(crate) fn logkey(&self) -> io::Result<Option<[u8; 16]>> {
+        let Some(text) = self.read_reservation(LOGKEY)? else {
+            return Ok(None);
+        };
+        let mut key = [0u8; 16];
+        match text.strip_suffix('\n') {
+            Some(hex)
+                if hex.len() == 32 && aterm_codec::hex::decode_into(hex.as_bytes(), &mut key) =>
+            {
+                Ok(Some(key))
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{} does not read as one alias key",
+                    self.path(LOGKEY).display()
+                ),
+            )),
+        }
+    }
+
+    /// Write `logkey` DURABLY, 0600 (it is the secret the edges' aliases are
+    /// keyed by): the temp flushed, then the directory. Once per node, before
+    /// the first take that names the key ([`StateDir::logkey`]).
+    ///
+    /// # Errors
+    ///
+    /// The write's or a flush's.
+    pub(crate) fn set_logkey(&self, key: &[u8; 16]) -> io::Result<()> {
+        self.replace(LOGKEY, &aterm_codec::hex::encode_lower(key), true, 0o600)
+    }
+
+    /// THE FLOOR OF THE MIRROR'S LIFETIME TOTAL (`logfloor`, ruling Q13): at
+    /// or above every body byte this node's mirror ever sent, because it is
+    /// raised past a batch's bytes before any byte of the batch is sent
+    /// ([`StateDir::raise_logfloor`]). The total a bridge resumes at when the
+    /// pin cannot say (it is gone, or a power cut may have rolled it back):
+    /// never below what was counted. `None` where no bridge of this build
+    /// has sent a batch.
+    ///
+    /// # Errors
+    ///
+    /// One that exists and cannot be read, or does not read as one number:
+    /// durable, so damage is a bug's or a hand's.
+    pub(crate) fn logfloor(&self) -> io::Result<Option<u64>> {
+        let Some(text) = self.read_reservation(LOGFLOOR)? else {
+            return Ok(None);
+        };
+        text.strip_suffix('\n')
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|n| n.parse().ok())
+            .map(Some)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{} does not read as one floor",
+                        self.path(LOGFLOOR).display()
+                    ),
+                )
+            })
+    }
+
+    /// RAISE `logfloor` to `top`, DURABLY — never lower it: a floor at or
+    /// above `top` already is kept as it is, and nothing is written. Answers
+    /// the floor the media now holds.
+    ///
+    /// # Errors
+    ///
+    /// The floor's read ([`StateDir::logfloor`]: one that does not read is
+    /// never written over), the write's or a flush's.
+    pub(crate) fn raise_logfloor(&self, top: u64) -> io::Result<u64> {
+        match self.logfloor()? {
+            Some(floor) if floor >= top => Ok(floor),
+            _ => {
+                self.replace(LOGFLOOR, &top.to_string(), true, 0o666)?;
+                Ok(top)
+            }
+        }
+    }
+
+    /// RULING Q6 AND Q13 ACROSS A POWER CUT: AFTER AN UNCLEAN STOP IN AN
+    /// EARLIER BOOT ([`StateDir::torn_files_possible`]), THE MIRROR'S PIN IS
+    /// RECONCILED WITH ITS DURABLE COPIES — its floor on the media
+    /// (`logfloor`) and its key (`logkey`), which a bridge of this build
+    /// writes before any take names the key and before any byte of a batch is
+    /// sent.
+    ///
+    /// The pin is atomic only, so the cut may have left it ROLLED BACK (an
+    /// older whole version, whose total is below what was counted since) or
+    /// TORN (not provably whole: [`crate::mirror::Pin::parse`] refuses
+    /// exactly that). So, where the dir holds a floor:
+    ///
+    /// - a whole pin whose total is below the floor is rewritten at the floor,
+    ///   its batch and key kept (the batch is republished at its pinned
+    ///   sequences, as after a kill). Nothing tells the newest pin from an
+    ///   older one, so this is every such reboot's, and the floor's lease
+    ///   ([`crate::mirror::FLOOR_LEASE_BYTES`]) is counted as mirrored;
+    /// - a torn one, where `logkey` holds the key, is MOVED ASIDE, never
+    ///   deleted — its exact bytes into [`QUARANTINE`] as `quarantine/logpin`,
+    ///   durably, before its name is unlinked
+    ///   ([`StateDir::move_into_quarantine`]) — and a WHOLE PIN IS WRITTEN FROM
+    ///   THE COPIES IN ITS PLACE (no batch, `logkey`'s key, the floor as its
+    ///   total), durably ([`StateDir::set_logpin`]): the mirror resumes from it,
+    ///   its lost batch taken again where its sessions still are, a copy each
+    ///   reader dedupes (what an older whole version always cost), and an
+    ///   older build that runs here before this one pins again refuses it
+    ///   rather than find no pin and mint a second key;
+    /// - an absent one has that whole pin written in its place too (a bridge
+    ///   killed between the move and the write, or a pin whose first write
+    ///   the cut took).
+    ///
+    /// NOTHING is moved where the copies cannot be shown to cover the pin: no
+    /// floor (no bridge of this build sent a batch here, so the pin an older
+    /// build wrote holds the node's only key and total); a torn pin with no
+    /// key in `logkey` (it may hold the only copy of one); and a torn pin that
+    /// begins as an OLDER BUILD'S ([`crate::mirror::Pin::by_an_older_build`]:
+    /// it wrote past a floor it does not raise). There the torn pin stays
+    /// where the mirror refuses it and stops, naming what a person does.
+    /// Within one boot, after a clean stop (which flushed the pin,
+    /// [`StateDir::end_run_clean`]) and where no boot can be told from
+    /// another, nothing is changed either: damage there is a bug's, and the
+    /// mirror stops on it.
+    ///
+    /// WHATEVER THE `[fabric] log` MODE: a pin and a floor exist only where a
+    /// mirror ran, and the next bridge of this boot to turn it on must find
+    /// the pin reconciled, because no later start of the boot can tell the
+    /// cut. Run by the first bridge of the boot, after
+    /// [`StateDir::set_aside_torn`] and before [`StateDir::begin_run`] ends
+    /// the verdict, so a bridge killed part-way leaves the next in the same
+    /// one (idempotent: a raised pin is at the floor, a moved one is gone and
+    /// its place holds the whole pin, or none, which the next writes).
+    ///
+    /// # Errors
+    ///
+    /// The verdict's, the floor's or the key's read, the pin's read, its
+    /// rewrite, its move or its replacement's write: what was not done is
+    /// the mirror's to refuse, as before.
+    pub(crate) fn reconcile_logpin(&self) -> io::Result<Reconciled> {
+        self.reconcile_logpin_by(PinRules::ALL)
+    }
+
+    /// TEST-ONLY: [`StateDir::reconcile_logpin`] with one of its rules off —
+    /// the simulation's negative controls (`Mutant::KeepTornPin`,
+    /// `Mutant::KeyInThePinAlone`, `Mutant::TotalInThePinAlone`).
+    #[cfg(test)]
+    pub(crate) fn reconcile_logpin_with(&self, rules: PinRules) -> io::Result<Reconciled> {
+        self.reconcile_logpin_by(rules)
+    }
+
+    fn reconcile_logpin_by(&self, rules: PinRules) -> io::Result<Reconciled> {
+        if !self.torn_files_possible()? {
+            return Ok(Reconciled::Kept);
+        }
+        let Some(floor) = self.logfloor()? else {
+            return Ok(Reconciled::Kept);
+        };
+        let key = self.logkey()?;
+        // The pin written from the copies: no batch, the key, the floor.
+        let from_the_copies = || crate::mirror::Pin {
+            key,
+            total: if rules.total_from_floor { floor } else { 0 },
+            ..crate::mirror::Pin::default()
+        };
+        let path = self.path(LOGPIN);
+        match std::fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                self.set_logpin(&from_the_copies().render())?;
+                return Ok(Reconciled::Restored);
+            }
+            Err(e) => return Err(e),
+            Ok(meta) if !meta.is_file() => return Ok(Reconciled::Kept),
+            Ok(_) => {}
+        }
+        let bytes = std::fs::read(&path)?;
+        match std::str::from_utf8(&bytes)
+            .ok()
+            .map(crate::mirror::Pin::parse)
+        {
+            Some(Ok(mut pin)) => {
+                if !rules.total_from_floor || pin.total >= floor {
+                    return Ok(Reconciled::Kept);
+                }
+                let from = pin.total;
+                pin.total = floor;
+                self.set_logpin(&pin.render())?;
+                Ok(Reconciled::Raised { from, to: floor })
+            }
+            _ if !rules.set_aside_torn
+                || (rules.need_key && key.is_none())
+                || crate::mirror::Pin::by_an_older_build(&bytes) =>
+            {
+                Ok(Reconciled::Kept)
+            }
+            _ => {
+                let moved = self.move_into_quarantine(&[(LOGPIN.to_string(), bytes)], "")?;
+                let Some(moved) = moved.into_iter().next() else {
+                    return Ok(Reconciled::Kept);
+                };
+                self.set_logpin(&from_the_copies().render())?;
+                Ok(Reconciled::SetAside(moved))
+            }
+        }
     }
 
     pub(crate) fn post_pin(&self, sid: &str, id: u64) -> io::Result<Option<PublishPin>> {
@@ -1775,6 +2263,25 @@ impl StateDir {
     /// write's own, so nothing can read it half written, and a second `write`
     /// for the newline was one more system call on every replace.
     fn replace_bytes(&self, name: &str, bytes: &[u8], durable: bool, mode: u32) -> io::Result<()> {
+        let flush = durable.then_some(aterm_durable::Flush::Durable);
+        self.replace_bytes_as(name, bytes, flush, mode)
+    }
+
+    /// [`StateDir::replace_bytes`] finished by `flush` (`aterm_durable`'s two):
+    /// none; [`aterm_durable::Flush::Durable`], the temp flushed before the
+    /// rename and the directory after it, on the media on return; or
+    /// [`aterm_durable::Flush::Ordered`], the temp's data flushed by the
+    /// barrier before the rename — so the name never reaches the media before
+    /// its bytes, whole — and the rename left to a later flush of the
+    /// directory, the caller's: the clean stop's record
+    /// ([`StateDir::end_run_clean`]), whose root is flushed in full next.
+    fn replace_bytes_as(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        flush: Option<aterm_durable::Flush>,
+        mode: u32,
+    ) -> io::Result<()> {
         #[cfg(test)]
         self.refused_by_a_test(name)?;
         let target = self.path(name);
@@ -1782,26 +2289,23 @@ impl StateDir {
         let w = crate::fx::Write::Replace {
             path: &target,
             bytes,
-            durable,
+            flush,
             mode,
         };
         self.disk.before(w)?;
         std::fs::create_dir_all(parent)?;
         let (tmp, mut f) = crate::enable::create_temp_beside(&target, mode)?;
+        let durable = flush == Some(aterm_durable::Flush::Durable);
         self.count(|ops| {
             ops.replaces += 1;
             ops.renames += 1;
             ops.fsyncs += 2 * u64::from(durable);
+            ops.barriers += u64::from(flush == Some(aterm_durable::Flush::Ordered));
         });
-        let flush = durable && flushes_media();
         let staged = (|| {
             f.write_all(bytes)?;
-            if flush {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "aterm-link's flushes are the Ordered-tier work's to classify; the full flush is kept until then"
-                )]
-                f.sync_all()?;
+            if let Some(flush) = flush.filter(|_| flushes_media()) {
+                flush.file(&f)?;
             }
             drop(f);
             std::fs::rename(&tmp, &target)
@@ -1812,14 +2316,18 @@ impl StateDir {
         }
         if durable {
             self.kill_point(IncStep::Renamed)?;
-            if flush {
+            if flushes_media() {
                 sync_dir(parent)?;
             }
         }
         self.disk.after(w);
         // A file of a [`TornKind`] left unflushed is one a clean stop flushes
-        // ([`StateDir::end_run_clean`]); a durable replace has flushed it.
-        if TornKind::of(name).is_some() {
+        // ([`StateDir::end_run_clean`]), and so is the mirror's pin, so a pin
+        // found damaged after a clean stop is a bug's, never a power cut's; a
+        // durable replace has flushed it. An ordered one (none of these
+        // kinds is written so: only the clean stop's record) is the media's
+        // only once a later flush is, so it settles nothing.
+        if TornKind::of(name).is_some() || name == LOGPIN {
             let mut unflushed = self.unflushed.lock().unwrap_or_else(|e| e.into_inner());
             if durable {
                 unflushed.remove(name);
@@ -1978,6 +2486,40 @@ impl StateDir {
     /// [`on_boot_volume`]).
     #[cfg(not(unix))]
     pub(crate) fn inc_file(&self) -> Option<IncFile> {
+        None
+    }
+
+    /// THE MARK THIS STATE DIR'S BRIDGES PUT ON EVERY PRESENCE ROW OF A SESSION
+    /// THEY WRITE ([`PRESENCE_MARK`], the module doc's "Whose row it is"):
+    /// sixteen hex digits of FNV-1a/64 over the kernel boot identity, `node`
+    /// and the dir's own device and inode. `None` without either identity —
+    /// and then no row is ever the dir's by its mark. Read, never stored,
+    /// so a copy of the dir (which keeps the bytes and gets a directory of its
+    /// own) has a mark of its own, and a dir renamed within its volume keeps
+    /// its mark IN THE SAME BOOT. A cloned machine can repeat device and inode,
+    /// so a different boot must differ even for those same local names. A fixed
+    /// versioned hash lets an update within a boot read its predecessor's rows;
+    /// the previous, unqualified hash is deliberately not adopted. A witnessed
+    /// will carries its writer's mark too: the incarnation alone can alias.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) fn mark(&self, node: &str) -> Option<String> {
+        use std::os::unix::fs::MetadataExt;
+        let boot = self.kernel_boot()?;
+        let dir = std::fs::metadata(&self.root).ok()?;
+        let named = format!(
+            "aterm-link boot state dir {} {node} {}:{}",
+            aterm_codec::hex::encode_lower(&boot),
+            dir.dev(),
+            dir.ino()
+        );
+        Some(format!("{:016x}", aterm_hash::fnv1a_64(named.as_bytes())))
+    }
+
+    /// No inode to name: no mark, and no row is ever the dir's by one.
+    #[cfg(not(unix))]
+    #[must_use]
+    pub(crate) fn mark(&self, _node: &str) -> Option<String> {
         None
     }
 
@@ -2410,10 +2952,62 @@ impl StateDir {
     /// Flush the directory `dir` through the dir's door ([`crate::fx::Disk`]), so
     /// every entry change in it (an unlink, a rename) survives a power loss.
     fn flush_dir(&self, dir: &Path) -> io::Result<()> {
-        let w = crate::fx::Write::SyncDir { path: dir };
+        self.flush_dir_as(dir, aterm_durable::Flush::Durable)
+    }
+
+    /// FLUSH THE FILE `rel` WHERE IT IS, its bytes as they stand, by `flush`
+    /// ([`StateDir::end_run_clean`]'s): no copy is written and nothing is
+    /// renamed, so its mode, its bytes and its name are the ones the run left,
+    /// and only what the page cache still holds of it is written. Its name is
+    /// its directory's flush's. `false` when there is no regular file there:
+    /// gone since, or a directory or FIFO planted at the name (opened without
+    /// waiting, never flushed through). A link or a socket planted at the name
+    /// is refused by the open itself (`O_NOFOLLOW`: `ELOOP`; a socket does not
+    /// open) and is the error, so the stop that met it leaves `run` open and
+    /// claims no clean stop. The caller looks first and passes over what is
+    /// not a regular file then ([`StateDir::end_run_clean`]), so only an
+    /// occupant planted between that look and this open is refused here.
+    fn flush_in_place(&self, rel: &str, flush: aterm_durable::Flush) -> io::Result<bool> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        #[cfg(test)]
+        self.refused_by_a_test(rel)?;
+        let path = self.path(rel);
+        let w = crate::fx::Write::Flush { path: &path, flush };
         self.disk.before(w)?;
-        self.count(|ops| ops.fsyncs += 1);
-        sync_dir(dir)?;
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(crate::enable::LOCK_OPEN_FLAGS)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        if !file.metadata()?.is_file() {
+            return Ok(false);
+        }
+        self.count(|ops| match flush {
+            aterm_durable::Flush::Durable => ops.fsyncs += 1,
+            aterm_durable::Flush::Ordered => ops.barriers += 1,
+        });
+        if flushes_media() {
+            flush.file(&file)?;
+        }
+        self.disk.after(w);
+        Ok(true)
+    }
+
+    /// [`StateDir::flush_dir`] with `flush`: on the media on return, or
+    /// ordered ahead of every later write on the device (the barrier, a clean
+    /// stop's, [`StateDir::end_run_clean`]).
+    fn flush_dir_as(&self, dir: &Path, flush: aterm_durable::Flush) -> io::Result<()> {
+        let w = crate::fx::Write::SyncDir { path: dir, flush };
+        self.disk.before(w)?;
+        self.count(|ops| match flush {
+            aterm_durable::Flush::Durable => ops.fsyncs += 1,
+            aterm_durable::Flush::Ordered => ops.barriers += 1,
+        });
+        sync_dir_as(dir, flush)?;
         self.disk.after(w);
         Ok(())
     }
@@ -2727,6 +3321,47 @@ impl StateDir {
         self.move_into_quarantine(&whole, RETIRED_PREFIX)
     }
 
+    /// HOW MANY TORN FILES THE QUARANTINE STILL HOLDS: every regular file in
+    /// [`QUARANTINE`] a sweep set aside ([`StateDir::set_aside_torn`], and the
+    /// mirror's pin, [`StateDir::reconcile_logpin`]) and the owner has not yet
+    /// removed or moved back — never a whole in-flight entry an earlier boot
+    /// left ([`RETIRED_PREFIX`], told to nobody), nor a hidden temp a move
+    /// stages. `None` where there is no quarantine: nothing was ever set aside
+    /// in this dir. It is the owner's to empty, and what tells aterm that the
+    /// fact it filed for the owner's look has ended (`Bridge::tell_quarantine`).
+    ///
+    /// # Errors
+    ///
+    /// The quarantine's name holds something that is not a real directory (a
+    /// link or a file planted there), or it cannot be listed.
+    pub(crate) fn quarantined_torn(&self) -> io::Result<Option<u64>> {
+        let quarantine = self.path(QUARANTINE);
+        match std::fs::symlink_metadata(&quarantine) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+            Ok(meta) if !meta.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not a directory", quarantine.display()),
+                ));
+            }
+            Ok(_) => {}
+        }
+        let mut torn = 0u64;
+        for entry in std::fs::read_dir(&quarantine)? {
+            let entry = entry?;
+            let named = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| !n.starts_with('.') && !n.starts_with(RETIRED_PREFIX));
+            // `DirEntry::file_type` does not follow a link: a link is none.
+            if named && entry.file_type()?.is_file() {
+                torn += 1;
+            }
+        }
+        Ok(Some(torn))
+    }
+
     /// MOVE EACH `(path inside the dir, its bytes)` INTO [`QUARANTINE`], NEVER
     /// DELETED: its exact bytes at `quarantine/<prefix><path with / as .>` (a
     /// `.<n>` added past a name taken, never over another), DURABLY, mode 0600;
@@ -2808,7 +3443,7 @@ impl StateDir {
         let w = crate::fx::Write::Replace {
             path: &target,
             bytes,
-            durable: true,
+            flush: Some(aterm_durable::Flush::Durable),
             mode: 0o600,
         };
         self.disk.before(w)?;
@@ -2843,14 +3478,15 @@ impl StateDir {
     /// OPEN, durably — so a power cut from here on is judged unclean by the
     /// first bridge of the next boot ([`StateDir::torn_files_possible`]). One
     /// durable write at the first start in a boot and at the first after a
-    /// clean stop; none at a start after a kill in the same boot, whose record
-    /// already says so.
+    /// clean stop; none at a start after a kill or a handoff in the same boot
+    /// (`Bridge::end_run`: a seamless update's successor goes on with the run),
+    /// whose record already says so.
     ///
     /// And what this run must flush before it may say it stopped cleanly
     /// ([`StateDir::end_run_clean`]): what it writes itself, and — unless the
     /// last run stopped cleanly or ran in another boot, so the media holds every
     /// such file there now — every one already here, which a predecessor killed
-    /// in this boot may have left unflushed.
+    /// in this boot may have left unflushed; the mirror's pin among them.
     ///
     /// # Errors
     ///
@@ -2858,7 +3494,7 @@ impl StateDir {
     /// Invalid or unreadable marker evidence is not replaced, and no marker is
     /// removed to force a legacy fallback. A write may already have progressed
     /// before an I/O error; uncertainty must remain fail-closed.
-    pub(crate) fn begin_run(&self) -> io::Result<()> {
+    pub(crate) fn begin_run(&self) -> io::Result<Flushed> {
         let now = self.kernel_boot();
         let last = self.last_run()?;
         let on_the_media = last.is_some_and(|run| {
@@ -2870,40 +3506,93 @@ impl StateDir {
         };
         if !on_the_media {
             let here = self.torn_kind_files()?;
+            let pin = std::fs::symlink_metadata(self.path(LOGPIN))
+                .is_ok_and(|meta| meta.is_file())
+                .then(|| LOGPIN.to_string());
             self.unflushed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .extend(here.into_iter().map(|(_, _, rel)| rel));
+                .extend(here.into_iter().map(|(_, _, rel)| rel).chain(pin));
         }
+        let mut flushed = Flushed::default();
         if last != Some(open) {
             self.write_durable("run", &open.render())?;
+            flushed.full += 2;
         }
-        Ok(())
+        Ok(flushed)
     }
 
     /// A CLEAN STOP: every file of a [`TornKind`] this run must flush
-    /// ([`StateDir::begin_run`]) rewritten DURABLY with its own bytes and mode,
+    /// ([`StateDir::begin_run`]), and the mirror's pin, flushed where it is,
     /// every such directory flushed (an unlink made since is kept), and only
-    /// then `run` says the run stopped cleanly, durably. A power cut from then
-    /// until the next bridge's [`StateDir::begin_run`] tears none of them, so
-    /// the first bridge of the next boot sets nothing aside: damage it finds
-    /// is a bug's, refused where it is read — the promise astream's clean
-    /// close makes of its log (`BrokerLog::close_clean`).
+    /// then `run` says the run stopped cleanly — on the media, with all of it,
+    /// when this returns. A power cut from then until the next bridge's
+    /// [`StateDir::begin_run`] tears none of them, so the first bridge of the
+    /// next boot sets nothing aside: damage it finds is a bug's, refused where
+    /// it is read — the promise astream's clean close makes of its log
+    /// (`BrokerLog::close_clean`).
     ///
-    /// The last act of a bridge that stops because aterm went away
-    /// (`Bridge::wind_down`), after its last write of those files: two flushes
-    /// a file this run wrote (an entry still in flight, a reservation, a
-    /// session's keys or floors — few at a stop) and one a directory. A bridge
-    /// that dies instead leaves `run` open, and the next boot's sweep runs.
+    /// ORDERED BY THE BARRIER, ENDED BY ONE FULL FLUSH (sim item S6). The law
+    /// needs one order only: `run`=clean never on the media before what it
+    /// vouches for. That is what aterm-durable's barrier
+    /// (`aterm_durable::ordered`, `F_BARRIERFSYNC` on macOS) promises: "A site
+    /// may use this for 'A persists before B' on one device only after
+    /// flushing every descriptor that phase A depends on, including directory
+    /// publications". Phase A is each file flushed where it is by the barrier
+    /// ([`StateDir::flush_in_place`]: its bytes as they stand, nothing copied
+    /// or renamed), then the barrier on every directory whose entries moved —
+    /// the renames that put those bytes at their names, and every unlink this
+    /// run made; the root's too where the mirror's pin was flushed. Phase B is
+    /// the record: its temp flushed by the barrier before its rename (its name
+    /// never on the media ahead of its bytes), and the root flushed in full,
+    /// which puts every write flushed before it on the device on the media too
+    /// ("a successful full flush also persists the earlier, already-flushed
+    /// I/O on its device") — so on return the stop is as durable as it was
+    /// with a full flush at every step. Its recovery, which a barrier's caller
+    /// must name: a power cut before the return leaves either `run` open, and
+    /// the next boot's sweep sets aside whatever it finds torn, or `run` clean
+    /// with every file and unlink under it whole (`sim::tests`'
+    /// `a_clean_stop_keeps_the_runs_files_exactly_under_its_record`: a kill at every
+    /// write and a tearing power cut after it, with the record first, the
+    /// directories unflushed and the files unflushed as its controls). A
+    /// directory on another device than the root, where `run` lives, is the
+    /// barrier's blind spot ("it promises nothing about another volume"): it
+    /// and its files are flushed in full
+    /// ([`aterm_durable::Flush::ordered_if_same_device`]).
+    ///
+    /// The last act of a bridge that stops because aterm went away for good —
+    /// a quit, or aterm gone without a word; never a handoff, whose successor
+    /// goes on with the run (`Bridge::end_run`) — after its last write of
+    /// those files (`Bridge::wind_down`): a barrier a file this run wrote or
+    /// inherited (an entry still in flight, a reservation, a session's keys
+    /// or floors, the mirror's pin) and a directory, one the record's bytes,
+    /// and one full flush. Measured on fabric_world's `handoff_cost` (sixteen
+    /// files, four directories): 38 full flushes in about 147 ms when each
+    /// file was rewritten durably; the CHANGELOG has the numbers since. A
+    /// bridge that dies instead leaves `run` open, and the next boot's sweep
+    /// runs.
     ///
     /// # Errors
     ///
-    /// The first record read, directory admission, rewrite or flush that fails.
+    /// The first record read, directory admission, file flush or directory
+    /// flush that fails.
     /// Invalid marker evidence is left untouched, and paths still needing a
     /// flush remain pending for another attempt. No marker is removed to force
     /// a legacy fallback.
-    pub(crate) fn end_run_clean(&self) -> io::Result<()> {
-        use std::os::unix::fs::PermissionsExt as _;
+    pub(crate) fn end_run_clean(&self) -> io::Result<Flushed> {
+        self.end_run_clean_by(StopRules::ALL)
+    }
+
+    /// TEST-ONLY: [`StateDir::end_run_clean`] with one of its rules off — the
+    /// negative controls of the clean-stop law on the simulated device
+    /// (`sim::tests`' `a_clean_stop_keeps_the_runs_files_exactly_under_its_record`).
+    #[cfg(test)]
+    pub(crate) fn end_run_clean_with(&self, rules: StopRules) -> io::Result<Flushed> {
+        self.end_run_clean_by(rules)
+    }
+
+    fn end_run_clean_by(&self, rules: StopRules) -> io::Result<Flushed> {
+        use aterm_durable::Flush;
         let _ = self.last_run()?;
         let dirs: Vec<PathBuf> = TornKind::ALL
             .into_iter()
@@ -2914,29 +3603,69 @@ impl StateDir {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        // A barrier orders only its own device's I/O: a directory elsewhere
+        // than the root, where `run` lives, is flushed in full, and so are
+        // its files.
+        let tier = |dir: &Path| Flush::ordered_if_same_device(dir, &self.root);
+        let mut flushed = Flushed::default();
+        if !rules.record_last {
+            self.write_clean_record(&mut flushed)?;
+        }
+        let mut root_moved = false;
         for rel in &paths {
             let path = self.path(rel);
-            let mode = match std::fs::symlink_metadata(&path) {
+            match std::fs::symlink_metadata(&path) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
                 Ok(meta) if !meta.is_file() => continue,
-                Ok(meta) => meta.permissions().mode() & 0o777,
-            };
-            let bytes = std::fs::read(&path)?;
-            self.replace_bytes(rel, &bytes, true, mode)?;
+                Ok(_) => {}
+            }
+            let parent = path.parent().unwrap_or(&self.root);
+            let flush = tier(parent);
+            if rules.flush_files && self.flush_in_place(rel, flush)? {
+                flushed.files += 1;
+                flushed.note(Some(flush), 1);
+            }
+            root_moved |= parent == self.root;
         }
-        for dir in dirs {
-            self.flush_dir(&dir)?;
+        // Every directory whose entries moved — the renames above, and every
+        // unlink this run made — flushed after them and before the record.
+        if rules.flush_dirs {
+            let root = self.root.clone();
+            for dir in dirs.iter().chain(root_moved.then_some(&root)) {
+                let flush = tier(dir);
+                self.flush_dir_as(dir, flush)?;
+                flushed.dirs += 1;
+                flushed.note(Some(flush), 1);
+            }
         }
-        let clean = LastRun {
-            boot: self.kernel_boot(),
-            clean: true,
-        };
-        self.write_durable("run", &clean.render())?;
+        if rules.record_last {
+            self.write_clean_record(&mut flushed)?;
+        }
         self.unflushed
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|rel| !paths.contains(rel));
+        Ok(flushed)
+    }
+
+    /// `run` says this boot's run stopped cleanly ([`StateDir::end_run_clean`]'s
+    /// last write): its bytes flushed by the barrier before its rename, then
+    /// the root flushed in full — the one full flush of a clean stop, which
+    /// puts the record, and every write flushed before it on the device, on
+    /// the media before it returns.
+    fn write_clean_record(&self, flushed: &mut Flushed) -> io::Result<()> {
+        use aterm_durable::Flush;
+        let clean = LastRun {
+            boot: self.kernel_boot(),
+            clean: true,
+        };
+        let mut record = clean.render().into_bytes();
+        record.push(b'\n');
+        self.replace_bytes_as("run", &record, Some(Flush::Ordered), 0o666)?;
+        flushed.note(Some(Flush::Ordered), 1);
+        self.flush_dir_as(&self.root, Flush::Durable)?;
+        flushed.note(Some(Flush::Durable), 1);
         Ok(())
     }
 
@@ -5400,6 +6129,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&c);
     }
 
+    /// **A STATE DIR'S MARK IS ITS OWN, AND A COPY HAS ANOTHER** (finding F4,
+    /// the module doc's "Whose row it is"): the same dir, opened again or
+    /// renamed within its volume, answers the same mark — so a later bridge
+    /// of it reads the rows an earlier one wrote as the dir's — while a copy
+    /// holding every byte of it, the `node` file included, answers another,
+    /// as does the same dir under another node id. Sixteen hex digits.
+    ///
+    /// Negative control: the mark as a function of the dir's BYTES (here, the
+    /// `node` file the copy shares) answers the same for the copy — what the
+    /// directory's own identity is there to refuse.
+    #[cfg(unix)]
+    #[test]
+    fn a_state_dirs_mark_is_its_own_and_a_copy_has_another() {
+        const NODE: &str = "n-0123456789abcdef";
+        let boot = crate::durability::test_boot(1);
+        let open = |path: &Path| {
+            let state = StateDir::open(path).expect("open the state dir");
+            state.set_inc_seam(IncSeam {
+                boot: Some(Some(boot)),
+                ..IncSeam::default()
+            });
+            state
+        };
+        let (a, c) = (scratch("mark-a"), scratch("mark-c"));
+        let original = open(&a);
+        std::fs::write(a.join("node"), format!("{NODE}\n")).expect("the node");
+        let mark = original
+            .mark(NODE)
+            .expect("a mark where the platform names an inode");
+        assert_eq!(mark.len(), 16, "{mark}");
+        assert!(mark.bytes().all(|b| b.is_ascii_hexdigit()), "{mark}");
+        assert_eq!(
+            open(&a).mark(NODE).as_deref(),
+            Some(mark.as_str()),
+            "the same dir, opened again, is the same dir"
+        );
+        // A COPY: every byte of the dir, in a directory of its own.
+        let copy = open(&c);
+        std::fs::copy(a.join("node"), c.join("node")).expect("copy the node");
+        let copied = copy.mark(NODE).expect("the copy's mark");
+        assert_ne!(copied, mark, "a copy of the dir is another dir");
+        assert_ne!(
+            original.mark("n-fedcba9876543210").as_deref(),
+            Some(mark.as_str()),
+            "another node's"
+        );
+        // A CLONED MACHINE can repeat both local filesystem names. Keep the
+        // very same directory metadata and change only the injected kernel
+        // boot, so this does not pass merely because a local copy got a new inode.
+        original.set_inc_seam(IncSeam {
+            boot: Some(Some(crate::durability::test_boot(2))),
+            ..IncSeam::default()
+        });
+        assert_ne!(original.mark(NODE).as_deref(), Some(mark.as_str()));
+        original.set_inc_seam(IncSeam {
+            boot: Some(None),
+            ..IncSeam::default()
+        });
+        assert_eq!(
+            original.mark(NODE),
+            None,
+            "no boot identity grants no adoption"
+        );
+        original.set_inc_seam(IncSeam {
+            boot: Some(Some(boot)),
+            ..IncSeam::default()
+        });
+        assert_eq!(original.mark(NODE).as_deref(), Some(mark.as_str()));
+        // RENAMED within its volume: the same directory, so the same mark.
+        let moved = scratch("mark-moved");
+        std::fs::rename(&a, &moved).expect("rename the original");
+        assert_eq!(
+            open(&moved).mark(NODE).as_deref(),
+            Some(mark.as_str()),
+            "a rename keeps the dir"
+        );
+        // NEGATIVE CONTROL: a mark of the dir's bytes is the copy's too.
+        let of_bytes = |dir: &Path| {
+            let node = std::fs::read(dir.join("node")).expect("the node");
+            format!("{:016x}", aterm_hash::fnv1a_64(&node))
+        };
+        assert_eq!(
+            of_bytes(&moved),
+            of_bytes(&c),
+            "the copy holds the same bytes"
+        );
+        let _ = std::fs::remove_dir_all(&moved);
+        let _ = std::fs::remove_dir_all(&c);
+    }
+
     /// **THE SHIPPED TRUST DECISION LEASES ON THIS MACHINE**: with no seam, the kernel's
     /// boot session and the dir's own device decide (`trusted_boot`), and on macOS — the
     /// build whose `F_FULLFSYNC` the lease exists to spare — they must vouch for a dir
@@ -6305,13 +7124,76 @@ mod tests {
         }
     }
 
+    /// **THE QUARANTINE'S COUNT IS THE TORN FILES THE OWNER HAS NOT YET TAKEN
+    /// AWAY, AND NOTHING ELSE** ([`StateDir::quarantined_torn`]): what tells
+    /// aterm its entry for the owner's look has ended (`link quarantine
+    /// torn=0`). A dir nothing was set aside in has no quarantine (`None`).
+    /// After boot 1's unclean stop, boot 2's start sets a cut in-flight entry
+    /// aside and retires a whole one: the count is the torn one alone — not
+    /// the retired entry, a hidden temp a move stages, or a link planted
+    /// there. The owner removes the torn file, and the count is 0 while the
+    /// retired entry stays. A file planted at the quarantine's name is refused.
+    #[test]
+    fn the_quarantine_counts_the_torn_files_the_owner_has_not_taken_away() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("held")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let st = StateDir::open(root).expect("open");
+        assert_eq!(st.quarantined_torn().expect("no quarantine reads"), None);
+        st.set_inc_seam(in_boot(1));
+        st.begin_run().expect("boot 1's run");
+        st.set_in_flight(&in_flight_entry(7))
+            .expect("a whole entry");
+        let entry = in_flight_entry(8).render();
+        std::fs::write(
+            root.join("inflight/8"),
+            &entry.as_bytes()[..entry.find("/s-a/").expect("the face") + 3],
+        )
+        .expect("a cut entry");
+        st.set_inc_seam(in_boot(2));
+        assert_eq!(st.set_aside_torn().expect("the sweep").len(), 1);
+        assert_eq!(
+            st.retire_in_flight_of_an_earlier_boot()
+                .expect("the retirement")
+                .len(),
+            1
+        );
+        let quarantine = root.join(QUARANTINE);
+        std::fs::write(quarantine.join(".inflight.9.tmp.1"), b"staged").expect("a temp");
+        std::os::unix::fs::symlink("inflight.8", quarantine.join("a-link")).expect("a link");
+        assert_eq!(
+            st.quarantined_torn().expect("the count"),
+            Some(1),
+            "the torn entry alone"
+        );
+        std::fs::remove_file(quarantine.join("inflight.8")).expect("the owner removes it");
+        assert_eq!(
+            st.quarantined_torn().expect("the count"),
+            Some(0),
+            "none torn left, the retired entry kept"
+        );
+        assert!(quarantine
+            .join(format!("{RETIRED_PREFIX}inflight.7"))
+            .exists());
+        std::fs::remove_dir_all(&quarantine).expect("the owner empties it");
+        std::fs::write(&quarantine, b"planted").expect("a file at the name");
+        assert_eq!(
+            st.quarantined_torn().expect_err("not a directory").kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
     /// **AFTER A CLEAN STOP, DAMAGE IS A BUG'S, AND A REBOOT DOES NOT CHANGE
     /// THAT** — the review of finding F1's fix, against astream's clean close.
     /// A bridge in boot 1 writes a reservation and an in-flight entry and is
     /// killed; its successor in the same boot inherits them unflushed, writes a
-    /// receipt pin, and stops cleanly: every one of the three is rewritten
-    /// durably (and nothing else), then `run` says `clean`. A bug then damages
-    /// the reservation. In boot 2 nothing is set aside and its reader refuses
+    /// receipt pin, and stops cleanly: every one of the three is flushed where
+    /// it is (no copy written, nothing renamed), each directory whose entries
+    /// moved is flushed, and only then is `run` written, saying `clean` — the
+    /// one file the stop writes. A bug then damages the reservation. In boot
+    /// 2 nothing is set aside and its reader refuses
     /// it, fail-closed. NEGATIVE CONTROL: the same run killed instead of
     /// stopped — boot 2 sets the damage aside, as after a power cut.
     #[test]
@@ -6337,10 +7219,7 @@ mod tests {
             st.set_receipt_pin("s-a", 4, &entry.pin)
                 .expect("a receipt pin");
             if clean {
-                st.set_inc_seam(IncSeam {
-                    kill_at: Some(IncStep::Renamed),
-                    ..in_boot(1)
-                });
+                st.refuse_writes_of(Some("sent/s-a.1"));
                 assert!(
                     st.end_run_clean().is_err(),
                     "a controlled failed flush attempt"
@@ -6349,13 +7228,28 @@ mod tests {
                     st.last_run().expect("run reads").map(|run| run.clean),
                     Some(false)
                 );
-                st.set_inc_seam(in_boot(1));
+                st.refuse_writes_of(None);
                 let before = st.ops();
-                st.end_run_clean().expect("a clean stop");
+                let flushed = st.end_run_clean().expect("a clean stop");
+                let ops = st.ops() - before;
                 assert_eq!(
-                    (st.ops() - before).replaces,
-                    4,
-                    "the three files of the two runs, rewritten durably, then `run`"
+                    (ops.replaces, ops.renames),
+                    (1, 1),
+                    "the three files of the two runs flushed where they are: only `run` written"
+                );
+                // ORDERED, ENDED BY ONE FULL FLUSH (sim item S6): a barrier
+                // a file, one a directory whose entries moved (`inflight`,
+                // `sent`, `acks`), one the record's bytes, and the root's full
+                // flush last.
+                assert_eq!((ops.barriers, ops.fsyncs), (3 + 3 + 1, 1));
+                assert_eq!(
+                    flushed,
+                    Flushed {
+                        files: 3,
+                        dirs: 3,
+                        ordered: 7,
+                        full: 1,
+                    }
                 );
                 assert_eq!(
                     st.last_run().expect("run reads").map(|run| run.clean),
@@ -6376,6 +7270,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **WHAT A FLUSH IN PLACE PASSES OVER, AND WHAT IT REFUSES**
+    /// ([`StateDir::flush_in_place`], as its doc says): a regular file is
+    /// flushed where it is (`true`, one barrier); a name gone since and a
+    /// directory planted at it are passed over (`false`, nothing flushed); a
+    /// link planted at it is refused by the no-follow open — the error, so
+    /// the stop that meets one claims nothing clean — and what it names is
+    /// never flushed through.
+    #[test]
+    fn a_flush_in_place_passes_over_what_is_gone_and_refuses_a_link() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("in-place")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let elsewhere = aterm_tempfile::Builder::new()
+            .prefix("in-place-target")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let st = StateDir::open(dir.path()).expect("open");
+        st.set_inc_seam(in_boot(1));
+        st.write("keys/s-a", "k\n").expect("a key file");
+        let flush = aterm_durable::Flush::Ordered;
+        let before = st.ops();
+        assert!(st
+            .flush_in_place("keys/s-a", flush)
+            .expect("a regular file"));
+        assert_eq!((st.ops() - before).barriers, 1, "flushed where it is");
+        let before = st.ops();
+        assert!(!st.flush_in_place("keys/s-b", flush).expect("gone"));
+        std::fs::create_dir(st.path("keys/s-c")).expect("a planted directory");
+        assert!(!st.flush_in_place("keys/s-c", flush).expect("a directory"));
+        let target = elsewhere.path().join("outside");
+        std::fs::write(&target, b"outside").expect("what a link would name");
+        std::os::unix::fs::symlink(&target, st.path("keys/s-d")).expect("a planted link");
+        assert!(
+            st.flush_in_place("keys/s-d", flush).is_err(),
+            "a link is the open's error, never passed over as if gone"
+        );
+        assert_eq!(
+            (st.ops() - before).barriers,
+            0,
+            "nothing passed over or refused is flushed"
+        );
     }
 
     /// **FINDING F2, DECIDED: A WHOLE IN-FLIGHT ENTRY OF AN EARLIER BOOT IS
@@ -6633,11 +7571,12 @@ mod tests {
         assert!(st.post_pin("s-a", 1).is_err(), "refused, fail-closed");
     }
 
-    /// **A TORN `logpin` IS NOT SET ASIDE** — the review of finding F1's fix:
-    /// the pin holds the node's lifetime total of mirrored bytes (ruling Q13's
-    /// cap) and its alias key (ruling Q6), which no reboot ends. Moved aside,
-    /// the next mirror would mint a fresh key and count from zero; left where
-    /// it is, the mirror refuses it and stops, keeping both on disk.
+    /// **THE SWEEP OF THE TORN KINDS NEVER MOVES `logpin`** — the review of
+    /// finding F1's fix: the pin holds the node's lifetime total of mirrored
+    /// bytes (ruling Q13's cap) and its alias key (ruling Q6), which no reboot
+    /// ends, so it is judged with its durable copies, by its own step
+    /// ([`StateDir::reconcile_logpin`]), and with no copies on the media (a dir
+    /// only an older build mirrored in) it stays where the mirror refuses it.
     #[test]
     fn a_torn_logpin_is_left_for_the_mirror_to_refuse() {
         let dir = aterm_tempfile::Builder::new()
@@ -6651,6 +7590,365 @@ mod tests {
         std::fs::write(root.join("logpin"), b"").expect("torn to nothing");
         st.set_inc_seam(in_boot(2));
         assert!(st.set_aside_torn().expect("the sweep").is_empty());
+        assert_eq!(
+            st.reconcile_logpin().expect("the reconcile"),
+            Reconciled::Kept,
+            "no floor on the media: the pin holds the only copies"
+        );
         assert_eq!(st.logpin().expect("read").as_deref(), Some(""));
+    }
+
+    /// A pin of one batch, key `key`, total `total`.
+    fn mirror_pin(key: [u8; 16], total: u64) -> crate::mirror::Pin {
+        crate::mirror::Pin {
+            inc: 1,
+            total,
+            key: Some(key),
+            slots: vec![crate::mirror::PinSlot {
+                pseq: 9,
+                sid: "s-a".to_string(),
+                at: aterm_slog::BusCursor::new(4, 2, 1),
+                body: "v=2 t=1 ep=4 seq=2 ms=1 op=open node=t1 k=turn src=screen conf=strong"
+                    .to_string(),
+            }],
+        }
+    }
+
+    /// **RULINGS Q6 AND Q13 ACROSS A POWER CUT, ON THE REAL FILESYSTEM: A TORN
+    /// PIN WITH ITS DURABLE COPIES IS SET ASIDE AFTER AN UNCLEAN STOP IN AN
+    /// EARLIER BOOT, A WHOLE ONE WRITTEN FROM THEM IN ITS PLACE, AND A WHOLE
+    /// ONE IS RAISED TO THE FLOOR** ([`StateDir::reconcile_logpin`]).
+    ///
+    /// The last bridge ran in boot 1, wrote the alias key to `logkey` and a
+    /// floor to `logfloor` (both durable), pinned a batch, and did not stop
+    /// cleanly; a power cut left the pin cut short of its last bytes. In boot
+    /// 2 the pin is moved into `quarantine/logpin` with its exact bytes, the
+    /// copies stay, and a whole pin written from them, durably, takes its
+    /// place: no batch, the key, the floor — of the version an older build
+    /// refuses, so one that ran here next stops rather than find no pin and
+    /// mint a second key. A second reconcile changes nothing; a pin gone
+    /// again (a bridge killed between the move and the write) is written
+    /// again. A whole pin below the floor is rewritten at the floor, its
+    /// batch and key kept. NEGATIVE CONTROLS: the same torn pin read in boot
+    /// 1 again (a `kill -9`), with no floor on the media, with no key in
+    /// `logkey` (the pin may hold the only copy of one), after a clean stop —
+    /// which flushes the pin — and an OLDER BUILD'S torn pin over the copies
+    /// (it mirrored past a floor it does not raise), each is kept, for the
+    /// mirror to refuse.
+    #[test]
+    fn a_torn_logpin_with_its_copies_is_set_aside_after_an_unclean_stop_and_kept_otherwise() {
+        let key = [0x5a; 16];
+        for (world, key_copy, floor_copy, reboot, clean, older) in [
+            (
+                "an unclean stop, then a reboot",
+                true,
+                true,
+                true,
+                false,
+                false,
+            ),
+            ("a kill, in the same boot", true, true, false, false, false),
+            ("no floor on the media", true, false, true, false, false),
+            ("no key in logkey", false, true, true, false, false),
+            ("a clean stop, then a reboot", true, true, true, true, false),
+            (
+                "an older build's pin over the copies",
+                true,
+                true,
+                true,
+                false,
+                true,
+            ),
+        ] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("logpin")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let st = StateDir::open(root).expect("open");
+            st.set_inc_seam(in_boot(1));
+            st.begin_run().expect("the last bridge's run, in boot 1");
+            st.take_incarnation(0).expect("its attach");
+            if key_copy {
+                st.set_logkey(&key).expect("the key's copy");
+            }
+            if floor_copy {
+                assert_eq!(st.raise_logfloor(5000).expect("the floor"), 5000);
+            }
+            st.set_logpin(&mirror_pin(key, 3000).render())
+                .expect("the first pin");
+            let pin = mirror_pin(key, 4000);
+            st.set_logpin(&pin.render()).expect("the pin");
+            if clean {
+                let before = st.ops();
+                st.end_run_clean().expect("a clean stop");
+                let ops = st.ops() - before;
+                assert_eq!(
+                    (ops.replaces, ops.barriers, ops.fsyncs),
+                    (1, 4, 1),
+                    "{world}: the pin flushed where it is, `sent/` (which every state dir has) \
+                     and the root ordered after it, then `run`'s bytes ordered and the root \
+                     flushed in full"
+                );
+            }
+            let mut text = pin.render();
+            if older {
+                text = text.replacen("logpin v=2", "logpin v=1", 1);
+            }
+            let cut = &text.as_bytes()[..text.len() - 7];
+            std::fs::write(root.join("logpin"), cut).expect("cut short");
+            if reboot {
+                st.set_inc_seam(in_boot(2));
+            }
+            let done = st.reconcile_logpin().expect("the reconcile");
+            if world == "an unclean stop, then a reboot" {
+                assert_eq!(
+                    done,
+                    Reconciled::SetAside(SetAside {
+                        from: "logpin".to_string(),
+                        to: format!("{QUARANTINE}/logpin"),
+                    }),
+                    "{world}"
+                );
+                assert_eq!(
+                    std::fs::read(root.join("quarantine/logpin")).expect("kept"),
+                    cut,
+                    "its exact bytes, never deleted"
+                );
+                let placed = st.logpin().expect("reads").expect("a pin in its place");
+                assert!(
+                    crate::mirror::Pin::by_this_build(placed.as_bytes()),
+                    "of the version an older build refuses: {placed:?}"
+                );
+                let from_the_copies = crate::mirror::Pin {
+                    key: Some(key),
+                    total: 5000,
+                    ..crate::mirror::Pin::default()
+                };
+                assert_eq!(
+                    crate::mirror::Pin::parse(&placed),
+                    Ok(from_the_copies.clone()),
+                    "no batch, logkey's key, logfloor's total"
+                );
+                assert!(
+                    !st.unflushed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(LOGPIN),
+                    "written durably: no cut brings back the absence"
+                );
+                assert_eq!(
+                    st.logkey().expect("reads"),
+                    Some(key),
+                    "the key's copy stays"
+                );
+                assert_eq!(
+                    st.logfloor().expect("reads"),
+                    Some(5000),
+                    "so does the floor"
+                );
+                assert_eq!(st.reconcile_logpin().expect("again"), Reconciled::Kept);
+                // Gone again: a bridge killed between the move and the write.
+                std::fs::remove_file(root.join("logpin")).expect("gone");
+                assert_eq!(
+                    st.reconcile_logpin().expect("the reconcile"),
+                    Reconciled::Restored
+                );
+                assert_eq!(
+                    st.logpin()
+                        .expect("reads")
+                        .map(|t| crate::mirror::Pin::parse(&t)),
+                    Some(Ok(from_the_copies)),
+                    "written again"
+                );
+                // A whole pin with a lower total: the newest, or an older one
+                // a cut brought back, which nothing tells apart.
+                st.set_logpin(&mirror_pin(key, 100).render())
+                    .expect("an older pin");
+                assert_eq!(
+                    st.reconcile_logpin().expect("the reconcile"),
+                    Reconciled::Raised {
+                        from: 100,
+                        to: 5000
+                    }
+                );
+                let raised =
+                    crate::mirror::Pin::parse(&st.logpin().expect("reads").expect("a pin"))
+                        .expect("whole");
+                assert_eq!(raised, mirror_pin(key, 5000), "its batch and key kept");
+                assert_eq!(st.reconcile_logpin().expect("again"), Reconciled::Kept);
+            } else {
+                assert_eq!(done, Reconciled::Kept, "{world}");
+                assert_eq!(
+                    st.logpin()
+                        .expect("reads")
+                        .map(String::into_bytes)
+                        .as_deref(),
+                    Some(cut),
+                    "{world}: kept as it is, for the mirror to refuse"
+                );
+                assert!(!root.join(QUARANTINE).exists(), "{world}: nothing moved");
+            }
+        }
+    }
+
+    /// THE FIRST PIN OF EACH OPEN IS DURABLE, THE REST ATOMIC
+    /// ([`StateDir::set_logpin`]): a visible v=2 may be a failed flush, so
+    /// this open establishes its version fence before relying on it. Own
+    /// later replacements stay atomic; an error, reopen, removal, replacement
+    /// or legacy header invalidates that admission.
+    #[test]
+    fn the_first_pin_of_this_build_is_durable_and_the_rest_atomic() {
+        let older = mirror_pin([7; 16], 10)
+            .render()
+            .replacen("logpin v=2", "logpin v=1", 1);
+        for (world, before) in [
+            ("no pin", None),
+            ("an older build's pin", Some(older.as_bytes())),
+            ("damage that names no version", Some(&b"logpin v="[..])),
+            ("this build's pin, torn", Some(&b"logpin v=2 inc=1 n"[..])),
+        ] {
+            let dir = aterm_tempfile::Builder::new()
+                .prefix("logpin")
+                .tempdir_in("/tmp")
+                .expect("scratch");
+            let root = dir.path();
+            let st = StateDir::open(root).expect("open");
+            if let Some(bytes) = before {
+                std::fs::write(root.join("logpin"), bytes).expect("what is there");
+            }
+            let ops = st.ops();
+            st.set_logpin(&mirror_pin([7; 16], 20).render())
+                .expect("the pin");
+            assert_eq!((st.ops() - ops).fsyncs, 2, "{world}");
+            let ops = st.ops();
+            st.set_logpin(&mirror_pin([7; 16], 30).render())
+                .expect("the next");
+            assert_eq!((st.ops() - ops).fsyncs, 0, "{world}: the next is atomic");
+        }
+
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("logpin")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let pin = mirror_pin([7; 16], 40).render();
+        let st = StateDir::open(root).expect("open");
+        st.set_inc_seam(IncSeam {
+            kill_at: Some(IncStep::Renamed),
+            ..Default::default()
+        });
+        assert!(
+            st.set_logpin(&pin).is_err(),
+            "the first flush failed after rename"
+        );
+        assert!(crate::mirror::Pin::by_this_build(
+            &std::fs::read(root.join(LOGPIN)).unwrap()
+        ));
+        st.set_inc_seam(IncSeam::default());
+        let ops = st.ops();
+        st.set_logpin(&pin).expect("retried");
+        assert_eq!((st.ops() - ops).fsyncs, 2, "the retry is still durable");
+        let ops = st.ops();
+        st.ensure_logpin_durable(|| panic!("a known fence needs no render or rewrite"))
+            .expect("already admitted");
+        assert_eq!((st.ops() - ops).replaces, 0);
+
+        let st = StateDir::open(root).expect("reopen");
+        let ops = st.ops();
+        st.ensure_logpin_durable(|| pin.clone())
+            .expect("reestablished after reopen");
+        assert_eq!((st.ops() - ops).fsyncs, 2);
+        for change in ["removed", "replaced", "legacy header"] {
+            let path = root.join(LOGPIN);
+            match change {
+                "removed" => std::fs::remove_file(&path).unwrap(),
+                "replaced" => {
+                    let staged = root.join("other-pin");
+                    std::fs::write(&staged, &pin).unwrap();
+                    std::fs::rename(staged, &path).unwrap();
+                }
+                _ => std::fs::write(&path, pin.replacen("v=2", "v=1", 1)).unwrap(),
+            }
+            let ops = st.ops();
+            st.ensure_logpin_durable(|| pin.clone()).expect(change);
+            assert_eq!(
+                (st.ops() - ops).fsyncs,
+                2,
+                "{change}: admission invalidated"
+            );
+            let ops = st.ops();
+            st.set_logpin(&pin).expect("the next own replacement");
+            assert_eq!(
+                (st.ops() - ops).fsyncs,
+                0,
+                "{change}: later own writes stay atomic"
+            );
+        }
+        st.refuse_writes_of(Some(LOGPIN));
+        assert!(
+            st.set_logpin(&pin).is_err(),
+            "an ordinary atomic write failed"
+        );
+        st.refuse_writes_of(None);
+        let ops = st.ops();
+        st.ensure_logpin_durable(|| pin)
+            .expect("readmitted after the error");
+        assert_eq!(
+            (st.ops() - ops).fsyncs,
+            2,
+            "any write error revokes admission"
+        );
+    }
+
+    /// THE DURABLE COPIES READ BACK, AND THE FLOOR IS ONLY EVER RAISED: a
+    /// raise below the floor writes nothing; a key or floor that does not
+    /// read is refused, never taken as none — and the reconcile that needs
+    /// it moves nothing.
+    #[test]
+    fn the_mirrors_copies_read_back_and_the_floor_is_only_raised() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("copies")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let root = dir.path();
+        let st = StateDir::open(root).expect("open");
+        assert_eq!(st.logkey().expect("none"), None);
+        assert_eq!(st.logfloor().expect("none"), None);
+        st.set_logkey(&[3; 16]).expect("the key");
+        assert_eq!(st.logkey().expect("reads"), Some([3; 16]));
+        assert_eq!(st.raise_logfloor(700).expect("raised"), 700);
+        let before = st.ops();
+        assert_eq!(st.raise_logfloor(600).expect("kept"), 700, "never lowered");
+        assert_eq!((st.ops() - before).replaces, 0, "nothing written");
+        assert_eq!(st.raise_logfloor(900).expect("raised"), 900);
+        assert_eq!(st.logfloor().expect("reads"), Some(900));
+        st.set_inc_seam(in_boot(1));
+        st.begin_run().expect("a run in boot 1");
+        std::fs::write(root.join("logpin"), b"logpin v=2 inc=1 n=0 to").expect("a torn pin");
+        st.set_inc_seam(in_boot(2));
+        for (name, damage) in [("logfloor", &b"90"[..]), ("logkey", &b"03030303\n"[..])] {
+            let good = std::fs::read(root.join(name)).expect("the copy");
+            std::fs::write(root.join(name), damage).expect("damaged");
+            assert_eq!(
+                if name == "logkey" {
+                    st.logkey().map(|_| ()).expect_err("refused").kind()
+                } else {
+                    st.logfloor().map(|_| ()).expect_err("refused").kind()
+                },
+                io::ErrorKind::InvalidData,
+                "{name}"
+            );
+            assert!(
+                st.reconcile_logpin().is_err(),
+                "{name}: no move on a copy that does not read"
+            );
+            assert!(root.join("logpin").exists(), "{name}: the pin stays");
+            std::fs::write(root.join(name), good).expect("repaired");
+        }
+        assert!(matches!(
+            st.reconcile_logpin().expect("the reconcile"),
+            Reconciled::SetAside(_)
+        ));
     }
 }

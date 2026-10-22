@@ -40,6 +40,7 @@ impl<'ev> TypedPress<'ev> {
     /// The brk → backspace → glyphs cascade every feed takes: `on_char` runs
     /// for the bare glyph and for each char of the IME run; `target` threads
     /// the feed's receiver through so no two callbacks borrow it at once.
+    #[inline]
     pub fn feed<T>(
         self,
         target: &mut T,
@@ -59,6 +60,7 @@ impl<'ev> TypedPress<'ev> {
     }
 
     /// The glyphs this press types — the bare glyph, then the IME run.
+    #[inline]
     pub fn chars(self) -> impl Iterator<Item = char> + 'ev {
         self.typed
             .into_iter()
@@ -170,6 +172,7 @@ impl Companions {
     /// detector, and the tone tracker's partial window return to rest while
     /// keeping warmed-up buffers and cooldowns intact. Idempotent: it runs
     /// every frame while Serious Mode holds.
+    #[inline]
     pub fn drain_serious(&mut self) {
         self.cursor_cat = CursorCat::default();
         self.dog_cameo = DogCameo::default();

@@ -1196,7 +1196,7 @@ const SUPERVISE_CLOCK_HOMES: &[&str] = &[
 
 /// How a clock name must sit in a line to be a read.
 #[derive(Clone, Copy)]
-enum ClockShape {
+pub(super) enum ClockShape {
     /// Anywhere (a word): `Instant::now`, `thread::sleep`, called or passed.
     Named,
     /// A free reader: called (`unix_ms(`) or named by a path (`limit::unix_now`,
@@ -1785,12 +1785,12 @@ fn module_path(code: &str, r: &LiveReader<'_>) -> bool {
 }
 
 /// The imports of a file, and the code outside their actual spans.
-struct UseStatements {
+pub(super) struct UseStatements {
     /// Each statement, joined across its lines, with its first line's number.
-    statements: Vec<(usize, String)>,
+    pub(super) statements: Vec<(usize, String)>,
     /// Only lines containing imports, with those spans blanked in place.
     /// Executable statements after their semicolons keep their byte positions.
-    executable: std::collections::BTreeMap<usize, String>,
+    pub(super) executable: std::collections::BTreeMap<usize, String>,
 }
 
 /// Each `use` statement of `file`'s shipped code: a live body imported into a
@@ -1799,7 +1799,7 @@ struct UseStatements {
 /// ([`live_import`]); and so is a clock bound under a name the lines cannot
 /// see ([`use_leaves`]). Only its span through its semicolon is an import:
 /// `use std::thread; thread::sleep(d);` still calls a clock door on that line.
-fn use_statements(file: &SourceFile) -> UseStatements {
+pub(super) fn use_statements(file: &SourceFile) -> UseStatements {
     let mut out = UseStatements {
         statements: Vec::new(),
         executable: std::collections::BTreeMap::new(),
@@ -1838,17 +1838,17 @@ fn use_statements(file: &SourceFile) -> UseStatements {
 }
 
 /// One name a `use` statement — or a `type` alias ([`type_alias`]) — binds.
-struct UseLeaf<'s> {
+pub(super) struct UseLeaf<'s> {
     /// Its whole path, the group prefixes above it joined: `std::thread::sleep`
     /// from `use std::{thread::{self, sleep}};`, and `std::thread` from that
     /// `self`.
-    path: Vec<&'s str>,
+    pub(super) path: Vec<&'s str>,
     /// The name it is bound to when renamed (`as Mono`); `as _` binds nothing
     /// a call can name.
-    alias: Option<&'s str>,
+    pub(super) alias: Option<&'s str>,
     /// A glob (`std::thread::*`): `path` is the module's, and every item of it
     /// is bound bare.
-    glob: bool,
+    pub(super) glob: bool,
 }
 
 /// THE NAMES ONE `use` STATEMENT BINDS, each with its whole path: the line
@@ -1857,7 +1857,7 @@ struct UseLeaf<'s> {
 /// after `use std::time::Instant as Mono;` — a group splits the path from its
 /// item, a rename hides it — so the statement is read as the tree it is,
 /// however it wraps.
-fn use_leaves(stmt: &str) -> Vec<UseLeaf<'_>> {
+pub(super) fn use_leaves(stmt: &str) -> Vec<UseLeaf<'_>> {
     let mut out = Vec::new();
     if let Some(at) = hits(stmt, "use", Bound::Word).next() {
         let tree = stmt[at + 3..].split(';').next().unwrap_or("");
@@ -1930,7 +1930,7 @@ fn top_level_members(group: &str) -> Vec<&str> {
 /// (`type Mono = std::time::Instant;` binds `Instant` as `Mono`, as
 /// `use std::time::Instant as Mono;` does). An alias of anything but a path
 /// (`fn() -> Instant`, a tuple, a generic) binds no clock to call.
-fn type_alias(code: &str) -> Option<UseLeaf<'_>> {
+pub(super) fn type_alias(code: &str) -> Option<UseLeaf<'_>> {
     let at = hits(code, "type", Bound::Word).next()?;
     let head = code[..at].trim();
     if !(head.is_empty() || head.starts_with("pub")) {
@@ -2392,7 +2392,7 @@ fn starts_use(code: &str) -> bool {
 
 /// The first included name that sits in `code` in its shape. An allowed
 /// home read cannot hide another name later on the same line.
-fn first_hit<'a>(
+pub(super) fn first_hit<'a>(
     code: &str,
     names: impl Iterator<Item = &'a (&'static str, ClockShape, &'static str)>,
     include: impl Fn(&str) -> bool,

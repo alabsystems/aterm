@@ -220,6 +220,16 @@ fn require_instance(run: &Run, pid: i32, ops: &mut impl Ops) -> Result<(), Fail>
 /// running), the instance did not end, interrupted, or the relaunch did not
 /// come up.
 fn crash(run: &mut Run, a: &Asked, ops: &mut impl Ops) -> Result<Crashed, Fail> {
+    // A WINDOWED LAB (`forever --window`) is not crashed: the pid it records
+    // may be the keeper that holds its window's lifeline, whose SIGKILL would
+    // leave the window's aterm running beside the relaunch.
+    if crate::lab::windowed(run) {
+        return Err(Fail::usage(format!(
+            "crash: lab '{}' runs its instance in a window (forever --window), whose recorded pid may be its keeper's: \
+             nothing killed (crash a headless lab)",
+            run.tag
+        )));
+    }
     let old = run.instance_pid;
     require_instance(run, old, ops)?;
     ops.witness(run)
@@ -651,6 +661,31 @@ mod tests {
         assert!(did.ended_by_pid.is_empty());
         assert_eq!(f.relaunches().len(), 1);
         assert_eq!((did.up, run.instance_pid), (NEXT, NEXT));
+    }
+
+    /// A WINDOWED LAB IS NEVER CRASHED: its recorded pid may be its window's
+    /// keeper, whose SIGKILL leaves the aterm running. CONTROL: the same lab
+    /// headless is crashed and relaunched.
+    #[test]
+    fn a_windowed_lab_is_never_crashed() {
+        let keep = Asked::default();
+        let mut f = fake();
+        let mut windowed = Run {
+            window: "1".into(),
+            ..lab()
+        };
+        let e = crash(&mut windowed, &keep, &mut f).unwrap_err();
+        assert_eq!(e.code, 2);
+        assert!(e.msg.unwrap_or_default().contains("in a window"));
+        assert!(f.ev.is_empty(), "{:?}", f.ev);
+        let mut f = fake();
+        let mut headless = Run {
+            window: "0".into(),
+            ..lab()
+        };
+        assert!(crash(&mut headless, &keep, &mut f).is_ok());
+        assert_eq!(f.kills().first(), Some(&INSTANCE));
+        assert_eq!(f.relaunches().len(), 1);
     }
 
     /// A RECORDED PID THAT IS NOT THE LAB'S IS NEVER SIGNALLED: the instance

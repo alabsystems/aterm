@@ -859,6 +859,19 @@ pub(crate) fn on_pause(app: &mut App, session: u64, plan: Option<crate::PausePla
     true
 }
 
+/// THE NEED THE CHIP'S TITLE SAYS on session `session` moved (§12.2.3 item 5;
+/// the W4 title slice): its published need's words, the first need and how
+/// many more (`App::publish_need`). The need is no part of the glass — the
+/// title reads it from the published verdict where it is built
+/// (`claude_lights::TitleWords`) — and moves nothing the chip draws at
+/// rest, so only the trail's generation moves: a title someone is reading
+/// is built again ([`ChipGlass::trail`], folded into the footer's term only
+/// while it is read), and a frame at rest keys nothing new.
+pub(crate) fn on_need_words(app: &mut App, session: u64) {
+    let glass = app.harness_glass.entry(session).or_default();
+    glass.trail_gen = glass.trail_gen.wrapping_add(1);
+}
+
 /// LAND'S HOLD of session `session` moved to `held` (`None`: none stands;
 /// `HarnessFact::LandHeld`, §12.3.3 item 3, slice 3c): kept on the
 /// session's glass with its `since` stamped ONCE — its local clock and day,
@@ -929,8 +942,9 @@ impl HeldGlass {
 /// are read, and how much room and which clock that place has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HoldForm {
-    /// The chip's title, after `autopilot: land — ` (the W4 title slice
-    /// wires it): its legs title-safe, its `since` and nudges after ` · `.
+    /// The chip's title, after `autopilot: land — `
+    /// (`claude_lights::ChipFace::explanation`): its legs title-safe, its
+    /// `since` and nudges after ` · `.
     Title,
     /// Settings ▸ Harness's SESSIONS state line: wrapped, never cut, its
     /// clock with its weekday on another day.
@@ -944,16 +958,9 @@ pub(crate) enum HoldForm {
     /// menu keeps ages, composed at paint; the Overview is composed at a
     /// glance's rebuild and read long after).
     Tip,
-    /// The chip's accessibility description's lead (the W4 title slice
-    /// wires it): one sentence a leg, glyph-free.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "built and tested here (slice 3c); the W4 title slice puts it in the \
-                      chip's accessibility description"
-        )
-    )]
+    /// The chip's accessibility description's lead
+    /// (`claude_lights::autopilot_description`): one sentence a leg,
+    /// glyph-free.
     Spoken,
 }
 
@@ -1155,6 +1162,28 @@ fn repo_words(held: LandHeld) -> String {
     }
 }
 
+/// A HARNESS'S NEED IN THE CHIP'S TITLE (§12.2.1, §12.2.3 item 5; the W4
+/// title slice): the state line's head (`needs you: <the need> (+1 more);
+/// carrying on`, `harness_screen::need_head`, the one function that words
+/// it), title-safe, so the worker's own ` · ` and ` — ` never move the
+/// title's cuts ([`crate::claude_lights::lean_titles`]).
+#[must_use]
+pub(crate) fn need_title(ask: &crate::needs::HarnessAsk) -> String {
+    title_safe(&crate::harness_screen::need_head(ask))
+}
+
+/// A HARNESS'S NEED AS A SCREEN READER HEARS IT, in the chip's accessibility
+/// description (§12.2.1; the W4 title slice): the hold's own need sentence
+/// ([`spoken_leg`]: `Needs you: <the need>. And 1 more.`, glyph-free), then
+/// `Carrying on.`, as the entry says the work goes on.
+#[must_use]
+pub(crate) fn need_spoken(ask: &crate::needs::HarnessAsk) -> String {
+    format!(
+        "{} Carrying on.",
+        spoken_leg(LandHeld::default(), HoldLeg::Needs, Some(ask))
+    )
+}
+
 /// A worker's words made safe for the chip's title (§12.2.3 item 6): its
 /// ` · ` and ` — `, which the title reads as its cut marks, become `, `.
 fn title_safe(words: &str) -> String {
@@ -1166,8 +1195,9 @@ fn title_safe(words: &str) -> String {
 /// Words as a screen reader says them (§12.2.3 item 6, the face table's
 /// rule): letters, digits, spaces and `.:,` alone — `&` said `and`, `%`
 /// `percent` and `#` `number` (`#45`, `90%`: words, where dropped they said
-/// nothing), `▸` a comma, a hyphen or a dash a space, anything else dropped
-/// — and the spaces folded.
+/// nothing), `▸` a comma against the word before it (`System Settings,
+/// Privacy and Security`), a hyphen or a dash a space, anything else
+/// dropped — and the spaces folded.
 fn speakable(words: &str) -> String {
     let mut out = String::with_capacity(words.len());
     for c in words.chars() {
@@ -1175,7 +1205,10 @@ fn speakable(words: &str) -> String {
             '&' => out.push_str(" and "),
             '%' => out.push_str(" percent "),
             '#' => out.push_str(" number "),
-            '\u{25b8}' => out.push(','),
+            '\u{25b8}' => {
+                out.truncate(out.trim_end().len());
+                out.push(',');
+            }
             '-' | '\u{2010}'..='\u{2014}' => out.push(' '),
             c if c.is_alphanumeric() || matches!(c, '.' | ':' | ',') => out.push(c),
             c if c.is_whitespace() => out.push(' '),

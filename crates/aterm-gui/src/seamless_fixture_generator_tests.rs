@@ -53,19 +53,10 @@ use super::*;
 /// Keep the installed build stamp and generator environment out of sibling
 /// tests. An explicit destination retains the release caller's required pins;
 /// ordinary tests use the deterministic library stamp and a private directory.
-///
-/// [`ENV_LOCK`] is held while the child is started, so the environment it
-/// inherits holds no sibling's scratch `HOME` or published handoff, and let
-/// go before the wait (`seamless::tests::run_in_children`'s rule): the
-/// child's environment is its own from its start, and holding the lock
-/// through its run parked every test of the module the runner started
-/// meanwhile (the handoff generator, 0.8 s alone, held it 5.7 s in the
-/// `-p aterm-gui --lib` binary).
 fn fx_generator_in_child(output: &str) -> bool {
     if crate::test_alone::in_child() {
         return true;
     }
-    let env_lock = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let scratch = aterm_tempfile::tempdir().expect("private fixture destination");
     let mut vars = vec![];
     let destination = if let Some(out) = std::env::var_os(output) {
@@ -89,9 +80,7 @@ fn fx_generator_in_child(output: &str) -> bool {
     };
     vars.push((output, destination.as_os_str().to_owned()));
     let env: Vec<_> = vars.iter().map(|(k, v)| (*k, v.as_os_str())).collect();
-    let child = crate::test_alone::spawn_alone_with(&env);
-    drop(env_lock);
-    child.passed();
+    crate::test_alone::run_alone_with(&env);
     assert!(
         std::fs::read_dir(&destination)
             .expect("generator destination exists")
@@ -370,7 +359,6 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
         land_at: None,
         control: None,
         frozen_path: false,
-        identity: None,
         topics: Vec::new(),
         // Stamped by the park capture (`fx_write`, as `stamp_fg_holders`).
         fg_holder: None,
@@ -455,7 +443,6 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         icon: None,
         role: None,
         attention: None,
-        identity: None,
         theme: None,
         questions: None,
         autopilot: None,
@@ -478,8 +465,8 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
 /// names: its sid, the first session of the restores it continues (its
 /// lineage) and the epoch its log is at (written by every capture since the
 /// session log's phase 2A and 6A-2), and the operator's
-/// metadata and spawn identity in lockstep with the session's record (both
-/// are drawn from the one `SessionMeta`). A leaf that names no session of
+/// metadata in lockstep with the session's record (drawn from `SessionMeta`).
+/// A leaf that names no session of
 /// the desk keeps what its builder gave it.
 fn fx_capture_leaves(desk: &mut FxDesk) {
     use crate::restore::{RestoredSplitTree, RestoredView};
@@ -528,7 +515,6 @@ fn fx_capture_leaves(desk: &mut FxDesk) {
         leaf.questions = record.questions;
         leaf.autopilot = record.autopilot;
         leaf.land_at = record.land_at;
-        leaf.identity = record.identity;
     };
     for window in &mut desk.layout.windows {
         for tab in &mut window.restored_tabs {
@@ -671,6 +657,7 @@ fn fx_window_in(
                 },
                 ("markdown", None, Some(uri)) => NativeTabRestore::Markdown { uri: uri.clone() },
                 ("editor", None, Some(uri)) => NativeTabRestore::Editor { uri: uri.clone() },
+                ("system-state", None, None) => NativeTabRestore::SystemState,
                 other => panic!("a native tab this generator does not spell: {other:?}"),
             };
             // The mirror's one rule: no second Settings and no second copy.
@@ -3991,7 +3978,7 @@ fn fx_agent(
 /// Autopilot `cruise` until a time, set over `aterm ctl`), under a fleet
 /// and a local halt (the status item saw the local one), an external
 /// supervisor's lease, a task the harness marks working and the agent's work
-/// on it so far, a spawn identity, its own theme, the first session of the
+/// on it so far, its own theme, the first session of the
 /// restores it continues, and its mailbox and topic ([`fx_mailbox`]); the
 /// bridge's mirror took its log.
 /// Session 1 is the shell session 0 spawned, a cold restore's tab whose
@@ -4113,7 +4100,6 @@ fn fx_carried_state_desk() -> FxDesk {
         worked_ms: 25_000,
     }
     .row();
-    record.identity = Some("work".to_string());
     // The first session of the restores it continues (`seed_lineage`, as a
     // restore's shell takes it), and the bridge's mirror took its log
     // (`cmd_log_take`'s copy, under the timeline's lock).
@@ -4992,6 +4978,22 @@ fn fx_variants_desk() -> FxDesk {
         });
         sessions.push(fx_session(id, title, term));
     }
+    // Open and capture the real controller without a startup offer: its
+    // handoff descriptor carries the tab, never credentials or OS work.
+    let mut app = crate::App::headless_for_test();
+    assert!(app.open_system_state_tab_in_window(crate::WindowId(0)));
+    let mut captured = app.capture_handoff_layout();
+    let system_state = captured.windows[0]
+        .restored_tabs
+        .pop()
+        .expect("the opened System State tab is captured");
+    assert!(matches!(
+        &system_state.root,
+        RestoredSplitTree::Leaf {
+            view: RestoredView::Native(native),
+        } if native.restore_tag == "system-state"
+    ));
+    tabs.push(system_state);
     FxDesk {
         name: "variants",
         nonce_seed: 0x0100_0019,
@@ -5090,6 +5092,10 @@ const NO_HANDOFF_WRITES_OFF_MACOS: &[(&str, &str)] = &[
 /// retired, or set by nothing in this build), beside why. The hold refuses a
 /// row a desk writes, and one that names nothing a desk reaches.
 const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
+    // Named session identities are retired, including their saved labels.
+    // Older published desks carry these fields; this producer no longer does.
+    ("manifest", "SessionRecord.identity"),
+    ("layout", "TerminalLeafRestore.identity"),
     // A crash carry's turn-id count (`handoff_carry::CrashLedger`); an
     // update's sidecar leaves it out (`encode_wire`).
     ("control", "Wire.turn_ids"),
@@ -5243,11 +5249,9 @@ mod rendezvous_generator {
             std::env::var_os("ATERM_RENDEZVOUS_FIXTURE_OUT")
                 .expect("set ATERM_RENDEZVOUS_FIXTURE_OUT to tests/fixtures/handoff/v<release>"),
         );
-        let scratch = std::env::temp_dir().join(format!("aterm-rz-gen-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&scratch);
-        std::fs::create_dir_all(&scratch).expect("scratch");
-        let capture = capture_transport(&scratch);
-        let _ = std::fs::remove_dir_all(&scratch);
+        let scratch = crate::test_scratch::short_dir("the claim's socket");
+        let capture = capture_transport(scratch.path());
+        drop(scratch);
         for slot in &capture.descriptor_order {
             assert!(
                 !slot.starts_with("unknown"),

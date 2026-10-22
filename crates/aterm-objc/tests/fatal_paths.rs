@@ -3,7 +3,7 @@
 
 //! The misuses that must END the process by name, and the one that must not.
 //! Each runs its fatal body in a child (this binary re-run on the one test,
-//! `support/reexec.rs`) and reads the signal and the stderr back:
+//! `support/reexec.rs`) and reads its exit and its stderr back:
 //!
 //! * a Rust panic inside a declared method that Foundation dispatched aborts
 //!   with the method's name instead of unwinding into Foundation;
@@ -21,8 +21,6 @@
     reason = "the subject is the send itself: these tests cast the bare `msg` by hand"
 )]
 
-use std::os::unix::process::ExitStatusExt as _;
-
 use aterm_objc::{
     ClassPtr, ClassType, Id, RcBlock, Sel, class, declare_class, msg, ns_string, sel,
 };
@@ -38,9 +36,6 @@ fn mtm() -> aterm_objc::MainThread {
     // affinity and its ivars are born and dropped on this one worker.
     unsafe { aterm_objc::MainThread::new_unchecked() }
 }
-
-/// `SIGABRT`, spelled out: this crate has no dependencies, `libc` included.
-const SIGABRT: i32 = 6;
 
 declare_class! {
     /// Panics on demand, so the unwind guard runs.
@@ -92,7 +87,7 @@ const PANIC_CHILD: &str = "ATERM_OBJC_PANIC_CHILD";
 
 #[test]
 fn a_panic_inside_a_declared_method_aborts_instead_of_unwinding_into_foundation() {
-    if std::env::var_os(PANIC_CHILD).is_some() {
+    if reexec::is_child(PANIC_CHILD) {
         let obj = Panicker::alloc_init(mtm(), ()).expect("+alloc/-init");
         // Dispatched by Foundation, not by a direct call: `-performSelector:`
         // puts a framework frame between the send and our trampoline, the
@@ -118,9 +113,9 @@ fn a_panic_inside_a_declared_method_aborts_instead_of_unwinding_into_foundation(
         "the panic did not abort\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert_eq!(
-        out.status.signal(),
-        Some(SIGABRT),
-        "expected SIGABRT\nstdout: {stdout}\nstderr: {stderr}"
+        out.status.code(),
+        Some(reexec::ABORTED),
+        "expected an abort\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
         stderr.contains("panic escaped Objective-C method `boom`"),
@@ -142,7 +137,7 @@ fn the_unwind_guard_does_not_itself_panic_when_stderr_is_gone() {
         fn close(fd: i32) -> i32;
     }
 
-    if std::env::var_os(BROKEN_STDERR).is_some() {
+    if reexec::is_child(BROKEN_STDERR) {
         // Count panic-hook runs on stdout, which stays open. Exactly one panic
         // should happen; a second means the guard panicked reporting the first
         // (as `eprintln!` does on a broken fd 2), unwinding out of the
@@ -184,8 +179,8 @@ fn the_unwind_guard_does_not_itself_panic_when_stderr_is_gone() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let hooks = stdout.matches("HOOK ").count();
     assert_eq!(
-        out.status.signal(),
-        Some(SIGABRT),
+        out.status.code(),
+        Some(reexec::ABORTED),
         "expected the guard to abort\nstdout: {stdout}"
     );
     assert_eq!(
@@ -210,7 +205,7 @@ fn an_instance_objective_c_minted_is_caught_by_the_ivar_flag() {
     // The initialised flag is checked in release builds too: ObjC code can
     // `+alloc`/`-init` the class by name without reaching `alloc_init`, leaving
     // an all-zero ivar slot. The assert turns that into a named abort.
-    if std::env::var_os(OBJC_MINTED_CHILD).is_some() {
+    if reexec::is_child(OBJC_MINTED_CHILD) {
         // SAFETY: `+alloc` and `-init` on a registered class reached by name,
         // then a message the class declares: what a nib or
         // `NSClassFromString` does, and what the flag guards.
@@ -242,8 +237,8 @@ fn an_instance_objective_c_minted_is_caught_by_the_ivar_flag() {
         "an unwritten ivar slot was read as a live value\nstdout: {stdout}"
     );
     assert_eq!(
-        out.status.signal(),
-        Some(SIGABRT),
+        out.status.code(),
+        Some(reexec::ABORTED),
         "expected the named abort\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
@@ -271,7 +266,7 @@ impl Drop for PanicsOnDrop {
 
 #[test]
 fn a_panicking_drop_in_a_block_capture_aborts_by_name() {
-    if std::env::var_os(CHILD_DISPOSE).is_some() {
+    if reexec::is_child(CHILD_DISPOSE) {
         let bomb = PanicsOnDrop;
         // SAFETY: a no-argument block that is never invoked; the only thing
         // this test needs from it is that releasing it runs `dispose_helper`,
@@ -302,9 +297,9 @@ fn a_panicking_drop_in_a_block_capture_aborts_by_name() {
          stdout: {stdout}\nstderr: {stderr}"
     );
     assert_eq!(
-        out.status.signal(),
-        Some(SIGABRT),
-        "expected SIGABRT\nstdout: {stdout}\nstderr: {stderr}"
+        out.status.code(),
+        Some(reexec::ABORTED),
+        "expected an abort\nstdout: {stdout}\nstderr: {stderr}"
     );
     // It aborted BEFORE the guard, too — through Rust's own
     // `extern "C"` shim, with "thread caused non-unwinding panic. aborting.",
@@ -327,7 +322,7 @@ const CHILD_NO_POOL: &str = "ATERM_OBJC_AUTORELEASE_NO_POOL_CHILD";
 
 #[test]
 fn autoreleasing_with_no_pool_leaks_and_that_is_all_it_does() {
-    if std::env::var_os(CHILD_NO_POOL).is_some() {
+    if reexec::is_child(CHILD_NO_POOL) {
         // NOT inside `autoreleasepool`, and nothing above this frame pushed a
         // pool either — a libtest worker thread starts with an empty pool
         // stack. Both safe wrappers run here. Under the OLD `# Safety` text
@@ -370,8 +365,8 @@ fn autoreleasing_with_no_pool_leaks_and_that_is_all_it_does() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
-        out.status.signal(),
-        None,
+        out.status.code(),
+        Some(0),
         "a pool-less autorelease killed the process; the demoted contract \
          in `runtime::autorelease` would be WRONG and must be restored\n\
          stdout: {stdout}\nstderr: {stderr}"

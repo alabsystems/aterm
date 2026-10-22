@@ -1648,6 +1648,14 @@ const LINK_CONTINUES_LANE: u32 = 3;
 /// would answer `ERR usage`, so it is not told (stderr has said it).
 const LINK_SET_ASIDE_LANE: u32 = 4;
 
+/// The bridge lane that added `link quarantine torn=<k>`
+/// ([`Bridge::tell_quarantine`]): how many of the torn files set aside the
+/// state dir's quarantine still holds, which at 0 ends the entry aterm filed
+/// for the owner's look. An endpoint below it would answer `ERR usage`, so it
+/// is not told, and its entry stands until the owner dismisses it. One number
+/// with the endpoint's, which reads it off this bridge's `hello lane=`.
+const LINK_QUARANTINE_LANE: u32 = aterm_types::control_verbs::LINK_QUARANTINE_LANE;
+
 /// What an attach found when the log it reads is NOT the one this node read
 /// before ([`Bridge::judge_log`]): what it is and what it was, for the one
 /// report it makes ([`Bridge::attach_broker`]'s `ev log-replaced`).
@@ -2138,14 +2146,21 @@ pub struct Bridge {
     node: String,
     producer_id: u64,
     inc: u64,
-    /// The one incarnation of THIS node, other than its own, whose session rows
-    /// this bridge may retire: the one whose WILL it found on the node face when
-    /// it attached, which is proof that process is gone.
+    /// The exact dying writer `(incarnation, mark)` whose WILL this attach read.
+    /// An incarnation can be shared by concurrent copied dirs: the will of a
+    /// colliding attach proves only that writer dead, not its still-live alias.
     ///
-    /// `None` for "none but my own", and RE-SET on every attach rather than
+    /// `None` without a marked will, and RE-SET on every attach rather than
     /// filled in once — a reconnect that finds a live node row must clear an
     /// adoption an earlier attach granted. See [`adoptable`].
-    witnessed_dead: Option<u64>,
+    witnessed_dead: Option<(u64, String)>,
+    /// THIS STATE DIR'S MARK ([`StateDir::mark`]), which every session row this
+    /// bridge writes carries under [`crate::state::PRESENCE_MARK`]: a row of a
+    /// lower incarnation that carries it was written by an earlier bridge of
+    /// this dir in this kernel boot, dead while this one holds the dir's lock,
+    /// and is this bridge's to retire (finding F4, [`adoptable`]). `None`
+    /// without an inode or kernel boot: no row is then this dir's by its mark.
+    mark: Option<String>,
     state: StateDir,
     /// The ring every connection attaches: read from `cfg.cap_files` at
     /// start, and READ AGAIN before every dial ([`Bridge::reload_caps`]), so
@@ -2392,6 +2407,11 @@ pub struct Bridge {
     /// before the wait did ([`Bridge::run_names_this_boot`]). Tests only.
     #[cfg(test)]
     attach_past_an_earlier_boots_run: bool,
+    /// What this process's start set aside ([`Bridge::tell_set_aside`]), for the
+    /// negative control that tells it in place of what the quarantine holds
+    /// (`Mutant::TellMovedNotHeld`). Tests only.
+    #[cfg(test)]
+    moved_at_start: u64,
     /// Offsets this bridge has acked on its OWN lanes, for the self-lane check.
     self_acked: BTreeSet<u64>,
     /// How many entries the state dir's `acked` log holds, repeats included
@@ -2501,6 +2521,19 @@ pub struct Bridge {
     /// How many torn files this process set aside after a stop the page cache
     /// did not outlive ([`Bridge::set_aside_torn_state`]), not yet told to aterm.
     set_aside: u64,
+    /// How many torn files this process last told aterm the quarantine holds
+    /// ([`Bridge::tell_quarantine`]); `None` before it said any. Above 0, the
+    /// roster's backstop looks again, and each redial while no broker is
+    /// attached, so the entry ends soon after the owner empties the quarantine.
+    quarantine_said: Option<u64>,
+    /// Whether the quarantine's last look failed, so its stderr line is said
+    /// once, not at every round.
+    quarantine_unread: bool,
+    /// Why this process, the first bridge after an unclean stop in an earlier
+    /// boot, could not reconcile the mirror's pin
+    /// ([`Bridge::reconcile_logpin_state`]): the stop the pin then causes names
+    /// it, rather than read the damage as a bug's.
+    pin_unreconciled: Option<String>,
     mailbox: Arc<Mailbox>,
     /// THE DOORS ([`crate::fx`]): every clock this bridge reads, its park on
     /// the mailbox, its broker dials and readers, its verb lane and its
@@ -2884,6 +2917,7 @@ impl Bridge {
             producer_id,
             inc: 0,
             witnessed_dead: None,
+            mark: None,
             self_acked: newest(acked.offsets, SELF_ACK_KEEP),
             acked_entries: acked.entries,
             acked_appendable: acked.appendable,
@@ -2951,6 +2985,8 @@ impl Bridge {
             ignore_lineage: false,
             #[cfg(test)]
             attach_past_an_earlier_boots_run: false,
+            #[cfg(test)]
+            moved_at_start: 0,
             closers: Vec::new(),
             link: LinkReport::new(),
             attaching: false,
@@ -2959,6 +2995,9 @@ impl Bridge {
             withdrawn: BTreeSet::new(),
             withdrawal_told: false,
             set_aside: 0,
+            quarantine_said: None,
+            quarantine_unread: false,
+            pin_unreconciled: None,
             mailbox: Arc::new(Mailbox::default()),
             cfg,
             fx,
@@ -4077,6 +4116,9 @@ impl Bridge {
     /// matters because `Last` returns one record per subject and a reader could
     /// never see a `live` hidden behind a later `away` (§7).
     fn bring_presence_up(&mut self) -> io::Result<()> {
+        // Read under the state-dir hold at attach, after the simulation has
+        // installed its kernel boot identity. No older boot grants adoption.
+        self.mark = self.state.mark(&self.node);
         let subject = subject::node_face(&self.cfg.fleet, &self.node, "presence");
         // THE SAME READ ANSWERS TWO QUESTIONS. `inc=` gives the incarnation to
         // outrank; `state=` says whether the row is a predecessor's WILL, which
@@ -4137,7 +4179,14 @@ impl Bridge {
                         .get("state")
                         .map(String::as_str)
                         .is_some_and(crate::glance::is_will);
-                    (inc, will.then_some(inc))
+                    let dead = will
+                        .then(|| body.unknown.get(crate::state::PRESENCE_MARK).cloned())
+                        .flatten()
+                        .filter(|mark| {
+                            mark.len() == 16 && mark.bytes().all(|b| b.is_ascii_hexdigit())
+                        })
+                        .map(|mark| (inc, mark));
+                    (inc, dead)
                 }
                 None => (0, None),
             }
@@ -4170,13 +4219,16 @@ impl Bridge {
         // sees once this node is away, and a node away for speaking another
         // protocol is exactly the one whose release the other hosts need to
         // read ([`release_tokens`]).
-        let gone = format!(
+        let mut gone = format!(
             "v=1 t={} state={} inc={} fabric=disconnected {}",
             self.fx.wall_ms(),
             crate::glance::AWAY,
             self.inc,
             release_tokens()
         );
+        if let Some(mark) = &self.mark {
+            gone.push_str(&format!(" {}={mark}", crate::state::PRESENCE_MARK));
+        }
         // THE WILL AT THE TOP OF THE INCARNATION'S SPACE, in astream's layout
         // (`crate::state`'s `INC_MAX`): above every ordinary sequence this
         // incarnation hands out, below every one of the next, so a reconnect's
@@ -4206,6 +4258,9 @@ impl Bridge {
             std::process::id(),
             release_tokens()
         );
+        if let Some(mark) = &self.mark {
+            live.push_str(&format!(" {}={mark}", crate::state::PRESENCE_MARK));
+        }
         // AN OBSERVER'S NODE SAYS SO, as its session rows do: it answers no
         // halt ([`Bridge::ack_halt`]), and a fold of "presence roster minus
         // acked" must be able to tell it from a member that did not hold.
@@ -4252,6 +4307,16 @@ impl Bridge {
     /// retained; a constant `connected` there would lie, while glance renders a
     /// missing token as `-` ("unknown"), which is the truth. The node's own row
     /// carries it, where the will keeps it honest.
+    ///
+    /// ## `statedir=`: whose row it is
+    ///
+    /// The state dir's mark ([`StateDir::mark`]): sixteen hex digits of a hash
+    /// of the kernel boot, node and the dir's own device and inode, nothing a
+    /// reader can turn back into a path. A later bridge of the same dir in
+    /// the same boot retires the ghost rows an earlier one left by it. A copy
+    /// of the dir under the same node id has another mark, even when a cloned
+    /// disk repeats device and inode on another boot (finding F4,
+    /// [`Bridge::retire_ghost_presence`]).
     ///
     /// ## After `bye quit`, nothing but the withdrawal
     ///
@@ -4304,6 +4369,9 @@ impl Bridge {
             self.fx.wall_ms(),
             self.inc
         );
+        if let Some(mark) = &self.mark {
+            body.push_str(&format!(" {}={mark}", crate::state::PRESENCE_MARK));
+        }
         if self.attachment == Attachment::Observer {
             body.push_str(" observer=1");
         }
@@ -4869,7 +4937,8 @@ impl Bridge {
     /// next bridge is not handed them again; nothing new is started. A commit
     /// a rolled-back batch refused is sent again before the exit, as anywhere
     /// it must land; one that still does not is handed over. And then the run
-    /// stops cleanly ([`Bridge::end_run`]): nothing more is written.
+    /// stops cleanly, or after a handoff goes on in the successor's bridge
+    /// ([`Bridge::end_run`]): nothing more is written.
     fn wind_down(&mut self) {
         if self.conn.is_some() {
             self.land_inbox_commit();
@@ -8673,11 +8742,23 @@ impl Bridge {
     /// * it has been absent across [`GHOST_AFTER`] of THIS bridge's
     ///   observations — not merely old on the bus, which a quietly busy
     ///   session's row also is, and
-    /// * the row's `inc=` is at or below this bridge's own incarnation. A
-    ///   bridge that attached after this one took `max(local, bus) + 1` and so
-    ///   carries a STRICTLY HIGHER `inc`; leaving those alone means a newer
-    ///   sibling's live sessions are never touched, and the worst this sweep
-    ///   can do to a node it has been superseded on is nothing.
+    /// * the row's `inc=` is this bridge's own incarnation or a LOWER one AND
+    ///   it carries this state dir's mark (`statedir=`, [`StateDir::mark`]),
+    ///   so an earlier bridge of the dir in this boot wrote it, dead while
+    ///   this one holds the dir's lock (finding F4: before the mark, a ghost whose writer's
+    ///   successors all died inside the five minutes stood for good); or the
+    ///   exact writer `(incarnation, mark)` whose will this attach witnessed
+    ///   ([`adoptable`]). A bridge that
+    ///   attached after this one took `max(local, bus) + 1` and so carries a
+    ///   STRICTLY HIGHER `inc`, and a sibling on a copy of the dir writes the
+    ///   copy's mark, even under a number this dir took too (one an attach
+    ///   here took and never presented, or one a log that lost power no longer
+    ///   shows): a live sibling's sessions are never touched, and the worst
+    ///   this sweep can do to a node it has been superseded on is nothing.
+    ///   Retiring a dead predecessor's row is reversible too: a session that
+    ///   lives on — in an instance whose bridge stands by on the dir's lock —
+    ///   has its row written `live` again by the bridge that hosts it, at that
+    ///   bridge's attach.
     ///
     /// A retirement is one record per ghost, once — the sid is dropped from
     /// [`Bridge::ghosts`] after it is published, and the row it wrote is no
@@ -8737,7 +8818,35 @@ impl Bridge {
                 continue;
             }
             // ONLY WHAT THIS INCARNATION CAN PROVE UNHOSTED.
-            if !adoptable(presence_inc(&body), self.inc, self.witnessed_dead) {
+            let marked = self.mark.is_some()
+                && body.unknown.get(crate::state::PRESENCE_MARK) == self.mark.as_ref();
+            // NEGATIVE CONTROL (`crate::sim`): no row's mark read, as before
+            // finding F4's decision — this incarnation and the will its attach
+            // witnessed are the only ones whose rows are its to retire.
+            #[cfg(test)]
+            let marked = marked && !self.fx.mutant(crate::sim::world::Mutant::ReadNoMark);
+            let witnessed_dead = self.witnessed_dead.as_ref().and_then(|(inc, mark)| {
+                (body.unknown.get(crate::state::PRESENCE_MARK) == Some(mark)).then_some(*inc)
+            });
+            #[cfg(test)]
+            let witnessed_dead = if self
+                .fx
+                .mutant(crate::sim::world::Mutant::WitnessByIncarnationAlone)
+            {
+                self.witnessed_dead.as_ref().map(|(inc, _)| *inc)
+            } else {
+                witnessed_dead
+            };
+            let ours = adoptable(presence_inc(&body), self.inc, witnessed_dead, marked);
+            // NEGATIVE CONTROL (`crate::sim`): every lower incarnation taken
+            // for a predecessor, a live sibling's included.
+            #[cfg(test)]
+            let ours = ours
+                || (self
+                    .fx
+                    .mutant(crate::sim::world::Mutant::RetireEveryEarlierIncarnation)
+                    && presence_inc(&body).is_some_and(|inc| inc < self.inc));
+            if !ours {
                 continue;
             }
             unhosted.insert(sid.to_string());
@@ -11777,6 +11886,74 @@ impl Bridge {
         }
     }
 
+    /// RULINGS Q6 AND Q13 ACROSS A POWER CUT: after an unclean stop in an
+    /// earlier boot, the bus mirror's pin is RECONCILED with its durable copies
+    /// ([`StateDir::reconcile_logpin`]): a torn one is moved aside — counted
+    /// with the torn files, for aterm ([`Bridge::set_aside`]) — a whole one
+    /// written from the copies in its place, and the mirror resumes with the
+    /// same key (`logkey`) and its total at the floor (`logfloor`); a whole one
+    /// has its total raised to the floor, since nothing tells it from an older
+    /// one a cut brought back. Whatever `[fabric] log` says: a mirror turned
+    /// on later in this boot must find it reconciled, and no later start can
+    /// tell the cut. A failure is said and survived, and kept for the stop it
+    /// leads to ([`Bridge::pin_unreconciled`]): a pin that does not read stops
+    /// the mirror, as before.
+    fn reconcile_logpin_state(&mut self) {
+        // NEGATIVE CONTROLS (`crate::sim`): a torn pin kept where it is, as
+        // before (the mirror stops on it); one set aside with no key on the
+        // media (as before `logkey`, whose world writes none); a whole one's
+        // total left below the floor.
+        #[cfg(test)]
+        let rules = crate::state::PinRules {
+            set_aside_torn: !self.fx.mutant(crate::sim::world::Mutant::KeepTornPin),
+            total_from_floor: !self
+                .fx
+                .mutant(crate::sim::world::Mutant::TotalInThePinAlone),
+            need_key: !self.fx.mutant(crate::sim::world::Mutant::KeyInThePinAlone),
+        };
+        #[cfg(test)]
+        let done = if rules == crate::state::PinRules::ALL {
+            self.state.reconcile_logpin()
+        } else {
+            self.state.reconcile_logpin_with(rules)
+        };
+        #[cfg(not(test))]
+        let done = self.state.reconcile_logpin();
+        match done {
+            Ok(crate::state::Reconciled::Kept) => {}
+            Ok(crate::state::Reconciled::Raised { from, to }) => eprintln!(
+                "aterm-link: mirror: the last bridge stopped uncleanly in an earlier boot, and \
+                 nothing tells logpin from an older version a power cut brought back, so its \
+                 total ({from} bytes) is raised to its floor ({to}): what the floor leased \
+                 ahead, at most {} bytes and the batch in flight, is counted as mirrored",
+                crate::mirror::FLOOR_LEASE_BYTES
+            ),
+            Ok(crate::state::Reconciled::SetAside(m)) => {
+                eprintln!(
+                    "aterm-link: {} did not read whole after the last bridge stopped uncleanly \
+                     in an earlier boot (a power cut tears what was not yet on disk); moved \
+                     aside to {} in the state dir, and a whole logpin written from logkey and \
+                     logfloor in its place — the mirror resumes under the same alias key, its \
+                     total at the floor",
+                    m.from, m.to
+                );
+                self.set_aside += 1;
+            }
+            Ok(crate::state::Reconciled::Restored) => eprintln!(
+                "aterm-link: mirror: no logpin after the last bridge stopped uncleanly in an \
+                 earlier boot; a whole one written from logkey and logfloor — the same alias \
+                 key, its total at the floor"
+            ),
+            Err(e) => {
+                eprintln!(
+                    "aterm-link: the mirror's pin could not be reconciled after an unclean stop: \
+                     {e}; a pin that does not read stops the mirror, as before"
+                );
+                self.pin_unreconciled = Some(e.to_string());
+            }
+        }
+    }
+
     /// THIS RUN BEGINS ([`StateDir::begin_run`]), after the sweep and before
     /// this bridge writes any file a power cut could tear: the state dir's
     /// `run` record says a bridge runs in this boot, so the first bridge of
@@ -11786,12 +11963,22 @@ impl Bridge {
     /// recovery stays fail-closed. Where the record it could not replace
     /// names an earlier boot's unclean stop, every attach first writes it
     /// again, and none goes on until it holds ([`Bridge::run_names_this_boot`]).
+    /// A record written is said with what it cost (a start after a kill in
+    /// this boot writes none, and says nothing).
     fn begin_run(&self) {
-        if let Err(e) = self.state.begin_run() {
-            eprintln!(
+        let began = self.fx.now();
+        match self.state.begin_run() {
+            Ok(flushed) if flushed.full > 0 => eprintln!(
+                "aterm-link: the run record says a bridge runs in this boot: {} full flushes in \
+                 {} us",
+                flushed.full,
+                self.fx.now().saturating_duration_since(began).as_micros()
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!(
                 "aterm-link: the state dir's run record could not be written: {e}; no marker \
                  is removed to force legacy recovery; unavailable recovery stays fail-closed"
-            );
+            ),
         }
     }
 
@@ -11823,7 +12010,7 @@ impl Bridge {
             return true;
         }
         match self.state.begin_run() {
-            Ok(()) => true,
+            Ok(_) => true,
             Err(e) => {
                 if self.link.down_wants_report("error") {
                     eprintln!(
@@ -11843,13 +12030,60 @@ impl Bridge {
     /// damage the next boot finds is refused as a bug's, never set aside as a
     /// power cut's. The last act of a bridge aterm closed; one that fails
     /// removes no marker to force a legacy fallback and leaves unavailable
-    /// recovery fail-closed.
+    /// recovery fail-closed. Said with what it cost: what was flushed, by
+    /// which of the two flushes, and how long the stop took.
+    ///
+    /// A HANDOFF IS NOT THE RUN'S END (sim item S6). Where aterm's last word
+    /// was `bye handoff` — a seamless update's Commit — its successor's bridge
+    /// takes this state dir in this boot and goes on with the run, and the
+    /// handoff's gap is the fabric's whole outage: so nothing is flushed here
+    /// and `run` stays open, as after a kill. The successor's start then finds
+    /// `run` open in this boot, writes no record and inherits every file a
+    /// power cut could tear, unflushed ([`StateDir::begin_run`]), and its own
+    /// clean stop flushes them. A power cut once the successor's run has begun
+    /// finds the run open in an earlier boot and the next boot's sweep runs,
+    /// as it would have with this stop clean.
+    ///
+    /// THE PRICE IS THE GAP BEFORE THAT START. A power cut after this exit and
+    /// before the successor's [`StateDir::begin_run`] finds this run open too,
+    /// where a clean stop here would have closed it: the next boot's first
+    /// bridge judges the stop unclean, so it sets aside whatever it finds
+    /// torn, retires every whole in-flight entry into the quarantine (never
+    /// published again, [`StateDir::retire_in_flight_of_an_earlier_boot`]) and
+    /// raises the mirror's total to its floor, as after a kill a reboot
+    /// followed. In an update that gap is short: the successor's bridge
+    /// stands by on the lock this exit releases, trying it every
+    /// [`STANDBY_POLL`] ([`hold_state_dir`]), or starts just after; where
+    /// no successor bridge begins a run in this boot (its `[fabric] command`
+    /// removed, or a bridge that keeps failing to start), it is the rest of
+    /// the boot. Nothing claims a clean stop it did not make, so damage after
+    /// a clean stop stays a bug's; and a handoff costs the state dir nothing:
+    /// measured on the eight-session handoff of fabric_world's
+    /// `handoff_cost`, 38 full flushes (about 150 ms) at the old bridge's stop
+    /// and 2 (about 9 ms) at its successor's start, before.
     fn end_run(&self) {
-        if let Err(e) = self.state.end_run_clean() {
+        if self.bye == Some(Bye::Handoff) {
             eprintln!(
+                "aterm-link: handed off: the run goes on in the successor's bridge, so nothing \
+                 is flushed and the run record stays open"
+            );
+            return;
+        }
+        let began = self.fx.now();
+        match self.state.end_run_clean() {
+            Ok(flushed) => eprintln!(
+                "aterm-link: the run stopped cleanly: {} state files and {} directories \
+                 flushed, then the run record: {} barriers and {} full flushes in {} us",
+                flushed.files,
+                flushed.dirs,
+                flushed.ordered,
+                flushed.full,
+                self.fx.now().saturating_duration_since(began).as_micros()
+            ),
+            Err(e) => eprintln!(
                 "aterm-link: this run's state files could not all be flushed: {e}; no marker \
                  is removed to force legacy recovery; unavailable recovery stays fail-closed"
-            );
+            ),
         }
     }
 
@@ -11861,6 +12095,10 @@ impl Bridge {
     /// refuse it again — and the stderr line stands either way.
     fn tell_set_aside(&mut self) {
         let files = std::mem::take(&mut self.set_aside);
+        #[cfg(test)]
+        {
+            self.moved_at_start = files;
+        }
         if files == 0
             || self.attachment != Attachment::Inherited
             || self.endpoint_lane < LINK_SET_ASIDE_LANE
@@ -11875,6 +12113,77 @@ impl Bridge {
             ),
             Err(e) => eprintln!("aterm-link: `link set-aside` failed: {e}"),
         }
+    }
+
+    /// TELL ATERM HOW MANY TORN FILES THE QUARANTINE STILL HOLDS (`link
+    /// quarantine torn=<k>`), so the entry it filed for the owner's look
+    /// (`fabric.state.torn`) ends once the owner has emptied it: at 0 aterm
+    /// ends it, and any other count changes nothing there. The cause of that
+    /// entry is bytes the owner has not looked through; taken away (read and
+    /// removed, or moved back), it is over.
+    ///
+    /// Said once at the start, after what the start set aside
+    /// ([`Bridge::tell_set_aside`]) — 0 where there is no quarantine at all,
+    /// since the owner may have removed it whole — and again each time the
+    /// count moves while the last count said is above 0
+    /// ([`Bridge::watches_quarantine`]): looked at by the roster's backstop
+    /// each round while the broker is attached, and at each redial while it
+    /// is not ([`Bridge::pass`]), since no round runs then. So the entry ends
+    /// within a round of the owner emptying it, or within a redial's back-off
+    /// ([`crate::transport::RECONNECT_MAX`]) while the bus is away, and a dir
+    /// with nothing torn in it costs one line at the start and no look after.
+    /// Only an inherited bridge has an aterm
+    /// to tell, and only an endpoint at [`LINK_QUARANTINE_LANE`] or later reads
+    /// the line; any answer settles the count said, as `link set-aside`'s
+    /// does. A quarantine that cannot be read (a file or link planted at its
+    /// name) is said on stderr once, and nothing is told.
+    fn tell_quarantine(&mut self) {
+        if self.attachment != Attachment::Inherited || self.endpoint_lane < LINK_QUARANTINE_LANE {
+            return;
+        }
+        let held = match self.state.quarantined_torn() {
+            Ok(held) => held.unwrap_or(0),
+            Err(e) => {
+                if !self.quarantine_unread {
+                    eprintln!(
+                        "aterm-link: the state dir's quarantine could not be read ({e}); aterm \
+                         is not told whether the torn files set aside are still there"
+                    );
+                }
+                self.quarantine_unread = true;
+                return;
+            }
+        };
+        self.quarantine_unread = false;
+        // NEGATIVE CONTROL (`crate::sim`): what this start moved is told in
+        // place of what the quarantine holds — a later boot that moved fewer
+        // (or none) understates what an earlier one left there.
+        #[cfg(test)]
+        let held = if self.fx.mutant(crate::sim::world::Mutant::TellMovedNotHeld) {
+            self.moved_at_start
+        } else {
+            held
+        };
+        if self.quarantine_said == Some(held) {
+            return;
+        }
+        match self.ctl_request(&format!("link quarantine torn={held}")) {
+            Ok(reply) if reply.ok() => {}
+            Ok(reply) => eprintln!(
+                "aterm-link: aterm did not take `link quarantine torn={held}`: {}",
+                reply.header()
+            ),
+            Err(e) => eprintln!("aterm-link: `link quarantine` failed: {e}"),
+        }
+        self.quarantine_said = Some(held);
+    }
+
+    /// Whether the quarantine is looked at again ([`Bridge::tell_quarantine`]:
+    /// by the roster's backstop, or by each redial while no broker is
+    /// attached): only while the last count said was above 0, so the entry
+    /// ends soon after the owner empties it and an empty one costs nothing.
+    fn watches_quarantine(&self) -> bool {
+        self.quarantine_said.is_some_and(|held| held > 0)
     }
 
     /// THE HANDSHAKE: say which lane grammar this bridge reads and writes,
@@ -12027,14 +12336,17 @@ impl Bridge {
         // attach reads the in-flight journal and the reservations — and before
         // this run's record says, for the next boot, that a bridge runs in this
         // one: the torn files set aside, then the whole in-flight entries of
-        // that earlier boot retired (finding F2), whose verdict `begin_run`
+        // that earlier boot retired (finding F2), and the mirror's pin
+        // reconciled with its durable copies, whose verdict `begin_run`
         // ends — and where the disk refuses it, no attach goes on until it
         // has ([`Bridge::run_names_this_boot`]).
         self.set_aside_torn_state();
         self.retire_in_flight_state();
+        self.reconcile_logpin_state();
         self.begin_run();
         self.introduce();
         self.tell_set_aside();
+        self.tell_quarantine();
         if !self.first_roster() {
             // NOTHING THIS PROCESS DOES CHANGES THE ENDPOINT ITS DESCRIPTORS
             // ARE BOUND TO: it attaches nothing, writes nothing to the bus, and
@@ -12075,6 +12387,15 @@ impl Bridge {
             return Some(Ok(()));
         }
         if self.conn.is_none() {
+            // THE OWNER EMPTYING THE QUARANTINE IS LOOKED FOR WITH NO BROKER
+            // TOO, once a redial while it holds what aterm was told of: the
+            // look asks aterm, not the broker, and the round's backstop below
+            // is never reached while an attach fails. So the entry ends
+            // within a redial's back-off ([`crate::transport::RECONNECT_MAX`])
+            // of the owner emptying it while the bus is away.
+            if self.watches_quarantine() {
+                self.tell_quarantine();
+            }
             // A LINK THAT DID NOT STAY UP IS A FAILED ATTACH, whatever
             // dropped it: a subscription the broker refused arrives as its
             // reader's first `recv` error, AFTER the attach reported `up`,
@@ -12132,6 +12453,12 @@ impl Bridge {
             self.arm_deadline_sweep(true, false);
             // The backstop for a record no push line accompanied.
             self.mirror_wake();
+            // And for the owner emptying the quarantine, while it holds what
+            // aterm was told of (with no broker, each redial looks instead,
+            // above).
+            if self.watches_quarantine() {
+                self.tell_quarantine();
+            }
         }
         // AND THE GHOSTS — ONLY WHILE THERE IS ONE, which is what keeps
         // this from being a heartbeat.
@@ -13054,16 +13381,21 @@ fn carried_elsewhere(body: &Body, inc: u64, self_inc: u64, host: &str) -> Option
 /// WHETHER A RETAINED ROW AT `inc` IS THIS BRIDGE'S TO RETIRE.
 ///
 /// The predicate the ghost sweep turns on, split out so it can be tested
-/// without two bridges and a broker. Three answers, and the default is no:
+/// without two bridges and a broker. The default is no:
 ///
-/// * `Some(inc) == self_inc` — this incarnation published the row itself and
-///   does not host the session, so it is a ghost of our own making.
-/// * `Some(inc) == witnessed_dead` — an incarnation whose WILL this bridge saw
-///   on the node face when it attached. A will fires only on disconnect, so
-///   that record is proof the process behind it is gone.
+/// * `inc` at or below `self_inc` and the row `marked` with this state dir's own
+///   mark ([`StateDir::mark`]) — an earlier bridge of this dir in this boot
+///   wrote it, dead because one state dir is one bridge and this one holds its lock (finding
+///   F4: before the mark, a ghost whose writer's successors all died inside
+///   the five minutes stood for good).
+/// * `Some(inc) == witnessed_dead` — a will's incarnation, passed here ONLY
+///   after its writer mark matched the session row's. Concurrent copied dirs
+///   can take the same current incarnation, and a colliding attach's will
+///   proves only its own writer dead, not the other one under that number.
 /// * anything else, `None` included — refuse. A row with no `inc=` cannot be
-///   attributed at all, and a row from an incarnation whose death nobody
-///   witnessed may belong to a sibling that is alive right now.
+///   attributed at all, and an unmarked row, or one whose exact writer's death
+///   nobody witnessed and whose mark is not this dir's, may belong to a sibling
+///   that is alive right now.
 ///
 /// NOT `inc > self_inc => skip`: `self.inc` is `max(local, bus) + 1`, so a
 /// bridge attaching SECOND under a shared node id (a copied state dir — one
@@ -13073,12 +13405,19 @@ fn carried_elsewhere(body: &Body, inc: u64, self_inc: u64, host: &str) -> Option
 ///
 /// AND NOT `inc <= witnessed_dead` EITHER: a surviving OLDER sibling
 /// does not rewrite the node face when a younger one's will fires, so a node
-/// face reading `state=away inc=K` proves K dead and says nothing whatever
-/// about `K-1`. The equality is the whole of what is proven, so the equality is
-/// what is used.
-fn adoptable(inc: Option<u64>, self_inc: u64, witnessed_dead: Option<u64>) -> bool {
+/// face reading `state=away inc=K statedir=M` proves only writer (K, M) dead,
+/// and says nothing about K-1 or a live alias under another mark. Both
+/// incarnation and writer-mark equality are required.
+///
+/// AND NOT "an incarnation this state dir took", which is what the dir could
+/// remember: a copy of the dir takes its numbers as this dir does, so it can
+/// take one this dir took and never presented, or one whose rows a log that
+/// lost power no longer shows, and run under it with live sessions (finding
+/// F4's review). The number does not say whose rows are under it; the mark
+/// does.
+fn adoptable(inc: Option<u64>, self_inc: u64, witnessed_dead: Option<u64>, marked: bool) -> bool {
     match inc {
-        Some(inc) => inc == self_inc || witnessed_dead == Some(inc),
+        Some(inc) => (marked && inc <= self_inc) || witnessed_dead == Some(inc),
         None => false,
     }
 }
@@ -14221,34 +14560,52 @@ mod tests {
     ///
     /// Driven through [`adoptable`] rather than through two real bridges: what
     /// is being asserted is the predicate, and a second broker, a second aterm
-    /// and a shared node id would make a slow test of a fast question.
+    /// and a shared node id would make a slow test of a fast question. Whose
+    /// mark a row carries is the state dir's (`state.rs`'s
+    /// `a_state_dirs_mark_is_its_own_and_a_copy_has_another`), and the copy
+    /// that takes one of this dir's numbers is the simulation's
+    /// (`a_sibling_that_takes_one_of_this_dirs_incarnations_is_never_retired`).
     #[test]
-    fn only_this_incarnation_and_a_witnessed_dead_one_are_adoptable() {
+    fn only_this_incarnation_its_dirs_earlier_ones_and_a_witnessed_dead_one_are_adoptable() {
         // B attached second under a shared node id: A is inc 1 and ALIVE, B is
-        // inc 2, and B saw a LIVE node row at attach, so it witnessed no death.
+        // inc 2, and B saw a LIVE node row at attach, so it witnessed no death;
+        // A runs on a copy of the dir, so its rows carry the copy's mark.
         let (a_live, b) = (1, 2);
         assert!(
-            !adoptable(Some(a_live), b, None),
+            !adoptable(Some(a_live), b, None, false),
             "an older sibling that is still running had its sessions retired"
         );
         // B's own rows for sessions it does not host are B's to retire.
-        assert!(adoptable(Some(b), b, None));
+        assert!(adoptable(Some(b), b, None, true));
+        assert!(
+            !adoptable(Some(b), b, None, false),
+            "a sibling can concurrently take the same incarnation: its writer mark is required"
+        );
         // A DEATH IT WITNESSED. B attaches, finds the node face carrying A's
         // will (`state=away inc=1`), and may retire exactly A's rows.
-        assert!(adoptable(Some(a_live), b, Some(a_live)));
+        assert!(adoptable(Some(a_live), b, Some(a_live), false));
         // AND ONLY THAT ONE. A will proves the incarnation it names is gone and
         // says nothing about any other, because a surviving older sibling does
         // not rewrite the node face when a younger one's will fires.
         assert!(
-            !adoptable(Some(1), 3, Some(2)),
+            !adoptable(Some(1), 3, Some(2), false),
             "`inc <= witnessed` is the generous reading, and it is not proven"
         );
-        // A FUTURE incarnation is still refused, which the old guard did get right.
-        assert!(!adoptable(Some(9), b, None));
-        assert!(!adoptable(Some(9), b, Some(a_live)));
+        // ITS OWN DIR'S EARLIER BRIDGES (finding F4): a lower incarnation's
+        // row with this dir's mark, each writer dead while B holds the lock —
+        // and not a copy's row under one of the very numbers the dir took.
+        assert!(adoptable(Some(1), 3, None, true));
+        assert!(
+            !adoptable(Some(1), 3, None, false),
+            "a number this dir may have taken too says nothing of whose row it is"
+        );
+        // A FUTURE incarnation is still refused, which the old guard did get
+        // right — this dir's mark or not, which no earlier bridge of it wrote.
+        assert!(!adoptable(Some(9), b, None, false));
+        assert!(!adoptable(Some(9), b, Some(a_live), true));
         // A row with no `inc=` cannot be attributed to anyone.
-        assert!(!adoptable(None, b, Some(a_live)));
-        assert!(!adoptable(None, b, None));
+        assert!(!adoptable(None, b, Some(a_live), true));
+        assert!(!adoptable(None, b, None, false));
     }
 
     /// **A BUS `inc=` NO WILL COULD BE REGISTERED UNDER IS NOT ADOPTED, and
@@ -16753,6 +17110,177 @@ mod tests {
                 );
             }
             bridge.close_subscriptions();
+        }
+    }
+
+    /// **WHAT THE QUARANTINE STILL HOLDS IS TOLD, AND TOLD AGAIN AS THE OWNER
+    /// EMPTIES IT** (sim item S6, [`Bridge::tell_quarantine`]): the count at
+    /// 0 is what ends aterm's entry for the owner's look. After boot 1's
+    /// unclean stop, boot 2's start sets a cut in-flight entry aside and
+    /// tells a lane-5 endpoint `set-aside files=1`, then `quarantine torn=1`.
+    /// A look with nothing moved says nothing; the owner removes the file,
+    /// and the backstop's next look says `torn=0`, once — it then stops
+    /// looking. The next process's start says `torn=0` again (the endpoint
+    /// may be a successor that never heard it), and so does a start in a dir
+    /// whose quarantine the owner removed whole. NEGATIVE CONTROL: an
+    /// endpoint at lane 4, which would refuse the line, is told the set-aside
+    /// and nothing of the quarantine.
+    #[test]
+    fn the_quarantine_count_is_told_and_told_again_as_the_owner_empties_it() {
+        for endpoint_lane in [aterm_types::control_verbs::BRIDGE_LANE, 4] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+            bridge.endpoint_lane = endpoint_lane;
+            let reads = endpoint_lane >= LINK_QUARANTINE_LANE;
+            let root = bridge.state.root().to_path_buf();
+            bridge.simulate_boot(crate::durability::test_boot(1), 0);
+            bridge.begin_run();
+            std::fs::create_dir_all(root.join("inflight")).unwrap();
+            std::fs::write(root.join("inflight/8"), b"v=1 cut").unwrap();
+            bridge.simulate_boot(crate::durability::test_boot(2), 0);
+            bridge.set_aside_torn_state();
+            bridge.tell_set_aside();
+            bridge.tell_quarantine();
+            let told = |n: usize| lane.links()[n..].to_vec();
+            if !reads {
+                assert_eq!(told(0), ["link set-aside files=1"], "lane {endpoint_lane}");
+                assert!(!bridge.watches_quarantine());
+                continue;
+            }
+            assert_eq!(
+                told(0),
+                ["link set-aside files=1", "link quarantine torn=1"]
+            );
+            assert!(bridge.watches_quarantine(), "a count above 0 is watched");
+            bridge.tell_quarantine();
+            assert_eq!(told(2), Vec::<String>::new(), "nothing moved, nothing said");
+            std::fs::remove_file(root.join("quarantine/inflight.8")).unwrap();
+            assert!(bridge.watches_quarantine());
+            bridge.tell_quarantine();
+            assert_eq!(told(2), ["link quarantine torn=0"], "the owner emptied it");
+            assert!(
+                !bridge.watches_quarantine(),
+                "and it is no longer looked at"
+            );
+            // THE NEXT PROCESS: no memory of what was said.
+            bridge.quarantine_said = None;
+            bridge.tell_quarantine();
+            assert_eq!(told(3), ["link quarantine torn=0"], "said at every start");
+            std::fs::remove_dir(root.join("quarantine")).unwrap();
+            bridge.quarantine_said = None;
+            bridge.tell_quarantine();
+            assert_eq!(
+                told(4),
+                ["link quarantine torn=0"],
+                "a quarantine removed whole holds none"
+            );
+        }
+    }
+
+    /// **THE OWNER EMPTYING THE QUARANTINE IS HEARD WITH NO BROKER TOO**
+    /// (sim item S6, the review's finding on [`Bridge::pass`]): the look asks
+    /// aterm, not the broker, so a bus that is away must not keep the entry
+    /// open. After a power cut the start sets a cut entry aside and says
+    /// `torn=1`; there is no broker to attach to. The owner removes the file,
+    /// and with the round due, one pass — whose attach fails and returns
+    /// before the round — says `torn=0`. A second pass says nothing more: the
+    /// count is no longer watched. Before the fix only the round looked, and
+    /// a failed attach never reaches it: the pass said `link down` and
+    /// nothing of the quarantine, for as long as the broker stayed away.
+    #[test]
+    fn the_quarantine_emptied_is_told_while_the_broker_is_away() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+        bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
+        let root = bridge.state.root().to_path_buf();
+        bridge.simulate_boot(crate::durability::test_boot(1), 0);
+        bridge.begin_run();
+        std::fs::create_dir_all(root.join("inflight")).unwrap();
+        std::fs::write(root.join("inflight/8"), b"v=1 cut").unwrap();
+        bridge.simulate_boot(crate::durability::test_boot(2), 0);
+        bridge.set_aside_torn_state();
+        bridge.tell_set_aside();
+        bridge.tell_quarantine();
+        assert_eq!(
+            lane.links(),
+            ["link set-aside files=1", "link quarantine torn=1"]
+        );
+        std::fs::remove_file(root.join("quarantine/inflight.8")).unwrap();
+        let quarantine_said = |lane: &FakeVerbLane| {
+            lane.links()
+                .into_iter()
+                .filter(|l| l.starts_with("link quarantine"))
+                .collect::<Vec<_>>()
+        };
+        let mut backoff = Backoff::default();
+        bridge.roster_due = bridge.fx.now();
+        assert!(bridge.pass(&mut backoff).is_none(), "the bridge runs on");
+        assert!(bridge.conn.is_none(), "no broker was reached");
+        assert!(
+            lane.links().iter().any(|l| l.starts_with("link down")),
+            "the attach failed: {:?}",
+            lane.links()
+        );
+        assert_eq!(
+            quarantine_said(&lane),
+            ["link quarantine torn=1", "link quarantine torn=0"],
+            "the owner emptied it, and aterm heard it with no broker"
+        );
+        assert!(!bridge.watches_quarantine());
+        bridge.roster_due = bridge.fx.now();
+        assert!(bridge.pass(&mut backoff).is_none());
+        assert_eq!(
+            quarantine_said(&lane).len(),
+            2,
+            "a count no longer watched is not looked at again"
+        );
+        bridge.close_subscriptions();
+    }
+
+    /// **A HANDOFF FLUSHES NOTHING AND LEAVES THE RUN TO ITS SUCCESSOR; A QUIT
+    /// STOPS IT CLEANLY** (sim item S6, [`Bridge::end_run`]). A bridge of boot
+    /// 1 wrote a reservation, unflushed, and aterm's last word was `bye
+    /// handoff`: its stop flushes nothing and `run` stays open in boot 1. The
+    /// successor's start in the same boot writes no record and inherits the
+    /// reservation unflushed, and its own clean stop flushes it where it is
+    /// (nothing rewritten, [`StateDir::end_run_clean`]). NEGATIVE
+    /// CONTROL: after `bye quit` the stop is clean, the successor's start
+    /// writes the record again (two full flushes) and inherits nothing —
+    /// the flushes a handoff no longer pays.
+    #[test]
+    fn a_handoff_leaves_the_run_to_its_successor_and_a_quit_stops_it_cleanly() {
+        for bye in [Bye::Handoff, Bye::Quit] {
+            let (_lane, mut bridge) = FakeVerbLane::bridge(&[]);
+            bridge.simulate_boot(crate::durability::test_boot(1), 0);
+            bridge.begin_run();
+            let pin = plain_pin(7, "/f/f/in/n-1/s-b/n-1/note", b"v=1 t=1");
+            bridge.state.set_post_pin("s-a", 1, &pin).unwrap();
+            bridge.bye = Some(bye);
+            bridge.end_run();
+            let run = bridge.state.last_run().unwrap().expect("a run record");
+            assert_eq!(
+                run.clean,
+                bye == Bye::Quit,
+                "{bye:?}: a handoff leaves the run open"
+            );
+            let successor = StateDir::open(bridge.state.root()).unwrap();
+            successor.set_inc_seam(crate::state::IncSeam {
+                boot: Some(Some(crate::durability::test_boot(1))),
+                kill_at: None,
+                mutant: 0,
+                span: None,
+                off_volume: false,
+            });
+            let began = successor.begin_run().unwrap();
+            let stopped = successor.end_run_clean().unwrap();
+            match bye {
+                Bye::Handoff => {
+                    assert_eq!(began.full, 0, "no record written at the successor's start");
+                    assert_eq!(stopped.files, 1, "the reservation, inherited and flushed");
+                }
+                Bye::Quit => {
+                    assert_eq!(began.full, 2, "CONTROL: the record written again");
+                    assert_eq!(stopped.files, 0, "CONTROL: nothing inherited");
+                }
+            }
         }
     }
 
@@ -20539,6 +21067,7 @@ mod tests {
                     replaces: 2 * posts,
                     renames: 2 * posts,
                     fsyncs: 0,
+                    barriers: 0,
                     unlinks: 2 * posts,
                     appends: posts,
                 },
@@ -25013,14 +25542,17 @@ mod tests {
         let (fleet, node) = (bridge.cfg.fleet.clone(), bridge.node.clone());
         let face = |sid: &str| subject::session_face(&fleet, &node, sid, "presence");
         let (mut writer, _) = bridge.connect().unwrap();
-        let live = format!("v=1 t=1 inc={} state=live", bridge.inc);
+        // Rows this bridge wrote: its incarnation and its state dir's mark.
+        let mark = bridge.mark.clone().expect("the state dir's mark");
+        let ours = |row: &str| format!("{row} {}={mark}", crate::state::PRESENCE_MARK);
+        let live = ours(&format!("v=1 t=1 inc={} state=live", bridge.inc));
         writer
             .publish(91, 1, &face("s-gone"), live.as_bytes())
             .unwrap();
         writer
             .publish(91, 2, &face("s-done"), live.as_bytes())
             .unwrap();
-        let done = format!("v=1 t=2 inc={} state=exited", bridge.inc);
+        let done = ours(&format!("v=1 t=2 inc={} state=exited", bridge.inc));
         writer
             .publish(91, 3, &face("s-done"), done.as_bytes())
             .unwrap();

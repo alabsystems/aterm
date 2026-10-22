@@ -53,7 +53,6 @@ fn record(local_id: u64) -> SessionRecord {
         land_at: None,
         control: None,
         frozen_path: false,
-        identity: None,
         topics: Vec::new(),
         fg_holder: None,
         rekey: false,

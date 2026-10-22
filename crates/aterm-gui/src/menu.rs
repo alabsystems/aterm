@@ -232,6 +232,8 @@ pub(crate) enum MenuAction {
     OpenMarkdown,
     /// Choose one local UTF-8 file and open it in the native editor.
     OpenEditor,
+    /// Save the active editor document through its existing file grant.
+    Save,
     /// Reopen the most recently closed whole tab with fresh runtime identities.
     ReopenClosedTab,
     /// Reinsert the most recently closed split leaf at its original topology path.
@@ -430,17 +432,6 @@ pub(crate) enum MenuAction {
     /// Set Role… — the same inline editor over the active tab, editing the focused session's
     /// `meta role` (the presence band's first slot). Terminal-only.
     SetRole,
-    /// Show Identity — read-only: the focused session's agent identity (its `identities
-    /// <name>` row and agents, or a sentence saying it runs under the user's own agent
-    /// configuration) as a Markdown tab. Terminal-only.
-    ShowIdentity,
-    /// New Window With Identity… — the identity picker (`App::open_identity_picker`): choosing
-    /// an identity, or typing a new name, opens a window whose first shell runs under it. Like
-    /// `spawn place=window identity=<name>`, it may create the identity.
-    NewWindowWithIdentity,
-    /// New Tab With Identity… — the same picker; choosing opens a tab in the
-    /// front window under the chosen identity.
-    NewTabWithIdentity,
     /// Edit ▸ Reset Terminal (`crate::manual_reset`): return the front session's terminal modes,
     /// a torn escape sequence and an open OSC 8 link to host defaults, keeping the screen and
     /// scrollback. The menu twin of the `reset` verb. Terminal-only.
@@ -530,9 +521,7 @@ impl MenuAction {
             // 67 is retired (was Presence Band); 68 is Show Needs in Windows.
             MenuAction::ToggleNeedsInWindows => 68,
             MenuAction::Messages => 69,
-            MenuAction::ShowIdentity => 70,
-            MenuAction::NewWindowWithIdentity => 71,
-            MenuAction::NewTabWithIdentity => 72,
+            // 70-72 retired (named session identities).
             MenuAction::ResetTerminal => 73,
             MenuAction::HarnessSettings => 74,
             MenuAction::ChooseTheme => 75,
@@ -550,6 +539,7 @@ impl MenuAction {
             MenuAction::DeckSizeAuto => 88,
             MenuAction::DeckSizeFull => 89,
             MenuAction::DeckSizeFolded => 90,
+            MenuAction::Save => 91,
             // Per-session themes (palette-256-session).
             MenuAction::ChooseTabTheme => 77,
             MenuAction::ClearTabTheme => 78,
@@ -619,9 +609,7 @@ impl MenuAction {
             // 67 retired (was Presence Band).
             68 => MenuAction::ToggleNeedsInWindows,
             69 => MenuAction::Messages,
-            70 => MenuAction::ShowIdentity,
-            71 => MenuAction::NewWindowWithIdentity,
-            72 => MenuAction::NewTabWithIdentity,
+            // 70-72 retired (named session identities).
             73 => MenuAction::ResetTerminal,
             74 => MenuAction::HarnessSettings,
             75 => MenuAction::ChooseTheme,
@@ -640,6 +628,7 @@ impl MenuAction {
             88 => MenuAction::DeckSizeAuto,
             89 => MenuAction::DeckSizeFull,
             90 => MenuAction::DeckSizeFolded,
+            91 => MenuAction::Save,
             _ => return None,
         })
     }
@@ -703,6 +692,9 @@ pub(crate) fn retired_invoke_name(name: &str) -> Option<&'static str> {
             "the presence band is gone; the needs border and its pill replace it \
              (ToggleNeedsInWindows)",
         ),
+        "ShowIdentity" | "NewWindowWithIdentity" | "NewTabWithIdentity" => {
+            Some("named session identities were removed")
+        }
         _ => None,
     }
 }
@@ -728,7 +720,6 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             | MenuAction::TakeOver
             | MenuAction::HandBack
             | MenuAction::SetRole
-            | MenuAction::ShowIdentity
             | MenuAction::ResetTerminal
             // A tab's own theme is the front session's.
             | MenuAction::ChooseTabTheme
@@ -1059,6 +1050,12 @@ pub(crate) const fn close_row_title(split: bool) -> &'static str {
 pub(crate) struct MenuLive {
     /// A text selection exists (Copy).
     pub has_selection: bool,
+    /// The active editor document has changes its file grant can save.
+    pub can_save: bool,
+    /// The focused content can open a search.
+    pub can_find: bool,
+    /// The focused content has a query Find Next/Previous can navigate.
+    pub can_find_again: bool,
     /// The front window has two or more tabs (Show Next / Previous Tab).
     pub multi_tab: bool,
     /// A closed tab can be reopened (Reopen Closed Tab).
@@ -1077,9 +1074,12 @@ pub(crate) struct MenuLive {
 
 #[cfg(any(target_os = "macos", test))]
 impl MenuLive {
-    /// Before the first publish: every row enabled, nothing checked, the static titles.
+    /// Before the first publish: Save and Find disabled, other rows enabled, nothing checked.
     pub(crate) const UNPUBLISHED: MenuLive = MenuLive {
         has_selection: true,
+        can_save: false,
+        can_find: false,
+        can_find_again: false,
         multi_tab: true,
         can_reopen_closed_tab: true,
         can_reopen_closed_view: true,
@@ -1089,20 +1089,26 @@ impl MenuLive {
         front_tab_split: false,
     };
 
-    const fn bits(self) -> u8 {
-        (self.has_selection as u8)
-            | (self.multi_tab as u8) << 1
-            | (self.can_reopen_closed_tab as u8) << 2
-            | (self.can_reopen_closed_view as u8) << 3
-            | (self.serious_mode as u8) << 4
-            | (self.rain_on as u8) << 5
-            | (self.kitty_favourited as u8) << 6
-            | (self.front_tab_split as u8) << 7
+    const fn bits(self) -> u16 {
+        (self.has_selection as u16)
+            | (self.multi_tab as u16) << 1
+            | (self.can_reopen_closed_tab as u16) << 2
+            | (self.can_reopen_closed_view as u16) << 3
+            | (self.serious_mode as u16) << 4
+            | (self.rain_on as u16) << 5
+            | (self.kitty_favourited as u16) << 6
+            | (self.front_tab_split as u16) << 7
+            | (self.can_save as u16) << 8
+            | (self.can_find as u16) << 9
+            | (self.can_find_again as u16) << 10
     }
 
-    const fn from_bits(b: u8) -> MenuLive {
+    const fn from_bits(b: u16) -> MenuLive {
         MenuLive {
             has_selection: b & 1 != 0,
+            can_save: b & (1 << 8) != 0,
+            can_find: b & (1 << 9) != 0,
+            can_find_again: b & (1 << 10) != 0,
             multi_tab: b & (1 << 1) != 0,
             can_reopen_closed_tab: b & (1 << 2) != 0,
             can_reopen_closed_view: b & (1 << 3) != 0,
@@ -1116,8 +1122,8 @@ impl MenuLive {
 
 #[cfg(any(target_os = "macos", test))]
 menu_static! {
-    static MENU_LIVE: std::sync::atomic::AtomicU8 =
-        std::sync::atomic::AtomicU8::new(MenuLive::UNPUBLISHED.bits());
+    static MENU_LIVE: std::sync::atomic::AtomicU16 =
+        std::sync::atomic::AtomicU16::new(MenuLive::UNPUBLISHED.bits());
 }
 
 /// Publish the front window's [`MenuLive`].
@@ -1214,6 +1220,9 @@ fn native_menu_action_enabled(action: MenuAction) -> bool {
     let live = menu_live();
     let precondition = match action {
         MenuAction::Copy => live.has_selection,
+        MenuAction::Save => live.can_save,
+        MenuAction::Find => live.can_find,
+        MenuAction::FindNext | MenuAction::FindPrev => live.can_find_again,
         MenuAction::NextTab | MenuAction::PrevTab => live.multi_tab,
         MenuAction::ReopenClosedTab => live.can_reopen_closed_tab,
         MenuAction::ReopenClosedView => live.can_reopen_closed_view,
@@ -1301,12 +1310,6 @@ impl MenuAction {
             MenuAction::OpenPalette | MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => {
                 OwnerOnly
             }
-            // Identity rows: a spawn under an identity may create it
-            // (`spawn identity=` is Owner-only on the wire), and Show Identity
-            // discloses the `identities` roster row (Owner-only too).
-            MenuAction::NewWindowWithIdentity
-            | MenuAction::NewTabWithIdentity
-            | MenuAction::ShowIdentity => OwnerOnly,
             // The Agents menu. The Overview lists every session of the
             // instance (the `open overview` OwnerOnly class). The harness log
             // runs a child on this instance's own socket and raises the
@@ -1363,6 +1366,7 @@ impl MenuAction {
             | MenuAction::NewTab
             | MenuAction::OpenMarkdown
             | MenuAction::OpenEditor
+            | MenuAction::Save
             | MenuAction::ReopenClosedTab
             | MenuAction::ReopenClosedView
             | MenuAction::MoveTabToNewWindow
@@ -1442,6 +1446,7 @@ impl MenuAction {
             | MenuAction::NewTab
             | MenuAction::OpenMarkdown
             | MenuAction::OpenEditor
+            | MenuAction::Save
             | MenuAction::ReopenClosedTab
             | MenuAction::ReopenClosedView
             | MenuAction::MoveTabToNewWindow
@@ -1487,9 +1492,6 @@ impl MenuAction {
             | MenuAction::FabricOff
             | MenuAction::RenameSession
             | MenuAction::SetRole
-            | MenuAction::ShowIdentity
-            | MenuAction::NewWindowWithIdentity
-            | MenuAction::NewTabWithIdentity
             // Resets the terminal's modes; nothing reaches the program's input.
             | MenuAction::ResetTerminal
             // Recolour one session; nothing reaches its input.
@@ -1524,6 +1526,7 @@ impl MenuAction {
             MenuAction::NewTab => "Open a new terminal tab in this window.",
             MenuAction::OpenMarkdown => "Choose a local file and open it as read-only Markdown.",
             MenuAction::OpenEditor => "Choose a local file and open it in the editor.",
+            MenuAction::Save => "Save changes to the active file.",
             MenuAction::ReopenClosedTab => "Reopen the tab closed most recently.",
             MenuAction::ReopenClosedView => {
                 "Reopen the pane closed most recently where it was, or in a new tab if that \
@@ -1538,7 +1541,7 @@ impl MenuAction {
             MenuAction::Copy => "Copy the selection.",
             MenuAction::Paste => "Paste the clipboard.",
             MenuAction::SelectAll => "Select the whole screen.",
-            MenuAction::Find => "Search the scrollback.",
+            MenuAction::Find => "Search the active tab.",
             MenuAction::FindNext => "Step to the next match.",
             MenuAction::FindPrev => "Step to the previous match.",
             MenuAction::ToggleFullScreen => "Enter or leave full screen.",
@@ -1606,15 +1609,6 @@ impl MenuAction {
             MenuAction::RenameSession => "Name this session; the tab shows the name.",
             MenuAction::SetRole => {
                 "Give this session a role; its tab and every list of needs use it."
-            }
-            MenuAction::ShowIdentity => {
-                "Open this session's agent identity as a tab: its name, directory and agents."
-            }
-            MenuAction::NewWindowWithIdentity => {
-                "Open a new window whose shell runs under an agent identity you choose or name."
-            }
-            MenuAction::NewTabWithIdentity => {
-                "Open a new tab whose shell runs under an agent identity you choose or name."
             }
             MenuAction::ResetTerminal => {
                 "Hand this terminal's keys, mouse and modes back to their defaults; \
@@ -1691,6 +1685,7 @@ impl MenuAction {
             "NewTab" => Some(MenuAction::NewTab),
             "OpenMarkdown" => Some(MenuAction::OpenMarkdown),
             "OpenEditor" => Some(MenuAction::OpenEditor),
+            "Save" => Some(MenuAction::Save),
             "ReopenClosedTab" => Some(MenuAction::ReopenClosedTab),
             "ReopenClosedView" => Some(MenuAction::ReopenClosedView),
             "MoveTabToNewWindow" => Some(MenuAction::MoveTabToNewWindow),
@@ -1741,9 +1736,6 @@ impl MenuAction {
             "FabricOn" => Some(MenuAction::FabricOn),
             "FabricOff" => Some(MenuAction::FabricOff),
             "SetRole" => Some(MenuAction::SetRole),
-            "ShowIdentity" => Some(MenuAction::ShowIdentity),
-            "NewWindowWithIdentity" => Some(MenuAction::NewWindowWithIdentity),
-            "NewTabWithIdentity" => Some(MenuAction::NewTabWithIdentity),
             "ToggleNeedsInWindows" => Some(MenuAction::ToggleNeedsInWindows),
             "StatsBarsDeck" => Some(MenuAction::StatsBarsDeck),
             "StatsBarsSill" => Some(MenuAction::StatsBarsSill),
@@ -1774,10 +1766,14 @@ pub(crate) enum MenuMods {
     CommandControl,
 }
 
-/// One entry of a menu section: a command item or a divider.
+/// One entry of a menu section: a command, a submenu or a divider.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum MenuEntry {
     Separator,
+    Submenu {
+        label: &'static str,
+        entries: &'static [MenuEntry],
+    },
     Item {
         label: &'static str,
         action: MenuAction,
@@ -1790,20 +1786,49 @@ pub(crate) enum MenuEntry {
 
 impl MenuEntry {
     /// This entry's item, if it is one — the one walk every consumer shares
-    /// (the completeness proof, the palette, the accelerator hints). The bar is flat.
+    /// (the completeness proof, the palette, the accelerator hints), including
+    /// commands nested in submenus.
     pub(crate) fn items(
         &self,
-    ) -> impl Iterator<Item = (&'static str, MenuAction, &'static str, MenuMods)> {
-        match self {
+    ) -> impl Iterator<Item = (&'static str, MenuAction, &'static str, MenuMods)> + '_ {
+        let mut pending = Vec::new();
+        let mut item = match self {
             MenuEntry::Item {
                 label,
                 action,
                 key,
                 mods,
             } => Some((*label, *action, *key, *mods)),
+            MenuEntry::Submenu { entries, .. } => {
+                pending.push(entries.iter());
+                None
+            }
             MenuEntry::Separator => None,
-        }
-        .into_iter()
+        };
+        // Ordinary items allocate nothing. A submenu retains only its current
+        // ancestry while walking the same commands in menu order.
+        std::iter::from_fn(move || {
+            if let Some(item) = item.take() {
+                return Some(item);
+            }
+            loop {
+                match pending.last_mut()?.next() {
+                    Some(MenuEntry::Item {
+                        label,
+                        action,
+                        key,
+                        mods,
+                    }) => {
+                        return Some((*label, *action, *key, *mods));
+                    }
+                    Some(MenuEntry::Submenu { entries, .. }) => pending.push(entries.iter()),
+                    Some(MenuEntry::Separator) => {}
+                    None => {
+                        pending.pop();
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -1813,7 +1838,7 @@ pub(crate) struct MenuSection {
     pub entries: &'static [MenuEntry],
 }
 
-use MenuEntry::{Item, Separator};
+use MenuEntry::{Item, Separator, Submenu};
 
 use crate::update_apply_trouble::ApplyTrouble;
 
@@ -1903,20 +1928,6 @@ const FILE_MENU: &[MenuEntry] = &[
         key: "t",
         mods: MenuMods::Command,
     },
-    // The identity rows open the identity picker. No key equivalents: choosing may create an
-    // identity, an Owner act.
-    Item {
-        label: "New Window With Identity…",
-        action: MenuAction::NewWindowWithIdentity,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "New Tab With Identity…",
-        action: MenuAction::NewTabWithIdentity,
-        key: "",
-        mods: MenuMods::None,
-    },
     Separator,
     Item {
         label: "Open Markdown…",
@@ -1925,9 +1936,15 @@ const FILE_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Item {
-        label: "Open File in Editor…",
+        label: "Open File…",
         action: MenuAction::OpenEditor,
         key: "o",
+        mods: MenuMods::Command,
+    },
+    Item {
+        label: "Save",
+        action: MenuAction::Save,
+        key: "s",
         mods: MenuMods::Command,
     },
     Item {
@@ -1941,25 +1958,6 @@ const FILE_MENU: &[MenuEntry] = &[
         action: MenuAction::ReopenClosedView,
         key: "",
         mods: MenuMods::None,
-    },
-    Separator,
-    Item {
-        label: "Move Tab to New Window",
-        action: MenuAction::MoveTabToNewWindow,
-        key: "n",
-        mods: MenuMods::CommandShift,
-    },
-    Item {
-        label: "Move Tab to Next Window",
-        action: MenuAction::MoveTabToNextWindow,
-        key: "m",
-        mods: MenuMods::CommandShift,
-    },
-    Item {
-        label: "Open Session in New Window",
-        action: MenuAction::ViewSessionInNewWindow,
-        key: "o",
-        mods: MenuMods::CommandShift,
     },
     Separator,
     Item {
@@ -2045,13 +2043,33 @@ pub(crate) const PALETTE_ONLY: &[(&str, MenuAction)] = &[
     ("Message Bus: Status", MenuAction::FabricStatus),
     ("Message Bus: Turn On…", MenuAction::FabricOn),
     ("Message Bus: Turn Off…", MenuAction::FabricOff),
-    ("Show Identity", MenuAction::ShowIdentity),
     ("Fleet Machines", MenuAction::FleetMachines),
 ];
 
 /// The palette section the [`PALETTE_ONLY`] rows sit in: the menu whose
 /// matter they are.
 pub(crate) const PALETTE_ONLY_SECTION: &str = "Agents";
+
+const FIND_MENU: &[MenuEntry] = &[
+    Item {
+        label: "Find…",
+        action: MenuAction::Find,
+        key: "f",
+        mods: MenuMods::Command,
+    },
+    Item {
+        label: "Find Next",
+        action: MenuAction::FindNext,
+        key: "g",
+        mods: MenuMods::Command,
+    },
+    Item {
+        label: "Find Previous",
+        action: MenuAction::FindPrev,
+        key: "g",
+        mods: MenuMods::CommandShift,
+    },
+];
 
 const EDIT_MENU: &[MenuEntry] = &[
     Item {
@@ -2073,23 +2091,9 @@ const EDIT_MENU: &[MenuEntry] = &[
         mods: MenuMods::Command,
     },
     Separator,
-    Item {
-        label: "Find…",
-        action: MenuAction::Find,
-        key: "f",
-        mods: MenuMods::Command,
-    },
-    Item {
-        label: "Find Next",
-        action: MenuAction::FindNext,
-        key: "g",
-        mods: MenuMods::Command,
-    },
-    Item {
-        label: "Find Previous",
-        action: MenuAction::FindPrev,
-        key: "g",
-        mods: MenuMods::CommandShift,
+    Submenu {
+        label: "Find",
+        entries: FIND_MENU,
     },
     Separator,
     // No key equivalent: Terminal.app's ⌥⌘R needs an Option modifier `MenuMods` does not carry,
@@ -2296,6 +2300,25 @@ const WINDOW_MENU: &[MenuEntry] = &[
         label: "Show Previous Tab",
         action: MenuAction::PrevTab,
         key: "[",
+        mods: MenuMods::CommandShift,
+    },
+    Separator,
+    Item {
+        label: "Move Tab to New Window",
+        action: MenuAction::MoveTabToNewWindow,
+        key: "n",
+        mods: MenuMods::CommandShift,
+    },
+    Item {
+        label: "Move Tab to Next Window",
+        action: MenuAction::MoveTabToNextWindow,
+        key: "m",
+        mods: MenuMods::CommandShift,
+    },
+    Item {
+        label: "Open Session in New Window",
+        action: MenuAction::ViewSessionInNewWindow,
+        key: "o",
         mods: MenuMods::CommandShift,
     },
     Separator,
@@ -2634,9 +2657,6 @@ pub(crate) const MENU_MODEL: &[MenuSection] = &[
 /// `app_introspect::read_native_chrome`, so the cross-platform (off-macOS) `chrome`
 /// reports the SAME logical menu the macOS bar shows.
 ///
-/// One line per section: the model holds no submenu. (The macOS live reader still prints a submenu AppKit
-/// adds on its own as `<label> ▸` in its parent's line, then that submenu's own line.)
-///
 /// A submenu prints twice, as both readers do: `<label> ▸` in its parent's line, then its own
 /// line titled `"<parent> ▸ <label>"`. The Version menu's first row is dynamic: `apply_row` is
 /// its live label ([`crate::palette::apply_row_label`]) and `None` leaves it out. ⌘W's title
@@ -2665,6 +2685,7 @@ fn chrome_lines_for(
     front_tab_split: bool,
 ) -> Vec<String> {
     let mut labels: Vec<String> = Vec::new();
+    let mut submenus = Vec::new();
     for e in entries {
         match e {
             // A row this platform cannot act on is not reported (`offered_on_this_platform`).
@@ -2680,10 +2701,21 @@ fn chrome_lines_for(
                 ..
             } => labels.push(close_row_title(front_tab_split).to_string()),
             MenuEntry::Item { label, .. } => labels.push((*label).to_string()),
+            MenuEntry::Submenu { label, entries } => {
+                labels.push(format!("{label} ▸"));
+                submenus.extend(chrome_lines_for(
+                    &format!("{title} ▸ {label}"),
+                    entries,
+                    apply_row,
+                    front_tab_split,
+                ));
+            }
             MenuEntry::Separator => {}
         }
     }
-    vec![format!("menu {title:?}: {}", labels.join(", "))]
+    let mut lines = vec![format!("menu {title:?}: {}", labels.join(", "))];
+    lines.extend(submenus);
+    lines
 }
 
 #[cfg(target_os = "macos")]
@@ -3381,6 +3413,9 @@ mod macos {
                     key,
                     mods,
                 } => add_item_mods(&menu, target, label, *action, key, mods_mask(*mods)),
+                super::MenuEntry::Submenu { label, entries } => {
+                    attach_submenu(&menu, label, build_section(target, entries)?)?;
+                }
                 super::MenuEntry::Separator => add_separator(&menu),
             }
         }
@@ -4529,7 +4564,7 @@ mod tests {
         use super::{MenuLive, menu_live, native_live_title, native_menu_checked, set_menu_live};
         set_active_tab_is_terminal(true);
         let before = menu_live();
-        // Before the first publish: every row enabled.
+        // Before the first publish: content-dependent Find and Save stay disabled.
         set_menu_live(MenuLive::UNPUBLISHED);
         assert_eq!(menu_live(), MenuLive::UNPUBLISHED);
         for a in [
@@ -4542,9 +4577,15 @@ mod tests {
             assert!(native_menu_action_enabled(a), "{a:?}");
         }
         assert_eq!(native_live_title(MenuAction::CloseTab), Some("Close Tab"));
+        for action in [MenuAction::Find, MenuAction::FindNext, MenuAction::FindPrev] {
+            assert!(!native_menu_action_enabled(action), "{action:?}");
+        }
 
         let idle = MenuLive {
             has_selection: false,
+            can_save: false,
+            can_find: false,
+            can_find_again: false,
             multi_tab: false,
             can_reopen_closed_tab: false,
             can_reopen_closed_view: false,
@@ -4555,6 +4596,25 @@ mod tests {
         };
         set_menu_live(idle);
         assert_eq!(menu_live(), idle, "every bit round-trips");
+        assert!(!native_menu_action_enabled(MenuAction::Save));
+        set_menu_live(MenuLive {
+            can_save: true,
+            ..idle
+        });
+        assert!(native_menu_action_enabled(MenuAction::Save));
+        for (open, again) in [(true, false), (true, true), (false, false)] {
+            set_menu_live(MenuLive {
+                can_find: open,
+                can_find_again: again,
+                ..idle
+            });
+            assert_eq!(native_menu_action_enabled(MenuAction::Find), open);
+            assert_eq!(native_menu_action_enabled(MenuAction::FindNext), again);
+            assert_eq!(native_menu_action_enabled(MenuAction::FindPrev), again);
+            assert_eq!(menu_live().can_find, open);
+            assert_eq!(menu_live().can_find_again, again);
+        }
+        set_menu_live(idle);
         for a in [
             MenuAction::Copy,
             MenuAction::NextTab,
@@ -4629,39 +4689,6 @@ mod tests {
             "Emoji & Symbols"
         );
         set_menu_live(before);
-    }
-
-    /// The identity rows sit right under New Terminal Tab in the File
-    /// menu, with no key equivalents (choosing may create an identity), and
-    /// the File menu holds no submenu.
-    #[test]
-    fn the_identity_rows_sit_under_new_terminal_tab() {
-        let file = MENU_MODEL.iter().find(|s| s.title == "File").unwrap();
-        let rows: Vec<(MenuAction, &str)> = file
-            .entries
-            .iter()
-            .flat_map(MenuEntry::items)
-            .map(|(_, a, k, _)| (a, k))
-            .collect();
-        let at = |action: MenuAction| {
-            rows.iter()
-                .position(|(a, _)| *a == action)
-                .unwrap_or_else(|| panic!("File menu lacks {action:?}"))
-        };
-        assert_eq!(
-            at(MenuAction::NewWindowWithIdentity),
-            at(MenuAction::NewTab) + 1
-        );
-        assert_eq!(
-            at(MenuAction::NewTabWithIdentity),
-            at(MenuAction::NewWindowWithIdentity) + 1
-        );
-        for action in [
-            MenuAction::NewWindowWithIdentity,
-            MenuAction::NewTabWithIdentity,
-        ] {
-            assert_eq!(rows[at(action)].1, "", "{action:?}: no key equivalent");
-        }
     }
 
     /// Every command the bar and the tab menu carry decodes back from the
@@ -4749,7 +4776,7 @@ mod tests {
     /// One `menu "<title>": …` line per section, in the standard Mac order with
     /// the app's own Agents menu between View and Window; each line lists
     /// exactly the rows its section offers here (the dynamic update row only
-    /// while live); no separator artifacts and no submenu.
+    /// while live); submenu contents have their own lines, with no separator artifacts.
     #[test]
     fn chrome_lines_render_titled_sections() {
         let lines = menu_chrome_lines(None, false);
@@ -4760,16 +4787,23 @@ mod tests {
                 "aterm", "File", "Edit", "View", "Agents", "Window", "Help", "Version"
             ]
         );
-        assert_eq!(lines.len(), titles.len(), "one line per section");
-        for (line, section) in lines.iter().zip(MENU_MODEL) {
+        assert_eq!(
+            lines.len(),
+            titles.len() + 1,
+            "sections plus the Find submenu"
+        );
+        for section in MENU_MODEL {
             let head = format!("menu {:?}: ", section.title);
-            assert!(line.starts_with(&head), "{line}");
+            let line = lines.iter().find(|line| line.starts_with(&head)).unwrap();
             let offered = section
                 .entries
                 .iter()
-                .flat_map(MenuEntry::items)
-                .filter(|(_, a, _, _)| {
-                    a.offered_on_this_platform() && *a != MenuAction::ApplyUpdate
+                .filter(|entry| match entry {
+                    MenuEntry::Item { action, .. } => {
+                        action.offered_on_this_platform() && *action != MenuAction::ApplyUpdate
+                    }
+                    MenuEntry::Submenu { .. } => true,
+                    MenuEntry::Separator => false,
                 })
                 .count();
             let listed = line[head.len()..]
@@ -4779,11 +4813,69 @@ mod tests {
             assert_eq!(listed, offered, "{line}");
         }
         assert!(
-            !lines
-                .iter()
-                .any(|l| l.contains(", ,") || l.contains('\u{25b8}')),
-            "no separator artifact, no submenu: {lines:?}"
+            !lines.iter().any(|l| l.contains(", ,")),
+            "no separator artifact: {lines:?}"
         );
+    }
+
+    #[test]
+    fn find_submenu_keeps_commands_shortcuts_and_palette_access() {
+        let edit = super::MENU_MODEL
+            .iter()
+            .find(|section| section.title == "Edit")
+            .unwrap();
+        let nested = edit
+            .entries
+            .iter()
+            .find_map(|entry| match entry {
+                MenuEntry::Submenu {
+                    label: "Find",
+                    entries,
+                } => Some(*entries),
+                _ => None,
+            })
+            .expect("one Find submenu");
+        assert!(
+            !edit.entries.iter().any(|entry| matches!(
+                entry,
+                MenuEntry::Item {
+                    action: MenuAction::Find | MenuAction::FindNext | MenuAction::FindPrev,
+                    ..
+                }
+            )),
+            "search commands are grouped, not repeated beside their submenu"
+        );
+        let commands: Vec<_> = nested
+            .iter()
+            .flat_map(MenuEntry::items)
+            .map(|(_, action, key, mods)| (action, key, mods))
+            .collect();
+        assert_eq!(
+            commands,
+            [
+                (MenuAction::Find, "f", super::MenuMods::Command),
+                (MenuAction::FindNext, "g", super::MenuMods::Command),
+                (MenuAction::FindPrev, "g", super::MenuMods::CommandShift),
+            ]
+        );
+        let chrome = super::chrome_lines_for("Edit", edit.entries, None, false);
+        assert!(chrome[0].contains("Find ▸"));
+        let submenu_rows = chrome[1]
+            .strip_prefix("menu \"Edit ▸ Find\": ")
+            .expect("the nested menu has its own inspection path");
+        assert_eq!(submenu_rows.split(", ").count(), commands.len());
+        let palette = crate::palette::PaletteState::new();
+        for name in ["Find", "FindNext", "FindPrev"] {
+            let action = MenuAction::from_invoke_name(name).unwrap();
+            assert_eq!(palette.action_by_name(name), Ok(action));
+            assert_eq!(
+                model_items()
+                    .iter()
+                    .filter(|(_, found, _, _)| *found == action)
+                    .count(),
+                1
+            );
+        }
     }
 
     /// `chrome` offers "Check for Updates…" exactly where an updater exists
@@ -4815,10 +4907,8 @@ mod tests {
         assert!(!offered("Install"), "{:?}", menu_chrome_lines(None, false));
         // Nothing else is platform-gated.
         for section in MENU_MODEL {
-            for entry in section.entries {
-                if let MenuEntry::Item { action, .. } = entry
-                    && !matches!(action, MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate)
-                {
+            for (_, action, _, _) in section.entries.iter().flat_map(MenuEntry::items) {
+                if !matches!(action, MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate) {
                     assert!(action.offered_on_this_platform(), "{action:?}");
                 }
             }

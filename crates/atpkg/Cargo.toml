@@ -33,10 +33,10 @@ test = false
 
 [features]
 # Development seams in an optimized build (`aterm_types::dev_seam!`: ATPKG_REGISTRY,
-# ATPKG_STAGE_DISK_REVERIFY; `config::DEV_SEAMS`: `[packages]` prefix/account and the
-# owner/repo form of `[packages.links]`). Debug builds have them anyway; aterm-release's
-# buildplan keeps a release build from enabling this. It forwards to aterm-types' own seam
-# readers (`dirs::logs_dir`, `dirs::runs_under_private_state_root`).
+# ATPKG_STAGE_DISK_REVERIFY, ATPKG_WAIT_ANNOUNCE_GRACE_MS; `config::DEV_SEAMS`: `[packages]`
+# prefix/account and the owner/repo form of `[packages.links]`). Debug builds have them
+# anyway; aterm-release's buildplan keeps a release build from enabling this. It forwards to
+# aterm-types' own seam readers (`dirs::logs_dir`, `dirs::runs_under_private_state_root`).
 dev-seams = ["aterm-update-core/dev-seams", "aterm-types/dev-seams"]
 
 [dependencies]
@@ -153,6 +153,9 @@ ring = { workspace = true, features = ["default"] }
 aterm-pty = { workspace = true }
 # The forge cell matrix: a published triple that no forge cell compiles fails a test.
 aterm-forge = { workspace = true }
+# The lock-wait tests read a waiter's parent from the kernel's process table (`kproc`, the
+# sweep off macOS), not through `ps`. First-party, libc only. Tests only.
+aterm-sysprobe = { workspace = true }
 
 [lints]
 workspace = true

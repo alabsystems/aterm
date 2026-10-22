@@ -1,0 +1,33 @@
+atape-text 1
+header
+| agh 0.107.0
+| api 2022-11-28
+| argv log alabsystems/aterm --limit 3
+| mode anonymous
+| endpoints github.com
+mono 20708
+exchange gh
+> GET /repos/alabsystems/aterm/commits?per_page=3
+> origin api
+> accept application/vnd.github+json
+> x-github-api-version 2022-11-28
+> as anonymous
+> body none
+< status 200
+< content-type application/json; charset=utf-8
+< etag W/"64c7ceb3fa7f6fdd2d27d01131fc760bca50945223c8e06f939b83e72c01d5eb"
+< link <https://api.github.com/repositories/1308352363/commits?per_page=3&page=2>; rel="next", <https://api.github.com/repositories/1308352363/commits?per_page=3&page=37>; rel="last"
+< x-ratelimit-limit 60
+< x-ratelimit-remaining 35
+< x-ratelimit-used 25
+< x-ratelimit-resource core
+< x-ratelimit-reset 1792542189
+< x-github-request-id E5DF:274DC4:164934:17AF10:6AD7FBCA
+<
+< [{"sha":"78404e3bbd328421d77044bd82106ff64fc68d31","node_id":"C_kwDOTfvfa9oAKDc4NDA0ZTNiYmQzMjg0MjFkNzcwNDRiZDgyMTA2ZmY2NGZjNjhkMzE","commit":{"author":{"name":"alabsystems publication","email":"publication@alabsystems.invalid","date":"2026-10-20T08:39:50Z"},"committer":{"name":"alabsystems publication","email":"publication@alabsystems.invalid","date":"2026-10-20T08:39:50Z"},"message":"release: aterm-staging@32a3c38149c0258671192bf9effafb3440798894","tree":{"sha":"6580b812ad609ae85720c6aa815209ec5db761f5","url":"https://api.github.com/repos/alabsystems/aterm/git/trees/6580b812ad609ae85720c6aa815209ec5db761f5"},"url":"https://api.github.com/repos/alabsystems/aterm/git/commits/78404e3bbd328421d77044bd82106ff64fc68d31","comment_count":0,"verification":{"verified":false,"reason":"unsigned","signature":null,"payload":null,"verified_at":null}},"url":"https://api.github.com/repos/alabsystems/aterm/commits/78404e3bbd328421d77044bd82106ff64fc68d31","html_url":"https://github.com/alabsystems/aterm/commit/78404e3bbd328421d77044bd82106ff64fc68d31","comments_url":"https://api.github.com/repos/alabsystems/aterm/commits/78404e3bbd328421d77044bd82106ff64fc68d31/comments","author":null,"committer":null,"parents":[{"sha":"1998f87b34d31000738766bf8c24bfa0f17a1bc7","url":"https://api.github.com/repos/alabsystems/aterm/commits/1998f87b34d31000738766bf8c24bfa0f17a1bc7","html_url":"https://github.com/alabsystems/aterm/commit/1998f87b34d31000738766bf8c24bfa0f17a1bc7"}]},{"sha":"1998f87b34d31000738766bf8c24bfa0f17a1bc7","node_id":"C_kwDOTfvfa9oAKDE5OThmODdiMzRkMzEwMDA3Mzg3NjZiZjhjMjRiZmEwZjE3YTFiYzc","commit":{"author":{"name":"alabsystems publication","email":"publication@alabsystems.invalid","date":"2026-10-18T01:43:05Z"},"committer":{"name":"alabsystems publication","email":"publication@alabsystems.invalid","date":"2026-10-18T01:43:05Z"},"message":"release: aterm-staging@dbf9231f838523c5647c4d0d68156aa111cc6cfb","tree":{"sha":"6d1382238a3a457f6460ef710746924585ba55f0","url":"https://api.github.com/repos/alabsystems/aterm/git/trees/6d1382238a3a457f6460ef710746924585ba55f0"},"url":"https://api.github.com/repos/alabsystems/aterm/git/commits/1998f87b34d31000738766bf8c24bfa0f17a1bc7","comment_count":0,"verification":{"verified":false,"reason":"unsigned","signature":null,"payload":null,"verified_at":null}},"url":"https://api.github.com/repos/alabsystems/aterm/commits/1998f87b34d31000738766bf8c24bfa0f17a1bc7","html_url":"https://github.com/alabsystems/aterm/commit/1998f87b34d31000738766bf8c24bfa0f17a1bc7","comments_url":"https://api.github.com/repos/alabsystems/aterm/commits/1998f87b34d31000738766bf8c24bfa0f17a1bc7/comments","author":null,"committer":null,"parents":[{"sha":"00c2274bbebf01c1435f5e46cb6c18381576d7e3","url":"https://api.github.com/repos/alabsystems/aterm/commits/00c2274bbebf01c1435f5e46cb6c18381576d7e3","html_url":"https://github.com/alabsystems/aterm/commit/00c2274bbebf01c1435f5e46cb6c18381576d7e3"}]},{"sha":"00c2274bbebf01c1435f5e46cb6c18381576d7e3","node_id":"C_kwDOTfvfa9oAKDAwYzIyNzRiYmViZjAxYzE0MzVmNWU0NmNiNmMxODM4MTU3NmQ3ZTM","commit":{"author":{"name":"alabsystems publication","email":"publication@alabsystems.invalid","date":"2026-10-16T23:06:33Z"},"committer":{"name":"alabsystems publication","email":"publication@alabsystems.invalid","date":"2026-10-16T23:06:33Z"},"message":"release: aterm-staging@53147fc40a9bc4a6913ef4edcd7e7d64e67d1572","tree":{"sha":"e3ea3fe2baacb04c76da3f57d9a6d449ba872f04","url":"https://api.github.com/repos/alabsystems/aterm/git/trees/e3ea3fe2baacb04c76da3f57d9a6d449ba872f04"},"url":"https://api.github.com/repos/alabsystems/aterm/git/commits/00c2274bbebf01c1435f5e46cb6c18381576d7e3","comment_count":0,"verification":{"verified":false,"reason":"unsigned","signature":null,"payload":null,"verified_at":null}},"url":"https://api.github.com/repos/alabsystems/aterm/commits/00c2274bbebf01c1435f5e46cb6c18381576d7e3","html_url":"https://github.com/alabsystems/aterm/commit/00c2274bbebf01c1435f5e46cb6c18381576d7e3","comments_url":"https://api.github.com/repos/alabsystems/aterm/commits/00c2274bbebf01c1435f5e46cb6c18381576d7e3/comments","author":null,"committer":null,"parents":[{"sha":"9254ba65f0da73da0e68887665e08263e832f7d7","url":"https://api.github.com/repos/alabsystems/aterm/commits/9254ba65f0da73da0e68887665e08263e832f7d7","html_url":"https://github.com/alabsystems/aterm/commit/9254ba65f0da73da0e68887665e08263e832f7d7"}]}]
+mono 331274708
+emit stdout
+| [{"author":"alabsystems publication","date":"2026-10-20T08:39:50Z","sha":"78404e3bbd328421d77044bd82106ff64fc68d31","subject":"release: aterm-staging@32a3c38149c0258671192bf9effafb3440798894"},{"author":"alabsystems publication","date":"2026-10-18T01:43:05Z","sha":"1998f87b34d31000738766bf8c24bfa0f17a1bc7","subject":"release: aterm-staging@dbf9231f838523c5647c4d0d68156aa111cc6cfb"},{"author":"alabsystems publication","date":"2026-10-16T23:06:33Z","sha":"00c2274bbebf01c1435f5e46cb6c18381576d7e3","subject":"release: aterm-staging@53147fc40a9bc4a6913ef4edcd7e7d64e67d1572"}]
+|
+emit exit
+| 0

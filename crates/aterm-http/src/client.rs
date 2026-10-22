@@ -4,8 +4,9 @@
 //! HTTP/1.1 request building and response parsing.
 //!
 //! Scope was set by the caller it was written for (the title-summary worker,
-//! retired 2026-10-15): one request per connection, a known-length body,
-//! `Connection: close`, and NO redirect following (an API endpoint that
+//! retired 2026-10-15): one request per connection, a known-length body (held
+//! whole, or streamed from a reader of a stated length), `Connection: close`,
+//! and NO redirect following (an API endpoint that
 //! redirects is a misconfiguration, and chasing it is how a bearer token
 //! reaches a host the caller never named).
 //! There is no connection pool and no HTTP/2, because a caller making one
@@ -22,12 +23,14 @@
 //!   credential); an unusable proxy setting fails the request, naming its
 //!   variable, and never falls back to a direct connection ([`crate::proxy`]).
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use aterm_uds::secret::{Secret, scrub};
+
 use crate::proxy::{self, EnvSource, ProcessEnv, ProxyMode, ProxyTarget};
-use crate::stream::{Connect, Deadline, Guard, Stream, TcpConnector};
+use crate::stream::{AlwaysAuthorized, Connect, Deadline, Guard, Stream, TcpConnector};
 use crate::tls::{self, Trust};
 use crate::uri::{Scheme, Uri};
 
@@ -37,6 +40,8 @@ pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HEADER_LINE: usize = 8 * 1024;
 /// Cap on the number of header lines.
 const MAX_HEADER_COUNT: usize = 128;
+/// The most a whole-body read reserves up front for a declared length.
+const PREALLOC_CAP: usize = 1 << 20;
 
 /// A failure anywhere in a request.
 #[derive(Debug)]
@@ -82,6 +87,145 @@ impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
     }
+}
+
+/// An HTTP request method.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Method {
+    /// `GET`: never carries a body or a `Content-Length`.
+    Get,
+    /// `HEAD`: as `GET`, and its answer has no body whatever it declares.
+    Head,
+    /// `POST`: always carries a `Content-Length`, 0 when empty.
+    Post,
+    /// `PATCH`: always carries a `Content-Length`, 0 when empty.
+    Patch,
+    /// `PUT`: always carries a `Content-Length`, 0 when empty.
+    Put,
+    /// `DELETE`: carries a `Content-Length` only with a non-empty body.
+    Delete,
+}
+
+impl Method {
+    /// The method's token on the request line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Head => "HEAD",
+            Self::Post => "POST",
+            Self::Patch => "PATCH",
+            Self::Put => "PUT",
+            Self::Delete => "DELETE",
+        }
+    }
+
+    /// Whether a request with this method may carry a body at all.
+    const fn takes_body(self) -> bool {
+        !matches!(self, Self::Get | Self::Head)
+    }
+
+    /// Whether a request with this method sends `Content-Length` even when
+    /// its body is empty.
+    const fn always_sends_length(self) -> bool {
+        matches!(self, Self::Post | Self::Patch | Self::Put)
+    }
+}
+
+/// A request body.
+pub enum Body<'a> {
+    /// No body.
+    Empty,
+    /// A body held whole in memory.
+    Bytes(&'a [u8]),
+    /// A streamed body of exactly `len` bytes (a DMG over 1 GB); sent with
+    /// `Content-Length: len`. A reader that ends sooner fails the request, and
+    /// one that fails is an `Other` error that carries its text, not its kind.
+    Reader {
+        /// The exact number of bytes the reader yields.
+        len: u64,
+        /// The bytes.
+        reader: &'a mut dyn Read,
+    },
+}
+
+impl Body<'_> {
+    /// The body's length in bytes.
+    fn len(&self) -> u64 {
+        match self {
+            Self::Empty => 0,
+            Self::Bytes(bytes) => wide(bytes.len()),
+            Self::Reader { len, .. } => *len,
+        }
+    }
+}
+
+impl std::fmt::Debug for Body<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("Empty"),
+            Self::Bytes(bytes) => write!(formatter, "Bytes({} bytes)", bytes.len()),
+            Self::Reader { len, .. } => write!(formatter, "Reader({len} bytes)"),
+        }
+    }
+}
+
+/// How far a failed request got: the source of a caller's "never sent" versus
+/// "may have been acted on" split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// No byte of the request head was accepted by the stream: DNS, connect,
+    /// a proxy CONNECT, the TLS handshake, or a refusal before any of them.
+    /// The server cannot have acted on the request.
+    NotSent,
+    /// The stream accepted request bytes (under TLS, plaintext into the
+    /// session, which is conservative) and no final response head has parsed.
+    Sent,
+    /// The status line and headers parsed. [`RequestBuilder::exchange`]
+    /// returns an [`Exchange`] at this point, so a later failure is a
+    /// [`BodyReader`] read error, which a caller attributes to this phase.
+    /// The one `SendError` at this phase is a head that is refused: an
+    /// unrequested final `101 Switching Protocols`, or a framing no body
+    /// boundary can be trusted under (`Content-Length` with
+    /// `Transfer-Encoding`, `Content-Length`s that disagree or do not parse,
+    /// a coding other than `chunked`). Either is an [`Error::Protocol`].
+    ///
+    /// An answer the server sent before the request was written whole (a 413
+    /// while a large body was still going out, then a close) is read after
+    /// the write that failed, and is this phase too (RFC 9112 §9.5).
+    Answered,
+}
+
+/// A failed exchange: what failed, and how far the request got first.
+#[derive(Debug)]
+pub struct SendError {
+    /// How far the request got.
+    pub phase: Phase,
+    /// What failed.
+    pub error: Error,
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.error)
+    }
+}
+
+impl std::error::Error for SendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// A `usize` as a `u64`: lossless on every target this crate builds for, and
+/// saturating rather than wrapping anywhere it would not be.
+fn wide(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// A `u64` as a `usize`, saturating: a length to read at most.
+fn narrow(n: u64) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
 }
 
 /// One lazily-built TLS configuration, shared by every clone of a [`Client`].
@@ -171,35 +315,41 @@ impl Client {
         self
     }
 
-    /// Begin a POST to `endpoint`.
+    /// Begin a POST to `endpoint`: [`Self::request`] with [`Method::Post`].
     #[must_use]
     pub fn post(&self, endpoint: &str) -> RequestBuilder<'_> {
-        self.request("POST", endpoint)
+        self.request(Method::Post, endpoint)
     }
 
-    /// Begin a PUT to `endpoint`. Its body is framed by `Content-Length`, as a
-    /// POST's is.
+    /// Begin a PUT to `endpoint`: [`Self::request`] with [`Method::Put`]. Its
+    /// body is framed by `Content-Length`, as a POST's is.
     #[must_use]
     pub fn put(&self, endpoint: &str) -> RequestBuilder<'_> {
-        self.request("PUT", endpoint)
+        self.request(Method::Put, endpoint)
     }
 
-    /// Begin a GET to `endpoint`. Send it with an empty body: the head then
-    /// carries no `Content-Length` (RFC 9110 §8.6: a GET anticipates no
-    /// content).
+    /// Begin a GET to `endpoint`: [`Self::request`] with [`Method::Get`]. Send
+    /// it with an empty body: the head then carries no `Content-Length` (RFC
+    /// 9110 §8.6: a GET anticipates no content).
     #[must_use]
     pub fn get(&self, endpoint: &str) -> RequestBuilder<'_> {
-        self.request("GET", endpoint)
+        self.request(Method::Get, endpoint)
     }
 
-    fn request(&self, method: &'static str, endpoint: &str) -> RequestBuilder<'_> {
+    /// Begin a `method` request to `endpoint`.
+    #[must_use]
+    pub fn request(&self, method: Method, endpoint: &str) -> RequestBuilder<'_> {
         RequestBuilder {
             client: self,
             method,
             endpoint: endpoint.to_owned(),
             headers: Vec::new(),
+            secrets: Vec::new(),
             limit: usize::MAX,
             guard: None,
+            idle: None,
+            backstop: None,
+            connect_within: None,
             error: None,
         }
     }
@@ -208,14 +358,40 @@ impl Client {
 /// A request under construction.
 pub struct RequestBuilder<'a> {
     client: &'a Client,
-    method: &'static str,
+    method: Method,
     endpoint: String,
     headers: Vec<(String, String)>,
+    /// Headers whose values are secrets: written after `headers`, into a
+    /// head buffer scrubbed once it is written, and never in a `Debug`.
+    secrets: Vec<(String, Secret)>,
     limit: usize,
     guard: Option<Arc<dyn Guard>>,
+    idle: Option<Duration>,
+    backstop: Option<Duration>,
+    connect_within: Option<Duration>,
     /// First construction error, surfaced at `send` so the builder stays
     /// chainable.
     error: Option<Error>,
+}
+
+/// Names, never values: a header set through [`RequestBuilder::header`] can
+/// carry a credential too, and the endpoint can carry one in its query.
+impl std::fmt::Debug for RequestBuilder<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        let secrets: Vec<&str> = self.secrets.iter().map(|(name, _)| name.as_str()).collect();
+        formatter
+            .debug_struct("RequestBuilder")
+            .field("method", &self.method)
+            .field("headers", &headers)
+            .field("secret_headers", &secrets)
+            .field("limit", &self.limit)
+            .field("idle", &self.idle)
+            .field("backstop", &self.backstop)
+            .field("connect_within", &self.connect_within)
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RequestBuilder<'_> {
@@ -227,6 +403,45 @@ impl RequestBuilder<'_> {
             return self;
         }
         self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// A header whose value is a secret: stored scrub-on-drop and rendered
+    /// into a head buffer that is scrubbed after it is written. It is never
+    /// in any `Debug` or error text. A name that is not a token, or a value
+    /// with a control character, is rejected as [`Self::header`] rejects it,
+    /// by a message that names the header and never quotes the value. So is
+    /// a name the client generates itself (`Host`, `Content-Length`,
+    /// `Transfer-Encoding`, `Connection`, `Proxy-Authorization`): where
+    /// [`Self::header`]'s copy is dropped from the head, a credential dropped
+    /// unsent would fail far from its cause. `Accept` is refused too: its
+    /// value is never a secret, and only a [`Self::header`] `Accept` takes
+    /// the place of the default `Accept: */*`, so one line is written.
+    #[must_use]
+    pub fn secret_header(mut self, name: &str, value: Secret) -> Self {
+        let refused = if !valid_header_name(name) {
+            Some(Error::Invalid(format!("invalid header name: {name:?}")))
+        } else if is_reserved(name) {
+            Some(Error::Invalid(format!(
+                "header {name} is generated by the client"
+            )))
+        } else if name.eq_ignore_ascii_case("accept") {
+            Some(Error::Invalid(format!(
+                "header {name} is never a secret: set it with header()"
+            )))
+        } else if !valid_header_bytes(value.expose()) {
+            Some(Error::Invalid(format!(
+                "header {name} has a value containing a control character"
+            )))
+        } else {
+            None
+        };
+        match refused {
+            Some(error) => {
+                self.error.get_or_insert(error);
+            }
+            None => self.secrets.push((name.to_owned(), value)),
+        }
         self
     }
 
@@ -244,6 +459,41 @@ impl RequestBuilder<'_> {
         self
     }
 
+    /// No byte for `idle` while connecting, sending or reading fails the
+    /// request `TimedOut`, with the text `no bytes for {ms}ms`: each socket
+    /// call waits at most `min(remaining, idle)`.
+    #[must_use]
+    pub const fn idle(mut self, idle: Duration) -> Self {
+        self.idle = Some(idle);
+        self
+    }
+
+    /// This request's total deadline, in place of the client's timeout. Like
+    /// [`Self::connect_within`]'s budget, it is enforced at each socket call,
+    /// so the platform certificate check of a TLS handshake can outlast it
+    /// up to that check's own bound.
+    #[must_use]
+    pub const fn backstop(mut self, total: Duration) -> Self {
+        self.backstop = Some(total);
+        self
+    }
+
+    /// The budget for DNS, connect, a proxy CONNECT and the TLS handshake,
+    /// within the total. DNS resolves on a helper thread the request waits
+    /// for at most the remaining budget, because std's resolver takes no
+    /// timeout.
+    ///
+    /// The budget is enforced at each socket call. The platform's certificate
+    /// check inside the handshake is no socket call and keeps its own bound
+    /// (30 s on Apple platforms, a 10 s URL-retrieval cap on Windows): a
+    /// check that stalls ends only at that bound, and the budget's expiry is
+    /// then reported at the next socket call.
+    #[must_use]
+    pub const fn connect_within(mut self, connect: Duration) -> Self {
+        self.connect_within = Some(connect);
+        self
+    }
+
     /// Send `body` and read the whole response.
     ///
     /// # Errors
@@ -256,14 +506,72 @@ impl RequestBuilder<'_> {
 
     /// [`Self::send`] against an injected environment source (tests).
     ///
+    /// [`Self::exchange_with_env`], then the body read to its end under the
+    /// limit: one framing path, [`BodyReader`]'s.
+    ///
     /// # Errors
     ///
     /// As [`Self::send`].
     pub fn send_with_env<E: EnvSource>(self, body: &[u8], env: &E) -> Result<Response, Error> {
-        if let Some(error) = self.error {
-            return Err(error);
+        let Exchange {
+            status,
+            headers,
+            body,
+        } = self
+            .exchange_with_env(Body::Bytes(body), env)
+            .map_err(|failed| failed.error)?;
+        Ok(Response {
+            status,
+            headers,
+            body: read_to_end(body.inner)?,
+        })
+    }
+
+    /// Send `body` and read the response head, leaving its body to be read
+    /// from the [`Exchange`].
+    ///
+    /// # Errors
+    ///
+    /// A [`SendError`]: the failure, and how far the request got.
+    pub fn exchange(self, body: Body<'_>) -> Result<Exchange, SendError> {
+        self.exchange_with_env(body, &ProcessEnv)
+    }
+
+    /// [`Self::exchange`] against an injected environment source.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::exchange`].
+    pub fn exchange_with_env<E: EnvSource>(
+        self,
+        body: Body<'_>,
+        env: &E,
+    ) -> Result<Exchange, SendError> {
+        let not_sent = |error: Error| SendError {
+            phase: Phase::NotSent,
+            error,
+        };
+        let sent = |error: Error| SendError {
+            phase: Phase::Sent,
+            error,
+        };
+        let Self {
+            client,
+            method,
+            endpoint,
+            headers,
+            secrets,
+            limit,
+            guard,
+            idle,
+            backstop,
+            connect_within,
+            error,
+        } = self;
+        if let Some(error) = error {
+            return Err(not_sent(error));
         }
-        let target = Uri::parse(&self.endpoint)
+        let target = Uri::parse(&endpoint)
             // The raw endpoint is NEVER echoed. `uri::parse` rejects userinfo
             // rather than stripping it, precisely so a credential cannot ride
             // along — and a caller may print this error to stderr, so
@@ -272,27 +580,169 @@ impl RequestBuilder<'_> {
             // refuse. The caller already holds the configured value to
             // correlate against.
             .ok_or_else(|| {
-                Error::Invalid("endpoint is not a usable absolute http(s) URL".to_owned())
+                not_sent(Error::Invalid(
+                    "endpoint is not a usable absolute http(s) URL".to_owned(),
+                ))
             })?;
-        let deadline = Deadline::after(self.client.timeout);
-        let guard: Arc<dyn Guard> = self
-            .guard
-            .unwrap_or_else(|| Arc::new(crate::stream::AlwaysAuthorized));
-        let via = proxy::resolve(self.client.proxy_mode, &target, env)?;
+        let body_len = body.len();
+        if body_len > 0 && !method.takes_body() {
+            return Err(not_sent(Error::Invalid(format!(
+                "a {} carries no body",
+                method.as_str()
+            ))));
+        }
+        let mut deadline = Deadline::after(backstop.unwrap_or(client.timeout));
+        if let Some(idle) = idle {
+            deadline = deadline.with_idle(idle);
+        }
+        let connect = connect_within.map_or(deadline, |within| deadline.connect_phase(within));
+        let guard: Arc<dyn Guard> = guard.unwrap_or_else(|| Arc::new(AlwaysAuthorized));
+        let via = proxy::resolve(client.proxy_mode, &target, env).map_err(not_sent)?;
 
-        let mut stream = self.client.open(&target, via.as_ref(), &guard, deadline)?;
-        let head = render_request(
-            self.method,
+        // Every byte up to here, a proxy CONNECT and a TLS handshake
+        // included, is the connect phase's: NotSent.
+        let mut stream = client
+            .open(&target, via.as_ref(), &guard, connect)
+            .map_err(not_sent)?;
+        stream.set_deadline(deadline);
+        let content_length = (method.always_sends_length() || body_len > 0).then_some(body_len);
+        let mut head = render_head(
+            method,
             &target,
             via.as_ref(),
-            &self.headers,
-            body.len(),
+            &headers,
+            &secrets,
+            content_length,
         );
-        stream.write_all(head.as_bytes())?;
-        stream.write_all(body)?;
-        stream.flush()?;
-        read_response(stream, self.limit)
+        drop(secrets);
+        let mut phase = Phase::NotSent;
+        let wrote = write_tracked(&mut stream, &head, &mut phase);
+        scrub(&mut head);
+        drop(head);
+        let written = match wrote {
+            Err(error) if phase == Phase::NotSent => return Err(not_sent(Error::Io(error))),
+            Err(error) => Err(Upload::Wire(error)),
+            Ok(()) => {
+                send_body(&mut stream, body).and_then(|()| stream.flush().map_err(Upload::Wire))
+            }
+        };
+        let mut reader = BufReader::new(stream);
+        let head = match written {
+            Ok(()) => read_final_head(&mut reader).map_err(sent)?,
+            // The peer still waits for the rest of the body: no answer is
+            // coming to read.
+            Err(Upload::Body(error)) => return Err(sent(error)),
+            Err(Upload::Wire(error)) => {
+                early_answer(&mut reader, &error).ok_or_else(|| sent(Error::Io(error)))?
+            }
+        };
+        // The status line and headers parsed: Answered, even when the
+        // framing they declare is refused (RFC 9112 §6.3).
+        let framing =
+            decide_framing(method, head.code, &head.headers).map_err(|error| SendError {
+                phase: Phase::Answered,
+                error,
+            })?;
+        Ok(Exchange {
+            status: head.code,
+            headers: head.headers,
+            body: BodyReader {
+                inner: Framed::new(reader, framing, limit),
+            },
+        })
     }
+}
+
+/// Write all of `bytes`, moving `phase` to [`Phase::Sent`] at the first byte
+/// the stream accepts.
+fn write_tracked(stream: &mut Stream, mut bytes: &[u8], phase: &mut Phase) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "the connection accepted no more of the request",
+                ));
+            }
+            Ok(written) => {
+                *phase = Phase::Sent;
+                bytes = bytes.get(written..).unwrap_or_default();
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Why the request's bytes stopped short of the peer.
+enum Upload {
+    /// The caller's body reader ended short or failed: the peer still waits
+    /// for the rest, so no answer is coming.
+    Body(Error),
+    /// The connection refused a write: the peer may have answered and closed.
+    Wire(io::Error),
+}
+
+/// Write the body after its head. A [`Body::Reader`] must yield exactly its
+/// `len`: one that ends sooner is `UnexpectedEof`, and nothing past `len` is
+/// asked of it. A reader's own error is `Other`, so it never reads as this
+/// request's socket failing.
+fn send_body(stream: &mut Stream, body: Body<'_>) -> Result<(), Upload> {
+    match body {
+        Body::Empty => Ok(()),
+        Body::Bytes(bytes) => stream.write_all(bytes).map_err(Upload::Wire),
+        Body::Reader { len, reader } => {
+            let mut buffer = vec![0u8; 64 * 1024];
+            let mut sent = 0u64;
+            while sent < len {
+                let want = narrow(len - sent).min(buffer.len());
+                let read = match reader.read(&mut buffer[..want]) {
+                    Ok(0) => {
+                        return Err(Upload::Body(Error::Io(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!("the body reader ended at {sent} of {len} bytes"),
+                        ))));
+                    }
+                    Ok(read) => read,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    // The caller's own reader failed, not this request's
+                    // socket: re-wrapped as `Other`, so its kind cannot read
+                    // as a socket fault (`PermissionDenied` as a revoked
+                    // authority, `TimedOut` as this connection's idle).
+                    Err(error) => {
+                        return Err(Upload::Body(Error::Io(io::Error::other(format!(
+                            "the body reader failed at {sent} of {len} bytes: {error}"
+                        )))));
+                    }
+                };
+                stream.write_all(&buffer[..read]).map_err(Upload::Wire)?;
+                sent += wide(read);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The answer a server sent before it read the whole request, read after the
+/// write it made fail (RFC 9112 §9.5: a client sending a body watches for an
+/// error response).
+///
+/// A server that refuses a body it has not read (a 413 for a large upload, a
+/// 401 or 403 on its head) answers and closes over the rest, and the next
+/// write fails (EPIPE, a reset) with the answer already in the receive buffer.
+/// One read of a final head, under the request's deadline, finds it; `None`
+/// leaves the write's error to report. A write that timed out or was revoked
+/// is no such close: a read would wait another idle period on a stalled peer,
+/// and a revoked guard refuses it anyway.
+fn early_answer<R: BufRead>(reader: &mut R, failed: &io::Error) -> Option<Head> {
+    if matches!(
+        failed.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::PermissionDenied
+    ) {
+        return None;
+    }
+    read_final_head(reader).ok()
 }
 
 impl Client {
@@ -385,13 +835,71 @@ fn connect_tunnel(
 /// when speaking plain HTTP to a proxy (RFC 9112 §3.2.2), and only then does
 /// the head carry the proxy's credential: inside a `CONNECT` tunnel the origin
 /// reads every header.
+///
+/// `Content-Length` is written when `content_length` is `Some`, and the
+/// default `Accept: */*` only when the caller set no `Accept` of its own.
+#[cfg(test)]
 fn render_request(
-    method: &str,
+    method: Method,
     target: &Uri,
     via: Option<&ProxyTarget>,
     headers: &[(String, String)],
-    body_len: usize,
+    content_length: Option<u64>,
 ) -> String {
+    let mut head = render_fields(method, target, via, headers, content_length);
+    head.push_str("\r\n");
+    head
+}
+
+/// The head [`render_fields`] renders, then each secret header after the
+/// caller's headers, then the blank line, into a buffer sized up front so it
+/// never reallocates: no copy of a secret is left behind in a freed
+/// allocation. The caller scrubs the buffer once it is written.
+fn render_head(
+    method: Method,
+    target: &Uri,
+    via: Option<&ProxyTarget>,
+    headers: &[(String, String)],
+    secrets: &[(String, Secret)],
+    content_length: Option<u64>,
+) -> Vec<u8> {
+    let fields = render_fields(method, target, via, headers, content_length);
+    // No reserved name is among them: `secret_header` refuses one.
+    let size = fields.len()
+        + secrets
+            .iter()
+            .map(|(name, value)| name.len() + 2 + value.len() + 2)
+            .sum::<usize>()
+        + 2;
+    let mut head = Vec::with_capacity(size);
+    head.extend_from_slice(fields.as_bytes());
+    for (name, value) in secrets {
+        head.extend_from_slice(name.as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.expose());
+        head.extend_from_slice(b"\r\n");
+    }
+    head.extend_from_slice(b"\r\n");
+    head
+}
+
+/// Whether [`render_fields`] owns the header `name`, so a caller's is dropped.
+fn is_reserved(name: &str) -> bool {
+    RESERVED_HEADERS
+        .iter()
+        .any(|generated| name.eq_ignore_ascii_case(generated))
+}
+
+/// The request line and every header line, without the blank line that ends
+/// the head.
+fn render_fields(
+    method: Method,
+    target: &Uri,
+    via: Option<&ProxyTarget>,
+    headers: &[(String, String)],
+    content_length: Option<u64>,
+) -> String {
+    let method = method.as_str();
     let absolute_via = via.filter(|_| target.scheme() == Scheme::Http);
     let request_target = if absolute_via.is_some() {
         format!(
@@ -411,30 +919,29 @@ fn render_request(
     // One request per connection: no pool to keep warm, and an explicit close
     // makes the response's end unambiguous.
     head.push_str("Connection: close\r\n");
-    // A bodiless GET or HEAD carries no length (RFC 9110 §8.6: a user agent
-    // SHOULD NOT send one when the method anticipates no content); every
-    // other request, an empty POST included, names its length.
-    if body_len > 0 || !matches!(method, "GET" | "HEAD") {
-        head.push_str(&format!("Content-Length: {body_len}\r\n"));
+    if let Some(length) = content_length {
+        head.push_str(&format!("Content-Length: {length}\r\n"));
     }
-    head.push_str("Accept: */*\r\n");
+    // The caller owns Accept: the default is written only when it set none.
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("accept"))
+    {
+        head.push_str("Accept: */*\r\n");
+    }
     for (name, value) in headers {
         // A caller header never duplicates a generated one: two `Host` or
         // `Content-Length` lines is a request-smuggling signature, and a second
         // `Connection` could revive keep-alive under close framing.
-        if RESERVED_HEADERS
-            .iter()
-            .any(|generated| name.eq_ignore_ascii_case(generated))
-        {
+        if is_reserved(name) {
             continue;
         }
         head.push_str(&format!("{name}: {value}\r\n"));
     }
-    head.push_str("\r\n");
     head
 }
 
-/// Headers whose wire meaning [`render_request`] owns. The body always uses
+/// Headers whose wire meaning [`render_fields`] owns. The body always uses
 /// Content-Length, and the proxy credential is the proxy URL's alone.
 const RESERVED_HEADERS: &[&str] = &[
     "host",
@@ -471,7 +978,12 @@ fn valid_header_name(name: &str) -> bool {
 }
 
 fn valid_header_value(value: &str) -> bool {
-    value.bytes().all(|b| b == b'\t' || b >= 0x20 && b != 0x7f)
+    valid_header_bytes(value.as_bytes())
+}
+
+/// A field value's bytes: HTAB, or anything from SP up except DEL.
+fn valid_header_bytes(value: &[u8]) -> bool {
+    value.iter().all(|&b| b == b'\t' || b >= 0x20 && b != 0x7f)
 }
 
 /// Reject a header whose name or value could terminate the header block early.
@@ -511,10 +1023,18 @@ impl Response {
     /// The first value of `name`, matched case-insensitively.
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+        header_values(&self.headers, name).next()
+    }
+
+    /// Every header as `(name, value)`, in the order the response sent them.
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        header_pairs(&self.headers)
+    }
+
+    /// Every value of `name`, matched case-insensitively, in order: repeated
+    /// headers (`Link`, `Set-Cookie`, …) are each one item.
+    pub fn header_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        header_values(&self.headers, name)
     }
 
     /// The response body.
@@ -524,10 +1044,411 @@ impl Response {
     }
 }
 
+/// The pairs of a header list as string slices, in order.
+fn header_pairs(headers: &[(String, String)]) -> impl Iterator<Item = (&str, &str)> {
+    headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+}
+
+/// EVERY value under `name` (ASCII case-insensitive), not just the first, in
+/// order: duplicates are the point.
+fn header_values<'h, 'n>(
+    headers: &'h [(String, String)],
+    name: &'n str,
+) -> impl Iterator<Item = &'h str> + use<'h, 'n> {
+    headers
+        .iter()
+        .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// A response whose head has been read and whose body has not.
+pub struct Exchange {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: BodyReader,
+}
+
+impl Exchange {
+    /// The HTTP status code.
+    #[must_use]
+    pub const fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Every header as `(name, value)`, in the order the response sent them.
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        header_pairs(&self.headers)
+    }
+
+    /// The first value of `name`, matched case-insensitively.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        header_values(&self.headers, name).next()
+    }
+
+    /// Every value of `name`, matched case-insensitively, in order.
+    pub fn header_all<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        header_values(&self.headers, name)
+    }
+
+    /// The body, to be read incrementally.
+    #[must_use]
+    pub fn into_body(self) -> BodyReader {
+        self.body
+    }
+}
+
+/// Header names, never values: a response header can carry a bearer
+/// credential too (a signed `Location`, a token in a `Set-Cookie`).
+impl std::fmt::Debug for Exchange {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        formatter
+            .debug_struct("Exchange")
+            .field("status", &self.status)
+            .field("headers", &names)
+            .field("body", &self.body)
+            .finish()
+    }
+}
+
+/// A response body, read incrementally under the response's framing and the
+/// request's limit (`Read + Send`).
+///
+/// It is the one framing path: [`RequestBuilder::send`] reads its whole body
+/// through it too. A body that ends before its framing says is
+/// `UnexpectedEof`; bad chunk framing is `InvalidData`; a body past the limit
+/// is `io::Error::other(Error::TooLarge { .. })`, whose inner [`Error`] a
+/// caller reaches with `get_ref` and `downcast_ref`.
+pub struct BodyReader {
+    inner: Framed<BufReader<Stream>>,
+}
+
+impl Read for BodyReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl BodyReader {
+    /// How many body bytes have been read so far (after chunked decoding).
+    #[must_use]
+    pub const fn consumed(&self) -> u64 {
+        self.inner.consumed
+    }
+
+    /// The length the response declared: its `Content-Length`, 0 for a body
+    /// that has none by rule (HEAD, 1xx, 204, 304), and `None` for a chunked
+    /// body or one that runs to EOF.
+    #[must_use]
+    pub fn declared_len(&self) -> Option<u64> {
+        self.inner.declared_len()
+    }
+}
+
+impl std::fmt::Debug for BodyReader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BodyReader")
+            .field("framing", &self.inner.framing)
+            .field("limit", &self.inner.limit)
+            .field("consumed", &self.inner.consumed)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Where a chunked body's decoder stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Chunk {
+    /// At a chunk-size line.
+    Size,
+    /// Inside a chunk, with this many data bytes left.
+    Data(u64),
+    /// At the CRLF that ends a chunk's data.
+    End,
+    /// Past the last chunk and its trailer section.
+    Done,
+}
+
+/// The framing decoder over any buffered reader: the live socket under a
+/// [`BodyReader`], or the in-memory bytes the unit tests feed it, so both run
+/// ONE framing path.
+struct Framed<R> {
+    reader: R,
+    framing: Framing,
+    limit: usize,
+    consumed: u64,
+    chunk: Chunk,
+}
+
+impl<R: BufRead> Framed<R> {
+    const fn new(reader: R, framing: Framing, limit: usize) -> Self {
+        Self {
+            reader,
+            framing,
+            limit,
+            consumed: 0,
+            chunk: Chunk::Size,
+        }
+    }
+
+    fn declared_len(&self) -> Option<u64> {
+        match self.framing {
+            Framing::Empty => Some(0),
+            Framing::Length(declared) => Some(wide(declared)),
+            Framing::Chunked | Framing::ToEof => None,
+        }
+    }
+
+    /// The error of a body that would pass the limit.
+    fn too_large(&self) -> io::Error {
+        io::Error::other(Error::TooLarge { limit: self.limit })
+    }
+
+    /// Count `read` more body bytes, refusing a total past the limit.
+    fn count(&mut self, read: usize) -> io::Result<usize> {
+        let total = self.consumed.saturating_add(wide(read));
+        if total > wide(self.limit) {
+            return Err(self.too_large());
+        }
+        self.consumed = total;
+        Ok(read)
+    }
+
+    fn read_chunked(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.chunk {
+                Chunk::Done => return Ok(0),
+                Chunk::Size => {
+                    let line = chunk_line(&mut self.reader, &mut 0)?;
+                    // A chunk-size line may carry `;ext` parameters, and BWS
+                    // before the first `;` (RFC 9112 §7.1.1) — but nothing
+                    // before the size itself.
+                    let size_text = line
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches([' ', '\t']);
+                    let size = parse_http_number(size_text, 16).ok_or_else(|| {
+                        bad_framing(format!("unparseable chunk size {size_text:?}"))
+                    })?;
+                    if size == 0 {
+                        // The trailer section, read to its blank line under
+                        // one header-block budget, and discarded.
+                        let mut budget = 0usize;
+                        while !chunk_line(&mut self.reader, &mut budget)?.is_empty() {}
+                        self.chunk = Chunk::Done;
+                        return Ok(0);
+                    }
+                    // CHECKED, because `size` came off the wire: a peer can
+                    // name up to usize::MAX, and an unchecked sum would wrap
+                    // under the limit check.
+                    let size = wide(size);
+                    let fits = self
+                        .consumed
+                        .checked_add(size)
+                        .is_some_and(|total| total <= wide(self.limit));
+                    if !fits {
+                        return Err(self.too_large());
+                    }
+                    self.chunk = Chunk::Data(size);
+                }
+                Chunk::Data(left) => {
+                    let want = narrow(left).min(buf.len());
+                    let read = self.reader.read(&mut buf[..want])?;
+                    if read == 0 {
+                        return Err(cut_short(format!(
+                            "the response body ended inside a chunk, at {} bytes",
+                            self.consumed
+                        )));
+                    }
+                    let left = left - wide(read);
+                    self.chunk = if left == 0 {
+                        Chunk::End
+                    } else {
+                        Chunk::Data(left)
+                    };
+                    return self.count(read);
+                }
+                Chunk::End => {
+                    if !chunk_line(&mut self.reader, &mut 0)?.is_empty() {
+                        return Err(bad_framing("chunk not terminated by CRLF".to_owned()));
+                    }
+                    self.chunk = Chunk::Size;
+                }
+            }
+        }
+    }
+}
+
+impl<R: BufRead> Read for Framed<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        match self.framing {
+            Framing::Empty => Ok(0),
+            Framing::Length(declared) => {
+                if declared > self.limit {
+                    return Err(self.too_large());
+                }
+                let declared = wide(declared);
+                let left = declared - self.consumed;
+                if left == 0 {
+                    return Ok(0);
+                }
+                let want = narrow(left).min(buf.len());
+                let read = self.reader.read(&mut buf[..want])?;
+                if read == 0 {
+                    return Err(cut_short(format!(
+                        "the response body ended at {} of {declared} bytes",
+                        self.consumed
+                    )));
+                }
+                self.count(read)
+            }
+            Framing::Chunked => self.read_chunked(buf),
+            // No framing header: the body runs to EOF (we sent Connection: close).
+            Framing::ToEof => {
+                let read = self.reader.read(buf)?;
+                self.count(read)
+            }
+        }
+    }
+}
+
+/// A body cut short: `UnexpectedEof`.
+fn cut_short(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, message)
+}
+
+/// Bad body framing: `InvalidData`, carrying the [`Error::Protocol`] that
+/// [`RequestBuilder::send`] reports.
+fn bad_framing(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, Error::Protocol(message))
+}
+
+/// One line of chunked framing (a chunk-size line, a chunk's closing CRLF, a
+/// trailer field), at most [`MAX_HEADER_LINE`] bytes, with the bytes counted
+/// against `budget` up to [`MAX_HEADER_BYTES`]. Every line must end in LF:
+/// EOF anywhere inside one is the body cut short.
+///
+/// An `Interrupted` read is retried here, never returned: the bytes of the
+/// line read so far live only in this call, so a caller's retry (which
+/// `read_to_end` and `io::copy` make, as `Read` requires) would resume the
+/// line from its middle and mis-frame the rest of the body.
+fn chunk_line<R: Read>(reader: &mut R, budget: &mut usize) -> io::Result<String> {
+    let mut raw = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        if read_uninterrupted(reader, &mut byte)? == 0 {
+            return Err(cut_short(
+                "the response body ended inside its chunked framing".to_owned(),
+            ));
+        }
+        *budget += 1;
+        if *budget > MAX_HEADER_BYTES {
+            return Err(bad_framing("chunk trailer section too large".to_owned()));
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        if raw.len() >= MAX_HEADER_LINE {
+            return Err(bad_framing("chunk framing line too long".to_owned()));
+        }
+        raw.push(byte[0]);
+    }
+    if raw.last() == Some(&b'\r') {
+        raw.pop();
+    }
+    String::from_utf8(raw).map_err(|_| bad_framing("chunk framing line is not UTF-8".to_owned()))
+}
+
+/// The [`Error`] a body read failed with: the one a [`Framed`] error carries
+/// inside it (`TooLarge`, `Protocol`), else the I/O error itself.
+fn body_error(error: io::Error) -> Error {
+    let ours = error.get_ref().is_some_and(|inner| inner.is::<Error>());
+    if !ours {
+        return Error::Io(error);
+    }
+    let kind = error.kind();
+    match error.into_inner().map(|inner| inner.downcast::<Error>()) {
+        Some(Ok(inner)) => *inner,
+        // Not reached: `ours` saw an `Error` inside.
+        _ => Error::Io(io::Error::from(kind)),
+    }
+}
+
+/// Read a whole body, as [`RequestBuilder::send`] returns it.
+fn read_to_end<R: BufRead>(mut body: Framed<R>) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::new();
+    // Reserve a declared length the limit admits, so a large body is not
+    // grown by doubling; a length past the limit fails on the first read.
+    // The length is the peer's word, so the reservation is capped and
+    // fallible: a `Content-Length` near `usize::MAX` neither panics nor aborts
+    // on allocation, and the body still grows to whatever the limit allows.
+    if let Some(declared) = body.declared_len().filter(|n| *n <= wide(body.limit)) {
+        let _ = bytes.try_reserve_exact(narrow(declared).min(PREALLOC_CAP));
+    }
+    body.read_to_end(&mut bytes).map_err(body_error)?;
+    Ok(bytes)
+}
+
 /// A final response head: its status and its header fields.
+#[derive(Debug)]
 struct Head {
     code: u16,
     headers: Vec<(String, String)>,
+}
+
+/// Read the final response head off `reader`: everything between a written
+/// request and the framing its headers declare.
+///
+/// EOF before a status line is `Io(UnexpectedEof)` with the text `connection
+/// closed before the response`: the server closed the connection without
+/// answering. A TLS peer that closes without `close_notify` is the same EOF:
+/// rustls reports it as an `UnexpectedEof` read error rather than `Ok(0)`.
+fn read_final_head<R: BufRead>(reader: &mut R) -> Result<Head, Error> {
+    let closed = loop {
+        match reader.fill_buf() {
+            Ok(buffered) => break buffered.is_empty(),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break true,
+            // A signal that cut the wait short is no answer: wait again.
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(Error::Io(error)),
+        }
+    };
+    if closed {
+        return Err(Error::Io(cut_short(
+            "connection closed before the response".to_owned(),
+        )));
+    }
+    read_head(reader)
+}
+
+/// One byte of a head, or `0` at its end. An `UnexpectedEof` read error is
+/// that end too: it is how rustls reports a peer that closed without
+/// `close_notify`, so a head cut short reads the same over TLS as over TCP.
+/// An `Interrupted` read is retried, as [`chunk_line`] does: the head is read
+/// a byte at a time into state no caller could resume.
+fn read_head_byte<R: Read>(reader: &mut R, byte: &mut [u8; 1]) -> io::Result<usize> {
+    match read_uninterrupted(reader, byte) {
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(0),
+        other => other,
+    }
+}
+
+/// `reader.read(buf)`, retrying every `Interrupted` (the `Read` contract's
+/// "this operation can be retried"), so no other error and no byte is lost.
+fn read_uninterrupted<R: Read>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        match reader.read(buf) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            other => return other,
+        }
+    }
 }
 
 /// Read one CRLF-terminated line, enforcing the header-block budget.
@@ -535,7 +1456,7 @@ fn read_line<R: Read>(reader: &mut R, consumed: &mut usize) -> Result<String, Er
     let mut raw = Vec::new();
     loop {
         let mut byte = [0u8; 1];
-        let n = reader.read(&mut byte)?;
+        let n = read_head_byte(reader, &mut byte)?;
         if n == 0 {
             if raw.is_empty() {
                 return Err(Error::Protocol("connection closed mid-header".to_owned()));
@@ -620,8 +1541,11 @@ fn read_header_fields<R: Read>(
 /// RFC 9110 §15.2: a client must parse 1xx responses it did not ask for
 /// (`100 Continue`, `103 Early Hints`); taking the first head would return a
 /// 1xx with the real response as its body and make a CONNECT look refused.
-/// `101` is an error: this client never asks to upgrade. All heads share one
-/// [`MAX_HEADER_BYTES`] budget, so a peer cannot stream 1xx heads forever.
+/// `101 Switching Protocols` is no interim response here: this client never
+/// asks to upgrade, so a 101 head is the final one, returned like any other and
+/// refused where its framing is decided ([`decide_framing`]), or as a non-2xx
+/// by a CONNECT. All heads share one [`MAX_HEADER_BYTES`] budget, so a peer
+/// cannot stream 1xx heads forever.
 ///
 /// A peer that closes before its first byte sent no response: [`Error::Io`]
 /// (`UnexpectedEof`), never [`Error::Protocol`], so a caller tells "nothing
@@ -640,44 +1564,27 @@ fn read_head<R: Read>(reader: &mut R) -> Result<Head, Error> {
             code => code?,
         };
         let headers = read_header_fields(reader, &mut consumed)?;
-        match code {
-            101 => {
-                return Err(Error::Protocol(
-                    "unrequested 101 Switching Protocols".to_owned(),
-                ));
-            }
-            100..=199 => {}
-            _ => return Ok(Head { code, headers }),
+        if code == 101 || !(100..=199).contains(&code) {
+            return Ok(Head { code, headers });
         }
     }
 }
 
-/// Read status line, headers and body from `stream`.
-fn read_response(stream: Stream, limit: usize) -> Result<Response, Error> {
-    read_response_from(&mut BufReader::new(stream), limit)
-}
-
-/// The response parser over any buffered reader, so the unit tests run the
-/// same framing path as the live socket.
-fn read_response_from<R: BufRead>(reader: &mut R, limit: usize) -> Result<Response, Error> {
-    let Head { code, headers } = read_head(reader)?;
-    let body = match decide_framing(code, &headers)? {
-        Framing::Empty => Vec::new(),
-        Framing::Chunked => read_chunked(reader, limit)?,
-        Framing::Length(declared) => {
-            if declared > limit {
-                return Err(Error::TooLarge { limit });
-            }
-            let mut body = vec![0u8; declared];
-            reader.read_exact(&mut body)?;
-            body
-        }
-        Framing::ToEof => read_to_limit(reader, limit)?,
-    };
+/// The whole response parser over any buffered reader: the in-memory bytes
+/// the unit tests feed it, through the same [`read_final_head`],
+/// [`decide_framing`] and [`Framed`] a live exchange runs.
+#[cfg(test)]
+fn read_response_from<R: BufRead>(
+    mut reader: R,
+    method: Method,
+    limit: usize,
+) -> Result<Response, Error> {
+    let Head { code, headers } = read_final_head(&mut reader)?;
+    let framing = decide_framing(method, code, &headers)?;
     Ok(Response {
         status: code,
         headers,
-        body,
+        body: read_to_end(Framed::new(reader, framing, limit))?,
     })
 }
 
@@ -685,7 +1592,7 @@ fn read_response_from<R: BufRead>(reader: &mut R, limit: usize) -> Result<Respon
 /// body whose end two parties disagree about is the whole smuggling class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Framing {
-    /// No content: the response ends at its header block (1xx, 204, 304).
+    /// No content: the response ends at its header block (HEAD, 1xx, 204, 304).
     Empty,
     /// `Transfer-Encoding: chunked`.
     Chunked,
@@ -698,27 +1605,35 @@ enum Framing {
 /// Resolve the response framing (RFC 9112 §6.3), refusing every ambiguous
 /// combination.
 ///
-/// 1xx, 204 and 304 end at their header block whatever they declare (rule 1).
-/// Refused: `Transfer-Encoding` with `Content-Length` (rule 3), disagreeing
-/// duplicate `Content-Length`s, a length that is not `1*DIGIT`, and any coding
-/// list other than exactly `chunked` — this client decodes nothing else, and a
-/// non-final chunked does not frame the body (rule 4). Every
-/// `Transfer-Encoding` header counts: `gzip` then `chunked` is `gzip, chunked`.
-fn decide_framing(status: u16, headers: &[(String, String)]) -> Result<Framing, Error> {
-    /// Every value under `name`, not just the first: duplicates are the point.
-    fn values<'a>(headers: &'a [(String, String)], name: &'a str) -> impl Iterator<Item = &'a str> {
-        headers
-            .iter()
-            .filter(move |(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+/// A final `101 Switching Protocols`, whatever the method, is refused first:
+/// this client never asks to upgrade. The answer to a HEAD, and any other 1xx,
+/// a 204 or a 304, ends at its header block whatever it declares (rule 1; a
+/// HEAD's answer and a 304 may name the length of a representation they did
+/// not send). Refused: `Transfer-Encoding` with `Content-Length` (rule 3),
+/// disagreeing duplicate `Content-Length`s, a length that is not `1*DIGIT`,
+/// and any coding list other than exactly `chunked` — this client decodes
+/// nothing else, and a non-final chunked does not frame the body (rule 4).
+/// Every `Transfer-Encoding` header counts: `gzip` then `chunked` is
+/// `gzip, chunked`.
+fn decide_framing(
+    method: Method,
+    status: u16,
+    headers: &[(String, String)],
+) -> Result<Framing, Error> {
+    // A final 101 switches to a protocol this client never asked for: no
+    // framing of this one describes what follows.
+    if status == 101 {
+        return Err(Error::Protocol(
+            "unrequested 101 Switching Protocols".to_owned(),
+        ));
     }
-    if matches!(status, 100..=199 | 204 | 304) {
+    if method == Method::Head || matches!(status, 100..=199 | 204 | 304) {
         return Ok(Framing::Empty);
     }
-    let transfer_encoded = values(headers, "transfer-encoding").next().is_some();
+    let transfer_encoded = header_values(headers, "transfer-encoding").next().is_some();
     // The codings in order across every header, empty list elements dropped
     // (RFC 9110 §5.6.1). Exactly one, `chunked`, is the one list decoded here.
-    let mut codings = values(headers, "transfer-encoding")
+    let mut codings = header_values(headers, "transfer-encoding")
         .flat_map(|v| v.split(','))
         .map(str::trim)
         .filter(|t| !t.is_empty());
@@ -728,7 +1643,7 @@ fn decide_framing(status: u16, headers: &[(String, String)]) -> Result<Framing, 
         && codings.next().is_none();
 
     let mut declared: Option<usize> = None;
-    for text in values(headers, "content-length") {
+    for text in header_values(headers, "content-length") {
         let parsed = parse_http_number(text, 10).ok_or_else(|| {
             let digits = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
             Error::Protocol(if digits {
@@ -766,75 +1681,6 @@ fn decide_framing(status: u16, headers: &[(String, String)]) -> Result<Framing, 
     Ok(Framing::Chunked)
 }
 
-/// Read to EOF, erroring rather than truncating past `limit`.
-fn read_to_limit<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>, Error> {
-    let mut body = Vec::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let n = reader.read(&mut chunk)?;
-        if n == 0 {
-            return Ok(body);
-        }
-        if body.len() + n > limit {
-            return Err(Error::TooLarge { limit });
-        }
-        body.extend_from_slice(&chunk[..n]);
-    }
-}
-
-/// Decode `Transfer-Encoding: chunked`.
-fn read_chunked<R: Read>(reader: &mut R, limit: usize) -> Result<Vec<u8>, Error> {
-    let mut body = Vec::new();
-    let mut header_budget = 0usize;
-    loop {
-        let line = read_line(reader, &mut header_budget)?;
-        // A chunk-size line may carry `;ext` parameters, and BWS before the
-        // first `;` (RFC 9112 §7.1.1) — but nothing before the size itself.
-        let size_text = line
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim_end_matches([' ', '\t']);
-        let size = parse_http_number(size_text, 16)
-            .ok_or_else(|| Error::Protocol(format!("unparseable chunk size {size_text:?}")))?;
-        if size == 0 {
-            // Trailer section, then done.
-            let mut trailer_budget = 0usize;
-            loop {
-                if read_line(reader, &mut trailer_budget)?.is_empty() {
-                    break;
-                }
-            }
-            return Ok(body);
-        }
-        // CHECKED, because `size` came off the wire: it is parsed with
-        // `usize::from_str_radix(.., 16)` from the chunk-size line, so a peer can
-        // name up to usize::MAX. Unchecked, `body.len() + size` panics outright in
-        // debug and WRAPS in release — and a wrapped sum slips under the `> limit`
-        // cap, makes `resize` TRUNCATE rather than grow, and then `read_exact`
-        // panics on the slice range. Either way the calling worker thread unwinds
-        // and stays dead for the life of the process, taking whatever it owns with
-        // it. Reachable from any endpoint a caller is pointed at, or from
-        // whatever won the race for a loopback port.
-        let total = body
-            .len()
-            .checked_add(size)
-            .ok_or(Error::TooLarge { limit })?;
-        if total > limit {
-            return Err(Error::TooLarge { limit });
-        }
-        let start = body.len();
-        body.resize(total, 0);
-        reader.read_exact(&mut body[start..])?;
-        // Each chunk is followed by its own CRLF.
-        let mut crlf = 0usize;
-        let line = read_line(reader, &mut crlf)?;
-        if !line.is_empty() {
-            return Err(Error::Protocol("chunk not terminated by CRLF".to_owned()));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,7 +1698,7 @@ mod tests {
 
     /// TCP reads may stop anywhere in the head or body. Drain the declared
     /// request before replying/closing, or an unread tail can reset the socket
-    /// while the client is still writing (including macOS EINVAL on timeouts).
+    /// while the client is still writing.
     fn read_plain_request(reader: &mut impl Read) -> Vec<u8> {
         const LIMIT: usize = 1024;
         let mut head = Vec::new();
@@ -972,11 +1818,11 @@ mod tests {
     #[test]
     fn a_plain_request_is_origin_form_with_host_and_length() {
         let head = render_request(
-            "POST",
+            Method::Post,
             &uri("http://127.0.0.1:11434/api/chat"),
             None,
             &[],
-            7,
+            Some(7),
         );
         assert!(head.starts_with("POST /api/chat HTTP/1.1\r\n"), "{head}");
         assert!(head.contains("Host: 127.0.0.1:11434\r\n"), "{head}");
@@ -986,45 +1832,13 @@ mod tests {
     }
 
     #[test]
-    fn a_bodiless_get_names_no_length_and_every_other_request_does() {
-        let target = uri("http://127.0.0.1:7484/v1/alab?after=3");
-        let get = render_request("GET", &target, None, &[], 0);
-        assert!(
-            get.starts_with("GET /v1/alab?after=3 HTTP/1.1\r\n"),
-            "{get}"
-        );
-        assert!(
-            !get.to_ascii_lowercase().contains("content-length"),
-            "{get}"
-        );
-        assert!(get.contains("Connection: close\r\n"), "{get}");
-        assert!(get.ends_with("\r\n\r\n"), "{get}");
-        // A caller's own length cannot sneak one back in.
-        let caller = [("Content-Length".to_owned(), "5".to_owned())];
-        let get = render_request("GET", &target, None, &caller, 0);
-        assert!(
-            !get.to_ascii_lowercase().contains("content-length"),
-            "{get}"
-        );
-        // An empty PUT or POST still frames its (empty) body.
-        for method in ["PUT", "POST"] {
-            let head = render_request(method, &target, None, &[], 0);
-            assert!(head.starts_with(&format!("{method} /v1/alab?after=3 ")));
-            assert!(head.contains("Content-Length: 0\r\n"), "{head}");
-        }
-        // A GET handed a body frames it rather than leaving it unframed.
-        let get = render_request("GET", &target, None, &[], 2);
-        assert!(get.contains("Content-Length: 2\r\n"), "{get}");
-    }
-
-    #[test]
     fn plain_http_through_a_proxy_uses_absolute_form() {
         let head = render_request(
-            "POST",
+            Method::Post,
             &uri("http://api.test/v1/x"),
             Some(&proxy("http://proxy.test:3128")),
             &[],
-            0,
+            Some(0),
         );
         assert!(
             head.starts_with("POST http://api.test/v1/x HTTP/1.1\r\n"),
@@ -1042,7 +1856,13 @@ mod tests {
             "proxy-authorization".to_owned(),
             "Basic Y2FsbGVy".to_owned(),
         )];
-        let head = render_request("POST", &uri("http://api.test/v1/x"), Some(&via), &caller, 0);
+        let head = render_request(
+            Method::Post,
+            &uri("http://api.test/v1/x"),
+            Some(&via),
+            &caller,
+            Some(0),
+        );
         // base64("alice:s3cret"), exactly once.
         assert_eq!(
             head.matches("Proxy-Authorization: Basic YWxpY2U6czNjcmV0\r\n")
@@ -1059,11 +1879,11 @@ mod tests {
         );
         // Inside a CONNECT tunnel the origin reads the head: no credential.
         let head = render_request(
-            "POST",
+            Method::Post,
             &uri("https://api.test/v1/x"),
             Some(&via),
             &caller,
-            0,
+            Some(0),
         );
         assert!(
             !head.to_ascii_lowercase().contains("proxy-authorization"),
@@ -1076,11 +1896,11 @@ mod tests {
         // The proxy sees only CONNECT; the request itself goes inside the
         // tunnel and must not leak the absolute URL.
         let head = render_request(
-            "POST",
+            Method::Post,
             &uri("https://api.test/v1/x"),
             Some(&proxy("http://proxy.test:3128")),
             &[],
-            0,
+            Some(0),
         );
         assert!(head.starts_with("POST /v1/x HTTP/1.1\r\n"), "{head}");
     }
@@ -1088,7 +1908,7 @@ mod tests {
     #[test]
     fn a_caller_cannot_duplicate_a_generated_header() {
         let head = render_request(
-            "POST",
+            Method::Post,
             &uri("http://a.test/x"),
             None,
             &[
@@ -1098,7 +1918,7 @@ mod tests {
                 ("connection".to_owned(), "keep-alive".to_owned()),
                 ("Content-Type".to_owned(), "application/json".to_owned()),
             ],
-            9,
+            Some(9),
         );
         assert_eq!(head.matches("Host:").count(), 1, "{head}");
         assert!(head.contains("Host: a.test\r\n"), "{head}");
@@ -1188,7 +2008,7 @@ mod tests {
     }
 
     fn parse(raw: &[u8], limit: usize) -> Result<Response, Error> {
-        read_response_from(&mut BufReader::new(raw), limit)
+        read_response_from(BufReader::new(raw), Method::Get, limit)
     }
 
     fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -1200,18 +2020,27 @@ mod tests {
 
     #[test]
     fn framing_refuses_every_response_whose_end_is_ambiguous() {
-        assert_eq!(decide_framing(200, &headers(&[])).unwrap(), Framing::ToEof);
         assert_eq!(
-            decide_framing(200, &headers(&[("Content-Length", "7")])).unwrap(),
+            decide_framing(Method::Get, 200, &headers(&[])).unwrap(),
+            Framing::ToEof
+        );
+        assert_eq!(
+            decide_framing(Method::Get, 200, &headers(&[("Content-Length", "7")])).unwrap(),
             Framing::Length(7)
         );
         assert_eq!(
-            decide_framing(200, &headers(&[("Transfer-Encoding", "chunked")])).unwrap(),
+            decide_framing(
+                Method::Get,
+                200,
+                &headers(&[("Transfer-Encoding", "chunked")])
+            )
+            .unwrap(),
             Framing::Chunked
         );
         // Repeating the same length is legal; disagreeing is not.
         assert_eq!(
             decide_framing(
+                Method::Get,
                 200,
                 &headers(&[("Content-Length", "5"), ("content-length", "5")])
             )
@@ -1220,7 +2049,7 @@ mod tests {
         );
         // A bodiless status ignores whatever framing it declares.
         assert_eq!(
-            decide_framing(204, &headers(&[("Content-Length", "5")])).unwrap(),
+            decide_framing(Method::Get, 204, &headers(&[("Content-Length", "5")])).unwrap(),
             Framing::Empty
         );
         for ambiguous in [
@@ -1244,26 +2073,31 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    decide_framing(200, &headers(&ambiguous)),
+                    decide_framing(Method::Get, 200, &headers(&ambiguous)),
                     Err(Error::Protocol(_))
                 ),
                 "{ambiguous:?} must be refused"
             );
         }
         // The refusal names what is wrong with the value, overflow apart.
-        let message =
-            |value: &str| match decide_framing(200, &headers(&[("Content-Length", value)])) {
-                Err(Error::Protocol(m)) => m,
-                other => panic!("{value:?}: {other:?}"),
-            };
-        assert_eq!(
-            message("+5"),
-            "Content-Length is not a decimal byte count: \"+5\""
-        );
+        let message = |value: &str| match decide_framing(
+            Method::Get,
+            200,
+            &headers(&[("Content-Length", value)]),
+        ) {
+            Err(Error::Protocol(m)) => m,
+            other => panic!("{value:?}: {other:?}"),
+        };
+        // Only the data each refusal carries is pinned, and that the two
+        // refusals are told apart.
+        let bad = message("+5");
+        assert!(bad.contains("\"+5\""), "{bad}");
         let huge = "9".repeat(40);
-        assert_eq!(
-            message(&huge),
-            format!("Content-Length {huge:?} is too large")
+        let too_large = message(&huge);
+        assert!(too_large.contains(&huge), "{too_large}");
+        assert_ne!(
+            bad.replace("\"+5\"", ""),
+            too_large.replace(&format!("{huge:?}"), "")
         );
     }
 
@@ -1464,5 +2298,114 @@ HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
     fn an_unterminated_header_block_does_not_hang() {
         let raw = b"HTTP/1.1 200 OK\r\nX-A: 1\r\n";
         assert!(parse(raw, 1024).is_err());
+    }
+
+    #[test]
+    fn a_declared_length_near_usize_max_is_a_short_body_not_an_allocation() {
+        for declared in [usize::MAX, usize::MAX / 2] {
+            let raw = format!("HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\n\r\nx");
+            match parse(raw.as_bytes(), usize::MAX) {
+                Err(Error::Io(error)) => {
+                    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{error}");
+                }
+                other => panic!("{declared}: {other:?}"),
+            }
+        }
+    }
+
+    /// A reader that yields `bytes`, then fails as rustls does when its peer
+    /// closes TCP without `close_notify`.
+    struct UncleanClose<'a>(&'a [u8]);
+
+    impl Read for UncleanClose<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "peer closed connection without sending TLS close_notify",
+                ));
+            }
+            let n = buf.len().min(self.0.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn an_unclean_tls_close_in_the_head_reads_as_the_plain_eof() {
+        // Before the status line: the same error a plaintext EOF gives.
+        let over_tls = read_final_head(&mut BufReader::new(UncleanClose(b""))).unwrap_err();
+        let over_tcp = read_final_head(&mut BufReader::new(&b""[..])).unwrap_err();
+        let (Error::Io(over_tls), Error::Io(over_tcp)) = (&over_tls, &over_tcp) else {
+            panic!("{over_tls:?} / {over_tcp:?}");
+        };
+        assert_eq!(over_tls.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            (over_tls.kind(), over_tls.to_string()),
+            (over_tcp.kind(), over_tcp.to_string())
+        );
+        // Mid-head: the plaintext path's Protocol, not the TLS layer's I/O error.
+        for (unclean, plain) in [
+            (
+                &b"HTTP/1.1 200 OK\r\nX-A:"[..],
+                &b"HTTP/1.1 200 OK\r\nX-A:"[..],
+            ),
+            (&b"HTTP/1.1 200 OK\r\n"[..], &b"HTTP/1.1 200 OK\r\n"[..]),
+        ] {
+            let over_tls = read_final_head(&mut BufReader::new(UncleanClose(unclean)));
+            let over_tcp = read_final_head(&mut BufReader::new(plain));
+            assert!(
+                matches!(
+                    (&over_tls, &over_tcp),
+                    (Err(Error::Protocol(a)), Err(Error::Protocol(b))) if a == b
+                ),
+                "{over_tls:?} / {over_tcp:?}"
+            );
+        }
+    }
+
+    /// A reader that hands out `parts` one per read and fails every other
+    /// read `Interrupted`, as a socket read does when a signal lands (on
+    /// Linux, any caught signal, once `SO_RCVTIMEO` is set).
+    struct Interrupting(std::collections::VecDeque<&'static [u8]>, bool);
+
+    impl Read for Interrupting {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if std::mem::take(&mut self.1) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let Some(part) = self.0.pop_front() else {
+                return Ok(0);
+            };
+            buf[..part.len()].copy_from_slice(part);
+            self.1 = true;
+            Ok(part.len())
+        }
+    }
+
+    #[test]
+    fn an_interrupted_read_inside_a_chunk_size_line_loses_no_framing() {
+        let inner = Interrupting(
+            [&b"1"[..], b"0\r\n0123456789abcdef\r\n0\r\n\r\n"].into(),
+            false,
+        );
+        let mut body = Vec::new();
+        Framed::new(BufReader::new(inner), Framing::Chunked, usize::MAX)
+            .read_to_end(&mut body)
+            .unwrap();
+        assert_eq!(body, b"0123456789abcdef");
+    }
+
+    #[test]
+    fn an_interrupted_read_in_the_head_is_waited_out() {
+        // Interrupted before the first byte, and again inside the status line.
+        let inner = Interrupting(
+            [&b"HTTP/1.1 2"[..], b"00 OK\r\nX-A: 1\r\n\r\n"].into(),
+            true,
+        );
+        let head = read_final_head(&mut BufReader::new(inner)).unwrap();
+        assert_eq!(head.code, 200);
+        assert_eq!(head.headers, vec![("X-A".to_owned(), "1".to_owned())]);
     }
 }

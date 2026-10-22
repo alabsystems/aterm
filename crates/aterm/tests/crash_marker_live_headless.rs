@@ -93,7 +93,7 @@ fn boot(root: &Path, tag: &str) -> Instance {
         Ok(pair) => pair,
         Err(e) => aterm_spec::host::could_not_run(format!("cannot open the instance log ({e})")),
     };
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
+    let mut cmd = Command::new(launch_isolation::aterm_executable());
     launch_isolation::apply(&mut cmd, root);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
         .arg("--control-sock")

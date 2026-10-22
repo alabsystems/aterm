@@ -57,6 +57,9 @@ pub struct BoxFacts {
     /// The one folder the session's own starter trusted for it (`meta
     /// trusted_cwd=`, [`ApprovalCtx::trusted_cwd`]); `None`: none.
     pub trusted_cwd: Option<PathBuf>,
+    /// The agent a worker's spawn started on this session (`meta worker=`,
+    /// [`ApprovalCtx::worker_agent`]); `None`: no spawn's worker.
+    pub worker_agent: Option<aterm_phase::Program>,
     /// The footer last read names bypass mode.
     pub bypass: bool,
     /// A limit reset was passed over at this dialog's mount.
@@ -120,6 +123,7 @@ pub const FIELDS: &[&str] = &[
     "program",
     "cwd",
     "trusted_cwd",
+    "worker_agent",
     "bypass",
     "limit_reset_passed",
     "limit_retry",
@@ -164,6 +168,7 @@ impl ApprovalCtx {
         ctx.cwd_known = facts.cwd.is_some();
         ctx.set_trust_roots(&config.trust_roots, env.uid);
         ctx.trusted_cwd.clone_from(&facts.trusted_cwd);
+        ctx.worker_agent = facts.worker_agent;
         // A safe rule a withdrawn key took away (`config::Withheld`): its roots.
         if config.withheld.rm_breaker {
             ctx.scratch_roots.clear();
@@ -230,6 +235,7 @@ struct Wire {
     program: Option<String>,
     cwd: Option<String>,
     trusted_cwd: Option<String>,
+    worker_agent: Option<String>,
     bypass: bool,
     limit_reset_passed: bool,
     limit_retry: bool,
@@ -275,6 +281,7 @@ impl BoxFacts {
             program: self.program.clone(),
             cwd: self.cwd.as_deref().map(text),
             trusted_cwd: self.trusted_cwd.as_deref().map(text),
+            worker_agent: self.worker_agent.map(|a| a.name().to_string()),
             bypass: self.bypass,
             limit_reset_passed: self.limit_reset_passed,
             limit_retry: self.limit_retry,
@@ -347,6 +354,16 @@ impl BoxFacts {
             program: wire.program,
             cwd: wire.cwd.as_deref().map(path).transpose()?,
             trusted_cwd: wire.trusted_cwd.as_deref().map(path).transpose()?,
+            worker_agent: wire
+                .worker_agent
+                .as_deref()
+                .map(|w| {
+                    aterm_phase::Program::ALL
+                        .into_iter()
+                        .find(|p| p.name() == w)
+                        .ok_or_else(|| format!("a worker's agent {w:?}"))
+                })
+                .transpose()?,
             bypass: wire.bypass,
             limit_reset_passed: wire.limit_reset_passed,
             limit_retry: wire.limit_retry,

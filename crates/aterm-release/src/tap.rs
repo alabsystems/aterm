@@ -369,7 +369,7 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) -> String {
-        let out = GitCli::new(dir).git(args).unwrap();
+        let out = crate::ledger::testing::Git::new(dir).git(args).unwrap();
         assert!(out.success(), "git {args:?}: {}", out.stderr_utf8());
         out.stdout_utf8().trim().to_string()
     }
@@ -398,10 +398,20 @@ mod tests {
     fn tap(root: &Path) -> PathBuf {
         let tap = root.join("tap");
         std::fs::create_dir_all(tap.join("Casks")).unwrap();
-        git(&tap, &["init", "-q", "-b", "main"]);
-        git(&tap, &["config", "user.name", "t"]);
-        git(&tap, &["config", "user.email", "t@example.invalid"]);
-        git(&tap, &["config", "commit.gpgsign", "false"]);
+        // The deploy commits with its own git, which reads this machine's global config:
+        // the checkout's own config keeps a person's identity, signing, hooks and global
+        // ignore and attributes files (an ignored cask is refused by `git add`) out of it.
+        crate::ledger::testing::init(
+            &tap,
+            &[
+                ("user.name", "t"),
+                ("user.email", "t@example.invalid"),
+                ("commit.gpgsign", "false"),
+            ],
+        );
+        git(&tap, &["config", "core.hooksPath", "/dev/null"]);
+        git(&tap, &["config", "core.excludesFile", "/dev/null"]);
+        git(&tap, &["config", "core.attributesFile", "/dev/null"]);
         std::fs::write(tap.join("README.md"), "# old\n").unwrap();
         std::fs::write(tap.join("Casks/aterm.rb"), LIVE).unwrap();
         std::fs::write(tap.join("LICENSE"), "mine\n").unwrap();

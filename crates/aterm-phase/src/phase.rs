@@ -1036,13 +1036,14 @@ fn frame_at(rows: &[String], caret: usize) -> Option<Frame> {
 /// What the search reads, from [`composer_index`] and [`frame_at`]: every
 /// row from the screen's last up to the caret row it stops at, row by row;
 /// the row above a `❯` row it tests (its rule, for an option-like caret);
-/// and, for a `❯` row not in column 0, the rows [`is_list_entry`] walks —
-/// up to the rule over the list, and on up the screen to the rule over
-/// that. So with a caret row found, the frame is a function of the rows from
-/// the one above the caret down, and of nothing over them — unless a row
-/// there opens on a `❯` past column 0 (the slash menu's highlighted entry, a
-/// draft that holds one), whose walk may go anywhere: then, as with no caret
-/// row at all, of every row. [`Self::from`] is that first row.
+/// and, for a `❯` row that is not a caret under a rule, the rows
+/// [`is_list_entry`] walks — up to the rule over the list, and on up the
+/// screen to the rule over that. So with a caret row found under its rule,
+/// the frame is a function of the rows from the one above the caret down, and
+/// of nothing over them — unless a `❯` row under the caret (the slash menu's
+/// highlighted entry, a pointed row of the agents panel, a draft that holds
+/// one) walks, which may go anywhere: then, as with no caret row at all, of
+/// every row. [`Self::from`] is that first row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameReach {
     frame: Option<Frame>,
@@ -1061,9 +1062,11 @@ impl FrameReach {
                 from: 0,
             };
         };
-        let walked = rows[caret..]
-            .iter()
-            .any(|r| !r.starts_with('❯') && crate::text::trim_start(r).starts_with('❯'));
+        let under_rule = rows[caret].starts_with('❯') && caret > 0 && is_rule(&rows[caret - 1]);
+        let walked = !under_rule
+            || rows[caret + 1..]
+                .iter()
+                .any(|r| crate::text::trim_start(r).starts_with('❯'));
         Self {
             frame: frame_at(rows, caret),
             from: if walked { 0 } else { caret.saturating_sub(1) },
@@ -1841,13 +1844,19 @@ pub fn composer_index(rows: &[String]) -> Option<usize> {
 /// gone: no composer, no wall, `agent=unknown`, and a `/compact` the loop
 /// typed was never seen as written. The caret is in column 0; a list under
 /// the frame is the run of indented rows that starts right under its bottom
-/// rule, a rule that closes a caret row in column 0.
+/// rule, a rule that closes a caret row in column 0. 2.1.307's agents panel,
+/// under the mode row and a blank, points at its hovered (or `↓`-selected)
+/// row in column 0 (`❯ ◯ salvage-merge …`): no rule over it, so it is no caret.
 fn is_list_entry(rows: &[String], i: usize) -> bool {
-    if rows[i].starts_with('❯') {
+    if rows[i].starts_with('❯') && i > 0 && is_rule(&rows[i - 1]) {
         return false;
     }
     let mut first = i;
-    while first > 0 && !is_rule(&rows[first - 1]) && leading_spaces(&rows[first - 1]) > 0 {
+    while first > 0
+        && !is_rule(&rows[first - 1])
+        && (leading_spaces(&rows[first - 1]) > 0
+            || crate::text::trim_end(&rows[first - 1]).is_empty())
+    {
         first -= 1;
     }
     let Some(bottom) = first.checked_sub(1).filter(|&b| is_rule(&rows[b])) else {
@@ -4996,6 +5005,44 @@ mod tests {
         assert_eq!(status_busy("✻ Waiting for your call"), None);
     }
 
+    /// The agents panel under the mode row points at the row the pointer
+    /// hovers (or `↓` selects) in column 0; the composer stays the caret under
+    /// the frame's top rule, so the footer's facts, chips and switch stay put.
+    #[test]
+    fn a_pointed_agents_panel_row_is_not_the_composer() {
+        let rule = "\u{2500}".repeat(60);
+        for (main, agent) in [
+            (
+                "  ⏺ main",
+                "  ◯ salvage-merge  ▱▱▱▱  0/5   12m43s · ↓ 943.7k tokens",
+            ),
+            (
+                "❯ ⏺ main",
+                "  ◯ salvage-merge  ▱▱▱▱  0/5   12m43s · ↓ 943.7k tokens",
+            ),
+            (
+                "  ⏺ main",
+                "❯ ◯ salvage-merge  ▱▱▱▱  0/5   12m43s · ↓ 943.7k tokens",
+            ),
+        ] {
+            let r = rows(&[
+                "⏺ Done.",
+                "",
+                &rule,
+                "❯ ",
+                &rule,
+                "  ⏵⏵ bypass permissions on · 2 shells · ↓ to manage",
+                "",
+                main,
+                agent,
+            ]);
+            assert_eq!(composer_index(&r), Some(3), "{r:?}");
+            let reach = FrameReach::of(&r);
+            assert_eq!(reach.rules(), Some((2, 4)), "{r:?}");
+            assert_eq!(reach.rules(), composer_rules(&r));
+        }
+    }
+
     /// Each footer rule, on an otherwise idle frame; the footers an idle worker
     /// shows fire none of them. A monitor is the soft rule.
     #[test]
@@ -7710,8 +7757,21 @@ mod tests {
             Some((4, 6)),
             "CONTROL: a row over the caret's row moved the frame"
         );
+        // The agents panel's pointed row, under the mode row and a blank.
+        let panel: Vec<String> = [
+            rule.as_str(),
+            "\u{276F} ",
+            rule.as_str(),
+            "  \u{23F5}\u{23F5} bypass permissions on",
+            "",
+            "  \u{23FA} main",
+            "\u{276F} \u{25EF} general-purpose  Searching",
+        ]
+        .map(str::to_owned)
+        .into();
         let mut screens = crate::text::fixture_screens();
         screens.push(walk);
+        screens.push(panel);
         let mut tight = 0;
         for screen in screens {
             for width in [usize::MAX, 40, 12] {

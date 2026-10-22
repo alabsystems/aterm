@@ -367,12 +367,17 @@ pub(crate) enum Disk {
     )
 )]
 pub(crate) enum Write<'a> {
-    /// `path` atomically replaced by `bytes` (temp + rename) under `mode`,
-    /// flushed (file and directory) when `durable`.
+    /// `path` atomically replaced by `bytes` (temp + rename) under `mode`.
+    /// `flush` is how it was finished (`aterm_durable`'s two flushes): none;
+    /// [`aterm_durable::Flush::Ordered`], the temp's data flushed and ordered
+    /// ahead of every later write on its device before the rename, the rename
+    /// itself left to a later flush of its directory; or
+    /// [`aterm_durable::Flush::Durable`], the temp flushed before the rename
+    /// and the directory after it, on the media on return.
     Replace {
         path: &'a std::path::Path,
         bytes: &'a [u8],
-        durable: bool,
+        flush: Option<aterm_durable::Flush>,
         mode: u32,
     },
     /// `bytes` appended to `path` in one `write`, never flushed.
@@ -382,9 +387,24 @@ pub(crate) enum Write<'a> {
     },
     /// `path` unlinked, never flushed.
     Remove { path: &'a std::path::Path },
+    /// The file at `path` flushed where it is, its bytes as they stand (a
+    /// clean stop's, `StateDir::end_run_clean`): on the media on return
+    /// ([`aterm_durable::Flush::Durable`]) or ahead of every later write on
+    /// its device ([`aterm_durable::Flush::Ordered`]). Its name is its
+    /// directory's flush's, not this one's.
+    Flush {
+        path: &'a std::path::Path,
+        flush: aterm_durable::Flush,
+    },
     /// The directory `path` flushed: every entry change in it (a rename, an
-    /// unlink) is on the media, and no file's unflushed data with it.
-    SyncDir { path: &'a std::path::Path },
+    /// unlink) is on the media — on return ([`aterm_durable::Flush::Durable`],
+    /// with everything flushed before it on the device), or ahead of every
+    /// later write on the device ([`aterm_durable::Flush::Ordered`]) — and no
+    /// file's unflushed data with it.
+    SyncDir {
+        path: &'a std::path::Path,
+        flush: aterm_durable::Flush,
+    },
 }
 
 impl Disk {

@@ -324,7 +324,7 @@ pub(crate) struct SessionMeta {
     /// through [`apply_meta_value`]; read it through [`Self::driver_wrote`].
     pub(crate) driver_writes: u8,
     /// The ONE folder a worker's starter trusted for it: the canonical `cwd=`
-    /// an Owner's `spawn agent=claude` named (`App::start_worker`), which the
+    /// an Owner's `spawn agent=<word>` named (`App::start_worker`), which the
     /// window harness's folder-trust rule trusts for this session alone
     /// (`meta`'s `trusted_cwd=`; `[harness] trust_roots` is not widened).
     /// NOT a field `meta set` writes: no driver can name a folder trusted.
@@ -3674,6 +3674,17 @@ impl SessionTimeline {
     /// moved, the record only crossed.
     pub(crate) fn seed_task(&mut self, record: crate::task_record::TaskRecord) {
         self.task = Some(record);
+    }
+
+    /// Name the agent a worker's spawn started on its task record
+    /// ([`crate::task_record::TaskRecord::agent`]): the spawn's own write,
+    /// on the main thread right after the record's first mark, where no
+    /// update's Commit comes between them. A session with no task keeps
+    /// none. Not news: the rev stays.
+    pub(crate) fn set_task_agent(&mut self, agent: aterm_phase::Program) {
+        if let Some(task) = self.task.as_mut() {
+            task.agent = Some(agent);
+        }
     }
 
     /// The row a seamless update carries for the record, `None` with no task.

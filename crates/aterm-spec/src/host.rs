@@ -27,41 +27,10 @@ pub use aterm_uds::host::{
     could_not_run_without, find_tool, need_tool, refusals_for, tool, tooling_dir,
 };
 // Gated as aterm-uds builds them for a dependent: `test` is this crate's, not theirs.
+#[cfg(unix)]
+pub use aterm_uds::host::raise_open_files;
 #[cfg(all(unix, debug_assertions))]
 pub use aterm_uds::host::{held_probe, sh_held, sh_held_any};
-
-/// RAISE THIS TEST PROCESS'S SOFT `RLIMIT_NOFILE` TO `want` where its hard
-/// limit allows it, and say the soft limit it holds then (0: unreadable). A
-/// shell the Dock launched hands its tests 256 descriptors, which a suite
-/// keeping live fixtures side by side can run out of: such a suite sizes how
-/// many it admits at once by what this returns.
-// Skip: two libc calls through raw pointers to a struct this frame owns.
-#[cfg(unix)]
-#[cfg_attr(trust_verify, trust::skip)]
-#[must_use]
-pub fn raise_open_files(want: u64) -> u64 {
-    let mut limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `getrlimit` writes the struct this frame owns, of the type the
-    // call takes, and keeps no pointer to it.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
-        return 0;
-    }
-    if limit.rlim_cur < want && limit.rlim_max >= want {
-        let raised = libc::rlimit {
-            rlim_cur: want,
-            rlim_max: limit.rlim_max,
-        };
-        // SAFETY: `setrlimit` reads the struct this frame owns; a soft limit
-        // at or under the hard one is all it is asked.
-        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const raised) } == 0 {
-            return want;
-        }
-    }
-    limit.rlim_cur
-}
 
 /// HOW OVERSUBSCRIBED THIS HOST'S CPUS ARE, when they are: the worse of the
 /// 1- and 5-minute load averages above one runnable thread per online CPU
