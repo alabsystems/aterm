@@ -331,7 +331,8 @@ impl GlWindowSurface {
     }
 
     /// Whether a post waits for the display's refresh (swap interval 1).
-    pub(crate) fn synced(&self) -> bool {
+    #[inline]
+    pub(crate) const fn synced(&self) -> bool {
         self.interval > 0
     }
 

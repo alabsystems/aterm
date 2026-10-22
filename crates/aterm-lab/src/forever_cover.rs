@@ -619,6 +619,130 @@ pub(super) fn judge_wrote_cruise(seen: &Seen, done: Option<&(i64, String)>, t0: 
     )
 }
 
+/// C4: THE OWNER'S CONTINUATION IN TWO PARAGRAPHS ([`OWNER_CONTINUE`], the
+/// lab's `continue_text`): the work reply's point types `continue@v1`, the
+/// owner's words in ONE line — the ledger's text and every text of the
+/// conversation's requests that carries them ([`Cover::owner_texts`]: what
+/// reached the agent) hold no line break and both paragraphs' words — and
+/// the point after it reads the agent's reply (the done claim), never the
+/// act's own rows: no read after the act holds the owner's words, no need is
+/// raised (the owner's `NEEDS YOU:` line read as the agent's), no `DONE` and
+/// no `task=landed` (Cruise). UNOBSERVED where no act came and the watch
+/// ended before the persistence verdict, or the dumps were not read.
+pub(super) fn judge_owner_continuation(
+    seen: &Seen,
+    done: Option<&(i64, String)>,
+    t0: i64,
+) -> Verdict {
+    let Some(act) = seen.acts(turn_end::RULE_CONTINUE).first().copied() else {
+        return match lost_after(seen, t0, t0) {
+            Some(lost) => Verdict::Fail(format!("no continuation was typed: {lost}")),
+            None => Verdict::Unobserved(format!(
+                "no continuation was typed within {}",
+                at(t0, seen.end_ms)
+            )),
+        };
+    };
+    let typed = seen.act_text(turn_end::RULE_CONTINUE, act);
+    let mut bad = Vec::new();
+    if !(typed.contains(OWNER_KEY) && typed.contains(OWNER_TAIL)) {
+        bad.push(format!(
+            "the act typed is not the owner's text: {}",
+            crate::util::one_line(typed, 120)
+        ));
+    }
+    if typed.contains(['\n', '\r']) {
+        bad.push("the act's text holds a line break".to_string());
+    }
+    let reached = match &seen.cover.owner_texts {
+        None => None,
+        Some(texts) => {
+            if texts.is_empty() {
+                bad.push("no request of the conversation carried the owner's words".into());
+            }
+            if let Some(t) = texts.iter().find(|t| t.contains(['\n', '\r'])) {
+                bad.push(format!(
+                    "the owner's words reached the agent with a line break: {t:?}"
+                ));
+            }
+            if !texts.is_empty()
+                && !texts
+                    .iter()
+                    .any(|t| t.contains(OWNER_KEY) && t.contains(OWNER_TAIL))
+            {
+                bad.push("no text that reached the agent holds both paragraphs".into());
+            }
+            Some(texts.len())
+        }
+    };
+    if let Some(n) = need_raised(seen) {
+        bad.push(format!("a need was raised, though no reply named one: {n}"));
+    }
+    if let Some((d, l)) = done {
+        bad.push(format!(
+            "ENDED at +{}: {}",
+            at(t0, *d),
+            crate::util::one_line(l, 90)
+        ));
+    }
+    if seen.status_said("task", "landed", t0) {
+        bad.push("status said task=landed under Cruise".into());
+    }
+    let next = seen
+        .all_acts()
+        .into_iter()
+        .find(|(t, _)| *t > act.0)
+        .map(|(t, _)| *t);
+    let reads = || {
+        seen.journal
+            .iter()
+            .filter(move |(t, _)| *t > act.0 && next.is_none_or(|n| *t < n))
+    };
+    if let Some((t, l)) = reads().find(|(_, l)| {
+        idle_words(l).is_some_and(|w| w.contains(OWNER_KEY) || w.contains(OWNER_TAIL))
+    }) {
+        bad.push(format!(
+            "the act's own words read as the agent's at +{}: {}",
+            at(t0, *t),
+            crate::util::one_line(l, 120)
+        ));
+    }
+    let reply = reads().find(|(_, l)| idle_words(l).is_some_and(|w| w.contains(DONE_CLAIM_KEY)));
+    let said = format!(
+        "continue@v1 at +{} ({}); {}",
+        at(t0, act.0),
+        crate::util::one_line(typed, 90),
+        reached.map_or_else(
+            || "the dumps not read".to_string(),
+            |n| format!("{n} text(s) of it reached the agent")
+        )
+    );
+    if !bad.is_empty() {
+        return Verdict::Fail(format!("{said}: {}", bad.join("; ")));
+    }
+    let Some((tr, lr)) = reply else {
+        return match lost_after(seen, act.0, t0) {
+            Some(lost) => Verdict::Fail(format!("{said}; its reply never read: {lost}")),
+            None => Verdict::Unobserved(format!(
+                "{said}; its reply (\"{DONE_CLAIM_KEY} …\") not read{}",
+                next.map_or_else(
+                    || format!(" within {}", at(t0, seen.end_ms)),
+                    |n| format!(" before the next act at +{}", at(t0, n))
+                )
+            )),
+        };
+    };
+    let said = format!(
+        "{said}; its reply read at +{} ({})",
+        at(t0, *tr),
+        crate::util::one_line(lr, 90)
+    );
+    if reached.is_none() {
+        return Verdict::Unobserved(format!("{said}; what reached the agent unread"));
+    }
+    Verdict::Pass(said)
+}
+
 /// A task record's age (`since_ms=`, ms since its `since`).
 fn age(record: &str) -> Option<i64> {
     word(record, "since_ms").and_then(|v| v.parse().ok())
@@ -1027,11 +1151,212 @@ pub(super) fn judge_cap(seen: &Seen, t0: i64) -> Verdict {
 /// A journal point that reads the usage wall: an `EVENT limited` line (a
 /// wall on the screen at the turn's end), or an `EVENT prompt … kind=usage-limit`
 /// one (the program's usage-limit dialog, a box: Gemini CLI's).
-fn wall_point(line: &str) -> bool {
+pub(super) fn wall_point(line: &str) -> bool {
     line.starts_with("EVENT limited ")
         || (line.starts_with("EVENT prompt ")
             && word(line, "kind").as_deref() == Some("usage-limit"))
 }
+
+/// The words of the loop's wait on Gemini CLI's usage-limit dialog that
+/// names no reset it can place: its `Keep trying` "is pressed on the
+/// back-off ladder" (`approval_loop.rs`'s `limit_retry_hold`).
+const LADDER_WORDS: &str = "on the back-off ladder";
+
+/// How far apart the ladder's badge and its wait are written: at the same
+/// read of the dialog.
+const LADDER_WITH_MS: i64 = 5_000;
+
+/// THE LADDER'S BADGE: an escalation `r` of Gemini CLI's usage-limit dialog
+/// that names no reset (a key's per-day quota), ledgered with the ladder's
+/// own wait ([`RULE_LIMIT_RETRY`] `waiting`, [`LADDER_WORDS`]) — FOREVER's
+/// NEEDS YOU, loud and never blocking: the loop goes on pressing its `Keep
+/// trying` on the entitlement ladder while a person is told. No stall of the
+/// wall; an escalation with no such wait beside it is one.
+fn ladder_badge(seen: &Seen, r: &Row) -> bool {
+    seen.ledger.iter().any(|w| {
+        w.rule == RULE_LIMIT_RETRY
+            && w.decision == "waiting"
+            && w.reason.contains(LADDER_WORDS)
+            && (w.ts - r.ts).abs() <= LADDER_WITH_MS
+    })
+}
+
+/// The ladder's waits on Gemini CLI's usage-limit dialog that names no
+/// reset, journaled after `t1` (the act that met it): each `WAITING …
+/// rule=limit-retry@v1 … on the back-off ladder` with its `until=` (unix
+/// ms) and its line, in order.
+fn ladder_waits(seen: &Seen, t1: i64) -> Vec<(i64, i64, &str)> {
+    let rule = format!("rule={RULE_LIMIT_RETRY} ");
+    seen.journal
+        .iter()
+        .filter(|(t, l)| {
+            *t > t1 && l.starts_with("WAITING ") && l.contains(&rule) && l.contains(LADDER_WORDS)
+        })
+        .filter_map(|(t, l)| {
+            let (_, rest) = l.split_once(" until=")?;
+            let until = crate::workers::iso_ms(rest.split_whitespace().next()?)?;
+            Some((*t, until, l.as_str()))
+        })
+        .collect()
+}
+
+/// The ladder's due standing when the lab lifted the wall at `lift`: the
+/// first `until=` of [`ladder_waits`] at or past it. The harness goes on
+/// there, past the lift, not at the lift: W1's deadline counts from the
+/// later of the two — the first rung's due where the lift comes before it
+/// (`--mode wall-day`), the climbed rung's where a try came in the wall
+/// (`--mode wall-climb`).
+fn ladder_due(seen: &Seen, t1: i64, lift: i64) -> Option<i64> {
+    ladder_waits(seen, t1)
+        .into_iter()
+        .map(|(_, until, _)| until)
+        .find(|until| *until >= lift)
+}
+
+/// How far before the due its ladder wait named a `Keep trying` may come and
+/// still be at that due (the journal cuts `until=` to its second).
+const LADDER_DUE_SLACK_MS: i64 = 2_000;
+
+/// The due of the `Keep trying` pressed at `ts`: the `until=` of the last
+/// `WAITING … rule=limit-retry@v1` journaled after `t1` and before it (the
+/// dialog's wait on its named reset, or the ladder's), unix ms.
+fn press_due(seen: &Seen, t1: i64, ts: i64) -> Option<i64> {
+    let rule = format!("rule={RULE_LIMIT_RETRY} ");
+    seen.journal
+        .iter()
+        .filter(|(t, l)| *t > t1 && *t < ts && l.starts_with("WAITING ") && l.contains(&rule))
+        .filter_map(|(_, l)| {
+            let (_, rest) = l.split_once(" until=")?;
+            crate::workers::iso_ms(rest.split_whitespace().next()?)
+        })
+        .next_back()
+}
+
+/// A LADDER'S TRY: `r` is a `Keep trying` of Gemini CLI's usage-limit dialog
+/// that names no reset ([`RULE_LIMIT_RETRY`] `approved`), pressed at or past
+/// the due of the ladder's wait standing before it ([`ladder_waits`]) — a try
+/// on the entitlement ladder while the quota may stand, which the harness
+/// cannot know is spent until the dialog comes back: no act typed into the
+/// wall. One pressed before its due, or with no ladder wait before it, is
+/// one.
+fn ladder_try(seen: &Seen, r: &Row, t1: i64) -> bool {
+    r.rule == RULE_LIMIT_RETRY
+        && r.decision == "approved"
+        && ladder_waits(seen, t1)
+            .into_iter()
+            .rfind(|(t, _, _)| *t < r.ts)
+            .is_some_and(|(_, until, _)| r.ts + LADDER_DUE_SLACK_MS >= until)
+}
+
+/// THE LADDER CLIMBED, NEEDS YOU STANDING: each of `tries` (the ladder's
+/// tries in the wall, [`ladder_try`]) answered by the dialog drawn again
+/// (the quota standing: a ladder wait saying `drawn again` after it), each
+/// pause from a try to the next due longer than the one before it (the
+/// first: from the dialog's first read to its first due), and the badge
+/// never cleared from the first try to `through` (the press that got
+/// through), every status read in that span saying `needs=ask` and one of
+/// them after the last try in the wall. `Err` names what was not so.
+fn ladder_climbed(
+    seen: &Seen,
+    t1: i64,
+    tries: &[&Row],
+    through: i64,
+    t0: i64,
+) -> Result<String, String> {
+    let waits = ladder_waits(seen, t1);
+    let Some(&(first_read, first_due, _)) = waits.first() else {
+        return Err("no ladder wait before the tries".into());
+    };
+    let mut pause = first_due - first_read;
+    let mut said = Vec::new();
+    for (n, r) in tries.iter().enumerate() {
+        let next = tries.get(n + 1).map_or(through, |n| n.ts);
+        let Some(&(_, due, _)) = waits
+            .iter()
+            .find(|(t, _, l)| *t > r.ts && *t < next && l.contains("drawn again"))
+        else {
+            return Err(format!(
+                "the try at +{} was not answered by the dialog drawn again before the next press",
+                at(t0, r.ts)
+            ));
+        };
+        let climbed = due - r.ts;
+        if climbed <= pause {
+            return Err(format!(
+                "the ladder did not climb at the try at +{}: its next due {} on, the pause before it {}",
+                at(t0, r.ts),
+                at(0, climbed),
+                at(0, pause)
+            ));
+        }
+        said.push(format!(
+            "try {} drawn again, next due {} on",
+            n + 1,
+            at(0, climbed)
+        ));
+        pause = climbed;
+    }
+    let first = tries.first().map_or(through, |r| r.ts);
+    if let Some((t, l)) = seen
+        .journal
+        .iter()
+        .find(|(t, l)| *t > first && *t < through && l.starts_with("CLEARED "))
+    {
+        return Err(format!(
+            "NEEDS YOU came down at +{} while the quota stood: {}",
+            at(t0, *t),
+            crate::util::one_line(l, 80)
+        ));
+    }
+    // The status reads from the first try to the press that got through
+    // (a read that changed nothing resolves to the value standing then:
+    // [`super::surfaces::observed`]): NEEDS YOU stood at every one.
+    let reads = super::surfaces::observed(&seen.status, &seen.status_reads, first, through);
+    if let Some((t, st)) = reads
+        .iter()
+        .find(|(_, st)| word(st, "needs").as_deref() != Some("ask"))
+    {
+        return Err(format!(
+            "NEEDS YOU not standing at the status read at +{} while the quota stood: {}",
+            at(t0, *t),
+            crate::util::one_line(st, 80)
+        ));
+    }
+    let last = tries.last().map_or(through, |r| r.ts);
+    if !reads.iter().any(|(t, _)| *t > last) {
+        return Err(format!(
+            "no status read between the last try in the wall (+{}) and the press that got through",
+            at(t0, last)
+        ));
+    }
+    Ok(format!(
+        "{}; needs=ask at {} status read(s)",
+        said.join(", "),
+        reads.len()
+    ))
+}
+
+/// NEEDS YOU TAKEN DOWN by the ladder's try that got through at `through`: a
+/// `CLEARED` line, or a status read without `needs=ask`, after it and by the
+/// landing `done`.
+fn ladder_cleared(seen: &Seen, through: i64, done: i64) -> Option<i64> {
+    let cleared = seen
+        .journal
+        .iter()
+        .find(|(t, l)| *t > through && *t <= done + AT_DONE_MS && l.starts_with("CLEARED "))
+        .map(|(t, _)| *t);
+    let down = seen
+        .status
+        .iter()
+        .find(|(t, st)| *t > through && word(st, "needs").as_deref() != Some("ask"))
+        .map(|(t, _)| *t)
+        .filter(|t| *t <= done + LADDER_DOWN_AFTER_DONE_MS);
+    cleared.or(down)
+}
+
+/// How long after the landing a status read may first say NEEDS YOU down
+/// ([`ladder_cleared`]): the lab reads status every few seconds.
+const LADDER_DOWN_AFTER_DONE_MS: i64 = 15_000;
 
 /// W1: A USAGE WALL UNDER LAND — the harness's own, drawn by the stub's
 /// `limit` ([`wall_claim`]) raised at the first point ([`Cover::wall`]): Muse
@@ -1042,13 +1367,16 @@ fn wall_point(line: &str) -> bool {
 /// limit, read otherwise, fails); NOTHING TYPED into it (no journal act, no
 /// acting ledger row from the act to the reset, no new harness text in the
 /// stub's dumps of it: [`Cover::window_stub`]), not handed to a person (no
-/// escalation of it: a stall), no landing while it stands (no DONE, no
-/// `task=landed` before the lab lifts it, [`Cover::lifted_ms`]), no need
-/// raised. After the reset the harness GOES ON — its act typed and ledgered
-/// past the reset, or at Gemini CLI's usage-limit dialog, which takes no
-/// typing, its `Keep trying` pressed past the reset the dialog names
-/// ([`RULE_LIMIT_RETRY`] ledgered `approved`; one pressed in the wall is an
-/// act in it: FAIL). Where the program went on by itself ([`Cover::went_on_ms`],
+/// escalation of it: a stall — save THE LADDER'S BADGE, [`ladder_badge`]),
+/// no landing while it stands (no DONE, no `task=landed` before the lab
+/// lifts it, [`Cover::lifted_ms`]), no need raised. After the reset the
+/// harness GOES ON — its act typed and ledgered past the reset, or at Gemini
+/// CLI's usage-limit dialog, which takes no typing, its `Keep trying` pressed
+/// past the reset the dialog names ([`RULE_LIMIT_RETRY`] ledgered
+/// `approved`; one pressed in the wall is an act in it: FAIL), or, on the
+/// dialog a key's per-day quota draws, which names none (`--mode wall-day`),
+/// at its ladder's first due ([`ladder_due`]), which the deadline counts
+/// from where it is the later. Where the program went on by itself ([`Cover::went_on_ms`],
 /// Claude Code's own continuation at the reset, read in the stub's requests),
 /// nothing typed and its answer landing is the harness leaving it be, and an
 /// act of the loop's after it is typed ON TOP of it, a double continue
@@ -1095,15 +1423,26 @@ pub(super) fn judge_wall(
     let rows_in: Vec<&Row> = seen
         .ledger
         .iter()
-        .filter(|r| in_wall(r.ts) && r.acted() && r.decision != "escalated")
+        .filter(|r| {
+            in_wall(r.ts) && r.acted() && r.decision != "escalated" && !ladder_try(seen, r, t1)
+        })
+        .collect();
+    // The ladder's tries in the wall (`--mode wall-climb`): Gemini CLI's
+    // dialog that names no reset, kept trying on its ladder while the quota
+    // stood ([`ladder_try`]) — no act typed into it, the climb.
+    let tries: Vec<&Row> = seen
+        .ledger
+        .iter()
+        .filter(|r| in_wall(r.ts) && ladder_try(seen, r, t1))
         .collect();
     // The wall handed to a person while it stood: the loop's escalation of it
     // (Gemini CLI's usage-limit dialog, which no rule presses) stalls the
-    // session until someone answers, whatever comes after.
+    // session until someone answers, whatever comes after — save the
+    // ladder's badge, raised while the loop goes on trying.
     let escalated = seen
         .ledger
         .iter()
-        .find(|r| r.ts > t1 && r.ts < reset && r.decision == "escalated");
+        .find(|r| r.ts > t1 && r.ts < reset && r.decision == "escalated" && !ladder_badge(seen, r));
     let points = || {
         seen.journal
             .iter()
@@ -1180,7 +1519,17 @@ pub(super) fn judge_wall(
             s.new_turns
         ));
     }
-    if let Some(n) = seen.needs_seen() {
+    // The ladder's badge is the session's `needs=ask` while it stands: the
+    // loop's own word, no reply's need (a `NEEDS` line or a needs entry
+    // still is one).
+    let ladder = seen
+        .ledger
+        .iter()
+        .any(|r| r.ts > t1 && r.decision == "escalated" && ladder_badge(seen, r));
+    if let Some(n) = seen
+        .needs_seen()
+        .filter(|n| !(ladder && n.starts_with("status ")))
+    {
         bad.push(format!("a need was raised, though no reply named one: {n}"));
     }
     let said = format!(
@@ -1218,7 +1567,9 @@ pub(super) fn judge_wall(
             "{said}: the stub's dumps of the wall were not read"
         ));
     }
-    let lost_at = reset + wall_grace_ms(program) + WALL_LOST_MS;
+    let lost_at = (reset + wall_grace_ms(program))
+        .max(ladder_due(seen, t1, lift).unwrap_or(i64::MIN))
+        + WALL_LOST_MS;
     let done = seen.first_after("DONE ", lift);
     // The program's own continuation past the wall ([`Cover::went_on_ms`]:
     // Claude Code goes on by itself at the reset).
@@ -1251,12 +1602,29 @@ pub(super) fn judge_wall(
                     at(t0, r.ts)
                 ));
             }
+            // AT ITS DUE: the press comes at the `until=` the dialog's wait
+            // named — the reset as the dialog's zone places it, its minute
+            // and the grace — never before it.
+            let due = press_due(seen, t1, r.ts);
+            if let Some(d) = due.filter(|d| r.ts + LADDER_DUE_SLACK_MS < *d) {
+                return Verdict::Fail(format!(
+                    "{said}; PRESSED BEFORE ITS DUE: {} at +{}, {} before the until= its wait named (+{})",
+                    r.rule,
+                    at(t0, r.ts),
+                    at(r.ts, d),
+                    at(t0, d)
+                ));
+            }
             format!(
-                "gone on: {} pressed at +{} ({} past the reset), ledgered: {}",
+                "gone on: {} pressed at +{} ({} past the reset), ledgered: {}; {}",
                 r.rule,
                 at(t0, r.ts),
                 at(0, r.ts - reset),
-                crate::util::one_line(&r.command, 60)
+                crate::util::one_line(&r.command, 60),
+                due.map_or_else(
+                    || "no wait named its due".to_string(),
+                    |d| format!("{} after the until= its wait named", at(d, r.ts))
+                )
             )
         }
         Some((ta, la)) => {
@@ -1342,6 +1710,25 @@ pub(super) fn judge_wall(
             at(t0, seen.end_ms)
         ));
     };
+    // THE LADDER (Gemini CLI's dialog that names no reset): every try in
+    // the wall climbed it with NEEDS YOU standing, and the try that got
+    // through took NEEDS YOU down.
+    let mut resumed = resumed;
+    if ladder && let Some(r) = press {
+        if !tries.is_empty() {
+            match ladder_climbed(seen, t1, &tries, r.ts, t0) {
+                Ok(c) => resumed = format!("{resumed}; the ladder climbed in the wall: {c}"),
+                Err(why) => return Verdict::Fail(format!("{said}; {resumed}; {why}")),
+            }
+        }
+        let Some(down) = ladder_cleared(seen, r.ts, done.0) else {
+            return Verdict::Fail(format!(
+                "{said}; {resumed}; NEEDS YOU STOOD after the try that got through at +{}",
+                at(t0, r.ts)
+            ));
+        };
+        resumed = format!("{resumed}; NEEDS YOU down at +{}", at(t0, down));
+    }
     if done.0 > lost_at {
         return Verdict::Fail(format!(
             "{said}; {resumed}; PERSISTENCE LOST: the landing came {} after the reset, past the {} deadline",
@@ -1360,6 +1747,33 @@ pub(super) fn judge_wall(
         done.0,
         window,
     )
+}
+
+/// W1 ON THE LADDER'S CLIMB (`--mode wall-climb`): W1's judge
+/// ([`judge_wall`]) over Gemini CLI's per-day dialog whose quota stood past
+/// the ladder's first rung, so a try came in the wall and was answered by the
+/// dialog drawn again ([`ladder_climbed`]). A pass with no try in the wall
+/// (the wall lifted before the first rung: `--mode wall-day`'s) shows nothing
+/// of the climb: UNOBSERVED.
+pub(super) fn judge_wall_climb(
+    seen: &Seen,
+    land: Option<&(i64, String)>,
+    program: &str,
+    t0: i64,
+) -> Verdict {
+    let climbed = land
+        .zip(seen.cover.wall)
+        .is_some_and(|(&(t1, _), (_, reset_s))| {
+            seen.ledger
+                .iter()
+                .any(|r| r.ts > t1 && r.ts < reset_s * 1000 && ladder_try(seen, r, t1))
+        });
+    match judge_wall(seen, land, program, t0) {
+        Verdict::Pass(w) if !climbed => Verdict::Unobserved(format!(
+            "{w}; but no try came in the wall (it lifted before the ladder's first rung): the climb unobserved"
+        )),
+        v => v,
+    }
 }
 
 /// W2: THE REMEMBERED WALL — W1's wall ([`judge_wall`]: Land's act meets it,
@@ -1430,10 +1844,26 @@ fn hidden_facts(
     // scrolled away (Muse Code's does; agy's reads none after the first
     // command's `> /title` row, its last user row), so that point may come at
     // a screen still drawing a row of it, after the first command and before
-    // the reset.
-    let read = seen.journal.iter().find(|(t, l)| {
-        *t > h.first_ms && *t < reset && l.starts_with("EVENT ") && !l.starts_with("EVENT limited")
-    });
+    // the reset. After a dialog's option ([`Hidden::stopped`]: Gemini CLI's
+    // Stop) the screen draws the error that option leaves, a wall its reader
+    // reads (`EVENT limited … [API Error: An unknown error occurred.]`): a
+    // point there is one without the notice when it is no usage-limit point
+    // of the dialog and names none of the notice's words, read at the screen
+    // without it or after.
+    let without_notice = |l: &str| {
+        if h.stopped {
+            l.starts_with("EVENT ")
+                && !(l.starts_with("EVENT prompt ") && wall_point(l))
+                && !h.words.iter().any(|w| l.contains(w))
+                && h.seq.is_none_or(|hs| seq_of(l).is_some_and(|s| s >= hs))
+        } else {
+            l.starts_with("EVENT ") && !l.starts_with("EVENT limited")
+        }
+    };
+    let read = seen
+        .journal
+        .iter()
+        .find(|(t, l)| *t > h.first_ms && *t < reset && without_notice(l));
     let waits: Vec<String> = seen
         .journal
         .iter()

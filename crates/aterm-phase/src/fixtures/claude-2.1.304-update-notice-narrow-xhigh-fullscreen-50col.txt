@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (50x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the update notice under the NARROW plain launch card at 50 columns (`--effort xhigh`, the key off: `Opus 5.5 with xhigh effort · API Usage Billing` does not fit the row), fullscreen renderer: the banner alone at column 11 over the plain mascot beside the model, the billing and the working directory, then the notice as under the wide card, a row lower
+
+           Claude Code v2.1.304
+ ▐▛███▛█   Opus 5.5 with xhigh effort
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.r3cj/proj
+
+  Updated to latest. Got 66 features, 424
+  bugfixes, and 126 other changes.
+  code.claude.com/docs/en/changelog for details
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                               ◉ xhigh · /effort
+──────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for …

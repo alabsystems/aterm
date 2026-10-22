@@ -1471,6 +1471,374 @@ fn a_style_round_trip_from_effects_off_leaves_no_redundant_master() {
     }
 }
 
+/// AN OLD `cursor_trail = false` NEVER SWALLOWS A CHOICE OF A DEFAULT: the
+/// default style and the typing glow turned on are writes of no value, yet
+/// the writer takes the retired switch out for them (the other successor
+/// pinned to what the file drew), so the page sends them, names what
+/// changed on screen, and its Undo puts the old switch back. Both rows the
+/// old switch holds off show as changed, and their Reset takes it out too.
+#[test]
+fn the_default_style_and_the_glow_are_chosen_over_the_retired_switch() {
+    if !crate::app_config::DEFAULT_DECORATIVE_EFFECTS {
+        // Where effects are off by default `cursor_trail = false` reads as
+        // the defaults, so there is nothing to choose.
+        return;
+    }
+    let legacy = "cursor_trail = false\n";
+    let style = prefs::EDIT_CURSOR_TRAIL_STYLE;
+    let glow = prefs::EDIT_CURSOR_MOMENTUM_GLOW;
+
+    // The default style, from the Cursor Styles list.
+    let mut lab = Lab::new(legacy);
+    assert!(
+        lab.state().is_explicit(style),
+        "the old switch holds it Off"
+    );
+    assert!(lab.state().is_explicit(glow), "and the glow off");
+    lab.state_mut().navigate(SettingsRoute::CursorStyles);
+    lab.compile(1_024.0, 768.0);
+    lab.commit(
+        &format!(
+            "settings/cursor-style/{}",
+            key_fragment(prefs::DEFAULT_CURSOR_TRAIL_STYLE)
+        ),
+        None,
+    );
+    assert_eq!(lab.text(), "cursor_momentum_glow = false\n");
+    let status = lab.state().feedback.clone().unwrap_or_default();
+    assert!(
+        status.starts_with("Cursor style set to Rainbow kitty"),
+        "{status}"
+    );
+    assert!(!lab.state().is_explicit(style));
+    lab.undo().expect("its Undo is offered");
+    assert_eq!(lab.text(), legacy, "Undo puts the old switch back");
+    assert_eq!(
+        lab.state().feedback.as_deref(),
+        Some("Restored Cursor style: Off")
+    );
+
+    // The typing glow turned on.
+    let mut lab = Lab::new(legacy);
+    lab.commit(
+        &format!("settings/set/{glow}"),
+        Some(SemanticInput::Bool(true)),
+    );
+    let glowing = |text: &str| {
+        let config: Config = aterm_toml::from_str(text).unwrap();
+        assert!(
+            config.cursor_trail.is_none(),
+            "the old switch is gone: {text}"
+        );
+        assert!(!config.cursor_trail_drawn(), "the style stays Off: {text}");
+        assert!(
+            config.cursor_momentum_glow_or_default(),
+            "the glow is on: {text}"
+        );
+    };
+    glowing(&lab.text());
+    let status = lab.state().feedback.clone().unwrap_or_default();
+    assert!(
+        status.starts_with("Typing momentum glow turned on"),
+        "{status}"
+    );
+
+    // Each row's Reset takes the old switch out, the other row kept.
+    for key in [style, glow] {
+        let mut lab = Lab::new(legacy);
+        lab.state_mut().navigate(SettingsRoute::CursorMotion);
+        let compiled = lab.compile(1_200.0, 2_400.0);
+        assert!(
+            compiled
+                .semantic(&UiKey::new(format!("settings/reset/{key}")))
+                .is_some(),
+            "{key} offers Reset"
+        );
+        lab.commit(&format!("settings/reset/{key}"), None);
+        if key == style {
+            assert_eq!(
+                lab.text(),
+                "cursor_momentum_glow = false\n",
+                "{key}'s Reset"
+            );
+        } else {
+            glowing(&lab.text());
+        }
+    }
+
+    // Negative control: `cursor_trail = true` over the default style reads
+    // as the defaults, so neither row is changed.
+    let lab = Lab::new("cursor_trail = true\n");
+    assert!(!lab.state().is_explicit(style));
+    assert!(!lab.state().is_explicit(glow));
+}
+
+/// A RETIRED `[packages]` SPELLING NEVER SWALLOWS A CHOICE OF A DEFAULT
+/// EITHER: over an old `auto_update = false`, turning Keep ALab tools up to
+/// date on (its default, a write of no value) takes the retired key out, as
+/// the writer does for any write of the key that replaced it; the row shows
+/// as changed before, and says it turned on.
+#[test]
+fn keep_tools_up_to_date_is_turned_on_over_the_retired_switch() {
+    let mut lab = Lab::new("[packages]\nauto_update = false\n");
+    assert!(lab.state().is_explicit(prefs::EDIT_PACKAGES_ENABLED));
+    lab.commit(
+        &format!("settings/set/{}", prefs::EDIT_PACKAGES_ENABLED),
+        Some(SemanticInput::Bool(true)),
+    );
+    assert!(!lab.text().contains("auto_update"), "{}", lab.text());
+    let config: Config = aterm_toml::from_str(&lab.text()).unwrap();
+    assert!(config.packages_enabled());
+    let status = lab.state().feedback.clone().unwrap_or_default();
+    assert!(
+        status.starts_with("Keep ALab tools up to date turned on"),
+        "{status}"
+    );
+}
+
+/// WHAT A STYLE'S PREVIEW SHOWS IS WHAT ITS PRESS SAVES, from every old
+/// Classic spelling: for each listed style, the style and trail colour the
+/// preview draws while the row is tried are the ones the saved file draws.
+/// Leaving a `classic mono` for Comet saves Comet in its own pale blue, as
+/// the preview showed, never a cursor colour the person never chose.
+#[test]
+fn a_tried_style_saves_what_its_preview_shows_from_an_old_classic() {
+    use aterm_effects::cursor_glow::GlowStyle;
+    // What a cursor draws: its style, Classic's one-colour face, its colour
+    // (Off draws none, so no colour).
+    let drawn = |raw: &str, color: aterm_effects::cursor_fx::TrailColor| {
+        let presentation = crate::app_config::resolve_trail_presentation(raw);
+        let style = presentation.style.style;
+        let mono =
+            style == Some(GlowStyle::Classic) && (presentation.classic_mono || color.chosen());
+        let color = if style.is_none() {
+            aterm_effects::cursor_fx::TrailColor::Automatic
+        } else if presentation.classic_mono && !color.chosen() {
+            // The old spelling says the cursor's colour.
+            aterm_effects::cursor_fx::TrailColor::Cursor
+        } else {
+            color
+        };
+        (style, mono, color)
+    };
+    let mut checked = 0;
+    for old in ["classic mono", "classic lumen", "mono classic"] {
+        let file = format!("cursor_trail_style = \"{old}\"\n");
+        for style in listed_cursor_style_values() {
+            let mut lab = Lab::new(&file);
+            lab.state_mut().navigate(SettingsRoute::CursorStyles);
+            lab.compile(1_024.0, 768.0);
+            if cursor_style_is_saved(lab.state(), style) {
+                continue;
+            }
+            lab.dispatch(AppEvent::FocusChanged(Some(UiKey::new(
+                cursor_style_row_key(style),
+            ))));
+            let spec = renderer_preview_spec(
+                lab.state(),
+                100,
+                crate::native_app::ViewMotionCx::default(),
+                13.0,
+                1.0,
+            )
+            .expect("the Cursor Styles preview");
+            // Classic over its old spelling is no trial: the list's check is
+            // on it, and the preview shows what pressing it keeps.
+            let shown = drawn(&spec.cursor.trail_style_raw, spec.cursor.color);
+            lab.commit(&cursor_style_row_key(style), None);
+            let saved: Config = aterm_toml::from_str(&lab.text()).unwrap();
+            assert_eq!(
+                drawn(saved.cursor_trail_style_raw(), saved.trail_color()),
+                shown,
+                "{old} to {style}: {}",
+                lab.text()
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 30, "{checked}");
+}
+
+/// WHAT `aterm ctl settings unset` SAYS A KEY NOW READS AS IS WHAT ITS ROW
+/// SAYS: for every choice and switch Settings draws, unset, the words after
+/// "now" ([`effective_value_words`]) are its row control's value — a choice
+/// in its picker's or segment's words with "(default)", a switch On or Off.
+/// Negative control: a config token placeholder ("auto (default)") is no
+/// row's words.
+#[test]
+fn every_unset_choice_and_switch_reads_now_as_its_row_says() {
+    let mut lab = Lab::new("");
+    let snapshot = lab.service.snapshot();
+    let fields: Vec<(&'static str, EditKind)> = prefs::editable_fields(&Config::default())
+        .iter()
+        .filter(|field| matches!(field.kind, EditKind::Enum { .. } | EditKind::Bool))
+        .map(|field| (field.key, field.kind))
+        .collect();
+    let mut checked = 0;
+    for (key, kind) in fields {
+        lab.dispatch(AppEvent::Action(ActionInvocation {
+            id: ActionId::new("settings/search"),
+            value: Some(SemanticInput::Text(key.to_string())),
+        }));
+        let compiled = lab.compile(1_200.0, 8_000.0);
+        let Some(control) = compiled.semantic(&UiKey::new(format!("settings/control/{key}")))
+        else {
+            continue;
+        };
+        let now = effective_value_words(&snapshot, key, false, None)
+            .unwrap_or_else(|| panic!("{key} has a row"));
+        match (&control.value, kind) {
+            (SemanticValue::Text(row), EditKind::Enum { .. }) => {
+                assert_eq!(&now, row, "{key}");
+                checked += 1;
+            }
+            (SemanticValue::Bool(on), EditKind::Bool) => {
+                let words = if *on { "On" } else { "Off" };
+                assert!(
+                    now == format!("{words} (default)")
+                        || now.starts_with(&format!("{words} (from theme")),
+                    "{key}: {now} for a switch that is {words}"
+                );
+                checked += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(checked > 60, "{checked}");
+    assert_ne!(
+        effective_value_words(&snapshot, prefs::EDIT_WINDOW_THEME, false, None).as_deref(),
+        Some("auto (default)")
+    );
+}
+
+/// A RESET THAT LEAVES A KEYWORD TOY HELD OFF SAYS SO IN THE SWITCH'S WORDS:
+/// with all word effects switched off, Reset on Keyword kitties takes its
+/// own `false` out, and its switch reads Off before and after, so the status
+/// says it was reset and is still Off and why, never "turned on" or
+/// "inactive"; Undo and Redo name what the switch shows, Off. Negative
+/// control: with the word effects on, the same Reset turns it on.
+#[test]
+fn a_reset_that_leaves_a_keyword_toy_held_off_says_it_is_still_off() {
+    let source = "[sparkle_words]\nenabled = false\n[sparkle_words.feline]\nenabled = false\n";
+    let mut lab = Lab::new(source);
+    lab.state_mut().navigate(SettingsRoute::Modified);
+    lab.commit(&format!("settings/reset/{KEYWORD_KITTIES_KEY}"), None);
+    assert!(!lab.text().contains("feline"), "{}", lab.text());
+    let status = lab.state().feedback.clone().unwrap_or_default();
+    assert!(
+        status.starts_with("Keyword kitties reset to its default")
+            && status.contains("Still Off: all word effects are switched off in aterm.toml")
+            && !status.contains("turned on")
+            && !status.to_lowercase().contains("inactive"),
+        "{status}"
+    );
+    lab.undo().expect("Undo is offered");
+    assert_eq!(
+        lab.state().feedback.as_deref(),
+        Some("Restored Keyword kitties: Off")
+    );
+    lab.undo().expect("Redo is offered");
+    assert_eq!(
+        lab.state().feedback.as_deref(),
+        Some("Restored Keyword kitties: Off")
+    );
+
+    let mut lab = Lab::new("[sparkle_words.feline]\nenabled = false\n");
+    lab.state_mut().navigate(SettingsRoute::Modified);
+    lab.commit(&format!("settings/reset/{KEYWORD_KITTIES_KEY}"), None);
+    let status = lab.state().feedback.clone().unwrap_or_default();
+    assert!(status.starts_with("Keyword kitties turned on"), "{status}");
+}
+
+/// EVERY TOP EFFECT SWITCH UNDER SERIOUS MODE SAYS WHAT ITS PRESS DOES: on
+/// Top Settings, Sound, search and Modified, saved On or Off, a Music
+/// effects, Sparkle words or Keyword kitties switch that reads Off says that
+/// turning it on turns Serious Mode off, and its press writes Serious Mode
+/// away. Negative control: Music effects saved On on Modified reads On, is
+/// "inactive" because of Serious Mode, and its press keeps Serious Mode.
+#[test]
+fn every_top_effect_switch_under_serious_mode_says_what_its_press_does() {
+    let leaves = |patch: &ConfigPatch| {
+        patch
+            .edits
+            .iter()
+            .any(|edit| edit.key == prefs::EDIT_SERIOUS_MODE && edit.value.is_none())
+    };
+    let mut checked = 0;
+    for key in [
+        prefs::EDIT_TRAIL_SOUNDS,
+        SPARKLE_WORDS_KEY,
+        KEYWORD_KITTIES_KEY,
+    ] {
+        let saved_off = if key == prefs::EDIT_TRAIL_SOUNDS {
+            "trail_sounds = false\n".to_string()
+        } else {
+            let table = key.trim_end_matches(".enabled");
+            format!("[{table}]\nenabled = false\n")
+        };
+        for saved in [String::new(), saved_off] {
+            for route in [
+                SettingsRoute::Home,
+                SettingsRoute::Sound,
+                SettingsRoute::Modified,
+            ] {
+                for search in [false, true] {
+                    let mut lab = Lab::new(&format!("serious_mode = true\n{saved}"));
+                    lab.state_mut().navigate(route);
+                    if search {
+                        lab.dispatch(AppEvent::Action(ActionInvocation {
+                            id: ActionId::new("settings/search"),
+                            value: Some(SemanticInput::Text(key.to_string())),
+                        }));
+                    }
+                    let state = lab.state();
+                    if top_effect_shown(state, None, key) {
+                        continue;
+                    }
+                    let effect = setting_effect_projection(
+                        state,
+                        None,
+                        key,
+                        SettingsAvailability::for_state(state),
+                        state.presented_motion.get(),
+                    );
+                    let context = format!("{key} saved {saved:?} on {route:?} search={search}");
+                    assert!(
+                        effect_note_contains(&effect, "turning this on turns Serious Mode off"),
+                        "{context}: {effect:?}"
+                    );
+                    let (patch, _) = lab
+                        .invoke(&format!("settings/set/{key}"), None)
+                        .unwrap_or_else(|| panic!("{context}: the press writes"));
+                    assert!(leaves(&patch), "{context}: {patch:?}");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert!(checked > 20, "{checked}");
+
+    let mut lab = Lab::new("serious_mode = true\ntrail_sounds = true\n");
+    lab.state_mut().navigate(SettingsRoute::Modified);
+    let state = lab.state();
+    assert!(top_effect_shown(state, None, prefs::EDIT_TRAIL_SOUNDS));
+    let effect = setting_effect_projection(
+        state,
+        None,
+        prefs::EDIT_TRAIL_SOUNDS,
+        SettingsAvailability::for_state(state),
+        state.presented_motion.get(),
+    );
+    assert!(
+        effect_note_contains(&effect, "Currently inactive because Serious Mode"),
+        "{effect:?}"
+    );
+    let (patch, _) = lab
+        .invoke(&format!("settings/set/{}", prefs::EDIT_TRAIL_SOUNDS), None)
+        .expect("the press writes");
+    assert!(!leaves(&patch), "{patch:?}");
+}
+
 /// A reset says the value in the words its row shows, never the config's:
 /// the selected tab color goes back to Automatic, and Remove on Wallpaper
 /// keeps its own words once the change is saved.
@@ -1896,6 +2264,7 @@ fn a_patch_that_changes_nothing_is_never_worded_as_a_change() {
                 value: Some("Menlo".to_string()),
             }],
         },
+        &BTreeMap::new(),
     );
     assert!(
         !words.status.contains("reset to") && !words.status.contains("set to"),

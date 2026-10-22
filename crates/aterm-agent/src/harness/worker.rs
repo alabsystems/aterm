@@ -30,9 +30,9 @@
 //!     session", the TUI root's parser): `--` then the prompt, as Claude
 //!     Code takes it.
 //!
-//!   agy's task file holds no blank line ([`WorkerCli::blank_lines`]): its
-//!   screen draws one inside a message as the gap under a message, so the
-//!   rows past it would read as the agent's reply.
+//!   agy's task file holds no blank line ([`WorkerCli::blank_lines`], its
+//!   reader's word): its screen draws one inside a message as the gap under
+//!   a message, so the rows past it would read as the agent's reply.
 //!
 //!   Every lane drops that first prompt from a relaunch's argv
 //!   (`upgrade_gemini`'s and `upgrade_agy`'s `prompt-interactive` and `i`,
@@ -73,8 +73,14 @@
 //!   own (`--session-id <uuid>`, [`fresh_session_id`]): the restarted CLI
 //!   finds that session already written and refuses to start (`Session ID
 //!   … already exists`, exit 42) rather than send the task again. The
-//!   relaunch lane drops the flag (`upgrade_gemini`'s `session-id`) and
-//!   resumes the session by its id.
+//!   relaunch lane reads that `42` as the restart it is — the id its first
+//!   start wrote, which the start-time rule names for the process
+//!   (`upgrade_gemini::restart_id`, `ExitKind::Restarted`) — and finishes
+//!   it: `gemini --resume <uuid>` with the flag and the prompt dropped
+//!   (`upgrade_gemini::rewrite_argv`), behind the worker's homes and its
+//!   trusted-folders file while that stands, and nothing typed after it.
+//!   Keeping the task out of a restart's argv is not the CLI's to offer: its
+//!   parent spawns every run from the argv it read once.
 //! * **The program** ([`starter`]): the starter's own, where the starter runs
 //!   the same agent — Claude Code's as its relaunch reads it
 //!   (`relaunch::caller_claude`); agy's and Muse Code's image, or atpkg's
@@ -138,16 +144,6 @@ pub struct WorkerCli {
     /// which runs the same argv again, refuses the id it already wrote rather
     /// than send the task a second time ([module](self)).
     pub session_flag: Option<&'static str>,
-    /// Whether the first prompt may hold a BLANK LINE: `false` where the
-    /// CLI's screen cannot bound a message holding one. agy draws a
-    /// message's blank line as a blank row with the rows under it two
-    /// columns in, as its reply's (measured in the lab 2026-10-21,
-    /// `aterm_phase::agy::fixtures::lab::WORKER_FIRST_PROMPT`), so its reader
-    /// reads the rows past it as the reply: a task's later paragraph, and the
-    /// fact line's `NEEDS YOU:` (a need nobody said, raised as the worker's
-    /// first turn ended), and both in the worker's result. Such a task file
-    /// drops its blank lines, the fact on the line under the task.
-    pub blank_lines: bool,
     /// Environment a fresh start sets that the line drops first when it
     /// would not fit (Claude Code's survey switch).
     pub nicety: &'static [(&'static str, &'static str)],
@@ -186,7 +182,6 @@ pub static WORKERS: [WorkerCli; 4] = [
         trust_flag: None,
         trust_file_env: None,
         session_flag: None,
-        blank_lines: true,
         nicety: &super::relaunch::CLAUDE_LAUNCH_ENV,
         dirs: &[super::accounts::HOME_ENV, super::accounts::HOMEDIR_ENV],
         launches: Launches::Claude,
@@ -201,7 +196,6 @@ pub static WORKERS: [WorkerCli; 4] = [
         trust_flag: None,
         trust_file_env: Some(super::upgrade_gemini::TRUSTED_FOLDERS_ENV),
         session_flag: Some("--session-id"),
-        blank_lines: true,
         nicety: &[],
         dirs: &[
             super::upgrade_gemini::HOME_ENV,
@@ -228,7 +222,6 @@ pub static WORKERS: [WorkerCli; 4] = [
         trust_flag: None,
         trust_file_env: None,
         session_flag: None,
-        blank_lines: false,
         nicety: &[],
         dirs: &[super::upgrade_agy::HOME_ENV],
         launches: Launches::Image {
@@ -245,7 +238,6 @@ pub static WORKERS: [WorkerCli; 4] = [
         trust_flag: Some("--trust-workspace"),
         trust_file_env: None,
         session_flag: None,
-        blank_lines: true,
         nicety: &[],
         dirs: &[
             super::upgrade_muse::DATA_ENV,
@@ -286,6 +278,22 @@ pub struct Starter {
 }
 
 impl WorkerCli {
+    /// Whether the first prompt may hold a BLANK LINE: its reader's word
+    /// ([`aterm_phase::ScreenReader::bounds_messages`]), `false` where the
+    /// CLI's screen cannot bound a message holding one. agy draws a
+    /// message's blank line as a blank row with the rows under it two
+    /// columns in, as its reply's (measured in the lab 2026-10-21,
+    /// `aterm_phase::agy::fixtures::lab::WORKER_FIRST_PROMPT`), so its reader
+    /// reads the rows past it as the reply: a task's later paragraph, and the
+    /// fact line's `NEEDS YOU:` (a need nobody said, raised as the worker's
+    /// first turn ended), and both in the worker's result. Such a task file
+    /// drops its blank lines, the fact on the line under the task (the acts
+    /// the harness types later go as one line each).
+    #[must_use]
+    pub fn blank_lines(&self) -> bool {
+        self.agent.reader().bounds_messages()
+    }
+
     /// The worker's program when no starter's own rides the line: the word,
     /// under the shell's own environment.
     #[must_use]

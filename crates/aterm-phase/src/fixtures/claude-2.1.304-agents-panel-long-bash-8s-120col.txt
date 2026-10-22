@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab), bypass mode (`--dangerously-skip-permissions`), fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1) · the agents panel 8 s after one turn started three background general-purpose agents (Agent with run_in_background): `long probe`, whose one Bash call is `sleep 300` with `timeout: 400000`; `quick probe`, a `sleep 2` (done and gone from the panel); `bg probe`, a Bash `sleep 200` with `run_in_background: true`, answered at once, whose agent finished its turn and waits on its own background work: its row's clock stands at `0s` (the elapsed is end − start) while its tokens show; the transcripts are crates/aterm-agent/src/harness/testdata/flight/
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.19iX/proj
+
+
+❯ toolstart
+
+⏺ Agent(long probe)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Agent(quick probe)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Agent(bg probe)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Tool call done.
+
+✻ Waiting for 3 background agents to finish
+
+⏺ Agent "bg probe" is waiting on its own background work · 0s
+
+⏺ Tool call done.
+
+✻ Waiting for 2 background agents to finish
+
+⏺ Agent "quick probe" finished · 2s
+
+⏺ Tool call done.
+
+✻ Waiting for 1 background agent to finish
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell · /tasks to see subagents · ↓ to manage
+
+  ⏺ main
+  ◯ general-purpose  long probe                                                                     8s · ↓ 6.2k tokens
+  ◯ general-purpose  bg probe                                                                       0s · ↓ 7.2k tokens
+

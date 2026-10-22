@@ -11891,6 +11891,29 @@ pub(crate) fn screen_alone(program: Program) -> bool {
     }
 }
 
+/// WHETHER A LIMIT MET UNDER `met` IS ANOTHER AGENT'S THAN THE ONE `here`
+/// NAMES: both are agents whose limits the loop reads and decides on (Claude
+/// Code, [`reads_conversation`]; Muse Code, agy and Gemini CLI,
+/// [`screen_alone`]), and they differ. A limit is its program's account's: it
+/// holds nothing of another agent's in the same tab, and its resume is no
+/// turn of theirs. Such a limit ends where the other agent's screen is read
+/// ([`TurnEndState::observe`]); a turn asked of its own program later meets
+/// it again, if it still stands — a wall of its own. Measured before (L1/L2
+/// of the remembered-limit stage, 2026-10-21): under a host, Claude Code's
+/// unread five-hour limit held a Muse Code that ran in its tab after it, and
+/// a Muse Code limit held the Claude Code after it, each with a look every
+/// [`LIMIT_CONVERSATION_LOOK`] for two days and nothing said; with no host,
+/// each held the other until its own reset and then typed `usage-resume@v1`
+/// into it. `None` (a row an older build wrote), Codex and a screen no
+/// reader names ([`Program::Generic`]: a shell, a Claude Code that draws
+/// neither its frame nor a box) name no agent either way, and keep the limit
+/// as it stands.
+#[must_use]
+pub(crate) fn met_under_another(met: Option<Program>, here: Program) -> bool {
+    let decided = |p: Program| reads_conversation(p) || screen_alone(p);
+    met.is_some_and(|met| met != here && decided(met) && decided(here))
+}
+
 /// What one screen says, as the turn-end policy reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnEndReading {
@@ -13851,6 +13874,19 @@ pub struct TurnEndState {
     /// loop that typed it. Cleared by any act of this loop's but the wall's
     /// retry that delivers it again, and by a turn the host types.
     seeded_check: Option<&'static str>,
+    /// THE CHECK WHOSE ANSWER THE POINT A LOOP BEFORE THIS ONE JUDGED LAST
+    /// WAS ([`Self::seed_check_point`]): read again as this loop's first
+    /// point, a wall there cut it. Taken at the first point; Off drops it.
+    check_point_seed: Option<&'static str>,
+    /// THE LAND ACT A LOOP BEFORE THIS ONE TYPED, by its rule, while a wall's
+    /// retry or a `/compact`'s continuation would deliver it again
+    /// ([`Self::seed_land_owed`]): what that continuation types for it
+    /// ([`Self::compact_owed_text`]), where the loop that typed it types its
+    /// words ([`Self::cut_text`]). Dropped by any act that does not deliver
+    /// or owe it, and by Off.
+    seeded_land: Option<&'static str>,
+    /// As [`Self::check_point_seed`], for the land act ([`Self::seed_land_point`]).
+    land_point_seed: bool,
     /// THE OPEN WORK THE CURRENT POINT'S DONE CLAIM NAMES: under Cruise its
     /// report read by [`open_work`], under Land by Land's strict reading
     /// ([`land_open_words`]); the point's act names it as a suffix
@@ -14226,6 +14262,9 @@ impl TurnEndState {
             done: 0,
             checking: false,
             seeded_check: None,
+            check_point_seed: None,
+            seeded_land: None,
+            land_point_seed: false,
             open: Vec::new(),
             repo: None,
             needs: Needs::default(),
@@ -14932,6 +14971,80 @@ impl TurnEndState {
         }
     }
 
+    /// THE DONE CHECK A FULL CONTEXT CUT, OWED TO THE `/COMPACT` A LOOP BEFORE
+    /// THIS ONE TYPED AT ITS POINT
+    /// ([`crate::supervise::approvals::CheckOwed::compact`]): the
+    /// compaction's continuation, owed at the next point ([`Self::after`]),
+    /// types the check again ([`Self::compact_owes`]), as for that loop.
+    pub fn seed_compact_check(&mut self, rule: &'static str) {
+        self.seeded_check = Some(rule);
+        self.compact_owes = Some(CompactOwes {
+            check: true,
+            land: false,
+        });
+        self.after = Some(RULE_COMPACT);
+    }
+
+    /// THE CHECK WHOSE ANSWER THE POINT A LOOP BEFORE THIS ONE JUDGED LAST
+    /// WAS, nothing typed since
+    /// ([`crate::supervise::approvals::check_point_last_in`]): that point,
+    /// read again as this loop's first ([`Self::seed_point`]), is the check's
+    /// answer, and a wall there cut it ([`Self::cut_check`]). A full context
+    /// writes no row, so only the screen says.
+    pub fn seed_check_point(&mut self, rule: &'static str) {
+        self.check_point_seed = Some(rule);
+    }
+
+    /// THE LAND ACT A LOOP BEFORE THIS ONE TYPED, by its rule
+    /// ([`crate::supervise::approvals::LandSeed::owed`]), which a wall's retry
+    /// or a `/compact`'s continuation delivers again: that continuation types
+    /// it ([`Self::compact_owed_text`]) — the instruction again where it was
+    /// the instruction — as the loop that typed it does.
+    pub fn seed_land_owed(&mut self, rule: &'static str) {
+        self.seeded_land = Some(rule);
+    }
+
+    /// THE LAND ACT A FULL CONTEXT CUT, OWED TO THE `/COMPACT` A LOOP BEFORE
+    /// THIS ONE TYPED AT ITS POINT
+    /// ([`crate::supervise::approvals::LandSeed::compact`]): the compaction's
+    /// continuation, owed at the next point ([`Self::after`]), types the act
+    /// again ([`Self::compact_owes`]), as for that loop.
+    pub fn seed_compact_land(&mut self) {
+        self.compact_owes = Some(CompactOwes {
+            check: false,
+            land: true,
+        });
+        self.after = Some(RULE_COMPACT);
+    }
+
+    /// THE LAND ACT WHOSE ANSWER THE POINT A LOOP BEFORE THIS ONE JUDGED LAST
+    /// WAS, nothing typed since
+    /// ([`crate::supervise::approvals::LandSeed::judged`]): that point, read
+    /// again as this loop's first, is the act's answer, and a wall there cut
+    /// it ([`Self::cut_land`]), as [`Self::seed_check_point`] says of the check.
+    pub fn seed_land_point(&mut self) {
+        self.land_point_seed = true;
+    }
+
+    /// A reading or act outside Land ends that episode, including an act a
+    /// compaction was to deliver again. The command still owes its generic
+    /// continuation, and a done check's payload remains its own.
+    fn leave_land_episode(&mut self) {
+        self.land = LandEpisode::default();
+        self.landing = false;
+        self.landing_act = None;
+        self.cut_land = false;
+        self.seeded_land = None;
+        self.land_point_seed = false;
+        if self.cut_text.as_deref().is_some_and(is_land_words) {
+            self.cut_text = None;
+        }
+        self.compact_owes = self.compact_owes.and_then(|mut owed| {
+            owed.land = false;
+            owed.check.then_some(owed)
+        });
+    }
+
     /// A TURN WAS READ RUNNING after the point a loop before this one
     /// recorded last ([`crate::supervise::approvals::StreakSeed::ran`]): a
     /// later turn than the one whose answer it judged, as for that loop's
@@ -15080,21 +15193,33 @@ impl TurnEndState {
     }
 
     /// THE TURN ENDING AT `r` IS OWED ITS WHOLE WORDS, whatever its last
-    /// ones claim: a turn ran since the last point (`worked`), and the
-    /// point folds its needs in (no box, no wall, nothing unanswered over
-    /// it, [`Self::observe`]) or its words may keep a landing on the record
-    /// (the record says the task finished, over a landing this state holds
-    /// or a seed armed: a landed task's own wake, whose need or open work
-    /// reopens it, [`wake_left_open`]). The loop reads such a turn up to the
-    /// row that opened it where that row is above the rows read
+    /// ones claim: a turn ran since the last point (`worked`) — or this is
+    /// the state's FIRST point, which folds in the needs of the turn on the
+    /// screen whatever ran before it ([`Self::observe`]), on a screen that
+    /// cannot bound a message by its rows (agy:
+    /// [`aterm_phase::ScreenReader::bounds_messages`]) — and the point
+    /// folds its needs in (no box, no wall, nothing unanswered over it) or
+    /// its words may keep a landing on the record (the record says the task
+    /// finished, over a landing this state holds or a seed armed: a landed
+    /// task's own wake, whose need or open work reopens it,
+    /// [`wake_left_open`]). The loop reads such a turn up to the row that
+    /// opened it where that row is above the rows read
     /// (`Session::turn_end_reading_as`). Read only where the last words
     /// claimed done, a NEEDS YOU said early in a tall turn that ended on
     /// other words was never raised — on every harness — and a landed
     /// task's tall wake kept the landing over the need it said above the
-    /// screen.
+    /// screen. Read only after a turn ran, a loop's first point on agy (a
+    /// seamless update's successor, a restart after a fault, Off to Land)
+    /// folded in the words of a reply cut at the rows' top as agy's: the
+    /// rows of aterm's own act above the reply, two columns in as a reply's,
+    /// among them, and a need said above the screen was never raised (the
+    /// review of b9/spawn-residuals, F1). Every other harness marks its
+    /// reply's head, and its first point reads as before: the rows a cut
+    /// reply shows are its own.
     #[must_use]
     pub fn reads_turn_whole(&self, r: &TurnEndReading, worked: bool) -> bool {
-        if !worked || matches!(r.phase, Phase::Busy | Phase::Prompt) {
+        let first_point = self.point_at.is_none() && !r.program.reader().bounds_messages();
+        if !(worked || first_point) || matches!(r.phase, Phase::Busy | Phase::Prompt) {
             return false;
         }
         let folds_needs = r.wall.is_none() && !r.pending_input;
@@ -15891,6 +16016,9 @@ impl TurnEndState {
         self.cut_check = false;
         self.cut_land = false;
         self.compact_owes = None;
+        self.check_point_seed = None;
+        self.seeded_land = None;
+        self.land_point_seed = false;
         self.carrying = false;
         self.carry_at_attach = false;
         // A landing seeded from a loop before this one still holds at the
@@ -16358,13 +16486,18 @@ impl TurnEndState {
     /// as this policy typed it ([`Self::cut_text`]) — or, for one it did not
     /// type (the restart's check, a check a loop before this one asked), the
     /// [`DONE_CHECK`] with [`DONE_CHECK_REVERSIBLE`] after it (nothing says
-    /// the report named no irreversible act), or a land nudge. `None` where
-    /// nothing is owed, or `rule` is no compaction's.
+    /// the report named no irreversible act), or the land act a loop before
+    /// this one typed ([`Self::seeded_land`]), a nudge where none is named.
+    /// `None` where nothing is owed, or `rule` is no compaction's.
     fn compact_owed_text(&self, rule: &str, rules: Option<&str>) -> Option<String> {
         let owes = self.compact_owes.filter(|_| rule == RULE_COMPACT)?;
         Some(self.cut_text.clone().unwrap_or_else(|| {
             if owes.land && !owes.check {
-                land_nudge_text(rules)
+                match self.seeded_land {
+                    Some(RULE_LAND) => land_text(rules),
+                    Some(RULE_LAND_ANSWER) => land_answer_text(rules),
+                    _ => land_nudge_text(rules),
+                }
             } else {
                 done_check_text(rules, true)
             }
@@ -17864,6 +17997,22 @@ impl TurnEndState {
         self.limit_ended = false;
         self.point_moved = false;
         self.left_judged = false;
+        // A LIMIT MET UNDER ANOTHER AGENT ([`met_under_another`]) ends where
+        // this agent's screen is read, busy or at a point: it holds nothing of
+        // this agent's, and its resume is no turn of theirs. Its tries end
+        // with it ([`Self::limit_ended`]), as at a wall of another named
+        // conversation ([`Self::track_wall`]). Not on the wall the loop
+        // remembers (`wall_remembered`): the memory supplies none of another
+        // agent's (`Session::remembered_wall`).
+        if !reading.wall_remembered
+            && self.wall.as_ref().is_some_and(|t| {
+                named_class(t.class) && met_under_another(t.program, reading.program)
+            })
+        {
+            self.wall = None;
+            self.fallback_unmade = false;
+            self.limit_ended = true;
+        }
         // The policy LOOKED at this screen: a limit a cancel left that a
         // later screen draws, and this one did not, answered a turn asked
         // since ([`Self::left_answer`]).
@@ -17875,7 +18024,7 @@ impl TurnEndState {
         // memory goes, and a later Land is a new episode, its instruction
         // typed again.
         if reading.autopilot != Autopilot::Land {
-            self.land = LandEpisode::default();
+            self.leave_land_episode();
         }
         self.autopilot = Some(reading.autopilot);
         // A PERSON'S ESC is timed from the first read that shows it: kept
@@ -18124,6 +18273,8 @@ impl TurnEndState {
         // ([`Self::seed_point`]): this loop's first judged point, no busy
         // read since it attached and no act of its own awaited.
         let seeded_point = self.point_seed.take();
+        let check_point = self.check_point_seed.take();
+        let land_point = std::mem::take(&mut self.land_point_seed);
         self.esc_seed = false;
         let seeded_yield = self.yield_seed.take();
         let same_point =
@@ -18666,6 +18817,16 @@ impl TurnEndState {
                 // before stopped before it read the wall, so no point row says it cut the check.
                 if checked && reading.wall.is_some() {
                     self.cut_check = true;
+                }
+                // …and so does the check whose answer that loop judged here, this point read again
+                // ([`Self::seed_check_point`]).
+                if let Some(rule) = check_point.filter(|_| same_point && reading.wall.is_some()) {
+                    self.cut_check = true;
+                    self.seeded_check = Some(rule);
+                }
+                // …and the land act's ([`Self::seed_land_point`]).
+                if land_point && same_point && reading.wall.is_some() {
+                    self.cut_land = true;
                 }
                 let lands = land_judged && clean;
                 self.done = if lands {
@@ -19754,6 +19915,9 @@ impl TurnEndState {
         if !cut_check && self.compact_owes.is_none_or(|o| !o.check) {
             self.seeded_check = None;
         }
+        if !cut_land && self.compact_owes.is_none_or(|o| !o.land) {
+            self.seeded_land = None;
+        }
         // The act's own text, which a `/compact`'s continuation types again
         // ([`Self::cut_text`]).
         let typed_text = match action {
@@ -19790,7 +19954,7 @@ impl TurnEndState {
         // and a land act typed once the instruction was is the one whose
         // clean defense lands the task ([`Self::observe`]).
         if reading.autopilot != Autopilot::Land {
-            self.land = LandEpisode::default();
+            self.leave_land_episode();
         }
         match typed_rule {
             Some(RULE_LAND) => self.land.typed = true,
@@ -19958,6 +20122,7 @@ impl TurnEndState {
         self.fallback_unasked = false;
         self.checking = false;
         self.seeded_check = None;
+        self.seeded_land = None;
         self.open.clear();
         self.repo = None;
         self.landing = false;
@@ -21478,11 +21643,7 @@ fn act_at_point(
             ),
             None => act,
         };
-    if let Some(t) = state.wall.as_ref().filter(|t| named_class(t.class))
-        && (reading.wall.is_none() || reading.wall_remembered)
-        && !limit_conversation_known(t, reading)
-        && !state.relaunched_off(t)
-    {
+    if let Some(t) = unread_track(state, reading) {
         let look = later(now, LIMIT_CONVERSATION_LOOK);
         let until = t
             .named
@@ -22198,10 +22359,11 @@ fn land_words(state: &TurnEndState, reading: &TurnEndReading) -> (String, &'stat
 }
 
 /// Whether `text`, typed under Land, is Land's own words ([`land_words`]):
-/// [`LAND`] or a [`LAND_NUDGE`], its suffixes and the standing rules after
-/// it — whatever rule a wall's continuation typed it under.
+/// [`LAND`], [`LAND_NUDGE`] or [`LAND_ANSWER`], their suffixes and the
+/// standing rules after them — whatever rule a wall's continuation typed
+/// them under.
 fn is_land_words(text: &str) -> bool {
-    text.starts_with(LAND) || text.starts_with(LAND_NUDGE)
+    text.starts_with(LAND) || text.starts_with(LAND_NUDGE) || text.starts_with(LAND_ANSWER)
 }
 
 /// Whether the vendor GOES ON BY ITSELF at the wall `reading` shows, as
@@ -22577,6 +22739,34 @@ fn limit_end(
 /// Recheck an unplaced remembered limit through the ordinary scheduler. A
 /// new screen is considered earlier; unreadness itself never resets or lapses it.
 pub(crate) const LIMIT_CONVERSATION_LOOK: Duration = Duration::from_secs(5 * 60);
+
+/// THE LIMIT HELD UNREAD AT THIS POINT ([`act_at_point`]'s
+/// `limit-conversation-unread`): a usage window's or a model bucket's track
+/// whose conversation this point's read cannot say is the screen's
+/// ([`limit_conversation_known`]), its notice gone from the screen or the
+/// wall the loop remembers, and no relaunch of ours moved the session off it
+/// ([`TurnEndState::relaunched_off`]).
+fn unread_track<'a>(state: &'a TurnEndState, reading: &TurnEndReading) -> Option<&'a WallTrack> {
+    state.wall.as_ref().filter(|t| {
+        named_class(t.class)
+            && (reading.wall.is_none() || reading.wall_remembered)
+            && !limit_conversation_known(t, reading)
+            && !state.relaunched_off(t)
+    })
+}
+
+impl TurnEndState {
+    /// WHEN THE HOLD ON A LIMIT HELD UNREAD AT THIS POINT ([`unread_track`])
+    /// STOPPED WAITING ON THE LIMIT ITSELF: its named reset, or its
+    /// appearance where its notice named none. `None`: no such hold.
+    /// Past it, nothing but a read lifts the hold — the conversation named,
+    /// or the worker working — and an hour on the owner is told
+    /// ([`super::exception::exception_for`]).
+    #[must_use]
+    pub(crate) fn held_unread_from(&self, reading: &TurnEndReading) -> Option<Instant> {
+        unread_track(self, reading).map(|t| t.named.map_or(t.since, |n| n.at))
+    }
+}
 
 fn limit_conversation_ours(t: &WallTrack, reading: &TurnEndReading) -> bool {
     limit_conversation_known(t, reading) && t.conversation == reading.conversation

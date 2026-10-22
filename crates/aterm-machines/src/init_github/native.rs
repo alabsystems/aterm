@@ -43,7 +43,10 @@ pub(super) fn run(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<ItemRep
         ctx,
     );
     if mode == Mode::Apply {
-        aterm_converge::run(&bound, mode, &mut crate::engine::account_journal()?)
+        // The journal of the account `sys` acts as: the item's own port, never one this
+        // process resolves beside it.
+        let mut journal = sys.journal()?;
+        aterm_converge::run(&bound, mode, journal.as_mut())
     } else {
         // A plan or a check changes nothing, so it records nothing: the
         // read-only journal, which refuses a record (`NoJournal` is a test's
@@ -638,6 +641,51 @@ mod tests {
             && !call.contains("/gh ")
             && !call.contains("auth login")));
         assert!(sys.fed().is_empty());
+    }
+
+    /// An apply journals its change in the journal of the system it runs on: the fake's
+    /// files hold the line. Negative control: a plan of the same machine writes none. A
+    /// mutant that asks the journal this process would resolve for itself leaves the
+    /// fake's empty and fails here.
+    #[test]
+    fn an_apply_journals_in_the_journal_of_the_system_it_runs_on_and_a_plan_in_none() {
+        let journaled = |sys: &Fake| -> Vec<String> {
+            sys.written(Fake::JOURNAL)
+                .map(|bytes| String::from_utf8(bytes).unwrap())
+                .unwrap_or_default()
+                .lines()
+                .map(|line| {
+                    let line: aterm_json::Value = aterm_json::from_str(line).unwrap();
+                    line["id"].as_str().unwrap().to_owned()
+                })
+                .collect()
+        };
+        for mode in [Mode::Plan, Mode::Apply] {
+            let (sys, item) = fixture();
+            answer(
+                &sys,
+                &item.user,
+                &format!("{ACCESSIBLE}&page=1"),
+                aterm_json::json!([]),
+            );
+            credential_commands(
+                &sys,
+                &item.user,
+                Ran::ok(&format!("username=alice\npassword={TOKEN}\n")),
+            );
+            let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+            let rows = run(&sys, &context, mode).unwrap();
+            let want = if mode == Mode::Apply {
+                (crate::model::Outcome::Changed, vec![item.id()])
+            } else {
+                (crate::model::Outcome::Planned, Vec::new())
+            };
+            assert_eq!(
+                (rows[0].outcome, journaled(&sys)),
+                want,
+                "{mode:?}: {rows:?}"
+            );
+        }
     }
 
     #[test]

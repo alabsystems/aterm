@@ -16,7 +16,7 @@ pub struct ScrollRegion {
 impl ScrollRegion {
     /// Create a scroll region covering all visible rows.
     #[inline]
-    pub(crate) fn full(visible_rows: u16) -> Self {
+    pub(crate) const fn full(visible_rows: u16) -> Self {
         Self {
             top: 0,
             bottom: visible_rows.saturating_sub(1),
@@ -25,7 +25,7 @@ impl ScrollRegion {
 
     /// Check if this is the full screen (no restricted region).
     #[inline]
-    pub(crate) fn is_full(self, visible_rows: u16) -> bool {
+    pub(crate) const fn is_full(self, visible_rows: u16) -> bool {
         self.top == 0 && self.bottom == visible_rows.saturating_sub(1)
     }
 }
@@ -44,7 +44,7 @@ impl HorizontalMargins {
     /// Create horizontal margins covering all columns.
     #[must_use]
     #[inline]
-    pub fn full(cols: u16) -> Self {
+    pub const fn full(cols: u16) -> Self {
         Self {
             left: 0,
             right: cols.saturating_sub(1),
@@ -54,7 +54,7 @@ impl HorizontalMargins {
     /// Check if this covers the full width (no restricted region).
     #[must_use]
     #[inline]
-    pub fn is_full(self, cols: u16) -> bool {
+    pub const fn is_full(self, cols: u16) -> bool {
         self.left == 0 && self.right == cols.saturating_sub(1)
     }
 }

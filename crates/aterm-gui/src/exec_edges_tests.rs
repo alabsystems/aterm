@@ -368,3 +368,31 @@ fn a_folded_exec_hands_its_image_to_the_sampled_edge() {
     x.read_edge(ABSORBED, true);
     assert_eq!(reads_of(ABSORBED), [None, None]);
 }
+
+/// Every drain that holds a process event (a fork, an `exec`, an exit: a job
+/// may have started or ended) tells the stuck engine's kernel edge, from a
+/// heard batch and from an absorbing edge alike. NEGATIVE CONTROL: a drain
+/// that finds nothing tells it nothing.
+#[test]
+fn a_drain_with_a_process_event_tells_the_kernel_edge() {
+    static EDGE: crate::vitals_host::ProcEdge = crate::vitals_host::ProcEdge::new();
+    const SH: i32 = 59_000;
+    const JOB: i32 = 59_001;
+    let (mut x, script, mut c) = rig(SH, SH, shell(SH));
+    x.proc_edge = &EDGE;
+    EDGE.arm(true);
+    c.begin();
+    assert!(!x.heard(&mut c, || SH, 0), "an empty drain");
+    assert!(!EDGE.take(), "nothing heard: nothing told");
+
+    set_image(tool(JOB));
+    script.post(&[ProcEvent::Fork { child: JOB }]);
+    c.begin();
+    assert!(!x.heard(&mut c, || SH, 0), "a fork alone cuts nothing");
+    assert!(EDGE.take(), "a fork tells it");
+
+    EDGE.arm(true);
+    script.post(&[ProcEvent::Exit { pid: JOB }]);
+    assert!(!x.absorb(SH), "an exit is no exec of the leader");
+    assert!(EDGE.take(), "an exit heard while absorbing tells it too");
+}

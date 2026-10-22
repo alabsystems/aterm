@@ -1,0 +1,12 @@
+# codex 0.154.0 · MEASURED 2026-09-16 in a private headless aterm (32x100, 7x14 px), DECODED here: the first synchronized frame (`?2026h` … `?2026l`) of `crates/aterm-effects/tests/fixtures/codex-particles-2026-09-16.ptylog`, its rows 1–11 laid out as text from the frame's cursor moves and erases · the session card, a blank row, the composer's slab (rows 8–10 erased onto `48;2;45;47;51`: the top pad, `›` and the dim placeholder, the bottom pad), the footer
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.154.0)            │
+│                                       │
+│ model:     loading   /model to change │
+│ directory: loading                    │
+╰───────────────────────────────────────╯
+
+
+› Ask Codex to do anything
+
+  ? for shortcuts

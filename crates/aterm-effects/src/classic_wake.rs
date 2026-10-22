@@ -169,6 +169,7 @@ pub(crate) struct WakeInk<'a> {
 /// `accent → color`, following the theme's cursor colour,
 /// `cursor_trail_color` and live OSC 12.
 #[must_use]
+#[inline]
 pub fn comet_color(mono: bool, color: u32, accent: u32, hue: f32, pos: f32) -> u32 {
     if mono {
         lerp_rgb(accent, color, pos)
@@ -207,12 +208,14 @@ impl ClassicWake {
     /// Wake brightness multiplier for typing light at the current heat: cool
     /// typing ~0.28×, sustained fast typing ~1.2×. Jump comets and rings are
     /// navigation feedback and stay at 1×.
+    #[inline]
     fn typing_boost(&self) -> f32 {
         0.28 + 0.92 * self.heat
     }
 
     /// Any light still alive → keep the animation timer armed.
     #[must_use]
+    #[inline]
     pub fn is_active(&self) -> bool {
         !self.sparks.is_empty() || self.ring.is_some() || self.crown_until.is_some()
     }
@@ -220,6 +223,7 @@ impl ClassicWake {
     /// The move the last tick spawned on, `(from, to)`, once: the classic
     /// wake lights every observed move, typed or not, and the host records it
     /// in the same spawn count and diagnosis ring the other styles fill.
+    #[inline]
     pub fn take_spawn(&mut self) -> Option<((u16, u16), (u16, u16))> {
         self.spawned.take()
     }
@@ -227,12 +231,14 @@ impl ClassicWake {
     /// Whether the engine remembers a cursor cell, from which its next tick
     /// would spawn a comet on a move.
     #[must_use]
+    #[inline]
     pub fn has_last(&self) -> bool {
         self.last.is_some()
     }
 
     /// Live swept-path samples, for `trail status`'s `sparks=` count.
     #[must_use]
+    #[inline]
     pub fn live_sparks(&self) -> usize {
         self.sparks.len()
     }
@@ -245,6 +251,7 @@ impl ClassicWake {
 
     /// The rows the live sparks span, `(first, last)`, for the host's read
     /// of the frame's text ([`CursorGlow::observe_frame_text`]).
+    #[inline]
     pub(crate) fn row_range(&self) -> Option<(u16, u16)> {
         let mut iter = self.sparks.iter().map(|s| s.row);
         let first = iter.next()?;
@@ -571,6 +578,7 @@ impl ClassicWake {
     /// A spark's coverage now: typing sparks hold full brightness for 55% of
     /// life then cosine-fade, so the chained streak stays lit across the
     /// inter-key gap; jump sparks fade linearly.
+    #[inline]
     fn spark_cov(s: &Spark, now: Instant, cfg: &GlowConfig) -> u8 {
         let age = now.saturating_duration_since(s.born).as_secs_f32();
         let frac = (age / s.life).clamp(0.0, 1.0);
@@ -951,6 +959,7 @@ impl ClassicWake {
     /// its window), `None` when there is no crown: the Glow size knob at 0,
     /// no caret on the grid, or the last move's window over. One window for
     /// every face and ground.
+    #[inline]
     fn crown_fade(
         &self,
         now: Instant,
@@ -1122,6 +1131,7 @@ impl ClassicWake {
 
     /// The ring's age fraction and coverage now, `None` when there is none or
     /// it has faded out.
+    #[inline]
     fn ring_now(&self, now: Instant, cfg: &GlowConfig) -> Option<(Ring, f32, u8)> {
         let ring = self.ring?;
         let age = now.saturating_duration_since(ring.born).as_secs_f32();
@@ -1179,6 +1189,7 @@ impl ClassicWake {
 
     /// The comet colour at path position `pos` (0 tail .. 1 head) in this
     /// config's face ([`comet_color`]).
+    #[inline]
     fn comet_color(&self, cfg: &GlowConfig, pos: f32) -> u32 {
         comet_color(cfg.classic_mono, cfg.color, cfg.accent, self.hue, pos)
     }

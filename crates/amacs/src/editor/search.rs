@@ -32,6 +32,26 @@ impl EditorWorkspace {
         Ok(show_match(view, &query, found, origin))
     }
 
+    /// Keep a selected match only while its current bytes still match the
+    /// query. Another view may have edited them since the query last ran.
+    pub(super) fn accept_search_match(
+        &self,
+        store: &DocumentStore,
+        view: &mut EditorBufferView,
+        query: &str,
+        origin: usize,
+    ) -> Result<bool, EditorError> {
+        let snapshot = snapshot_for_view(store, view)?;
+        if snapshot.text.get(view.primary_selection().range()) == Some(query) {
+            return Ok(true);
+        }
+        let origin = clamp_to_char_boundary(&snapshot.text, origin.min(snapshot.text.len()));
+        let found = search_match(&snapshot.text, query, origin, true, false);
+        let matched = found.is_some();
+        select_match(view, found, origin);
+        Ok(matched)
+    }
+
     pub(super) fn navigate_search(
         &self,
         store: &DocumentStore,
@@ -100,6 +120,20 @@ fn show_match(
     found: Option<Range<usize>>,
     origin: usize,
 ) -> Vec<EditorEffect> {
+    let matched = found.is_some();
+    select_match(view, found, origin);
+    if matched {
+        if query.is_empty() {
+            vec![EditorEffect::Status(String::new())]
+        } else {
+            vec![EditorEffect::Status(format!("I-search: {query}"))]
+        }
+    } else {
+        vec![EditorEffect::Status(format!("Failing I-search: {query}"))]
+    }
+}
+
+fn select_match(view: &mut EditorBufferView, found: Option<Range<usize>>, origin: usize) {
     view.mark_active = false;
     view.primary = 0;
     if let Some(range) = found {
@@ -107,14 +141,8 @@ fn show_match(
             anchor: range.start,
             head: range.end,
         }];
-        if query.is_empty() {
-            Vec::new()
-        } else {
-            vec![EditorEffect::Status(format!("I-search: {query}"))]
-        }
     } else {
         view.selections = vec![Selection::caret(origin)];
-        vec![EditorEffect::Status(format!("Failing I-search: {query}"))]
     }
 }
 
@@ -208,6 +236,142 @@ mod tests {
             view.primary_selection(),
             &Selection::caret("needle α".len())
         );
+    }
+
+    #[test]
+    fn clearing_successful_and_failed_search_queries_clears_status_and_restores_origin() {
+        for query in ["needle", "missing"] {
+            let (mut store, mut workspace, mut view, document) = editor("α🦀 needle tail");
+            let original = store.snapshot(document).unwrap();
+            let origin = "α".len();
+            view.selections = vec![Selection::caret(origin)];
+            workspace
+                .execute(&mut store, &mut view, EditorCommand::IncrementalSearch)
+                .unwrap();
+            let effects = workspace.insert_text(&mut store, &mut view, query).unwrap();
+            assert!(matches!(
+                effects.as_slice(),
+                [EditorEffect::Status(message)] if !message.is_empty()
+            ));
+            if query == "needle" {
+                assert_eq!(
+                    original.text.get(view.primary_selection().range()),
+                    Some(query)
+                );
+            } else {
+                assert_eq!(view.primary_selection(), &Selection::caret(origin));
+            }
+
+            for _ in query.chars().skip(1) {
+                workspace.minibuffer_backspace(&store, &mut view).unwrap();
+            }
+            let effects = workspace.minibuffer_backspace(&store, &mut view).unwrap();
+            assert_eq!(effects, [EditorEffect::Status(String::new())]);
+            assert!(matches!(
+                &view.minibuffer,
+                Minibuffer::Search { query, origin: at } if query.is_empty() && *at == origin
+            ));
+            assert_eq!(view.primary_selection(), &Selection::caret(origin));
+            assert!(
+                original
+                    .text
+                    .is_char_boundary(view.primary_selection().head)
+            );
+            let after = store.snapshot(document).unwrap();
+            assert_eq!(after.seq, original.seq);
+            assert_eq!(after.text, original.text);
+        }
+    }
+
+    #[test]
+    fn accepting_search_rechecks_external_edits_and_preserves_a_valid_later_match() {
+        for (name, text, changed, inserted, next, expected_match) in [
+            (
+                "insertion within the selected match",
+                "α needle tail needle",
+                6..6,
+                "🦀",
+                false,
+                Some(0),
+            ),
+            (
+                "removal of the only match",
+                "α needle tail",
+                3..9,
+                "",
+                false,
+                None,
+            ),
+            (
+                "a failed search gains a match",
+                "α hay tail",
+                3..6,
+                "needle",
+                false,
+                Some(0),
+            ),
+            (
+                "the second match remains valid",
+                "α needle β needle γ",
+                0..0,
+                "🙂 ",
+                true,
+                Some(1),
+            ),
+        ] {
+            let (mut store, mut workspace, mut view, document) = editor(text);
+            let mut writer = workspace
+                .attach(&mut store, document, crate::store::DocumentViewId(92))
+                .unwrap();
+            workspace
+                .execute(&mut store, &mut view, EditorCommand::IncrementalSearch)
+                .unwrap();
+            workspace
+                .insert_text(&mut store, &mut view, "needle")
+                .unwrap();
+            if next {
+                workspace
+                    .execute(&mut store, &mut view, EditorCommand::SearchNext)
+                    .unwrap();
+            }
+
+            writer.selections = vec![Selection {
+                anchor: changed.start,
+                head: changed.end,
+            }];
+            workspace
+                .insert_text(&mut store, &mut writer, inserted)
+                .unwrap();
+            let (seq, deltas) = workspace.take_last_commit(document).unwrap();
+            view.observe_external(seq, &deltas);
+            let before_submit = store.snapshot(document).unwrap();
+            let expected = expected_match.map(|index| {
+                let (start, query) = before_submit
+                    .text
+                    .match_indices("needle")
+                    .nth(index)
+                    .unwrap();
+                start..start + query.len()
+            });
+
+            let effects = workspace.submit_minibuffer(&mut store, &mut view).unwrap();
+            assert!(!view.minibuffer_active(), "{name}");
+            assert_eq!(view.last_search_query, "needle", "{name}");
+            if let Some(expected) = expected {
+                assert_eq!(view.primary_selection().range(), expected, "{name}");
+                assert_eq!(effects, [EditorEffect::Status(String::new())], "{name}");
+            } else {
+                assert_eq!(view.primary_selection(), &Selection::caret(0), "{name}");
+                assert_eq!(
+                    effects,
+                    [EditorEffect::Status("Not found".into())],
+                    "{name}"
+                );
+            }
+            let after_submit = store.snapshot(document).unwrap();
+            assert_eq!(after_submit.seq, before_submit.seq, "{name}");
+            assert_eq!(after_submit.text, before_submit.text, "{name}");
+        }
     }
 
     #[test]

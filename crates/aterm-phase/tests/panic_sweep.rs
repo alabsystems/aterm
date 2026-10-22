@@ -134,6 +134,11 @@ fn read_all(w: &[String]) {
         .get(aterm_phase::busy_zone_start(w)..)
         .expect("the live zone starts on the screen");
     let _ = aterm_phase::transcript_end(w);
+    // The agents panel's row reader, which the footer's locator runs on every
+    // row under the rule.
+    for row in w {
+        let _ = aterm_phase::agents_panel::parse_row(row, aterm_phase::agents_panel::one_cell);
+    }
     let _ = aterm_phase::phase::composer_draft(w);
     let _ = aterm_phase::phase::composer_rules(w);
     let _ = aterm_phase::phase::composer_index(w);
@@ -150,9 +155,15 @@ fn read_all(w: &[String]) {
         // …and holds it on the next frame by its words: on these rows, on
         // the rows above it, and on these rows one row down the screen.
         if let Some(words) = aterm_phase::launch_card_words(w, &place) {
-            for rows in [w, &w[..place.top], w.get(1..).unwrap_or_default()] {
+            let past_top = w.get(place.top + 1..).unwrap_or_default();
+            for rows in [w, &w[..place.top], w.get(1..).unwrap_or_default(), past_top] {
                 let scan = aterm_phase::launch_card_scan(rows);
-                let _ = aterm_phase::launch_card_held(rows, scan, &place, words);
+                let _ = aterm_phase::launch_card_held(rows, scan, &place, words.as_slice());
+                if let Some(cut) =
+                    aterm_phase::launch_card_scrolled(rows, scan, &place, words.as_slice())
+                {
+                    let _ = aterm_phase::launch_card_scrolled_unmoved(rows, &cut, &[0, usize::MAX]);
+                }
             }
         }
         let far = aterm_phase::CardPlace {

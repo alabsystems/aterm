@@ -2049,6 +2049,16 @@ impl App {
     }
 
     /// [`Self::pixel_to_cell`] against geometry the caller already derived.
+    ///
+    /// The cell is the GRID's: where the glass shows a row's cells somewhere
+    /// else than the grid holds them — Claude's mode pill relabelled `YOLO
+    /// on` and the row's items packed left behind it
+    /// (`crate::claude_footer::GlassColumns`) — the glass column under the
+    /// pointer is mapped back to the grid column whose cell it shows. Every
+    /// reader of the pointer's cell takes it from here (PTY mouse reports,
+    /// the hyperlink and path hovers, a selection's anchor, click-to-focus),
+    /// so they all land where the person sees the text. Identity on every
+    /// row nothing relabelled.
     fn pixel_to_cell_with(
         &self,
         wid: WindowId,
@@ -2062,7 +2072,7 @@ impl App {
             .get(&wid)
             .map_or((0, 0), |ws| (ws.rows, ws.cols));
         let (x, y) = self.window_to_frame_with(wid, geom, x, y);
-        pixel_to_term_cell(
+        let (row, col) = pixel_to_term_cell(
             x,
             y,
             cw,
@@ -2073,7 +2083,12 @@ impl App {
             geom.pad,
             geom.pad_top,
             geom.head,
-        )
+        );
+        let col = self
+            .windows
+            .get(&wid)
+            .map_or(col, |ws| ws.claude_footer_undo.grid_col(row, col));
+        (row, col)
     }
 
     /// Refresh the remembered cells under the pointer: the raw window cell (click-to-focus
@@ -3600,6 +3615,12 @@ impl App {
         {
             return Resolved(None);
         }
+        // So does the Autopilot menu, and a fact's menu with it
+        // (`crate::autopilot_menu`): its motion arm owns the pointer, and a
+        // chip or fact hidden under the card is not what a press would hit.
+        if self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid) {
+            return Resolved(None);
+        }
         // A native view owns its cursor through the motion path's native branch (I-beam over
         // text bodies, hand over controls); a modifier tap must not stomp it.
         if self.active_native_view(wid).is_some() {
@@ -3625,10 +3646,12 @@ impl App {
             self.set_hover_cursor(wid, CursorIcon::Default, false, false);
             return Resolved(None);
         }
-        // A Claude Code chip: a press acts on it (`crate::claude_lights`) — a
-        // hand; the blank between two is theirs too, where a press does
-        // nothing — the arrow, as the motion path has it.
-        match crate::claude_lights::OverChips::of(self.claude_chips_at(wid, px, py)) {
+        // A Claude Code chip, the top rule's switch or a fact of the bottom
+        // rule: a press acts on it (`crate::claude_lights`) — a hand; the
+        // blank between two chips is theirs too, where a press does nothing
+        // — the arrow, as the motion path has it.
+        match crate::claude_lights::OverChips::of_glass(self.claude_glass_at(wid, px, py).as_ref())
+        {
             crate::claude_lights::OverChips::Chip => {
                 self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
                 return Resolved(None);
@@ -3638,6 +3661,29 @@ impl App {
                 return Resolved(None);
             }
             crate::claude_lights::OverChips::No => {}
+        }
+        // The harness banner over Claude Code's update notice
+        // (`crate::claude_card`): the hand only where a link-modifier press
+        // opens its link; elsewhere on what it hid, what the grid beneath
+        // would show — the arrow under mouse tracking, else the I-beam — and
+        // never the hidden text's link or its caption.
+        if let Some((session, url)) = self.claude_notice_at(wid, px, py) {
+            let held = self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| link_modifier_held(ws.mods));
+            let tracking = self
+                .pool
+                .get(session)
+                .is_some_and(|owner| owner.ctx.modes.mouse_tracking_enabled());
+            if url.is_some() && held {
+                self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
+            } else if tracking {
+                self.set_hover_cursor(wid, CursorIcon::Default, false, false);
+            } else {
+                self.set_hover_cursor(wid, CursorIcon::Text, false, true);
+            }
+            return Resolved(None);
         }
         // The message band: a hand where a press acts (a capsule, a row body, the overflow
         // link), the plain pointer elsewhere (the presence row). Never an I-beam: the band is
@@ -4240,10 +4286,10 @@ impl App {
             self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
             return;
         }
-        // A Claude Code chip (`crate::claude_lights`) owns the motion over it and over the
-        // blank between two: no grid hover, selection drag or PTY motion report beneath
-        // either. Over a chip, where a press acts, a hand and its title on the row; over the
-        // blank, where a press does nothing, the arrow.
+        // A Claude Code chip, the switch or a fact (`crate::claude_lights`) owns the motion
+        // over it, and the chips the blank between two: no grid hover, selection drag or PTY
+        // motion report beneath either. Over a target, where a press acts, a hand and its
+        // title on the row; over the blank, where a press does nothing, the arrow.
         match over_claude_chips {
             crate::claude_lights::OverChips::Chip => {
                 self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
@@ -4964,6 +5010,12 @@ impl App {
         if self.chrome_owns_terminal_row(wid, window_row) {
             return None;
         }
+        // The harness banner over Claude Code's update notice: its link on the
+        // banner's words, none on what it hid — never the hidden text's.
+        let (px, py) = ws.last_cursor_px;
+        if let Some((_, url)) = self.claude_notice_at(wid, px, py) {
+            return url.map(|url| (url.to_owned(), false));
+        }
         let term = term_lock(&ws.front_terminal()?.term);
         // Viewport rows for both probes: `render_row` resolves through `display_offset`, so
         // a screen-keyed OSC 8 lookup would name a scrolled-back row's neighbour while the
@@ -4992,6 +5044,11 @@ impl App {
         let (row, col) = ws.last_mouse_cell;
         let window_row = usize::from(ws.last_mouse_window_cell.0);
         if self.chrome_owns_terminal_row(wid, window_row) {
+            return None;
+        }
+        // The harness banner hides the update notice's text: no citation in it.
+        let (px, py) = ws.last_cursor_px;
+        if self.claude_notice_at(wid, px, py).is_some() {
             return None;
         }
         let front = ws.front_terminal()?;
@@ -5448,6 +5505,11 @@ impl App {
             }
             return;
         }
+        // …and the double-click's second press on the card a choice just
+        // closed is spent there too (`App::spends_menu_follow_up`).
+        if pressed && self.spends_menu_follow_up(wid) {
+            return;
+        }
         if self
             .windows
             .get(&wid)
@@ -5860,16 +5922,21 @@ impl App {
                 return;
             }
         }
-        // Every other button on the chips' glass, a chip or the blank between two, is theirs
-        // too and does nothing: never the X11 PRIMARY paste, the right-click copy/paste or the
-        // mouse report below, which would hand the pane a press on a cell it does not show.
-        // Only the press is swallowed; the orphan guard drops its release.
+        // Every other button on the harness's glass — a chip or the blank between two, the
+        // switch, a fact — is theirs too and does nothing: never the X11 PRIMARY paste, the
+        // right-click copy/paste or the mouse report below, which would hand the pane a press
+        // on a cell it does not show. Only the press is swallowed; the orphan guard drops its
+        // release.
         if pressed && button != WinitMouseButton::Left {
             let (px, py) = self
                 .windows
                 .get(&wid)
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-            if self.claude_chips_at(wid, px, py).is_some() {
+            // A top line's lockup is decoration: its press is the pane's.
+            if self
+                .claude_glass_at(wid, px, py)
+                .is_some_and(|(_, at)| at != crate::claude_lights::GlassAt::Mark)
+            {
                 // A right press that finds the band's window-menu latch armed means its
                 // release was lost (the Windows right-press handling below): this press
                 // decides afresh, to do nothing, so its own release must not open the menu.
@@ -5880,10 +5947,11 @@ impl App {
                     ws.band_menu_release_pending = false;
                 }
                 // A right press on the Autopilot chip opens its menu
-                // (`crate::autopilot_menu`, design §9.3.3); on any other chip
-                // or the blank between two it does nothing, as before.
-                if button == WinitMouseButton::Right {
-                    self.open_autopilot_menu_at(wid, px, py);
+                // (`crate::autopilot_menu`, design §9.3.3), and one on a fact
+                // that fact's (`crate::fact_menu`); on any other chip, the
+                // switch or the blank between two it does nothing, as before.
+                if button == WinitMouseButton::Right && !self.open_autopilot_menu_at(wid, px, py) {
+                    self.open_fact_menu_at(wid, px, py);
                 }
                 return;
             }
@@ -6792,17 +6860,20 @@ impl App {
 /// `xdg-open`, Windows `ShellExecuteW`. Shared by the terminal's Cmd-click link open and
 /// the About dialog's site link; callers gate through `is_safe_url` first. Best-effort: a
 /// failed spawn is a silent no-op. The opener is not waited for: dropping its `spawnfd`
-/// child hands it to the reaper, so it never stays a zombie of the window.
+/// child hands it to the reaper, so it never stays a zombie of the window. A test
+/// build opens nothing: it notes the URL (`platform::take_opened_urls`).
 pub(crate) fn open_url_external(url: &str) {
-    #[cfg(target_os = "macos")]
+    #[cfg(test)]
+    crate::platform::record_opened_url(url);
+    #[cfg(all(not(test), target_os = "macos"))]
     drop(
         aterm_uds::spawnfd::command("/usr/bin/open")
             .arg(url)
             .spawn(),
     );
-    #[cfg(target_os = "linux")]
+    #[cfg(all(not(test), target_os = "linux"))]
     drop(aterm_uds::spawnfd::command("xdg-open").arg(url).spawn());
-    #[cfg(windows)]
+    #[cfg(all(not(test), windows))]
     open_url_windows(url);
 }
 
@@ -6811,7 +6882,7 @@ pub(crate) fn open_url_external(url: &str) {
 /// parsing (`&`, `^`, …) would reopen the injection hole `is_safe_url` closes. shell32 is
 /// on the approved tiny-FFI list for this use (nothing in kernel32 or std opens a URL by
 /// its registered handler). Failure (return <= 32) is a silent no-op, like `xdg-open`.
-#[cfg(windows)]
+#[cfg(all(not(test), windows))]
 fn open_url_windows(url: &str) {
     #[link(name = "shell32")]
     unsafe extern "system" {

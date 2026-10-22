@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · `/effort workspace on` sent as keystrokes while the vim composer was in NORMAL, fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1): the keys run as vim motions until `o` opens a line and enters INSERT, leaving an empty `❯` line and `  rt workspace on` under it, the terminal cursor on the second line, `-- INSERT --` back on the mode row; the stand-in `workspace` replaces the vendor's top effort key throughout
+
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.JhpC/proj
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+  rt workspace on
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)

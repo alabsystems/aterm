@@ -1159,19 +1159,25 @@ impl crate::App {
                 .is_some(),
             AuxTarget::Menu => self.front().is_some_and(|ws| ws.palette().is_some()),
             AuxTarget::TabMenu => self.front().is_some_and(|ws| ws.tab_menu.is_some()),
-            AuxTarget::AutopilotMenu => self
-                .autopilot_menu
-                .as_ref()
-                .is_some_and(|m| Some(m.wid) == self.frontmost_window),
+            AuxTarget::AutopilotMenu | AuxTarget::FactMenu => {
+                self.autopilot_menu.as_ref().is_some_and(|m| {
+                    Some(m.wid) == self.frontmost_window
+                        && (m.owner == crate::autopilot_menu::MenuOwner::Autopilot)
+                            == (target == AuxTarget::AutopilotMenu)
+                })
+            }
             AuxTarget::Overview => self.front().is_some_and(|ws| ws.overview().is_some()),
         };
         if shown {
             return None;
         }
         let name = target.keyword();
-        Some(format!(
-            "{name} is not open in the front window; use `open {name}` first"
-        ))
+        Some(match target {
+            AuxTarget::FactMenu => {
+                format!("{name} is not open in the front window; use `open {name} <fact>` first")
+            }
+            _ => format!("{name} is not open in the front window; use `open {name}` first"),
+        })
     }
 }
 
@@ -1241,6 +1247,42 @@ mod window_target_refusal_tests {
             Ok(AuxTarget::Prefs),
             "an alias resolves"
         );
+    }
+
+    /// `open fact-menu` NAMES ITS FACT: each fact opens its menu (the usage its
+    /// Traffic card), `close` closes it, and the bare target and any other
+    /// word are refused with the usage that names the facts.
+    /// Any other target's words are not this parser's (`None`).
+    #[test]
+    fn open_fact_menu_names_its_fact() {
+        use crate::claude_lights::Fact;
+        for (words, fact) in [
+            ("fact-menu model", Fact::Model),
+            ("fact-menu effort", Fact::Effort),
+            ("FACT-MENU path", Fact::Path),
+            ("fact-menu  branch", Fact::Branch),
+            ("fact-menu usage", Fact::Usage),
+        ] {
+            assert_eq!(
+                super::fact_menu_operand(words),
+                Some(Ok(Some(fact))),
+                "{words}"
+            );
+        }
+        assert_eq!(super::fact_menu_operand("fact-menu close"), Some(Ok(None)));
+        for refused in ["fact-menu", "fact-menu bogus", "fact-menu path x"] {
+            let refusal = super::fact_menu_operand(refused)
+                .expect("the fact menu's words")
+                .expect_err(refused);
+            assert!(
+                refusal.starts_with(
+                    "ERR usage: open fact-menu <model | effort | path | branch | context | usage>"
+                ),
+                "{refused}: {refusal}"
+            );
+        }
+        assert_eq!(super::fact_menu_operand("autopilot-menu"), None);
+        assert_eq!(super::fact_menu_operand("fact-menus"), None);
     }
 
     /// Each overlay, once open on the front window, is photographed — and only
@@ -2293,6 +2335,30 @@ fn open_target(trimmed: &str) -> Result<(crate::app_introspect::AuxTarget, bool)
         .ok_or_else(|| format!("ERR unknown target (use: {OPEN_TARGETS})\n"))
 }
 
+/// `open fact-menu <fact>` and `open fact-menu close`: `None` for any other
+/// target's words; else the fact whose menu opens (`None`: close it), or the
+/// usage refusal naming the facts.
+fn fact_menu_operand(trimmed: &str) -> Option<Result<Option<crate::claude_lights::Fact>, String>> {
+    use crate::claude_lights::Fact;
+    let mut words = trimmed.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("fact-menu") {
+        return None;
+    }
+    let operand = words.next().map(str::to_ascii_lowercase);
+    let usage = || {
+        "ERR usage: open fact-menu <model | effort | path | branch | context | usage> | open fact-menu close\n"
+            .to_string()
+    };
+    if words.next().is_some() {
+        return Some(Err(usage()));
+    }
+    Some(match operand.as_deref() {
+        Some("close") => Ok(None),
+        Some(word) => Fact::parse(word).map(Some).ok_or_else(usage),
+        None => Err(usage()),
+    })
+}
+
 /// `open <target> [close]` -> open or close a compatibility GUI target. `prefs`,
 /// `about`, and `update` resolve to routes in the native Settings tab; `menu` is a
 /// transient palette.
@@ -2315,6 +2381,22 @@ pub(crate) fn cmd_open(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
             Ok(Ok(message)) => format!("OK {message}\n"),
             Ok(Err(error)) => format!("ERR {error}\n"),
             Err(error) => format!("ERR {error}\n"),
+        };
+    }
+    // A fact's menu names its fact (`open fact-menu path`), which no other
+    // target takes: its own wake, the fact carried.
+    if let Some(operand) = fact_menu_operand(trimmed) {
+        let fact = match operand {
+            Ok(fact) => fact,
+            Err(refusal) => return refusal,
+        };
+        return match call_main(proxy, |reply| Wake::OpenFactMenu { fact, reply }) {
+            Ok(Ok(())) => format!(
+                "OK {} fact-menu\n",
+                if fact.is_none() { "closed" } else { "opened" }
+            ),
+            Ok(Err(msg)) => format!("ERR {msg}\n"),
+            Err(e) => format!("ERR {e}\n"),
         };
     }
     let (target, close) = match open_target(trimmed) {
@@ -4233,18 +4315,19 @@ impl crate::App {
         }
     }
 
-    /// The newborn `sid` is a worker: its folder trusted for it alone (the
-    /// window harness's folder-trust rule reads `meta`'s `trusted_cwd=`), its
-    /// own Autopilot word written (`land` unless the spawn said `cruise`:
-    /// FOREVER LAND, a worker's one wake at the end is its landing), and its
-    /// task record `working` with its `from=` — on the main thread, so
-    /// with no wait on a Commit's fence (`task_record::mark_session_task_within`)
-    /// — before the reply; what its launcher needs is returned
+    /// The newborn `sid` is a worker: its own Autopilot word written (`land`
+    /// unless the spawn said `cruise`: FOREVER LAND, a worker's one wake at
+    /// the end is its landing), and its task record `working` with its
+    /// `from=` — on the main thread, so with no wait on a Commit's fence
+    /// (`task_record::mark_session_task_within`) — before the reply; what
+    /// its launcher needs is returned
     /// ([`crate::task_launch::launch_worker`]). The line carries the starter's
     /// agent homes and login from the starter when it is hosted here. The
     /// agent it starts is named on its task record, for the startup deadline's reader
     /// (`harness_host::startup_seen`) and the window harness (`meta`'s
-    /// `worker=`), and a seamless update carries it with the record.
+    /// `worker=`), and so is its folder, trusted for it alone (the window
+    /// harness's folder-trust rule reads `meta`'s `trusted_cwd=`): a seamless
+    /// update carries both with the record.
     fn start_worker(
         &self,
         sid: &str,
@@ -4263,14 +4346,8 @@ impl crate::App {
         let Some((local, term, ctx)) = newborn else {
             return Err("the worker did not register".to_string());
         };
-        ctx.meta
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .trusted_cwd
-            .clone_from(&worker.order.trusted_cwd);
-        // The newborn's word, beside its trusted folder and before its agent
-        // runs: its loop's first read is the worker's own Autopilot. aterm's
-        // write, not a person's.
+        // The newborn's word, before its agent runs: its loop's first read
+        // is the worker's own Autopilot. aterm's write, not a person's.
         crate::session_timeline::apply_autopilot(
             &ctx,
             Some(worker.order.autopilot.word().to_string()),
@@ -4285,7 +4362,7 @@ impl crate::App {
         ctx.timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .set_task_agent(worker.order.agent);
+            .set_task_worker(worker.order.agent, worker.order.trusted_cwd.clone());
         let human = ctx.human_input.seq();
         Ok(crate::task_launch::Launch {
             local,

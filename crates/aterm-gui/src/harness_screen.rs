@@ -2057,8 +2057,8 @@ pub(crate) const HARNESS_LAND: &str = "harness/land";
 /// WHERE SETTINGS ▸ HARNESS LANDS as it opens
 /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §10.3.3, item 8): its top
 /// (View ▸ Coding Agent Harness…, the palette), a session's row (the
-/// Autopilot menu's `Harness settings…`), or SUPERVISION (an `⊘
-/// off` chip: the switch that turned it off is there).
+/// Autopilot menu's `Harness settings…`), or SUPERVISION (an `⊘ off` chip:
+/// the switch that turned it off is there).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum HarnessFocus {
     /// The page's top.

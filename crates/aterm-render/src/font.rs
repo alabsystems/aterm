@@ -206,8 +206,9 @@ pub struct LineMetrics {
 impl LineMetrics {
     /// Build from raw `hhea`/`OS/2` design units, computing `new_line_size` in
     /// `i32` first so a tall face cannot overflow `i16`.
-    fn new(ascent: i16, descent: i16, line_gap: i16) -> Self {
-        let (a, d, g) = (i32::from(ascent), i32::from(descent), i32::from(line_gap));
+    #[inline]
+    const fn new(ascent: i16, descent: i16, line_gap: i16) -> Self {
+        let (a, d, g) = (ascent as i32, descent as i32, line_gap as i32);
         Self {
             ascent: a as f32,
             descent: d as f32,
@@ -217,7 +218,8 @@ impl LineMetrics {
     }
 
     /// Scale design units to pixels.
-    fn scale(&self, scale: f32) -> Self {
+    #[inline]
+    const fn scale(&self, scale: f32) -> Self {
         Self {
             ascent: self.ascent * scale,
             descent: self.descent * scale,
@@ -260,6 +262,7 @@ pub(crate) enum WeakFaceBytes {
 }
 
 impl WeakFaceBytes {
+    #[inline]
     pub(crate) fn upgrade(&self) -> Option<FaceBytes> {
         match self {
             Self::Slice(bytes) => bytes.upgrade().map(FaceBytes::Slice),
@@ -269,6 +272,7 @@ impl WeakFaceBytes {
         }
     }
 
+    #[inline]
     pub(crate) fn is_live(&self) -> bool {
         match self {
             Self::Slice(bytes) => bytes.strong_count() != 0,
@@ -280,6 +284,7 @@ impl WeakFaceBytes {
 }
 
 impl FaceBytes {
+    #[inline]
     pub(crate) fn downgrade(&self) -> WeakFaceBytes {
         match self {
             Self::Slice(bytes) => WeakFaceBytes::Slice(Arc::downgrade(bytes)),
@@ -291,6 +296,7 @@ impl FaceBytes {
 
     /// Whether both handles are the same allocation or mapping: the O(1) identity the
     /// pointer-keyed caches rely on.
+    #[inline]
     #[must_use]
     pub fn ptr_eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -306,6 +312,7 @@ impl FaceBytes {
 
     /// Whether both handles hold the same bytes, answered by identity where it can (the
     /// same handle, or two mappings of one inode) and by comparison only otherwise.
+    #[inline]
     #[must_use]
     pub fn same_bytes(&self, other: &Self) -> bool {
         if self.ptr_eq(other) {
@@ -320,16 +327,18 @@ impl FaceBytes {
     }
 
     /// Whether the bytes are a file mapping (file-backed, evictable, shared). Diagnostics.
+    #[inline]
     #[must_use]
-    pub fn is_mapped(&self) -> bool {
+    pub const fn is_mapped(&self) -> bool {
         matches!(self, FaceBytes::Mapped(_))
     }
 
     /// Whether the bytes are anonymous heap this process owns, as opposed to file-backed
     /// pages (a mapping, or a face compiled into the executable). Diagnostics: the seal's
     /// residency split (`AdmittedFontSources::discovered_residency`).
+    #[inline]
     #[must_use]
-    pub fn is_heap(&self) -> bool {
+    pub const fn is_heap(&self) -> bool {
         matches!(self, FaceBytes::Slice(_) | FaceBytes::Vec(_))
     }
 }
@@ -430,6 +439,7 @@ impl core::fmt::Debug for Font {
 
 impl Font {
     /// The face's source bytes, through which a weak parsed-face index recovers its key.
+    #[inline]
     pub(crate) fn source_bytes(&self) -> &FaceBytes {
         &self.data
     }
@@ -601,6 +611,7 @@ impl Font {
     }
 
     /// Line metrics scaled to `px`; `None` only when the face declares none.
+    #[inline]
     #[must_use]
     pub fn horizontal_line_metrics(&self, px: f32) -> Option<LineMetrics> {
         Some(self.line_metrics?.scale(self.scale_factor(px)))
@@ -672,6 +683,7 @@ impl Font {
     /// [`Font::rasterize`] by glyph id. An out-of-range id or a NaN or non-positive `px`
     /// returns an empty mask with default metrics; a glyph with no outline returns an empty
     /// mask with its real advance.
+    #[inline]
     #[must_use]
     pub fn rasterize_indexed(&self, gid: u16, px: f32) -> (Metrics, Vec<u8>) {
         self.rasterize_indexed_at(gid, px, 0.0)

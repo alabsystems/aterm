@@ -70,7 +70,7 @@ const WEB_SHIFTED_SYMBOLS: &str = "~!@#$%^&*()_+{}|:\"<>?";
 /// every other printable.
 #[inline]
 #[must_use]
-pub fn web_typed_class(ch: char) -> TypedClass {
+pub const fn web_typed_class(ch: char) -> TypedClass {
     match ch {
         ' ' => TypedClass::Space,
         '!' => TypedClass::Bang,
@@ -104,7 +104,7 @@ const PAGE_SETTLE_FRAME: Duration = Duration::from_micros(16_667);
 /// wake's palette. Masked to `0x00RRGGBB`.
 #[inline]
 #[must_use]
-fn pet_contrast_cursor(input_cursor_color: u32, term_cursor_color: u32) -> u32 {
+const fn pet_contrast_cursor(input_cursor_color: u32, term_cursor_color: u32) -> u32 {
     if input_cursor_color == aterm_core::render::COLOR_UNSET {
         term_cursor_color & 0x00FF_FFFF
     } else {
@@ -183,6 +183,16 @@ fn content_scroll_decision(
     ContentScrollState::delta_since(previous, current)
 }
 
+/// What a page's [`EffectsPipeline::set_cursor_glow`] asked for, but its
+/// trail colour: the knobs, the style spelling and the theme cursor the
+/// config resolves against.
+#[derive(Clone, Copy, Debug)]
+struct GlowRequest {
+    knobs: crate::cursor_fx::GlowKnobs,
+    spelling: crate::cursor_fx::GlowSpelling,
+    theme_cursor: u32,
+}
+
 /// Owns the effect engines + scratch and applies them to a frame snapshot.
 pub struct EffectsPipeline {
     /// Host-advanced monotonic offset from `t0` (the injected clock).
@@ -211,12 +221,16 @@ pub struct EffectsPipeline {
     /// shared with the native window.
     cursor: CursorFx,
     glow_cfg: GlowConfig,
-    /// `true` when the host left glow color unset, so the wake follows the
-    /// frame's live OSC 12 / OSC 112 cursor instead of a pinned color.
-    glow_color_from_cursor: bool,
-    /// The accent follows the live cursor only when both color and accent were
-    /// left automatic; an explicit accent always stays fixed.
-    glow_accent_from_cursor: bool,
+    /// The page's trail colour setting ([`crate::cursor_fx::TrailColor`], the
+    /// native `cursor_trail_color`), which the frame's colour step
+    /// ([`crate::cursor_fx::follow_live_cursor`]) resolves against the live
+    /// cursor (OSC 12 / OSC 112) as a native window does.
+    glow_trail_color: crate::cursor_fx::TrailColor,
+    /// The page set an accent of its own: it stays fixed.
+    glow_explicit_accent: bool,
+    /// The page's last [`Self::set_cursor_glow`], which a colour change
+    /// ([`Self::set_cursor_glow_color`]) resolves again.
+    glow_request: Option<GlowRequest>,
     trail_cfg: TrailConfig,
     /// Serious Mode's cursor-body gate: no block-cursor body or momentum halo
     /// claims the caret while it holds.
@@ -226,9 +240,10 @@ pub struct EffectsPipeline {
     /// terminal's own cursor colour painted the caret.
     #[cfg(test)]
     block_fill: Option<crate::cursor_glow::BlockFill>,
-    /// Automatic opaque-comet color provenance, retained across frames so
-    /// OSC 12 / OSC 112 and live theme changes can recolor an existing trail.
-    trail_color_from_cursor: bool,
+    /// The opaque comet's own colour, where `set_cursor_trail` gave one; else
+    /// the comet wears the colour the glow draws, as a native comet body
+    /// does ([`crate::cursor_fx::follow_live_cursor`]).
+    trail_body_color: Option<u32>,
     /// Keystrokes noted since the last [`Self::advance`], replayed evenly
     /// across its `dt`: web hosts batch key events between rAF callbacks, and
     /// one shared instant would read as infinite typing speed. Capped past the
@@ -346,6 +361,7 @@ pub struct EffectsPipeline {
 }
 
 impl Default for EffectsPipeline {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -388,8 +404,9 @@ impl EffectsPipeline {
                 beam: true,
                 head_dx: 0.5,
             },
-            glow_color_from_cursor: true,
-            glow_accent_from_cursor: true,
+            glow_trail_color: crate::cursor_fx::TrailColor::Automatic,
+            glow_explicit_accent: false,
+            glow_request: None,
             trail_cfg: TrailConfig {
                 enabled: false,
                 duration: Duration::from_millis(260),
@@ -398,7 +415,7 @@ impl EffectsPipeline {
                 intensity: 0.0,
                 warmth: 0.0,
             },
-            trail_color_from_cursor: true,
+            trail_body_color: None,
             serious: false,
             #[cfg(test)]
             block_fill: None,
@@ -447,7 +464,8 @@ impl EffectsPipeline {
     /// Set the embedder's window chrome (per-edge `pad` + top-only `head`, px)
     /// so effect emissions are window-absolute within the padded frame. `0/0`
     /// restores the identity layout.
-    pub fn set_chrome(&mut self, pad: u16, head: u16) {
+    #[inline]
+    pub const fn set_chrome(&mut self, pad: u16, head: u16) {
         self.chrome_pad = pad;
         self.chrome_head = head;
     }
@@ -457,18 +475,30 @@ impl EffectsPipeline {
     /// it is drawn. Call before every `apply`; the pet's hit rect is taken in
     /// that frame's space. Emissions do not move (the compose translates them)
     /// and nothing is retired. `0` (the default) means nothing is prepended.
-    pub fn set_host_rows_px(&mut self, px: u16) {
+    #[inline]
+    pub const fn set_host_rows_px(&mut self, px: u16) {
         self.host_rows_px = px;
     }
 
     /// Window-space geometry for a `rows`×`cols` grid of `cell_w`×`cell_h`
     /// cells under the configured chrome: origin `(pad, pad + head)`, frame
     /// `(grid + 2·pad, grid + 2·pad + head)`.
-    fn chrome_geom(&self, rows: usize, cols: usize, cell_w: usize, cell_h: usize) -> Geom {
+    #[inline]
+    const fn chrome_geom(&self, rows: usize, cols: usize, cell_w: usize, cell_h: usize) -> Geom {
         let pad = self.chrome_pad;
         let head = self.chrome_head;
-        let grid_w = u16::try_from(cols * cell_w).unwrap_or(u16::MAX);
-        let grid_h = u16::try_from(rows * cell_h).unwrap_or(u16::MAX);
+        let w = cols.saturating_mul(cell_w);
+        let h = rows.saturating_mul(cell_h);
+        let grid_w = if w > u16::MAX as usize {
+            u16::MAX
+        } else {
+            w as u16
+        };
+        let grid_h = if h > u16::MAX as usize {
+            u16::MAX
+        } else {
+            h as u16
+        };
         Geom {
             cw: cell_w,
             ch: cell_h,
@@ -487,6 +517,7 @@ impl EffectsPipeline {
     /// Advance the injected clock by `dt_ms` (host rAF delta), replaying the
     /// keystrokes noted since the last step and feeding rain its whole elapsed
     /// milliseconds. Negative/NaN deltas are ignored.
+    #[inline]
     pub fn advance(&mut self, dt_ms: f64) {
         if !(dt_ms.is_finite() && dt_ms > 0.0) {
             return;
@@ -541,6 +572,7 @@ impl EffectsPipeline {
     /// A settling caret body (the rainbow caret's colour release, the momentum
     /// glow's cool-down) counts: it still owes steps, paced by
     /// [`Self::next_deadline_ms`].
+    #[inline]
     #[must_use]
     pub fn is_active(&self) -> bool {
         let now = self.now();
@@ -564,6 +596,7 @@ impl EffectsPipeline {
     ///
     /// `&mut` because the rainbow caret's step is a memoised dry run of its
     /// tick ([`CursorFx::bodies_next_change_deadline`]).
+    #[inline]
     #[must_use]
     pub fn next_deadline_ms(&mut self) -> Option<f64> {
         let now = self.now();
@@ -643,6 +676,7 @@ impl EffectsPipeline {
     /// Focus gate: an unfocused embedder fires no cat idle one-shots. Rain maps
     /// it onto its drain ladder (focused = full, unfocused = calm cap + drain);
     /// hidden arrives via [`Self::set_effects_visibility`].
+    #[inline]
     pub fn set_focused(&mut self, focused: bool) {
         self.set_rain_visibility(if focused {
             RainVisibility::Focused
@@ -654,6 +688,7 @@ impl EffectsPipeline {
     /// Tri-state pane visibility: `"focused"` (full profile),
     /// `"visible_unfocused"` (calm cap + drain), `"hidden"` (hard drain even
     /// while the host keeps calling `advance`). Unknown states parse as focused.
+    #[inline]
     pub fn set_effects_visibility(&mut self, state: &str) {
         let v = if state.eq_ignore_ascii_case("hidden") {
             RainVisibility::Hidden
@@ -669,6 +704,7 @@ impl EffectsPipeline {
 
     /// Record the visibility and replay it onto a live engine (a lazily-built
     /// one receives it at construction).
+    #[inline]
     fn set_rain_visibility(&mut self, v: RainVisibility) {
         if v == RainVisibility::Hidden && self.rain_visibility != RainVisibility::Hidden {
             // Hidden is a hard cursor-coordinate boundary: a host may refocus
@@ -695,6 +731,7 @@ impl EffectsPipeline {
     /// any stragglers at the current instant. Also freezes literal rain
     /// material sampling until the host reports `TurnStart` (signal code 10);
     /// occupancy keeps tracking the live grid.
+    #[inline]
     pub fn note_keystroke(&mut self) {
         // Cap far past cadence saturation (heat clamps at knee_hi ≈ 7 gains):
         // bounds the advance-side replay under a paste flood.
@@ -715,6 +752,7 @@ impl EffectsPipeline {
     /// Returns whether the press was priced exactly. A scalar with no exact width (control,
     /// zero-width, or wider than two cells) degrades to [`Self::note_keystroke`] and reports
     /// `false`; both paths license the echo.
+    #[inline]
     #[must_use]
     pub fn note_committed_char(
         &mut self,
@@ -769,6 +807,7 @@ impl EffectsPipeline {
     /// into a running program's composer it keeps the hand on its row),
     /// `paste` the gesture. A page that only calls `note_keystroke` gets
     /// every key treated as a typed glyph.
+    #[inline]
     pub fn note_console_input(&mut self, kind: PetInputKind) {
         let now = self.now();
         self.companion.note_console_input(now, kind);
@@ -804,6 +843,7 @@ impl EffectsPipeline {
 
     /// Visual bell: the rain engine's 2 s amber alert hue-ramp (gated by the
     /// `bell_alert` knob) and the resident pet's startle.
+    #[inline]
     pub fn note_bell(&mut self) {
         if let Some(rain) = self.rain.as_deref_mut() {
             rain.note_bell();
@@ -837,6 +877,7 @@ impl EffectsPipeline {
 
     /// Embedded host observed wheel/PgUp while an alternate-screen TUI is
     /// active: hold the rain still during transcript reading.
+    #[inline]
     pub fn note_matrix_rain_alt_scroll(&mut self) {
         if let Some(rain) = self.rain.as_deref_mut() {
             rain.note_alt_scroll();
@@ -846,6 +887,7 @@ impl EffectsPipeline {
     /// Payload-free observable agent/tool choreography. The host sends only a
     /// stable enum code + bounded weight; literal glyphs still come exclusively
     /// from the protected terminal snapshot.
+    #[inline]
     pub fn note_matrix_rain_signal(&mut self, code: u32, weight: u32) {
         if code == crate::matrix_rain::RainSignal::TurnStart as u32 {
             self.rain_material_editing = false;
@@ -877,11 +919,13 @@ impl EffectsPipeline {
     /// `cursor_trail_style` spelling the native app accepts
     /// ([`crate::cursor_glow::spellings`]: its canonical rows and aliases,
     /// read the same way), where `off` draws nothing and an unknown spelling
-    /// draws lumen; `color = None` uses the
-    /// style default (Laser/Beam/Sparkle/Comet have canonical hues, others
-    /// derive from `theme_cursor`), which `apply` re-resolves each frame
-    /// against the live cursor ([`crate::cursor_fx::automatic_glow_color`]);
-    /// `accent = None` brightens that color 1.5×;
+    /// draws lumen; `color` is the native trail colour setting
+    /// ([`crate::cursor_fx::TrailColor`]): `Automatic` uses the style default
+    /// (Laser/Beam/Sparkle/Comet have canonical hues, others derive from the
+    /// cursor), `Cursor` the cursor's colour on every style, `Pinned` a fixed
+    /// colour; `apply` resolves it each frame against the live cursor through
+    /// the native step ([`crate::cursor_fx::follow_live_cursor`]);
+    /// `accent = None` brightens the colour the style draws 1.5×;
     /// `duration_ms` clamps 30..=2000, `length` 1..=512, `intensity` 0..=1,
     /// `radius` 0..=2.
     #[allow(
@@ -892,7 +936,7 @@ impl EffectsPipeline {
         &mut self,
         enabled: bool,
         style: &str,
-        color: Option<u32>,
+        color: crate::cursor_fx::TrailColor,
         accent: Option<u32>,
         duration_ms: u64,
         length: u32,
@@ -901,10 +945,9 @@ impl EffectsPipeline {
         ring: bool,
         theme_cursor: u32,
     ) {
-        let color_from_cursor = color.is_none();
-        let accent_from_cursor = color_from_cursor && accent.is_none();
-        self.glow_color_from_cursor = color_from_cursor;
-        self.glow_accent_from_cursor = accent_from_cursor;
+        let color = color.masked();
+        self.glow_trail_color = color;
+        self.glow_explicit_accent = accent.is_some();
         // The pet is a spelling of the style: the parsed enum cannot tell
         // `rainbow kitty` (resident) from `rainbow kitty flying`. The species
         // (`rainbow dog pet`) is a spelling too, applied at the owner's next
@@ -916,15 +959,10 @@ impl EffectsPipeline {
             } else {
                 PetSpecies::Cat
             });
-        let spelling = crate::cursor_fx::GlowSpelling::parse(style);
-        // The config rule both hosts use
-        // ([`crate::cursor_fx::resolve_glow_config`]). The ground pair is
-        // carried forward so a reconfigure does not flip a light theme to the
-        // dark default for a frame; `apply` attaches the cursor shape per frame.
-        self.glow_cfg = crate::cursor_fx::resolve_glow_config(
-            crate::cursor_fx::GlowKnobs {
+        self.glow_request = Some(GlowRequest {
+            knobs: crate::cursor_fx::GlowKnobs {
                 enabled,
-                color,
+                color: None,
                 accent,
                 duration_ms,
                 length: length as usize,
@@ -932,8 +970,47 @@ impl EffectsPipeline {
                 radius,
                 ring,
             },
-            spelling,
+            spelling: crate::cursor_fx::GlowSpelling::parse(style),
             theme_cursor,
+        });
+        self.resolve_glow();
+        if !enabled {
+            self.cursor.glow.reset();
+        }
+    }
+
+    /// Set only the glow's trail colour, written as the native
+    /// `cursor_trail_color` is ([`crate::cursor_fx::TrailColor::parse`]: blank
+    /// for each style's own, `cursor` for the cursor's colour on every style,
+    /// or `#RRGGBB`), keeping the rest of [`Self::set_cursor_glow`]'s
+    /// settings. `false`, and nothing changes, for a value that is none of
+    /// those.
+    pub fn set_cursor_glow_color(&mut self, color: &str) -> bool {
+        let Some(color) = crate::cursor_fx::TrailColor::parse(color) else {
+            return false;
+        };
+        self.glow_trail_color = color;
+        self.resolve_glow();
+        true
+    }
+
+    /// The glow's config from the page's last [`Self::set_cursor_glow`] and
+    /// its trail colour, by the config rule both hosts use
+    /// ([`crate::cursor_fx::resolve_glow_config`]). The ground pair is carried
+    /// forward so a reconfigure does not flip a light theme to the dark
+    /// default for a frame; `apply` attaches the cursor shape per frame.
+    #[inline]
+    fn resolve_glow(&mut self) {
+        let Some(request) = self.glow_request else {
+            return;
+        };
+        self.glow_cfg = crate::cursor_fx::resolve_glow_config(
+            crate::cursor_fx::GlowKnobs {
+                color: self.glow_trail_color.knob(request.theme_cursor),
+                ..request.knobs
+            },
+            request.spelling,
+            request.theme_cursor,
             true,
             self.glow_cfg.theme_fg,
             self.glow_cfg.theme_bg,
@@ -942,15 +1019,15 @@ impl EffectsPipeline {
         // A page has no audio host and drops every cue it would drain; the engine's key seam
         // stays open.
         self.glow_cfg.audible = true;
-        if !enabled {
-            self.cursor.glow.reset();
-        }
     }
 
     /// Configure the legacy opaque comet trail (the `cursor_trail` channel).
-    /// `color` `None` = the theme cursor, re-tinted each frame to the live
-    /// cursor (OSC 12 / OSC 112) whatever the glow style. Clamps mirror the
-    /// native accessors.
+    /// `color` `None` = the colour the glow draws, as a native comet body
+    /// wears it (trail, nucleus and crown one hue), resolved each frame by the
+    /// native step ([`crate::cursor_fx::follow_live_cursor`]): Laser's violet,
+    /// Comet's pale blue until the cursor colour is pinned, the live cursor
+    /// (OSC 12 / OSC 112) for a style with no hue of its own. `Some` keeps
+    /// that colour. Clamps mirror the native accessors.
     pub fn set_cursor_trail(
         &mut self,
         enabled: bool,
@@ -959,7 +1036,7 @@ impl EffectsPipeline {
         color: Option<u32>,
         theme_cursor: u32,
     ) {
-        self.trail_color_from_cursor = color.is_none();
+        self.trail_body_color = color.map(|color| color & 0x00FF_FFFF);
         self.trail_cfg = TrailConfig {
             enabled,
             duration: Duration::from_millis(duration_ms.clamp(30, 2000)),
@@ -981,6 +1058,7 @@ impl EffectsPipeline {
     /// stays clockless and dieless. `enabled = false` retires the body, hit
     /// rect and frame lane. Off at construction; resets the look to the launch
     /// rung.
+    #[inline]
     pub fn set_cursor_pet(&mut self, enabled: bool, seed: u64) {
         self.companion.set_enabled_seed(enabled, seed);
     }
@@ -990,6 +1068,7 @@ impl EffectsPipeline {
     /// pet is pinned at its station (drawn, but no chase, gait or arc). Not a
     /// load-shed term. [`Self::set_sparkle_reduced_motion`] and
     /// [`Self::set_matrix_rain_reduced_motion`] alias this setter.
+    #[inline]
     pub fn set_reduced_motion(&mut self, on: bool) {
         self.deco_cfg.reduced_motion = on;
         self.refresh_sparkle_cfg();
@@ -1001,6 +1080,7 @@ impl EffectsPipeline {
     /// The theme or palette authority changed (`set_theme` on the web hosts):
     /// retire the pet's frozen contrast sample so its next appearance
     /// re-samples the glass; behaviour, position and breed handoff continue.
+    #[inline]
     pub fn invalidate_companion_colors(&mut self) {
         self.companion.invalidate_colors();
     }
@@ -1009,11 +1089,13 @@ impl EffectsPipeline {
     /// included, see [`Self::set_host_rows_px`]). Returns `true` iff the stored
     /// pointer changed, so an idle hover costs no render. Non-finite samples
     /// are dropped.
+    #[inline]
     pub fn note_pointer_px(&mut self, x: f32, y: f32) -> bool {
         self.companion.set_pointer(Some((x, y)))
     }
 
     /// The pointer left the surface. Returns `true` iff there was one.
+    #[inline]
     pub fn note_pointer_leave(&mut self) -> bool {
         self.companion.set_pointer(None)
     }
@@ -1022,6 +1104,7 @@ impl EffectsPipeline {
     /// means the press landed on the drawn cat and is consumed (a stroke, never
     /// a selection); [`PressOutcome::Pass`] means the host keeps routing. The
     /// stroke latches and re-arms the frame lane; the next `apply` acts on it.
+    #[inline]
     pub fn press_px(&mut self, x: f32, y: f32) -> PressOutcome {
         self.companion.press(self.now(), (x, y))
     }
@@ -1029,7 +1112,7 @@ impl EffectsPipeline {
     /// The host's pet opt-in as last set.
     #[inline]
     #[must_use]
-    pub fn cursor_pet_enabled(&self) -> bool {
+    pub const fn cursor_pet_enabled(&self) -> bool {
         self.companion.enabled()
     }
 
@@ -1037,29 +1120,29 @@ impl EffectsPipeline {
     /// observability twin of the hit rect.
     #[inline]
     #[must_use]
-    pub fn cursor_pet_alpha(&self) -> u8 {
+    pub const fn cursor_pet_alpha(&self) -> u8 {
         self.companion.alpha()
     }
 
     /// Count of console input intentions, independent of their later echoes.
     #[inline]
     #[must_use]
-    pub fn cursor_pet_console_input_seq(&self) -> u64 {
-        self.companion.console_input_seq()
+    pub const fn cursor_pet_console_input_seq(&self) -> u64 {
+        self.companion.brain().console_input_seq()
     }
 
     /// Last classified console input intention; observing it never ticks.
     #[inline]
     #[must_use]
-    pub fn cursor_pet_console_input_kind(&self) -> Option<PetInputKind> {
-        self.companion.console_input_kind()
+    pub const fn cursor_pet_console_input_kind(&self) -> Option<PetInputKind> {
+        self.companion.brain().console_input_kind()
     }
 
     /// The pet's drawn body this frame in frame px `(x0, x1, y0, y1)`, the space
     /// [`Self::press_px`] reads; `None` when nothing is drawn.
     #[inline]
     #[must_use]
-    pub fn companion_hit_rect(&self) -> Option<(i32, i32, i32, i32)> {
+    pub const fn companion_hit_rect(&self) -> Option<(i32, i32, i32, i32)> {
         self.companion.hit_rect()
     }
 
@@ -1067,15 +1150,17 @@ impl EffectsPipeline {
     /// ([`crate::cursor_glow::BlockFill`]); `None` when the terminal's own
     /// cursor colour painted it.
     #[cfg(test)]
+    #[inline]
     #[must_use]
-    pub(crate) fn cursor_block_fill(&self) -> Option<crate::cursor_glow::BlockFill> {
+    pub(crate) const fn cursor_block_fill(&self) -> Option<crate::cursor_glow::BlockFill> {
         self.block_fill
     }
 
     /// Serious Mode's cursor-body gate: while on, no block-cursor body claims
     /// the caret. Off by default. The native window folds Serious Mode into its
     /// per-frame step inputs instead.
-    pub fn set_serious(&mut self, on: bool) {
+    #[inline]
+    pub const fn set_serious(&mut self, on: bool) {
         self.serious = on;
     }
 
@@ -1099,7 +1184,7 @@ impl EffectsPipeline {
     /// `true` while the sparkle master is on.
     #[inline]
     #[must_use]
-    pub fn sparkle_enabled(&self) -> bool {
+    pub const fn sparkle_enabled(&self) -> bool {
         self.sparkle.is_some()
     }
 
@@ -1131,12 +1216,14 @@ impl EffectsPipeline {
     /// Force the static path (no twinkle/jitter/pulse; novas collapse to the
     /// static glint). An alias of [`Self::set_reduced_motion`], so it reaches
     /// every effect.
+    #[inline]
     pub fn set_sparkle_reduced_motion(&mut self, on: bool) {
         self.set_reduced_motion(on);
     }
 
     /// Alt-screen suppression (native `[sparkle_words] suppress_in_alt_screen`,
     /// default off): when on, full-screen apps render with no decorations.
+    #[inline]
     pub fn set_sparkle_alt_screen_suppression(&mut self, on: bool) {
         self.deco_cfg.suppress_in_alt_screen = on;
         self.refresh_sparkle_cfg();
@@ -1231,6 +1318,7 @@ impl EffectsPipeline {
 
     /// The emphasis resolve, as in the native resolver: `enabled && (ink_enabled ||
     /// has_custom_specs)`.
+    #[inline]
     fn recompute_emphasis(&mut self) {
         self.deco_cfg.emphasis = self.emphasis_enabled
             && (self.deco_cfg.ink_enabled || self.deco_cfg.spec_table.has_custom());
@@ -1288,6 +1376,7 @@ impl EffectsPipeline {
     /// Re-resolve the active config (knob change; lexicon reuse) and hard-reset
     /// the per-occurrence state, as the native config reload does: `done_marks`
     /// clears and every one-shot replays after a knob change.
+    #[inline]
     fn refresh_sparkle_cfg(&mut self) {
         if let Some(rs) = self.sparkle.as_mut() {
             rs.cfg = self.deco_cfg.clone();
@@ -1343,7 +1432,7 @@ impl EffectsPipeline {
     /// `true` while the rain master is on.
     #[inline]
     #[must_use]
-    pub fn matrix_rain_enabled(&self) -> bool {
+    pub const fn matrix_rain_enabled(&self) -> bool {
         self.rain.is_some()
     }
 
@@ -1394,7 +1483,8 @@ impl EffectsPipeline {
     /// Fold the resolved theme into the streak. Called per frame so OSC 11/12
     /// recolors apply, without resetting the engine: a theme switch re-tints
     /// comets in flight rather than killing them.
-    pub fn set_output_streak_theme(
+    #[inline]
+    pub const fn set_output_streak_theme(
         &mut self,
         dark_theme: bool,
         theme_bg: u32,
@@ -1409,12 +1499,14 @@ impl EffectsPipeline {
 
     /// Reduced motion for the streak: amplitude zero, which the engine treats as a full reset
     /// (pin, not ease): no quads, no cue, fingerprint 0.
-    pub fn set_output_streak_reduced_motion(&mut self, reduced: bool) {
+    #[inline]
+    pub const fn set_output_streak_reduced_motion(&mut self, reduced: bool) {
         self.streak_cfg.intensity = if reduced { 0.0 } else { 1.0 };
     }
 
     /// Forward one keystroke to the streak's echo discount. Without it the
     /// `input_hot` arm still works but the sharper keystroke-stamp arm is lost.
+    #[inline]
     pub fn note_output_streak_keystroke(&mut self) {
         let now = self.now();
         if let Some(s) = self.streak.as_deref_mut() {
@@ -1495,6 +1587,7 @@ impl EffectsPipeline {
 
     /// Update theme-derived rain colors without requiring the host to replay
     /// every matrix-rain knob after a live theme change.
+    #[inline]
     pub fn set_matrix_rain_theme(&mut self, default_bg: u32, theme_fg: u32, theme_accent: u32) {
         let default_bg = default_bg & 0x00FF_FFFF;
         let theme_fg = theme_fg & 0x00FF_FFFF;
@@ -1515,6 +1608,7 @@ impl EffectsPipeline {
 
     /// Reduce-motion for rain: the engine emits nothing, fp 0, inactive. An
     /// alias of [`Self::set_reduced_motion`].
+    #[inline]
     pub fn set_matrix_rain_reduced_motion(&mut self, on: bool) {
         self.set_reduced_motion(on);
     }
@@ -1523,6 +1617,7 @@ impl EffectsPipeline {
     /// or chrome origin invalidates every retained cell/pixel endpoint before
     /// the next cursor sample; the current scroll snapshot is re-baselined so
     /// the same layout transition cannot also replay as content motion.
+    #[inline]
     fn sync_cursor_coordinate_space(
         &mut self,
         current: CursorCoordinateSpace,
@@ -1687,30 +1782,24 @@ impl EffectsPipeline {
         // config colour) rather than the theme's seed? Read BEFORE the colour
         // fold below, which needs it, and handed to the step as the same fact.
         let cursor_color_pinned = term.cursor_color_recoloured();
-        // As natively, one colour law ([`crate::cursor_fx::automatic_glow_color`]):
-        // an automatic glow colour follows the live cursor for the styles with
-        // no hue of their own; Beam, Comet and Sparkle keep their canonical hue
-        // until the cursor colour is pinned (and return to it on OSC 112);
-        // Laser keeps storm violet; explicit colors stay fixed. The page's
-        // opaque trail is its own effect (`set_cursor_trail`, configured apart
-        // from the glow style), so an automatic one follows the live cursor
-        // whatever the glow style.
+        // The native window's colour step, the one colour law
+        // ([`crate::cursor_fx::follow_live_cursor`]): an automatic glow colour
+        // follows the live cursor for the styles with no hue of their own;
+        // Beam, Comet and Sparkle keep their canonical hue until the cursor
+        // colour is pinned (and return to it on OSC 112); Laser keeps storm
+        // violet; the cursor's colour, chosen, is the live cursor on every
+        // style; explicit colours stay. The opaque comet wears what the glow
+        // draws, unless the page gave it a colour of its own.
         if input.cursor_color != aterm_core::render::COLOR_UNSET {
-            let live = input.cursor_color & 0x00FF_FFFF;
-            if self.glow_color_from_cursor {
-                let color = crate::cursor_fx::automatic_glow_color(
-                    self.glow_cfg.style,
-                    live,
-                    cursor_color_pinned,
-                );
-                self.glow_cfg.color = color;
-                if self.glow_accent_from_cursor {
-                    self.glow_cfg.accent = brighten(color, 1.5);
-                }
-            }
-            if self.trail_color_from_cursor {
-                self.trail_cfg.color = live;
-            }
+            crate::cursor_fx::follow_live_cursor(
+                &mut self.glow_cfg,
+                &mut self.trail_cfg,
+                input.cursor_color & 0x00FF_FFFF,
+                cursor_color_pinned,
+                self.glow_trail_color,
+                self.glow_explicit_accent,
+                self.trail_body_color,
+            );
         }
 
         // The coherent row for the glow engine's row probe (the poof lane,
@@ -1794,7 +1883,7 @@ impl EffectsPipeline {
                     body_allowed: !self.serious,
                     // A page's glow switch is also its momentum-glow switch.
                     momentum_glow: self.glow_cfg.enabled,
-                    user_tinted: !self.glow_color_from_cursor,
+                    user_tinted: self.glow_trail_color.chosen(),
                 },
                 glow: &self.glow_cfg,
                 trail: trail_cfg,
@@ -2322,7 +2411,7 @@ mod tests {
                 p.set_cursor_glow(
                     true,
                     "lumen",
-                    None,
+                    crate::cursor_fx::TrailColor::Automatic,
                     None,
                     400,
                     24,
@@ -2367,7 +2456,7 @@ mod tests {
         p.set_cursor_glow(
             true,
             "lumen",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -2752,7 +2841,7 @@ mod tests {
         p.set_cursor_glow(
             true,
             style,
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -3196,7 +3285,7 @@ mod tests {
         p.set_cursor_glow(
             false,
             "rainbow kitty",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -3733,7 +3822,7 @@ mod tests {
             pipeline.set_cursor_glow(
                 true,
                 style,
-                None,
+                crate::cursor_fx::TrailColor::Automatic,
                 None,
                 400,
                 24,
@@ -3970,7 +4059,7 @@ mod tests {
                 pipeline.set_cursor_glow(
                     true,
                     "lumen",
-                    None,
+                    crate::cursor_fx::TrailColor::Automatic,
                     None,
                     400,
                     24,
@@ -4146,7 +4235,7 @@ mod tests {
         pipeline.set_cursor_glow(
             true,
             "fire",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -4205,7 +4294,7 @@ mod tests {
         pipeline.set_cursor_glow(
             true,
             "lumen",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -4251,7 +4340,7 @@ mod tests {
         pipeline.set_cursor_glow(
             true,
             "lumen",
-            Some(0x0001_0203),
+            crate::cursor_fx::TrailColor::Pinned(0x0001_0203),
             None,
             400,
             24,
@@ -4273,7 +4362,7 @@ mod tests {
         pipeline.set_cursor_glow(
             true,
             "laser",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -4292,9 +4381,122 @@ mod tests {
             "Laser keeps its canonical storm-violet default hue"
         );
         assert_eq!(
-            input.cursor_trail_color, 0x00AA_BBCC,
-            "an independently enabled automatic opaque trail still follows OSC 12"
+            input.cursor_trail_color,
+            crate::cursor_glow::LASER_DEFAULT_COLOR,
+            "an automatic opaque trail wears the glow's violet, as the native comet body does"
         );
+    }
+
+    /// THE PAGE RUNS THE NATIVE WINDOW'S COLOUR STEP: for every listed style,
+    /// each trail colour setting (automatic, the cursor's, a fixed one), with
+    /// the theme's cursor, a program's OSC 12, and OSC 112 back, the glow's
+    /// colour and accent and the opaque comet's colour are what
+    /// [`crate::cursor_fx::follow_live_cursor`] gives a native window for the
+    /// same config and live cursor. Negative control: a comet given its own
+    /// colour keeps it.
+    #[test]
+    fn the_page_colours_its_cursor_as_a_native_window_does() {
+        use crate::cursor_fx::TrailColor;
+        let (theme_cursor, osc12, chosen) = (0x0011_2233, 0x00AA_BBCC, 0x00E0_218A);
+        let mut checked = 0;
+        for row in crate::cursor_glow::spellings::TRAIL_STYLES {
+            if row.style.is_none() {
+                continue;
+            }
+            for setting in [
+                TrailColor::Automatic,
+                TrailColor::Cursor,
+                TrailColor::Pinned(chosen),
+            ] {
+                let mut pipeline = EffectsPipeline::new();
+                pipeline.set_cursor_glow(
+                    true,
+                    row.name,
+                    setting,
+                    None,
+                    400,
+                    24,
+                    1.0,
+                    0.6,
+                    true,
+                    theme_cursor,
+                );
+                pipeline.set_cursor_trail(true, 400, 24, None, theme_cursor);
+                let mut term = Terminal::new(2, 8);
+                let mut input = term.cell_frame(2, 8);
+                for (osc, live, pinned) in [
+                    (&b""[..], theme_cursor, false),
+                    (&b"\x1b]12;rgb:aa/bb/cc\x07"[..], osc12, true),
+                    (&b"\x1b]112\x07"[..], theme_cursor, false),
+                ] {
+                    term.process(osc);
+                    term.cell_frame_into(&mut input, 2, 8);
+                    stamp_cursor_color(&term, &mut input, theme_cursor);
+                    pipeline.apply(&mut term, &mut input, 10, 19);
+                    let mut glow = crate::cursor_fx::resolve_glow_config(
+                        crate::cursor_fx::GlowKnobs {
+                            enabled: true,
+                            color: setting.knob(theme_cursor),
+                            accent: None,
+                            duration_ms: 400,
+                            length: 24,
+                            intensity: 1.0,
+                            radius: 0.6,
+                            ring: true,
+                        },
+                        crate::cursor_fx::GlowSpelling::parse(row.name),
+                        theme_cursor,
+                        true,
+                        pipeline.glow_cfg.theme_fg,
+                        pipeline.glow_cfg.theme_bg,
+                        0.5,
+                    );
+                    let mut trail = pipeline.trail_cfg;
+                    crate::cursor_fx::follow_live_cursor(
+                        &mut glow, &mut trail, live, pinned, setting, false, None,
+                    );
+                    let case = format!("{} {setting:?} live {live:06x}", row.name);
+                    assert_eq!(pipeline.glow_cfg.color, glow.color, "{case}");
+                    assert_eq!(pipeline.glow_cfg.accent, glow.accent, "{case}");
+                    assert_eq!(pipeline.trail_cfg.color, trail.color, "{case}");
+                    assert_eq!(input.cursor_trail_color, glow.color, "{case}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "{checked}");
+
+        // A comet the page gave a colour of its own keeps it.
+        let mut pipeline = EffectsPipeline::new();
+        pipeline.set_cursor_glow(
+            true,
+            "laser",
+            TrailColor::Automatic,
+            None,
+            400,
+            24,
+            1.0,
+            0.6,
+            true,
+            theme_cursor,
+        );
+        pipeline.set_cursor_trail(true, 400, 24, Some(0x0004_0506), theme_cursor);
+        let mut term = Terminal::new(2, 8);
+        let mut input = term.cell_frame(2, 8);
+        stamp_cursor_color(&term, &mut input, theme_cursor);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(input.cursor_trail_color, 0x0004_0506);
+        assert_eq!(
+            pipeline.glow_cfg.color,
+            crate::cursor_glow::LASER_DEFAULT_COLOR
+        );
+
+        // The cursor's colour, set apart: Laser drops its violet for it.
+        assert!(pipeline.set_cursor_glow_color("cursor"));
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert_eq!(pipeline.glow_cfg.color, theme_cursor);
+        assert!(!pipeline.set_cursor_glow_color("violetish"));
+        assert_eq!(pipeline.glow_trail_color, TrailColor::Cursor);
     }
 
     /// The web host's half of the one colour law: an automatic comet keeps
@@ -4309,7 +4511,7 @@ mod tests {
         pipeline.set_cursor_glow(
             true,
             "comet",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -4425,7 +4627,7 @@ mod tests {
         p.set_cursor_glow(
             true,
             "ember",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             64,
@@ -4517,7 +4719,7 @@ mod tests {
         p.set_cursor_glow(
             true,
             "lumen",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -4550,7 +4752,7 @@ mod tests {
         p.set_cursor_glow(
             true,
             "lumen",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -4614,7 +4816,7 @@ mod tests {
         p.set_cursor_glow(
             true,
             "lumen",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -4649,7 +4851,7 @@ mod tests {
         p.set_cursor_glow(
             true,
             "lumen",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -4753,7 +4955,7 @@ mod tests {
         p.set_cursor_glow(
             true,
             style,
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -4814,7 +5016,7 @@ mod tests {
         p.set_cursor_glow(
             true,
             "classic",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -5064,7 +5266,7 @@ mod tests {
             p.set_cursor_glow(
                 true,
                 "fire",
-                None,
+                crate::cursor_fx::TrailColor::Automatic,
                 None,
                 400,
                 24,
@@ -5119,7 +5321,7 @@ mod tests {
         p.set_cursor_glow(
             true,
             "fire",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -5163,7 +5365,7 @@ mod tests {
         p.set_cursor_glow(
             true,
             "lumen",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,
@@ -5941,7 +6143,7 @@ mod tests {
         p.set_cursor_glow(
             true,
             "lumen",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             260,
             24,
@@ -5985,7 +6187,7 @@ mod tests {
         p.set_cursor_glow(
             true,
             "rainbow kitty",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             260,
             24,

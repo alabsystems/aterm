@@ -345,39 +345,40 @@ mod tests {
     }
 
     #[test]
-    fn a_held_element_cannot_cross_an_owner_lifecycle_replacement() {
-        let scoped = |generation| {
+    fn a_held_element_cannot_cross_an_owner_lifecycle_or_review_replacement() {
+        use crate::model::ActionContext;
+        let scoped = |context| {
             let mut update = update(true);
-            update.nodes[0]
-                .1
-                .set_action_context(crate::model::ActionContext::new(41, generation));
+            update.nodes[0].1.set_action_context(context);
             update
         };
-        let mut state = Publication::default();
-        state.update(scoped(7));
-        let held = state.handle(model_id(2)).unwrap();
-        let queued = state.action(&held, Action::Click, None).unwrap();
-        let changes = state.update(scoped(8));
-        assert_eq!(changes.replaced, vec![model_id(2)]);
-        assert!(
-            state.node(&held).is_none(),
-            "the old OS element is retired despite equal node ids"
-        );
-        assert!(state.action(&held, Action::Click, None).is_none());
-        assert_eq!(
-            queued.context,
-            Some(crate::model::ActionContext::new(41, 7))
-        );
-        let current = state.handle(model_id(2)).unwrap();
-        assert_eq!(
-            state.action(&current, Action::Click, None).unwrap().context,
-            Some(crate::model::ActionContext::new(41, 8))
-        );
-        assert!(state.update(scoped(8)).replaced.is_empty());
-        assert!(
-            state.action(&current, Action::Click, None).is_some(),
-            "ordinary same-owner frames preserve identity"
-        );
+        for next in [
+            ActionContext::new(41, 8),
+            ActionContext::native_review(41, 7, 1),
+        ] {
+            let mut state = Publication::default();
+            state.update(scoped(ActionContext::new(41, 7)));
+            let held = state.handle(model_id(2)).unwrap();
+            let queued = state.action(&held, Action::Click, None).unwrap();
+            let changes = state.update(scoped(next));
+            assert_eq!(changes.replaced, vec![model_id(2)]);
+            assert!(
+                state.node(&held).is_none(),
+                "the old OS element is retired despite equal node ids"
+            );
+            assert!(state.action(&held, Action::Click, None).is_none());
+            assert_eq!(queued.context, Some(ActionContext::new(41, 7)));
+            let current = state.handle(model_id(2)).unwrap();
+            assert_eq!(
+                state.action(&current, Action::Click, None).unwrap().context,
+                Some(next)
+            );
+            assert!(state.update(scoped(next)).replaced.is_empty());
+            assert!(
+                state.action(&current, Action::Click, None).is_some(),
+                "ordinary same-owner frames preserve identity"
+            );
+        }
     }
 
     #[test]

@@ -58,6 +58,22 @@ pub struct InputEpoch(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DrivenInput(u64);
 
+/// A watch on one sink's [`DrivenInput`] that holds no descriptor
+/// ([`SinkWriter::driven_input_watch`]): a thread that must never be handed a
+/// master fd (whose number a close can reuse), and must not keep a closed
+/// session's master open, can still tell whether anyone drove input into the
+/// session since it last looked. It shares the count, nothing else.
+#[derive(Clone, Debug)]
+pub struct DrivenInputWatch(Arc<AtomicU64>);
+
+impl DrivenInputWatch {
+    /// The sink's [`DrivenInput`] now.
+    #[must_use]
+    pub fn get(&self) -> DrivenInput {
+        DrivenInput(self.0.load(Ordering::Acquire))
+    }
+}
+
 /// Opaque process-local order of frames accepted by one PTY sink.
 ///
 /// Unlike [`InputEpoch`], minted at the sink's direct-write or spill-FIFO
@@ -774,6 +790,11 @@ pub struct SinkWriter {
     /// visiting the process-wide writer registry, so a paste in another tab
     /// cannot put its registry lock on this session's typing path.
     ordered_egress_pending: AtomicUsize,
+    /// [`SinkWriter::driven_input`]: advanced beside the input epoch by every
+    /// producer but the reply writer. Only ever compared for equality, so it
+    /// wraps (2^64 writes away) instead of failing closed. Its own `Arc`, so a
+    /// [`DrivenInputWatch`] shares the count and nothing that holds the fd.
+    driven_input: Arc<AtomicU64>,
     /// The write-serialization and spill state, behind its own `Arc` so the
     /// detached drainer can hold it without the sink (the drainer pins the PTY
     /// via its own `dup(2)`'d fd; see [`Shared`]).
@@ -797,10 +818,6 @@ struct Shared {
     /// Every non-empty producer reserves this before it can wait for `lock` or
     /// touch the PTY. `u64::MAX` is a fail-closed terminal value (never wraps).
     input_epoch: AtomicU64,
-    /// [`SinkWriter::driven_input`]: advanced beside `input_epoch` by every
-    /// producer but the reply writer. Only ever compared for equality, so it
-    /// wraps (2^64 writes away) instead of failing closed.
-    driven_input: AtomicU64,
     /// Packed `(SPILL_ACTIVE_BIT | accepted_order)`: bit 63 is set iff
     /// [`Spill::buf`] is non-empty, and bits 0..63 hold the per-sink
     /// accepted-order counter (`ORDER_MASK` is terminal, never wrapping).
@@ -920,6 +937,7 @@ impl SinkWriter {
             master,
             _owned: None,
             ordered_egress_pending: AtomicUsize::new(0),
+            driven_input: Arc::new(AtomicU64::new(0)),
             shared: Arc::new(Shared::new()),
         }
     }
@@ -965,6 +983,7 @@ impl SinkWriter {
             master: master.as_raw_fd(),
             _owned: Some(CountedMaster::new(master)),
             ordered_egress_pending: AtomicUsize::new(0),
+            driven_input: Arc::new(AtomicU64::new(0)),
             shared: Arc::new(Shared::new()),
         }
     }
@@ -1007,6 +1026,7 @@ impl SinkWriter {
             master: master.as_raw(),
             _owned: Some(CountedMaster::new(master)),
             ordered_egress_pending: AtomicUsize::new(0),
+            driven_input: Arc::new(AtomicU64::new(0)),
             shared: Arc::new(Shared::new()),
         }
     }
@@ -1611,14 +1631,21 @@ impl SinkWriter {
     /// queries leave it where it was.
     #[must_use]
     pub fn driven_input(&self) -> DrivenInput {
-        DrivenInput(self.shared.driven_input.load(Ordering::Acquire))
+        DrivenInput(self.driven_input.load(Ordering::Acquire))
+    }
+
+    /// A watch on [`Self::driven_input`] that holds no descriptor and keeps
+    /// nothing of the session alive but the count ([`DrivenInputWatch`]).
+    #[must_use]
+    pub fn driven_input_watch(&self) -> DrivenInputWatch {
+        DrivenInputWatch(Arc::clone(&self.driven_input))
     }
 
     /// Reserve one non-empty DRIVEN input attempt (a key, a paste, a report, a
     /// control verb's bytes): it moves [`Self::driven_input`] as well as the
     /// input epoch ([`Self::reserve_attempt`]).
     fn reserve_input_attempt(&self) {
-        self.shared.driven_input.fetch_add(1, Ordering::AcqRel);
+        self.driven_input.fetch_add(1, Ordering::AcqRel);
         self.reserve_attempt();
     }
 
@@ -2645,7 +2672,6 @@ impl Shared {
         Self {
             lock: Mutex::new(()),
             input_epoch: AtomicU64::new(0),
-            driven_input: AtomicU64::new(0),
             order_state: AtomicU64::new(0),
             spilled_bytes: AtomicUsize::new(0),
             cached_tty_swallows: AtomicU8::new(0),
@@ -3838,6 +3864,29 @@ mod tests {
         assert!(bytes[2..expected_len - 1].iter().all(|byte| *byte == b'L'));
         assert_eq!(bytes[expected_len - 1], b'R');
         drop(writer);
+    }
+
+    /// The descriptor-free watch reads the sink's driven-input count and
+    /// moves with it, a reply leaving it where it was. NEGATIVE CONTROL:
+    /// another sink's watch does not move with this one's input.
+    #[test]
+    fn a_driven_input_watch_follows_its_own_sink_only() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let sink = SinkWriter::new(writer.as_raw_fd());
+        let watch = sink.driven_input_watch();
+        let other = SinkWriter::new(-1).driven_input_watch();
+        let (before, theirs) = (watch.get(), other.get());
+        assert_eq!(before, sink.driven_input());
+        assert_eq!(sink.write_frame(b"K").expect("a driven write"), 1);
+        assert_ne!(watch.get(), before, "a key moves it");
+        assert_eq!(watch.get(), sink.driven_input());
+        let keyed = watch.get();
+        assert_eq!(sink.write_reply(b"R").expect("a reply"), 1);
+        assert_eq!(watch.get(), keyed, "a reply does not");
+        assert_eq!(other.get(), theirs, "another sink's count stays");
+        let mut bytes = [0_u8; 2];
+        reader.read_exact(&mut bytes).expect("both bytes");
+        assert_eq!(&bytes, b"KR");
     }
 
     /// A contended fd lock is a zero-byte refusal, never a spill behind the holder: the

@@ -339,6 +339,13 @@ pub struct TranscriptUsage {
     served_at: Option<i64>,
     /// The time Claude was working ([`Self::busy_ms`]).
     busy: BusySpans,
+    /// The summed rows' tokens over time ([`Self::series`]).
+    series: TokenSeries,
+    /// Summed rows with no `timestamp`: in the totals, not in the series.
+    unstamped: u64,
+    /// Moves whenever the series or the working time does
+    /// ([`Self::generation`]).
+    generation: u64,
 }
 
 /// The time Claude was working in one transcript: the union of its main
@@ -391,6 +398,258 @@ impl BusySpans {
             self.spans.pop_front();
         }
     }
+}
+
+/// The most buckets a [`TokenSeries`] holds.
+pub const SERIES_BUCKETS: usize = 120;
+
+/// The finest bucket of a [`TokenSeries`], in seconds: a minute.
+pub const SERIES_BASE_S: i64 = 60;
+
+/// The session's tokens over time, for the footer's traffic graph: each
+/// summed row's tokens in the bucket of its own `timestamp` — in, the prompt
+/// ([`TokenUsage::prompt`]: input, cache writes and reads, the `Σ ↑`), and
+/// out, the output (the `Σ ↓`).
+///
+/// Buckets are ALIGNED TO THE EPOCH: bucket `i` at width `w` holds the rows
+/// stamped in `[i·w, (i+1)·w)`, `w` [`SERIES_BASE_S`] times a power of two. A
+/// row that would put the span past [`SERIES_BUCKETS`] COARSENS the series:
+/// the width doubles and aligned pairs merge exactly, until the row fits. No
+/// history is ever dropped and the sum of the buckets is the sum of every row
+/// noted; two series merge exactly ([`Self::absorb`]). A row costs O(1)
+/// amortised (a coarsening halves the buckets).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TokenSeries {
+    /// The bucket width in seconds; 0 while empty.
+    width_s: i64,
+    /// The first bucket's index at `width_s`.
+    first: i64,
+    /// `(in, out)` per bucket from `first`, at most [`SERIES_BUCKETS`].
+    buckets: VecDeque<(u64, u64)>,
+}
+
+impl TokenSeries {
+    /// The bucket width in seconds (0 while empty).
+    #[must_use]
+    pub fn width_s(&self) -> i64 {
+        self.width_s
+    }
+
+    /// Unix seconds of the first bucket's start (0 while empty).
+    #[must_use]
+    pub fn start_s(&self) -> i64 {
+        self.first.saturating_mul(self.width_s)
+    }
+
+    /// `(in, out)` per bucket, oldest first.
+    #[must_use]
+    pub fn buckets(&self) -> &VecDeque<(u64, u64)> {
+        &self.buckets
+    }
+
+    /// Whether no row was noted.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buckets.is_empty()
+    }
+
+    /// Every bucket summed: every row noted.
+    #[must_use]
+    pub fn sum(&self) -> (u64, u64) {
+        self.buckets.iter().fold((0, 0), |(i, o), &(bi, bo)| {
+            (i.saturating_add(bi), o.saturating_add(bo))
+        })
+    }
+
+    /// One bucket index past the last.
+    fn end(&self) -> i64 {
+        self.first
+            .saturating_add(i64::try_from(self.buckets.len()).unwrap_or(i64::MAX))
+    }
+
+    /// Double the width, merging each aligned pair: bucket `i` goes to
+    /// `⌊i/2⌋`. The sum is unchanged.
+    fn coarsen(&mut self) {
+        let Some(width) = self.width_s.checked_mul(2) else {
+            return;
+        };
+        let first = self.first.div_euclid(2);
+        let mut merged: VecDeque<(u64, u64)> = VecDeque::with_capacity(self.buckets.len() / 2 + 1);
+        for (k, &(i, o)) in self.buckets.iter().enumerate() {
+            let at = self.first + i64::try_from(k).unwrap_or(0);
+            let slot = usize::try_from(at.div_euclid(2) - first).unwrap_or(0);
+            if merged.len() <= slot {
+                merged.resize(slot + 1, (0, 0));
+            }
+            let held = &mut merged[slot];
+            *held = (held.0.saturating_add(i), held.1.saturating_add(o));
+        }
+        self.width_s = width;
+        self.first = first;
+        self.buckets = merged;
+    }
+
+    /// Whether buckets `lo..hi` fit the series at its width.
+    fn fits(lo: i64, hi: i64) -> bool {
+        hi.saturating_sub(lo) <= i64::try_from(SERIES_BUCKETS).unwrap_or(i64::MAX)
+    }
+
+    /// Widen the buckets to cover `lo..hi` (indices at the width), zeros in
+    /// the new ones.
+    fn cover(&mut self, lo: i64, hi: i64) {
+        while self.first > lo {
+            self.buckets.push_front((0, 0));
+            self.first -= 1;
+        }
+        while self.end() < hi {
+            self.buckets.push_back((0, 0));
+        }
+    }
+
+    /// Note a row stamped `at_s` (unix seconds) with `input` and `output`
+    /// tokens. A row of no tokens notes nothing.
+    pub fn note(&mut self, at_s: i64, input: u64, output: u64) {
+        if input == 0 && output == 0 {
+            return;
+        }
+        if self.width_s == 0 {
+            self.width_s = SERIES_BASE_S;
+            self.first = at_s.div_euclid(SERIES_BASE_S);
+            self.buckets.clear();
+        }
+        let mut at = at_s.div_euclid(self.width_s);
+        while !Self::fits(self.first.min(at), self.end().max(at.saturating_add(1))) {
+            let width = self.width_s;
+            self.coarsen();
+            if self.width_s == width {
+                // The width can double no further: the row joins the
+                // nearer end's bucket.
+                at = at.clamp(self.first, self.end().saturating_sub(1));
+                break;
+            }
+            at = at_s.div_euclid(self.width_s);
+        }
+        self.cover(at, at.saturating_add(1));
+        let slot = usize::try_from(at - self.first).unwrap_or(0);
+        if let Some(held) = self.buckets.get_mut(slot) {
+            *held = (held.0.saturating_add(input), held.1.saturating_add(output));
+        }
+    }
+
+    /// Merge `other` in: the finer of the two is coarsened to the wider width
+    /// (and both further while their span passes [`SERIES_BUCKETS`]), then
+    /// bucket adds to bucket. Exact: the widths are both
+    /// [`SERIES_BASE_S`]·2ᵏ, so their buckets align.
+    pub fn absorb(&mut self, other: &Self) {
+        if other.is_empty() {
+            return;
+        }
+        if self.is_empty() {
+            self.clone_from(other);
+            return;
+        }
+        let mut theirs = other.clone();
+        while self.width_s < theirs.width_s {
+            self.coarsen();
+        }
+        while theirs.width_s < self.width_s {
+            theirs.coarsen();
+        }
+        while !Self::fits(self.first.min(theirs.first), self.end().max(theirs.end())) {
+            let width = self.width_s;
+            self.coarsen();
+            theirs.coarsen();
+            if self.width_s == width {
+                break;
+            }
+        }
+        let (lo, hi) = (self.first.min(theirs.first), self.end().max(theirs.end()));
+        self.cover(lo, hi);
+        for (k, &(i, o)) in theirs.buckets.iter().enumerate() {
+            let at = theirs.first + i64::try_from(k).unwrap_or(0);
+            let slot = usize::try_from(at - self.first).unwrap_or(0);
+            if let Some(held) = self.buckets.get_mut(slot) {
+                *held = (held.0.saturating_add(i), held.1.saturating_add(o));
+            }
+        }
+    }
+
+    /// The buckets spread over `n` columns of `from_s..to_s` (unix seconds),
+    /// for a graph `n` cells wide: each bucket's tokens go to the columns its
+    /// span overlaps, in proportion, rounded so every token lands in exactly
+    /// one column. A bucket the window clips puts ALL its tokens in the part
+    /// inside: a window that ends at now, inside the newest bucket, holds
+    /// every token stamped so far, so over the series' whole span the
+    /// columns sum to [`Self::sum`]. Pure. Empty for no columns; zeros for
+    /// an empty window.
+    #[must_use]
+    pub fn columns(&self, from_s: i64, to_s: i64, n: usize) -> Vec<(u64, u64)> {
+        spread_columns(
+            self.first,
+            self.width_s,
+            self.buckets.iter().copied(),
+            (from_s, to_s),
+            n,
+        )
+    }
+}
+
+/// [`TokenSeries::columns`] over any run of buckets: `buckets` from bucket
+/// index `first`, `width_s` seconds each, spread over `n` columns of
+/// `from_s..to_s` — what a series and a flat view of one
+/// (`session_usage::TrafficView::columns`) both draw with. Pure.
+#[must_use]
+pub(crate) fn spread_columns(
+    first: i64,
+    width_s: i64,
+    buckets: impl IntoIterator<Item = (u64, u64)>,
+    (from_s, to_s): (i64, i64),
+    n: usize,
+) -> Vec<(u64, u64)> {
+    let mut out = vec![(0u64, 0u64); n];
+    if n == 0 || to_s <= from_s || width_s == 0 {
+        return if n == 0 { Vec::new() } else { out };
+    }
+    let span = i128::from(to_s) - i128::from(from_s);
+    let cols = i128::try_from(n).unwrap_or(i128::MAX);
+    // Column `c` covers `[from + c·span/n, from + (c+1)·span/n)`, in
+    // seconds scaled by `n` to stay whole.
+    let edge = |c: i128| i128::from(from_s) * cols + c * span;
+    for (k, (input, output)) in buckets.into_iter().enumerate() {
+        if input == 0 && output == 0 {
+            continue;
+        }
+        let at = i128::from(first) + i128::try_from(k).unwrap_or(0);
+        let lo = (at * i128::from(width_s)).max(i128::from(from_s)) * cols;
+        let hi = ((at + 1) * i128::from(width_s)).min(i128::from(to_s)) * cols;
+        if hi <= lo {
+            continue;
+        }
+        let whole = hi - lo;
+        // The columns the clipped span touches, and the share of each
+        // by cumulative rounding: every token lands in exactly one.
+        let first_col = ((lo - edge(0)) / span).clamp(0, cols - 1);
+        let mut c = first_col;
+        let mut done = 0i128;
+        let mut given = (0u64, 0u64);
+        while c < cols {
+            let (a, b) = (edge(c).max(lo), edge(c + 1).min(hi));
+            if b > a {
+                done += b - a;
+            }
+            let share = |v: u64| u64::try_from(i128::from(v) * done / whole).unwrap_or(u64::MAX);
+            let upto = (share(input), share(output));
+            let slot = &mut out[usize::try_from(c).unwrap_or(0)];
+            slot.0 = slot.0.saturating_add(upto.0 - given.0);
+            slot.1 = slot.1.saturating_add(upto.1 - given.1);
+            given = upto;
+            if edge(c + 1) >= hi {
+                break;
+            }
+            c += 1;
+        }
+    }
+    out
 }
 
 /// A limit notice as Claude Code wrote it into the transcript: an assistant
@@ -465,6 +724,16 @@ impl TranscriptUsage {
     /// An empty fold.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty fold that replaces `older` (its file started over): its
+    /// [`Self::generation`] starts past `older`'s, so a reader keyed on it
+    /// never takes the new fold for the old one.
+    pub(crate) fn following(older: &Self) -> Self {
+        Self {
+            generation: older.generation.wrapping_add(1),
+            ..Self::default()
+        }
     }
 
     /// Spend by model id, in key order.
@@ -568,6 +837,7 @@ impl TranscriptUsage {
         let Some(id) = id else {
             self.rows_without_id = self.rows_without_id.saturating_add(1);
             self.add(model, usage, sidechain);
+            self.note_series(obj, usage);
             if served {
                 self.note_served(obj);
             }
@@ -576,6 +846,7 @@ impl TranscriptUsage {
         match self.seen.remember(id, usage) {
             Seen::New => {
                 self.add(model, usage, sidechain);
+                self.note_series(obj, usage);
                 if served {
                     self.note_served(obj);
                 }
@@ -590,6 +861,7 @@ impl TranscriptUsage {
                 self.conflicting_repeats = self.conflicting_repeats.saturating_add(1);
                 let key = self.model_key(model).to_owned();
                 self.per_model.entry(key).or_default().add_tokens(growth);
+                self.note_series(obj, growth);
                 // Only a message that GREW is a response served again: a
                 // repeat at or below the figures held is an old one.
                 if served && growth != TokenUsage::default() {
@@ -615,6 +887,50 @@ impl TranscriptUsage {
         self.busy.total_ms
     }
 
+    /// The main chain's finished turns as disjoint `[start, end)` spans in
+    /// unix milliseconds, in time order ([`BusySpans`]: the newest
+    /// [`BUSY_SPANS_MAX`]).
+    #[must_use]
+    pub fn busy_spans(&self) -> &VecDeque<(i64, i64)> {
+        &self.busy.spans
+    }
+
+    /// The summed rows' tokens over time ([`TokenSeries`]): a new message's
+    /// whole usage, a grown repeat's growth alone, each at its row's own
+    /// `timestamp`.
+    #[must_use]
+    pub fn series(&self) -> &TokenSeries {
+        &self.series
+    }
+
+    /// Summed rows the series could not place (no `timestamp`): counted in
+    /// the totals, not graphed.
+    #[must_use]
+    pub fn unstamped(&self) -> u64 {
+        self.unstamped
+    }
+
+    /// A count that moves whenever the series, the unplaced rows or the
+    /// working time move: a reader rebuilds what it drew from them only when
+    /// it did.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Put a summed row's `usage` (a new message's, or a repeat's growth) in
+    /// the series at its `timestamp`, else count it unplaced.
+    fn note_series(&mut self, obj: &Map, usage: TokenUsage) {
+        if usage.is_zero() {
+            return;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        match row_time(obj) {
+            Some(at) => self.series.note(at, usage.prompt(), usage.output),
+            None => self.unstamped = self.unstamped.saturating_add(1),
+        }
+    }
+
     /// Fold a `turn_duration` row: the turn `[timestamp − durationMs,
     /// timestamp]`. A sidechain's row, or one without both fields, is not
     /// a main turn and is left out.
@@ -628,7 +944,11 @@ impl TranscriptUsage {
         ) else {
             return;
         };
+        let before = self.busy.total_ms;
         self.busy.note(end.saturating_sub(ms), end);
+        if self.busy.total_ms != before {
+            self.generation = self.generation.wrapping_add(1);
+        }
     }
 
     fn note_served(&mut self, obj: &Map) {
@@ -691,9 +1011,10 @@ impl TranscriptUsage {
 
     /// Add another fold's spend and counters to this one (the files of one
     /// session). The [`MAX_MODELS`] bound holds. Dedupe sets are not merged
-    /// (each file deduped within itself). Limit notices and the served time
-    /// are not summed: the limit wall is the main transcript's
-    /// (`session_usage::SessionUsage::main`).
+    /// (each file deduped within itself). The series merge exactly
+    /// ([`TokenSeries::absorb`]). Limit notices, the served time and the
+    /// working time are not summed: the limit wall is the main transcript's
+    /// (`session_usage::SessionUsage::main`), and so is the working time.
     pub(crate) fn absorb(&mut self, other: &Self) {
         for (model, spend) in &other.per_model {
             let key = self.model_key(model).to_owned();
@@ -712,6 +1033,9 @@ impl TranscriptUsage {
         ] {
             *mine = mine.saturating_add(theirs);
         }
+        self.series.absorb(&other.series);
+        self.unstamped = self.unstamped.saturating_add(other.unstamped);
+        self.generation = self.generation.wrapping_add(other.generation);
         // The session's model is the first absorbed fold's that names one:
         // `SessionUsage::total_fold` absorbs the main transcript first, and
         // subagent rows are sidechain rows, which name none.
@@ -1769,6 +2093,259 @@ mod tests {
         assert_eq!(m.messages, 1);
         assert_eq!(t.conflicting_repeats, 2);
         assert_eq!(t.duplicates, 2);
+    }
+
+    // -- TokenSeries --------------------------------------------------------
+
+    /// An assistant row stamped `at` (RFC 3339) with `input` prompt tokens
+    /// (no cache) and `output`.
+    fn stamped_row(id: &str, input: u64, output: u64, at: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{at}","isSidechain":false,"message":{{"id":"{id}","model":"m","usage":{{"input_tokens":{input},"output_tokens":{output}}}}}}}"#
+        )
+    }
+
+    /// Unix seconds of `at`.
+    fn unix(at: &str) -> i64 {
+        i64::try_from(super::super::upgrade_models::parse_utc(at).expect("a stamp")).unwrap()
+    }
+
+    /// The fold's totals, `(prompt, output)` over every model.
+    fn totals(t: &TranscriptUsage) -> (u64, u64) {
+        t.per_model().values().fold((0, 0), |(i, o), spend| {
+            let tokens = spend.tokens();
+            (i + tokens.prompt(), o + tokens.output)
+        })
+    }
+
+    /// EACH ROW IN THE MINUTE OF ITS OWN STAMP: buckets are a minute wide and
+    /// aligned to the epoch (the first starts on the minute, not at the
+    /// first row), rows of one minute share a bucket, a quiet minute is an
+    /// empty bucket, and the prompt counts its cache writes and reads.
+    #[test]
+    fn the_series_buckets_tokens_by_row_minute() {
+        let mut t = TranscriptUsage::new();
+        fold_all(
+            &mut t,
+            &[
+                &stamped_row("a", 100, 1, "2026-10-19T12:00:05Z"),
+                &stamped_row("b", 200, 2, "2026-10-19T12:00:59.900Z"),
+                &stamped_row("c", 400, 4, "2026-10-19T12:01:00Z"),
+                &stamped_row("d", 800, 8, "2026-10-19T12:03:10Z"),
+                // Cache tokens are prompt tokens: the Σ ↑.
+                &assistant_row("e", "m", 1, 16).replacen(
+                    '{',
+                    r#"{"timestamp":"2026-10-19T12:03:59Z","#,
+                    1,
+                ),
+            ],
+        );
+        let series = t.series();
+        assert_eq!(series.width_s(), SERIES_BASE_S);
+        assert_eq!(series.start_s(), unix("2026-10-19T12:00:00Z"));
+        assert_eq!(
+            series.buckets().iter().copied().collect::<Vec<_>>(),
+            [(300, 3), (400, 4), (0, 0), (800 + 1 + 10 + 1000, 8 + 16)]
+        );
+        assert_eq!(series.sum(), totals(&t), "every row graphed");
+        assert_eq!(t.unstamped(), 0);
+    }
+
+    /// A ROW PAST THE SPAN COARSENS, NEVER DROPS: the width doubles until
+    /// the span fits [`SERIES_BUCKETS`] (the bucket edges still on the
+    /// epoch's grid), whichever end the row lands past, and the buckets sum
+    /// to every row noted, out to the widest stamps an `i64` holds.
+    #[test]
+    fn the_series_coarsens_and_keeps_the_sum() {
+        let base = unix("2026-10-19T00:00:00Z");
+        let mut series = TokenSeries::default();
+        let mut sum = (0u64, 0u64);
+        // Five hours, one row a minute, then two hours BEFORE the first.
+        for minute in (0..300).chain((-120..0).rev()) {
+            let (i, o) = (u64::try_from(minute + 1000).unwrap(), 1);
+            series.note(base + minute * 60 + 7, i, o);
+            sum = (sum.0 + i, sum.1 + o);
+            assert!(series.buckets().len() <= SERIES_BUCKETS);
+            assert_eq!(series.sum(), sum, "nothing dropped at minute {minute}");
+        }
+        // Seven hours fit 120 buckets of four minutes.
+        assert_eq!(series.width_s(), 4 * SERIES_BASE_S);
+        assert_eq!(series.start_s().rem_euclid(series.width_s()), 0);
+        assert!(series.start_s() <= base - 120 * 60);
+        assert!(series.start_s() + series.width_s() * 120 > base + 299 * 60);
+        // A row of no tokens notes nothing and widens nothing.
+        let held = series.clone();
+        series.note(base + 86_400 * 365, 0, 0);
+        assert_eq!(series, held);
+        // The extremes still keep every token.
+        for at in [i64::MIN, i64::MAX, 0] {
+            series.note(at, 5, 5);
+            sum = (sum.0 + 5, sum.1 + 5);
+        }
+        assert!(series.buckets().len() <= SERIES_BUCKETS);
+        assert_eq!(series.sum(), sum);
+    }
+
+    /// TWO WIDTHS MERGE EXACTLY: the finer series is coarsened to the wider
+    /// one's width (and both further while the union passes
+    /// [`SERIES_BUCKETS`]), so absorbing either into the other is the series
+    /// one fold of every row would hold. Control: the same buckets added
+    /// index for index without aligning them differ.
+    #[test]
+    fn absorb_aligns_two_widths() {
+        let base = unix("2026-10-19T09:00:00Z");
+        let fine: Vec<(i64, u64, u64)> = (0..10).map(|m| (base + m * 60, 10, 1)).collect();
+        // Three hours: two-minute buckets.
+        let coarse: Vec<(i64, u64, u64)> = (0..180)
+            .step_by(7)
+            .map(|m| (base - 3600 + m * 60 + 30, 100, 3))
+            .collect();
+        let of = |rows: &[(i64, u64, u64)]| {
+            let mut series = TokenSeries::default();
+            for &(at, i, o) in rows {
+                series.note(at, i, o);
+            }
+            series
+        };
+        let (a, b) = (of(&fine), of(&coarse));
+        assert_eq!(
+            (a.width_s(), b.width_s()),
+            (SERIES_BASE_S, 2 * SERIES_BASE_S)
+        );
+        let mut ab = a.clone();
+        ab.absorb(&b);
+        let mut ba = b.clone();
+        ba.absorb(&a);
+        let mut all = fine.clone();
+        all.extend(&coarse);
+        assert_eq!(ab, of(&all), "one fold of every row");
+        assert_eq!(ba, ab);
+        assert_eq!(ab.sum(), (a.sum().0 + b.sum().0, a.sum().1 + b.sum().1));
+        // Merging nothing changes nothing; merging into nothing copies.
+        let mut held = ab.clone();
+        held.absorb(&TokenSeries::default());
+        assert_eq!(held, ab);
+        let mut empty = TokenSeries::default();
+        empty.absorb(&b);
+        assert_eq!(empty, b);
+        // CONTROL: unaligned, the fine minutes land in the wrong buckets.
+        let mut naive = b.clone();
+        for (k, &(i, o)) in a.buckets().iter().enumerate() {
+            let slot = &mut naive.buckets[k];
+            *slot = (slot.0 + i, slot.1 + o);
+        }
+        assert_ne!(naive, ab);
+    }
+
+    /// A REPEAT THAT GREW ADDS ITS GROWTH ALONE, in the bucket of the row
+    /// that carried it: the series sums as the totals do.
+    #[test]
+    fn a_grown_repeat_adds_only_its_growth() {
+        let mut t = TranscriptUsage::new();
+        let first = stamped_row("msg_c", 100, 10, "2026-10-19T12:00:10Z");
+        let grown = stamped_row("msg_c", 100, 999, "2026-10-19T12:01:10Z");
+        let lower = stamped_row("msg_c", 50, 20, "2026-10-19T12:02:10Z");
+        assert_eq!(
+            fold_all(&mut t, &[&first, &grown, &lower]),
+            [Fold::Summed, Fold::Conflict, Fold::Conflict]
+        );
+        assert_eq!(
+            t.series().buckets().iter().copied().collect::<Vec<_>>(),
+            [(100, 10), (0, 989)],
+            "the growth alone, in its own row's minute; a lower repeat adds nothing"
+        );
+        assert_eq!(t.series().sum(), totals(&t));
+        assert_eq!(totals(&t), (100, 999));
+    }
+
+    /// A ROW WITH NO STAMP is summed in the totals and counted, never placed
+    /// in the series; every summed row moves the generation, and a row that
+    /// sums nothing moves nothing. Control: the same row stamped is graphed.
+    #[test]
+    fn a_row_without_a_timestamp_counts_in_the_totals_not_the_series() {
+        let mut t = TranscriptUsage::new();
+        let bare = assistant_row("n1", "m", 100, 10);
+        assert_eq!(t.fold_line(&bare), Fold::Summed);
+        assert_eq!(totals(&t), (100 + 10 + 1000, 10));
+        assert!(t.series().is_empty());
+        assert_eq!(t.unstamped(), 1);
+        let generation = t.generation();
+        assert_ne!(generation, 0);
+        assert_eq!(t.fold_line(&bare), Fold::Duplicate);
+        assert_eq!(t.generation(), generation, "a duplicate sums nothing");
+        // CONTROL: stamped, the same tokens are graphed.
+        let stamped = assistant_row("n2", "m", 100, 10).replacen(
+            '{',
+            r#"{"timestamp":"2026-10-19T12:00:00Z","#,
+            1,
+        );
+        assert_eq!(t.fold_line(&stamped), Fold::Summed);
+        assert_eq!(t.series().sum(), (100 + 10 + 1000, 10));
+        assert_eq!(t.unstamped(), 1);
+        assert_ne!(t.generation(), generation);
+        // Merged folds keep both counts.
+        let mut whole = TranscriptUsage::new();
+        whole.absorb(&t);
+        whole.absorb(&t);
+        assert_eq!((whole.unstamped(), whole.series().sum()), (2, (2220, 20)));
+    }
+
+    /// COLUMNS SPREAD A BUCKET OVER THE CELLS ITS SPAN COVERS, in proportion
+    /// and rounded so every token lands in one column: a minute over three
+    /// columns is a third each, a window that ends inside a bucket (now,
+    /// mid-minute) holds that bucket's every token, and every width sums to
+    /// the series.
+    #[test]
+    fn columns_spread_and_keep_the_sum() {
+        let start = unix("2026-10-19T12:00:00Z");
+        let mut series = TokenSeries::default();
+        series.note(start + 5, 60, 6);
+        series.note(start + 65, 120, 0);
+        series.note(start + 185, 1, 7);
+        assert_eq!(series.columns(start, start + 60, 3), [(20, 2); 3]);
+        assert_eq!(series.columns(start, start + 30, 1), [(60, 6)]);
+        assert_eq!(
+            series.columns(start, start + 90, 3),
+            [(30, 3), (30, 3), (120, 0)],
+            "a window ending mid-minute holds the minute"
+        );
+        let whole = series.sum();
+        for n in 1..=97 {
+            let columns = series.columns(start - 17, start + 240 + 13, n);
+            let sum = columns
+                .iter()
+                .fold((0, 0), |(i, o), &(ci, co)| (i + ci, o + co));
+            assert_eq!(sum, whole, "{n} columns");
+        }
+        // A token is never split into nothing: one over three columns is
+        // in exactly one.
+        let lone = series.columns(start + 180, start + 240, 3);
+        assert_eq!(lone.iter().map(|c| c.0).sum::<u64>(), 1);
+        assert_eq!(lone.iter().map(|c| c.1).sum::<u64>(), 7);
+        assert!(series.columns(start, start + 60, 0).is_empty());
+        assert_eq!(series.columns(start + 60, start, 2), [(0, 0); 2]);
+        assert_eq!(
+            TokenSeries::default().columns(start, start + 60, 2),
+            [(0, 0); 2]
+        );
+        // A flat view of the series spreads as the series does.
+        let view = crate::harness::session_usage::TrafficView {
+            start_s: series.start_s(),
+            width_s: series.width_s(),
+            buckets: series.buckets().iter().copied().collect(),
+            ..Default::default()
+        };
+        for n in [1, 3, 7, 60] {
+            assert_eq!(
+                view.columns(start - 17, start + 253, n),
+                series.columns(start - 17, start + 253, n),
+                "{n} columns"
+            );
+        }
+        assert_eq!(
+            crate::harness::session_usage::TrafficView::default().columns(start, start + 60, 2),
+            [(0, 0); 2]
+        );
     }
 
     /// Working time is the union of the main chain's `turn_duration` turns: a

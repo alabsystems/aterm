@@ -135,6 +135,41 @@ const CALLS: Shape = Shape::Object(&[
         Shape::Object(&[("content", Shape::Seq(&CALL_PART))]),
     ),
 ]);
+/// A call or a result as the flight fold reads it (`super::flight`): its
+/// kind, the call's id and tool, the id of the call a result answers and
+/// whether it answers with an error, and of the call's arguments only the
+/// two that bound how long it may run — its declared `timeout` and whether
+/// it went to the background. Never what it runs, writes or returns; a part
+/// that is no object is read as null.
+const FLIGHT_PART: Shape = Shape::Record(&[
+    ("type", Shape::Scalar),
+    ("id", Shape::Scalar),
+    ("name", Shape::Scalar),
+    ("tool_use_id", Shape::Scalar),
+    ("is_error", Shape::Scalar),
+    (
+        "input",
+        Shape::Record(&[
+            ("timeout", Shape::Scalar),
+            ("run_in_background", Shape::Scalar),
+        ]),
+    ),
+]);
+/// A row as the flight fold reads it: its type and time, its message's id and
+/// stop reason, and its content's [`FLIGHT_PART`]s (a prompt's plain string
+/// validated and read as null, never copied).
+const FLIGHT: Shape = Shape::Object(&[
+    ("type", Shape::Scalar),
+    ("timestamp", Shape::Scalar),
+    (
+        "message",
+        Shape::Object(&[
+            ("id", Shape::Scalar),
+            ("stop_reason", Shape::Scalar),
+            ("content", Shape::Parts(&FLIGHT_PART)),
+        ]),
+    ),
+]);
 /// What is kept of a limit row's `quotaLimits`: whether the request was
 /// rejected, the reset it names, which of the account's limits it was, and
 /// what it says of the account's usage credits — whether they are on
@@ -558,6 +593,13 @@ impl<'de> Deserialize<'de> for Exchange {
 struct Excerpt(Value);
 struct Calls(Value);
 struct Steps<const PARTS: bool>(Value);
+struct Flight(Value);
+
+impl<'de> Deserialize<'de> for Flight {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        FLIGHT.deserialize(de).map(Self)
+    }
+}
 
 impl<'de> Deserialize<'de> for Usage {
     fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
@@ -634,6 +676,13 @@ pub(super) fn exchange(line: &str) -> aterm_json::Result<Value> {
 /// files they name, but never what a call writes or a result holds.
 pub(crate) fn calls(line: &str) -> aterm_json::Result<Value> {
     aterm_json::from_str::<Calls>(line).map(|v| v.0)
+}
+
+/// The flight fold's read of a row (`super::flight`): which calls of a
+/// subagent wait on a result, their tools and declared timeouts, never what
+/// a call runs or a result holds.
+pub(crate) fn flight(line: &str) -> aterm_json::Result<Value> {
+    aterm_json::from_str::<Flight>(line).map(|v| v.0)
 }
 
 /// The step fold's read of a row that holds a call or a result: ids,

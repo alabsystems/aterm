@@ -66,7 +66,8 @@ impl GlCanvasSurface {
 
     /// A browser paces presents itself (the host's animation frames); a
     /// post never waits for the display.
-    pub(crate) fn synced(&self) -> bool {
+    #[inline]
+    pub(crate) const fn synced(&self) -> bool {
         false
     }
 

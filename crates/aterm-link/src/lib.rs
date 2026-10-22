@@ -89,6 +89,9 @@ mod broker_args;
 /// What a serving broker watches in itself: the poisoned log it exits over
 /// for its supervisor to reopen — see [`broker_health::poisoned_line`].
 pub mod broker_health;
+/// The retention rules every broker aterm opens keeps its log by — see
+/// [`broker_rules::default_rules`].
+pub mod broker_rules;
 /// The bridge command line, as a library entry - see [`cli::dispatch`].
 pub mod cli;
 pub mod ctl;

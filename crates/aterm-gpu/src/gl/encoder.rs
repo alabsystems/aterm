@@ -171,6 +171,7 @@ impl<'s> GlFrame<'s> {
 impl GlPass<'_, '_> {
     /// Bind `buf` as the uniform block at `binding` for the pass's later draws
     /// (a present's crown binds its own block inside the blit's pass).
+    #[inline]
     pub(crate) fn bind_uniform(&mut self, buf: &GlBuffer, binding: u32) {
         // SAFETY: the context is current; the buffer belongs to it.
         unsafe {
@@ -180,6 +181,7 @@ impl GlPass<'_, '_> {
 
     /// Scissor the pass's later draws to `(x, y, w, h)` (top-left rows, as
     /// every texture of the arm stores them), or lift the scissor.
+    #[inline]
     pub(crate) fn set_scissor(&mut self, scissor: Option<(u32, u32, u32, u32)>) {
         let gl = self.frame.cur.gl();
         // SAFETY: the context is current; valid capability and extents.
@@ -195,6 +197,7 @@ impl GlPass<'_, '_> {
     }
 
     /// Switch to `pipe`: program, vertex array, blend and write mask.
+    #[inline]
     pub(crate) fn set_pipeline(&mut self, pipe: &GlPipeline) {
         let gl = self.frame.cur.gl();
         let m = |b: bool| if b { ffi::GL_TRUE } else { ffi::GL_FALSE };
@@ -229,6 +232,7 @@ impl GlPass<'_, '_> {
     /// sRGB-stored texture without the decode (the Unorm view's read); only a
     /// filtered sample honours it (`texelFetch` always decodes, so no twin
     /// fetches a view texture with it; see `shaders/blit.glsl`).
+    #[inline]
     pub(crate) fn bind_texture(
         &mut self,
         tex: &GlTexture,
@@ -257,6 +261,7 @@ impl GlPass<'_, '_> {
     /// Bind the per-draw instance stream into the current pipeline's vertex
     /// array. A stream the pass cannot take (no pipeline yet, or a row that
     /// reads none) leaves it unstreamed, and the next draw refuses by name.
+    #[inline]
     pub(crate) fn set_stream(&mut self, buf: &GlBuffer) {
         let Some(bound) = self.bound.as_mut() else {
             return;
@@ -277,6 +282,7 @@ impl GlPass<'_, '_> {
     /// Draw `instances` instances of `vertices` vertices with the current
     /// pipeline (6 for a quad list, 4 for the tray strip, 3 for a fullscreen
     /// triangle).
+    #[inline]
     pub(crate) fn draw(&mut self, vertices: u32, instances: u32) -> Result<(), String> {
         let bound = self.bound.ok_or("gl: a draw with no pipeline")?;
         if bound.layout.is_some() && !bound.stream {

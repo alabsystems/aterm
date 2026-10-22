@@ -28,6 +28,7 @@ pub(crate) struct MetalResourceDevice {
 impl MetalResourceDevice {
     /// A mint for `latch`'s loss domain on `dev` (retained, not copied — the
     /// same `MTLDevice`).
+    #[inline]
     pub(crate) fn new(dev: &Device, latch: Arc<LossLatch>) -> Self {
         Self {
             dev: dev.clone_ref(),
@@ -36,6 +37,7 @@ impl MetalResourceDevice {
     }
 
     /// The device this mint creates on.
+    #[inline]
     pub(crate) const fn device(&self) -> &Device {
         &self.dev
     }
@@ -59,6 +61,7 @@ impl MetalResourceDevice {
     }
 
     /// A shared-storage buffer. Unsealed on purpose — see the module header.
+    #[inline]
     pub(crate) fn buffer(&self, len: usize) -> Result<Obj, String> {
         self.dev
             .new_buffer(len)
@@ -66,6 +69,7 @@ impl MetalResourceDevice {
     }
 
     /// A sampler state. Unsealed on purpose — see the module header.
+    #[inline]
     pub(crate) fn sampler(&self, desc: SamplerDesc) -> Result<Obj, String> {
         self.dev
             .new_sampler(desc)
@@ -98,17 +102,20 @@ unsafe impl Sync for SharedBuffer {}
 
 impl SharedBuffer {
     /// Wrap a minted buffer.
+    #[inline]
     pub(crate) const fn new(obj: Obj) -> Self {
         Self(obj)
     }
 
     /// The raw buffer for FFI (`buffer_write`, binds, readback length).
+    #[inline]
     pub(crate) const fn obj(&self) -> &Obj {
         &self.0
     }
 
     /// The raw buffer, by value, for a one-shot buffer used and dropped on this
     /// thread.
+    #[inline]
     pub(crate) fn into_obj(self) -> Obj {
         self.0
     }
@@ -130,23 +137,27 @@ pub(crate) struct SealedTexture {
 impl SealedTexture {
     /// Stamp an existing texture into `latch`'s domain: the swapchain's
     /// drawable, vended by CoreAnimation but in the swapchain's loss domain.
-    pub(super) fn from_parts(obj: Obj, latch: Arc<LossLatch>) -> Self {
+    #[inline]
+    pub(super) const fn from_parts(obj: Obj, latch: Arc<LossLatch>) -> Self {
         Self { obj, latch }
     }
 
     /// The raw texture for read-only FFI (binding, property getters). Write
     /// verbs take `&SealedTexture` and check the stamp.
+    #[inline]
     pub(crate) const fn obj(&self) -> &Obj {
         &self.obj
     }
 
     /// The loss-domain stamp.
+    #[inline]
     pub(crate) const fn latch(&self) -> &Arc<LossLatch> {
         &self.latch
     }
 
     /// A second +1 handle to the same texture with the same stamp
     /// ([`Obj::clone_retained`]).
+    #[inline]
     pub(crate) fn clone_handle(&self) -> Self {
         Self {
             obj: self.obj.clone_retained(),
@@ -156,6 +167,7 @@ impl SealedTexture {
 
     /// `newTextureViewWithPixelFormat:` inheriting this texture's stamp: the
     /// Unorm/sRGB alias pair is one storage, one loss domain.
+    #[inline]
     pub(crate) fn alias_view(&self, format: PixelFormat) -> Option<SealedTexture> {
         ffi::texture_view(&self.obj, format).map(|obj| SealedTexture {
             obj,
@@ -170,17 +182,20 @@ impl SealedTexture {
     /// As [`ffi::texture_upload`]: the texture's storage is not `Private`, its
     /// dimensions cover `region`, and `bytes` holds at least
     /// `bytes_per_row * region.size.height` bytes at that stride.
+    #[inline]
     pub(crate) unsafe fn upload(&self, region: MtlRegion, bytes: &[u8], bytes_per_row: usize) {
         // SAFETY: forwarded contract, pinned by the caller.
         unsafe { ffi::texture_upload(&self.obj, region, bytes, bytes_per_row) }
     }
 
     /// `-width`, off the live object.
+    #[inline]
     pub(crate) fn width(&self) -> usize {
         ffi::texture_width(&self.obj)
     }
 
     /// `-height`, off the live object.
+    #[inline]
     pub(crate) fn height(&self) -> usize {
         ffi::texture_height(&self.obj)
     }

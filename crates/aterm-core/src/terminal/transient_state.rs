@@ -50,7 +50,7 @@ pub(super) struct SyncEndCaret {
 /// the PTY peer (`response_buffer`, `report_buffer`) and the replies' rate limiter; the
 /// monotonic counts and serials, which never
 /// rewind (`sync_end_seq`, `full_clears`, `screen_mutations`, `kitty_serial`,
-/// `print_anchor_seq`); the per-batch clocks, which each batch overwrites before any reader
+/// `print_anchor_seq`, `focus_arms`); the per-batch clocks, which each batch overwrites before any reader
 /// runs; `kitty_last_assigned_id`, where the next `I=` id's search starts; and
 /// `host_resyncs_alt_screen`, the embedder's host policy. New resettable fields go here
 /// and in `reset`.
@@ -114,6 +114,13 @@ pub(super) struct TransientState {
     /// exit (47/1047/1049) and full resets. A swapped or wiped screen no longer
     /// holds the rows a resize displaced. Never reset to 0.
     pub(super) screen_replaced: u64,
+    /// Monotonic count of the program's DEC 1004 enables: each `CSI ? 1004 h` (or
+    /// XTRESTORE) that turns focus reporting on from off. Published lock-free
+    /// ([`super::ModeMirror::focus_arms`]) so the host tells a program that turned it on
+    /// in a session without the keyboard that it is unfocused, at once, rather than
+    /// leaving it to believe the focus it assumes until the next focus change. Never
+    /// reset; it wraps.
+    pub(super) focus_arms: u32,
     /// The engine's render debt ([`RenderDebt`](super::RenderDebt)): what the
     /// alternate-screen, non-reflowed resizes run under `ResizePolicy::Native` since the
     /// screen was last repainted from scratch (a full clear, a screen switch, a reset)
@@ -353,6 +360,7 @@ impl TransientState {
             reset_generation: 0,
             full_clears: 0,
             screen_replaced: 0,
+            focus_arms: 0,
             render_debt: super::RenderDebt::default(),
             screen_mutations: 0,
             sync_open_dirty: false,

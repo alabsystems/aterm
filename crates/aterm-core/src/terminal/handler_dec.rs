@@ -177,6 +177,11 @@ impl TerminalHandler<'_> {
                 }
                 1004 => {
                     if set {
+                        // Counted on the off->on edge only, as DEC 2048's report is: a
+                        // program re-sending `?1004h` with every frame arms nothing new.
+                        if !self.modes.focus_reporting {
+                            self.transient.focus_arms = self.transient.focus_arms.wrapping_add(1);
+                        }
                         self.enable_focus_reporting();
                     } else {
                         self.disable_focus_reporting();

@@ -122,8 +122,9 @@
 //! append to it, and never on a replica or a log retention has cut). THIS
 //! BRIDGE RETIRES EXACTLY ONE KIND OF SUBJECT: a closed session's own `ev`
 //! face, once the session's mirrored tail has landed (`bridge_mirror.rs`'s
-//! `mirror_retire_face`) — so only under `[fabric] log = "turns"`, the
-//! session-log mirror, which is off by default. No `presence` subject is
+//! `mirror_retire_face`) — so only while the session-log mirror runs
+//! (`[fabric] log`: on by default over a broker that retains the node's `ev`
+//! faces, session log Phase 6 step 6E-3; never with "off"). No `presence` subject is
 //! retired (the `exited` row a quitting instance or `aterm fabric doctor
 //! --retire-ghosts` writes is an update of it, which every roster reads), nor
 //! a `say/<topic>` face, nor a mail lane. So the ceiling is real: roughly two
@@ -219,7 +220,7 @@ use crate::subject::{self, Reject};
 use crate::transport::{self, Backoff, Conn};
 use crate::wait_tally::Recorder;
 
-/// THE BUS MIRROR's wiring (session log phase 4, `[fabric] log = "turns"`):
+/// THE BUS MIRROR's wiring (session log phase 4, `[fabric] log`):
 /// a child of this module, so it moves the bridge's own state.
 #[path = "bridge_mirror.rs"]
 mod mirror_run;
@@ -1603,14 +1604,36 @@ fn read_back_rows(
 ) -> io::Result<Vec<BrokerRecord>> {
     match page {
         Ok((rows, _)) => Ok(rows),
-        Err(e)
-            if astream_broker::broker_refusal(&e)
-                .and_then(astream_broker::BrokerRefusal::retained_from)
-                .is_some_and(|oldest| oldest > off) =>
-        {
-            Ok(Vec::new())
-        }
+        Err(e) if transport::retained_past(&e, off).is_some() => Ok(Vec::new()),
         Err(e) => Err(e),
+    }
+}
+
+/// Why `inbox get @<off>` has no record to hand over
+/// ([`Bridge::fetch_record`]), as the `fetched=` line's tail says it.
+#[derive(Debug, PartialEq, Eq)]
+enum Unfetched {
+    /// One bounded token: `err=<why>` (`no-record`, `unreadable`, …).
+    Why(&'static str),
+    /// The broker's retention gave this session's lane up below the floor:
+    /// `err=retained floor=<n>`, which an endpoint from before it answers as
+    /// any other failure (`reason=retained`) and reads `floor=` past.
+    Retained(u64),
+}
+
+impl From<&'static str> for Unfetched {
+    fn from(why: &'static str) -> Self {
+        Unfetched::Why(why)
+    }
+}
+
+impl Unfetched {
+    /// The `fetched=` line's tail.
+    fn tail(&self) -> String {
+        match self {
+            Unfetched::Why(why) => format!("err={why}"),
+            Unfetched::Retained(floor) => format!("err=retained floor={floor}"),
+        }
     }
 }
 
@@ -1655,6 +1678,13 @@ const LINK_SET_ASIDE_LANE: u32 = 4;
 /// is not told, and its entry stands until the owner dismisses it. One number
 /// with the endpoint's, which reads it off this bridge's `hello lane=`.
 const LINK_QUARANTINE_LANE: u32 = aterm_types::control_verbs::LINK_QUARANTINE_LANE;
+
+/// The bridge lane that added the mirror's WAITING states to `link mirror`
+/// (session log Phase 6): `budget`, the node at its window budget on a
+/// retaining broker ([`crate::mirror::NODE_WINDOW_BYTES`]), and
+/// `unretained`. An endpoint below it answers the word `ERR usage`, so it is
+/// not told (stderr says it).
+const LINK_MIRROR_WAIT_LANE: u32 = 6;
 
 /// What an attach found when the log it reads is NOT the one this node read
 /// before ([`Bridge::judge_log`]): what it is and what it was, for the one
@@ -2092,9 +2122,10 @@ pub struct Config {
     /// however the bridge was set up: with it off nothing can release a `post
     /// --wait-ack`. `--no-receipts` and `[fabric] receipts = false` turn it off.
     pub receipts: bool,
-    /// `--log off|turns` / `[fabric] log` (session log phase 4): whether the
-    /// bridge mirrors the session logs' bus class onto the sessions' `ev`
-    /// faces. OFF by default (owner decision D4 is open).
+    /// `--log auto|off|turns` / `[fabric] log` (session log phase 4): whether
+    /// the bridge mirrors the session logs' bus class onto the sessions' `ev`
+    /// faces. `auto` by default (owner decision D4, session log Phase 6 step
+    /// 6E-3): on while the broker retains them.
     pub log: crate::mirror::LogMode,
 }
 
@@ -2387,8 +2418,15 @@ pub struct Bridge {
     /// when this is N or later (`aterm_types::control_verbs::BRIDGE_LANE`).
     endpoint_lane: u32,
     /// THE BUS MIRROR (session log phase 4): `None` with `[fabric] log =
-    /// "off"`, the default, and then nothing of it runs ([`mirror_run`]).
+    /// "off"`, the opt-out, and then nothing of it runs ([`mirror_run`]).
     mirror: Option<Box<mirror_run::MirrorRun>>,
+    /// WHETHER THE BROKER RETAINS THIS NODE'S `ev` FACES, as the current
+    /// connection's `Hello` advertised its rules
+    /// ([`crate::broker_rules::retains_ev`], session log Phase 6 step 6E-2):
+    /// `None` before any attach. Judged at every attach
+    /// ([`Bridge::note_broker_retention`]); the mirror keeps to its window
+    /// budget over such a broker, and to its lifetime total over any other.
+    broker_retains: Option<bool>,
     endpoint_build: Option<String>,
     /// An INBOX-GROUP offset owed without an attributable sid. Never released
     /// by a roster prune: a future owed cause need not be a known lane fault.
@@ -2979,6 +3017,7 @@ impl Bridge {
             commit_refused: false,
             endpoint_lane: 0,
             mirror,
+            broker_retains: None,
             endpoint_build: None,
             commit_floor: None,
             #[cfg(test)]
@@ -3128,6 +3167,20 @@ impl Bridge {
         let (c, closer) = self.connect()?;
         same_log(self.bus_log, &c)?;
         Ok((c, closer))
+    }
+
+    /// Judge [`Bridge::broker_retains`] by the rules the current connection's
+    /// latest `Hello` advertised: called once the attach has said one
+    /// ([`Bridge::read_log_identity`]). No connection, or a broker that
+    /// advertises none (one from before astream's R4, or one opened without
+    /// rules), is no retaining broker.
+    fn note_broker_retention(&mut self) {
+        let fleet = self.cfg.fleet.clone();
+        let node = self.node.clone();
+        // What the `Hello` said, read off the client: no request, no wait.
+        let rules = self.conn.as_ref().and_then(|link| link.retention_rules());
+        self.broker_retains =
+            Some(rules.is_some_and(|r| crate::broker_rules::retains_ev(&r, &fleet, &node)));
     }
 
     /// The IDENTITY of the log the publisher connection reaches
@@ -3743,23 +3796,37 @@ impl Bridge {
         // ([`transport::ROW_PAGE`]) of them: a burst of presence that outruns
         // it is a walk the caller must repeat, not a memory risk.
         const STRETCH_MAX: u32 = transport::ROW_PAGE;
-        let (rows, (from, _)) = self.last_all(filter)?;
-        let fx = self.fx.clone();
-        let conn = self.conn_now().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotConnected, "the broker is unreachable")
-        })?;
-        let started = fx.now();
-        let answer = conn.fetch(from, filter, STRETCH_MAX);
-        let (stretch, (next, head)) = self.observe(started, answer, Some("read"))?;
-        if next < head {
-            return self.observe(
-                self.fx.now(),
-                Err(io::Error::other(format!(
-                    "the records on {filter} since its last-value walk did not fit one read"
-                ))),
-                Some("read"),
-            );
-        }
+        // A RETAINING BROKER (astream R4) may cut its log between the walk and
+        // the stretch: the stretch then reads on from the new floor, and the
+        // records the cut took held rows newer than the walk's (each row's
+        // newest value is carried whatever the cut), so the walk is taken
+        // once more, from the cut log. A second cut under it is the overflow's
+        // answer: unknown.
+        let mut cut_under = false;
+        let (rows, stretch) = loop {
+            let (rows, (from, _)) = self.last_all(filter)?;
+            let fx = self.fx.clone();
+            let conn = self.conn_now().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "the broker is unreachable")
+            })?;
+            let started = fx.now();
+            let answer = transport::fetch_kept(conn, from, filter, STRETCH_MAX);
+            let ((stretch, (next, head)), floor) = self.observe(started, answer, Some("read"))?;
+            if floor.is_some() && !cut_under {
+                cut_under = true;
+                continue;
+            }
+            if next < head || floor.is_some() {
+                return self.observe(
+                    self.fx.now(),
+                    Err(io::Error::other(format!(
+                        "the records on {filter} since its last-value walk did not fit one read"
+                    ))),
+                    Some("read"),
+                );
+            }
+            break (rows, stretch);
+        };
         let mut face: BTreeMap<String, BrokerRecord> =
             rows.into_iter().map(|row| (row.1.clone(), row)).collect();
         for rec in stretch {
@@ -4641,9 +4708,21 @@ impl Bridge {
                     return false;
                 };
                 let started = fx.now();
-                let answer = conn.fetch(cursor, &filter, 256);
+                // A RETAINING BROKER (astream R4) refuses a read below what
+                // the lane still keeps: the refill reads on from there, and
+                // says what the broker gave up ([`transport::fetch_kept`]).
+                let answer = transport::fetch_kept(conn, cursor, &filter, 256);
                 match self.observe(started, answer, Some("read")) {
-                    Ok(p) => p,
+                    Ok((p, floor)) => {
+                        if let Some(floor) = floor {
+                            eprintln!(
+                                "aterm-link: refill of {sid}: the broker's retention gave up \
+                                 this lane's records below @{floor} (from @{cursor}); reading on \
+                                 from there"
+                            );
+                        }
+                        p
+                    }
                     Err(e) => {
                         eprintln!("aterm-link: refill of {sid} stopped: {e}");
                         return false;
@@ -6283,7 +6362,9 @@ impl Bridge {
     /// SESSION's own lane — the filter is the authority: a record at `off` that
     /// is not on this session's lane (another session's, another face's, or
     /// nothing at all) answers `err=no-record`, and the endpoint never learns
-    /// which. The record is classified by the same code that classified it at
+    /// which; an offset below what the broker's retention still keeps of THIS
+    /// lane answers `err=retained floor=<n>`, the lane's own floor. The
+    /// record is classified by the same code that classified it at
     /// delivery and handed over WHOLE as `deliver <sid> fetched=<off> …` — in
     /// consecutive chunks when it does not fit one control line
     /// ([`fetched_lines`]) — which fills the parked wait and touches no ring.
@@ -6293,12 +6374,11 @@ impl Bridge {
     /// take (one over its body bound) is fetched and refused on every drain
     /// until the read times out.
     fn answer_fetch(&mut self, sid: &str, off: u64) {
-        let lines = match self
-            .fetch_record(sid, off)
-            .and_then(|(fields, text)| fetched_lines(sid, off, &fields, &text))
-        {
+        let lines = match self.fetch_record(sid, off).and_then(|(fields, text)| {
+            fetched_lines(sid, off, &fields, &text).map_err(Unfetched::from)
+        }) {
             Ok(lines) => lines,
-            Err(why) => vec![format!("deliver {sid} fetched={off} err={why}")],
+            Err(why) => vec![format!("deliver {sid} fetched={off} {}", why.tail())],
         };
         for line in lines {
             match self.ctl_request(&line) {
@@ -6323,39 +6403,49 @@ impl Bridge {
     }
 
     /// The record at `off` on `sid`'s lane as the `from= kind= trust= …` fields
-    /// of a `fetched=` line and its whole decoded body, or the one-token reason
-    /// there is none.
-    fn fetch_record(&mut self, sid: &str, off: u64) -> Result<(String, String), &'static str> {
+    /// of a `fetched=` line and its whole decoded body, or why there is none
+    /// ([`Unfetched`]).
+    fn fetch_record(&mut self, sid: &str, off: u64) -> Result<(String, String), Unfetched> {
         if self.attachment == Attachment::Observer {
-            return Err("observer");
+            return Err("observer".into());
         }
         let filter = format!("/f/{}/in/{}/{sid}/>", self.cfg.fleet, self.node);
         let fx = self.fx.clone();
         let Some(conn) = self.conn_now() else {
-            return Err("unreadable");
+            return Err("unreadable".into());
         };
         let started = fx.now();
-        let answer = conn.fetch(off, &filter, 1);
-        let (rows, _) = self
+        // A record the broker's retention gave up is no record: its
+        // `retained-from=` is no rows, never the link down ([`read_back_rows`]),
+        // and the answer names the floor THIS SESSION'S LANE is kept from
+        // (session log Phase 6 step 6E-2): what is below it is gone, whoever's
+        // record `off` was, so it says nothing of another session's.
+        let page = conn.fetch(off, &filter, 1);
+        let floor = page
+            .as_ref()
+            .err()
+            .and_then(|e| transport::retained_past(e, off));
+        let answer = read_back_rows(page, off);
+        let rows = self
             .observe(started, answer, Some("read"))
             .map_err(|_| "unreadable")?;
         let Some((at, subj, raw)) = rows.into_iter().next() else {
-            return Err("no-record");
+            return Err(floor.map_or(Unfetched::Why("no-record"), Unfetched::Retained));
         };
         if at != off {
-            return Err("no-record");
+            return Err("no-record".into());
         }
         let addr =
             subject::parse_in(&self.cfg.fleet, &self.node, &subj).map_err(|_| "malformed")?;
         if addr.sid != sid {
-            return Err("no-record");
+            return Err("no-record".into());
         }
         if addr.src == self.node && self.is_forged_self(off) {
-            return Err("forged-self");
+            return Err("forged-self".into());
         }
         let (body, _) = Body::decode(&raw);
         if !body.via.as_deref().is_none_or(via_ok) {
-            return Err("via");
+            return Err("via".into());
         }
         let (kind, demoted, _) = self.classify_delivery(&addr, &body);
         let trust = trust_of(&addr.src, body.via.is_some());
@@ -7064,8 +7154,17 @@ impl Bridge {
                 ));
             };
             let started = fx.now();
-            let answer = conn.fetch(cursor, &filter, 256);
-            let (rows, (next, head)) = self.observe(started, answer, Some("read"))?;
+            // Records retention gave up below the lane's floor cannot settle
+            // anything any more: the scan reads on from it, and an ask none
+            // of whose kept records settle it is past its deadline unsettled.
+            let answer = transport::fetch_kept(conn, cursor, &filter, 256);
+            let ((rows, (next, head)), floor) = self.observe(started, answer, Some("read"))?;
+            if let Some(floor) = floor {
+                eprintln!(
+                    "aterm-link: the deadline of @{off} on {sid}'s lane: the broker's retention \
+                     gave up its records below @{floor}; judged on what it keeps"
+                );
+            }
             for (_, subj, raw) in rows {
                 let kind = subj.rsplit('/').next().unwrap_or("");
                 let settles = ANSWER_KINDS
@@ -8556,10 +8655,18 @@ impl Bridge {
             return false;
         };
         let started = fx.now();
-        let page = conn.fetch(from, &filter, records);
-        let Ok((rows, (next, _))) = self.observe(started, page, Some("read")) else {
+        // A topic's records the broker's retention gave up are not replayed:
+        // the walk reads on from what the topic keeps, and says so.
+        let page = transport::fetch_kept(conn, from, &filter, records);
+        let Ok(((rows, (next, _)), floor)) = self.observe(started, page, Some("read")) else {
             return false;
         };
+        if let Some(floor) = floor {
+            eprintln!(
+                "aterm-link: the broadcast topic {topic}: the broker's retention gave up its \
+                 records below @{floor} (from @{from}); replaying from there"
+            );
+        }
         for (off, subject, raw) in rows {
             // STRICTLY BELOW THE DRAIN POSITION. A record at or past it is
             // one the subscription will deliver (or already has), and
@@ -10539,8 +10646,14 @@ impl Bridge {
             io::Error::new(io::ErrorKind::NotConnected, "the broker is unreachable")
         })?;
         let started = fx.now();
-        let answer = conn.fetch(view.exact_to, &filter, CONFIRM_ROWS);
-        let (found, mark) = self.observe(started, answer, Some("read"))?;
+        let answer = transport::fetch_kept(conn, view.exact_to, &filter, CONFIRM_ROWS);
+        let ((found, mark), floor) = self.observe(started, answer, Some("read"))?;
+        // A cut can hide a rival claim or withdrawal since the view's exact
+        // point. Last carries that row, but Fetch from the new floor does not:
+        // only the walk can judge it. Do not mark the unread gap as confirmed.
+        if floor.is_some() {
+            return Ok(None);
+        }
         let confirmed =
             crate::presence_view::confirmation(&self.cfg.fleet, sid, view.exact_to, &found, mark);
         self.presence_view
@@ -11084,6 +11197,9 @@ impl Bridge {
             if let Some(rtt) = self.attach_rtt.take() {
                 self.note_ack(rtt);
             }
+            // An `auto` mirror follows the retention this broker's `Hello`
+            // advertised (session log Phase 6 step 6E-3).
+            self.mirror_attached();
         } else {
             self.attach_rtt = None;
         }
@@ -11164,6 +11280,9 @@ impl Bridge {
             self.conn = None;
             return false;
         };
+        // The `Hello` the identity read guarantees also advertised the
+        // broker's retention rules (session log Phase 6 step 6E-2).
+        self.note_broker_retention();
         let lineage = self.conn_now().and_then(|c| c.log_lineage().cloned());
         #[cfg(test)]
         let lineage = lineage.filter(|_| !self.ignore_lineage);
@@ -11963,8 +12082,8 @@ impl Bridge {
     /// recovery stays fail-closed. Where the record it could not replace
     /// names an earlier boot's unclean stop, every attach first writes it
     /// again, and none goes on until it holds ([`Bridge::run_names_this_boot`]).
-    /// A record written is said with what it cost (a start after a kill in
-    /// this boot writes none, and says nothing).
+    /// A record written is said with what it cost. A fresh StateDir open
+    /// establishes its own required publication fence, even after a handoff.
     fn begin_run(&self) {
         let began = self.fx.now();
         match self.state.begin_run() {
@@ -11982,8 +12101,8 @@ impl Bridge {
         }
     }
 
-    /// WHETHER AN ATTACH MAY GO ON: NOT WHILE THE STATE DIR'S `run` STILL
-    /// SAYS THE LAST BRIDGE STOPPED UNCLEANLY IN AN EARLIER BOOT
+    /// WHETHER AN ATTACH MAY GO ON: ONLY AFTER THIS OPEN ADMITTED ITS RUN.
+    /// In particular, not while `run` names an earlier boot's unclean stop
     /// ([`StateDir::torn_files_possible`]) — which is what a start whose
     /// [`Bridge::begin_run`] the disk refused (full, an I/O error) leaves.
     /// Every bridge started later in this boot would read that verdict
@@ -11998,15 +12117,13 @@ impl Bridge {
     /// written while `run` names its boot. A refusal is said once per change
     /// (`link down reason=error`), and the loop's back-off tries again.
     ///
-    /// No other verdict waits: a record that names this boot, a clean stop or
-    /// no boot retires nothing, and one that does not read retires nothing
-    /// in any bridge (its error refuses the retirement), as before.
+    /// Visible OPEN bytes alone are insufficient: a predecessor, or this
+    /// attempt, may have died or failed after the rename and before the root
+    /// flush. Every attach therefore requires this StateDir open's successful
+    /// admission; a reconnect reuses it only while that same OPEN file remains.
     fn run_names_this_boot(&mut self) -> bool {
         #[cfg(test)]
         if self.attach_past_an_earlier_boots_run {
-            return true;
-        }
-        if !matches!(self.state.torn_files_possible(), Ok(true)) {
             return true;
         }
         match self.state.begin_run() {
@@ -12014,9 +12131,8 @@ impl Bridge {
             Err(e) => {
                 if self.link.down_wants_report("error") {
                     eprintln!(
-                        "aterm-link: the state dir's run record still names an earlier boot's \
-                         unclean stop and could not be written: {e}; not attaching until it can \
-                         (an entry in flight now would be retired as that boot's)"
+                        "aterm-link: the state dir's OPEN run record could not be durably \
+                         admitted: {e}; not attaching until its required publication succeeds"
                     );
                 }
                 self.link_down("error");
@@ -12038,8 +12154,9 @@ impl Bridge {
     /// takes this state dir in this boot and goes on with the run, and the
     /// handoff's gap is the fabric's whole outage: so nothing is flushed here
     /// and `run` stays open, as after a kill. The successor's start then finds
-    /// `run` open in this boot, writes no record and inherits every file a
-    /// power cut could tear, unflushed ([`StateDir::begin_run`]), and its own
+    /// `run` open in this boot, re-establishes its durable OPEN publication
+    /// fence and inherits every file a power cut could tear, unflushed
+    /// ([`StateDir::begin_run`]), and its own
     /// clean stop flushes them. A power cut once the successor's run has begun
     /// finds the run open in an earlier boot and the next boot's sweep runs,
     /// as it would have with this stop clean.
@@ -12057,10 +12174,9 @@ impl Bridge {
     /// no successor bridge begins a run in this boot (its `[fabric] command`
     /// removed, or a bridge that keeps failing to start), it is the rest of
     /// the boot. Nothing claims a clean stop it did not make, so damage after
-    /// a clean stop stays a bug's; and a handoff costs the state dir nothing:
-    /// measured on the eight-session handoff of fabric_world's
-    /// `handoff_cost`, 38 full flushes (about 150 ms) at the old bridge's stop
-    /// and 2 (about 9 ms) at its successor's start, before.
+    /// a clean stop stays a bug's. The old bridge's handoff flushes nothing;
+    /// its successor pays one durable OPEN write. Historical full-flush
+    /// measurements in `handoff_cost` predate this required admission fence.
     fn end_run(&self) {
         if self.bye == Some(Bye::Handoff) {
             eprintln!(
@@ -14819,6 +14935,56 @@ mod tests {
         assert!(!drain.more, "no `more` line, a whole listing");
     }
 
+    /// **A FETCH BELOW WHAT THE BROKER KEEPS OF THE SESSION'S LANE NAMES THE
+    /// LANE'S FLOOR** (session log Phase 6 step 6E-2): two mails on the
+    /// session's lane, the broker's cut past the first. `inbox get @<off>` of
+    /// the first is answered `err=retained floor=<n>` (the endpoint's `ERR
+    /// retained-from=<n>`), with the floor past it and at or below the kept
+    /// mail; the kept one still comes back whole, and an offset above the
+    /// floor that holds nothing of this lane is still `err=no-record`.
+    /// NEGATIVE CONTROL, run: the retained refusal read as `no-record`.
+    #[test]
+    fn a_fetch_below_the_lanes_retained_floor_names_the_floor() {
+        const SID: &str = "s-kept";
+        let (lane, mut bridge, _server, broker) = rig_with_kept_broker(&[(1, SID)], false);
+        let node = bridge.node.clone();
+        let subject = format!("/f/f/in/{node}/{SID}/{node}/note");
+        let gone = bridge
+            .publish_own_off(&subject, b"v=1 t=1 from=s-gone text=first")
+            .unwrap();
+        let kept = bridge
+            .publish_own_off(&subject, b"v=1 t=1 from=s-gone text=second")
+            .unwrap();
+        assert!(broker.retain_before(kept).unwrap() > 0, "the cut");
+
+        bridge.answer_fetch(SID, gone);
+        bridge.answer_fetch(SID, kept);
+        bridge.answer_fetch(SID, kept + 1);
+        // The fake endpoint refuses a `fetched=` record line (`err=refused`
+        // follows it); each offset's FIRST line is the bridge's answer.
+        let lines = lane.deliveries.lock().unwrap().clone();
+        let first = |off: u64| {
+            let head = format!("deliver {SID} fetched={off} ");
+            lines
+                .iter()
+                .find_map(|l| l.strip_prefix(&head))
+                .unwrap_or_else(|| panic!("no answer for {off}: {lines:?}"))
+                .to_string()
+        };
+        let floor: u64 = first(gone)
+            .strip_prefix("err=retained floor=")
+            .unwrap_or_else(|| panic!("the lane's floor: {lines:?}"))
+            .parse()
+            .expect("a floor");
+        assert!(gone < floor && floor <= kept, "{gone} < {floor} <= {kept}");
+        let whole = first(kept);
+        assert!(
+            whole.starts_with("from=") && whole.ends_with("text=second"),
+            "{lines:?}"
+        );
+        assert_eq!(first(kept + 1), "err=no-record");
+    }
+
     /// **A FETCHED BODY GOES BACK WHOLE: ONE LINE WHEN IT FITS, CONSECUTIVE
     /// CHUNKS WHEN IT DOES NOT, AND CUT AT THE ENDPOINT'S BOUND WITH `len=` WHEN
     /// IT IS LARGER THAN THAT.** Reviewed defect: the answer reused the very
@@ -17239,12 +17405,11 @@ mod tests {
     /// STOPS IT CLEANLY** (sim item S6, [`Bridge::end_run`]). A bridge of boot
     /// 1 wrote a reservation, unflushed, and aterm's last word was `bye
     /// handoff`: its stop flushes nothing and `run` stays open in boot 1. The
-    /// successor's start in the same boot writes no record and inherits the
+    /// successor's start in the same boot re-establishes OPEN and inherits the
     /// reservation unflushed, and its own clean stop flushes it where it is
     /// (nothing rewritten, [`StateDir::end_run_clean`]). NEGATIVE
     /// CONTROL: after `bye quit` the stop is clean, the successor's start
-    /// writes the record again (two full flushes) and inherits nothing —
-    /// the flushes a handoff no longer pays.
+    /// writes the record again (two full flushes) and inherits nothing.
     #[test]
     fn a_handoff_leaves_the_run_to_its_successor_and_a_quit_stops_it_cleanly() {
         for bye in [Bye::Handoff, Bye::Quit] {
@@ -17273,7 +17438,7 @@ mod tests {
             let stopped = successor.end_run_clean().unwrap();
             match bye {
                 Bye::Handoff => {
-                    assert_eq!(began.full, 0, "no record written at the successor's start");
+                    assert_eq!(began.full, 2, "the successor admits OPEN independently");
                     assert_eq!(stopped.files, 1, "the reservation, inherited and flushed");
                 }
                 Bye::Quit => {
@@ -17377,6 +17542,42 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn no_attach_runs_while_run_names_an_earlier_boot_so_a_relaunch_retires_nothing_live() {
+        for reopen in [false, true] {
+            let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
+            let (socket, _broker, _server) = serve_log(&lane, "open-fence");
+            bridge.cfg.broker = socket;
+            bridge.simulate_boot(crate::durability::test_boot(1), 0);
+            bridge.begin_run();
+            bridge.state.end_run_clean().unwrap();
+            let root = bridge.state.root().to_path_buf();
+            let refusal = (
+                root.as_path(),
+                aterm_durable::Flush::Durable,
+                io::ErrorKind::PermissionDenied,
+            );
+            bridge.state.refuse_directory_flush(Some(refusal));
+            bridge.begin_run();
+            assert!(
+                !bridge.state.last_run().unwrap().unwrap().clean,
+                "OPEN is visible"
+            );
+            if reopen {
+                bridge.state = StateDir::open(&root).unwrap();
+                bridge.simulate_boot(crate::durability::test_boot(1), 0);
+                bridge.state.refuse_directory_flush(Some(refusal));
+            }
+            assert!(!bridge.attach_broker(), "unadmitted OPEN, reopen={reopen}");
+            assert!(bridge.conn.is_none());
+            assert_eq!(bridge.state.incarnation(), 0);
+            let (mut reader, _) = bridge.connect().unwrap();
+            let (rows, _) = reader
+                .fetch(0, &format!("/f/{}/>", bridge.cfg.fleet), 64)
+                .unwrap();
+            assert!(rows.is_empty(), "a refused admission published {rows:?}");
+            bridge.state.refuse_directory_flush(None);
+            assert!(bridge.attach_broker(), "publication retry, reopen={reopen}");
+            bridge.close_subscriptions();
+        }
         for (wait, on_volume) in [(true, false), (false, false), (false, true)] {
             let case = format!("wait={wait} on_volume={on_volume}");
             let (lane, mut bridge) = FakeVerbLane::bridge(&[]);
@@ -17525,16 +17726,40 @@ mod tests {
     fn rig_with_broker(
         sessions: &[(u64, &str)],
     ) -> (FakeVerbLane, Bridge, astream_broker::BrokerHandle) {
+        let (lane, bridge, server, _) = rig_with_kept_broker(sessions, false);
+        (lane, bridge, server)
+    }
+
+    /// [`rig_with_broker`], the broker kept for the test (to cut its log),
+    /// and retaining by aterm's default rules when `retained`
+    /// ([`crate::broker_rules::retain`]): the bridge has then read its
+    /// `Hello` and judged it ([`Bridge::note_broker_retention`]).
+    fn rig_with_kept_broker(
+        sessions: &[(u64, &str)],
+        retained: bool,
+    ) -> (
+        FakeVerbLane,
+        Bridge,
+        astream_broker::BrokerHandle,
+        astream_broker::Broker,
+    ) {
         let (lane, mut bridge) = FakeVerbLane::bridge(sessions);
         let socket = lane.dir.path().join("broker.sock");
         let broker = crate::test_broker(lane.dir.path().join("broker.log")).unwrap();
+        if retained {
+            crate::broker_rules::retain(&broker).unwrap();
+        }
         let server = broker.serve(&socket).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         let (conn, _) = bridge.connect().unwrap();
         bridge.conn = Some(conn.into());
         bridge.note_ack(Duration::from_millis(1));
         assert!(bridge.link.up);
-        (lane, bridge, server)
+        if retained {
+            bridge.read_log_identity().unwrap();
+            bridge.note_broker_retention();
+        }
+        (lane, bridge, server, broker)
     }
 
     /// **A FACE AT ITS MAILBOX BOUND PAUSES; IT NEVER SITS ON AN UNREAD SOCKET.**
@@ -20012,6 +20237,9 @@ mod tests {
     ///   walks to `ambiguous` — the resolve-time read §6.1 promises. The
     ///   negative control is the view's own answer at that moment: the pinned
     ///   node alone, which an unconfirmed view would have routed to;
+    /// * A RETAINED-AWAY STRETCH walks without advancing the view: a rival's
+    ///   claim below the new floor is still in `Last`, and must make the post
+    ///   ambiguous. A sole advertiser behind the same cut still routes;
     /// * A STRETCH KNOWN TO BE LONG — a mark that says the head is more than
     ///   [`CONFIRM_SCAN_MAX`] records past the view, or this node's own last
     ///   publish that does — is walked with no confirmation sent.
@@ -20228,6 +20456,57 @@ mod tests {
         let long = counted(&mut bridge, "@s-moved");
         assert_eq!((long.1, long.2), (1, 1), "the walk alone: {long:?}");
         bridge.bus_high = bus_high;
+
+        // A CUT TAKES A RIVAL'S CLAIM before the view applies it. Fetch from
+        // the new floor sees nothing of the sid; Last still holds both nodes.
+        // The view must neither route its stale answer nor advance across the
+        // missing stretch, even after a previous fallback has walked it.
+        let cut_a = publish(&row("n-cut-a", "s-cut"), LIVE);
+        let solo = publish(&row("n-solo", "s-solo"), LIVE);
+        let g = view.open();
+        assert!(view.apply(g, "f", cut_a, &row("n-cut-a", "s-cut"), LIVE.as_bytes()));
+        assert!(view.apply(g, "f", solo, &row("n-solo", "s-solo"), LIVE.as_bytes()));
+        let before_cut = solo + 1;
+        assert!(view.mark(g, before_cut, before_cut));
+        let rival = publish(&row("n-cut-b", "s-cut"), LIVE);
+        let floor = publish("/f/f/term/n-z/s-z/after-cut", "busy");
+        assert!(before_cut <= rival && rival < floor);
+        broker.retain_before_carrying_state(floor).expect("the cut");
+        let filter = crate::presence_view::presence_filter("f");
+        let refused = reader.fetch(before_cut, &filter, CONFIRM_ROWS).unwrap_err();
+        assert_eq!(transport::retained_past(&refused, before_cut), Some(floor));
+        let ((suffix, (next, head)), crossed) =
+            transport::fetch_kept(&mut reader, before_cut, &filter, CONFIRM_ROWS).unwrap();
+        assert_eq!(crossed, Some(floor));
+        assert!(
+            suffix.is_empty() && next == head,
+            "Fetch cannot see the rival"
+        );
+        let (last, _) = reader.last(&filter, "", CONFIRM_ROWS).unwrap();
+        for far in ["n-cut-a", "n-cut-b"] {
+            assert!(
+                last.iter()
+                    .any(|(_, subject, _)| subject == &row(far, "s-cut")),
+                "Last preserves the actual claim of {far}"
+            );
+        }
+        assert_eq!(
+            view.snapshot("s-cut").unwrap().nodes,
+            BTreeSet::from(["n-cut-a".to_string()]),
+            "NEGATIVE CONTROL: the stale view alone would route to n-cut-a"
+        );
+        let cut = counted(&mut bridge, "@s-cut");
+        assert_eq!(
+            cut.0,
+            Route::Ambiguous,
+            "the retained rival is still a rival"
+        );
+        assert!(walked(&cut), "the cut requires Last: {cut:?}");
+        assert_eq!(view.snapshot("s-cut").unwrap().exact_to, before_cut);
+        let solo = counted(&mut bridge, "@s-solo");
+        assert_eq!(solo.0, to("n-solo", "s-solo"));
+        assert!(walked(&solo), "a unique route survives the cut: {solo:?}");
+        assert_eq!(view.snapshot("s-solo").unwrap().exact_to, before_cut);
 
         // A RECONNECT CLOSES IT with every other subscription.
         bridge.close_subscriptions();
@@ -21713,9 +21992,13 @@ mod tests {
                     if entry.file_type().unwrap().is_dir() {
                         todo.push(entry.path());
                     } else {
-                        // The only new fact a refusal may record is that this
-                        // identity can no longer vouch for its old offsets.
-                        if entry.path() != root.join("rewound-log") {
+                        // The only new facts a refusal may record: that this
+                        // identity can no longer vouch for its old offsets, and
+                        // the run's OPEN fence the attach's admission writes
+                        // before any broker exchange (768104f73e).
+                        if entry.path() != root.join("rewound-log")
+                            && entry.path() != root.join("run")
+                        {
                             files.insert(entry.path(), std::fs::read(entry.path()).unwrap());
                         }
                     }
@@ -21735,6 +22018,11 @@ mod tests {
             "no presence or old reference was published"
         );
         assert_eq!(files(bridge.state.root()), before, "all durable facts stay");
+        let run = std::fs::read_to_string(bridge.state.root().join("run")).unwrap();
+        assert!(
+            run.starts_with("open "),
+            "the run file is its OPEN fence: {run:?}"
+        );
         assert_eq!(bridge.log_witness, witnessed, "the high-water is retained");
         assert!(
             lane.delivery_offsets().is_empty(),
@@ -22586,6 +22874,45 @@ mod tests {
             })
             .collect();
         (records, writer, socket, broker, server)
+    }
+
+    /// **A REFILL BELOW A RETAINING BROKER'S FLOOR READS ON FROM IT** (session
+    /// log Phase 6 step 6E-2). Three records on a session's inbox lane and no
+    /// `seen` cursor, so the refill reads from [`REFILL_FLOOR_SPAN`] behind the
+    /// head, offset 0; the broker then cuts its log below the second record,
+    /// so a plain read from there is refused `retained-from=` the second, as it
+    /// would be at every retry for ever. The refill delivers the
+    /// two the broker kept, in order, and the link stays up. NEGATIVE CONTROL,
+    /// run: the plain `fetch` the refill made before stops it at its first page
+    /// and drops the connection.
+    #[cfg(unix)]
+    #[test]
+    fn a_refill_below_the_retained_floor_reads_on_from_it() {
+        const SID: &str = "s-kept";
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, SID)]);
+        let (records, mut reader, _socket, broker, _server) = burst_rig(&lane, &mut bridge, SID, 3);
+        let offs: Vec<u64> = records.iter().map(|r| r.0).collect();
+        broker
+            .retain_before_carrying_state(offs[1])
+            .expect("the cut");
+        let filter = format!("/f/f/in/{}/{SID}/>", bridge.node);
+        let refused = reader
+            .fetch(offs[0], &filter, 8)
+            .expect_err("PRECONDITION: a plain read below the floor is refused");
+        assert_eq!(transport::retained_past(&refused, offs[0]), Some(offs[1]));
+        assert_eq!(
+            bridge.state.seen_off(SID),
+            None,
+            "PRECONDITION: no `seen`, so the refill reads from its floor span, offset 0"
+        );
+
+        assert!(bridge.refill(SID), "the refill reads on");
+        assert_eq!(
+            lane.delivery_offsets(),
+            offs[1..],
+            "the kept records, in order"
+        );
+        assert!(bridge.conn.is_some(), "and the link stays up");
     }
 
     /// **A BURST OF INBOX RECORDS COSTS ONE COMMIT, NOT ONE PER RECORD.** Sixteen

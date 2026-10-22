@@ -51,8 +51,14 @@ impl RainLatches {
     /// suspended pane, a disabled session), so a completion during suppression
     /// does not fire a stale ember/wave on resume.
     #[inline]
-    pub fn baseline_completion(&mut self, session: u64, cmd_seq: Option<u64>) {
-        self.last_cmd = Some((session, cmd_seq.unwrap_or(0)));
+    pub const fn baseline_completion(&mut self, session: u64, cmd_seq: Option<u64>) {
+        self.last_cmd = Some((
+            session,
+            match cmd_seq {
+                Some(seq) => seq,
+                None => 0,
+            },
+        ));
     }
 
     /// A frame on which the surface runs no rain engine: both latches keep

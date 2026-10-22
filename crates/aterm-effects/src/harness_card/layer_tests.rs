@@ -429,6 +429,14 @@ fn random_frame(seed: u64) -> (CardScene, Clock) {
         _ => (i32::MIN, i32::MIN, i32::MAX, i32::MAX),
     };
     let dark = pick(2) == 0;
+    let palette = match pick(3) {
+        0 => CardPalette::Cruise,
+        1 => CardPalette::Land,
+        _ => CardPalette::Off,
+    };
+    // The ripple from the mascot's wand, a cell into the box, or the box's
+    // corner.
+    let wand = (pick(3) != 0).then_some((pick(3) as u16, top));
     let s = CardScene {
         origin_x,
         origin_y,
@@ -445,21 +453,19 @@ fn random_frame(seed: u64) -> (CardScene, Clock) {
         kitty_col: with_kitty.then_some(kitty_col),
         kitty_rows,
         clip,
-        palette: if pick(2) == 0 {
-            CardPalette::Cruise
-        } else {
-            CardPalette::Land
-        },
+        palette,
         dark,
         ground: if dark { 0x0012_1721 } else { 0x00F8_FAFD },
         serious: pick(12) == 0,
         coat: (next() & 0x00FF_FFFF) as u32,
         eye: (next() & 0x00FF_FFFF) as u32,
+        wand,
     };
     let t = next() % EPISODE_MS;
-    let clock = match next() % 4 {
+    let clock = match next() % 5 {
         0 => Clock::SETTLED,
         1 => Clock::seated(t),
+        2 => Clock::flowing(next() % (4 * crate::ripple::GLINT_PERIOD_MS)),
         _ => Clock::riding(t % (RIDE_MS + BURST_MS + 400)),
     };
     (s, clock)

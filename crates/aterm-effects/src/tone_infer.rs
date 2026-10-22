@@ -68,6 +68,7 @@ pub struct ToneTracker {
 }
 
 impl Default for ToneTracker {
+    #[inline]
     fn default() -> Self {
         Self {
             buf: std::collections::VecDeque::new(),
@@ -87,7 +88,8 @@ impl ToneTracker {
     /// The cached verdict before the `tone_melody` knob, for introspection;
     /// [`Self::effective`] is what rides a sound event.
     #[inline]
-    pub fn current(&self) -> Tone {
+    #[must_use]
+    pub const fn current(&self) -> Tone {
         self.tone
     }
 
@@ -96,7 +98,8 @@ impl ToneTracker {
     /// the neutral [`Tone::Technical`] with it off, even while a verdict from
     /// before the toggle is cached. Every sound seam takes its tone from here.
     #[inline]
-    pub fn effective(&self, tone_melody: bool) -> Tone {
+    #[must_use]
+    pub const fn effective(&self, tone_melody: bool) -> Tone {
         if tone_melody {
             self.tone
         } else {
@@ -128,6 +131,7 @@ impl ToneTracker {
     /// Window maintenance is unconditional; only marking is gated on
     /// `infer_active`. The keystroke count carries across an inactive spell, so
     /// the first press after a re-enable re-infers.
+    #[inline]
     pub fn note_char(&mut self, now: Instant, session: u64, ch: char, infer_active: bool) {
         self.rekey(session);
         if self.buf.len() == BUF_CAP {
@@ -184,6 +188,7 @@ impl ToneTracker {
 
     /// Run the classifier over the window and cache the verdict. A missing or
     /// corrupt weight asset degrades to Technical.
+    #[inline]
     fn infer(&mut self, now: Instant) {
         self.keys_since_infer = 0;
         self.last_infer = Some(now);

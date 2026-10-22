@@ -35,6 +35,7 @@ pub struct CurrentStyle {
 }
 
 impl Default for CurrentStyle {
+    #[inline]
     fn default() -> Self {
         let fg = PackedColor::DEFAULT_FG;
         let bg = PackedColor::DEFAULT_BG;
@@ -53,7 +54,8 @@ impl Default for CurrentStyle {
 impl CurrentStyle {
     /// Construct from explicit fields (checkpoint deserialization).
     #[must_use]
-    pub fn new(fg: PackedColor, bg: PackedColor, flags: CellFlags, protected: bool) -> Self {
+    #[inline]
+    pub const fn new(fg: PackedColor, bg: PackedColor, flags: CellFlags, protected: bool) -> Self {
         Self {
             fg,
             bg,
@@ -67,26 +69,29 @@ impl CurrentStyle {
 
     /// Foreground color as packed u32.
     #[must_use]
-    pub fn fg_packed(&self) -> u32 {
+    #[inline]
+    pub const fn fg_packed(&self) -> u32 {
         self.fg.0
     }
 
     /// Background color as packed u32.
     #[must_use]
-    pub fn bg_packed(&self) -> u32 {
+    #[inline]
+    pub const fn bg_packed(&self) -> u32 {
         self.bg.0
     }
 
     /// Cell flags as raw u16 bits.
     #[must_use]
-    pub fn flags_bits(&self) -> u16 {
+    #[inline]
+    pub const fn flags_bits(&self) -> u16 {
         self.flags.bits()
     }
 
     /// Cached packed colors for writing cells without per-character conversion.
     #[must_use]
     #[inline]
-    pub fn cached_colors(&self) -> PackedColors {
+    pub const fn cached_colors(&self) -> PackedColors {
         self.cached_colors
     }
 
@@ -94,7 +99,7 @@ impl CurrentStyle {
     /// `set_cursor_template` callers carry through erase/fill/scroll operations.
     #[must_use]
     #[inline]
-    pub fn bce_bg_rgb(&self) -> Option<[u8; 3]> {
+    pub const fn bce_bg_rgb(&self) -> Option<[u8; 3]> {
         if self.bg.is_rgb() {
             let (r, g, b) = self.bg.rgb_components();
             Some([r, g, b])
@@ -106,7 +111,7 @@ impl CurrentStyle {
     /// Whether the style alone requires CellExtras overflow.
     #[must_use]
     #[inline]
-    pub fn has_style_extras(&self) -> bool {
+    pub const fn has_style_extras(&self) -> bool {
         self.cached_has_style_extras
     }
 
@@ -114,7 +119,7 @@ impl CurrentStyle {
     /// `write_ascii_blast` path applies.
     #[must_use]
     #[inline]
-    pub fn is_default(&self) -> bool {
+    pub const fn is_default(&self) -> bool {
         self.cached_is_default
     }
 
@@ -122,7 +127,7 @@ impl CurrentStyle {
     ///
     /// Must be called after any change to `fg`, `bg`, `flags`, or `protected`.
     #[inline]
-    pub fn update_cached_colors(&mut self) {
+    pub const fn update_cached_colors(&mut self) {
         self.cached_colors = crate::Cell::convert_colors(self.fg, self.bg);
         self.cached_has_style_extras =
             self.flags.has_extended_flags() || self.fg.is_rgb() || self.bg.is_rgb();
@@ -135,7 +140,7 @@ impl CurrentStyle {
     /// Recompute only the flag-derived caches after a flags-only SGR change (e.g. `\x1b[1m`),
     /// which leaves `cached_colors` valid and skips `convert_colors`.
     #[inline]
-    pub fn update_flags_cache(&mut self) {
+    pub const fn update_flags_cache(&mut self) {
         self.cached_has_style_extras =
             self.flags.has_extended_flags() || self.fg.is_rgb() || self.bg.is_rgb();
         self.cached_is_default = self.fg.is_default()
@@ -147,12 +152,14 @@ impl CurrentStyle {
     /// Reset to default style (full reset including DECSCA protection).
     ///
     /// Used by RIS (full terminal reset).
+    #[inline]
     pub fn reset(&mut self) {
         *self = Self::default();
     }
 
     /// Reset SGR attributes only (colors and flags). Per VT510, SGR 0 does not reset the
     /// DECSCA protection attribute.
+    #[inline]
     pub fn reset_sgr(&mut self) {
         let protected = self.protected;
         *self = Self::default();

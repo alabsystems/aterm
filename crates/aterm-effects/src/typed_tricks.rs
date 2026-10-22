@@ -569,7 +569,7 @@ impl Line {
 
     /// The open token can still be looked up: non-empty and inside the window.
     #[inline]
-    fn token_is_live(&self) -> bool {
+    const fn token_is_live(&self) -> bool {
         self.token_chars > 0 && self.token_chars as usize <= TOKEN_CHARS
     }
 }
@@ -609,6 +609,7 @@ pub struct TrickListener {
 }
 
 impl Default for TrickListener {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -649,6 +650,7 @@ impl TrickListener {
 
     /// [`needs_lexicon`](Self::needs_lexicon) for an IME commit. May say `true`
     /// for a commit that turns out not to ask; never `false` for one that does.
+    #[inline]
     #[must_use]
     pub fn ime_needs_lexicon(&self, text: &str) -> bool {
         if !self.judging() {
@@ -670,13 +672,13 @@ impl TrickListener {
     /// [`needs_lexicon`](Self::needs_lexicon) for Enter.
     #[inline]
     #[must_use]
-    pub fn submit_needs_lexicon(&self) -> bool {
+    pub const fn submit_needs_lexicon(&self) -> bool {
         self.judging() && self.line.token_is_live()
     }
 
     /// The line can still fire: pure and unpoisoned.
     #[inline]
-    fn judging(&self) -> bool {
+    const fn judging(&self) -> bool {
         self.line.pure && !self.line.poisoned
     }
 
@@ -685,7 +687,7 @@ impl TrickListener {
     /// Every token so far was pet vocabulary and no code has appeared.
     #[inline]
     #[must_use]
-    pub fn is_pure(&self) -> bool {
+    pub const fn is_pure(&self) -> bool {
         self.line.pure
     }
 
@@ -693,14 +695,15 @@ impl TrickListener {
     /// a reset.
     #[inline]
     #[must_use]
-    pub fn is_poisoned(&self) -> bool {
+    pub const fn is_poisoned(&self) -> bool {
         self.line.poisoned
     }
 
     /// The live tentative fire, if any.
+    #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn tentative(&self) -> Option<Trick> {
+    pub const fn tentative(&self) -> Option<Trick> {
         self.line.tentative
     }
 
@@ -708,7 +711,7 @@ impl TrickListener {
     /// empty only when it is not [poisoned](Self::is_poisoned).
     #[inline]
     #[must_use]
-    pub fn line_chars(&self) -> u32 {
+    pub const fn line_chars(&self) -> u32 {
         self.line.line_chars
     }
 
@@ -759,6 +762,7 @@ impl TrickListener {
     }
 
     /// Drop `session` from the dirty memory; whether it was there.
+    #[inline]
     fn forget(&mut self, session: u64) -> bool {
         let Some(at) = self.dirty.iter().position(|s| *s == Some(session)) else {
             return false;
@@ -793,6 +797,7 @@ impl TrickListener {
     /// [`note_char`](Self::note_char) would, and an open run stays open. `lexicon`
     /// may be `None` unless [`ime_needs_lexicon`](Self::ime_needs_lexicon) says
     /// otherwise.
+    #[inline]
     pub fn note_ime(
         &mut self,
         now: Instant,
@@ -887,6 +892,7 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
+    #[inline]
     pub fn note_line_reset(&mut self) -> TrickFeed<'_> {
         let out = self.fresh_line();
         self.feed(out, false)
@@ -1368,6 +1374,7 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
+    #[inline]
     fn deliver_tail(&mut self, now: Instant, fed: u32) -> Option<Outcome> {
         let verdict = self.line.tail.take()?;
         self.deliver(now, verdict, fed)
@@ -1450,6 +1457,7 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
+    #[inline]
     fn go_impure(&mut self) -> Option<Outcome> {
         self.line.pure = false;
         self.line.held = None;
@@ -1466,6 +1474,7 @@ impl TrickListener {
             project = "conformance_trick_listener::project"
         )
     )]
+    #[inline]
     fn poison(&mut self) -> Option<Outcome> {
         self.line.poisoned = true;
         self.line.held = None;
@@ -1490,6 +1499,7 @@ impl TrickListener {
     ///
     /// Exact for readline, zsh and vim. An editor that deletes one scalar per
     /// press can leave a stray mark the listener believes gone.
+    #[inline]
     fn pop_cluster(&mut self) -> u32 {
         if self.line.token_chars as usize > TOKEN_CHARS {
             self.line.token_chars = self.line.token_chars.saturating_sub(1);

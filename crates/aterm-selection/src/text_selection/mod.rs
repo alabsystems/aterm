@@ -89,12 +89,14 @@ impl SelectionAnchor {
 }
 
 impl PartialOrd for SelectionAnchor {
+    #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for SelectionAnchor {
+    #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         (self.row, self.col, self.side).cmp(&(other.row, other.col, other.side))
     }
@@ -206,6 +208,7 @@ impl TextSelection {
     /// bottom, negative = scrollback) into absolute rows via `live_top_abs + row`
     /// (`live_top_abs = absolute_row_counter - visible_rows`).
     #[must_use]
+    #[inline]
     pub fn intersects_absolute_band(&self, live_top_abs: u64, lo_abs: u64, hi_abs: u64) -> bool {
         if self.state == SelectionState::None {
             return false;
@@ -344,6 +347,7 @@ impl TextSelection {
     /// which excludes the whole end row — retreat to the previous row with
     /// `end_col = u16::MAX`. Shared by `side_adjusted_bounds`, `contains`, and
     /// `project_range` so all sites agree on the selected region.
+    #[inline]
     fn apply_side_adjustment(
         ns: SelectionAnchor,
         ne: SelectionAnchor,
@@ -378,6 +382,7 @@ impl TextSelection {
     ///
     /// Returns `None` if no selection is active or if the selection is empty
     /// after side adjustment.
+    #[inline]
     pub fn side_adjusted_bounds(&self) -> Option<(i32, u16, i32, u16)> {
         if self.state == SelectionState::None {
             return None;
@@ -570,7 +575,8 @@ impl TextSelection {
     /// selection type, columns, and anchor sides are preserved. Each row uses
     /// saturating addition so even an untrusted or degenerate offset cannot
     /// overflow.
-    pub fn translate_rows_for_presentation(&mut self, delta: i32) {
+    #[inline]
+    pub const fn translate_rows_for_presentation(&mut self, delta: i32) {
         self.start.row = self.start.row.saturating_add(delta);
         self.end.row = self.end.row.saturating_add(delta);
     }
@@ -621,6 +627,7 @@ impl TextSelection {
     /// (`is_wide` lead or `is_wide_continuation` right half) as selected when
     /// either of its columns via [`glyph_cell_span`](aterm_types::selection::glyph_cell_span)
     /// is selected so highlight and copy boundaries agree.
+    #[inline]
     pub fn contains_cell(
         &self,
         row: i32,
@@ -645,6 +652,7 @@ impl TextSelection {
     /// Note: this method knows nothing about wide (CJK/emoji) glyphs, so on its
     /// own it will divide one. Anything painting cells wants
     /// [`Self::contains_cell`], which counts a glyph whole.
+    #[inline]
     pub fn contains(&self, row: i32, col: u16) -> bool {
         let Some((start_row, start_col, end_row, end_col)) = self.side_adjusted_bounds() else {
             return false;
@@ -676,6 +684,7 @@ impl TextSelection {
     /// Returns `None` if no selection is active or if the selection is empty
     /// after side adjustment. `last_col` is the rightmost column index for
     /// `Lines` selection expansion.
+    #[inline]
     pub fn project_range(&self, last_col: u16) -> Option<SelectionProjection> {
         let (start_row, start_col, end_row, end_col) = self.side_adjusted_bounds()?;
         // `Lines` spans whole rows whatever the sub-cell sides say.
@@ -701,6 +710,7 @@ impl TextSelection {
     ///
     /// Sets the earlier anchor's side to `Left` and the later anchor's side
     /// to `Right`, ensuring that `project_range` will not clip either endpoint.
+    #[inline]
     pub fn include_all(&mut self) {
         if self.state != SelectionState::None {
             if self.start <= self.end {
@@ -717,7 +727,8 @@ impl TextSelection {
     ///
     /// Used by scroll-rotation adapters that need to shift both anchors
     /// by a delta while preserving the selection type and side metadata.
-    pub fn relocate(&mut self, start_row: i32, start_col: u16, end_row: i32, end_col: u16) {
+    #[inline]
+    pub const fn relocate(&mut self, start_row: i32, start_col: u16, end_row: i32, end_col: u16) {
         self.start.row = start_row;
         self.start.col = start_col;
         self.end.row = end_row;
@@ -727,6 +738,7 @@ impl TextSelection {
     /// Expand selection to semantic boundaries (for word selection).
     ///
     /// This is called after starting a Semantic selection to expand to word boundaries.
+    #[inline]
     pub fn expand_semantic(&mut self, start_col: u16, end_col: u16) {
         if self.state == SelectionState::InProgress
             && self.selection_type == SelectionType::Semantic
@@ -741,6 +753,7 @@ impl TextSelection {
     /// Expand selection to full lines.
     ///
     /// This is called for Lines selection type to select entire lines.
+    #[inline]
     pub fn expand_lines(&mut self, max_col: u16) {
         if self.state == SelectionState::InProgress && self.selection_type == SelectionType::Lines {
             self.start.col = 0;

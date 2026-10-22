@@ -81,6 +81,7 @@ pub use text_selection::{
 
 /// Return `true` when `(start_row, start_col) <= (end_row, end_col)` in row-major order.
 #[must_use]
+#[inline]
 pub const fn is_ordered_cell_pair(
     start_row: i64,
     start_col: usize,
@@ -98,12 +99,14 @@ pub const fn is_ordered_cell_pair(
 
 /// Return the column span width `end_col.saturating_sub(start_col)`.
 #[must_use]
+#[inline]
 pub const fn cell_span_width(start_col: usize, end_col: usize) -> usize {
     end_col.saturating_sub(start_col)
 }
 
 /// Encode selection bounds (`start_row`, `start_col`, `end_row`, `end_col`) into 16 LE bytes.
 #[must_use]
+#[inline]
 pub const fn encode_selection_bounds_le(
     start_row: i32,
     start_col: u32,
@@ -134,6 +137,7 @@ pub const fn encode_selection_bounds_le(
 
 /// Decode 16 LE bytes into selection bounds (`start_row`, `start_col`, `end_row`, `end_col`).
 #[must_use]
+#[inline]
 pub const fn decode_selection_bounds_le(bytes: [u8; 16]) -> (i32, u32, i32, u32) {
     let sr = (bytes[0] as u32)
         | ((bytes[1] as u32) << 8)

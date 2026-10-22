@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · SYNTHETIC 2026-10-19, KEPT because no capture covers it: the lab's MEASURED notice captures (claude-2.1.304-update-notice-fullscreen-*/-inline-*, `lastReleaseNotesSeen` seeded older) never drew a one-shot notice between the card and the summary, and this case is what the reader's reach (NOTICE_REACH) is for. A private headless aterm (lab instance, 120x40, aterm 0.107.0) ran the real 2.1.304 store build by path with a scratch HOME, a fake API key and CLAUDE_CODE_FORCE_FIRST_LAUNCH=2.1.300, and drew the card, the remote-settings warning under it (wrapped at 120 columns) and the composer below (MEASURED), but no update notice (that variable does not make it draw; a seeded `lastReleaseNotesSeen` does); the notice rows are laid as the measured captures draw them (the bold summary and the dim details row at column 2), its counts illustrative · a one-shot notice (`Ca`, rendered before the summary in `_a`) between the card and the summary, the summary assumed to follow it with no blank row (the summary's Box has no margin)
+
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   ~/proj
+
+⚠ Remote managed settings failed to load (authentication rejected (401)) · no remote policy applied · /status for
+  details
+  Updated to latest. Got 9 features, 49 bugfixes, and 57 other changes.
+  code.claude.com/docs/en/changelog for details
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts

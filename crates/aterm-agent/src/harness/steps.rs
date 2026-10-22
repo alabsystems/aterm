@@ -724,7 +724,7 @@ pub fn notice_read(line: &str) -> Option<NoticeRead> {
 /// that sit near a row's start are looked for first: a result row (the
 /// bulk of a transcript's bytes) answers before any scan of its whole line
 /// (plan §9 M1).
-fn wants_parts(line: &str) -> bool {
+pub(super) fn wants_parts(line: &str) -> bool {
     [KEY_TOOL_USE_ID, KEY_TOOL_RESULT, KEY_TOOL_USE]
         .iter()
         .any(|k| quoted(line, k))

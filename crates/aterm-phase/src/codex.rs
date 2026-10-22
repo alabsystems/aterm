@@ -1,0 +1,244 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Andrew Yates
+
+//! Codex's composer, PLACED for the glass and never read: where aterm's glass
+//! draws the program's mark and the harness switch on a Codex pane (its top
+//! line). Presentation only — [`crate::reader::CodexReader`] keeps its
+//! identity-only policy (aterm's Codex screen lane was retired on
+//! 2026-10-16), and no phase, prompt, wall or supervisor decision reads
+//! this.
+//!
+//! **THE COMPOSER** (measured on 0.154.0, the first frame of
+//! `crates/aterm-effects/tests/fixtures/codex-particles-2026-09-16.ptylog`,
+//! [`fixtures::COMPOSER_0_154`]): Codex (ratatui, inline) draws its composer
+//! as a SLAB, three rows erased onto one tint (`48;2;45;47;51` on a dark
+//! ground): a blank pad row, the prompt row — `›` in column 0, a blank, the
+//! draft or the dim placeholder `Ask Codex to do anything` — and a blank pad
+//! row, then its footer (`  ? for shortcuts`) on the pane's own ground.
+//!
+//! ```text
+//! ╰───────────────────────────────────────╯    the session card
+//!                                              a blank row
+//! ·····································        the slab's top pad: the TOP LINE
+//! › Ask Codex to do anything                   the prompt row
+//! ·····································        the slab's bottom pad
+//!   ? for shortcuts                            the footer
+//! ```
+//!
+//! A choice list draws the same `›` as its pointer (`› 1. Yes, continue`,
+//! codex 0.155.1's trust gate), so a row whose `›` points at a numbered
+//! choice is no prompt row. A message already sent stands in the transcript
+//! as its own `›` row on the same tint, padded the same way, so the prompt
+//! is the screen's LAST `›` row in column 0 — and only while nothing under
+//! it is anything but the composer's own rows and its footer, every one
+//! blank or indented: where an approval, a picker or a question dialog
+//! (`  › 1. Short-term`, its pointer at column 2, measured on 0.163.0) takes
+//! the composer's place, or the transcript goes on below a `›` row
+//! (`• Ran ls` in column 0), the last `›` row is a sent message and there is
+//! no composer to name. Text alone never proves the slab: the row
+//! [`composer_pad`] names is a candidate the glass writes on only once the
+//! cells prove it (every cell a blank on one background that is not the
+//! pane's own and is the `›` row's).
+
+use crate::text::blank;
+
+/// The prompt glyph, in column 0 (U+203A).
+const PROMPT: char = '›';
+
+/// A prompt row: `›` in column 0, alone or before a blank, and not pointing
+/// at a numbered choice (`› 1. Yes, continue`: digits, `.`, a blank).
+fn is_prompt_row(row: &str) -> bool {
+    let Some(rest) = row.strip_prefix(PROMPT) else {
+        return false;
+    };
+    if crate::text::trim_end(rest).is_empty() {
+        return true;
+    }
+    let Some(rest) = rest.strip_prefix(' ') else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    !(digits > 0 && rest[digits..].starts_with(". "))
+}
+
+/// The row of the composer's top pad (module header): the blank row right
+/// above the prompt row, the LAST row with `›` in column 0. `None` with no
+/// such row; with that row a choice's pointer (`› 1. Yes, proceed`), never
+/// passed over for a sent message's `›` above it; with a row under it that
+/// opens with `›` at any indent (a choice's pointer: a question dialog's
+/// `  › 1. Short-term`) or holds anything in column 0 (the transcript, going
+/// on below a sent message); with the prompt row first on the screen; or
+/// with anything drawn on the row above it. Presentation only: a candidate
+/// whose cells the caller proves before it draws there.
+#[must_use]
+pub fn composer_pad(rows: &[String]) -> Option<usize> {
+    let prompt = rows.iter().rposition(|r| r.starts_with(PROMPT))?;
+    let under_is_composer = rows[prompt + 1..]
+        .iter()
+        .all(|r| !r.trim_start().starts_with(PROMPT) && r.chars().next().is_none_or(|c| c == ' '));
+    if !is_prompt_row(&rows[prompt]) || !under_is_composer {
+        return None;
+    }
+    let pad = prompt.checked_sub(1)?;
+    blank(&rows[pad]).then_some(pad)
+}
+
+/// The Codex screens the tests read, each with its program, version and
+/// provenance on its first line.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use crate::prompt::fixtures::rows;
+
+    /// codex 0.154.0's first frame (module header).
+    pub(crate) const COMPOSER_0_154: &str = include_str!("fixtures/codex-0.154.0-composer.txt");
+
+    /// codex 0.155.1's trust gate, measured.
+    pub(crate) fn codex_0_155_trust() -> Vec<String> {
+        rows(&[
+            "> You are in /Users//x/aterm",
+            "",
+            "  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of",
+            "  prompt injection. Trusting the directory allows project-local config, hooks, and exec policies to load.",
+            "",
+            "› 1. Yes, continue",
+            "  2. No, quit",
+            "",
+            "  Press enter to continue",
+        ])
+    }
+
+    /// codex 0.163.0's question dialog in the composer's place, under the
+    /// message that asked for it (measured 2026-10-16,
+    /// `aterm-lab`'s `codexs_question_dialog_is_no_composer`): its pointer
+    /// at column 2.
+    pub(crate) fn codex_0_163_question() -> Vec<String> {
+        rows(&[
+            "› QUESTION: plan the database migration",
+            "",
+            "  Question 1/1 (1 unanswered)",
+            "  Which rollout should the migration use?",
+            "",
+            "  › 1. Short-term (Recommended)  Patch it now, revisit later.",
+            "    2. Long-term                 Redesign the schema properly.",
+            "    3. None of the above         Optionally, add details in notes (tab)",
+            "",
+            "  tab to add notes | enter to submit answer | esc to interrupt",
+        ])
+    }
+
+    /// A turn running over the composer (the reader's sample).
+    pub(crate) fn working() -> Vec<String> {
+        rows(&[
+            "• Working (12s • esc to interrupt)",
+            "",
+            "› Ask Codex to do anything",
+            "",
+            "  gpt-5 · ~/src",
+        ])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::{COMPOSER_0_154, codex_0_155_trust, codex_0_163_question, working};
+    use super::*;
+    use crate::prompt::fixtures::{provenance, rows, screen};
+
+    /// THE COMPOSER'S TOP PAD is the blank row above the prompt: on the
+    /// reader's sample of a running turn and on 0.154.0's measured first
+    /// frame (the card, a blank row, the slab's pad, `›`, the pad, the
+    /// footer), and with a draft typed or wrapped, under the same `›`; a
+    /// transcript's earlier `›` row is passed over for the last one.
+    /// NEGATIVE CONTROLS: codex 0.155.1's trust gate (`› 1. Yes, continue`,
+    /// a choice's pointer) is refused, and so is a two-digit choice; so is a
+    /// sent message's `›` row, padded like the composer, over what took the
+    /// composer's place — an approval (`› 1. Yes, proceed`), 0.163.0's
+    /// question dialog (its pointer at column 2), the transcript going on
+    /// in column 0; the prompt row with text on the row above it, `›` first
+    /// on the screen, `›` not in column 0, `›` before a word with no blank,
+    /// and a screen with no `›` name no pad.
+    #[test]
+    fn codex_composer_pad_is_the_row_above_the_prompt() {
+        assert_eq!(composer_pad(&working()), Some(1));
+        let take = screen(COMPOSER_0_154);
+        assert!(provenance(COMPOSER_0_154).is_some_and(|p| p.starts_with("codex 0.154.0")));
+        let prompt = take
+            .iter()
+            .position(|r| r.starts_with("› Ask Codex to do anything"))
+            .expect("the prompt row");
+        assert_eq!(
+            (prompt, composer_pad(&take)),
+            (8, Some(7)),
+            "row 9 of the take is `›`, row 8 its pad"
+        );
+        assert!(take[6].is_empty() && take[5].starts_with('╰'), "{take:#?}");
+        let mut typed = take.clone();
+        typed[prompt] = "› think slowly".to_string();
+        assert_eq!(composer_pad(&typed), Some(7), "a draft");
+        let mut wrapped = take.clone();
+        wrapped[prompt] = "› a draft long enough to wrap onto".to_string();
+        wrapped.insert(prompt + 1, "  the next row".to_string());
+        assert_eq!(composer_pad(&wrapped), Some(7), "a wrapped draft");
+        let mut empty = take.clone();
+        empty[prompt] = "›".to_string();
+        assert_eq!(composer_pad(&empty), Some(7), "`›` alone");
+        let mut history = rows(&["› an earlier message", "", "• Ran ls"]);
+        history.extend(take.iter().cloned());
+        assert_eq!(composer_pad(&history), Some(10), "the last `›` row");
+
+        // NEGATIVE CONTROLS.
+        assert_eq!(composer_pad(&codex_0_155_trust()), None, "the trust gate");
+        let mut choice = codex_0_155_trust();
+        choice[5] = "› 12. Yes, continue".to_string();
+        assert_eq!(composer_pad(&choice), None, "a two-digit choice");
+        // A sent message over what took the composer's place: its pad is a
+        // blank row above a `›` row, as the composer's is.
+        let sent = |under: &[&str]| {
+            let mut screen = take[..prompt - 1].to_vec();
+            screen.extend(rows(&["", "› fix the tests", ""]));
+            screen.extend(rows(under));
+            screen
+        };
+        assert_eq!(
+            composer_pad(&sent(&["", "  ? for shortcuts"])),
+            Some(prompt - 1),
+            "CONTROL: the same rows as the composer name its pad"
+        );
+        assert_eq!(
+            composer_pad(&sent(&[
+                "",
+                "  Would you like to run the following command?",
+                "",
+                "› 1. Yes, proceed",
+                "  2. No, and tell Codex what to do differently",
+            ])),
+            None,
+            "an approval under a sent message"
+        );
+        let mut question = take[..prompt - 1].to_vec();
+        question.push(String::new());
+        question.extend(codex_0_163_question());
+        assert_eq!(
+            composer_pad(&question),
+            None,
+            "0.163.0's question dialog under a sent message"
+        );
+        assert_eq!(
+            composer_pad(&sent(&["", "• Ran ls", "  └ a b c"])),
+            None,
+            "the transcript going on under a sent message"
+        );
+        let mut under_text = take.clone();
+        under_text[7] = "• Working (3s • esc to interrupt)".to_string();
+        assert_eq!(composer_pad(&under_text), None, "text above the prompt");
+        assert_eq!(composer_pad(&take[prompt..]), None, "`›` first");
+        let mut indented = take.clone();
+        indented[prompt] = format!(" {}", take[prompt]);
+        assert_eq!(composer_pad(&indented), None, "`›` in column 1");
+        let mut glued = take.clone();
+        glued[prompt] = "›Ask Codex to do anything".to_string();
+        assert_eq!(composer_pad(&glued), None, "`›` before a word");
+        assert_eq!(composer_pad(&rows(&["% ls", "", "a b c"])), None);
+        assert_eq!(composer_pad(&[]), None);
+    }
+}

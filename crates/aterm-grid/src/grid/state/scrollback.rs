@@ -11,18 +11,21 @@ use super::GridStorage;
 
 impl GridStorage {
     /// Attach a scrollback buffer to this grid.
+    #[inline]
     pub fn attach_scrollback(&mut self, scrollback: impl Into<ScrollbackStorage>) {
         self.scrollback = Some(scrollback.into());
     }
 
     /// Get a reference to the scrollback storage, if attached.
     #[must_use]
-    pub fn scrollback(&self) -> Option<&ScrollbackStorage> {
+    #[inline]
+    pub const fn scrollback(&self) -> Option<&ScrollbackStorage> {
         self.scrollback.as_ref()
     }
 
     /// Get a mutable reference to the scrollback storage, if attached.
-    pub fn scrollback_mut(&mut self) -> Option<&mut ScrollbackStorage> {
+    #[inline]
+    pub const fn scrollback_mut(&mut self) -> Option<&mut ScrollbackStorage> {
         self.scrollback.as_mut()
     }
 
@@ -32,6 +35,7 @@ impl GridStorage {
     ///
     /// [`Grid::set_scrollback_line_limit`]: crate::Grid::set_scrollback_line_limit
     #[cfg(test)]
+    #[inline]
     pub fn set_store_line_limit(&mut self, limit: Option<usize>) {
         if let Some(scrollback) = &mut self.scrollback {
             scrollback.set_line_limit(limit);
@@ -44,6 +48,7 @@ impl GridStorage {
     /// round-trips; during an off-thread reflow, the detach-time value or the
     /// newest deferred mutation. Ring-only grids report the ring cap.
     #[must_use]
+    #[inline]
     pub fn scrollback_line_limit(&self) -> Option<usize> {
         if self.scrollback_detached_for_reflow
             && let Some(settings) = self.pending_scrollback_settings
@@ -65,6 +70,7 @@ impl GridStorage {
     /// Effective tiered-store byte budget, including a mutation deferred while
     /// the store is detached for off-thread reflow.
     #[must_use]
+    #[inline]
     pub fn scrollback_memory_budget(&self) -> Option<usize> {
         if self.scrollback_detached_for_reflow
             && let Some(settings) = self.pending_scrollback_settings
@@ -105,11 +111,12 @@ impl GridStorage {
     /// Ring buffer scrollback count (total_lines minus visible).
     #[must_use]
     #[inline]
-    pub fn ring_buffer_scrollback(&self) -> usize {
+    pub const fn ring_buffer_scrollback(&self) -> usize {
         self.total_lines.saturating_sub(self.visible_rows as usize)
     }
 
     #[must_use]
+    #[inline]
     pub(crate) fn ring_history_row(&self, ring_idx: usize) -> Option<&Row> {
         if ring_idx >= self.ring_buffer_scrollback() {
             return None;

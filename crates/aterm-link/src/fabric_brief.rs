@@ -296,7 +296,14 @@ fn read(cfg: &Config, opts: &BriefOpts) -> io::Result<Read> {
     r.from = head.saturating_sub(window);
     let mut at = r.from;
     while at < head && r.pages < WINDOW_MAX / u64::from(PAGE_MAX) + 16 {
-        let (rows, (next, _)) = conn.fetch(at, &ev, PAGE_MAX)?;
+        // A RETAINING BROKER (astream R4, `aterm link broker`'s default rules)
+        // keeps the `ev` faces for a bounded window: a window that reaches
+        // below what it keeps reads from its floor, and the fold starts there
+        // (a session whose open went with it is seeded from its next snapshot).
+        let ((rows, (next, _)), floor) = transport::fetch_kept(&mut conn, at, &ev, PAGE_MAX)?;
+        if let Some(floor) = floor {
+            r.from = r.from.max(floor);
+        }
         r.pages += 1;
         r.scanned = next.saturating_sub(r.from);
         for (off, subject, body) in rows {

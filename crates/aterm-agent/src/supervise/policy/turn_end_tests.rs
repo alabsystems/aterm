@@ -18631,6 +18631,247 @@ fn a_seeded_check_a_529_cut_is_typed_again_after_the_compaction() {
     }
 }
 
+/// A DONE CHECK A FULL CONTEXT CUT IN A LOOP BEFORE THIS ONE IS TYPED AGAIN AS
+/// THE COMPACTION'S CONTINUATION, as for the loop that typed it
+/// ([`TurnEndState::compact_owes`]). That wall writes no row: the books say
+/// the check's point was judged, or a `/compact` followed it. A `/compact`
+/// typed at the check's point owes its continuation the check
+/// ([`TurnEndState::seed_compact_check`]); the check's point read again as
+/// this loop's first, a full context there cut the check
+/// ([`TurnEndState::seed_check_point`]), so the `/compact` this loop types
+/// owes it. Without either, `keep going` went there. NEGATIVE CONTROLS: no
+/// seed; the check's point seeded but a turn ran since (this loop's first
+/// point is a later one).
+#[test]
+fn a_check_a_full_context_cut_before_this_loop_is_typed_again_after_the_compaction() {
+    let context = walled(WallKind::Context, "Context limit reached", None);
+    let compacted = idle("Conversation compacted.", Some(Duration::from_secs(40)));
+    let again = TurnEndAction::Type {
+        text: done_check_text(None, true),
+        rule_id: RULE_COMPACT,
+    };
+    // The `/compact` a loop before this one typed, its answer this loop's first point.
+    let mut st = TurnEndState::default();
+    st.seed_compact_check(RULE_DONE_CHECK);
+    assert_eq!(act(&mut st, &compacted, t0()), again, "the /compact's");
+    let cases = [
+        ("the check's point read again", Some(None), again),
+        ("control: no seed", None, typed(RULE_COMPACT)),
+        (
+            "control: a turn since the check's point",
+            Some(Some(4 * MIN)),
+            typed(RULE_COMPACT),
+        ),
+    ];
+    for (case, seed, want) in cases {
+        let mut st = TurnEndState::default();
+        let mut now = t0();
+        let mut first = context.clone();
+        if let Some(worked) = seed {
+            st.seed_point(Duration::from_secs(1), now);
+            st.seed_check_point(RULE_DONE_CHECK);
+            first.worked = worked;
+        }
+        let mut a = at(&mut st, &first, now);
+        for _ in 0..8 {
+            let TurnEndAction::WaitUntil { until, .. } = a else {
+                break;
+            };
+            now = until;
+            a = at(&mut st, &first, now);
+        }
+        assert!(
+            matches!(
+                a,
+                TurnEndAction::TypeCommand {
+                    rule_id: RULE_COMPACT,
+                    ..
+                }
+            ),
+            "{case}: {a:?}"
+        );
+        st.acted(&a, &first, now);
+        now += MIN;
+        assert_eq!(act(&mut st, &compacted, now), want, "{case}");
+    }
+}
+
+/// A LAND ACT A FULL CONTEXT CUT IN A LOOP BEFORE THIS ONE IS TYPED AGAIN AS
+/// THE COMPACTION'S CONTINUATION, as for the loop that typed it
+/// ([`TurnEndState::compact_owes`]): the instruction as the instruction, an
+/// answer as the answer ([`TurnEndState::seed_land_owed`]). That wall writes
+/// no row: the books say the act's point was judged, or a `/compact`
+/// followed it. A `/compact` typed at the act's point owes its continuation
+/// the act ([`TurnEndState::seed_compact_land`]); the act's point read again
+/// as this loop's first, a full context there cut the act
+/// ([`TurnEndState::seed_land_point`]), so the `/compact` this loop types
+/// owes it. Without the act named, a land nudge went there; without the
+/// seeds, the plain continuation. NEGATIVE CONTROLS: no seed; the act's
+/// point seeded but a turn ran since (this loop's first point is a later
+/// one); an act this loop typed since drops the act named.
+#[test]
+fn a_land_act_a_full_context_cut_before_this_loop_is_typed_again_after_the_compaction() {
+    let context = land(walled(WallKind::Context, "Context limit reached", None));
+    let compacted = land(idle(
+        "Conversation compacted.",
+        Some(Duration::from_secs(40)),
+    ));
+    let again = |text: String| TurnEndAction::Type {
+        text,
+        rule_id: RULE_COMPACT,
+    };
+    let nudge = again(land_nudge_text(None));
+    // The `/compact` a loop before this one typed, its answer this loop's first point.
+    for (rule, text) in [
+        (Some(RULE_LAND), land_text(None)),
+        (Some(RULE_LAND_ANSWER), land_answer_text(None)),
+        (Some(RULE_LAND_NUDGE), land_nudge_text(None)),
+        (None, land_nudge_text(None)),
+    ] {
+        let mut st = TurnEndState::default();
+        st.seed_land(0, false, false, false);
+        if let Some(rule) = rule {
+            st.seed_land_owed(rule);
+        }
+        st.seed_compact_land();
+        assert_eq!(act(&mut st, &compacted, t0()), again(text), "{rule:?}");
+    }
+    let cases = [
+        (
+            "the act's point read again",
+            true,
+            Some(None),
+            again(land_text(None)),
+        ),
+        ("the act unnamed", false, Some(None), nudge.clone()),
+        ("control: no seed", true, None, nudge.clone()),
+        (
+            "control: a turn since the act's point",
+            true,
+            Some(Some(4 * MIN)),
+            nudge.clone(),
+        ),
+    ];
+    // The `/compact` at a full context, past any wait: the time after it.
+    let compact_at = |st: &mut TurnEndState, r: &TurnEndReading, mut now: Instant, case: &str| {
+        let mut a = at(st, r, now);
+        for _ in 0..8 {
+            let TurnEndAction::WaitUntil { until, .. } = a else {
+                break;
+            };
+            now = until;
+            a = at(st, r, now);
+        }
+        assert!(
+            matches!(
+                a,
+                TurnEndAction::TypeCommand {
+                    rule_id: RULE_COMPACT,
+                    ..
+                }
+            ),
+            "{case}: {a:?}"
+        );
+        st.acted(&a, r, now);
+        now + MIN
+    };
+    for (case, named, seed, want) in cases {
+        let mut st = TurnEndState::default();
+        st.seed_land(0, false, false, false);
+        if named {
+            st.seed_land_owed(RULE_LAND);
+        }
+        let mut first = context.clone();
+        if let Some(worked) = seed {
+            st.seed_point(Duration::from_secs(1), t0());
+            st.seed_land_point();
+            first.worked = worked;
+        }
+        let now = compact_at(&mut st, &first, t0(), case);
+        assert_eq!(act(&mut st, &compacted, now), want, "{case}");
+    }
+    // CONTROL: an act this loop typed since names its own. A wall's continuation in Land's
+    // words under its own rule, its turn cut by a full context, is owed the nudge, as for the
+    // loop that typed it (no words kept for it).
+    let mut st = TurnEndState::default();
+    st.seed_land(0, false, false, false);
+    st.seed_land_owed(RULE_LAND);
+    let resume = TurnEndAction::Type {
+        text: land_nudge_text(None),
+        rule_id: RULE_LIMIT_RESUME,
+    };
+    st.acted(&resume, &land(idle("Stage 3 of 5 is in.", None)), t0());
+    let cut = land(walled(
+        WallKind::Context,
+        "Context limit reached",
+        Some(4 * MIN),
+    ));
+    let now = compact_at(&mut st, &cut, t0() + 4 * MIN, "a wall's continuation");
+    assert_eq!(
+        act(&mut st, &compacted, now),
+        nudge,
+        "a wall's continuation"
+    );
+
+    // A direct mode change ends Land's payload without losing the command's continuation.
+    // Cover both a restored compact and one this state actually typed and saw taken: the
+    // latter holds the answer's text in cut_text rather than in the seeded rule alone.
+    for restored in [true, false] {
+        for mode in [Autopilot::Land, Autopilot::Cruise, Autopilot::Off] {
+            let mut st = TurnEndState::default();
+            st.seed_land(0, false, false, false);
+            let now = t0();
+            let now = if restored {
+                st.seed_land_owed(RULE_LAND_ANSWER);
+                st.seed_compact_land();
+                now
+            } else {
+                let answer = TurnEndAction::Type {
+                    text: land_answer_text(None),
+                    rule_id: RULE_LAND_ANSWER,
+                };
+                st.acted(
+                    &answer,
+                    &land(idle("Should I merge the branch?", None)),
+                    now,
+                );
+                let cut = land(walled(
+                    WallKind::Context,
+                    "Context limit reached",
+                    Some(4 * MIN),
+                ));
+                let now = compact_at(&mut st, &cut, now + 4 * MIN, "the taken compact");
+                st.took();
+                now
+            };
+            let r = under(mode, compacted.clone());
+            let got = at(&mut st, &r, now);
+            let want = match mode {
+                Autopilot::Land => again(land_answer_text(None)),
+                Autopilot::Cruise => typed(RULE_COMPACT),
+                Autopilot::Off => TurnEndAction::Nothing,
+            };
+            assert_eq!(got, want, "restored={restored} mode={mode:?}");
+            if mode != Autopilot::Land {
+                // No act was typed while the word changed. Returning to Land begins a new
+                // episode; neither the seeded answer nor the retained answer text revives.
+                assert_eq!(
+                    at(&mut st, &compacted, now + MIN),
+                    again(land_text(None)),
+                    "restored={restored} after {mode:?}"
+                );
+            }
+        }
+    }
+    // A check belongs to Cruise too: leaving Land must preserve that compact's payload.
+    let mut st = TurnEndState::default();
+    st.seed_compact_check(RULE_DONE_CHECK);
+    assert_eq!(
+        at(&mut st, &under(Autopilot::Cruise, compacted), t0()),
+        again(done_check_text(None, true))
+    );
+}
+
 /// The task's face and the landed seed (`turn_end_face_tests.rs`; the
 /// Autopilot design's §9.4.2, §9.4.5).
 mod face {
@@ -18658,6 +18899,13 @@ mod land_reading {
 mod land_review {
     use super::*;
     include!("turn_end_land_review_tests.rs");
+}
+
+/// What agy reads back of a message the harness types into it, held to
+/// agy's measured screens (`turn_end_agy_message_tests.rs`).
+mod agy_messages {
+    use super::*;
+    include!("turn_end_agy_message_tests.rs");
 }
 
 /// An unknown cell is no point to type at and no draft to submit. Known

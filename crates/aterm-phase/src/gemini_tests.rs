@@ -740,17 +740,30 @@ fn the_accounts_usage_limit_dialog_names_its_reset_and_is_the_same_box() {
     assert!(roles(&p).iter().all(|&r| r == Role::Other));
 }
 
-/// The reset the account's dialog names is its clock less its zone (`5:06
-/// AM` of `Access resets at 5:06 AM PDT.`), the zone's short name dropped
-/// whatever it is and the CLI's no-break space read as a space; the
-/// supervisor waits for it before `Keep trying`. NEGATIVE CONTROLS: the
-/// per-day quota's dialog names none; the same row moved under the options
-/// (no part of the dialog's message), or on a screen with no dialog, names
-/// none; a row whose words are no reset's is not read as one.
+/// The reset as [`limit_reset`] reads it: `clock` and `zone`.
+fn reset_of(clock: &str, zone: Option<&str>) -> LimitReset {
+    LimitReset {
+        clock: clock.to_string(),
+        zone: zone.map(str::to_string),
+    }
+}
+
+/// The reset the account's dialog names is its clock AND the zone it is
+/// drawn in (`5:06 AM` in `PDT` of `Access resets at 5:06 AM PDT.`), the
+/// CLI's no-break space read as a space; the supervisor waits for it before
+/// `Keep trying`. The zone is kept whatever it is (the CLI's process may run
+/// in a zone other than aterm's: `TZ`, an `ssh`), and a row that ends at the
+/// clock names none. NEGATIVE CONTROLS: the per-day quota's dialog names
+/// none; the same row moved under the options (no part of the dialog's
+/// message), or on a screen with no dialog, names none; a row whose words
+/// are no reset's is not read as one.
 #[test]
 fn the_accounts_usage_limit_dialog_names_its_reset_by_its_clock() {
     let rows = screen(LIMIT_DIALOG_ACCOUNT);
-    assert_eq!(limit_reset(&rows).as_deref(), Some("5:06 AM"));
+    let read = limit_reset(&rows).expect("the reset");
+    assert_eq!(read, reset_of("5:06 AM", Some("PDT")));
+    assert_eq!(read.to_string(), "5:06 AM PDT");
+    assert_eq!(read.offset_s(), Some(-7 * 3600));
     let row = rows
         .iter()
         .find(|r| r.starts_with("│ Access resets at"))
@@ -765,16 +778,74 @@ fn the_accounts_usage_limit_dialog_names_its_reset_by_its_clock() {
         edited(&rows, "│ Access resets at", &format!("{body:<width$}│"))
     };
     assert_eq!(
-        limit_reset(&respelled("5:06 AM PDT", "5:06\u{202f}AM PDT")).as_deref(),
-        Some("5:06 AM")
+        limit_reset(&respelled("5:06 AM PDT", "5:06\u{202f}AM PDT")),
+        Some(reset_of("5:06 AM", Some("PDT")))
     );
+    // The zones the measure drew in other `TZ`s (Europe/Paris, Asia/Kolkata,
+    // UTC), each kept as drawn with its offset.
+    for (zone, offset) in [("GMT+2", 2 * 3600), ("GMT+5:30", 19_800), ("UTC", 0)] {
+        let read = limit_reset(&respelled("5:06 AM PDT", &format!("5:06 AM {zone}")));
+        assert_eq!(read, Some(reset_of("5:06 AM", Some(zone))), "{zone}");
+        assert_eq!(read.and_then(|r| r.offset_s()), Some(offset), "{zone}");
+    }
+    // A sentence that ends at the clock names no zone, and one no en-US
+    // short name spells names no offset.
+    let bare = limit_reset(&respelled("5:06 AM PDT.", "11:30 PM.")).expect("the reset");
+    assert_eq!(bare, reset_of("11:30 PM", None));
+    assert_eq!(bare.offset_s(), None);
+    let foreign = limit_reset(&respelled("5:06 AM PDT", "5:06 AM CEST")).expect("the reset");
+    assert_eq!(foreign, reset_of("5:06 AM", Some("CEST")));
+    assert_eq!(foreign.offset_s(), None);
+    // THE SENTENCE WRAPPED in a box narrower than it: its rest on the rows
+    // under it, read to its full stop — the zone, and the whole clock.
+    // NEGATIVE CONTROL: a row with no full stop over the next line's `/`
+    // command reads no further than itself.
+    let at = rows.iter().position(|r| *r == row).expect("the row");
+    let width = row.chars().count() - 1;
+    let boxed = |text: &str| format!("{:<width$}│", format!("│ {text}"));
+    let wrapped = |first: &str, rest: &[&str]| -> Vec<String> {
+        let mut w = rows.clone();
+        w[at] = boxed(first);
+        for (k, more) in rest.iter().enumerate() {
+            w.insert(at + 1 + k, boxed(more));
+        }
+        w
+    };
+    for (first, rest, clock, zone) in [
+        (
+            "Access resets at 11:05 PM",
+            &["PDT."][..],
+            "11:05 PM",
+            "PDT",
+        ),
+        (
+            "Access resets at 9:35 PM",
+            &["GMT+5:30."][..],
+            "9:35 PM",
+            "GMT+5:30",
+        ),
+        (
+            "Access resets at",
+            &["11:05\u{202f}PM", "EDT."][..],
+            "11:05 PM",
+            "EDT",
+        ),
+    ] {
+        let w = wrapped(first, rest);
+        assert_eq!(
+            prompt(&w).map(|p| p.kind),
+            Some(PromptKind::UsageLimit),
+            "PRECONDITION: still the dialog"
+        );
+        let read = limit_reset(&w);
+        assert_eq!(read, Some(reset_of(clock, Some(zone))), "{w:#?}");
+        assert!(read.and_then(|r| r.offset_s()).is_some(), "{zone}");
+    }
+    let cut = limit_reset(&wrapped("Access resets at 11:05 PM", &[])).expect("the reset");
     assert_eq!(
-        limit_reset(&respelled("5:06 AM PDT", "5:06 AM GMT+2")).as_deref(),
-        Some("5:06 AM")
-    );
-    assert_eq!(
-        limit_reset(&respelled("5:06 AM PDT.", "11:30 PM.")).as_deref(),
-        Some("11:30 PM")
+        cut,
+        reset_of("11:05 PM", None),
+        "the next line is no rest of it"
     );
     // NEGATIVE CONTROLS.
     assert_eq!(limit_reset(&screen(LIMIT_DIALOG)), None);
@@ -795,6 +866,69 @@ fn the_accounts_usage_limit_dialog_names_its_reset_by_its_clock() {
     assert_eq!(limit_reset(&under), None, "{under:#?}");
     let renamed = respelled("Access resets at", "Access ended at");
     assert_eq!(limit_reset(&renamed), None);
+}
+
+/// The zone a reset is drawn in reads as its offset, for every spelling the
+/// measure drew ([`zone_offset_s`]: `Intl.DateTimeFormat("en-US", …
+/// timeZoneName: "short")` over every IANA zone, January and July, as
+/// `node` printed them under `TZ=<zone>`: `5:06 AM PDT`, `9:36 AM GMT-2:30`,
+/// `1:51 AM GMT+13:45`, `3:06 AM HADT`, `12:06 PM GMT+0` for a `TZ` it does
+/// not know). NEGATIVE CONTROLS: names en-US never draws (another locale's
+/// `CEST`, `IST`, an IANA name, `BST`), and offsets no zone has or no
+/// `GMT±` form spells, read as none.
+#[test]
+fn the_dialogs_zone_names_read_as_their_offsets() {
+    let h = |n: i32| n * 3600;
+    for (zone, offset) in [
+        ("UTC", 0),
+        ("GMT", 0),
+        ("GMT+0", 0),
+        ("PST", h(-8)),
+        ("PDT", h(-7)),
+        ("MST", h(-7)),
+        ("MDT", h(-6)),
+        ("CST", h(-6)),
+        ("CDT", h(-5)),
+        ("EST", h(-5)),
+        ("EDT", h(-4)),
+        ("AKST", h(-9)),
+        ("AKDT", h(-8)),
+        ("HST", h(-10)),
+        ("HAST", h(-10)),
+        ("HADT", h(-9)),
+        ("AST", h(-4)),
+        ("ADT", h(-3)),
+        ("GMT+1", h(1)),
+        ("GMT+2", h(2)),
+        ("GMT+9", h(9)),
+        ("GMT+14", h(14)),
+        ("GMT-12", h(-12)),
+        ("GMT+5:30", h(5) + 1800),
+        ("GMT+5:45", h(5) + 2700),
+        ("GMT+13:45", h(13) + 2700),
+        ("GMT-2:30", -(h(2) + 1800)),
+        ("GMT-9:30", -(h(9) + 1800)),
+    ] {
+        assert_eq!(zone_offset_s(zone), Some(offset), "{zone}");
+    }
+    // NEGATIVE CONTROLS.
+    for zone in [
+        "CEST",
+        "IST",
+        "BST",
+        "America/Los_Angeles",
+        "pdt",
+        "GMT+15",
+        "GMT+5:3",
+        "GMT+5:60",
+        "GMT+",
+        "GMT5",
+        "GMT+123",
+        "GMT+-2",
+        "",
+    ] {
+        assert_eq!(zone_offset_s(zone), None, "{zone}");
+    }
 }
 
 /// The folder-trust dialog of a first run is a box no typing answers: a
@@ -2068,4 +2202,196 @@ fn the_frame_before_the_banner_is_idle_with_no_turn_and_not_fresh() {
     assert!(!ended.fresh);
     assert!(ended.said_tail.is_some());
     assert!(turn_opened_by(&screen(END_OF_TURN)).is_some());
+}
+
+/// GEMINI CLI'S TOP LINE ([`top_rule`], the row aterm's glass marks the
+/// program on): the live zone's `─` rule over the approval mode, as wide as
+/// the composer's band, in every capture whose composer has one — at rest,
+/// with a draft, busy, at a turn's end, narrow, under YOLO, under its
+/// sandbox, with a box kept over the composer, and with the UI details
+/// hidden under a non-default mode, which brings the rule back (module
+/// header) — and none with the UI details hidden at the default mode, nor
+/// where a box replaced the live zone. Swept over every capture: a row it
+/// names is a plain `─` rule with the band of its width under it, at most
+/// [`UNDER_RULE_ROWS`] rows down, its caret under its `▄`. NEGATIVE
+/// CONTROLS: the band's `▄` row and a sent message's band are offered and
+/// refused — the band's top is no rule the sweep would pass, the band with
+/// its rule taken away names no top line (not its `▄`), the sent message's
+/// band in `busy-streaming` (no rule over it) names none once the live
+/// zone's rule is gone, and a full-width rule laid right over that sent band
+/// is never the top line while the composer's rule stands.
+#[test]
+fn gemini_top_rule_is_the_live_zone_rule() {
+    /// The rule `top` names on `rows`, proven: a plain rule, the band of its
+    /// width under it within reach, the caret on the band's next row.
+    fn proven(rows: &[String], top: usize) -> bool {
+        plain_rule_width(&rows[top]).is_some_and(|w| {
+            (top + 1..=(top + UNDER_RULE_ROWS + 1).min(rows.len() - 1)).any(|t| {
+                run_of(&rows[t], BAND_TOP) == Some(w)
+                    && rows.get(t + 1).is_some_and(|r| is_caret_row(r))
+            })
+        })
+    }
+    for text in [
+        IDLE,
+        IDLE_CONTEXT,
+        DRAFT,
+        END_OF_TURN,
+        BUSY_THINKING,
+        BUSY_STREAMING,
+        NARROW_IDLE,
+        NARROW_DRAFT,
+        NARROW_BUSY,
+        NARROW_END_OF_TURN,
+        YOLO_IDLE,
+        YOLO_DRAFT,
+        YOLO_BUSY,
+        YOLO_END_OF_TURN,
+        HINT_OFF_IDLE,
+        SANDBOX_IDLE,
+        SANDBOX_NARROW_IDLE,
+        DRAWER_KEPT_BOX_SHELL,
+        DETAILS_HIDDEN_YOLO_IDLE,
+    ] {
+        let what = provenance(text).unwrap_or_default();
+        let rows = screen(text);
+        let top = top_rule(&rows).unwrap_or_else(|| panic!("a top rule: {what}"));
+        assert!(proven(&rows, top), "{what}: row {top} {:?}", rows[top]);
+        assert_eq!(
+            Some(top),
+            rows.iter().rposition(|r| plain_rule_width(r).is_some()),
+            "the last plain rule drawn: {what}"
+        );
+    }
+    for text in [
+        DETAILS_HIDDEN_IDLE,
+        DETAILS_HIDDEN_DRAFT,
+        DETAILS_HIDDEN_BUSY,
+        DETAILS_HIDDEN_END_OF_TURN,
+        DETAILS_HIDDEN_YOLO_DRAFT,
+        DETAILS_HIDDEN_BOX_SHELL,
+        HINT_OFF_DETAILS_HIDDEN_IDLE,
+        BOX_SHELL,
+        BOX_WRITE,
+        QUESTION,
+        TRUST,
+        EXIT,
+    ] {
+        let what = provenance(text).unwrap_or_default();
+        assert_eq!(top_rule(&screen(text)), None, "{what}");
+    }
+    for (name, text) in captures() {
+        let rows = screen(&text);
+        if let Some(top) = top_rule(&rows) {
+            assert!(proven(&rows, top), "{name}: row {top} {:?}", rows[top]);
+        }
+    }
+
+    // NEGATIVE CONTROLS. The band's `▄` row offered: no rule the sweep
+    // passes, and the band with its rule blanked names no top line at all.
+    let rows = screen(IDLE);
+    let band = caret_at(&rows) - 1;
+    assert_eq!(
+        run_of(&rows[band], BAND_TOP),
+        plain_rule_width(&rows[top_rule(&rows).expect("the rule")])
+    );
+    assert!(!proven(&rows, band), "the band's top is no rule");
+    let mut unruled = rows.clone();
+    unruled[top_rule(&rows).expect("the rule")] = String::new();
+    assert_eq!(top_rule(&unruled), None, "the band alone");
+    // A sent message's band (`> think slowly`, no rule over it) offered.
+    let rows = screen(BUSY_STREAMING);
+    let live = top_rule(&rows).expect("the live zone's rule");
+    let sent = rows
+        .iter()
+        .position(|r| r.starts_with(" > think slowly"))
+        .expect("the sent message")
+        - 1;
+    assert!(run_of(&rows[sent], BAND_TOP).is_some() && sent < live);
+    let mut unruled = rows.clone();
+    unruled[live] = String::new();
+    assert_eq!(top_rule(&unruled), None, "the sent band, no rule over it");
+    let mut planted = rows.clone();
+    planted[sent - 1] = "─".repeat(run_of(&rows[sent], BAND_TOP).expect("its width"));
+    assert_eq!(top_rule(&planted), Some(live), "a rule over the sent band");
+}
+
+/// THE ERROR A DIALOG'S `Stop` LEAVES ([`stopped_error`]): the usage-limit
+/// dialog's answered `2. Stop`, at 144 columns and wrapped at 72, and the
+/// no-access dialog's — `[API Error: An unknown error occurred.]`, no code,
+/// not retried. NEGATIVE CONTROLS: a 401 (Auth), the 400 of a key that is no
+/// key, a 403, and a retryable 5xx are no such error.
+#[test]
+fn the_error_a_dialogs_stop_leaves_is_read_as_such() {
+    for f in [
+        LIMIT_STOPPED,
+        NARROW_LIMIT_STOPPED,
+        NARROW_NO_ACCESS_STOPPED,
+    ] {
+        let w = wall(&screen(f)).expect("the turn's error");
+        assert!(stopped_error(&w), "{w:?}");
+    }
+    for f in [ERROR_401, ERROR_400_KEY, NARROW_ERROR_403] {
+        let w = wall(&screen(f)).expect("the turn's error");
+        assert!(!stopped_error(&w), "{w:?}");
+    }
+    let mut w = wall(&screen(LIMIT_STOPPED)).expect("the turn's error");
+    w.kind = WallKind::ApiError {
+        code: Some(503),
+        retryable: true,
+        cause: ApiCause::Server,
+    };
+    assert!(!stopped_error(&w));
+}
+
+/// A LONG PASTE IS DRAWN AS ITS CHIP ([`folded_paste`]): on the measured
+/// screen ([`FOLDED_PASTE`]) the composer holds `[Pasted Text: 538 chars]`
+/// alone, which is what `folded_paste` says for any 538-character text, and
+/// Gemini CLI's reader says the same ([`ScreenReader::folded_paste`]). The
+/// bounds are the bundle's: more than 500 UTF-16 code units (a character past
+/// the Basic Multilingual Plane counts two, and `\r\n` reads as one `\n`), or
+/// more than 5 lines (named by its lines). NEGATIVE CONTROLS: 500 units, 250
+/// emoji, 499 characters before a `\r\n` and 5 lines are drawn as typed
+/// (`None`), and no other program's reader folds a paste.
+#[test]
+fn a_long_paste_is_drawn_as_its_chip() {
+    let rows = screen(FOLDED_PASTE);
+    let (caret, lines) = composer_draft(&rows).expect("the composer");
+    assert_eq!(rows[caret], " > [Pasted Text: 538 chars]");
+    assert_eq!(lines, ["[Pasted Text: 538 chars]"]);
+    let text = "x".repeat(538);
+    assert_eq!(folded_paste(&text).as_deref(), Some(lines[0].as_str()));
+    assert_eq!(
+        crate::reader::GeminiReader.folded_paste(&text).as_deref(),
+        Some(lines[0].as_str())
+    );
+
+    assert_eq!(folded_paste(&"x".repeat(500)), None);
+    assert_eq!(
+        folded_paste(&"x".repeat(501)).as_deref(),
+        Some("[Pasted Text: 501 chars]")
+    );
+    assert_eq!(folded_paste(&"\u{1F600}".repeat(250)), None);
+    assert_eq!(
+        folded_paste(&"\u{1F600}".repeat(251)).as_deref(),
+        Some("[Pasted Text: 502 chars]")
+    );
+    assert_eq!(folded_paste(&format!("{}\r\n", "x".repeat(499))), None);
+    assert_eq!(
+        folded_paste(&format!("{}\r\n", "x".repeat(500))).as_deref(),
+        Some("[Pasted Text: 501 chars]")
+    );
+    assert_eq!(folded_paste("a\nb\nc\nd\ne"), None);
+    assert_eq!(
+        folded_paste("a\r\nb\rc\nd\ne\nf").as_deref(),
+        Some("[Pasted Text: 6 lines]")
+    );
+    for reader in [
+        &ClaudeReader as &dyn ScreenReader,
+        &CodexReader,
+        &AgyReader,
+        &MuseReader,
+    ] {
+        assert_eq!(reader.folded_paste(&text), None, "{:?}", reader.program());
+    }
 }

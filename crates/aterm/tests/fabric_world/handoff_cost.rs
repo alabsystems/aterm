@@ -83,8 +83,8 @@ fn quit(w: &mut World) {
 /// THE RUN WROTE.** Eight sessions in use leave sixteen torn-kind files
 /// written with no flush; the instance hands off: its bridge flushes nothing
 /// and leaves the run open, and its successor, on the same dir in the same
-/// boot, writes no run record. The successor then quits, and its clean stop
-/// flushes every one of the sixteen it inherited where it is (nothing
+/// boot, establishes its own durable OPEN fence. The successor then quits,
+/// and its clean stop flushes every one of the sixteen it inherited where it is (nothing
 /// rewritten), each by the barrier, and ends with one full flush.
 #[test]
 fn a_handoff_flushes_nothing_and_the_quit_after_it_flushes_the_run() {
@@ -147,10 +147,12 @@ fn a_handoff_flushes_nothing_and_the_quit_after_it_flushes_the_run() {
     w.wait_ready();
     let began = said(&w, before, "aterm-link: the run record says a bridge runs");
     eprintln!("MEASURED handoff, the successor's start: {began:?}");
-    assert!(
-        began.is_empty(),
-        "the run is open in this boot: no record to write"
+    assert_eq!(
+        began.len(),
+        1,
+        "the successor establishes its own OPEN fence"
     );
+    assert_eq!(number(&began[0], "full flushes"), 2);
 
     // ITS QUIT: a real one, and a clean stop of the run it inherited.
     let before = log_len(&w);

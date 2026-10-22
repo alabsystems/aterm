@@ -245,14 +245,20 @@ held to
 .B \-\-budget
 tokens; the sessions past it are counted
 .BR more=sessions: .
-It shows something only for a node whose bridge runs
-with
-.BR "[fabric] log = \(dqturns\(dq" :
-the default
-.B \(dqoff\(dq
-puts nothing of the session logs on the bus. With
+It shows the session logs of a node whose bridge mirrors them: by default
+.RB ( "[fabric] log = \(dqauto\(dq" )
+once its broker retains them, as
+.B aterm link broker
+does
+.RB ( "aterm ctl fabric status"
+says
+.B mirror=unretained
+where the broker retains nothing);
 .B \(dqturns\(dq
-each session's turns, runs, needs and the approval, question, wall and stall
+mirrors over any broker, and
+.B \(dqoff\(dq
+puts nothing of the session logs on the bus.
+Each session's turns, runs, needs and the approval, question, wall and stall
 steps they rise from go to its
 .B ev
 face as counts and closed words: no command line, title, cwd, note text or
@@ -262,11 +268,13 @@ never its sid (the hash keyed by a secret the node mints once).
 .B aterm fabric tail \-\-bodies
 prints such a record's wire fields, labelled by its
 .BR src= .
-Before the broker keeps a retention policy, a node stops
-mirroring at 256 MiB of records
-.RB ( "aterm ctl fabric status"
-says
-.BR mirror=capped ).
+Over a broker that retains its log, a node waits once its records in the
+broker's window reach 64 MiB, until the broker gives the oldest up
+.RB ( mirror=budget );
+with
+.B \(dqturns\(dq
+over a broker that retains nothing, it stops at 256 MiB of records
+.RB ( mirror=capped ).
 Closed sessions' records still held for a bridge that no longer mirrors are
 said there as
 .BR "mirror=unserved tails=" \fIk\fR.

@@ -303,27 +303,46 @@ pub(crate) struct PassCost {
     pub(crate) p99_us: f64,
 }
 
+/// What the pointer is on in a probed frame.
+#[cfg(feature = "bench-support")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pointer {
+    Off,
+    /// Autopilot's chip, a harness host drawing it.
+    Chip,
+    /// The branch fact, a harness host drawing the block its title takes.
+    Fact,
+}
+
 /// THE PROBE: for each kind of frame — at rest, a keystroke into the
 /// composer, a row Claude streams, a spinner's tick, and at rest with a
 /// harness host and the pointer on Autopilot's chip, whose title a hovered
-/// frame builds — `passes` footer passes timed (the frame's change and its
+/// frame builds, or on the branch fact, drawn lit with its title in the
+/// block's slot — `passes` footer passes timed (the frame's change and its
 /// extraction outside the timing), after a warm-up that grows every buffer
 /// the change grows.
 #[cfg(feature = "bench-support")]
 pub(crate) fn footer_pass_cost(passes: usize) -> Vec<PassCost> {
-    let kinds: [(&'static str, Option<Change>, bool); 5] = [
-        ("at rest", None, false),
-        ("keystroke", Some(keystroke), false),
-        ("streamed row", Some(streamed), false),
-        ("spinner tick", Some(spinner), false),
-        ("hovered chip", None, true),
+    let kinds: [(&'static str, Option<Change>, Pointer); 6] = [
+        ("at rest", None, Pointer::Off),
+        ("keystroke", Some(keystroke), Pointer::Off),
+        ("streamed row", Some(streamed), Pointer::Off),
+        ("spinner tick", Some(spinner), Pointer::Off),
+        ("hovered chip", None, Pointer::Chip),
+        ("hovered fact", None, Pointer::Fact),
     ];
     let mut out = Vec::with_capacity(kinds.len());
-    for (what, step, hovered) in kinds {
+    for (what, step, pointer) in kinds {
         let (mut app, wid, session) = probe_glass();
-        let _host = hovered.then(|| {
+        let _host = (pointer != Pointer::Off).then(|| {
             let host = hosted(&mut app);
-            app.hover_claude_chip(wid, Some((session, crate::claude_lights::Chip::Autopilot)));
+            match pointer {
+                Pointer::Chip => app
+                    .hover_claude_chip(wid, Some((session, crate::claude_lights::Chip::Autopilot))),
+                _ => {
+                    app.hover_claude_fact(wid, Some((session, crate::claude_lights::Fact::Branch)))
+                }
+            }
             host
         });
         let frame = |app: &mut App, i: usize| {

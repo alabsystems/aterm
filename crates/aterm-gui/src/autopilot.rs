@@ -41,6 +41,7 @@
 use std::sync::OnceLock;
 
 use aterm_agent::supervise::{Autopilot, SupervisorConfig};
+use aterm_effects::harness_card::CardPalette;
 
 use crate::{App, WindowId};
 
@@ -338,10 +339,40 @@ impl AutopilotView {
     }
 
     /// Whether the harness carries this session's work at all: Cruise or
-    /// Land. What the harness card is drawn for (§3).
+    /// Land. Where the harness's acts are shown; the harness's glass (the
+    /// card, the border) is [`Self::wears_glass`].
     #[must_use]
     pub(crate) const fn carries(self) -> bool {
         matches!(self, Self::Cruise | Self::Land)
+    }
+
+    /// The colours the harness's glass wears under this view (§3): Cruise's
+    /// spectrum, Land's sunset, Off's moonbow (white); none where no harness
+    /// runs ([`Self::MasterOff`], [`Self::Unhosted`], [`Self::AgentOff`]).
+    #[must_use]
+    pub(crate) const fn card_palette(self) -> Option<CardPalette> {
+        match self {
+            Self::Cruise => Some(CardPalette::Cruise),
+            Self::Land => Some(CardPalette::Land),
+            Self::Off => Some(CardPalette::Off),
+            Self::MasterOff | Self::Unhosted | Self::AgentOff(_) => None,
+        }
+    }
+
+    /// Whether, and in what colours, the harness's glass — the launch card,
+    /// the composer's border — is drawn for a session under this view, where
+    /// `supervised` says this window's host holds its live claim: Cruise and
+    /// Land only under that claim; Off with none, since Off stops the
+    /// session's worker, which gives the claim back (`harness_host`'s
+    /// `OffSessions`), so Off rests on the view alone — the view says a host
+    /// runs with the master switch and the agent's on. Never where no harness
+    /// runs.
+    #[must_use]
+    pub(crate) const fn wears_glass(self, supervised: bool) -> Option<CardPalette> {
+        match self {
+            Self::Cruise | Self::Land if !supervised => None,
+            _ => self.card_palette(),
+        }
     }
 
     /// The word a click writes ([`App::cycle_session_autopilot`]): the next
@@ -463,15 +494,42 @@ impl AutopilotView {
     }
 }
 
+/// THE ONE THEME PREDICATE of the harness's persistent glass — the
+/// composer's border, and the agents panel the harness paints: the session's
+/// palette where its glass is worn ([`AutopilotView::wears_glass`]), or, in
+/// a window with no host ([`AutopilotView::Unhosted`]) whose policy would
+/// supervise the agent were there one (`unhosted_on`: the master switch and
+/// the agent's own on, [`App::unhosted_glass`]) and whose session's own
+/// `word` is not Off, the word's (Land's sunset, else Cruise's spectrum: the
+/// border an unhosted window has always drawn). `None`: bare. The composer's
+/// top rule wears it only where a harness switch stands
+/// ([`HarnessSwitch::of`]): with no host it draws no harness border, and
+/// the unhosted arm themes the agents panel alone.
+#[must_use]
+pub(crate) fn harness_theme(
+    view: AutopilotView,
+    supervised: bool,
+    word: Option<Autopilot>,
+    unhosted_on: bool,
+) -> Option<CardPalette> {
+    view.wears_glass(supervised).or(match (view, word) {
+        (AutopilotView::Unhosted, _) if !unhosted_on => None,
+        (AutopilotView::Unhosted, Some(Autopilot::Off)) => None,
+        (AutopilotView::Unhosted, Some(Autopilot::Land)) => Some(CardPalette::Land),
+        (AutopilotView::Unhosted, _) => Some(CardPalette::Cruise),
+        _ => None,
+    })
+}
+
 /// THE HARNESS SWITCH (owner, 2026-10-20: "there needs to be an "on" button
-/// drawn for the claude harness"): the one on/off switch at the right of a
-/// hosted agent session's composer top rule, where ` ✦ alab kitty · claude
-/// harness ● on ` stands while the harness carries the session. In every
-/// state the harness does not carry it — the session's own Off, its agent's
-/// switch off, the master switch off — the same switch is drawn off, with
-/// an `on` button: `claude harness ○ off ▐ on ▌` (`claude_footer`'s
-/// `switch_face`). A window with no host has no switch: nothing there could
-/// turn a harness on.
+/// drawn for the claude harness"; 2026-10-21: "alab harness on"): the one
+/// on/off switch at the right of a hosted agent session's composer top rule,
+/// ` alab harness ● on ` while the harness carries the session — the CLI's
+/// lockup at the rule's left names the program. In every state the harness
+/// does not carry it — the session's own Off, its agent's switch off, the
+/// master switch off — the same switch is drawn off, with an `on` button:
+/// ` alab harness ○ off ▐ on ▌ ` (`claude_footer`'s `switch_face`). A window
+/// with no host has no switch: nothing there could turn a harness on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum HarnessSwitch {
     /// The harness carries the session (Cruise or Land): `● on` lit; a click
@@ -882,6 +940,20 @@ impl App {
         )
     }
 
+    /// Whether a window with no host wears the harness's glass for `agent`
+    /// ([`harness_theme`]'s `unhosted_on`): the policy in force would
+    /// supervise it were there a host — the master switch on, and the
+    /// agent's own. Off either way, an unhosted window's border and panel
+    /// stay bare, as a hosted one's do.
+    #[must_use]
+    pub(crate) fn unhosted_glass(&self, agent: Option<aterm_phase::Program>) -> bool {
+        matches!(
+            HarnessPosture::of(true, &self.harness_policy.get().policy, self.headless)
+                .for_agent(agent),
+            HarnessPosture::On(_)
+        )
+    }
+
     /// Publish [`Self::harness_posture`] into the session registry, for the
     /// readers off the main thread (the `sessions` roster). Called when the
     /// policy in force changes (`adopt_harness_policy`); the launch publishes
@@ -931,7 +1003,9 @@ impl App {
         local_id: u64,
         clock: &ClaimClock,
     ) -> (Option<Autopilot>, AutopilotView, bool) {
-        self.session_autopilot_for(local_id, self.session_agent(local_id), clock)
+        let (word, view, supervised, _) =
+            self.session_autopilot_for(local_id, self.session_agent(local_id), clock);
+        (word, view, supervised)
     }
 
     /// The agent session `local_id` publishes that the host supervises or
@@ -952,29 +1026,49 @@ impl App {
             .for_agent(self.session_agent(local_id))
     }
 
-    /// The footer already read this program under its one timeline guard.
+    /// [`Self::session_autopilot_on`] for an `agent` the caller already read
+    /// under its one timeline guard (the footer's), with a fourth answer only
+    /// the composer's top line reads: whether the live claim is a PROVEN
+    /// SELF-CLAIM (`SessionMeta::supervisor_proven`, [`crate::self_claim`]) —
+    /// codex-alab carrying itself, whose harness is ALab's though this
+    /// window's host holds no claim. Read in the same meta lock as the claim's
+    /// holder, on the pass's clock, which it reads only for a proven claim
+    /// with a lapse.
     pub(crate) fn session_autopilot_for(
         &self,
         local_id: u64,
         agent: Option<aterm_phase::Program>,
         clock: &ClaimClock,
-    ) -> (Option<Autopilot>, AutopilotView, bool) {
+    ) -> (Option<Autopilot>, AutopilotView, bool, bool) {
         #[cfg(test)]
         crate::work_counts::autopilot_read();
         let posture = self.harness_posture().for_agent(agent);
         let Some(session) = self.pool.get(local_id) else {
-            return (None, AutopilotView::of(posture, None), false);
+            return (None, AutopilotView::of(posture, None), false, false);
         };
-        let (word, supervised) = {
+        let (word, supervised, self_proven) = {
             let meta = session.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             // `SessionMeta::live_supervisor`'s rule, the clock read last.
-            let supervised = meta.supervisor.as_ref().is_some_and(|claim| {
-                claim.holder == own_holder()
-                    && claim.expires_us.is_none_or(|at| at > clock.now_us())
-            });
-            (meta.autopilot_word(), supervised)
+            let live = |claim: &crate::session_timeline::SupervisorClaim| {
+                claim.expires_us.is_none_or(|at| at > clock.now_us())
+            };
+            let supervised = meta
+                .supervisor
+                .as_ref()
+                .is_some_and(|claim| claim.holder == own_holder() && live(claim));
+            // `SessionMeta::supervisor_proven`'s rule, the same way.
+            let self_proven = meta
+                .supervisor
+                .as_ref()
+                .is_some_and(|claim| claim.proven.is_some() && live(claim));
+            (meta.autopilot_word(), supervised, self_proven)
         };
-        (word, AutopilotView::of(posture, word), supervised)
+        (
+            word,
+            AutopilotView::of(posture, word),
+            supervised,
+            self_proven,
+        )
     }
 
     /// Write session `local_id`'s own Autopilot word (`None`: unset it, and the
@@ -1338,9 +1432,9 @@ impl App {
         plan
     }
 
-    /// Open Settings ▸ Harness in window `wid` (the chip under the master
-    /// switch off, the Autopilot menu's `Harness settings…`, View ▸ Coding
-    /// Agent Harness…): the one Settings tab, raised there at the
+    /// Open Settings ▸ Harness in window `wid` (the no-host chip, the
+    /// Autopilot menu's `Harness settings…`, View ▸ Coding Agent Harness…,
+    /// the palette): the one Settings tab, raised there at the
     /// Harness route, and landed at `focus` (§10.3.3, item 8) — a session's
     /// row, drawn selected until the next press or scroll, SUPERVISION, or
     /// [`HarnessFocus::Top`], the page's top (§10.3.1: View ▸ Coding Agent
@@ -1611,6 +1705,45 @@ mod tests {
         assert!(AutopilotView::Cruise.carries() && AutopilotView::Land.carries());
         assert!(!AutopilotView::Off.carries() && !AutopilotView::MasterOff.carries());
         assert_eq!(AutopilotView::ALL.len(), 6);
+        // The glass (§3): Cruise and Land under this host's claim, Off with
+        // or without one (Off gives its claim back) in white, and nothing
+        // where no harness runs. The border's theme is the glass's, but in a
+        // window with no host, where the session's own word not Off gives
+        // the border its colours. CONTROL: an unclaimed Cruise is bare.
+        for view in AutopilotView::ALL {
+            for supervised in [false, true] {
+                let glass = match view {
+                    AutopilotView::Cruise if supervised => Some(CardPalette::Cruise),
+                    AutopilotView::Land if supervised => Some(CardPalette::Land),
+                    AutopilotView::Off => Some(CardPalette::Off),
+                    _ => None,
+                };
+                assert_eq!(view.wears_glass(supervised), glass, "{view:?} {supervised}");
+                for (word, unhosted_on) in [
+                    None,
+                    Some(Autopilot::Cruise),
+                    Some(Autopilot::Land),
+                    Some(Autopilot::Off),
+                ]
+                .into_iter()
+                .flat_map(|word| [(word, true), (word, false)])
+                {
+                    let theme = match (view, word) {
+                        (AutopilotView::Unhosted, _) if !unhosted_on => None,
+                        (AutopilotView::Unhosted, Some(Autopilot::Off)) => None,
+                        (AutopilotView::Unhosted, Some(Autopilot::Land)) => Some(CardPalette::Land),
+                        (AutopilotView::Unhosted, _) => Some(CardPalette::Cruise),
+                        _ => glass,
+                    };
+                    assert_eq!(
+                        harness_theme(view, supervised, word, unhosted_on),
+                        theme,
+                        "{view:?} {supervised} {word:?} {unhosted_on}"
+                    );
+                }
+            }
+        }
+        assert_eq!(AutopilotView::Cruise.wears_glass(false), None, "CONTROL");
     }
 
     /// AN AGENT'S OWN SWITCH OFF IS NAMED (§10.2.1, §10.2.5): for each
@@ -1925,11 +2058,66 @@ mod tests {
         assert!(supervised, "the actual claim remains visible");
         assert_eq!(view.wire(), "off", "Claude is denied by the host's policy");
         assert!(!view.carries(), "a stale claim does not admit a card");
+        assert!(
+            view.wears_glass(supervised).is_none(),
+            "a stale claim does not admit a card"
+        );
+        assert_eq!(
+            harness_theme(
+                view,
+                supervised,
+                word,
+                app.unhosted_glass(Some(aterm_phase::Program::Claude))
+            ),
+            None,
+            "nor the border"
+        );
         assert_eq!(app.harness_state().sessions[0].view.wire(), "off");
 
         publish_program(&app, "agy");
         assert_eq!(app.session_autopilot(0).1, AutopilotView::Cruise);
         assert_eq!(app.harness_state().sessions[0].view, AutopilotView::Cruise);
+    }
+
+    /// AN UNHOSTED WINDOW KEEPS THE SWITCHES (the cross-track review of
+    /// 2026-10-19): with no control socket nothing supervises, but its
+    /// border and panel wear the word's colours only where the policy in
+    /// force would supervise the agent — the master switch off, or Claude
+    /// Code's own switch off, leaves them bare, as a hosted window's are.
+    /// CONTROL: the default policy lights them, and Claude's switch off
+    /// leaves another agent's lit.
+    #[test]
+    fn an_unhosted_window_keeps_the_master_and_agent_switches() {
+        use aterm_phase::Program;
+        let claude = Some(Program::Claude);
+        for (toml, lit_claude, lit_agy) in [
+            ("[harness]\nheadless = true\n", true, true),
+            ("[harness]\nenabled = false\n", false, false),
+            (
+                "[harness]\nheadless = true\n[harness.claude]\nenabled = false\n",
+                false,
+                true,
+            ),
+        ] {
+            let mut app = App::headless_for_test();
+            assert!(app.harness.is_none(), "CONTROL: no host");
+            app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+                crate::app_config::HarnessPolicy::read(toml),
+            );
+            assert_eq!(app.unhosted_glass(claude), lit_claude, "{toml:?}: Claude");
+            assert_eq!(
+                app.unhosted_glass(Some(Program::Agy)),
+                lit_agy,
+                "{toml:?}: agy"
+            );
+            let (word, view, supervised) = app.session_autopilot(0);
+            assert_eq!(view, AutopilotView::Unhosted, "{toml:?}");
+            assert_eq!(
+                harness_theme(view, supervised, word, app.unhosted_glass(claude)).is_some(),
+                lit_claude,
+                "{toml:?}: the border"
+            );
+        }
     }
 
     #[test]
@@ -1978,7 +2166,7 @@ mod tests {
     /// chip's): Settings ▸ Harness, opened in the window it was pressed in
     /// (View ▸ Coding Agent Harness… opens it in the front one).
     #[test]
-    fn open_harness_settings_opens_the_page_the_chip_names() {
+    fn the_harness_page_opens_in_the_window_asked() {
         use crate::native_settings::SettingsRoute;
         let mut app = App::headless_for_test();
         assert!(

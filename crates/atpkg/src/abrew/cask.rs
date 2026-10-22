@@ -309,7 +309,10 @@ pub fn install(
                 cask.token
             )));
         } else {
-            println!("abrew: {} {} already installed", cask.token, inst.version);
+            eprintln!(
+                "Warning: {} {} is already installed",
+                cask.token, inst.version
+            );
             return Ok(inst.version);
         }
     }
@@ -359,7 +362,7 @@ pub fn install(
     // stale bytes under the current version.
     let reusable = cask.sha256.is_some() && fetch::verify_sha256(&dest, expected).is_ok();
     if !reusable {
-        println!("==> Fetching cask {} ({})", cask.token, cask.version);
+        eprintln!("==> Fetching cask {} ({})", cask.token, cask.version);
         fetch::curl_to_file(&cask.url, &dest, &[])?;
     }
     fetch::verify_sha256(&dest, expected)?;

@@ -997,6 +997,19 @@ pub struct SubscriptionDisplay {
     pub plan: Option<String>,
     /// Its weekly quota, only while the selected account's cached sample is current.
     pub weekly: Option<String>,
+    /// The screen reading's placed reset, retained after expiry so an
+    /// unchanged card cannot revive the same window.
+    pub weekly_reset: Option<WeeklyReset>,
+}
+
+/// One reset occurrence, placed when the card is first observed. The words
+/// distinguish a later window without re-placing a relative time on every read.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct WeeklyReset {
+    /// The card's reset words, which identify the observed window.
+    pub words: String,
+    /// Unknown words or local offset leave the occurrence unplaced.
+    pub at: Option<i64>,
 }
 
 /// THE PLAN AS A DATED FACT (`docs/DESIGN-stats-deck-v2-2026-10-20.md` §8.4): the
@@ -1103,17 +1116,25 @@ pub fn subscription_and_plan_for(
 /// store, `muse/auth.json` under the config home its environment names
 /// (`XDG_CONFIG_HOME`, else `~/.config`; MEASURED on 1.4.11-R6667.1,
 /// where the `meta` provider's row carries `user_email` beside its
-/// `oauth` mechanism and the credential itself in the keychain). The
+/// `oauth` mechanism and the credential itself in the keychain), for a
+/// process on the Meta provider alone: an explicit `--provider` or
+/// `-c provider=…` in its argv, else its global `settings.json`'s
+/// `provider`, else Muse Code's own `meta` default. The
 /// tier and the weekly quota are not in the store; the window reads
 /// those off Muse Code's own `/status` and `/usage` cards
 /// (`aterm_phase::muse::status_card_account`,
 /// `aterm_phase::muse::usage_card_weekly`). `None` where the process
-/// runs on an API key (`META_API_KEY` in its environment: its `/status`
-/// card then names no account), no store reads, or its `meta` row names
-/// no address: nothing shown rather than guessed, and the address is
-/// returned only as this display, never logged or recorded.
+/// runs on another provider, on an API key (`META_API_KEY` in its
+/// environment: its `/status` card then names no account), no store
+/// reads, or its `meta` row names no address: nothing shown rather
+/// than guessed, and the address is returned only as this display,
+/// never logged or recorded.
 #[must_use]
-pub fn muse_subscription_for(env: &[String], user_home: &Path) -> Option<SubscriptionDisplay> {
+pub fn muse_subscription_for(
+    argv: &[String],
+    env: &[String],
+    user_home: &Path,
+) -> Option<SubscriptionDisplay> {
     let var = |key: &str| {
         env.iter()
             .find_map(|entry| entry.strip_prefix(key)?.strip_prefix('='))
@@ -1127,8 +1148,31 @@ pub fn muse_subscription_for(env: &[String], user_home: &Path) -> Option<Subscri
         _ => var("HOME")
             .map_or_else(|| user_home.to_path_buf(), PathBuf::from)
             .join(".config"),
+    }
+    .join("muse");
+    let provider = match muse_provider_arg(argv) {
+        Some(provider) => Some(provider),
+        None => match read_with(&config.join("settings.json"), |bytes| {
+            let Obj(raw) = aterm_json::from_slice::<Obj<RawMuseSettings>>(bytes)
+                .map_err(|_| NoProfile::Unreadable)?;
+            match raw.ok_or(NoProfile::Unreadable)?.provider {
+                Leaf::Absent => Ok(None),
+                Leaf::Text(word) => Ok(word.map(|word| word.as_str().to_ascii_lowercase())),
+                _ => Err(NoProfile::Unreadable),
+            }
+        }) {
+            Ok(provider) => provider,
+            Err(NoProfile::Missing) => None,
+            Err(_) => return None,
+        },
     };
-    let email = read_with(&config.join("muse").join("auth.json"), |bytes| {
+    if provider
+        .as_deref()
+        .is_some_and(|provider| provider != "meta")
+    {
+        return None;
+    }
+    let email = read_with(&config.join("auth.json"), |bytes| {
         let Obj(raw) =
             aterm_json::from_slice::<Obj<RawMuseAuth>>(bytes).map_err(|_| NoProfile::Unreadable)?;
         let meta = raw.and_then(|auth| auth.providers.0).and_then(|p| p.meta.0);
@@ -1145,7 +1189,50 @@ pub fn muse_subscription_for(env: &[String], user_home: &Path) -> Option<Subscri
         email: Some(email),
         plan: None,
         weekly: None,
+        weekly_reset: None,
     })
+}
+
+/// The provider a Muse Code command line names (`--provider` in either
+/// spelling, a `-c`/`--config provider=…` for this run; the last one
+/// named, as its launch flags read), lower-cased. Words after `--` are
+/// its prompt, not its flags.
+fn muse_provider_arg(argv: &[String]) -> Option<String> {
+    let config_provider = |spec: &str| {
+        let (key, value) = spec.split_once('=')?;
+        (key.trim() == "provider")
+            .then(|| value.trim().trim_matches('"').trim().to_ascii_lowercase())
+    };
+    let mut provider = None;
+    let mut i = 0;
+    while let Some(arg) = argv.get(i) {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--provider" {
+            provider = argv.get(i + 1).map(|value| value.to_ascii_lowercase());
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--provider=") {
+            provider = Some(value.to_ascii_lowercase());
+        } else if matches!(arg.as_str(), "-c" | "--config") {
+            if let Some(named) = argv.get(i + 1).and_then(|spec| config_provider(spec)) {
+                provider = Some(named);
+            }
+            i += 2;
+            continue;
+        } else if let Some(named) = arg
+            .strip_prefix("-c=")
+            .or_else(|| arg.strip_prefix("--config="))
+            .or_else(|| arg.strip_prefix("-c"))
+            .and_then(config_provider)
+        {
+            provider = Some(named);
+        }
+        i += 1;
+    }
+    provider.filter(|provider| !provider.is_empty())
 }
 
 /// One read of a process's selected profile ([`selected_profile`]).
@@ -1259,6 +1346,7 @@ impl Selected {
             email: self.email.take(),
             plan,
             weekly,
+            weekly_reset: None,
         }
     }
 
@@ -1907,6 +1995,15 @@ struct RawMuseMeta {
     mechanism: Address,
     #[serde(rename = "user_email")]
     email: Address,
+}
+
+/// Muse Code's global `settings.json`, its `provider` alone kept: what
+/// tells a Meta-account process from an `echo` or `local` one running
+/// under the same login store.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawMuseSettings {
+    provider: Leaf,
 }
 
 /// The email-only allowlist shared by the login check and volatile footer display.

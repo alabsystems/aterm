@@ -44,6 +44,7 @@ impl Script {
 
     /// The ISO 15924 code.
     #[must_use]
+    #[inline]
     pub const fn code(self) -> [u8; 4] {
         self.0
     }
@@ -152,6 +153,7 @@ impl GeneralCategory {
 
     /// `Mn`, `Mc` or `Me`.
     #[must_use]
+    #[inline]
     pub const fn is_mark(self) -> bool {
         matches!(
             self,
@@ -161,6 +163,7 @@ impl GeneralCategory {
 
     /// `Lu`, `Ll`, `Lt`, `Lm` or `Lo`.
     #[must_use]
+    #[inline]
     pub const fn is_letter(self) -> bool {
         matches!(
             self,
@@ -175,6 +178,7 @@ impl GeneralCategory {
 
 /// The value of the run table entry that covers `c`: the last entry whose
 /// start is at or below it. Entry 0 starts at U+0000, so one always does.
+#[inline]
 fn run_value(runs: &[u32], c: char) -> u8 {
     let cp = u32::from(c);
     let at = runs.partition_point(|&e| (e >> 8) <= cp);
@@ -184,6 +188,7 @@ fn run_value(runs: &[u32], c: char) -> u8 {
 
 /// The `Script` property of `c`.
 #[must_use]
+#[inline]
 pub fn script(c: char) -> Script {
     let index = usize::from(run_value(&SCRIPT_RUNS, c));
     SCRIPT_CODES
@@ -197,6 +202,7 @@ pub fn script(c: char) -> Script {
 /// last at U+10FFFF, so [`script`] of a code point is the script of the last
 /// run that starts at or below it. For a caller that counts which of many code
 /// points carry a script (a font's cmap) without a lookup per code point.
+#[inline]
 pub fn script_runs() -> impl Iterator<Item = (u32, Script)> {
     SCRIPT_RUNS.iter().map(|&e| {
         let index = usize::from((e & 0xFF) as u8);
@@ -210,6 +216,7 @@ pub fn script_runs() -> impl Iterator<Item = (u32, Script)> {
 
 /// The `General_Category` property of `c`.
 #[must_use]
+#[inline]
 pub fn general_category(c: char) -> GeneralCategory {
     let index = usize::from(run_value(&GENERAL_CATEGORY_RUNS, c));
     GeneralCategory::ALL

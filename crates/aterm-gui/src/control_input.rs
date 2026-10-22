@@ -866,6 +866,9 @@ pub(crate) struct InputFence<'a> {
     pub fp: Option<u64>,
     /// `if-human=<n>` — the session's person-gesture count must still be this.
     pub human: Option<u64>,
+    /// The published foreground identity the decision belongs to. Checked
+    /// after the terminal fence, with the timeline held through delivery.
+    pub foreground: Option<&'a crate::session_timeline::ForegroundStamp>,
     /// Match `guard` against the CURSOR's row only, not every visible row.
     /// The guarded submit's binding: a composer holds the cursor, a select
     /// box does not, and a transcript row that happens to match (Claude Code
@@ -886,6 +889,7 @@ impl InputFence<'_> {
             || self.generation.is_some()
             || self.fp.is_some()
             || self.human.is_some()
+            || self.foreground.is_some()
             || self.entering_command
     }
 
@@ -1025,14 +1029,29 @@ pub(crate) fn input_if_fenced_observed(
         InputEvent::KeySequence(bytes) => bytes.clone(),
         _ => return GuardedInput::Pressed(Delivery::BusyZero),
     };
+    // frame -> terminal -> timeline, the status sweep's same leaf-lock order.
+    // Keep publication still only through the bounded sink write; receipt
+    // publication and completion callbacks run after this leaf is released.
+    let foreground = fence.foreground.map(|_| {
+        ctx.timeline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    });
+    if let Some(expected) = fence.foreground
+        && foreground.as_ref().and_then(|tl| tl.foreground_stamp()) != Some(*expected)
+    {
+        return GuardedInput::Changed;
+    }
     crate::note_unseamed_control_input(&ev);
     let echo_write = ctx.output_echo.begin_event(&ev);
     if bytes.is_empty() {
         // A faithful no-op (a legacy release): nothing to deliver, nothing owed.
+        drop(foreground);
         echo_write.finish_delivery(Delivery::Full, None, &ctx.sink);
         return GuardedInput::Pressed(Delivery::Full);
     }
     let (outcome, accepted_order) = ctx.sink.try_write_frame_whole_with_receipt(&bytes);
+    drop(foreground);
     let delivery = match outcome {
         // Queued: the rest rides the spill right behind the accepted prefix,
         // accepted for ordered delivery as a spilled frame is (`Delivery::Full`).

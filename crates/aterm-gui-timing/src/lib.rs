@@ -67,6 +67,7 @@ impl Timing {
 
     /// The length to wait for a wait whose production length is `production`.
     #[must_use]
+    #[inline]
     pub const fn of(self, production: Duration) -> Duration {
         if self.divisor == 1 || production.is_zero() {
             return production;
@@ -83,6 +84,7 @@ impl Timing {
     /// disk), whose test value must still leave the OS its time under load.
     /// The production length is `production`, whatever the floor.
     #[must_use]
+    #[inline]
     pub const fn of_at_least(self, production: Duration, floor: Duration) -> Duration {
         let scaled = self.of(production);
         if self.divisor == 1 || scaled.as_nanos() >= floor.as_nanos() {
@@ -96,12 +98,14 @@ impl Timing {
 
     /// Whether this is [`Timing::FAST`].
     #[must_use]
+    #[inline]
     pub const fn is_fast(self) -> bool {
         self.divisor != 1
     }
 
     /// Return this timing mode's divisor (`1` for production, `1000` for fast).
     #[must_use]
+    #[inline]
     pub const fn divisor(self) -> u32 {
         self.divisor
     }
@@ -111,6 +115,7 @@ impl Timing {
     /// [`Timing::FAST`] divides by `1000`, clamping any non-zero wait to at
     /// least `1` ms so a cadence loop never spins.
     #[must_use]
+    #[inline]
     pub const fn scale_millis(self, production_ms: u64) -> u64 {
         if self.divisor <= 1 || production_ms == 0 {
             return production_ms;
@@ -121,6 +126,7 @@ impl Timing {
 
     /// Scale `production_ms`, clamping the scaled wait to `[min(floor_ms, production_ms), production_ms]`.
     #[must_use]
+    #[inline]
     pub const fn scale_millis_at_least(self, production_ms: u64, floor_ms: u64) -> u64 {
         let scaled = self.scale_millis(production_ms);
         if self.divisor <= 1 || scaled >= floor_ms {
@@ -136,6 +142,7 @@ impl Timing {
     /// capped at `cap_ms`, with `shift` clamped to `<= 20`) and scale it by
     /// `self`.
     #[must_use]
+    #[inline]
     pub const fn exponential_backoff_ms(self, base_ms: u64, attempt: u32, cap_ms: u64) -> u64 {
         let shift = if attempt > 20 { 20 } else { attempt };
         let raw = base_ms.saturating_mul(1u64 << shift);
@@ -146,6 +153,7 @@ impl Timing {
     /// Encode `(self, production_ms, floor_ms)` into a 20-byte little-endian
     /// wire snapshot (`divisor: u32, production_ms: u64, floor_ms: u64`).
     #[must_use]
+    #[inline]
     pub const fn encode_cadence_wire_le(self, production_ms: u64, floor_ms: u64) -> [u8; 20] {
         let d = self.divisor.to_le_bytes();
         let p = production_ms.to_le_bytes();
@@ -160,6 +168,7 @@ impl Timing {
     /// [`Self::encode_cadence_wire_le`], accepting only canonical divisors (`1`
     /// or `1000`).
     #[must_use]
+    #[inline]
     pub const fn decode_cadence_wire_le(wire: &[u8; 20]) -> Option<(Self, u64, u64)> {
         let divisor = u32_le(wire[0], wire[1], wire[2], wire[3]);
         let timing = match divisor {
@@ -179,6 +188,7 @@ impl Timing {
     /// Encode `(self, production_ms, floor_ms)` into a 20-byte big-endian
     /// wire snapshot (`divisor: u32, production_ms: u64, floor_ms: u64`).
     #[must_use]
+    #[inline]
     pub const fn encode_cadence_wire_be(self, production_ms: u64, floor_ms: u64) -> [u8; 20] {
         let d = self.divisor.to_be_bytes();
         let p = production_ms.to_be_bytes();
@@ -193,6 +203,7 @@ impl Timing {
     /// [`Self::encode_cadence_wire_be`], accepting only canonical divisors (`1`
     /// or `1000`).
     #[must_use]
+    #[inline]
     pub const fn decode_cadence_wire_be(wire: &[u8; 20]) -> Option<(Self, u64, u64)> {
         let divisor = u32_be(wire[0], wire[1], wire[2], wire[3]);
         let timing = match divisor {

@@ -47,23 +47,25 @@ struct Cell {
 }
 
 impl Cell {
-    fn open(col: usize, base: char, wide: bool) -> Self {
+    #[inline]
+    const fn open(col: usize, base: char, wide: bool) -> Self {
         Self {
             col,
             base,
             wide,
-            ris: u8::from(is_regional_indicator(base)),
+            ris: is_regional_indicator(base) as u8,
             joined: 0,
             ends_zwj: false,
         }
     }
 
     /// Store `c` after the base, as `CellExtra::add_combining` does.
-    fn store(&mut self, c: char) {
+    #[inline]
+    const fn store(&mut self, c: char) {
         if self.joined < MAX_JOINED {
             self.joined += 1;
             self.ends_zwj = c == ZWJ;
-            self.ris = self.ris.saturating_add(u8::from(is_regional_indicator(c)));
+            self.ris = self.ris.saturating_add(is_regional_indicator(c) as u8);
         }
     }
 
@@ -75,7 +77,8 @@ impl Cell {
     /// only to Extended_Pictographic, and no ASCII character is one): neither
     /// the run writer (`print_ascii_bulk`) nor `write_char` under IRM, DECAWM
     /// off or a national charset.
-    fn folds(&self, c: char) -> bool {
+    #[inline]
+    const fn folds(&self, c: char) -> bool {
         (is_skin_tone_modifier(c) && self.wide && is_emoji_modifier_base(self.base))
             || (is_regional_indicator(c) && is_regional_indicator(self.base) && self.ris < 2)
             || (self.ends_zwj && !c.is_ascii())
@@ -111,6 +114,7 @@ pub enum GridStep {
 impl GridStep {
     /// Columns the cursor advanced.
     #[must_use]
+    #[inline]
     pub const fn advance(self) -> usize {
         match self {
             Self::Opens { width, .. } => width,
@@ -162,6 +166,7 @@ impl GridColumns {
     /// A walk from a line's first column, East Asian Ambiguous characters one
     /// cell wide (the terminal's default).
     #[must_use]
+    #[inline]
     pub const fn new() -> Self {
         Self::with_ambiguous_width(AmbiguousWidth::Single)
     }
@@ -170,6 +175,7 @@ impl GridColumns {
     /// wide as `ambiguous` says: two cells under [`AmbiguousWidth::Double`],
     /// as the grid writes them with `ambiguous_width = "wide"`.
     #[must_use]
+    #[inline]
     pub const fn with_ambiguous_width(ambiguous: AmbiguousWidth) -> Self {
         Self {
             cursor: 0,
@@ -180,11 +186,13 @@ impl GridColumns {
 
     /// The cursor column: the cells everything fed so far occupies.
     #[must_use]
+    #[inline]
     pub const fn column(&self) -> usize {
         self.cursor
     }
 
     /// Lay out `c` after everything fed so far.
+    #[inline]
     pub fn step(&mut self, c: char) -> GridStep {
         let width = match self.ambiguous {
             AmbiguousWidth::Double => unicode_tables::char_width_cjk(c),
@@ -222,6 +230,7 @@ impl GridColumns {
     }
 
     /// Lay out every character of `s`; returns the columns the cursor advanced.
+    #[inline]
     pub fn advance_str(&mut self, s: &str) -> usize {
         let before = self.cursor;
         for c in s.chars() {
@@ -237,12 +246,14 @@ impl GridColumns {
 /// Can exceed `s`'s display width: a Devanagari conjunct is one UAX #29
 /// cluster the grid paints in three cells (`न्`, `द`, `ी`).
 #[must_use]
+#[inline]
 pub fn str_grid_columns(s: &str) -> usize {
     str_grid_columns_with(s, AmbiguousWidth::Single)
 }
 
 /// [`str_grid_columns`] under the terminal's `ambiguous_width` policy.
 #[must_use]
+#[inline]
 pub fn str_grid_columns_with(s: &str, ambiguous: AmbiguousWidth) -> usize {
     GridColumns::with_ambiguous_width(ambiguous).advance_str(s)
 }
@@ -276,6 +287,7 @@ pub struct GridGraphemes<'a> {
 impl<'a> Iterator for GridGraphemes<'a> {
     type Item = GridGrapheme<'a>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let (byte_offset, text) = self.clusters.next()?;
         let mut start_col = self.grid.column();
@@ -304,6 +316,7 @@ impl<'a> Iterator for GridGraphemes<'a> {
 /// `ය` of Sinhala `ක්‍ය`, the second `👍` of `👍‍‍👍`) adds no column and is
 /// drawn in the cell it joined.
 #[must_use]
+#[inline]
 pub fn grid_graphemes(s: &str) -> GridGraphemes<'_> {
     grid_graphemes_with(s, AmbiguousWidth::Single)
 }
@@ -312,6 +325,7 @@ pub fn grid_graphemes(s: &str) -> GridGraphemes<'_> {
 /// [`AmbiguousWidth::Double`] an East Asian Ambiguous character (`→`, `─`,
 /// `°`) is drawn in two columns, as the grid writes it.
 #[must_use]
+#[inline]
 pub fn grid_graphemes_with(s: &str, ambiguous: AmbiguousWidth) -> GridGraphemes<'_> {
     GridGraphemes {
         clusters: s.grapheme_indices(),

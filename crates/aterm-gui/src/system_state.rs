@@ -21,58 +21,23 @@ use crate::native_ui::{
     SemanticValue, StyleRef, SwitchSpec, TextFieldSpec, TextSpec, UiContent, UiKey, UiNode, UiTree,
 };
 
-/// Static Toastbyte art from the shared kitty baker over the existing rainbow
-/// banner. Horizontal color runs keep this small decoration inexpensive.
-pub(crate) fn paint_brand_kitty(
-    prims: &mut Vec<crate::widget::DrawPrim>,
-    rect: crate::native_ui::LogicalRect,
-) {
-    static ART: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    let art = ART.get_or_init(|| {
-        use aterm_effects::cat_baker::{ResolvedFills, bake_variant};
-        bake_variant(
-            aterm_effects::cat_glyphs_gen::CatGlyphId::SpecStretch,
-            &ResolvedFills::from_indices(8, 4, false),
-            84,
-            54,
-        )
-        .pixels()
-        .to_vec()
-    });
-    let scale = (rect.height / 54.0).min(rect.width / 100.0).max(0.0);
-    let left = rect.right() - 84.0 * scale - 8.0;
-    let top = rect.y + (rect.height - 54.0 * scale) / 2.0;
-    for y in 0..54 {
-        let mut x = 0;
-        while x < 84 {
-            let pixel = &art[(y * 88 + x) * 4..(y * 88 + x + 1) * 4];
-            let mut end = x + 1;
-            while end < 84 && &art[(y * 88 + end) * 4..(y * 88 + end + 1) * 4] == pixel {
-                end += 1;
-            }
-            if pixel[3] != 0 {
-                prims.push(crate::widget::DrawPrim::Panel {
-                    x: left + x as f32 * scale,
-                    y: top + y as f32 * scale,
-                    w: (end - x) as f32 * scale,
-                    h: scale,
-                    radius: 0.0,
-                    fill: [pixel[0], pixel[1], pixel[2], pixel[3]],
-                });
-            }
-            x = end;
-        }
-    }
-}
 use crate::workstation_setup::{Clock, Request, SetupAnswer, WorkstationSetupDecision};
 
 /// A non-secret snapshot published by setup's worker.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SetupStatus {
     pub plan: Option<Plan>,
+    pub check: Option<SetupCheck>,
     pub permissions: Option<InitialSetupPermissionPolicy>,
     pub busy: bool,
     pub finished: bool,
+    pub rows: Vec<SetupStatusRow>,
+}
+
+/// A read-only observation of one exact reviewed checklist and vault source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupCheck {
+    pub plan: Plan,
     pub rows: Vec<SetupStatusRow>,
 }
 
@@ -92,29 +57,42 @@ pub struct SetupStatusRow {
 }
 
 impl SetupStatus {
-    pub(crate) fn needs_attention(&self) -> bool {
+    fn rows_for(
+        &self,
+        plan: Option<&Plan>,
+    ) -> impl DoubleEndedIterator<Item = &SetupStatusRow> + Clone {
+        let check = self
+            .check
+            .as_ref()
+            .filter(|check| plan.is_none_or(|plan| check.plan == *plan));
+        self.rows
+            .iter()
+            .chain(check.into_iter().flat_map(|check| check.rows.iter()))
+    }
+
+    pub(crate) fn needs_attention(&self, plan: Option<&Plan>) -> bool {
         !self.busy
-            && self.rows.iter().any(|row| {
+            && self.rows_for(plan).any(|row| {
                 matches!(
                     row.status.as_str(),
-                    "blocked" | "error" | "failed" | "unverified" | "not started"
+                    "drift" | "blocked" | "error" | "failed" | "unverified" | "not started"
                 )
             })
     }
 
-    fn summary(&self) -> Option<String> {
-        let preferred = self
-            .rows
-            .iter()
+    fn summary(&self, plan: Option<&Plan>) -> Option<String> {
+        let mut rows = self.rows_for(plan);
+        let preferred = rows
+            .clone()
             .filter_map(|row| {
                 let priority = match row.status.as_str() {
                     "not started" => 5,
                     "error" | "failed" => 4,
                     "unverified" => 3,
-                    "blocked" => 2,
-                    "pending" if !row.detail.is_empty() => 2,
+                    "drift" | "blocked" => 2,
+                    "pending" if !row.detail.is_empty() => 1,
                     "running" => 1,
-                    "ok" | "applied" | "stopped" => 0,
+                    "ok" | "applied" | "restored" | "stopped" => 0,
                     _ => return None,
                 };
                 Some((priority, row))
@@ -136,9 +114,7 @@ impl SetupStatus {
         }
         if self.busy {
             return Some(
-                self.rows
-                    .iter()
-                    .rfind(|row| row.status == "running")
+                rows.rfind(|row| row.status == "running")
                     .map_or_else(|| "Working…".to_owned(), SetupStatusRow::words),
             );
         }
@@ -238,13 +214,18 @@ impl Password {
         {
             return;
         }
-        let count = text.as_str().map_or(0, |text| text.graphemes().count());
+        let inserted_end = start + text.len();
         let mut bytes = Vec::with_capacity(old.len() - (end - start) + text.len());
         bytes.extend_from_slice(&old[..start]);
         bytes.extend_from_slice(text.as_slice());
         bytes.extend_from_slice(&old[end..]);
         self.value = Some(SecretBytes::new(bytes));
-        self.head = self.anchor.min(self.head) + count;
+        // Insertion can join clusters on either side, as when a combining mark
+        // follows a letter or a joiner connects two emoji. Resolve the caret in
+        // the resulting value, at the first whole-cluster boundary after it.
+        self.head = self
+            .boundaries()
+            .partition_point(|boundary| *boundary < inserted_end);
         self.anchor = self.head;
     }
 
@@ -257,13 +238,21 @@ impl Password {
                 self.head = self.count();
             }
             TextInputEvent::Left { extend } | TextInputEvent::WordLeft { extend } => {
-                self.head = self.head.saturating_sub(1);
+                self.head = if !extend && self.anchor != self.head {
+                    self.anchor.min(self.head)
+                } else {
+                    self.head.saturating_sub(1)
+                };
                 if !extend {
                     self.anchor = self.head;
                 }
             }
             TextInputEvent::Right { extend } | TextInputEvent::WordRight { extend } => {
-                self.head = (self.head + 1).min(self.count());
+                self.head = if !extend && self.anchor != self.head {
+                    self.anchor.max(self.head)
+                } else {
+                    (self.head + 1).min(self.count())
+                };
                 if !extend {
                     self.anchor = self.head;
                 }
@@ -364,11 +353,14 @@ impl SystemStateApp {
         }
     }
 
+    pub(crate) fn can_offer(&self) -> bool {
+        !self.status.busy
+            && !self.request.as_ref().is_some_and(Request::pending)
+            && !self.has_unsubmitted_changes()
+    }
+
     pub(crate) fn offer(&mut self, request: Request) -> bool {
-        if self.status.busy
-            || self.request.as_ref().is_some_and(Request::pending)
-            || self.has_unsubmitted_changes()
-        {
+        if !request.pending() || !self.can_offer() {
             request.finish(WorkstationSetupDecision::Unavailable);
             return false;
         }
@@ -403,6 +395,21 @@ impl SystemStateApp {
 
     pub(crate) fn take_action(&mut self) -> Option<SystemStateAction> {
         self.actions.pop_front()
+    }
+
+    /// Final-view disposal transfers explicit cancellation to the host before
+    /// the form's remaining deferred actions are dropped.
+    pub(crate) fn take_queued_cancel(&mut self) -> bool {
+        let before = self.actions.len();
+        self.actions
+            .retain(|action| !matches!(action, SystemStateAction::Cancel));
+        self.actions.len() != before
+    }
+
+    pub(crate) fn has_queued_cancel(&self) -> bool {
+        self.actions
+            .iter()
+            .any(|action| matches!(action, SystemStateAction::Cancel))
     }
 
     pub(crate) fn interact(&mut self) {
@@ -443,6 +450,12 @@ impl SystemStateApp {
         self.request.as_ref().is_some_and(Request::pending)
     }
 
+    pub(crate) fn offered_request_matches(&self, request: &Request) -> bool {
+        self.request
+            .as_ref()
+            .is_some_and(|current| current.pending() && current.same_offer(request))
+    }
+
     fn has_unsubmitted_changes(&self) -> bool {
         (self.pending() && self.clock.interacted())
             || !self.password.text().is_empty()
@@ -462,10 +475,14 @@ impl SystemStateApp {
         self.actions.push_back(SystemStateAction::Cancel);
     }
 
-    fn reviewed_plan(&self) -> Plan {
+    pub(crate) fn reviewed_plan(&self) -> Plan {
         let mut plan = self.plan.clone();
         plan.vault_url = self.url.value().trim().to_owned();
         plan
+    }
+
+    pub(crate) fn needs_attention(&self) -> bool {
+        self.status.needs_attention(Some(&self.reviewed_plan()))
     }
 
     fn apply(&mut self) {
@@ -487,6 +504,7 @@ impl SystemStateApp {
                 decision: WorkstationSetupDecision::Begin(plan),
                 password,
                 receipt: None,
+                cancel_receipt: None,
             }));
     }
 
@@ -571,6 +589,17 @@ impl NativeAppModel for SystemStateApp {
         event: AppEvent,
         cx: &mut UpdateCx<'_>,
     ) -> EventResult {
+        let shared = match &event {
+            AppEvent::FocusChanged(_) => false,
+            AppEvent::ScrollLines(_) | AppEvent::ScrollAt { .. } | AppEvent::ScrollPage(_) => {
+                self.clock_repaint || (self.pending() && !self.clock.interacted())
+            }
+            #[cfg(any(a11y_tree, test))]
+            AppEvent::RevealControl(_) => {
+                self.clock_repaint || (self.pending() && !self.clock.interacted())
+            }
+            _ => true,
+        };
         let handled = match event {
             AppEvent::FocusChanged(focus) => {
                 view.common.last_focus = focus;
@@ -578,10 +607,11 @@ impl NativeAppModel for SystemStateApp {
             }
             AppEvent::ScrollLines(lines) | AppEvent::ScrollAt { lines, .. } => {
                 self.interact();
-                view.scroll = view
-                    .scroll
-                    .saturating_add_signed(lines as isize)
-                    .min((Setting::ALL.len() + self.status.rows.len()).saturating_sub(1));
+                view.scroll = view.scroll.saturating_add_signed(lines as isize).min(
+                    (Setting::ALL.len()
+                        + self.status.rows_for(Some(&self.reviewed_plan())).count())
+                    .saturating_sub(1),
+                );
                 true
             }
             AppEvent::ScrollPage(direction) => {
@@ -589,7 +619,11 @@ impl NativeAppModel for SystemStateApp {
                 view.scroll = view
                     .scroll
                     .saturating_add_signed((direction as isize) * 5)
-                    .min((Setting::ALL.len() + self.status.rows.len()).saturating_sub(1));
+                    .min(
+                        (Setting::ALL.len()
+                            + self.status.rows_for(Some(&self.reviewed_plan())).count())
+                        .saturating_sub(1),
+                    );
                 true
             }
             #[cfg(any(a11y_tree, test))]
@@ -603,15 +637,7 @@ impl NativeAppModel for SystemStateApp {
                 if text_input_interacts(&event) {
                     self.interact();
                 }
-                if event == TextInputEvent::Submit
-                    && view
-                        .common
-                        .last_focus
-                        .as_ref()
-                        .is_some_and(|key| key.as_str() == "system-state/apply")
-                {
-                    self.apply();
-                } else if event != TextInputEvent::Cancel {
+                if event != TextInputEvent::Cancel {
                     self.field_event(
                         view.common.last_focus.as_ref().map_or("", UiKey::as_str),
                         event,
@@ -634,14 +660,17 @@ impl NativeAppModel for SystemStateApp {
                 self.interact();
                 let key = action.id.as_str();
                 if key == "system-state/apply" {
+                    cx.retire_review();
                     self.apply();
                 } else if key == "system-state/cancel" {
+                    cx.retire_review();
                     self.cancel();
                 } else if key == "system-state/check" && !self.status.busy {
                     let plan = self.reviewed_plan();
                     self.status.busy = true;
                     self.actions.push_back(SystemStateAction::Check(plan));
                 } else if key == "system-state/restore" && !self.status.busy {
+                    cx.retire_review();
                     self.status.busy = true;
                     self.actions.push_back(SystemStateAction::Restore);
                 } else if let Some(row) = key
@@ -692,7 +721,11 @@ impl NativeAppModel for SystemStateApp {
         };
         if handled {
             view.common.presentation_revision = view.common.presentation_revision.wrapping_add(1);
-            cx.repaint(crate::native_app::DamageRegion::All);
+            if shared {
+                cx.repaint_instance(crate::native_app::DamageRegion::All);
+            } else {
+                cx.repaint(crate::native_app::DamageRegion::All);
+            }
             EventResult::Handled
         } else {
             EventResult::Bubble
@@ -705,16 +738,20 @@ impl NativeAppModel for SystemStateApp {
         let compact = width < 720.0;
         let padding = if compact { 12.0 } else { 24.0 };
         let inner = (width - padding * 2.0).max(1.0);
-        let summary = self.status.summary();
+        let reviewed_plan = self.reviewed_plan();
+        let summary = self.status.summary(Some(&reviewed_plan));
+        let guidance = if self.pending() && !self.clock.interacted() {
+            "Click, type or scroll to stop automatic Apply."
+        } else {
+            "Choose your Mac settings, then Apply."
+        };
         let (help, help_h) = wrapped_text(
             if summary.is_some() {
                 "system-state/summary"
             } else {
                 "system-state/help"
             },
-            summary.as_deref().unwrap_or(
-                "Review your Mac setup. Click, type or scroll to stop the timer, then Apply.",
-            ),
+            summary.as_deref().unwrap_or(guidance),
             StyleRef::Secondary,
             inner,
             summary.is_some().then_some(3),
@@ -793,7 +830,7 @@ impl NativeAppModel for SystemStateApp {
                 row_h,
             ));
         }
-        for (index, row) in self.status.rows.iter().enumerate() {
+        for (index, row) in self.status.rows_for(Some(&reviewed_plan)).enumerate() {
             let (node, height) = wrapped_text(
                 format!("system-state/status/{index}"),
                 &row.words(),
@@ -927,12 +964,12 @@ impl NativeAppModel for SystemStateApp {
                     .height(Length::Fill),
             ),
             UiNode::new(
-                "system-state/rainbow-kitty",
+                "system-state/rainbow",
                 UiContent::Custom(AuditedCustomNode {
                     audit_id: RAINBOW_BANNER_AUDIT,
                     role: SemanticRole::Text,
-                    label: "A rainbow and aterm's Toastbyte kitty".to_owned(),
-                    value: Some("system-state-kitty".to_owned()),
+                    label: "aterm rainbow banner".to_owned(),
+                    value: None,
                     action: None,
                     focusable: false,
                     focused: false,
@@ -996,7 +1033,7 @@ impl NativeAppModel for SystemStateApp {
             indicators: AppIndicators {
                 dirty: self.has_unsubmitted_changes(),
                 busy: self.status.busy,
-                attention: self.status.needs_attention(),
+                attention: self.needs_attention(),
             },
             closable: true,
             tooltip: Some("System State".to_owned()),
@@ -1180,7 +1217,7 @@ mod tests {
                 ..SetupStatus::default()
             });
             assert!(!app.presentation(&view).indicators.attention);
-            assert!(app.status.summary().is_none());
+            assert!(app.status.summary(None).is_none());
         }
         for status in ["pending", "running", "ok", "applied", "stopped"] {
             app.publish(SetupStatus {
@@ -1193,7 +1230,7 @@ mod tests {
             });
             assert!(!app.presentation(&view).indicators.attention);
             if status == "pending" {
-                assert!(app.status.summary().is_none());
+                assert!(app.status.summary(None).is_none());
             }
         }
         app.publish(SetupStatus {
@@ -1209,11 +1246,274 @@ mod tests {
     }
 
     #[test]
+    fn check_results_follow_the_reviewed_plan_across_linked_views() {
+        use crate::native_app::{ActionInvocation, ViewMotionCx};
+        use crate::native_ui::LogicalRect;
+        let viewport = LogicalRect::new(0.0, 0.0, 999.0, 740.0);
+        for (key, changed, restored) in [
+            (
+                "system-state/url",
+                SemanticInput::Text("http://other.local:7484/v1/team".into()),
+                SemanticInput::Text(format!("  {}  ", Plan::default().vault_url)),
+            ),
+            (
+                "system-state/setting/5",
+                SemanticInput::Bool(false),
+                SemanticInput::Bool(true),
+            ),
+        ] {
+            let mut app = SystemStateApp::new(Plan::default());
+            let status = SetupStatus {
+                plan: Some(Plan::default()),
+                finished: true,
+                check: Some(SetupCheck {
+                    plan: Plan::default(),
+                    rows: vec![SetupStatusRow {
+                        name: "Check: Secrets vault".into(),
+                        status: "blocked".into(),
+                        detail: "approval code CHECK42".into(),
+                    }],
+                }),
+                rows: vec![SetupStatusRow {
+                    name: "Previous preferences".into(),
+                    status: "applied".into(),
+                    detail: "saved result DURABLE17".into(),
+                }],
+                ..SetupStatus::default()
+            };
+            app.publish(status.clone());
+            app.password
+                .input(TextInputEvent::Commit("private-draft".into()));
+            let (mut runtime, instance, first) = runtime_with_app(app);
+            let second = ViewId::from_stored(2);
+            runtime
+                .attach_view(second, instance, AppViewState::SystemState(Box::default()))
+                .unwrap();
+            assert!(
+                runtime
+                    .presentation(instance, second)
+                    .unwrap()
+                    .indicators
+                    .attention
+            );
+            runtime
+                .dispatch(
+                    instance,
+                    first,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(key),
+                        value: Some(changed),
+                    }),
+                )
+                .unwrap();
+            // Ordinary polls must not reinstall observations of a different
+            // reviewed URL or checklist in either shared view.
+            runtime.publish_system_state(status.clone());
+            for view in [first, second] {
+                assert!(
+                    !runtime
+                        .presentation(instance, view)
+                        .unwrap()
+                        .indicators
+                        .attention
+                );
+                let compiled = runtime
+                    .render(
+                        instance,
+                        view,
+                        &ViewCx {
+                            viewport,
+                            animation_phase_ms: 0,
+                            motion: ViewMotionCx::default(),
+                            terminal_font_px: 13.0,
+                            terminal_scale: 1.0,
+                            semantic_font: None,
+                            document: None,
+                        },
+                    )
+                    .unwrap()
+                    .compile(viewport)
+                    .unwrap();
+                assert!(
+                    compiled
+                        .semantics
+                        .iter()
+                        .all(|node| !node.label.contains("CHECK42"))
+                );
+                assert!(
+                    compiled
+                        .semantics
+                        .iter()
+                        .any(|node| node.label.contains("DURABLE17"))
+                );
+            }
+            let app = runtime.system_state_mut().unwrap();
+            assert_eq!(app.password.projection().text, "•".repeat(13));
+            assert!(app.has_unsubmitted_changes());
+            // A different current worker failure remains actionable even while
+            // an old read-only observation is irrelevant to the edited plan.
+            let mut failed = status.clone();
+            failed.rows.push(SetupStatusRow {
+                name: "Restore preferences".into(),
+                status: "failed".into(),
+                detail: "recovery result ERROR19".into(),
+            });
+            runtime.publish_system_state(failed);
+            assert!(
+                runtime
+                    .presentation(instance, second)
+                    .unwrap()
+                    .indicators
+                    .attention
+            );
+            let app = runtime.system_state_mut().unwrap();
+            let summary = app.status.summary(Some(&app.reviewed_plan())).unwrap();
+            assert!(summary.contains("ERROR19"));
+            assert!(!summary.contains("CHECK42"));
+            runtime
+                .dispatch(
+                    instance,
+                    second,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(key),
+                        value: Some(restored),
+                    }),
+                )
+                .unwrap();
+            runtime.publish_system_state(status);
+            assert!(
+                runtime
+                    .presentation(instance, first)
+                    .unwrap()
+                    .indicators
+                    .attention
+            );
+        }
+    }
+
+    #[test]
+    fn status_results_show_check_drift_over_historical_success() {
+        let mut app = SystemStateApp::new(Plan::default());
+        let result = SetupStatusRow {
+            name: "Check: current setting".into(),
+            status: "drift".into(),
+            detail: "observed value differs: DIFF42".into(),
+        };
+        app.publish(SetupStatus {
+            finished: true,
+            rows: vec![
+                SetupStatusRow {
+                    name: "Previous preferences".into(),
+                    status: "applied".into(),
+                    detail: String::new(),
+                },
+                result.clone(),
+            ],
+            ..SetupStatus::default()
+        });
+        assert!(
+            app.presentation(&SystemStateViewState::default())
+                .indicators
+                .attention
+        );
+        let summary = app.status.summary(None).unwrap();
+        assert!(summary.contains(&result.name));
+        assert!(summary.contains(&result.status));
+        assert!(summary.contains(&result.detail));
+
+        let mut interrupted = app.status.clone();
+        interrupted.finished = false;
+        interrupted.rows.insert(
+            0,
+            SetupStatusRow {
+                name: "Previous attempt".into(),
+                status: "pending".into(),
+                detail: "INTERRUPTED17: an older attempt did not finish".into(),
+            },
+        );
+        assert!(
+            !SetupStatus {
+                rows: vec![interrupted.rows[0].clone()],
+                ..SetupStatus::default()
+            }
+            .needs_attention(None)
+        );
+        app.publish(interrupted);
+        assert!(app.status.summary(None).unwrap().contains(&result.detail));
+        assert!(
+            app.presentation(&SystemStateViewState::default())
+                .indicators
+                .attention
+        );
+
+        let approval = SetupStatusRow {
+            name: "Secrets vault".into(),
+            status: "blocked".into(),
+            detail: "approve code ABC123".into(),
+        };
+        app.status.rows.insert(0, approval.clone());
+        assert!(app.status.summary(None).unwrap().contains(&approval.detail));
+        app.status.busy = true;
+        let active = SetupStatusRow {
+            name: "Current pass".into(),
+            status: "running".into(),
+            detail: "MEASURE17".into(),
+        };
+        app.status.rows.push(active.clone());
+        assert!(
+            !app.presentation(&SystemStateViewState::default())
+                .indicators
+                .attention
+        );
+        assert!(app.status.summary(None).unwrap().contains(&active.detail));
+    }
+
+    #[test]
+    fn status_results_show_successful_restore_over_the_durable_stop() {
+        let mut app = SystemStateApp::new(Plan::default());
+        let result = SetupStatusRow {
+            name: "Original preference".into(),
+            status: "restored".into(),
+            detail: "saved value loaded: RESTORE42".into(),
+        };
+        app.publish(SetupStatus {
+            finished: true,
+            rows: vec![
+                SetupStatusRow {
+                    name: "Selected Mac settings".into(),
+                    status: "stopped".into(),
+                    detail: "restoration requested".into(),
+                },
+                result.clone(),
+            ],
+            ..SetupStatus::default()
+        });
+        assert!(
+            !app.presentation(&SystemStateViewState::default())
+                .indicators
+                .attention
+        );
+        let summary = app.status.summary(None).unwrap();
+        assert!(summary.contains(&result.name));
+        assert!(summary.contains(&result.status));
+        assert!(summary.contains(&result.detail));
+    }
+
+    #[test]
     fn result_and_approval_guidance_stays_visible_above_an_unscrolled_checklist() {
         use crate::native_app::ViewMotionCx;
         use crate::native_ui::LogicalRect;
         let viewport = LogicalRect::new(0.0, 0.0, 999.0, 740.0);
         for (row, complete, busy) in [
+            (
+                SetupStatusRow {
+                    name: "Check: current setting".into(),
+                    status: "drift".into(),
+                    detail: "DRIFT42: observed value differs".into(),
+                },
+                true,
+                false,
+            ),
             (
                 SetupStatusRow {
                     name: "Restore preferences".into(),
@@ -1617,6 +1917,55 @@ mod tests {
             Some(SystemStateAction::Apply(_))
         ));
         assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn password_edit_incremental_clusters_keep_a_valid_caret_and_delete_whole() {
+        for (initial, insertion, middle) in [
+            ("e", "\u{301}", false),
+            ("👩👩", "\u{200d}", true),
+            ("🇺", "🇸", false),
+        ] {
+            let mut password = Password::default();
+            password.input(TextInputEvent::Commit(initial.into()));
+            if middle {
+                password.input(TextInputEvent::Left { extend: false });
+            }
+            password.input(TextInputEvent::Commit(insertion.into()));
+            let projection = password.projection();
+            assert_eq!(projection.text, "•");
+            assert_eq!(projection.selection, TextSelection::caret("•".len()));
+            password.input(TextInputEvent::Backspace);
+            assert!(password.projection().text.is_empty());
+            assert!(password.take().is_none());
+        }
+    }
+
+    #[test]
+    fn password_edit_arrows_collapse_either_selection_before_typing() {
+        for (right, reverse) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut password = Password::default();
+            password.input(TextInputEvent::Commit("aβz".into()));
+            if reverse {
+                password.input(TextInputEvent::Home { extend: true });
+            } else {
+                password.input(TextInputEvent::SelectAll);
+            }
+            password.input(if right {
+                TextInputEvent::Right { extend: false }
+            } else {
+                TextInputEvent::Left { extend: false }
+            });
+            assert_eq!(
+                password.projection().selection,
+                TextSelection::caret(if right { "•••".len() } else { 0 })
+            );
+            password.input(TextInputEvent::Commit("x".into()));
+            assert_eq!(
+                password.take().unwrap().as_str(),
+                Some(if right { "aβzx" } else { "xaβz" })
+            );
+        }
     }
 
     #[test]

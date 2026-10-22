@@ -7615,6 +7615,8 @@ fn dynamic_theme_ending_in_default_opens_highlights_previews_and_saves_exactly()
     state
         .raw_values
         .insert(prefs::EDIT_THEME.to_string(), name.to_string());
+    // The file the view projects, as a snapshot would carry it.
+    state.config_text = Arc::from(format!("theme = \"{name}\"\n"));
     let theme = state
         .legacy
         .fields
@@ -15878,20 +15880,17 @@ fn about_build_time_reads_on_the_readers_clock() {
 #[test]
 fn local_settings_eliders_keep_combining_zwj_and_flag_graphemes_atomic() {
     for cluster in ["e\u{301}", "👩\u{200d}💻", "🇺🇳"] {
-        // A fact's value wraps on whole graphemes, a code value too.
+        // A fact's value wraps on whole graphemes, a code value too, and
+        // neither is a word: nothing is put between them.
         for (label, width) in [("compiler", 72.0), ("commit", 72.0)] {
             let source = cluster.repeat(12);
             let lines = metadata_value_lines(label, &source, width);
-            assert_eq!(
-                lines.concat().replace('-', ""),
-                source,
-                "{label}: nothing is cut"
-            );
+            assert_eq!(lines.concat(), source, "{label}: nothing is cut or added");
             assert!(
                 lines
                     .iter()
                     .flat_map(|line| line.graphemes())
-                    .all(|grapheme| grapheme == cluster || grapheme == "-"),
+                    .all(|grapheme| grapheme == cluster),
                 "{label}'s wrap split {cluster:?}: {lines:?}"
             );
         }
@@ -25670,7 +25669,8 @@ fn every_cursor_style_spelling_reads_as_its_list_name() {
         ("classic lumen", "Classic"),
         ("classic mono", "Classic"),
         ("off", "Off"),
-        ("plasma", "Plasma"),
+        // A spelling aterm does not know draws the default, and says so.
+        ("plasma", "Rainbow kitty (unknown \"plasma\")"),
     ] {
         assert_eq!(
             setting_choice_label(prefs::EDIT_CURSOR_TRAIL_STYLE, spelling),

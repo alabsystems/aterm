@@ -51,7 +51,8 @@
 /// when there is no grid to translate: `grid_bot_row <= grid_top_row` (including the
 /// no-partition default `grid_bot_row == 0`) or a band below the frame.
 #[must_use]
-pub fn grid_band_px(
+#[inline]
+pub const fn grid_band_px(
     pad: usize,
     cell_h: usize,
     grid_top_row: usize,
@@ -61,8 +62,10 @@ pub fn grid_band_px(
     if grid_bot_row <= grid_top_row {
         return (0, 0);
     }
-    let y0 = (pad + grid_top_row.saturating_mul(cell_h)).min(h);
-    let y1 = (pad + grid_bot_row.saturating_mul(cell_h)).min(h);
+    let raw_y0 = pad + grid_top_row.saturating_mul(cell_h);
+    let raw_y1 = pad + grid_bot_row.saturating_mul(cell_h);
+    let y0 = if raw_y0 < h { raw_y0 } else { h };
+    let y1 = if raw_y1 < h { raw_y1 } else { h };
     (y0, y1)
 }
 
@@ -79,6 +82,7 @@ pub fn grid_band_px(
 /// [`paint_incoming_strip`] covers it (up-glide only); `|frac| >= band_h` exposes the
 /// whole band. Each direction is one `copy_within` (memmove), so overlap is safe
 /// (`matches_out_of_place`). `frac_px == 0` is a no-op.
+#[inline]
 pub fn translate_grid_band_in_place(buf: &mut [u32], w: usize, y0: usize, y1: usize, frac_px: i64) {
     if w == 0 || y0 >= y1 || frac_px == 0 {
         return;
@@ -110,7 +114,8 @@ pub fn translate_grid_band_in_place(buf: &mut [u32], w: usize, y0: usize, y1: us
 ///   inside the frame (a find bar) the row below the band is not the engine's apron;
 /// * no wallpaper (its frame-fixed backdrop would be wrong on a row rastered alone).
 #[must_use]
-pub fn incoming_row_applies(input: &aterm_core::render::RenderInput) -> bool {
+#[inline]
+pub const fn incoming_row_applies(input: &aterm_core::render::RenderInput) -> bool {
     input.scroll_frac_px > 0
         && (input.apron_row.present || input.display_offset == 0)
         && input.grid_bot_row == input.rows
@@ -121,11 +126,15 @@ pub fn incoming_row_applies(input: &aterm_core::render::RenderInput) -> bool {
 /// band's bottom `frac` rows. `None` for a non-positive residual, an empty band, or
 /// `frac >= band_h` (nothing moved, so no seam; the GPU's `band_shift_ops` agrees).
 #[must_use]
-pub fn incoming_strip(y0: usize, y1: usize, frac_px: i64) -> Option<(usize, usize)> {
+#[inline]
+pub const fn incoming_strip(y0: usize, y1: usize, frac_px: i64) -> Option<(usize, usize)> {
     if frac_px <= 0 || y0 >= y1 {
         return None;
     }
-    let n = usize::try_from(frac_px).ok()?;
+    if frac_px as i128 > usize::MAX as i128 {
+        return None;
+    }
+    let n = frac_px as usize;
     if n >= y1 - y0 {
         return None;
     }
@@ -138,6 +147,7 @@ pub fn incoming_strip(y0: usize, y1: usize, frac_px: i64) -> Option<(usize, usiz
 /// `apron` holds; a short apron fills the strip's top rows and leaves the rest as the
 /// placeholder. Writes only inside the strip. Returns the rows painted (`0` for a
 /// bounce, frac 0, an empty band or an empty apron).
+#[inline]
 pub fn paint_incoming_strip(
     buf: &mut [u32],
     w: usize,
@@ -279,6 +289,9 @@ mod tests {
         );
         assert_eq!(incoming_strip(5, 5, 2), None, "empty band");
         assert_eq!(incoming_strip(7, 3, 2), None, "degenerate band");
+        for frac in [i64::from(u32::MAX) + 1, i64::from(u32::MAX) + 2, i64::MAX] {
+            assert_eq!(incoming_strip(0, 10, frac), None, "oversized residual");
+        }
         assert_eq!(
             incoming_strip(3, 13, 10),
             None,

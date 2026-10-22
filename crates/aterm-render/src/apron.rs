@@ -70,34 +70,43 @@ impl ApronScratch {
     /// Forget the rastered row, so the next sub-row frame re-rasters it. The hosts'
     /// appearance invalidation (`WindowCpu::invalidate`, `WindowGpu::invalidate_present`)
     /// calls it for changes the key cannot see.
-    pub fn invalidate(&mut self) {
+    #[inline]
+    pub const fn invalidate(&mut self) {
         self.key = None;
     }
 
     /// The rastered incoming row: `rows()` rows of `width()` packed pixels, top row first,
     /// as [`crate::scroll_translate::paint_incoming_strip`] reads it. Empty until
     /// [`Renderer::rasterize_apron_row`] has run.
+    #[inline]
     #[must_use]
     pub fn band(&self) -> &[u32] {
         &self.pixels[self.band.clone()]
     }
 
     /// Width in px of the rastered row (the frame width).
+    #[inline]
     #[must_use]
-    pub fn width(&self) -> usize {
+    pub const fn width(&self) -> usize {
         self.w
     }
 
     /// Rows in [`band`](Self::band) (`cell_h` once written, else `0`).
+    #[inline]
     #[must_use]
-    pub fn rows(&self) -> usize {
-        self.band.len().checked_div(self.w).unwrap_or(0)
+    pub const fn rows(&self) -> usize {
+        let len = self.band.end.saturating_sub(self.band.start);
+        match len.checked_div(self.w) {
+            Some(r) => r,
+            None => 0,
+        }
     }
 
     /// The raster generation: advances exactly when [`Renderer::rasterize_apron_row`]
     /// rewrites the band (a key miss); unchanged on a hit.
+    #[inline]
     #[must_use]
-    pub fn generation(&self) -> u64 {
+    pub const fn generation(&self) -> u64 {
         self.generation
     }
 }

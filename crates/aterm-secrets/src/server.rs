@@ -318,6 +318,25 @@ pub fn start(listener: std::net::TcpListener, options: &Options) -> crate::Resul
     launch(listener, options, Tuning::default())
 }
 
+/// [`start`] with the join queue's change gap `gap` in place of [`JOIN_CHANGE_GAP`]: a flow
+/// that changes a request sits out no real gap (the gap itself is held on a faked clock in
+/// this module's tests).
+#[cfg(any(test, debug_assertions))]
+pub fn start_with_join_change_gap(
+    listener: std::net::TcpListener,
+    options: &Options,
+    gap: Duration,
+) -> crate::Result<Running> {
+    launch(
+        listener,
+        options,
+        Tuning {
+            join_change_gap: gap,
+            ..Tuning::default()
+        },
+    )
+}
+
 /// The clocks a server keeps and how it tells this machine's connections from others':
 /// the constants above and [`this_machine`] in a served server; tests shorten and fake them.
 #[derive(Clone, Copy)]
@@ -1141,6 +1160,9 @@ fn parse_head(head: &[u8], early: Vec<u8>) -> Result<Request, Reply> {
             return Err(bad("a header value holds a control character"));
         }
         let value = value.trim_matches([' ', '\t']);
+        if browser_metadata_header(name) {
+            return Err(Reply::text(403, BROWSER_REFUSED));
+        }
         if name.eq_ignore_ascii_case("content-length") {
             let parsed = (!value.is_empty()
                 && value.len() <= 12
@@ -1177,6 +1199,23 @@ fn parse_head(head: &[u8], early: Vec<u8>) -> Result<Request, Reply> {
         expect_continue,
         early,
     })
+}
+
+/// Why a request carrying browser metadata is refused. aterm's client sends neither header.
+const BROWSER_REFUSED: &str =
+    "browser-origin or fetch-metadata headers are not accepted (Origin or Sec-Fetch-*)";
+
+/// Reject browser request metadata before processing a body or admitting a join. `Origin`
+/// covers browser POSTs; `Sec-Fetch-*` is sent only to potentially trustworthy destinations
+/// (https://www.w3.org/TR/fetch-metadata/#integration-with-fetch-and-html).
+/// A plain HTTP read with neither header remains admissible, including after DNS rebinding:
+/// this filter is not client authentication. Envelope verification and the vault's admission
+/// policy retain their separate protocol boundaries.
+fn browser_metadata_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("origin")
+        || name
+            .get(..10)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sec-fetch-"))
 }
 
 fn token_char(b: u8) -> bool {
@@ -1746,8 +1785,24 @@ pub fn caffeinate_args(pid: u32) -> Vec<String> {
 /// The IPv4 address of the interface the default route leaves by: a UDP socket connected to
 /// TEST-NET-1 (no packet is sent) and its local address. `None` when there is no route.
 pub fn primary_ipv4() -> Option<Ipv4Addr> {
+    source_ipv4(Ipv4Addr::new(192, 0, 2, 1), 9)
+}
+
+/// The IPv4 address `<name>.local` is advertised at: the one this Mac's LAN reaches it by.
+/// The route to mDNS's own group (224.0.0.251) leaves by an interface mDNS answers on, and on
+/// macOS it is a link route on that interface, more specific than a full-tunnel VPN's `0/1`
+/// and `128/1` or a default route through a tunnel, so a tunnel's address (a corporate
+/// `10.x`, Tailscale's `100.x`), which the LAN cannot reach, is not the one advertised.
+/// Without such a route, [`primary_ipv4`]'s.
+fn lan_ipv4() -> Option<Ipv4Addr> {
+    source_ipv4(Ipv4Addr::new(224, 0, 0, 251), 5353).or_else(primary_ipv4)
+}
+
+/// The local address a UDP socket connected to `to` gets (no packet is sent): the address of
+/// the interface the route to `to` leaves by. `None` without a route.
+fn source_ipv4(to: Ipv4Addr, port: u16) -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    socket.connect((to, port)).ok()?;
     match socket.local_addr().ok()?.ip() {
         IpAddr::V4(ip) if !ip.is_unspecified() && !ip.is_loopback() => Some(ip),
         _ => None,
@@ -1825,7 +1880,7 @@ impl Children {
                         if set.closed {
                             return;
                         }
-                        reregister(&mut set, &name, port, primary_ipv4());
+                        reregister(&mut set, &name, port, lan_ipv4());
                     }
                     std::thread::sleep(ADVERTISE_EVERY);
                 }
@@ -2429,6 +2484,58 @@ mod tests {
         assert_eq!(
             waiter.join().expect("waiter").expect("ended"),
             Fetched::NoNewer
+        );
+    }
+
+    #[test]
+    fn a_browsers_request_is_refused_before_anything_is_read_or_queued() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let running = run(&options(root.path(), Duration::from_millis(200)));
+        put(&running, &envelope(&OLD, 1)).expect("first");
+        let line = format!(
+            "{} m22 abcd-ef23-ghij-k234",
+            crate::transport::test_recipient(1)
+        );
+        // A page's simple POST (text/plain needs no preflight), from any origin.
+        for header in [
+            "Origin: https://example.com",
+            "origin: null",
+            "Sec-Fetch-Site: cross-site",
+            "SEC-FETCH-MODE: no-cors",
+        ] {
+            let answer = raw(
+                &running,
+                format!(
+                    "POST /v1/alab/join HTTP/1.1\r\nHost: alab-secrets.local:7484\r\n{header}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{line}",
+                    line.len()
+                )
+                .as_bytes(),
+            );
+            assert!(answer.starts_with("HTTP/1.1 403 "), "{header}: {answer}");
+        }
+        // Refuse reads that carry Fetch Metadata too. Browsers omit these
+        // headers for destinations that are not potentially trustworthy.
+        for path in ["/v1/alab", "/v1/alab/join"] {
+            let answer = raw(
+                &running,
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: rebound.example:7484\r\nSec-Fetch-Site: same-origin\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            assert!(answer.starts_with("HTTP/1.1 403 "), "{path}: {answer}");
+        }
+        assert!(
+            transport::list_joins(&url(&running))
+                .expect("listed")
+                .is_empty(),
+            "nothing a browser sent was queued"
+        );
+        // NEGATIVE CONTROL: aterm's own client is answered.
+        transport::post_join(&url(&running), &line).expect("queued");
+        assert_eq!(
+            transport::list_joins(&url(&running)).expect("listed").len(),
+            1
         );
     }
 

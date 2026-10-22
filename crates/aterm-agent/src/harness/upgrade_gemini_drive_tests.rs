@@ -973,6 +973,145 @@ fn a_graceful_exit_a_refused_start_and_an_unwitnessed_end_are_never_relaunched()
     );
 }
 
+/// A worker's launch as its spawn types it (`harness::worker`): its model,
+/// the session id of its own, its first prompt attached; its homes behind it
+/// with its trusted-folders file `trust`.
+fn worker_snap(rig: &Rig, id: &str, trust: &Path) -> Snapshot {
+    let mut snap = rig.snap(Some(S1));
+    snap.argv = vec![
+        NODE.to_string(),
+        SCRIPT.to_string(),
+        "--model".to_string(),
+        "gemini-3.5-flash".to_string(),
+        "--session-id".to_string(),
+        id.to_string(),
+        "--prompt-interactive=fix it\n(Started by `s-1`)".to_string(),
+    ];
+    if let AgentRun::Gemini(run) = &mut snap.run {
+        run.env = vec![(
+            ug::TRUSTED_FOLDERS_ENV.to_string(),
+            trust.to_string_lossy().into_owned(),
+        )];
+    }
+    snap
+}
+
+/// The project's one session file as a worker's first start writes it:
+/// [`S1`]'s header begun `begun_ms` after the parent started (negative: before
+/// it), its first turn after.
+fn worker_files(rig: &Rig, begun_ms: i64) {
+    std::fs::remove_dir_all(&rig.chats).expect("chats");
+    std::fs::create_dir_all(&rig.chats).expect("chats");
+    let start = rig.kernel.started_ms;
+    let begun = start.saturating_add_signed(begun_ms);
+    std::fs::write(
+        rig.chats
+            .join(format!("session-2026-10-18T06-40-{}.jsonl", &S1[..8])),
+        format!(
+            "{}\n{}\n{}\n",
+            header(S1, &rig.hash, begun),
+            context(begun, "ctx-w"),
+            turn(begun + 4_000, "uw", "gw")
+        ),
+    )
+    .expect("session file");
+}
+
+/// A WORKER'S OWN RESTART IS FINISHED ON ITS SESSION, NOTHING TYPED: Gemini
+/// CLI's own restart (`/settings`, IDE trust, admin settings: exit `199`)
+/// runs its argv again, and the worker's `--session-id` — the id its first
+/// start wrote, which the start-time rule names for the process — is
+/// refused (`42`, relayed by the parent). The look owes it a relaunch as a
+/// crash is ([`ExitRecord::Crashed`]), and the attempt resumes that session
+/// by id: `gemini --model … --resume <id>`, never the `--session-id` nor the
+/// first prompt again, behind the worker's own trusted-folders file while it
+/// stands, and nothing typed after it (`done:resumed`, a quiet record).
+/// NEGATIVE CONTROLS: the same `42` from a worker whose id was written
+/// before it started (its first start refused: the rule names no session
+/// begun since), one whose session begun since is another than its
+/// `--session-id` (the rule refuses a witness its argv disagrees with), a
+/// worker's launch that also names a session to resume (`--resume`:
+/// `ug::restart_id` reads no restart of it, though the rule names its id),
+/// and the crash rig's plain `--resume` launch, are refused starts, nothing
+/// typed; a trusted-folders file gone with its worker is named to nothing.
+#[test]
+fn a_workers_own_restart_is_finished_on_its_session_with_nothing_typed() {
+    let rig = Rig::new("restart", 42, true, false, Files::default());
+    worker_files(&rig, 900);
+    let trust = rig.dir.join("s-1-1.trust.json");
+    std::fs::write(&trust, "{}").expect("trust file");
+    let snap = worker_snap(&rig, S1, &trust);
+    let left = rig.look(&snap);
+    assert_eq!(left, ExitRecord::Crashed);
+    // The host reads it as the restart it is before whose exit it decides
+    // (`relaunch::restarted_itself`: a person's keys before it asked for it).
+    assert!(look_at_exit(&rig.opts, &snap, &rig.kernel).restarted_itself);
+    assert_eq!(crate::harness::relaunch::launch_ended(&snap, &left), None);
+    let r = rig.attempt(&snap, &left, ExitCause::Exit);
+    assert_eq!(r.step, "done:resumed", "{r:?}\n{:#?}", rig.typed());
+    let typed = rig.typed();
+    assert_eq!(typed.len(), 1, "the line alone: {typed:#?}");
+    let line = &typed[0];
+    assert!(
+        line.contains(&format!("'--model' 'gemini-3.5-flash' '--resume' '{S1}'")),
+        "{line}"
+    );
+    assert!(
+        !line.contains("session-id") && !line.contains("prompt-interactive"),
+        "{line}"
+    );
+    assert!(
+        line.contains(ug::TRUSTED_FOLDERS_ENV) && line.contains(&*trust.to_string_lossy()),
+        "{line}"
+    );
+    let st = rig.state();
+    assert!(st.quiet);
+    assert_eq!(st.thread, S1);
+
+    // Its file gone with the worker: named to nothing.
+    let rig = Rig::new("restart-untrusted", 42, true, false, Files::default());
+    worker_files(&rig, 900);
+    let snap = worker_snap(&rig, S1, &rig.dir.join("gone.trust.json"));
+    let r = rig.attempt(&snap, &rig.look(&snap), ExitCause::Exit);
+    assert_eq!(r.step, "done:resumed", "{r:?}");
+    assert!(
+        !rig.typed()[0].contains(ug::TRUSTED_FOLDERS_ENV),
+        "{:#?}",
+        rig.typed()
+    );
+
+    for (name, begun, id, resume) in [
+        ("restart-written-before", -3_600_000, S1, false),
+        ("restart-begun-under-another-id", 900, S2, false),
+        ("restart-names-a-resume", 900, S1, true),
+    ] {
+        let rig = Rig::new(name, 42, true, false, Files::default());
+        worker_files(&rig, begun);
+        let mut snap = worker_snap(&rig, id, &trust);
+        if resume {
+            snap.argv
+                .splice(2..2, ["--resume".to_string(), S1.to_string()]);
+        }
+        let left = rig.look(&snap);
+        assert_eq!(left, ExitRecord::Refused, "{name}");
+        assert!(
+            !look_at_exit(&rig.opts, &snap, &rig.kernel).restarted_itself,
+            "{name}"
+        );
+        let r = rig.attempt(&snap, &left, ExitCause::Exit);
+        assert_eq!(r.step, "ended:refused-start", "{name}: {r:?}");
+        assert!(rig.typed().is_empty(), "{name}: {:#?}", rig.typed());
+    }
+    let rig = Rig::new("restart-resume-launch", 42, true, false, Files::default());
+    let snap = rig.snap(Some(S1));
+    let left = rig.look(&snap);
+    assert_eq!(left, ExitRecord::Refused);
+    assert_eq!(
+        rig.attempt(&snap, &left, ExitCause::Exit).step,
+        "ended:refused-start"
+    );
+}
+
 /// A SESSION THE START-TIME RULE CANNOT NAME IS TOLD, NEVER TYPED
 /// (`refused:no-witness`, the host's `Cannot`): two headers since its start
 /// (a `/clear`), no header, an older session switched onto since (an in-TUI
@@ -1870,11 +2009,63 @@ fn no_continuation_into_a_busy_drafted_or_held_gemini_cli() {
     assert_eq!(r.step, "continued", "{r:?}");
     assert_eq!(control.continuations(), 1);
     let typed = control.typed();
+    // The crash note is past the paste fold: its guard is the chip's
+    // ([`a_continuation_past_the_paste_fold_is_guarded_on_its_chip`]).
     assert!(
-        typed[1].contains("submit=guarded:^\\s[>\\s]\\s"),
+        typed[1].contains("submit=guarded:^\\s>\\s"),
         "the guard one blank before the caret: {}",
         typed[1]
     );
+}
+
+/// THE RELAUNCH'S CONTINUATION IS GUARDED ON THE CHIP IT IS DRAWN AS: past
+/// Gemini CLI's paste fold (the crash note runs 538 characters on 0.46.0),
+/// the composer shows `[Pasted Text: <n> chars]` with the cursor past it
+/// ([`aterm_phase::gemini::fixtures::FOLDED_PASTE`], measured), so the
+/// `turn`'s guard is the chip's, and it matches that measured caret row.
+/// NEGATIVE CONTROL: the guard on the note's own last word — the one typed
+/// before — matches no row of the measured screen (the live `turn` left the
+/// note unsent there), and a note within the fold keeps its words' guard.
+#[test]
+fn a_continuation_past_the_paste_fold_is_guarded_on_its_chip() {
+    use aterm_phase::gemini::{fixtures as fx, folded_paste};
+    let rig = relaunch_rig("fold", false, Knobs::default());
+    let r = rig.attempt(&rig.snap(Some(S1)), &ExitRecord::Crashed, ExitCause::Exit);
+    assert_eq!(r.step, "continued", "{r:?}");
+    let typed = rig.typed();
+    let turn = &typed[1];
+    let (_, text) = turn
+        .split_once(&format!(" {TURN_WAIT} "))
+        .expect("the note after the turn's options");
+    assert!(
+        text.starts_with("[aterm harness] Relaunched: Gemini CLI exited"),
+        "{text}"
+    );
+    let chip = folded_paste(text).expect("the crash note is past the fold");
+    let guard = composer_guard_at('>', CARET_COLUMN, &chip);
+    assert!(
+        turn.contains(&format!("submit=guarded:{guard} idle=600 ")),
+        "the chip's guard: {turn}"
+    );
+
+    let rows = aterm_phase::prompt::fixtures::screen(fx::FOLDED_PASTE);
+    let measured = folded_paste(&"x".repeat(538)).expect("538 characters fold");
+    let at_chip = aterm_observe::row_matcher(&composer_guard_at('>', CARET_COLUMN, &measured))
+        .expect("compiles");
+    let hits: Vec<&String> = rows.iter().filter(|r| at_chip.matches(r)).collect();
+    assert_eq!(
+        hits,
+        [" > [Pasted Text: 538 chars]"],
+        "the measured caret row"
+    );
+    let words =
+        aterm_observe::row_matcher(&composer_guard_at('>', CARET_COLUMN, text)).expect("compiles");
+    assert!(
+        !rows.iter().any(|r| words.matches(r)),
+        "the control: the words' guard matches no row of the folded screen"
+    );
+    let short = "[aterm harness] keep going";
+    assert_eq!(folded_paste(short), None, "the control: within the fold");
 }
 
 /// ONLY OUR OWN RELAUNCH IS ADOPTED: a Gemini CLI under the shell resuming

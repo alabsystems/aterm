@@ -1516,7 +1516,7 @@ pub fn apply(
     match req {
         NoticeRequest::Post(p) => apply_post(center, gate, p, stamp, now),
         NoticeRequest::Progress(p) => apply_progress(center, gate, &p, stamp, now),
-        NoticeRequest::Done(d) => apply_done(center, gate, d, now),
+        NoticeRequest::Done(d) => apply_done(center, gate, d, stamp, now),
         NoticeRequest::Ask(a) => post_row(center, gate, a.into_message().normalized(), stamp, now),
         NoticeRequest::Later(l) => apply_later(center, gate, l, stamp, now),
         NoticeRequest::Dismiss(id) => apply_dismiss(center, gate, id, stamp, now),
@@ -1722,6 +1722,7 @@ fn apply_done(
     center: &mut MessageCenter,
     gate: &mut WireGate,
     d: DoneRequest,
+    stamp: WallStamp,
     now: Instant,
 ) -> Applied {
     let Some(id) = center.live_by_key(&d.key).map(|l| l.id) else {
@@ -1735,7 +1736,14 @@ fn apply_done(
                 paint: Paint::None,
                 note: true,
             },
-            None => Applied::quiet("OK done=- how=gone".to_string()),
+            None => Applied {
+                reply: "OK done=- how=gone".to_string(),
+                paint: Paint::None,
+                // The owner may already have filed the entry. Its cause ending still
+                // ends that filing's quiet, so a later occurrence is news. There is no
+                // open entry to re-title or report as freshly completed.
+                note: center.forget_filing(&d.key, stamp, now),
+            },
         };
     };
     if let Some(words) = d.words {
@@ -1763,6 +1771,9 @@ fn apply_done(
         DoneHow::Warn => center.resolve(id, Outcome::Warn, now),
         DoneHow::Withdraw => center.withdraw(id, now),
     };
+    // A regular progress/post row can share a previously filed exception's key.
+    // Ending that cause also ends the earlier filing's quiet.
+    center.forget_filing(&d.key, stamp, now);
     let reply = format!("OK done={id} how={}", d.how.retired().as_word());
     shown(center, gate, now, reply)
 }

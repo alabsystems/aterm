@@ -114,13 +114,13 @@ impl CellFlags {
 
     /// Insert a flag (mutating).
     #[inline]
-    pub fn insert(&mut self, other: Self) {
+    pub const fn insert(&mut self, other: Self) {
         self.0 |= other.0;
     }
 
     /// Remove a flag (mutating).
     #[inline]
-    pub fn remove(&mut self, other: Self) {
+    pub const fn remove(&mut self, other: Self) {
         self.0 &= !other.0;
     }
 
@@ -169,6 +169,7 @@ impl CellFlags {
     /// singletons (DASHED = DOUBLE | CURLY, DOTTED = UNDERLINE | CURLY), so they
     /// are tested first. DECRQSS and the screen serializer both encode with it.
     #[must_use]
+    #[inline]
     pub const fn underline_sgr(self) -> Option<&'static str> {
         if self.contains(Self::DASHED_UNDERLINE) {
             Some("4:5")
@@ -190,6 +191,7 @@ impl CellFlags {
     /// so it is tested first. DECRQSS and the screen serializer both encode
     /// with it.
     #[must_use]
+    #[inline]
     pub const fn overline_or_script_sgr(self) -> Option<&'static str> {
         if self.contains(Self::OVERLINE) {
             Some("53")

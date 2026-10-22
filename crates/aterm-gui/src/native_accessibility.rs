@@ -61,11 +61,18 @@ fn composite_root_id() -> NodeId {
     NodeId(aterm_hash::fnv1a_64(b"aterm/native-a11y/window/v1").max(1))
 }
 
-/// Lifecycle stamp attached to every route in a published native leaf.
+/// Lifecycle and review identity attached to every published native route.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct AccessibilityOwner {
     pub(crate) view: ViewId,
     pub(crate) generation: u64,
+    pub(crate) review_revision: u64,
+}
+
+impl AccessibilityOwner {
+    fn context(self) -> ActionContext {
+        ActionContext::native_review(self.view.get(), self.generation, self.review_revision)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -313,7 +320,11 @@ pub(crate) struct PublishedNativeAccessibility {
 impl PublishedNativeAccessibility {
     #[cfg(test)]
     pub(crate) fn new(view: ViewId, generation: u64, routes: Vec<AccessibilityRoute>) -> Self {
-        let owner = AccessibilityOwner { view, generation };
+        let owner = AccessibilityOwner {
+            view,
+            generation,
+            review_revision: 0,
+        };
         Self {
             view,
             generation,
@@ -337,7 +348,11 @@ impl PublishedNativeAccessibility {
         routes: Vec<AccessibilityRoute>,
         virtual_text: Vec<VirtualTextTarget>,
     ) -> Self {
-        let owner = AccessibilityOwner { view, generation };
+        let owner = AccessibilityOwner {
+            view,
+            generation,
+            review_revision: 0,
+        };
         Self {
             view,
             generation,
@@ -377,9 +392,10 @@ impl PublishedNativeAccessibility {
     pub(crate) fn route_owner(&self, node: NodeId) -> Option<AccessibilityOwner> {
         let route = self.route(node)?;
         let owner = route.owner.or_else(|| {
-            (self.owners.len() == 1).then_some(AccessibilityOwner {
+            (self.owners.len() == 1).then(|| AccessibilityOwner {
                 view: self.view,
                 generation: self.generation,
+                review_revision: self.owners[0].review_revision,
             })
         })?;
         (self.owners.contains(&owner)
@@ -462,7 +478,7 @@ pub(crate) fn route_accessibility_action(
     let owner = published
         .route_owner(request.target_node)
         .ok_or(AccessibilityActionError::WrongOwnerContext)?;
-    let expected_context = ActionContext::new(owner.view.get(), owner.generation);
+    let expected_context = owner.context();
     if request.context != Some(expected_context) {
         return Err(AccessibilityActionError::WrongOwnerContext);
     }
@@ -881,7 +897,7 @@ pub(crate) fn project_native_accessibility_for_view_in_container(
     for route in &mut projection.routes {
         route.owner = Some(owner);
     }
-    let context = ActionContext::new(owner.view.get(), owner.generation);
+    let context = owner.context();
     for (_, node) in &mut projection.update.nodes {
         node.set_action_context(context);
     }
@@ -1985,6 +2001,7 @@ mod tests {
         let owner = |generation| AccessibilityOwner {
             view: ViewId::from_stored(41),
             generation,
+            review_revision: 0,
         };
         let before = project_native_accessibility_for_view_in_container(
             &compiled,
@@ -2038,15 +2055,57 @@ mod tests {
     }
 
     #[test]
+    fn queued_and_legacy_contexts_cannot_authorize_a_different_review() {
+        let compiled = compiled_form(&["alpha"]);
+        let owner = |review_revision| AccessibilityOwner {
+            view: ViewId::from_stored(41),
+            generation: 7,
+            review_revision,
+        };
+        let projection = project_native_accessibility_for_view_in_container(
+            &compiled,
+            None,
+            Affine::IDENTITY,
+            owner(4),
+        )
+        .unwrap();
+        let node = projection.id_for_key(&UiKey::new("alpha")).unwrap();
+        let (_, routes, text) = projection.into_update_routes_and_virtual_text();
+        let published =
+            PublishedNativeAccessibility::composite(owner(4), vec![owner(4)], routes, text);
+        let mut request = aterm_a11y::model::ActionRequest {
+            context: Some(ActionContext::native_review(41, 7, 3)),
+            action: Action::Focus,
+            target_tree: TreeId::ROOT,
+            target_node: node,
+            data: None,
+        };
+        for context in [request.context, Some(ActionContext::new(41, 7))] {
+            request.context = context;
+            assert_eq!(
+                route_accessibility_action(&published, &request),
+                Err(AccessibilityActionError::WrongOwnerContext)
+            );
+        }
+        request.context = Some(ActionContext::native_review(41, 7, 4));
+        assert!(matches!(
+            route_accessibility_action(&published, &request),
+            Ok(RoutedAccessibilityAction::Focus { .. })
+        ));
+    }
+
+    #[test]
     fn composite_namespaces_identical_sibling_keys_and_retains_each_transform_and_owner() {
         let compiled = compiled_form(&["alpha"]);
         let first = AccessibilityOwner {
             view: ViewId::from_stored(41),
             generation: 7,
+            review_revision: 0,
         };
         let second = AccessibilityOwner {
             view: ViewId::from_stored(42),
             generation: 9,
+            review_revision: 0,
         };
         let first_transform =
             Affine::translate(aterm_a11y::model::Vec2::new(12.0, 64.0)) * Affine::scale(1.0);

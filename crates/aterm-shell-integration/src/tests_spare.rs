@@ -190,23 +190,10 @@ impl SpareRig {
             argv.extend(over.into_iter().skip(1));
         }
         argv.push("-i".to_owned());
-        let mut cmd = Command::new("script");
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let mut cmd = pty_script(&argv);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
-        }
-        if cfg!(target_os = "macos") {
-            cmd.args(["-q", "/dev/null"]).args(&argv);
-        } else {
-            let quoted: Vec<String> = argv
-                .iter()
-                .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
-                .collect();
-            // util-linux runs `-c`'s line through `$SHELL -c`: /bin/sh here, never a
-            // bash that reads `~/.bashrc` on the way (Debian's does for a `-c` run
-            // over ssh, `SSH_CLIENT` set), which ran the rig's startup file before
-            // the shell under test began.
-            cmd.args(["-q", "-c", &quoted.join(" "), "/dev/null"])
-                .env("SHELL", "/bin/sh");
         }
         let hermetic = shell_command(program);
         for (key, value) in hermetic.get_envs() {
@@ -650,7 +637,7 @@ fn zsh_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) -> 
     let zsh = spare_zsh();
     let mut host = warm.then(|| rig.fifo());
     let mut sh = rig.spawn(ShellType::Zsh, zsh);
-    let at = if let Some(host) = host.as_mut() {
+    if let Some(host) = host.as_mut() {
         let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
         tell(host, "run");
         let spare = sh.wait_for_after(&signed_p("AtermStart=spare"), parked);
@@ -663,11 +650,11 @@ fn zsh_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) -> 
                 .expect("append history");
         }
         tell(host, "go");
-        sh.wait_for_after("\x1b]133;A", spare)
+        sh.wait_for_after("\x1b]133;A", spare);
     } else {
-        sh.wait_for_after("\x1b]133;A", 0)
-    };
-    sh.wait_for_zle(at);
+        sh.wait_for_after("\x1b]133;A", 0);
+    }
+    sh.wait_for_line_editor();
     let from = sh.output().len();
     // `DU""MP`: the listing quotes this line, and must not hold the marker.
     sh.send(
@@ -827,8 +814,8 @@ fn a_warm_zsh_reads_its_history_again_only_when_the_file_moved() {
         file.set_modified(mtime).expect("history mtime");
         drop(file);
         tell(&mut host, "go");
-        let at = sh.wait_for_after("\x1b]133;A", spare);
-        sh.wait_for_zle(at);
+        sh.wait_for_after("\x1b]133;A", spare);
+        sh.wait_for_line_editor();
         let from = sh.output().len();
         sh.send("fc -ln 1; print -r -- END$((40+2))");
         let end = sh.wait_for_after("END42", from);
@@ -869,6 +856,7 @@ fn bash_history_reading(rig: &SpareRig, warm: bool, append_during_hold: &str) ->
     } else {
         sh.wait_for_after("\x1b]133;A", 0);
     }
+    sh.wait_for_line_editor();
     let from = sh.output().len();
     sh.send("echo \"DU\"\"MP $HISTCMD\"; history; echo END$((40+2))");
     let end = sh.wait_for_after("END42", from);
@@ -1031,16 +1019,21 @@ fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
 
     // Negative control: bash's warm hold without the loop or the host's writer.
     // It needs a bash whose `read < fifo` fails when a signal interrupts the
-    // open: macOS's /bin/bash 3.2. Bash 5 restarts the open (Linux's 5.2 and
-    // Homebrew's 5.3 on macOS: sixty seconds of SIGWINCH every 20 ms never
-    // released it), so under it the cut hold cannot be released and there is
-    // nothing to control — the loop exists for 3.2's hold.
-    let bash = spare_bash();
-    let major = bash_major_version(bash);
+    // open: 3.2, whatever bash the suite runs (the `bash-3.2` tool: macOS's
+    // /bin/bash, GNU's 3.2.57 in the Linux lane's guest). Bash 5 restarts the
+    // open (Linux's 5.2 and Homebrew's 5.3 on macOS: sixty seconds of SIGWINCH
+    // every 20 ms never released it), so under it the cut hold cannot be
+    // released and there is nothing to control — the loop exists for 3.2's hold.
+    let bash_3_2 = aterm_spec::host::tool("bash-3.2");
+    let bash = aterm_spec::host::test_shell(bash_3_2.name)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| aterm_spec::host::could_not_run(bash_3_2.refusal()));
+    let major = bash_major_version(&bash);
     if major >= 5 {
         aterm_spec::host::could_not_run(format!(
             "{bash} is bash {major}, which restarts the interrupted open, so the negative \
-             control has no cut hold to show (it needs bash 3.2, macOS's /bin/bash)"
+             control has no cut hold to show; {}",
+            bash_3_2.refusal()
         ));
     }
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1059,7 +1052,7 @@ fn a_spare_hold_survives_sigwinch_and_only_go_releases_it() {
     let rig = SpareRig::new();
     rig.rc(".bashrc", "PS1='P> '\n");
     rig.make_fifo();
-    let mut sh = rig.spawn_from(ShellType::Bash, bash, &cut);
+    let mut sh = rig.spawn_from(ShellType::Bash, &bash, &cut);
     let parked = sh.wait_for_after(&signed_p("AtermSpare=parked"), 0);
     // `run` to the parked hold that has the FIFO open, and the writer let go of
     // at once: the hold reads the line, and the warm hold's open waits for a

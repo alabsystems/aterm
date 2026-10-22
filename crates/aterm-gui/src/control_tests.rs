@@ -7904,11 +7904,12 @@ fn a_questions_write_is_owner_only() {
     }
 }
 
-/// `meta`'s `worker=` IS THE AGENT A WORKER'S SPAWN STARTED, its task
-/// record's (`TaskRecord::agent`), after `trusted_cwd=`: what the window
+/// `meta`'s `worker=` IS THE AGENT A WORKER'S SPAWN STARTED, and
+/// `trusted_cwd=` the folder it trusted for it, both its task record's
+/// (`TaskRecord::agent`, `TaskRecord::trusted_cwd`): what the window
 /// harness's trust rules read (a Gemini CLI worker's folder-trust dialog is
 /// never pressed). NEGATIVE CONTROLS: a session with no task, and one whose
-/// record a `task mark` made, print `worker=-`.
+/// record a `task mark` made, print `worker=-` and `trusted_cwd=-`.
 #[test]
 fn meta_names_the_agent_a_workers_spawn_started() {
     use crate::task_record::{TaskMark, TaskState, mark_session_task};
@@ -7927,9 +7928,23 @@ fn meta_names_the_agent_a_workers_spawn_started() {
         .timeline
         .lock()
         .unwrap()
-        .set_task_agent(aterm_phase::Program::Muse);
+        .set_task_worker(aterm_phase::Program::Muse, None);
     assert!(
         read().contains(" trusted_cwd=- worker=muse autopilot="),
+        "{}",
+        read()
+    );
+    // The folder its spawn trusted for it: the record's too.
+    h.ctx
+        .timeline
+        .lock()
+        .unwrap()
+        .set_task_worker(aterm_phase::Program::Muse, Some("/w/my proj".to_string()));
+    assert!(
+        read().contains(&format!(
+            " trusted_cwd={} worker=muse autopilot=",
+            crate::control::pct_encode("/w/my proj")
+        )),
         "{}",
         read()
     );
@@ -15541,6 +15556,37 @@ fn a_bridges_hello_and_its_unparsed_lines_body() {
     let next = crate::fabric::next_bridge_generation();
     crate::fabric::bridge_attached(next);
     assert!(fabric_status_line().ends_with(&tail("-", "-", 0)));
+}
+
+/// THE STORE HEARS AN `auto` BRIDGE (session log Phase 6 step 6E-3): a
+/// recorded `hello … log=turns` serves the mirror; an `auto` hello (a
+/// bridge's restart, before its attach has judged the broker) leaves that as
+/// it was, so no session goes unengaged across the restart; the bridge's
+/// `link mirror unretained` clears it, and so does a hello without `log=`.
+/// NEGATIVE CONTROL, run: an `auto` hello read as one without `log=` fails
+/// it.
+#[test]
+fn an_auto_hello_leaves_the_served_word_and_unretained_clears_it() {
+    crate::fabric::with_link_reset(|| {
+        let store = session_store::new_store();
+        let generation = crate::fabric::next_bridge_generation();
+        crate::fabric::bridge_attached(generation);
+        crate::fabric::set_lane_generation(generation);
+        let say =
+            |verb: &str, rest: &str| dispatch_bridge_verb(verb, rest, None, Scope::Bridge, &store);
+        let served = || store.read().unwrap().mirror().served();
+        let turns = say("hello", "lane=5 build=x log=turns");
+        assert!(turns.trim_end().ends_with(" log=turns"), "{turns}");
+        assert!(served());
+        assert!(say("hello", "lane=5 build=x log=auto").starts_with("OK "));
+        assert!(served(), "an auto hello leaves the word as it was");
+        assert_eq!(say("link", "mirror unretained"), "OK\n");
+        assert!(!served(), "unretained: the node does not mirror");
+        assert!(say("hello", "lane=5 build=x log=turns").starts_with("OK "));
+        assert!(served());
+        assert!(say("hello", "lane=5 build=x").starts_with("OK "));
+        assert!(!served(), "a hello without log= clears it");
+    });
 }
 
 /// THE BUS MIRROR OFF TAKES NO LOCK OF ITS OWN (session log phase 4, ruling

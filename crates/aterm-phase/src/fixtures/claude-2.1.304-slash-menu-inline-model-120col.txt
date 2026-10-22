@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · `/model` typed into the empty composer of the INLINE renderer (CLAUDE_CODE_NO_FLICKER=0), auto mode: the slash menu is drawn UNDER the composer's bottom rule in the mode row's place, the typed command first and pointed (`❯` at column 2), the other entries four columns in; the fullscreen renderer draws the same menu over the top rule
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.UL78/proj
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /model
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ❯ /model                      Set the AI model for Claude Code (currently Opus 5.5)
+    /code-review                Review the current diff, or a PR number/branch/path target, for correctness bugs (plus
+                                reuse/simplification/efficiency cleanups where the model's review recipe covers them)…
+    /update-config              Use this skill to configure the Claude Code harness via settings.json. Automated
+                                behaviors ("from now on when X", "each time X", "whenever X", "before/after X") requi…
+    /loop                       Run a prompt or slash command on a recurring interval (e.g. /loop 5m /foo). Omit the
+                                interval to let the model self-pace.
+    /claude-api                 Reference for the Claude API / Anthropic SDK — model ids, pricing, params, streaming,
+                                tool use, MCP, agents, caching, token counting, model migration. TRIGGER — read BEFOR…
+    /effort                     Set effort level for model usage
+    /status                     Show Claude Code status including version, model, account, API connectivity, and tool
+                                statuses
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

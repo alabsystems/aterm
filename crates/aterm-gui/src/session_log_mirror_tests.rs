@@ -948,7 +948,9 @@ fn a_replaced_bus_log_stands_down_an_update_whose_only_cursors_are_adopted() {
 /// FIXER F15: the verbs are served only while the owning bridge's RECORDED
 /// hello asked for the mirror — a bridge whose hello did not is refused
 /// definitely, never engages a log — and retained state no bridge serves is
-/// said in `fabric status` (`mirror=unserved tails=<k> tombstones=<j>`).
+/// said in `fabric status` (`mirror=unserved tails=<k> tombstones=<j>`;
+/// under an `auto` hello, whose line already says `mirror=`, the counts
+/// alone, session log Phase 6 step 6E-3).
 #[test]
 fn the_verbs_are_refused_unless_the_recorded_hello_asked_and_retained_state_is_said() {
     crate::fabric::with_link_reset(|| {
@@ -997,6 +999,19 @@ fn the_verbs_are_refused_unless_the_recorded_hello_asked_and_retained_state_is_s
         assert_eq!(
             store.read().unwrap().mirror().unserved_facts(),
             " mirror=unserved tails=1 tombstones=0"
+        );
+        let auto = crate::fabric::next_bridge_generation();
+        crate::fabric::bridge_attached(auto);
+        let hello = crate::fabric::cmd_hello("lane=5 build=x log=auto", Some(auto));
+        assert!(!hello.contains("log="), "{hello}");
+        assert_eq!(
+            crate::fabric::fabric_mirror_facts(),
+            " bridge_log=auto mirror=starting"
+        );
+        assert_eq!(
+            store.read().unwrap().mirror().unserved_facts(),
+            " tails=1 tombstones=0",
+            "one mirror= on the line"
         );
         drop(h);
     });

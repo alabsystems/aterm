@@ -90,28 +90,32 @@ impl PageStore {
     /// Get pool statistics.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn stats(&self) -> PoolStats {
+    #[inline]
+    pub(crate) const fn stats(&self) -> PoolStats {
         self.stats
     }
 
     /// Number of active pages (holding allocations).
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn active_pages(&self) -> usize {
+    #[inline]
+    pub(crate) const fn active_pages(&self) -> usize {
         self.pages.len()
     }
 
     /// Number of free pages (available for reuse).
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn free_pages(&self) -> usize {
+    #[inline]
+    pub(crate) const fn free_pages(&self) -> usize {
         self.free_pages.len()
     }
 
     /// Total memory used by all pages (active + free), in bytes. Saturating, as
     /// in `Grid::memory_used`: exact whenever it fits, `usize::MAX` otherwise.
     #[must_use]
-    pub(crate) fn total_memory(&self) -> usize {
+    #[inline]
+    pub(crate) const fn total_memory(&self) -> usize {
         self.pages
             .len()
             .saturating_add(self.free_pages.len())
@@ -208,7 +212,8 @@ impl PageStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn recycled_rows(&self) -> usize {
+    #[inline]
+    pub(crate) const fn recycled_rows(&self) -> usize {
         self.recycled_cells.len()
     }
 
@@ -216,6 +221,7 @@ impl PageStore {
     /// `debug_assertions` for downstream property tests.
     #[cfg(any(test, debug_assertions))]
     #[allow(clippy::expect_used)]
+    #[inline]
     pub fn alloc_slice<T>(&mut self, len: u16) -> PageSlice<T> {
         self.alloc_slice_impl(len)
     }
@@ -223,6 +229,7 @@ impl PageStore {
     /// Allocate a typed slice within the page store (crate-internal in production).
     #[cfg(not(any(test, debug_assertions)))]
     #[allow(clippy::expect_used)]
+    #[inline]
     pub(crate) fn alloc_slice<T>(&mut self, len: u16) -> PageSlice<T> {
         self.alloc_slice_impl(len)
     }
@@ -274,7 +281,8 @@ impl PageStore {
     }
 }
 
-fn align_up(value: usize, align: usize) -> usize {
+#[inline]
+const fn align_up(value: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
     (value + align - 1) & !(align - 1)
 }

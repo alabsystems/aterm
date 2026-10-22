@@ -6280,7 +6280,7 @@ mod tests {
             "instance 1's bridge is another build than the instance: bridge a, instance b",
             "instance 1 could not parse 3 of its bridge's lines (lane_faults=3)",
             "node n-a holds 3072 of the 4096 distinct subjects one node may ever mint, and none but \
-             a closed session's own `ev` face (under [fabric] log = \"turns\") is ever given \
+             a closed session's own `ev` face (while the session-log mirror runs) is ever given \
              back: past the bound a new session gets no presence row and its posts are refused; \
              the remedy is a new node id",
             "the presence roster has more than 4096 rows and the read stopped there (rows=4096+ \

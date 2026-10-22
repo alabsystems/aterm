@@ -3,8 +3,11 @@
 
 //! THE BUS MIRROR END TO END (`docs/DESIGN-session-log-2026-10-15.md` §5.5,
 //! session log phase 4): a real headless aterm, its real bridge and a guarded
-//! broker. Off by default it writes nothing anywhere; with `--log turns`
-//! every session's bus-class records reach its `ev` face, each `(ep, seq)`
+//! broker. With `--log off` it writes nothing anywhere; by default (`auto`,
+//! over the world's broker, which retains by aterm's default rules, session
+//! log Phase 6 step 6E-3) it mirrors as `--log turns` does, and over a broker
+//! that retains nothing it mirrors nothing and says `mirror=unretained`. With
+//! the mirror on every session's bus-class records reach its `ev` face, each `(ep, seq)`
 //! once in the reader's view (ruling Q0), `ms` dense, with one exact cover
 //! per hole an eviction made (ruling Q2), no host or content text crossing,
 //! and `aterm fabric brief` folding what the bus holds. Every wait is a
@@ -115,22 +118,19 @@ fn claims(w: &World, sid: &str, n: usize) {
     }
 }
 
-/// RULING Q5 END TO END: a bridge with the default `[fabric] log` mirrors
-/// nothing. Sessions write claims and exit; the bus holds no `v=2` body on
-/// any face, the state dir holds no `logpin` and none of its durable copies
-/// (`logkey`, `logfloor`), and `fabric status` says nothing of a mirror.
-#[test]
-fn the_default_mirrors_nothing_and_writes_nothing() {
-    let w = World::boot("lm-off", &[]);
-    w.wait_ready();
+/// Sessions write claims and one exits; then, past a drain barrier through
+/// the same bridge, whether the bus holds no `v=2` body on any face and the
+/// state dir no `logpin` and none of its durable copies (`logkey`,
+/// `logfloor`): what a bridge that does not mirror leaves.
+fn mirrors_nothing(w: &World) {
     let (a, b) = w.two_sessions();
-    claims(&w, &a, 3);
-    claims(&w, &b, 3);
+    claims(w, &a, 3);
+    claims(w, &b, 3);
     assert!(w.verb(&format!("@{b} close")).ok());
     // The bridge's own `ev` records still flow; give it a round to publish
     // whatever it would: a drain barrier through the same bridge.
     w.drained(&a);
-    let all = bodies(&w, &format!("/f/{FLEET}/pub/>"));
+    let all = bodies(w, &format!("/f/{FLEET}/pub/>"));
     assert!(
         all.iter().all(|b| aterm_slog::decode_bus(b).is_err()),
         "a v=2 body on the bus with the mirror off: {:?}",
@@ -139,8 +139,68 @@ fn the_default_mirrors_nothing_and_writes_nothing() {
     for file in ["logpin", "logkey", "logfloor"] {
         assert!(!w.state.join(file).exists(), "no {file} is ever written");
     }
+}
+
+/// RULING Q5 END TO END: a bridge with `--log off` (`[fabric] log = "off"`,
+/// the opt-out since session log Phase 6 step 6E-3) mirrors nothing: no
+/// `v=2` body on any face, no `logpin` and none of its durable copies, and
+/// `fabric status` says nothing of a mirror. NEGATIVE CONTROL, run: `off`
+/// read as `auto` fails it.
+#[test]
+fn log_off_mirrors_nothing_and_writes_nothing() {
+    let w = World::boot_flags_with("lm-off", &["--log", "off"], &[]);
+    w.wait_ready();
+    mirrors_nothing(&w);
     let fs = w.verb("fabric status");
     assert!(!fs.header().contains("bridge_log="), "{}", fs.header());
+}
+
+/// THE DEFAULT MIRRORS TURNS (owner decision D4, session log Phase 6 step
+/// 6E-3): with no `--log` and no `[fabric] log`, over the world's broker,
+/// which retains by aterm's default rules and advertises them in its
+/// `Hello`, every live turn-class record of a session reaches its `ev` face,
+/// once, `ms` dense, and `fabric status` says the mirror is on. NEGATIVE
+/// CONTROL, run: an attach that does not follow the broker (no
+/// `mirror_attached`) fails it.
+#[test]
+fn the_default_mirrors_turns() {
+    let w = World::boot("lm-default", &[]);
+    w.wait_ready();
+    let (a, _b) = w.two_sessions();
+    claims(&w, &a, 4);
+    let m = until("the session's mirror to be quiescent and complete", || {
+        complete(&w, &a)
+    });
+    assert!(
+        m.raw.values().all(|n| *n == 1),
+        "a duplicate on the bus: {:?}",
+        m.raw
+    );
+    let fs = w.verb("fabric status");
+    assert!(
+        fs.header().contains(" bridge_log=turns mirror=on"),
+        "{}",
+        fs.header()
+    );
+}
+
+/// THE DEFAULT FOLLOWS THE BROKER (session log Phase 6 step 6E-3): over
+/// `World::without_retention`'s broker, which retains nothing and advertises
+/// no rule, the default bridge mirrors nothing — no `v=2` body, no `logpin`,
+/// `logkey` or `logfloor` — and `fabric status` says `bridge_log=auto
+/// mirror=unretained`. NEGATIVE CONTROL, run: an `auto` mirror that does not
+/// ask the broker's `Hello` (the gate always open) fails it.
+#[test]
+fn the_default_over_an_unretaining_broker_mirrors_nothing_and_says_so() {
+    let w = World::without_retention("lm-unret");
+    w.wait_ready();
+    mirrors_nothing(&w);
+    let fs = w.verb("fabric status");
+    assert!(
+        fs.header().contains(" bridge_log=auto mirror=unretained"),
+        "{}",
+        fs.header()
+    );
 }
 
 /// TURNS LAND ONCE, DENSE: two sessions' claims and the second's exit reach

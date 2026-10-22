@@ -653,6 +653,7 @@ const BED_PARTIALS: [u32; 4] = [1, 2, 3, 4];
 /// and [`BED_LEVEL`] means what it says.
 const BED_PARTIAL_NORM: f32 = 0.838_1;
 
+#[inline]
 const fn compute_sky_bed_degrees(chord: usize) -> [i32; 3] {
     let lit = CHORD_LOOP[chord % SKY_BED_CHORDS].lit;
     let mut out = [0i32; 3];
@@ -777,6 +778,7 @@ const SPACE_STEP_HI_HZ: f32 = BASS_BASE_HZ * 4.0;
 /// figure, the live chord's lit degrees on the keyed lattice from the first
 /// above the dyad's `root` to the last under [`SPACE_STEP_HI_HZ`], then again.
 /// On chord I over C4 that is E4 G4 C5 E5 G5; on vi over A4, C5 E5 A5.
+#[inline]
 fn indent_step_hz(chord: usize, root: f32, n: u32, key: i32) -> f32 {
     let lit = sky_bed_degrees(chord);
     let m = lit.len();
@@ -862,6 +864,7 @@ const STEER_MAX_DEG: i32 = 3;
 /// The candidate of `cands` nearest `from`; at equal distance the lower one
 /// when `fall`, else the upper. `skip` is a degree to pass over (the
 /// anti-drone's), or −1.
+#[inline]
 fn nearest_cand(cands: &[i32], from: i32, fall: bool, skip: i32) -> Option<i32> {
     let mut best: Option<i32> = None;
     for &c in cands {
@@ -901,6 +904,7 @@ fn nearest_cand(cands: &[i32], from: i32, fall: bool, skip: i32) -> Option<i32> 
 /// degree farther and within [`STEER_MAX_DEG`], that one is taken, so
 /// consecutive sentences do not end on the same C. A `?` with nothing above
 /// within the bound holds its note.
+#[inline]
 fn cadence_target(mark: u8, from: i32, last_cadence: i32) -> i32 {
     let (cands, fall): (&[i32], bool) = match mark {
         MARK_PERIOD => (&[0, 5], true),
@@ -1216,6 +1220,7 @@ fn ting_fold(mut f: f32) -> f32 {
 /// The ting's voice at `f` (see [`TING_ATTACK_S`]): a pure sine, its octave,
 /// the tine's clink and a quiet felt mallet under a real roof, in
 /// [`LANE_TING`].
+#[inline]
 fn ting(f: f32) -> Voice {
     Voice {
         dur: TING_DUR_S,
@@ -1520,6 +1525,7 @@ const CAD_BELL_LEVEL: f32 = 0.199_526_2;
 /// full cadence, shared with the sing-along's outro
 /// (`TrailSynth::design_celebration_outro`, RAINBOW-KITTY-V2.md §27). Spawn at
 /// `gain × trim`, half a column out.
+#[inline]
 pub(super) fn cad_bell_voice(delay: f32) -> (Voice, f32) {
     let bell = Voice {
         delay,
@@ -1834,6 +1840,7 @@ pub struct MelodyV2 {
 }
 
 impl Default for MelodyV2 {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -1841,6 +1848,7 @@ impl Default for MelodyV2 {
 
 impl MelodyV2 {
     /// A fresh melody: home, the loop on I, no history and no subject.
+    #[inline]
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -1934,6 +1942,7 @@ impl MelodyV2 {
     /// (nothing typed for [`PHRASE_PAUSE_MS`]). The handback needs both: a
     /// stream with no spaces (a base64 paste, a password field) never reaches a
     /// word head.
+    #[inline]
     fn at_boundary(&self, at: u32) -> bool {
         self.text.word_pos == 0
             || self
@@ -1949,6 +1958,7 @@ impl MelodyV2 {
         self.text
     }
 
+    #[inline]
     fn push_undo(&mut self) {
         let frame = self.frame();
         if usize::from(self.undo_len) == UNDO_N {
@@ -1962,6 +1972,7 @@ impl MelodyV2 {
         }
     }
 
+    #[inline]
     fn pop_undo(&mut self) {
         let Some(n) = self.undo_len.checked_sub(1) else {
             return;
@@ -1990,6 +2001,7 @@ impl MelodyV2 {
     /// bounds cut at most two candidates off one side, so the `deg` fallback is
     /// unreachable; it stays so a chord-table change fails a test rather than
     /// playing an unlit note.
+    #[inline]
     fn nearest_lit_within(&self, deg: i32, from: i32) -> i32 {
         let deg = deg.clamp(TUNE_DEG_LO, TUNE_DEG_HI);
         if self.deg_is_lit(deg) {
@@ -2009,6 +2021,7 @@ impl MelodyV2 {
     /// Re-latches the subject (§3.1): the next [`MOTIF_LEN`] intervals become the
     /// line's new motif. Run by a rest and by the Space behind `.` `!` `?`, where
     /// a phrase ends; an Enter keeps the subject.
+    #[inline]
     fn relatch_motif(&mut self) {
         self.text.motif_len = 0;
         self.text.motif_play = 0;
@@ -2020,6 +2033,7 @@ impl MelodyV2 {
     /// a kill clear the pending mark, the token's steering budget and the open
     /// bracket. `last_cadence_deg` survives: the anti-drone spans consecutive
     /// sentences, including across one-sentence lines.
+    #[inline]
     fn end_phrase(&mut self) {
         self.text.last_mark = MARK_NONE;
         self.text.token_marked = false;
@@ -2031,6 +2045,7 @@ impl MelodyV2 {
 
     /// Ends the aside ([`ASIDE_GAIN`]), every open bracket at once: on a line
     /// boundary, a phrase rest, or the [`ASIDE_MAX_KEYS`]-th key inside it.
+    #[inline]
     fn close_aside(&mut self) {
         self.text.aside_depth = 0;
         self.text.aside_keys = 0;
@@ -2158,6 +2173,7 @@ impl TimbreStops {
 }
 
 impl Default for TimbreStops {
+    #[inline]
     fn default() -> Self {
         Self::ALL
     }
@@ -2168,6 +2184,7 @@ impl MelodyV2 {
     /// chord is parked so the next word boundary lands on I after a green one
     /// ([`CHORD_AFTER_ENTER`]) or on vi after a red one ([`CHORD_AFTER_RED`]).
     /// The playhead is untouched: a finishing command is not a keystroke.
+    #[inline]
     fn note_verdict(&mut self, at: u32, failed: bool, green_long: bool) {
         self.text.chord = if failed {
             CHORD_AFTER_RED
@@ -2179,6 +2196,7 @@ impl MelodyV2 {
 
     /// Take the hot key's door if this key is inside [`VERDICT_LIT_MS`] of
     /// it. Spent either way — one key, and the next one prices itself.
+    #[inline]
     fn take_verdict_lit(&mut self, at: u32) -> bool {
         let Some(mark) = self.verdict_at_ms.take() else {
             return false;
@@ -2605,6 +2623,7 @@ impl MelodyV2 {
     /// (when the plain one reflects back onto `from` or onto the same stride);
     /// a wider step the same way; a narrower one. At most one of the four can
     /// equal the run stride, so one always exists.
+    #[inline]
     fn break_run(&self, from: i32, deg: i32) -> i32 {
         let sounded = deg - from;
         if sounded == 0
@@ -2631,6 +2650,7 @@ impl MelodyV2 {
 
     /// [`MELODY_RUN_MAX`]'s bookkeeping: how long the line has taken the same
     /// stride. A repeat (stride 0) is standing still, so it clears the count.
+    #[inline]
     fn note_run(&mut self, stride: i32) {
         if stride != 0 && i32::from(self.text.run_stride) == stride {
             self.text.run_len = self.text.run_len.saturating_add(1);
@@ -2642,6 +2662,7 @@ impl MelodyV2 {
 
     /// The autorepeat detectors ([`AUTOREPEAT_JITTER_MS`]). The melody still
     /// advances; either can only take the pitch off the note.
+    #[inline]
     fn detect_autorepeat(&mut self, gap: u32, rank: u8, first: bool) -> bool {
         if first {
             self.repeat_run = 1;
@@ -2730,6 +2751,7 @@ impl MelodyV2 {
 
     /// Is this line feed the echo of the keyed Return just admitted (§10.4,
     /// [`ENTER_ECHO_SWALLOW_MS`])? The cadence has already spoken for it.
+    #[inline]
     fn jump_echoes_enter(&self, at: u32) -> bool {
         self.last_enter_ms
             .is_some_and(|e| at.saturating_sub(e) < ENTER_ECHO_SWALLOW_MS)
@@ -2807,6 +2829,7 @@ impl MelodyV2 {
         reflect_deg(i32::from(deg)) as i8
     }
 
+    #[inline]
     fn open_next_run_phrase(&mut self) {
         self.run_phrase = (self.run_phrase + 1) % (SONG_FORM.len() as u8 - 1);
         self.run_theme_pos = SONG_FORM[usize::from(self.run_phrase)];
@@ -2814,6 +2837,7 @@ impl MelodyV2 {
 
     /// §10.4's `on Backspace`: rewinds one keystroke of melody state. The sound
     /// is the unpitched poof: a deletion has no note (§19.2).
+    #[inline]
     fn on_backspace(&mut self, at: u32) {
         self.pop_undo();
         self.last_key_ms = Some(at);
@@ -2825,6 +2849,7 @@ impl MelodyV2 {
     /// §10.4's `on Kill / KillWord`: the playhead is untouched (a clause is
     /// leaving, not the tune rewinding), but the undo history and the word go
     /// with the text.
+    #[inline]
     fn on_kill(&mut self, at: u32) {
         self.undo_len = 0;
         self.end_phrase();
@@ -2833,6 +2858,7 @@ impl MelodyV2 {
     }
 
     /// The next glint's degree above the verse note (§13), rotating.
+    #[inline]
     fn next_glint_deg(&mut self) -> i32 {
         let deg = i32::from(self.text.walk) + GLINT_DEGREES[usize::from(self.glint_k)];
         self.glint_k = (self.glint_k + 1) % GLINT_DEGREES.len() as u8;
@@ -2842,6 +2868,7 @@ impl MelodyV2 {
     /// The answer's pitch (§3.3): the nearest degree lit by the live chord
     /// strictly above `deg`, always within three degrees. It may sit above the
     /// TUNE register: it lives in [`LANE_BLOOM`].
+    #[inline]
     fn answer_deg_above(&self, deg: i32) -> i32 {
         (1..=5)
             .map(|k| deg + k)
@@ -2900,6 +2927,7 @@ fn g_ioi(ioi_s: f32) -> f32 {
 /// [`ROOF_HUE_ADD_HZ`] from the hue (§3.3 item 3), never a decibel. `hue` is
 /// the arc position from [`hue_arc`] (0 red, 1 cyan); with the hue stop out
 /// the caller passes 0.0.
+#[inline]
 fn roof_hz(cps: f32, lit: bool, heat: f32, hue: f32, touch: Touch) -> f32 {
     let u = ((cps - ROOF_CPS_LO) / ROOF_CPS_SPAN).clamp(0.0, 1.0);
     let plain = ROOF_PLAIN_LO_HZ + (ROOF_PLAIN_HI_HZ - ROOF_PLAIN_LO_HZ) * u;
@@ -2940,6 +2968,7 @@ fn hue_air(hue: f32) -> f32 {
 /// Octave-folds `f` into `[lo, hi)`. Halving and doubling are exact in binary
 /// floating point, so the folded pitch keeps its lattice pitch class (§13).
 /// Bounded: callers keep `lo` positive and the loops step by octaves.
+#[inline]
 fn fold_into(f: f32, lo: f32, hi: f32) -> f32 {
     let mut f = f.clamp(1.0, 40_000.0);
     for _ in 0..24 {
@@ -2958,6 +2987,7 @@ fn fold_into(f: f32, lo: f32, hi: f32) -> f32 {
 /// the scaled voice decay, `roof` the resolved lowpass. `mallet_only` is
 /// §10.2's felt touch. `flow` (§22) changes only the step's
 /// fundamental-to-octave balance ([`flow_partials`]); at `0.0` it is inert.
+#[inline]
 fn tine(f: f32, touch: Touch, tau: f32, roof: f32, mallet_only: bool, flow: f32) -> Voice {
     let (p1, p2, p3, mallet) = match touch {
         Touch::Step => {
@@ -3042,6 +3072,7 @@ impl Forte {
     /// | re-strike / felt | 0 | the weight only | no | — |
     ///
     /// The sparkle's call site fires only on a struck step.
+    #[inline]
     fn of(
         shifted: bool,
         class: u8,
@@ -3139,6 +3170,7 @@ fn forte_index(f: f32, force: f32) -> f32 {
 /// (§9.5 law 1), every pitch and `Σ p.lvl`; a capital's decibels are
 /// [`Forte::gain`]. The strike site locks the modulator's angle after the spawn
 /// ([`TrailSynth::v2_lock_hammer`]).
+#[inline]
 fn forte(v: &mut Voice, f: f32, force: f32) {
     v.p[0].fm_ratio = FORTE_FM_RATIO;
     v.p[0].fm_i0 = forte_index(f, force);
@@ -3164,6 +3196,7 @@ fn forte(v: &mut Voice, f: f32, force: f32) {
 /// in place of the felt. `f` is the fundamental `tine` was built on; a step
 /// takes the bar's levels, a re-struck digit keeps the re-strike ladder's
 /// (0.50 / 0.10 / 0). Neither the IOI nor the fundamental is touched.
+#[inline]
 fn wood(v: &mut Voice, f: f32, touch: Touch) {
     v.p[1].f0 = f * WOOD_P2_RATIO;
     v.p[1].decay = WOOD_P2_TAU_S;
@@ -3208,6 +3241,7 @@ fn stop_breathes(class: u8) -> bool {
 /// fingertip, or for `_ ~ \ |` and `/` the zip. The caller has already put the
 /// voice on the pluck's τ. As in [`wood`], frequencies and decays always move;
 /// levels only on a step, so a re-struck mark keeps the re-strike ladder's.
+#[inline]
 fn pluck(v: &mut Voice, f: f32, class: u8, touch: Touch) {
     let step = touch == Touch::Step;
     v.p[1].f0 = f * PLUCK_P2_RATIO;
@@ -3239,6 +3273,7 @@ fn pluck(v: &mut Voice, f: f32, class: u8, touch: Touch) {
 /// Q 0.7, 8 / 55 / 149 ms, [`LANE_BREATH`]), and the air a stop moves,
 /// `delay` seconds after its pluck ([`STOP_BREATH_DELAY_S`]). A space's is at
 /// delay 0.
+#[inline]
 fn breath(delay: f32) -> Voice {
     Voice {
         delay,
@@ -3259,6 +3294,7 @@ fn breath(delay: f32) -> Voice {
 /// §9.3's bass dyad as a prototype voice: `root`, its `partner` and the short
 /// octave over the root, on `decay` with the tail law's `dur`, `delay` seconds
 /// out. The word downbeat, the Return's tonic and the verdict's chords.
+#[inline]
 fn bass_dyad(root: f32, partner: f32, decay: f32, delay: f32) -> Voice {
     Voice {
         delay,
@@ -3308,6 +3344,7 @@ fn p1_sine(f0: f32) -> [Partial; 3] {
 /// falling 3200 → 900 Hz at the origin on a 1.5 ms decay, living
 /// [`MET_TICK_DUR_S`] so its crest clears the release ramp, under
 /// [`MET_TICK_ROOF_HZ`]. The arm adds its ttl.
+#[inline]
 fn met_tick() -> Voice {
     Voice {
         dur: MET_TICK_DUR_S,
@@ -3329,6 +3366,7 @@ fn met_tick() -> Voice {
 /// folded into the stardust lane and its octave under, through
 /// [`BREATH_ROOF_HZ`]. Only a run's head; a tail space and a stop take
 /// [`breath`].
+#[inline]
 fn head_breath(root: f32) -> Voice {
     let twinkle = fold_into(root, GLINT_LO_HZ, GLINT_HI_HZ);
     Voice {
@@ -3354,6 +3392,7 @@ fn head_breath(root: f32) -> Voice {
 /// above the note's. Decay and head scale with `tau_v` (the live IOI's
 /// [`tau_v_s`], without the re-strike multiplier) under their ceilings, so at
 /// the 4 cps reference each term equals its constant.
+#[inline]
 fn bloom(deg: i32, roof: f32, tau_v: f32) -> Voice {
     let decay = (BLOOM_DECAY_TAU_MUL * tau_v).min(BLOOM_DECAY_S);
     let head = (tau_v / TAU_V_MAX_S).clamp(BLOOM_HEAD_MIN_MUL, 1.0);
@@ -3404,6 +3443,7 @@ impl TrailSynth {
     /// A seeded velocity multiplier, `10^(u·k/20)` with `u ∈ [−1, 1]` (§9.6),
     /// drawn from the synth's seeded stream so a script replays bit-exactly
     /// (A27).
+    #[inline]
     fn v2_velocity(&mut self, db: f32) -> f32 {
         let u = self.rnd_in(-1.0, 1.0);
         (10.0f32).powf(u * db / 20.0)
@@ -3412,6 +3452,7 @@ impl TrailSynth {
     /// The seeded ±0.03 pan jitter (§9.1). §9.1 states it in the stereo law's
     /// output units (after `× 0.35`); this is the law's input, so the draw is
     /// divided back out and the heard pan moves by ±0.03.
+    #[inline]
     fn v2_pan(&mut self, pan: f32) -> f32 {
         pan + self.rnd_in(-PAN_JITTER, PAN_JITTER) / PAN_LAW_SCALE
     }
@@ -3421,6 +3462,7 @@ impl TrailSynth {
     /// borrowed `song_key` returns to the neutral lattice before the next
     /// word's first note, never mid-word (A31). Called at the top of every
     /// event that can open a word.
+    #[inline]
     fn v2_hand_back_key(&mut self, at: u32) {
         if self.v2_key_pending && self.v2.at_boundary(at) {
             self.song_key = 0;
@@ -3431,6 +3473,7 @@ impl TrailSynth {
     /// §9.5 law 5 for lanes whose newcomer may land on a live voice's exact
     /// pitch (echo, glint): damps the old voice first over the 12 ms ramp, so
     /// two independently phased sines at one frequency never comb.
+    #[inline]
     fn v2_damp_same_pitch(&mut self, lane: u8, f: f32) {
         for v in &mut self.voices {
             if v.on && v.lane == lane && v.damp <= 0.0 && (v.p[0].f0 - f).abs() < SAME_PITCH_HZ {
@@ -3445,6 +3488,7 @@ impl TrailSynth {
     /// [`LANE_TING`] voice. This pitch: within [`SAME_PITCH_CENTS`], a ratio,
     /// since the ting sits two octaves above the lanes [`SAME_PITCH_HZ`] was
     /// sized for. Read-only.
+    #[inline]
     fn v2_live_ting_at(&self, f: f32) -> bool {
         let Some((slot, born)) = self.v2.lift else {
             return false;
@@ -3460,6 +3504,7 @@ impl TrailSynth {
     /// announced, on the pan glide (§16 delta 3) with both far-end gains scaled,
     /// so pan holds and level is continuous. Draws nothing and arms at most once
     /// per ting; a ting already fading, or a stale address, is left alone.
+    #[inline]
     fn v2_duck_ting(&mut self, to: f32) {
         #[cfg(test)]
         if self.ting_unducked {
@@ -3485,6 +3530,7 @@ impl TrailSynth {
 
     /// Spawn and return the voice's address — `(slot, born)` — so a later damp
     /// or cancel can prove it is still talking to the same voice.
+    #[inline]
     fn v2_spawn(&mut self, proto: Voice, gain: f32, pan: f32) -> Option<(u8, u32)> {
         let idx = self.spawn(proto, gain, pan)?;
         Some((idx as u8, self.voices[idx].born))
@@ -3495,6 +3541,7 @@ impl TrailSynth {
     /// four draws in order and discards the first phase, since one draw fewer
     /// would shift every later voice's seeded stream (A27); hence not
     /// [`TrailSynth::spawn_seeded`].
+    #[inline]
     fn v2_spawn_ph0(
         &mut self,
         proto: Voice,
@@ -3515,6 +3562,7 @@ impl TrailSynth {
     /// octave, `delay_s` behind the strike. Digit bars (3f) and plucks (4f)
     /// have no stationary 2f, so unmatched voices keep their seeded phase.
     /// The flow echo passes [`FLOW_ECHO_DELAY_S`].
+    #[inline]
     fn v2_flow_echo_phase(&self, fundamental: f32, delay_s: f32) -> Option<f32> {
         let (slot, born) = self.v2.lead?;
         let lead = &self.voices[usize::from(slot)];
@@ -3534,6 +3582,7 @@ impl TrailSynth {
     /// [`FORTE_FM_RATIO`] × that phase, and the render advances both at that
     /// ratio, so the angle holds. Draws nothing; reached only when
     /// `force > 0`. A stale address (the TUNE lane refused the key) is a no-op.
+    #[inline]
     fn v2_lock_hammer(&mut self, who: Option<(u8, u32)>, turn: f32) {
         let Some((slot, born)) = who else { return };
         let v = &mut self.voices[usize::from(slot)];
@@ -3548,6 +3597,7 @@ impl TrailSynth {
     /// under a full pool the decoration is dropped and the mark still sounds.
     /// Lane caps exclude fade tails and pre-delayed voices, and queued keys can
     /// arrive between renders, so the check is on the whole pool.
+    #[inline]
     fn v2_spawn_decoration(&mut self, proto: Voice, gain: f32, pan: f32) -> Option<(u8, u32)> {
         if self.voices.iter().all(|v| v.on) {
             return None;
@@ -3558,6 +3608,7 @@ impl TrailSynth {
     /// Ramps a specific voice down. Does nothing when the address is stale
     /// (slot recycled) or the voice is already damping: §9.5 law 2's ramp is
     /// armed once, never restarted.
+    #[inline]
     fn v2_damp(&mut self, who: Option<(u8, u32)>, ramp: f32) {
         let Some((slot, born)) = who else { return };
         let v = &mut self.voices[usize::from(slot)];
@@ -3571,6 +3622,7 @@ impl TrailSynth {
     /// still at `t < 0` has produced no sample, so retiring it is silent. A
     /// voice that has started is left alone: a bell that has sounded is never
     /// damped.
+    #[inline]
     fn v2_cancel_unsounded(&mut self, who: Option<(u8, u32)>) {
         let Some((slot, born)) = who else { return };
         let v = &mut self.voices[usize::from(slot)];
@@ -3583,6 +3635,7 @@ impl TrailSynth {
     /// (`t < 0`), else ramps it down over `ramp` like the note it decorated. A
     /// ring on a key the hand has just taken back goes with the note (unlike
     /// the meteor's bell, which is never damped once sounded).
+    #[inline]
     fn v2_retire(&mut self, who: Option<(u8, u32)>, ramp: f32) {
         let Some((slot, born)) = who else { return };
         let v = &mut self.voices[usize::from(slot)];
@@ -4376,6 +4429,7 @@ impl TrailSynth {
 
     /// The lit step's roof at the live IOI under this cue's hue — the one
     /// roof a whole-gesture's tines share (strum, cadence, verdict, bell).
+    #[inline]
     fn v2_lit_roof(&self, ev: &SoundEvent) -> f32 {
         let arc = if self.v2.stops.hue {
             hue_arc(ev.hue)
@@ -4640,6 +4694,7 @@ impl TrailSynth {
     /// lattice degree, octave-folded into the stardust lane, twinkling at the
     /// star's own scintillation rate, so what winks on screen and in the ear is
     /// one number (D12).
+    #[inline]
     fn v2_glint(&mut self, ev: &SoundEvent, twinkle_hz: u8) {
         let vel = self.v2_velocity(VEL_DB_RESTRIKE);
         // The hero star is its own event and has no strike to stand off
@@ -4651,6 +4706,7 @@ impl TrailSynth {
     /// its own velocity; a typed key's sparkle shares the strike's, since it is
     /// part of that strike and a second draw would shift the seeded stream
     /// (A27).
+    #[inline]
     fn v2_glint_at(&mut self, ev: &SoundEvent, twinkle_hz: u8, level: f32, vel: f32, delay: f32) {
         let deg = self.v2.next_glint_deg() + i32::from(self.song_key);
         self.v2_glint_deg_at(ev, deg, twinkle_hz, level, vel, delay);
@@ -4660,6 +4716,7 @@ impl TrailSynth {
     /// lattice degree `deg` (reflected and keyed by the caller), on the key's
     /// roof and pan with no draw of its own. Returns the address for
     /// [`MelodyV2::graft`].
+    #[inline]
     fn v2_tink(&mut self, deg: i32, roof: f32, gain: f32, pan: f32) -> Option<(u8, u32)> {
         let voice = Voice {
             delay: TINK_DELAY_S,

@@ -2,8 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::supervise::approvals::{Outcome, RULE_WALL_WAIT, Row};
-use crate::supervise::policy::turn_end::{Conversation, RULE_LIMIT_RESUME, decide_turn_end};
+use crate::supervise::approvals::{Outcome, RULE_WALL_WAIT, RULE_WALL_WAIT_END, Row};
+use crate::supervise::policy::turn_end::{
+    Conversation, RULE_CONTINUE, RULE_LIMIT_RESUME, decide_turn_end,
+};
 
 /// Compose the measured limit/resume screens with a shell that outlived the
 /// turn, as the measured background-work fixtures draw it. No live turn runs.
@@ -204,12 +206,14 @@ struct Limited {
 }
 
 /// What one point decided, and the limit's conversation it left: the
-/// track's ([`TurnEndState::limit_conversation`]) and the memory's.
-#[derive(Debug, PartialEq, Eq)]
+/// track's ([`TurnEndState::limit_conversation`]) and the memory's; and the
+/// exception the point stands under (`kind why`, [`exception_for`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Decided {
     act: String,
     track: Option<Conversation>,
     memory: Option<Conversation>,
+    told: Option<String>,
 }
 
 /// One point of a loop: its `seq`, the program `status` names there
@@ -288,6 +292,10 @@ fn loop_points(
             act,
             track: s.turn_end.limit_conversation().cloned(),
             memory: s.wall_memory.as_ref().map(|m| m.conversation.clone()),
+            told: s
+                .exception_now
+                .as_ref()
+                .map(|e| format!("{} {}", e.kind.word(), e.why)),
         });
     }
     decided
@@ -1106,33 +1114,384 @@ fn a_hosts_loop_requires_the_wall_it_takes_up_before_any_decision() {
     }
 }
 
-/// A LIMIT IS RELEASED TO THE HOSTLESS LANE'S ONLY WHERE IT WAS MET UNDER AN
-/// AGENT WHOSE SCREEN IS ALL ITS EVIDENCE ([`screen_alone`]), whatever program
-/// the tab runs at the decision. One tab under a host whose read names no
-/// conversation: Claude Code meets conversation B's five-hour limit (unread,
-/// `"conversation":null`), hides its notice under a shell, then exits and Muse
-/// Code, agy or Gemini CLI runs in the same tab. That agent's decisions leave
-/// Claude Code's limit unread, on the track, in memory and in every wall row,
-/// and a hostless loop that follows, an hour past the reset at Claude Code's
-/// screen, looks again: nothing is typed into a conversation no read
-/// confirmed. NEGATIVE CONTROL: Muse Code's own limit, required unread by a
-/// Claude Code decision under the host, is released by Muse Code's next
-/// decision and written so, and a hostless loop that follows resumes it past
-/// its reset. Measured before: the agent's first decision released Claude
-/// Code's limit and wrote it, and the hostless loop typed `usage-resume@v1`.
+/// The wall rows of `rows` ([`ledger_scopes`]).
+fn wall_rows(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.split(' ').next() == Some(RULE_WALL_WAIT))
+        .cloned()
+        .collect()
+}
+
+/// Whether the ledger's rows `rows` end the wall they open: a wall row, and
+/// the wall's end row after the last of them.
+fn wall_ended(rows: &[String]) -> bool {
+    let end = format!("{RULE_WALL_WAIT_END} ");
+    rows.iter()
+        .rposition(|r| r.split(' ').next() == Some(RULE_WALL_WAIT))
+        .is_some_and(|last| rows[last..].iter().any(|r| r.starts_with(&end)))
+}
+
+/// Whether `d` is held or resumed on a limit's account: the unread look,
+/// the wait on a limit's reset, or the limit's resume.
+fn on_a_limits_account(d: &Decided) -> bool {
+    d.act
+        .contains("the remembered limit's conversation is unread")
+        || d.act.contains("resets")
+        || d.act.contains("goes on by itself")
+        || d.act == format!("act {RULE_LIMIT_RESUME}")
+}
+
+/// A screen of Claude Code's own turn end, its conversation at no limit (a
+/// `/resume` of another conversation at an armed limit, the lab's capture,
+/// 2.1.300): an idle point.
+fn claude_idle() -> Vec<String> {
+    aterm_phase::prompt::fixtures::screen(
+        aterm_phase::prompt::fixtures::RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300,
+    )
+}
+
+/// A limit a screen-alone agent meets: its name, its wall drawn (`None`:
+/// Gemini CLI, whose quota is a dialog, no wall the turn's end reads), the
+/// open wall a loop before this one wrote met under it (Gemini CLI's), and
+/// the agent's own screen after its wall.
+struct AgentLimit {
+    name: &'static str,
+    wall: Option<Vec<String>>,
+    seed: Option<String>,
+    own: Vec<String>,
+}
+
+/// Muse Code's, agy's and Gemini CLI's limits ([`AgentLimit`]).
+fn agent_limits() -> Vec<AgentLimit> {
+    use aterm_phase::agy::fixtures::lab as a;
+    use aterm_phase::muse::fixtures as u;
+    use aterm_phase::prompt::fixtures::screen;
+    let limit = muse_limit();
+    let reason = approvals::wall_wait_reason(
+        Some(TEST_NOW + LIMITED_RESET_IN),
+        limit.reset.as_deref(),
+        limit.kind,
+        &limit.message,
+    );
+    let gemini_row = Row {
+        rule_id: RULE_WALL_WAIT,
+        outcome: Outcome::Waiting,
+        command: "",
+        reason: &reason,
+        box_seq: 100,
+    }
+    .to_json_wall_wait_by(
+        (TEST_NOW - 60) * 1000,
+        Some("@s-1"),
+        &Conversation::Hostless,
+        Some(Program::Gemini),
+    );
+    vec![
+        AgentLimit {
+            name: "muse",
+            wall: Some(screen(u::USAGE_WALL)),
+            seed: None,
+            own: screen(u::END_OF_TURN_BG_RUNNING),
+        },
+        AgentLimit {
+            name: "agy",
+            wall: Some(screen(a::ERROR_429_LONG)),
+            seed: None,
+            own: screen(a::BG_TASK),
+        },
+        AgentLimit {
+            name: "gemini",
+            wall: None,
+            seed: Some(gemini_row),
+            own: screen(aterm_phase::gemini::fixtures::END_OF_TURN),
+        },
+    ]
+}
+
+/// What a loop decided at [`agent_then`]'s points, and what its ledger was
+/// left holding.
+struct AgentThen {
+    /// Every point's decision, the wall's first where it is drawn.
+    all: Vec<Decided>,
+    /// The decisions after the wall.
+    after: Vec<Decided>,
+    /// Each ledger row's rule and conversation ([`ledger_scopes`]).
+    rows: Vec<String>,
+    /// The program each wall row names ([`wall_programs`]).
+    programs: Vec<Option<String>>,
+    /// The open wall left for a loop that follows.
+    open: Option<approvals::OpenWall>,
+}
+
+/// One loop on a scratch ledger, `host` there or not: `l`'s limit (its wall
+/// drawn, or its open wall taken up), then `after` at each of `later`'s
+/// clocks.
+fn agent_then(tag: &str, l: &AgentLimit, host: bool, after: &[String], later: &[i64]) -> AgentThen {
+    let (dir, ledger) = ledger_at(&format!("{tag}-{}-{host}", l.name));
+    if let Some(row) = &l.seed {
+        std::fs::write(&ledger, format!("{row}\n")).expect("the ledger");
+    }
+    let mut points = Vec::new();
+    if let Some(wall) = &l.wall {
+        points.push(At {
+            seq: 101,
+            program: None,
+            rows: wall,
+            at: 0,
+            worked: Some(Duration::from_secs(60)),
+        });
+    }
+    for (&at, seq) in later.iter().zip(102..) {
+        points.push(At {
+            seq,
+            program: None,
+            rows: after,
+            at,
+            worked: None,
+        });
+    }
+    let seed = approvals::open_wall(&ledger, Some("@s-1"));
+    let all = loop_points(&ledger, host, seed, &points);
+    let rows = ledger_scopes(&ledger);
+    let programs = wall_programs(&ledger);
+    let open = approvals::open_wall(&ledger, Some("@s-1"));
+    let _ = std::fs::remove_dir_all(dir);
+    let after = all[usize::from(l.wall.is_some())..].to_vec();
+    AgentThen {
+        all,
+        after,
+        rows,
+        programs,
+        open,
+    }
+}
+
+/// Whether `t`'s points after the wall are the next agent's own — never on
+/// the limit's account, the limit's track and memory gone, the last its
+/// continue — and the limit, never scoped, ended at the first of them
+/// (`name`'s wall rows all naming it).
+fn ended_at_the_next_agent(t: &AgentThen, name: &str) -> bool {
+    t.after
+        .iter()
+        .all(|d| !on_a_limits_account(d) && d.track.is_none() && d.memory.is_none())
+        && t.after
+            .last()
+            .is_some_and(|d| d.act == format!("act {RULE_CONTINUE}"))
+        && !wall_rows(&t.rows).is_empty()
+        && wall_rows(&t.rows)
+            .iter()
+            .all(|r| r.ends_with("conversation=None"))
+        && wall_ended(&t.rows)
+        && t.open.is_none()
+        && t.programs.iter().all(|p| p.as_deref() == Some(name))
+}
+
+/// A LIMIT MET UNDER MUSE CODE, AGY OR GEMINI CLI IS NO LIMIT OF THE CLAUDE
+/// CODE THAT RUNS IN ITS TAB AFTER IT ([`met_under_another`]), a host there
+/// or not — the remembered-limit stage's L1, decided on the merits
+/// (2026-10-21): a Claude Code decision under a host does NOT require such a
+/// limit's conversation, since no read of Claude Code's could ever name it,
+/// and the limit ends at Claude Code's point, its end row written and its
+/// track and memory gone. Claude Code's idle point is then its own turn's
+/// end, the continue policy's act, before the other agent's reset and two
+/// days past it; Claude Code's background work alone is no point of that
+/// limit's. No row scopes the limit `"conversation":null`, and none is left
+/// open for a loop that follows. Measured before (Muse Code's usage wall,
+/// then Claude Code's idle screen): under a host the Claude
+/// Code decision wrote the limit `"conversation":null` and held Claude Code's
+/// tab with a look every five minutes (`limit-conversation-unread`), two
+/// days on and looking still; with no host it held Claude Code until the
+/// other agent's reset and then typed `usage-resume@v1` into it.
+/// NEGATIVE CONTROL: the agent's own screen after its wall keeps the limit,
+/// its reset waited for, its scope the hostless lane's.
 #[test]
-fn a_limit_met_under_claude_code_outlives_a_screen_alone_agent_in_its_tab() {
-    use aterm_phase::prompt::fixtures::{RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300, screen};
-    let claude = with_shell(screen(RESUMED_NO_LIMIT_AT_ARMED_LIMIT_2_1_300));
+fn a_screen_alone_agents_limit_is_no_limit_of_the_claude_code_after_it() {
+    let claude = claude_idle();
+    let claude_bg = with_shell(claude_idle());
+    for l in &agent_limits() {
+        let name = l.name;
+        for host in [true, false] {
+            let t = agent_then(
+                "met-under-agent-claude",
+                l,
+                host,
+                &claude,
+                &[30, 2 * 86_400],
+            );
+            if l.wall.is_some() {
+                assert!(
+                    t.all[0].act.starts_with("wait "),
+                    "{name}, host {host}: the agent's reset is waited for at its wall: {:#?}",
+                    t.all
+                );
+            }
+            assert!(
+                ended_at_the_next_agent(&t, name),
+                "{name}, host {host}: Claude Code's point is its own turn's end, the agent's \
+                 limit gone, never scoped, ended: {:#?}\n{:#?}\n{:?}\n{:?}",
+                t.all,
+                t.rows,
+                t.programs,
+                t.open
+            );
+            // Claude Code's background work alone: no point of the
+            // agent's limit.
+            let t = agent_then(
+                "met-under-agent-claude-bg",
+                l,
+                host,
+                &claude_bg,
+                &[30, 2 * 86_400],
+            );
+            assert!(
+                t.after
+                    .iter()
+                    .all(|d| d.act == "nothing" && d.track.is_none() && d.memory.is_none())
+                    && wall_ended(&t.rows)
+                    && t.open.is_none(),
+                "{name}, host {host}: Claude Code's background work stands for no wall of the \
+                 agent's: {:#?}\n{:#?}",
+                t.all,
+                t.rows
+            );
+            // NEGATIVE CONTROL: the agent's own screen after its wall.
+            let t = agent_then("met-under-agent-own", l, host, &l.own, &[30]);
+            assert!(
+                t.after.iter().all(|d| d.act.starts_with("wait ")
+                    && on_a_limits_account(d)
+                    && !d.act.contains("unread")
+                    && d.track == Some(Conversation::Hostless))
+                    && !wall_ended(&t.rows)
+                    && t.open.is_some(),
+                "{name}, host {host}, CONTROL: the agent's own screen keeps its limit: \
+                 {:#?}\n{:#?}",
+                t.all,
+                t.rows
+            );
+        }
+    }
+}
+
+/// A LIMIT MET UNDER ONE SCREEN-ALONE AGENT IS NO LIMIT OF ANOTHER THAT RUNS
+/// IN ITS TAB AFTER IT ([`met_under_another`], T1 of the review of
+/// `b9/walls-2`): Muse Code's limit, then agy or Gemini CLI idle at its
+/// turn's end; agy's, then Muse Code or Gemini CLI; Gemini CLI's (the open
+/// wall a loop before wrote), then Muse Code or agy — a host there or not.
+/// The next agent's points, half a minute and two days on, are its own:
+/// never a wait on the first agent's reset, never its resume; the limit,
+/// never scoped, ends at the first of them, its end row written and none
+/// left open. Measured before the cross-program end was held for these
+/// pairs (a mutant that ends only a limit crossing Claude Code, the whole
+/// suite passing): Muse Code's limit held agy's and Gemini CLI's tab until
+/// Muse Code's reset (`wait 15172s: usage-session resets`) and then typed
+/// `usage-resume@v1` into it, hosted and hostless. NEGATIVE CONTROL: each
+/// agent's own screen after its limit keeps it
+/// ([`a_screen_alone_agents_limit_is_no_limit_of_the_claude_code_after_it`]).
+#[test]
+fn a_screen_alone_agents_limit_is_no_limit_of_another_screen_alone_agent_after_it() {
+    use aterm_phase::prompt::fixtures::screen;
+    let idle = [
+        ("muse", screen(aterm_phase::muse::fixtures::END_OF_TURN)),
+        ("agy", screen(aterm_phase::agy::fixtures::lab::END_OF_TURN)),
+        ("gemini", screen(aterm_phase::gemini::fixtures::END_OF_TURN)),
+    ];
+    let mut pairs = 0;
+    for l in &agent_limits() {
+        for (next, rows) in idle.iter().filter(|(n, _)| *n != l.name) {
+            for host in [true, false] {
+                let t = agent_then(
+                    &format!("met-under-agent-{next}"),
+                    l,
+                    host,
+                    rows,
+                    &[30, 2 * 86_400],
+                );
+                assert!(
+                    ended_at_the_next_agent(&t, l.name),
+                    "{} then {next}, host {host}: the next agent's points are its own, the \
+                     limit ended: {:#?}\n{:#?}\n{:?}\n{:?}",
+                    l.name,
+                    t.all,
+                    t.rows,
+                    t.programs,
+                    t.open
+                );
+                pairs += 1;
+            }
+        }
+    }
+    assert_eq!(pairs, 12, "every ordered pair, hosted and hostless");
+}
+
+/// The points of [`claude_codes_unread_limit_holds_no_screen_alone_agent_in_its_tab`]:
+/// Claude Code's limit met by a turn (`armed`), its notice hidden under a
+/// shell half a minute on (`claude`), then the agent's idle screen `agent`
+/// a minute, an hour and two days on.
+fn held_points<'a>(
+    armed: &'a [String],
+    claude: &'a [String],
+    agent: Option<&'a [String]>,
+) -> Vec<At<'a>> {
+    let mut points = vec![
+        At {
+            seq: 101,
+            program: None,
+            rows: armed,
+            at: 0,
+            worked: Some(Duration::from_secs(60)),
+        },
+        At {
+            seq: 102,
+            program: None,
+            rows: claude,
+            at: 30,
+            worked: None,
+        },
+    ];
+    for (at, seq) in [60, 3600, 2 * 86_400].into_iter().zip(103..) {
+        if let Some(rows) = agent {
+            points.push(At {
+                seq,
+                program: None,
+                rows,
+                at,
+                worked: None,
+            });
+        }
+    }
+    points
+}
+
+/// CLAUDE CODE'S UNREAD LIMIT HOLDS NO MUSE CODE, AGY OR GEMINI CLI THAT
+/// RUNS IN ITS TAB AFTER IT — the remembered-limit stage's L2, bounded at
+/// the agent's first point ([`met_under_another`]). One tab under a host
+/// whose read names no conversation: Claude Code meets conversation B's
+/// five-hour limit (unread, `"conversation":null`) and hides its notice under
+/// a shell, where the limit holds Claude Code's own tab, unread; then Claude
+/// Code exits and the agent runs there, idle at its turn's end. Its first
+/// point is its own: the limit ends there (its end row written, its track
+/// and memory gone, its scope never released: every wall row stays
+/// `"conversation":null`, met under Claude Code), and the agent's point and
+/// every one after it, an hour and two days on, is its own turn's end —
+/// never the unread look, never a wait on Claude Code's reset, never Claude
+/// Code's resume. So too on the hostless lane, and for a loop that follows
+/// taking the limit up from the ledger at the agent's screen. Measured before
+/// (Muse Code's idle screen, 2026-10-21): every one of the agent's points
+/// waited `now + 5 min` ("the remembered limit's conversation is unread; no
+/// act on its account"), at a minute, an hour, six hours and two days — a
+/// look every five minutes for as long as the agent sat idle, nothing typed
+/// and nothing said; with no host the agent waited for Claude Code's reset
+/// and was typed `usage-resume@v1`. NEGATIVE CONTROL: the same limit at
+/// Claude Code's own screen stays unread and held, for this loop and for a
+/// hostless loop that follows it an hour past the reset: nothing is typed
+/// into a conversation no read confirmed.
+#[test]
+fn claude_codes_unread_limit_holds_no_screen_alone_agent_in_its_tab() {
+    use aterm_phase::prompt::fixtures::screen;
+    let claude = with_shell(claude_idle());
     let unread = |d: &Decided| {
         d.act
             .contains("the remembered limit's conversation is unread")
-    };
-    let walls = |rows: &[String]| -> Vec<String> {
-        rows.iter()
-            .filter(|r| r.split(' ').next() == Some(RULE_WALL_WAIT))
-            .cloned()
-            .collect()
     };
     let past_reset = |ledger: &Path| {
         approvals::open_wall(ledger, Some("@s-1"))
@@ -1141,151 +1500,362 @@ fn a_limit_met_under_claude_code_outlives_a_screen_alone_agent_in_its_tab() {
             + 3600
             - TEST_NOW
     };
+    let armed = armed_conversation_b();
     for (name, agent) in [
-        (
-            "muse",
-            screen(aterm_phase::muse::fixtures::END_OF_TURN_BG_RUNNING),
-        ),
-        ("agy", screen(aterm_phase::agy::fixtures::lab::BG_TASK)),
+        ("muse", screen(aterm_phase::muse::fixtures::END_OF_TURN)),
+        ("agy", screen(aterm_phase::agy::fixtures::lab::END_OF_TURN)),
         ("gemini", screen(aterm_phase::gemini::fixtures::END_OF_TURN)),
     ] {
-        let (dir, ledger) = ledger_at(&format!("met-under-claude-{name}"));
-        let hosted = loop_points(
-            &ledger,
-            true,
-            None,
-            &[
-                At {
-                    seq: 101,
-                    program: None,
-                    rows: &armed_conversation_b(),
-                    at: 0,
-                    worked: Some(Duration::from_secs(60)),
-                },
-                At {
-                    seq: 102,
-                    program: None,
-                    rows: &claude,
-                    at: 30,
-                    worked: None,
-                },
-                At {
-                    seq: 103,
-                    program: None,
-                    rows: &agent,
-                    at: 60,
-                    worked: None,
-                },
-            ],
-        );
-        let rows = ledger_scopes(&ledger);
-        assert!(
-            hosted.iter().all(|d| d.track == Some(Conversation::Unknown)
-                && d.memory == Some(Conversation::Unknown))
-                && hosted[1..].iter().all(unread),
-            "{name}: Claude Code's limit stays unread in its tab: {hosted:#?}\n{rows:#?}"
-        );
-        assert!(
-            !walls(&rows).is_empty()
-                && walls(&rows)
+        for host in [true, false] {
+            let (dir, ledger) = ledger_at(&format!("claude-then-{name}-{host}"));
+            let points = held_points(&armed, &claude, Some(&agent));
+            let decided = loop_points(&ledger, host, None, &points);
+            let rows = ledger_scopes(&ledger);
+            let programs = wall_programs(&ledger);
+            let open = approvals::open_wall(&ledger, Some("@s-1"));
+            let _ = std::fs::remove_dir_all(dir);
+            if host {
+                assert!(
+                    unread(&decided[1]) && decided[1].track == Some(Conversation::Unknown),
+                    "{name}, CONTROL: the limit holds Claude Code's own tab, unread: \
+                     {decided:#?}"
+                );
+            }
+            assert!(
+                decided[2..]
                     .iter()
-                    .all(|r| r.contains("conversation=Some(Null)")),
-            "{name}: no row releases it: {rows:#?}"
-        );
-        assert!(
-            wall_programs(&ledger)
-                .iter()
-                .all(|p| p.as_deref() == Some("claude")),
-            "{name}: each wall row names the program it was met under: {:?}",
-            wall_programs(&ledger)
-        );
+                    .all(|d| !on_a_limits_account(d) && d.track.is_none() && d.memory.is_none()),
+                "{name}, host {host}: the agent's points are its own: {decided:#?}\n{rows:#?}"
+            );
+            let scope = if host {
+                "conversation=Some(Null)"
+            } else {
+                "conversation=None"
+            };
+            assert!(
+                !wall_rows(&rows).is_empty()
+                    && wall_rows(&rows).iter().all(|r| r.ends_with(scope))
+                    && wall_ended(&rows)
+                    && open.is_none()
+                    && programs.iter().all(|p| p.as_deref() == Some("claude")),
+                "{name}, host {host}: the limit, never released, ends at the agent's point: \
+                 {rows:#?}\n{programs:?}"
+            );
+        }
+        // A loop that follows takes the limit up at the agent's screen,
+        // past its reset; and, the CONTROL, at Claude Code's.
+        for (host, at_agent) in [(true, true), (false, true), (false, false)] {
+            let (dir, ledger) = ledger_at(&format!("claude-left-{name}-{host}-{at_agent}"));
+            let points = held_points(&armed, &claude, None);
+            let _ = loop_points(&ledger, true, None, &points);
+            let open = approvals::open_wall(&ledger, Some("@s-1"));
+            assert!(
+                open.as_ref()
+                    .is_some_and(|o| o.program == Some(Program::Claude)
+                        && o.conversation == Conversation::Unknown),
+                "{name}: the first loop leaves Claude Code's limit open, unread: {open:?}"
+            );
+            let rows: &[String] = if at_agent { &agent } else { &claude };
+            let successor = loop_points(
+                &ledger,
+                host,
+                open,
+                &[At {
+                    seq: 104,
+                    program: None,
+                    rows,
+                    at: past_reset(&ledger),
+                    worked: None,
+                }],
+            );
+            let scopes = ledger_scopes(&ledger);
+            let left = approvals::open_wall(&ledger, Some("@s-1"));
+            let _ = std::fs::remove_dir_all(dir);
+            if at_agent {
+                assert!(
+                    successor.iter().all(|d| !on_a_limits_account(d)
+                        && d.track.is_none()
+                        && d.memory.is_none())
+                        && wall_ended(&scopes)
+                        && left.is_none(),
+                    "{name}, host {host}: a loop that follows ends the limit at the agent's \
+                     point: {successor:#?}\n{scopes:#?}"
+                );
+            } else {
+                assert!(
+                    successor.iter().all(unread) && left.is_some(),
+                    "{name}, CONTROL: a hostless loop that follows holds it at Claude Code's \
+                     screen: {successor:#?}\n{scopes:#?}"
+                );
+            }
+        }
+    }
+}
+
+/// A LIMIT HELD UNREAD AT ITS OWN AGENT'S SCREEN IS TOLD TO THE OWNER AN HOUR
+/// PAST ITS RESET, AND STILL HELD ([`Exception::unread_limit`], FOREVER:
+/// NEEDS YOU is loud and never blocking) — the bound on the remembered-limit
+/// stage's L2 that the agent itself still needs. Under a host whose read
+/// names no conversation, Claude Code meets conversation B's five-hour limit
+/// (unread) and hides its notice under a shell: the tab is looked at every
+/// five minutes with nothing typed (no read confirms the conversation the
+/// screen holds), half an hour past the reset with nothing said, and from an
+/// hour past it under the exception, two days on too; a hostless loop that
+/// takes the unread limit up is told the same. NEGATIVE CONTROL: the same
+/// limit on the hostless lane, its conversation the screen's, is no hold and
+/// tells nothing of the kind. Measured before: two days past the reset the
+/// point still waited `now + 5 min`, and no exception stood.
+#[test]
+fn a_limit_held_unread_past_its_reset_is_told_and_still_held() {
+    use crate::supervise::policy::exception::{Exception, FUTILE_AFTER};
+    let e = Exception::unread_limit();
+    assert!(
+        e.why.chars().count() <= aterm_messages::need::STEP_CAP
+            && e.action.chars().count() <= aterm_messages::need::STEP_CAP
+            && aterm_messages::need::Step::new(&e.action).fault().is_none(),
+        "the digest's words: {e:?}"
+    );
+    let told = format!("{} {}", e.kind.word(), e.why);
+    let unread = |d: &Decided| {
+        d.act
+            .contains("the remembered limit's conversation is unread")
+    };
+    let armed = armed_conversation_b();
+    let claude = with_shell(claude_idle());
+    // The reset the loop places for B's limit.
+    let (dir, ledger) = ledger_at("unread-told-reset");
+    let _ = loop_points(
+        &ledger,
+        true,
+        None,
+        &[At {
+            seq: 101,
+            program: None,
+            rows: &armed,
+            at: 0,
+            worked: Some(Duration::from_secs(60)),
+        }],
+    );
+    let reset = approvals::open_wall(&ledger, Some("@s-1"))
+        .and_then(|o| o.reset_unix)
+        .expect("the reset placed")
+        - TEST_NOW;
+    let _ = std::fs::remove_dir_all(dir);
+    let bound = i64::try_from(FUTILE_AFTER.as_secs()).expect("an hour");
+    let clocks = [30, reset + bound - 600, reset + bound + 300, 2 * 86_400];
+    let points = |claude: &[String]| -> Vec<(i64, Vec<String>)> {
+        clocks.iter().map(|&at| (at, claude.to_vec())).collect()
+    };
+    let run = |tag: &str, host: bool| {
+        let (dir, ledger) = ledger_at(tag);
+        let later = points(&claude);
+        let mut at = vec![At {
+            seq: 101,
+            program: None,
+            rows: &armed,
+            at: 0,
+            worked: Some(Duration::from_secs(60)),
+        }];
+        for ((clock, rows), seq) in later.iter().zip(102..) {
+            at.push(At {
+                seq,
+                program: None,
+                rows,
+                at: *clock,
+                worked: None,
+            });
+        }
+        let decided = loop_points(&ledger, host, None, &at);
+        // A hostless loop that takes the limit up two hours past its end.
         let successor = loop_points(
             &ledger,
             false,
             approvals::open_wall(&ledger, Some("@s-1")),
             &[At {
-                seq: 104,
+                seq: 110,
                 program: None,
                 rows: &claude,
-                at: past_reset(&ledger),
+                at: reset + 2 * bound,
                 worked: None,
             }],
         );
-        let rows = ledger_scopes(&ledger);
         let _ = std::fs::remove_dir_all(dir);
-        assert!(
-            successor.iter().all(unread),
-            "{name}: a hostless loop that follows holds it: {successor:#?}\n{rows:#?}"
-        );
-    }
-    // NEGATIVE CONTROL: the limit met under Muse Code is released by Muse
-    // Code's decision after a Claude Code decision required it.
-    use aterm_phase::muse::fixtures as u;
-    let muse_after = screen(u::END_OF_TURN_BG_RUNNING);
-    let (dir, ledger) = ledger_at("met-under-muse");
-    let hosted = loop_points(
-        &ledger,
-        true,
-        None,
-        &[
-            At {
-                seq: 101,
-                program: None,
-                rows: &screen(u::USAGE_WALL),
-                at: 0,
-                worked: Some(Duration::from_secs(60)),
-            },
-            At {
-                seq: 102,
-                program: None,
-                rows: &claude,
-                at: 30,
-                worked: None,
-            },
-            At {
-                seq: 103,
-                program: None,
-                rows: &muse_after,
-                at: 60,
-                worked: None,
-            },
-        ],
-    );
-    let rows = ledger_scopes(&ledger);
+        (decided, successor)
+    };
+    let (held, successor) = run("unread-told", true);
     assert!(
-        hosted[1].track == Some(Conversation::Unknown)
-            && hosted[2].track == Some(Conversation::Hostless)
-            && hosted[2].memory == Some(Conversation::Hostless)
-            && walls(&rows)
-                .last()
-                .is_some_and(|r| r.contains("conversation=None")),
-        "CONTROL: Muse Code's own limit is released by its decision: {hosted:#?}\n{rows:#?}"
+        held[1..].iter().all(unread),
+        "the limit holds Claude Code's tab unread: {held:#?}"
     );
     assert!(
-        wall_programs(&ledger)
+        held[1..3].iter().all(|d| d.told.is_none()),
+        "nothing is told before the hour past the reset: {held:#?}"
+    );
+    assert!(
+        held[3..]
             .iter()
-            .all(|p| p.as_deref() == Some("muse")),
-        "CONTROL: each wall row names Muse Code: {:?}",
-        wall_programs(&ledger)
+            .all(|d| d.told.as_deref() == Some(told.as_str())),
+        "an hour past the reset the owner is told, the hold standing: {held:#?}"
     );
-    let successor = loop_points(
-        &ledger,
-        false,
-        approvals::open_wall(&ledger, Some("@s-1")),
-        &[At {
-            seq: 104,
-            program: None,
-            rows: &muse_after,
-            at: past_reset(&ledger),
-            worked: None,
-        }],
+    assert!(
+        successor
+            .iter()
+            .all(|d| unread(d) && d.told.as_deref() == Some(told.as_str())),
+        "a hostless loop that takes the unread limit up is told too: {successor:#?}"
     );
-    let rows = ledger_scopes(&ledger);
+    // SAID, in the journal, once, while the loop goes on waiting: each
+    // decision carried out as the loop does.
+    let (dir, ledger) = ledger_at("unread-told-journal");
+    let mut m = Mock::new(vec![busy_screen()]);
+    let mut s = session(&mut m, Some("@s-1".to_owned()));
+    s.set_zone_lookup(test_zones);
+    s.set_mono_standing();
+    s.set_approval_ledger(Some(ledger.clone()));
+    let mut notes = Vec::new();
+    s.ledger = approvals::Ledger::open(Some(&ledger), Some("@s-1"), &mut notes);
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::new(AccountHost::default()) as Arc<dyn IdleHost>),
+        ..hosted(30)
+    };
+    let mut heard = Heard::default();
+    let mut waits = Vec::new();
+    for (seq, at, rows, worked) in [
+        (101, 0, &armed, Some(Duration::from_secs(60))),
+        (102, clocks[1], &claude, None),
+        (103, clocks[2], &claude, None),
+        (104, clocks[3], &claude, None),
+    ] {
+        s.set_clock(TEST_NOW + at, PDT);
+        let point = point_at(&s, rows.clone(), seq);
+        let action = s
+            .turn_end_at_point(&point, worked, &opts)
+            .expect("a decision");
+        waits.push(matches!(action, TurnEndAction::WaitUntil { .. }));
+        s.turn_end_execute(&point, action, &opts, &[], &mut heard)
+            .expect("carried out");
+    }
+    drop(s);
     let _ = std::fs::remove_dir_all(dir);
-    assert_eq!(
-        successor.last().map(|d| d.act.as_str()),
-        Some(format!("act {RULE_LIMIT_RESUME}").as_str()),
-        "CONTROL: a hostless loop that follows resumes Muse Code's limit: {successor:#?}\n{rows:#?}"
+    let said: Vec<&String> = heard
+        .noted
+        .iter()
+        .filter(|l| l.starts_with("EXCEPTION ") || l.starts_with("CLEARED "))
+        .collect();
+    assert!(
+        waits.iter().all(|w| *w)
+            && said.len() == 1
+            && said[0].starts_with("EXCEPTION seq=103 kind=futile when=later ")
+            && said[0].contains(&e.why)
+            && said[0].ends_with(&e.action),
+        "told once, in the journal, the loop waiting on: {waits:?} {said:#?}\n{:#?}",
+        heard.noted
+    );
+    // NEGATIVE CONTROL: the hostless lane's limit, its conversation read.
+    let (dir, ledger) = ledger_at("unread-told-hostless");
+    let mut at = vec![At {
+        seq: 101,
+        program: None,
+        rows: &armed,
+        at: 0,
+        worked: Some(Duration::from_secs(60)),
+    }];
+    let later = points(&claude);
+    for ((clock, rows), seq) in later.iter().zip(102..) {
+        at.push(At {
+            seq,
+            program: None,
+            rows,
+            at: *clock,
+            worked: None,
+        });
+    }
+    let hostless = loop_points(&ledger, false, None, &at);
+    let _ = std::fs::remove_dir_all(dir);
+    assert!(
+        hostless
+            .iter()
+            .all(|d| !unread(d) && d.told.as_deref() != Some(told.as_str())),
+        "CONTROL: the hostless lane's limit is no unread hold: {hostless:#?}"
+    );
+}
+
+/// A LIMIT HELD UNREAD THAT NAMED NO RESET IS TOLD AN HOUR AFTER IT
+/// APPEARED, AND STILL HELD (T2 of the review of `b9/walls-2`): under a host
+/// whose read names no conversation, Claude Code meets its Fable model's
+/// limit, whose notice names no reset (2.1.301), and hides it under a shell.
+/// The tab is held unread with nothing said for the first hour, and from an
+/// hour after the limit appeared (no reset to count from) the owner is told
+/// ([`Exception::unread_limit`]), two days on too, the hold standing.
+/// NEGATIVE CONTROLS: the hostless lane's same limit is no unread hold and
+/// tells nothing of the kind; and a hold counted from a reset alone never
+/// tells this one — measured on that mutant, the tab waited two days on its
+/// five-minute looks with nothing told.
+///
+/// [`Exception::unread_limit`]: crate::supervise::policy::exception::Exception::unread_limit
+#[test]
+fn a_limit_held_unread_with_no_reset_is_told_an_hour_after_it_appeared() {
+    use crate::supervise::policy::exception::{Exception, FUTILE_AFTER};
+    use aterm_phase::prompt::fixtures::{WALL_FABLE_NO_RESET_2_1_301, screen};
+    let fable = screen(WALL_FABLE_NO_RESET_2_1_301);
+    assert!(
+        aterm_phase::read(None, &fable, None)
+            .wall
+            .is_some_and(|w| w.reset.is_none()),
+        "PRECONDITION: a limit that names no reset"
+    );
+    let e = Exception::unread_limit();
+    let told = format!("{} {}", e.kind.word(), e.why);
+    let unread = |d: &Decided| {
+        d.act
+            .contains("the remembered limit's conversation is unread")
+    };
+    let claude = with_shell(claude_idle());
+    let bound = i64::try_from(FUTILE_AFTER.as_secs()).expect("an hour");
+    let clocks = [30, bound - 600, bound + 300, 2 * 86_400];
+    let mut points = vec![At {
+        seq: 101,
+        program: None,
+        rows: &fable,
+        at: 0,
+        worked: Some(Duration::from_secs(60)),
+    }];
+    for (&at, seq) in clocks.iter().zip(102..) {
+        points.push(At {
+            seq,
+            program: None,
+            rows: &claude,
+            at,
+            worked: None,
+        });
+    }
+    let run = |tag: &str, host: bool| {
+        let (dir, ledger) = ledger_at(tag);
+        let decided = loop_points(&ledger, host, None, &points);
+        let _ = std::fs::remove_dir_all(dir);
+        decided
+    };
+    let held = run("unread-no-reset-told", true);
+    assert!(
+        held[1..].iter().all(unread),
+        "the limit holds Claude Code's tab unread: {held:#?}"
+    );
+    assert!(
+        held[1..3].iter().all(|d| d.told.is_none()),
+        "nothing is told in the hour after it appeared: {held:#?}"
+    );
+    assert!(
+        held[3..]
+            .iter()
+            .all(|d| d.told.as_deref() == Some(told.as_str())),
+        "an hour after it appeared the owner is told, the hold standing: {held:#?}"
+    );
+    // NEGATIVE CONTROL: the hostless lane's limit, its conversation read.
+    let hostless = run("unread-no-reset-hostless", false);
+    assert!(
+        hostless
+            .iter()
+            .all(|d| !unread(d) && d.told.as_deref() != Some(told.as_str())),
+        "CONTROL: the hostless lane's limit is no unread hold: {hostless:#?}"
     );
 }
 
@@ -1765,11 +2335,14 @@ fn a_limits_try_carries_the_program_its_wall_was_met_under() {
 /// remembered: Claude Code's Fable bucket, its notice naming no reset, met
 /// unread under a host whose read names no conversation; an idle point of
 /// Claude Code's then ends the remembered wall (no reset it named is waited
-/// on) but not the limit's track. Then Muse Code runs in the tab: its
-/// decision leaves Claude Code's limit unread, by the track's own record
-/// ([`Session::limit_met_under`]). NEGATIVE CONTROL: agy's quota, met under
-/// agy and required unread by the same Claude Code decision, is released by
-/// Muse Code's.
+/// on) but not the limit's track, which stays unread there. Then Muse Code
+/// runs in the tab: its point ends Claude Code's limit by the track's own
+/// record ([`WallTrack::program`], [`met_under_another`]), never releasing it
+/// to the hostless lane's. Recorded on the wall alone, the track named no
+/// program at Muse Code's point, and Muse Code's decision released the
+/// limit to the hostless lane's, as an older build's row is. The mirror:
+/// agy's quota, met under agy, ends at Claude Code's first point. NEGATIVE
+/// CONTROL: Claude Code's own idle point keeps its limit's track.
 #[test]
 fn a_limits_track_keeps_the_program_it_was_met_under_without_its_wall() {
     use aterm_phase::prompt::fixtures::{
@@ -1813,15 +2386,22 @@ fn a_limits_track_keeps_the_program_it_was_met_under_without_its_wall() {
     let fable = in_tab("track-fable", &screen(WALL_FABLE_NO_RESET_2_1_301));
     assert!(
         fable[1..].iter().all(|d| d.memory.is_none())
-            && fable.iter().all(|d| d.track == Some(Conversation::Unknown)),
-        "Claude Code's bucket stays unread on its track alone: {fable:#?}"
+            && fable[..2]
+                .iter()
+                .all(|d| d.track == Some(Conversation::Unknown)),
+        "CONTROL: Claude Code's bucket stays unread on its track alone at its own \
+         point: {fable:#?}"
+    );
+    assert_eq!(
+        fable[2].track, None,
+        "Muse Code's point ends Claude Code's bucket by its track's record: {fable:#?}"
     );
     let agy = in_tab(
         "track-agy",
         &screen(aterm_phase::agy::fixtures::lab::ERROR_429_LONG),
     );
     assert!(
-        agy[1].track == Some(Conversation::Unknown) && agy[2].track == Some(Conversation::Hostless),
-        "CONTROL: agy's quota is released by Muse Code's decision: {agy:#?}"
+        agy[0].track == Some(Conversation::Hostless) && agy[1..].iter().all(|d| d.track.is_none()),
+        "agy's quota ends at Claude Code's point: {agy:#?}"
     );
 }

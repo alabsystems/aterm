@@ -323,13 +323,6 @@ pub(crate) struct SessionMeta {
     /// identity was captured. Not persisted, not part of equality. Write it only
     /// through [`apply_meta_value`]; read it through [`Self::driver_wrote`].
     pub(crate) driver_writes: u8,
-    /// The ONE folder a worker's starter trusted for it: the canonical `cwd=`
-    /// an Owner's `spawn agent=<word>` named (`App::start_worker`), which the
-    /// window harness's folder-trust rule trusts for this session alone
-    /// (`meta`'s `trusted_cwd=`; `[harness] trust_roots` is not widened).
-    /// NOT a field `meta set` writes: no driver can name a folder trusted.
-    /// Never restored, not part of equality, not `meta=1`.
-    pub(crate) trusted_cwd: Option<String>,
 }
 
 /// Equality is over the eight values (what a tab label, a `meta` reader and a
@@ -354,7 +347,6 @@ impl PartialEq for SessionMeta {
             autopilot_set_by: _,
             autopilot_revision: _,
             driver_writes: _,
-            trusted_cwd: _,
         } = self;
         *user_title == other.user_title
             && *description == other.description
@@ -501,7 +493,6 @@ impl SessionMeta {
             autopilot_set_by,
             autopilot_revision: 0,
             driver_writes: 0,
-            trusted_cwd: None,
         }
     }
 
@@ -2454,6 +2445,16 @@ pub(crate) const PROGRAM_STATE: &str = "program-state";
 /// turns of `working`, `blocked`, `working`, `done`.
 pub(crate) const PROGRAM_STATE_ROWS_MAX: usize = TIMELINE_CAP / 2;
 
+/// Published foreground custody for an input decision, independent of
+/// ordinary phase or screen revisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ForegroundStamp {
+    generation: u64,
+    pgid: i32,
+    holder: Option<u64>,
+    agent: aterm_phase::Program,
+}
+
 /// A session's bounded event timeline, newest-last, drop-oldest at
 /// [`TIMELINE_CAP`], with per-session monotonic ids minted here.
 #[derive(Default)]
@@ -2470,10 +2471,20 @@ pub(crate) struct SessionTimeline {
     /// writes `program`, and `sessions`, `await agent` and the push loop read it
     /// from the control threads.
     agent: AgentPublication,
+    /// Input custody, independent of busy/idle and ordinary verdict revisions.
+    /// Observed foreground, program, reader and image changes cannot revive
+    /// an older press by returning to the same published identity.
+    foreground_generation: u64,
     /// The Claude Code footer's facts (`aterm_agent::harness::footer`), with the foreground
     /// group and kernel start they were read for. Host-side only: painted into the rule under
     /// Claude Code's input box (`crate::claude_footer`). Written by the footer resolver thread.
     claude_footer: Option<(i32, Option<u64>, aterm_agent::harness::footer::FooterFacts)>,
+    /// Last Muse account named in this terminal. Its anonymous usage cards
+    /// cannot be attributed after a known account switch, even if a pane is
+    /// rebuilt or the foreground process changes: the old glass survives both.
+    muse_card_account: Option<String>,
+    /// Sticky for the terminal's life, also set when old glass is adopted.
+    muse_cards_need_account: bool,
     /// Those facts' `version` as a build, parsed once when they were stored:
     /// what the card's gate holds an image of unknown build to
     /// ([`Self::card_gate`], every frame, with no parse).
@@ -2539,6 +2550,12 @@ pub(crate) struct SessionTimeline {
     /// next one), read by the `survey` verb, so a survey reads no transcript.
     /// Never painted, so a new excerpt repaints nothing.
     claude_excerpts: Option<(i32, crate::survey::ClaudeExcerpts)>,
+    /// THE FOOTER'S SIDE of the Claude Code process in front
+    /// ([`crate::claude_footer::FactSide`]: its directories and traffic) and
+    /// the group it was read for, written by the footer resolver with every
+    /// footer read, read by the fact menus and the traffic card. Never
+    /// painted and never in the facts, so a new side repaints nothing.
+    claude_side: Option<(i32, std::sync::Arc<crate::claude_footer::FactSide>)>,
     /// When the footer resolver last read facts for the group in front, and
     /// that group: each read folds the session's usage anew, whether or not
     /// anything moved, so the Stats Deck takes its token rates between two
@@ -3324,7 +3341,7 @@ impl SessionTimeline {
     /// Tests: what the presence classifier's published reader says.
     #[cfg(test)]
     pub(crate) fn set_agent_reader_for_test(&mut self, claude: bool) {
-        self.agent.reader = claude.then_some(aterm_phase::Program::Claude);
+        self.set_agent_reader(claude.then_some(aterm_phase::Program::Claude));
     }
 
     /// Whether this session's program reads as the agent class (Claude Code)
@@ -3595,6 +3612,33 @@ impl SessionTimeline {
         &self.agent
     }
 
+    /// The identity already published for input to this foreground group.
+    /// No kernel read: an unobserved process change is not vouched for here.
+    pub(crate) fn foreground_stamp(&self) -> Option<ForegroundStamp> {
+        let agent = crate::harness_host::identified_agent(&self.agent)?;
+        (self.agent.program_pgid > 0 && self.foreground_generation < u64::MAX).then(|| {
+            ForegroundStamp {
+                generation: self.foreground_generation,
+                pgid: self.agent.program_pgid,
+                holder: self.current_holder_image().and_then(|image| image.token),
+                agent,
+            }
+        })
+    }
+
+    fn advance_foreground_generation(&mut self) {
+        // Exhaustion disables new stamps instead of aliasing an older one.
+        self.foreground_generation = self.foreground_generation.saturating_add(1);
+    }
+
+    fn set_agent_reader(&mut self, reader: Option<aterm_phase::Program>) {
+        let before = crate::harness_host::identified_agent(&self.agent);
+        self.agent.reader = reader;
+        if crate::harness_host::identified_agent(&self.agent) != before {
+            self.advance_foreground_generation();
+        }
+    }
+
     /// The session's task record, `None` for a session with no task.
     pub(crate) fn task(&self) -> Option<&crate::task_record::TaskRecord> {
         self.task.as_ref()
@@ -3676,14 +3720,21 @@ impl SessionTimeline {
         self.task = Some(record);
     }
 
-    /// Name the agent a worker's spawn started on its task record
-    /// ([`crate::task_record::TaskRecord::agent`]): the spawn's own write,
-    /// on the main thread right after the record's first mark, where no
-    /// update's Commit comes between them. A session with no task keeps
+    /// Name the agent a worker's spawn started on its task record, and the
+    /// one folder its starter trusted for it
+    /// ([`crate::task_record::TaskRecord::agent`],
+    /// [`crate::task_record::TaskRecord::trusted_cwd`]): the spawn's own
+    /// write, on the main thread right after the record's first mark, where
+    /// no update's Commit comes between them. A session with no task keeps
     /// none. Not news: the rev stays.
-    pub(crate) fn set_task_agent(&mut self, agent: aterm_phase::Program) {
+    pub(crate) fn set_task_worker(
+        &mut self,
+        agent: aterm_phase::Program,
+        trusted_cwd: Option<String>,
+    ) {
         if let Some(task) = self.task.as_mut() {
             task.agent = Some(agent);
+            task.trusted_cwd = trusted_cwd;
         }
     }
 
@@ -3729,7 +3780,7 @@ impl SessionTimeline {
         if word == "busy" && self.agent.screen_word != "busy" && !regrid {
             self.agent.busy_entries = self.agent.busy_entries.wrapping_add(1);
         }
-        self.agent.reader = reader;
+        self.set_agent_reader(reader);
         self.agent.screen_word = word;
         self.agent.screen_detail = detail;
         let changed = self.settle_agent_word(regrid);
@@ -3891,6 +3942,7 @@ impl SessionTimeline {
         if self.agent.program_pgid == pgid {
             return false;
         }
+        self.advance_foreground_generation();
         self.agent.program_pgid = pgid;
         let had_reader = self.agent.reader.take().is_some();
         self.leader_copy = None;
@@ -3988,6 +4040,7 @@ impl SessionTimeline {
     ) -> crate::holder_image::Offer {
         let offer = crate::holder_image::decide(self.holder_image.as_deref(), &image);
         if offer == crate::holder_image::Offer::Published {
+            self.advance_foreground_generation();
             if crate::holder_image::DEV_ROWS {
                 self.record(
                     "holder-edge",
@@ -4334,6 +4387,7 @@ impl SessionTimeline {
     /// to wake the GUI status observer.
     pub(crate) fn set_program(&mut self, pgid: i32, program: Option<String>) -> bool {
         if self.agent.program_pgid == pgid && self.agent.program != program {
+            self.advance_foreground_generation();
             if crate::holder_image::DEV_ROWS
                 && let Some(card) = program
                     .as_deref()
@@ -4379,7 +4433,48 @@ impl SessionTimeline {
         if self.agent.program_pgid != pgid {
             return false;
         }
-        let next = facts.map(|facts| (pgid, started, facts));
+        let mut next = facts.map(|facts| (pgid, started, facts));
+        let is_muse = match self
+            .agent
+            .program
+            .as_deref()
+            .and_then(aterm_phase::program_of)
+        {
+            Some(aterm_phase::Program::Muse) => true,
+            Some(
+                aterm_phase::Program::Claude
+                | aterm_phase::Program::Codex
+                | aterm_phase::Program::Agy
+                | aterm_phase::Program::Gemini
+                | aterm_phase::Program::Generic,
+            )
+            | None => false,
+        };
+        let mut switched = false;
+        if is_muse
+            && let Some(email) = next
+                .as_ref()
+                .and_then(|(_, _, facts)| facts.subscription.as_ref()?.email.as_deref())
+            && self.muse_card_account.as_deref() != Some(email)
+        {
+            switched = self.muse_card_account.is_some();
+            self.muse_cards_need_account |= switched;
+            self.muse_card_account = Some(email.to_owned());
+        }
+        if is_muse
+            && self.muse_cards_need_account
+            && let Some(sub) = next
+                .as_mut()
+                .and_then(|(_, _, facts)| facts.subscription.as_mut())
+        {
+            // Publication itself enforces the boundary, including a frame
+            // that first discovers B while carrying A's anonymous quota.
+            sub.weekly = None;
+            sub.weekly_reset = None;
+            if switched {
+                sub.plan = None;
+            }
+        }
         if self.claude_footer == next {
             return false;
         }
@@ -4455,6 +4550,20 @@ impl SessionTimeline {
             .map(|(pgid, started, _)| (*pgid, *started))
     }
 
+    /// A known switch or carried glass cannot attribute an anonymous Muse
+    /// card to the current login. Only an account-bearing card may fill its
+    /// own fields; a separate usage card supplies no account proof.
+    pub(crate) fn muse_cards_need_account(&self) -> bool {
+        self.muse_cards_need_account
+    }
+
+    /// An adopted terminal may still show another account's cards, and its
+    /// predecessor need not have carried an account observation. Revoke the
+    /// bootstrap allowance without adding a version-dependent wire field.
+    pub(crate) fn note_carried_glass(&mut self) {
+        self.muse_cards_need_account = true;
+    }
+
     /// Forget the footer facts; whether there were any. For when the status
     /// sweep that keeps them current stops (`tab_status` off), so stale facts
     /// are not painted over the next Claude Code in this tab. The survey's
@@ -4462,6 +4571,7 @@ impl SessionTimeline {
     pub(crate) fn clear_claude_footer(&mut self) -> bool {
         self.claude_card = None;
         self.claude_excerpts = None;
+        self.claude_side = None;
         self.claude_footer_read = None;
         self.claude_footer_build = None;
         self.claude_footer_image = None;
@@ -4505,6 +4615,29 @@ impl SessionTimeline {
             .as_ref()
             .filter(|(pgid, _)| *pgid == self.agent.program_pgid)
             .map(|(_, excerpts)| excerpts)
+    }
+
+    /// The footer resolver's side for `pgid`, applied only while that group
+    /// is in front, as [`Self::set_claude_excerpts`] applies its excerpts;
+    /// `None` forgets it.
+    pub(crate) fn set_claude_side(
+        &mut self,
+        pgid: i32,
+        side: Option<std::sync::Arc<crate::claude_footer::FactSide>>,
+    ) {
+        if self.agent.program_pgid != pgid {
+            return;
+        }
+        self.claude_side = side.map(|side| (pgid, side));
+    }
+
+    /// The footer's side for the CURRENT foreground group, or `None` when the
+    /// program in front is not the one it was read for.
+    pub(crate) fn claude_side(&self) -> Option<&std::sync::Arc<crate::claude_footer::FactSide>> {
+        self.claude_side
+            .as_ref()
+            .filter(|(pgid, _)| *pgid == self.agent.program_pgid)
+            .map(|(_, side)| side)
     }
 
     /// The status sweep's latest [`AgentGauges`] for the agent in front.

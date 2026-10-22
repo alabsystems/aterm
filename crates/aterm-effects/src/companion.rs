@@ -79,18 +79,19 @@ pub const PET_HIT_SLOP_PX: i32 = 4;
 /// (`(x0, x1, y0, y1)`, right/bottom exclusive), padded by `slop` on every side.
 #[inline]
 #[must_use]
-pub fn pet_rect_hit(rect: (i32, i32, i32, i32), x: f64, y: f64, slop: i32) -> bool {
+pub const fn pet_rect_hit(rect: (i32, i32, i32, i32), x: f64, y: f64, slop: i32) -> bool {
     let (x0, x1, y0, y1) = rect;
-    x >= f64::from(x0.saturating_sub(slop))
-        && x < f64::from(x1.saturating_add(slop))
-        && y >= f64::from(y0.saturating_sub(slop))
-        && y < f64::from(y1.saturating_add(slop))
+    x >= x0.saturating_sub(slop) as f64
+        && x < x1.saturating_add(slop) as f64
+        && y >= y0.saturating_sub(slop) as f64
+        && y < y1.saturating_add(slop) as f64
 }
 
 // ── the palette sampler ─────────────────────────────────────────────────────
 
 /// Resolve the companion's local terminal palette from the grid cells its sprite
 /// intersects, capped at 64 samples so this stays allocation-free and O(1).
+#[inline]
 #[must_use]
 pub fn cursor_cat_color_key(
     cells: &[Vec<RenderCell>],
@@ -197,7 +198,7 @@ pub fn cursor_cat_color_key(
 /// must come back as the same cat.
 #[inline]
 #[must_use]
-pub fn resident_pet_owner_present(
+pub const fn resident_pet_owner_present(
     pet_mode: bool,
     cursor_trail_enabled: bool,
     style: GlowStyle,
@@ -215,7 +216,7 @@ pub fn resident_pet_owner_present(
 /// caret anchor.
 #[inline]
 #[must_use]
-pub fn cursor_companion_on_glass(
+pub const fn cursor_companion_on_glass(
     duty: CompanionDuty,
     cursor: Option<(u16, u16)>,
     head_px: Option<(i32, i32, i32, i32)>,
@@ -223,11 +224,14 @@ pub fn cursor_companion_on_glass(
 ) -> Option<CompanionOnGlass> {
     match duty {
         CompanionDuty::Idle => None,
-        CompanionDuty::Pet => pet_body_px.map(|body_px| CompanionOnGlass::at_body(cursor, body_px)),
-        CompanionDuty::FlyingHead { cell } => Some(head_px.map_or_else(
-            || CompanionOnGlass::at_cell(cell),
-            |head_px| CompanionOnGlass::at_head(cell, head_px),
-        )),
+        CompanionDuty::Pet => match pet_body_px {
+            Some(body_px) => Some(CompanionOnGlass::at_body(cursor, body_px)),
+            None => None,
+        },
+        CompanionDuty::FlyingHead { cell } => Some(match head_px {
+            Some(head_px) => CompanionOnGlass::at_head(cell, head_px),
+            None => CompanionOnGlass::at_cell(cell),
+        }),
     }
 }
 
@@ -266,7 +270,7 @@ pub fn pet_arrival_for_sync(
     incoming_coat: u8,
 ) -> PetArrival {
     use crate::kitty_registry::{SUFFICIENT_DIFFERENCE, coat_distance};
-    if rung != CompanionRung::Program {
+    if !matches!(rung, CompanionRung::Program) {
         return PetArrival::Quiet;
     }
     match authorised {
@@ -286,18 +290,19 @@ pub fn pet_arrival_for_sync(
 /// into frame px by `origin`. `None` ("nothing drawn") clears the stash.
 #[inline]
 #[must_use]
-pub fn pet_hit_rect_win(
+pub const fn pet_hit_rect_win(
     body: Option<(i32, i32, i32, i32)>,
     origin: (i32, i32),
 ) -> Option<(i32, i32, i32, i32)> {
-    body.map(|(x0, x1, y0, y1)| {
-        (
+    match body {
+        Some((x0, x1, y0, y1)) => Some((
             x0.saturating_add(origin.0),
             x1.saturating_add(origin.0),
             y0.saturating_add(origin.1),
             y1.saturating_add(origin.1),
-        )
-    })
+        )),
+        None => None,
+    }
 }
 
 /// Perk-and-watch: a frame is an output burst only when the pane visibly gained
@@ -308,7 +313,7 @@ pub fn pet_hit_rect_win(
 /// its composer would read as a build log.
 #[inline]
 #[must_use]
-pub fn pet_output_burst(
+pub const fn pet_output_burst(
     scrolled: bool,
     seq_advanced: bool,
     shell_executing: bool,
@@ -323,7 +328,7 @@ pub fn pet_output_burst(
 /// stores the baseline. `!=` rather than `>`, because main/alt buffer swaps keep
 /// per-grid serials: inequality costs at most one spurious wrap at a swap.
 #[inline]
-pub fn wrap_fact_edge(seen: &mut Option<(u64, u64)>, session: u64, serial: u64) -> bool {
+pub const fn wrap_fact_edge(seen: &mut Option<(u64, u64)>, session: u64, serial: u64) -> bool {
     let wrapped = matches!(*seen, Some((sid, s)) if sid == session && s != serial);
     *seen = Some((session, serial));
     wrapped
@@ -333,7 +338,7 @@ pub fn wrap_fact_edge(seen: &mut Option<(u64, u64)>, session: u64, serial: u64) 
 /// `None` outside the pane's grid.
 #[must_use]
 #[inline]
-pub fn pet_pointer_cell(
+pub const fn pet_pointer_cell(
     pointer_px: (f64, f64),
     origin: (i32, i32),
     cell: (usize, usize),
@@ -343,10 +348,13 @@ pub fn pet_pointer_cell(
     if cw == 0 || ch == 0 {
         return None;
     }
-    let col = (pointer_px.0 - f64::from(origin.0)) / cw as f64;
-    let row = (pointer_px.1 - f64::from(origin.1)) / ch as f64;
-    (col >= 0.0 && row >= 0.0 && col < grid.0 as f64 && row < grid.1 as f64)
-        .then_some((col as f32, row as f32))
+    let col = (pointer_px.0 - origin.0 as f64) / cw as f64;
+    let row = (pointer_px.1 - origin.1 as f64) / ch as f64;
+    if col >= 0.0 && row >= 0.0 && col < grid.0 as f64 && row < grid.1 as f64 {
+        Some((col as f32, row as f32))
+    } else {
+        None
+    }
 }
 
 // ── the custody law ─────────────────────────────────────────────────────────
@@ -355,14 +363,14 @@ pub fn pet_pointer_cell(
 /// non-finite drive reads as not live.
 #[inline]
 #[must_use]
-pub fn sing_face_live(drive: f32) -> bool {
+pub const fn sing_face_live(drive: f32) -> bool {
     drive >= 0.33
 }
 
 /// Resolve [`CompanionDuty`] from this frame's two already-gated alphas.
 #[inline]
 #[must_use]
-pub fn cursor_companion_duty(
+pub const fn cursor_companion_duty(
     pet_on_glass: bool,
     kitty_alpha: u8,
     cursor: Option<(u16, u16)>,
@@ -382,7 +390,10 @@ pub fn cursor_companion_duty(
 /// running while history is visible, but no companion is drawn over retained rows.
 #[inline]
 #[must_use]
-pub fn cursor_companion_presentable(decoration_presentable: bool, live_viewport: bool) -> bool {
+pub const fn cursor_companion_presentable(
+    decoration_presentable: bool,
+    live_viewport: bool,
+) -> bool {
     decoration_presentable && live_viewport
 }
 
@@ -399,7 +410,7 @@ pub const RESIDENT_SHED_CADENCE: aterm_time::Duration = aterm_time::Duration::fr
 /// never whether the body belongs to this surface.
 #[inline]
 #[must_use]
-pub fn resident_pet_surface_presentable(
+pub const fn resident_pet_surface_presentable(
     focused: bool,
     unobscured: bool,
     live_viewport: bool,
@@ -412,7 +423,7 @@ pub fn resident_pet_surface_presentable(
 /// admitted while the envelope is finite and above zero.
 #[inline]
 #[must_use]
-pub fn shed_companion_presentable(base_presentable: bool, envelope: f32) -> bool {
+pub const fn shed_companion_presentable(base_presentable: bool, envelope: f32) -> bool {
     base_presentable && envelope.is_finite() && envelope > 0.0
 }
 
@@ -433,7 +444,7 @@ pub fn shed_companion_alpha(alpha: u8, envelope: f32) -> u8 {
 /// at zero; fade-in starts from that exact zero and stops only at full amplitude.
 #[inline]
 #[must_use]
-pub fn shed_envelope_transitioning(shed_active: bool, envelope: f32) -> bool {
+pub const fn shed_envelope_transitioning(shed_active: bool, envelope: f32) -> bool {
     if !envelope.is_finite() {
         return false;
     }
@@ -447,7 +458,7 @@ pub fn shed_envelope_transitioning(shed_active: bool, envelope: f32) -> bool {
 /// Suppress the flying companion's exit flourish on a pet-mode frame copy.
 /// The resident keeps custody even when the hidden flying episode winds down.
 #[inline]
-pub fn pin_pet_mode_exit(pet_mode: bool, frame: &mut crate::kitty_cursor::CatFrame) {
+pub const fn pin_pet_mode_exit(pet_mode: bool, frame: &mut crate::kitty_cursor::CatFrame) {
     if pet_mode {
         frame.exit = crate::kitty_cursor::CatExit::Plain;
     }
@@ -575,7 +586,7 @@ impl PetTick {
     /// stopped writing.
     #[inline]
     #[must_use]
-    pub fn escort_caret(&self) -> Option<(u16, u16)> {
+    pub const fn escort_caret(&self) -> Option<(u16, u16)> {
         self.escort_caret
     }
 }
@@ -584,7 +595,8 @@ impl PetTick {
 impl PetTick {
     /// The frame's burst verdict; the brain's own copy is not refreshed on a tick
     /// it returns from early.
-    pub(crate) fn output_burst(&self) -> bool {
+    #[inline]
+    pub(crate) const fn output_burst(&self) -> bool {
         self.sense.output_burst
     }
 }
@@ -771,6 +783,7 @@ struct PixelFrame {
 }
 
 impl Default for CompanionOwner {
+    #[inline]
     fn default() -> Self {
         let base = KittyLook::default();
         Self {
@@ -813,6 +826,7 @@ impl CompanionOwner {
 
     /// Dress the pet in `KittyLook::for_launch(seed)` (rung `Launch`, quiet);
     /// `enabled = false` retires it outright, so off costs and draws nothing.
+    #[inline]
     pub fn set_enabled_seed(&mut self, enabled: bool, seed: u64) {
         let look = KittyLook::for_launch(seed);
         self.pair = (look.coat, look.iris);
@@ -827,7 +841,7 @@ impl CompanionOwner {
     /// Dress the pet from the native verdict ([`crate::companion_look`]); only a
     /// `Program` rung may carry a ceremony.
     #[inline]
-    pub fn set_look(&mut self, pair: (u8, u8), arrival: PetArrival, rung: CompanionRung) {
+    pub const fn set_look(&mut self, pair: (u8, u8), arrival: PetArrival, rung: CompanionRung) {
         self.pair = pair;
         self.arrival = arrival;
         self.rung = rung;
@@ -920,6 +934,7 @@ impl CompanionOwner {
     /// rested there [`HIDDEN_REST`] ([`Latches::hidden_rest`]); until then
     /// the caret taken before stands. The first reading on a session's grid
     /// is taken at once. A capture reads the state and moves none of it.
+    #[inline]
     fn rested_caret(
         &mut self,
         facts: &TerminalFacts,
@@ -966,6 +981,7 @@ impl CompanionOwner {
     /// * the pane binding, species and ink.
     ///
     /// A capture reads and spends none of the present-owned diffs.
+    #[inline]
     pub fn prepare(&mut self, f: PetFacts<'_>, decos: &mut WordDecorations) -> PetTick {
         let PetFacts {
             facts,
@@ -1186,6 +1202,7 @@ impl CompanionOwner {
     /// each cheers on its first look. Seen, it is handed back to be marked
     /// cheered; the pet, where it `owns` the glass, latches the big cheer
     /// ([`PetBrain::note_room_landed`]) once per `(session, serial)`.
+    #[inline]
     fn take_landed(
         &mut self,
         session: u64,
@@ -1207,6 +1224,7 @@ impl CompanionOwner {
     /// The host's terminal panes on glass this frame, offered before [`Self::tick`]:
     /// records whether each pending or own ghost glass is among them exactly as
     /// drawn. A host that offers nothing never spends a ghost off its own surface.
+    #[inline]
     pub fn offer_glass(&mut self, glass: impl IntoIterator<Item = PetGlass>) {
         if self.resight_frame.is_none() && self.own_glass.iter().all(Option::is_none) {
             return;
@@ -1234,6 +1252,7 @@ impl CompanionOwner {
     /// The frame's tick, unconditional: `needs_frames()` reads state only the
     /// tick advances, so ticking inside the draw gate would freeze it. Then custody
     /// (`on_glass = admitted && alpha > 0`) and the hit rect.
+    #[inline]
     pub fn tick(&mut self, t: PetTick) -> CompanionFrame {
         let geom = self.geom;
         let frame_px = PixelFrame {
@@ -1350,6 +1369,7 @@ impl CompanionOwner {
     /// Word-cat bat: forward the word engine's peek landings to the brain as the
     /// landed head's centre in fractional cells. Only a pet visible this frame
     /// hears them; the brain acts on the ground next tick.
+    #[inline]
     pub fn note_peeks(
         &mut self,
         now: Instant,
@@ -1390,6 +1410,7 @@ impl CompanionOwner {
     /// channel) and each ghost on its own glass into `window` (`None`: `free` is
     /// the window's), in window-grid pixels at its pane, cropped to it, beneath its
     /// ink. Placed by the focused pane's placement it would land in the wrong pane.
+    #[inline]
     pub fn emit_on(
         &mut self,
         t: &CompanionFrame,
@@ -1480,11 +1501,13 @@ impl CompanionOwner {
     /// the commit consumes the authorisation, so the next present cannot repeat it.
     #[must_use]
     #[inline]
-    pub fn commit_hello_due(&self, present: bool, outcome: SyncLookOutcome) -> bool {
+    pub const fn commit_hello_due(&self, present: bool, outcome: SyncLookOutcome) -> bool {
         present
-            && self.last_sync.is_some_and(|(pair, arrival)| {
-                arrival == PetArrival::Ceremony && pair != outcome.worn
-            })
+            && matches!(
+                self.last_sync,
+                Some((pair, PetArrival::Ceremony))
+                    if pair.0 != outcome.worn.0 || pair.1 != outcome.worn.1
+            )
     }
 
     /// The terminal BEL rang in the pane this pet is chasing.
@@ -1571,7 +1594,7 @@ impl CompanionOwner {
     }
 
     #[inline]
-    fn clear_surface_state(&mut self) {
+    const fn clear_surface_state(&mut self) {
         self.hit_rect = None;
         self.drawn_frame = None;
         self.resight_frame = None;
@@ -1607,6 +1630,7 @@ impl CompanionOwner {
     /// retires, but a body the last tick drew is kept for the next tick to
     /// crossfade from, in the pixel frame it was drawn in. Idempotent: a second
     /// boundary before the next tick keeps the first one's ghost.
+    #[inline]
     pub fn resight_coordinate_space(&mut self) {
         if let Some(drawn) = self.drawn_frame.take() {
             self.resight_frame = Some(drawn);
@@ -1630,7 +1654,7 @@ impl CompanionOwner {
     /// The host withdrew this frame's drawn body (a torn projection, a route that
     /// draws no pet), so the petting rect goes with it.
     #[inline]
-    pub fn withdraw_hit_rect(&mut self) {
+    pub const fn withdraw_hit_rect(&mut self) {
         self.hit_rect = None;
     }
 
@@ -1696,6 +1720,7 @@ impl CompanionOwner {
     /// DEC-2026 hold), so it is re-offered a whole cadence out: a past or `now`
     /// offer would be re-armed every turn, a busy loop. `None` when nothing will
     /// change.
+    #[inline]
     #[must_use]
     pub fn next_change_deadline(&self, now: Instant) -> Option<Instant> {
         if self.last_static {
@@ -1729,29 +1754,30 @@ impl CompanionOwner {
     /// The host's opt-in as last set.
     #[inline]
     #[must_use]
-    pub fn enabled(&self) -> bool {
+    pub const fn enabled(&self) -> bool {
         self.enabled
     }
 
     /// The alpha the last tick put on glass (`0` = nothing drawn).
     #[inline]
     #[must_use]
-    pub fn alpha(&self) -> u8 {
+    pub const fn alpha(&self) -> u8 {
         self.last_alpha
     }
 
     /// This frame's drawn body in frame px, `None` when the pet is not drawn.
     #[inline]
     #[must_use]
-    pub fn hit_rect(&self) -> Option<(i32, i32, i32, i32)> {
+    pub const fn hit_rect(&self) -> Option<(i32, i32, i32, i32)> {
         self.hit_rect
     }
 
     /// The animal the host chose, which every `prepare` applies and every retire
     /// keeps; the brain's identity is [`Self::brain`].
+    #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn species(&self) -> PetSpecies {
+    pub const fn species(&self) -> PetSpecies {
         self.species
     }
 
@@ -1759,7 +1785,7 @@ impl CompanionOwner {
     /// cannot tick it.
     #[inline]
     #[must_use]
-    pub fn brain(&self) -> &PetBrain {
+    pub const fn brain(&self) -> &PetBrain {
         &self.pet
     }
 }

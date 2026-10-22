@@ -14,7 +14,9 @@
 //! names) and a regular file takes its place. Nor is a symlinked directory written through:
 //! an entry behind one (`~/.secrets` itself, or a directory between home and a `~/a/b/c`
 //! target) fails, naming it, and the rest proceed. A target equal to the new value is
-//! adopted silently, its mode narrowed to 0600 if it lets other users in.
+//! adopted silently, its mode narrowed to 0600 if it lets other users in. A file the vault
+//! did not write stays the machine's own when adopted: it is kept out of the manifest, so
+//! the vault never removes it, and a later value moves it aside like any file of its own.
 //!
 //! An ` if-absent` entry ([`Entry::if_absent`]) fills a gap: where it finds a file this
 //! vault never wrote, or one lands there before its write (a gap is filled by a link that
@@ -150,7 +152,9 @@ pub fn aside_name(name: &str, now: u64) -> String {
 /// entry of this run already placed or found (two names for one file). So the `Err` arm is
 /// never taken today; it is kept for a refusal that would stop a whole sync.
 ///
-/// The new manifest holds every entry written or adopted, and keeps `held`'s digest for an
+/// The new manifest holds every entry written, or found holding its value where the vault
+/// wrote it before (a file the vault never wrote that holds the value is adopted but stays
+/// the machine's own, out of the manifest), and keeps `held`'s digest for an
 /// entry that failed (so a later sync still knows what the vault wrote there); an
 /// ` if-absent` entry left alone is not in it, nor is one whose file changed since the
 /// vault wrote it. A name the vault dropped, or an anchored entry it takes back, leaves the
@@ -280,7 +284,16 @@ pub fn apply_resuming(
                         .get(entry.name.as_str())
                         .copied()
                         .unwrap_or(Standing::Unseen);
-                    let placed = if unannounced {
+                    let placed = if unannounced && adoptable(&target, entry, held_digest) {
+                        // The machine's own file already holds the value: nothing is
+                        // written, so `ahead` was rightly not told of it.
+                        match fsx::file_id(&target).and_then(|id| claimed.get(&id)) {
+                            Some(other) => {
+                                Err(format!("lands on the same file as entry `{other}`"))
+                            }
+                            None => narrow(&target).map(|()| Placed::Adopted),
+                        }
+                    } else if unannounced {
                         Err(format!(
                             "{}: changed while this pass looked at it; the next pass places it",
                             target.display()
@@ -316,6 +329,7 @@ pub fn apply_resuming(
                     .insert(entry.name.clone(), digest_hex(entry.value.as_slice()));
                 report.unchanged.push(entry.name.clone());
             }
+            Ok(Placed::Adopted) => report.unchanged.push(entry.name.clone()),
             Ok(Placed::Left) => report.left.push(entry.name.clone()),
             Ok(Placed::Withdrawn) => {
                 withdrawn.extend(held_digest.map(|digest| (entry.name.clone(), digest.clone())));
@@ -408,13 +422,19 @@ fn to_write(
         })
         .filter_map(|entry| {
             let digest = digest_hex(entry.value.as_slice());
+            let target = target_path(places.home, &entry.name).ok();
             let wrote = held.files.get(&entry.name).or_else(|| {
-                target_path(places.home, &entry.name)
-                    .ok()
-                    .and_then(|target| fsx::file_id(&target))
+                target
+                    .as_deref()
+                    .and_then(fsx::file_id)
                     .and_then(|id| history.get(&id).copied())
             });
-            (wrote != Some(&digest)).then(|| (entry.name.clone(), digest))
+            // A file of the machine's own that already holds the value is adopted, never
+            // written: told to `ahead`, a pass cut short would count it the vault's.
+            let adopted = target
+                .as_deref()
+                .is_some_and(|target| adoptable(target, entry, wrote));
+            (wrote != Some(&digest) && !adopted).then(|| (entry.name.clone(), digest))
         })
         .collect()
 }
@@ -487,6 +507,10 @@ impl<'a> Places<'a> {
 enum Placed {
     Written,
     Unchanged,
+    /// A plain entry whose target, a file the vault never wrote, already held its value:
+    /// narrowed and kept, and still the machine's own (out of the manifest), so dropping the
+    /// entry leaves it and a new value moves it aside first.
+    Adopted,
     /// An ` if-absent` entry whose target, or anchor, is the machine's own.
     Left,
     /// An anchored ` if-absent` entry whose file the vault wrote and whose anchor is the
@@ -550,7 +574,12 @@ fn place(
         Kind::File => match judge(target, value, held) {
             Judged::Same => {
                 narrow(target)?;
-                return Ok(Placed::Unchanged);
+                // Found holding the value where the vault never wrote: the machine's own.
+                return Ok(if held.is_some() {
+                    Placed::Unchanged
+                } else {
+                    Placed::Adopted
+                });
             }
             Judged::Ours => false,
             Judged::Foreign => true,
@@ -682,6 +711,15 @@ fn standings<'a>(
             standings.insert(name, of);
         }
     }
+}
+
+/// Whether a plain entry's target is a regular file the vault never wrote (`wrote` is
+/// `None`) that already holds the entry's value: adopted, never written.
+fn adoptable(target: &Path, entry: &Entry, wrote: Option<&String>) -> bool {
+    !entry.if_absent
+        && wrote.is_none()
+        && matches!(fsx::kind(target), Ok(Kind::File))
+        && holds(target, entry.value.as_slice())
 }
 
 /// Whether the regular file at `target` holds `value`.
@@ -954,9 +992,90 @@ mod tests {
             apply(home.path(), &[entry("t", b"same")], &Manifest::default(), 1).expect("applied");
         assert_eq!(report.unchanged, ["t"]);
         assert!(report.written.is_empty() && report.moved_aside.is_empty());
-        assert_eq!(manifest.files["t"], digest_hex(b"same"));
+        assert!(
+            !manifest.files.contains_key("t"),
+            "an adopted file stays the machine's own"
+        );
         assert_eq!(mode(&secrets.join("t")), 0o600);
         assert!(!secrets.join(".replaced").exists());
+        // Every later pass adopts it again, and fails nothing.
+        let (manifest, report) =
+            apply(home.path(), &[entry("t", b"same")], &manifest, 2).expect("again");
+        assert_eq!(report.unchanged, ["t"]);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        assert!(manifest.files.is_empty());
+    }
+
+    #[test]
+    fn dropping_an_adopted_entry_leaves_the_machines_own_file() {
+        // The audit's case: `set ~/.aws/credentials --file ~/.aws/credentials`, then unset.
+        let home = scratch();
+        let secrets = home.path().join(".secrets");
+        std::fs::create_dir(&secrets).expect("dir");
+        plant(&secrets.join("token"), b"hand-made", 0o600);
+        let entries = [entry("token", b"hand-made"), entry("other", b"o")];
+        let (held, _) = apply(home.path(), &entries, &Manifest::default(), 1).expect("first");
+        let (manifest, report) = apply(home.path(), &entries[1..], &held, 2).expect("dropped");
+        assert!(report.removed.is_empty(), "{:?}", report.removed);
+        assert_eq!(read(&secrets.join("token")), b"hand-made");
+        assert!(!manifest.files.contains_key("token"));
+        // NEGATIVE CONTROL: what the vault wrote itself is still removed when dropped.
+        let (_, report) = apply(home.path(), &[], &manifest, 3).expect("dropped");
+        assert_eq!(report.removed, ["other"]);
+        assert!(!secrets.join("other").exists());
+        assert_eq!(read(&secrets.join("token")), b"hand-made");
+    }
+
+    #[test]
+    fn a_new_value_moves_an_adopted_file_aside_first() {
+        let home = scratch();
+        let secrets = home.path().join(".secrets");
+        std::fs::create_dir(&secrets).expect("dir");
+        plant(&secrets.join("token"), b"hand-made", 0o600);
+        let (held, _) = apply(
+            home.path(),
+            &[entry("token", b"hand-made")],
+            &Manifest::default(),
+            1,
+        )
+        .expect("adopted");
+        let (manifest, report) =
+            apply(home.path(), &[entry("token", b"rotated")], &held, 2).expect("changed");
+        let [(name, aside)] = report.moved_aside.as_slice() else {
+            panic!("moved aside: {:?}", report.moved_aside);
+        };
+        assert_eq!(name, "token");
+        assert_eq!(read(aside), b"hand-made");
+        assert_eq!(read(&secrets.join("token")), b"rotated");
+        assert_eq!(manifest.files["token"], digest_hex(b"rotated"));
+    }
+
+    #[test]
+    fn an_adoptable_file_is_never_announced_as_a_write() {
+        let home = scratch();
+        let secrets = home.path().join(".secrets");
+        std::fs::create_dir(&secrets).expect("dir");
+        plant(&secrets.join("token"), b"hand-made", 0o600);
+        let mut told = Vec::new();
+        let (_, report) = apply_resuming(
+            home.path(),
+            &[entry("token", b"hand-made"), entry("new", b"n")],
+            &Manifest::default(),
+            &Pending::new(),
+            1,
+            &mut |_, pending| {
+                told.extend(pending.keys().cloned());
+                Ok(())
+            },
+        )
+        .expect("applied");
+        assert_eq!(
+            told,
+            ["new"],
+            "a cut pass must not count the adopted file the vault's"
+        );
+        assert_eq!(report.unchanged, ["token"]);
+        assert_eq!(report.written, ["new"]);
     }
 
     #[test]
@@ -1241,7 +1360,8 @@ mod tests {
         );
         assert!(report.moved_aside.is_empty());
         assert_eq!(read(&first), b"v", "never written through the second name");
-        assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["~/first"]);
+        // Found holding its value, `~/first` is adopted: still the machine's own.
+        assert!(manifest.files.is_empty(), "{:?}", manifest.files);
     }
 
     #[test]
@@ -1885,7 +2005,8 @@ mod tests {
         assert!(report.left.is_empty(), "{:?}", report.left);
         // What the refused `~/link/x` saw through the link is not claimed by it.
         assert_eq!(report.unchanged, ["~/target/x"]);
-        assert_eq!(manifest.files.keys().collect::<Vec<_>>(), ["~/target/x"]);
+        // Adopted, it stays the machine's own; nothing else is the vault's either.
+        assert!(manifest.files.is_empty(), "{:?}", manifest.files);
         assert_eq!(read(&real.join("gh_token")), b"theirs");
         assert_eq!(read(&deep.join("c")), b"theirs");
     }

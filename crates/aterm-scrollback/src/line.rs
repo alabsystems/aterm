@@ -51,6 +51,7 @@ impl CellAttrs {
 
     /// Create new cell attributes.
     #[must_use]
+    #[inline]
     pub const fn new(fg: u32, bg: u32, flags: u16) -> Self {
         Self { fg, bg, flags }
     }
@@ -123,6 +124,7 @@ impl CellAttrs {
 // spelling keeps the callee a plain cross-crate call; `runs.len()` is
 // `run_count()`, and a linear walk of `runs` gives `Rle::get`'s value.
 
+#[inline]
 fn attr_runs(attrs: Option<&Rle<CellAttrs>>) -> &[aterm_rle::Run<CellAttrs>] {
     attrs.map_or(&[], Rle::runs)
 }
@@ -227,6 +229,7 @@ impl Line {
     /// ENSURES: !self.has_hyperlinks()
     /// ENSURES: !self.is_wrapped()
     #[must_use]
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
@@ -237,6 +240,7 @@ impl Line {
     /// ENSURES: !self.has_attrs()
     /// ENSURES: !self.has_hyperlinks()
     #[must_use]
+    #[inline]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         Self {
             content: LineContent::from_bytes(bytes),
@@ -351,6 +355,7 @@ impl Line {
     /// non-decreasing indices cost O(runs) per line in total, and a backward index
     /// rewinds. Same result as `get_attr` at every index.
     #[must_use]
+    #[inline]
     pub fn attr_cursor(&self) -> AttrRunCursor<'_> {
         AttrRunCursor {
             runs: attr_runs(self.attrs.as_deref()),
@@ -363,7 +368,7 @@ impl Line {
     #[must_use]
     #[inline]
     #[cfg(test)]
-    pub fn has_attrs(&self) -> bool {
+    pub const fn has_attrs(&self) -> bool {
         self.attrs.is_some()
     }
 
@@ -441,6 +446,7 @@ impl Line {
     // Skip: drop glue for the replaced Option<Box<SmallVec>> sidecar (std/alloc
     // internals, the drop-glue lane). Field replacement only; unit-tested.
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     pub fn clear_hyperlinks(&mut self) {
         self.hyperlinks = None;
     }
@@ -585,7 +591,7 @@ impl Line {
     /// Check if wrapped.
     #[must_use]
     #[inline]
-    pub fn is_wrapped(&self) -> bool {
+    pub const fn is_wrapped(&self) -> bool {
         self.flags.contains(LineFlags::WRAPPED)
     }
 
@@ -622,6 +628,7 @@ impl Line {
     // Skip: `str::from_utf8` is the hardened strict-reject class; non-UTF-8 content
     // reads as None and stays byte-exact via `as_bytes`.
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     pub fn as_str(&self) -> Option<&str> {
         std::str::from_utf8(self.as_bytes()).ok()
     }
@@ -736,6 +743,7 @@ impl AttrRunCursor<'_> {
     /// The attribute at `char_idx`, identical to [`Line::get_attr`]; amortized
     /// O(1) for non-decreasing indices.
     #[must_use]
+    #[inline]
     pub fn attr_at(&mut self, char_idx: usize) -> CellAttrs {
         let idx = u32::try_from(char_idx).unwrap_or(u32::MAX);
         if idx < self.run_start {

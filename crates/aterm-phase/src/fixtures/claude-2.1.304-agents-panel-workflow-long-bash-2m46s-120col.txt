@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab), bypass mode (`--dangerously-skip-permissions`), fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1) · the same workflow 2 m 46 s in: its `long` agent inside its 200 s Bash call, the row's tokens unmoved since 2 s in, past the fold's 150 s stuck rule
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.19iX/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ Workflow(Long tool call inside a workflow)
+  ⎿  Running in background · /workflows to monitor and save · medium size (/config)
+
+⏺ Tool call done.
+
+✻ Waiting for 1 dynamic workflow to finish
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+
+  ◯ stall-probe  ▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱  1/2 · 2m46s · ↓ 12.7k tokens
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

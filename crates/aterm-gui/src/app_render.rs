@@ -10087,6 +10087,7 @@ impl App {
             cursor_color_pinned,
             self.config.trail_color(),
             self.config.cursor_trail_accent_u32().is_some(),
+            None,
         );
         // Diagnostic (`trace_spawn_enabled`, sampled once): log every cursor
         // position the effect engines see, per frame.
@@ -22230,7 +22231,7 @@ impl App {
                 im.retain(|(col, _)| !span.contains(col));
             }
         }
-        crate::claude_card::cut_out(&mut ws.claude_card, &mut ws.input_scratch, rect);
+        crate::claude_card::cut_out(&mut ws.claude_card, &mut ws.input_scratch, rect, cw, pad);
         scrub_overlay_card(&mut ws.input_scratch, rect, (cw, ch), (pad, grid_top));
         ws.tab_menu_rect = Some(rect);
         // Pin the card out of the smooth-scroll band (clamped so the band never

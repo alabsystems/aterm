@@ -38,7 +38,7 @@
 //!   [`crate::mirror::FLOOR_LEASE_BYTES`] of bodies). Each is written once, or when
 //!   its set changes, never per message.
 //! - Atomic only: everything else (`logpin`, the bus mirror's one batch in
-//!   flight, written only by a bridge with `[fabric] log = "turns"`, among it). A power loss ends what those files pair with
+//!   flight, written only by a bridge whose session-log mirror runs, among it). A power loss ends what those files pair with
 //!   anyway: the outbox, the owed receipts and the inbox ring live in aterm's memory
 //!   (a seamless update carries them, a reboot does not), and aterm mints fresh sids
 //!   at every launch, so every file serving a session (`seen/`, `sent/`, `acks/`,
@@ -279,10 +279,10 @@
 //! | `deadlines` | atomic | each `ask`/`task` published with `dl=` and not yet answered, newest [`DEADLINES_KEEP`] | no `expired` for those asks; the bus is checked before any verdict, so never a false one |
 //! | `topics/<sid>` | atomic | `<topic> <next>` per broadcast opt-in ([`StateDir::topics`]) | the topic restarts from the session's `since=`, and `head` skips what was published meanwhile, so it is written every step |
 //! | `unhandled/<sid>` | atomic | `<topic> <off>`: per topic, the lowest offset of a broadcast the endpoint took as new and `inbox seen` has not passed, written before the cursor moves past it ([`StateDir::topic_floors`]) | a successor that keeps the sid (a seamless update, a PTY keeper's recovery) is not offered those broadcasts again, though they are gone from its inbox; no successor keeps a sid across a reboot. TORN, set aside |
-//! | `logpin` | atomic, flushed at a clean stop; durable where it replaces none of this build's | the bus mirror's one batch in flight, the node's total of mirrored bytes and its alias key ([`StateDir::logpin`]), `v=2`, which an older build refuses ([`crate::mirror::Pin`]); only with `[fabric] log = "turns"` | an older whole version: one batch taken again at fresh sequences, a second copy each reader dedupes; after an unclean stop in an earlier boot, its total raised to `logfloor` ([`StateDir::reconcile_logpin`]), which counts the floor's lease as mirrored. TORN there, with `logfloor` and `logkey` on the media: set aside, a whole pin written from them in its place, and the mirror resumes (rulings Q6, Q13). Torn with no floor or no key (an older build's pin, the only copy), torn as an older build's `v=1`, within one boot or after a clean stop: the mirror stops, keeps it as it is, and says what a person does |
-//! | `logkey` | durable | the bus mirror's alias key (ruling Q6), 32 hex digits, written once, before the first take that names it ([`StateDir::logkey`]); only with `[fabric] log = "turns"` | load-bearing: a fresh key is a second alias for every edge on the bus, so a torn pin is never set aside without it. Missing in a dir only an older build mirrored in, whose pin's `key=` is copied here before the next take |
-//! | `logfloor` | durable | the floor of the bus mirror's lifetime total (ruling Q13): at or above every body byte it sent, raised by [`crate::mirror::FLOOR_LEASE_BYTES`] past a batch before any byte of it is sent ([`StateDir::logfloor`]); only with `[fabric] log = "turns"` | the total a mirror resumes at when its pin is gone or may be rolled back: the lease's unused rest and the batch in flight are counted as mirrored, never a byte less. Missing: no bridge of this build sent a batch, and a torn pin stops the mirror |
-//! | `run` | durable | the boot the last bridge ran in and whether it stopped cleanly, every file of a [`TornKind`] it wrote flushed first ([`LastRun`]): written once per boot by the first bridge, after its sweep, and at a clean stop (a quit: a seamless update's handoff leaves it open for the successor that goes on with the run) | a dir without one is judged by its lease's boot, as a build before it was; a torn file found after a stop it cannot call unclean is refused where it is read |
+//! | `logpin` | atomic, flushed at a clean stop; durable where it replaces none of this build's | the bus mirror's one batch in flight, the node's total of mirrored bytes and its alias key ([`StateDir::logpin`]), `v=2`, which an older build refuses ([`crate::mirror::Pin`]); only while the session-log mirror runs (`[fabric] log`) | an older whole version: one batch taken again at fresh sequences, a second copy each reader dedupes; after an unclean stop in an earlier boot, its total raised to `logfloor` ([`StateDir::reconcile_logpin`]), which counts the floor's lease as mirrored. TORN there, with `logfloor` and `logkey` on the media: set aside, a whole pin written from them in its place, and the mirror resumes (rulings Q6, Q13). Torn with no floor or no key (an older build's pin, the only copy), torn as an older build's `v=1`, within one boot or after a clean stop: the mirror stops, keeps it as it is, and says what a person does |
+//! | `logkey` | durable | the bus mirror's alias key (ruling Q6), 32 hex digits, written once, before the first take that names it ([`StateDir::logkey`]); only while the session-log mirror runs (`[fabric] log`) | load-bearing: a fresh key is a second alias for every edge on the bus, so a torn pin is never set aside without it. Missing in a dir only an older build mirrored in, whose pin's `key=` is copied here before the next take |
+//! | `logfloor` | durable | the floor of the bus mirror's lifetime total (ruling Q13): at or above every body byte it sent, raised by [`crate::mirror::FLOOR_LEASE_BYTES`] past a batch before any byte of it is sent ([`StateDir::logfloor`]); only while the session-log mirror runs (`[fabric] log`) | the total a mirror resumes at when its pin is gone or may be rolled back: the lease's unused rest and the batch in flight are counted as mirrored, never a byte less. Missing: no bridge of this build sent a batch, and a torn pin stops the mirror |
+//! | `run` | durable | the boot the last bridge ran in and whether it stopped cleanly, every file of a [`TornKind`] it wrote flushed first ([`LastRun`]): OPEN admitted once per StateDir open after its sweep, and CLEAN at a clean stop (a quit: a handoff leaves it open and its successor re-establishes the publication fence) | a dir without one is judged by its lease's boot, as a build before it was; a torn file found after a stop it cannot call unclean is refused where it is read |
 //! | `quarantine/` | durable | the exact bytes of each file found torn after an unclean stop in an earlier boot, moved aside by the first bridge after it ([`StateDir::set_aside_torn`], [`QUARANTINE`]) — the mirror's pin among them, as `logpin`, once its copies are on the media ([`StateDir::reconcile_logpin`]) — and of each whole in-flight entry it retired then, as `retired.inflight.<seq>` ([`StateDir::retire_in_flight_of_an_earlier_boot`]) | nothing reads it: it is the owner's, to read or remove. Only its count is read: how many torn files it still holds ([`StateDir::quarantined_torn`]), which at none ends aterm's entry for the owner's look |
 
 use std::collections::BTreeMap;
@@ -614,27 +614,17 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     sync_dir_as(dir, aterm_durable::Flush::Durable)
 }
 
-/// [`sync_dir`] with `flush` (`aterm_durable`'s two): the full flush, or the
-/// barrier that orders the directory's entry changes ahead of every later
-/// write on its device ([`StateDir::end_run_clean`]'s). The same errors are
-/// tolerated; a directory so tolerated was not flushed, and orders nothing.
+/// [`sync_dir`] with `flush`. The same errors are tolerated; a directory so
+/// tolerated was not flushed, and orders nothing. A clean stop instead requires
+/// [`sync_dir_required_as`]'s successful barrier or full flush.
 pub(crate) fn sync_dir_as(dir: &Path, flush: aterm_durable::Flush) -> io::Result<()> {
-    let dir = if dir.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        dir
-    };
-    // The open, and what its error is taken for, run in every build: only the
-    // flush is skipped in this crate's tests ([`flushes_media`]).
-    match std::fs::File::open(dir).and_then(|d| {
-        if flushes_media() {
-            flush.file(&d)
-        } else {
-            Ok(())
-        }
-    }) {
+    tolerate_dir_flush(sync_dir_required_as(dir, flush))
+}
+
+fn tolerate_dir_flush(result: io::Result<()>) -> io::Result<()> {
+    match result {
         Err(e)
-            if !matches!(
+            if matches!(
                 e.kind(),
                 io::ErrorKind::Unsupported
                     | io::ErrorKind::InvalidInput
@@ -642,10 +632,29 @@ pub(crate) fn sync_dir_as(dir: &Path, flush: aterm_durable::Flush) -> io::Result
                     | io::ErrorKind::NotFound
             ) =>
         {
-            Err(e)
+            Ok(())
         }
-        _ => Ok(()),
+        other => other,
     }
+}
+
+/// An actual directory flush: every open or flush error is returned, so a caller
+/// may rely on its ordering or durability only after success.
+fn sync_dir_required_as(dir: &Path, flush: aterm_durable::Flush) -> io::Result<()> {
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    // The open, and what its error is taken for, run in every build: only the
+    // flush is skipped in this crate's tests ([`flushes_media`]).
+    std::fs::File::open(dir).and_then(|d| {
+        if flushes_media() {
+            flush.file(&d)
+        } else {
+            Ok(())
+        }
+    })
 }
 
 /// THE INCARNATION LAYOUT IS ASTREAM'S: incarnation `inc` owns the producer
@@ -921,6 +930,9 @@ pub struct StateDir {
     /// identity. Atomic successors preserve that durable-version baseline;
     /// a new open, error or replacement does not.
     logpin_fence: std::sync::Mutex<Option<std::fs::File>>,
+    /// The current OPEN record this open successfully published durably.
+    /// Retain its identity: a visible record alone may follow a failed flush.
+    run_fence: std::sync::Mutex<Option<std::fs::File>>,
     /// TEST-ONLY: what this dir's writers did to the filesystem ([`FileOps`]).
     #[cfg(test)]
     ops: std::sync::Mutex<FileOps>,
@@ -931,6 +943,9 @@ pub struct StateDir {
     /// ([`StateDir::refuse_writes_of`]).
     #[cfg(test)]
     refused: std::sync::Mutex<Option<String>>,
+    /// TEST-ONLY: a raw directory open/flush error, before legacy tolerance.
+    #[cfg(test)]
+    dir_flush_refusal: std::sync::Mutex<Option<(PathBuf, aterm_durable::Flush, io::ErrorKind)>>,
 }
 
 /// The filesystem operations one [`StateDir`] made, by kind (counted only in a
@@ -1431,7 +1446,7 @@ impl StopRules {
 /// unclean-stop rule for its weak tiers (`astream_broker::Durability::Relaxed`:
 /// a run that did not close cleanly, judged in another boot).
 ///
-/// `open boot=<id>` from the first start in a boot (written after the sweep,
+/// `open boot=<id>` from each StateDir open's first admission (after the sweep,
 /// before any file of those kinds), `clean boot=<id>` once a bridge has
 /// flushed every such file it or a predecessor of this boot wrote and stops
 /// ([`StateDir::end_run_clean`]); `-` for a boot the kernel does not name.
@@ -1577,12 +1592,15 @@ impl StateDir {
             disk,
             unflushed: std::sync::Mutex::default(),
             logpin_fence: std::sync::Mutex::default(),
+            run_fence: std::sync::Mutex::default(),
             #[cfg(test)]
             ops: std::sync::Mutex::default(),
             #[cfg(test)]
             inc_seam: std::sync::Mutex::default(),
             #[cfg(test)]
             refused: std::sync::Mutex::default(),
+            #[cfg(test)]
+            dir_flush_refusal: std::sync::Mutex::default(),
         }
     }
 
@@ -1605,6 +1623,19 @@ impl StateDir {
     #[cfg(test)]
     pub(crate) fn refuse_writes_of(&self, name: Option<&str>) {
         *self.refused.lock().unwrap_or_else(|e| e.into_inner()) = name.map(str::to_string);
+    }
+
+    /// TEST-ONLY: refuse a raw directory open/flush before legacy tolerance.
+    #[cfg(test)]
+    pub(crate) fn refuse_directory_flush(
+        &self,
+        at: Option<(&Path, aterm_durable::Flush, io::ErrorKind)>,
+    ) {
+        *self
+            .dir_flush_refusal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            at.map(|(path, flush, kind)| (path.to_path_buf(), flush, kind));
     }
 
     /// TEST-ONLY: the full disk's error for a replace of `name` a test
@@ -2282,6 +2313,17 @@ impl StateDir {
         flush: Option<aterm_durable::Flush>,
         mode: u32,
     ) -> io::Result<()> {
+        self.replace_bytes_as_with(name, bytes, flush, mode, tolerate_dir_flush)
+    }
+
+    fn replace_bytes_as_with(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        flush: Option<aterm_durable::Flush>,
+        mode: u32,
+        finish_dir: fn(io::Result<()>) -> io::Result<()>,
+    ) -> io::Result<()> {
         #[cfg(test)]
         self.refused_by_a_test(name)?;
         let target = self.path(name);
@@ -2316,9 +2358,7 @@ impl StateDir {
         }
         if durable {
             self.kill_point(IncStep::Renamed)?;
-            if flushes_media() {
-                sync_dir(parent)?;
-            }
+            finish_dir(self.directory_flush_result(parent, aterm_durable::Flush::Durable))?;
         }
         self.disk.after(w);
         // A file of a [`TornKind`] left unflushed is one a clean stop flushes
@@ -2949,10 +2989,10 @@ impl StateDir {
         self.flush_dir(&self.path("inflight"))
     }
 
-    /// Flush the directory `dir` through the dir's door ([`crate::fx::Disk`]), so
-    /// every entry change in it (an unlink, a rename) survives a power loss.
+    /// Flush the directory `dir` through the dir's door ([`crate::fx::Disk`]),
+    /// retaining [`sync_dir`]'s legacy tolerance of unavailable directory flushes.
     fn flush_dir(&self, dir: &Path) -> io::Result<()> {
-        self.flush_dir_as(dir, aterm_durable::Flush::Durable)
+        self.flush_dir_with(dir, aterm_durable::Flush::Durable, tolerate_dir_flush)
     }
 
     /// FLUSH THE FILE `rel` WHERE IT IS, its bytes as they stand, by `flush`
@@ -3001,21 +3041,48 @@ impl StateDir {
     /// ordered ahead of every later write on the device (the barrier, a clean
     /// stop's, [`StateDir::end_run_clean`]).
     fn flush_dir_as(&self, dir: &Path, flush: aterm_durable::Flush) -> io::Result<()> {
+        self.flush_dir_with(dir, flush, std::convert::identity)
+    }
+
+    fn flush_dir_with(
+        &self,
+        dir: &Path,
+        flush: aterm_durable::Flush,
+        finish: fn(io::Result<()>) -> io::Result<()>,
+    ) -> io::Result<()> {
         let w = crate::fx::Write::SyncDir { path: dir, flush };
         self.disk.before(w)?;
         self.count(|ops| match flush {
             aterm_durable::Flush::Durable => ops.fsyncs += 1,
             aterm_durable::Flush::Ordered => ops.barriers += 1,
         });
-        sync_dir_as(dir, flush)?;
+        finish(self.directory_flush_result(dir, flush))?;
         self.disk.after(w);
         Ok(())
+    }
+
+    fn directory_flush_result(&self, dir: &Path, flush: aterm_durable::Flush) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some((path, tier, kind)) = &*self
+            .dir_flush_refusal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            if path == dir && *tier == flush {
+                return Err(io::Error::new(*kind, "a test's directory flush refusal"));
+            }
+        }
+        sync_dir_required_as(dir, flush)
     }
 
     /// How the last bridge of this dir stopped, and in which boot (`run`,
     /// [`LastRun`]); `None` only for a genuinely missing record (a build
     /// before it). An unreadable, damaged or nonregular occupant is refused.
     pub(crate) fn last_run(&self) -> io::Result<Option<LastRun>> {
+        self.run_file().map(|record| record.map(|(_, run)| run))
+    }
+
+    fn run_file(&self) -> io::Result<Option<(std::fs::File, LastRun)>> {
         use std::io::Read as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let path = self.path("run");
@@ -3039,11 +3106,13 @@ impl StateDir {
             return Err(bad());
         }
         let mut text = String::new();
-        file.take(128).read_to_string(&mut text)?;
+        (&file).take(128).read_to_string(&mut text)?;
         if text.len() >= 128 {
             return Err(bad());
         }
-        LastRun::parse(&text).map(Some).ok_or_else(bad)
+        LastRun::parse(&text)
+            .map(|run| Some((file, run)))
+            .ok_or_else(bad)
     }
 
     /// WHETHER A POWER CUT CAN HAVE TORN A FILE OF A [`TornKind`] since the
@@ -3477,10 +3546,10 @@ impl StateDir {
     /// and before it writes any file of a [`TornKind`]: `run` names this boot,
     /// OPEN, durably — so a power cut from here on is judged unclean by the
     /// first bridge of the next boot ([`StateDir::torn_files_possible`]). One
-    /// durable write at the first start in a boot and at the first after a
-    /// clean stop; none at a start after a kill or a handoff in the same boot
-    /// (`Bridge::end_run`: a seamless update's successor goes on with the run),
-    /// whose record already says so.
+    /// durable write at the first admission of this StateDir open, including
+    /// after a kill or handoff: a predecessor may have died after its rename
+    /// but before its directory flush. Reconnects through this same open reuse
+    /// only its successfully published, still-current OPEN record.
     ///
     /// And what this run must flush before it may say it stopped cleanly
     /// ([`StateDir::end_run_clean`]): what it writes itself, and — unless the
@@ -3495,15 +3564,40 @@ impl StateDir {
     /// removed to force a legacy fallback. A write may already have progressed
     /// before an I/O error; uncertainty must remain fail-closed.
     pub(crate) fn begin_run(&self) -> io::Result<Flushed> {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut known = self.run_fence.lock().unwrap_or_else(|e| e.into_inner());
         let now = self.kernel_boot();
-        let last = self.last_run()?;
-        let on_the_media = last.is_some_and(|run| {
-            run.clean || (now.is_some() && run.boot.is_some() && run.boot != now)
-        });
+        let current = match self.run_file() {
+            Ok(current) => current,
+            Err(e) => {
+                *known = None;
+                return Err(e);
+            }
+        };
+        let last = current.as_ref().map(|(_, run)| *run);
         let open = LastRun {
             boot: now,
             clean: false,
         };
+        if last == Some(open)
+            && known.as_ref().is_some_and(|held| {
+                let (Ok(held), Some(Ok(current))) = (
+                    held.metadata(),
+                    current.as_ref().map(|(file, _)| file.metadata()),
+                ) else {
+                    return false;
+                };
+                (held.dev(), held.ino()) == (current.dev(), current.ino())
+            })
+        {
+            return Ok(Flushed::default());
+        }
+        // Keep the old inode held through replacement. No error may leave
+        // successful admission cached, even if the new OPEN is already visible.
+        let previous = known.take();
+        let on_the_media = last.is_some_and(|run| {
+            run.clean || (now.is_some() && run.boot.is_some() && run.boot != now)
+        });
         if !on_the_media {
             let here = self.torn_kind_files()?;
             let pin = std::fs::symlink_metadata(self.path(LOGPIN))
@@ -3515,10 +3609,30 @@ impl StateDir {
                 .extend(here.into_iter().map(|(_, _, rel)| rel).chain(pin));
         }
         let mut flushed = Flushed::default();
-        if last != Some(open) {
-            self.write_durable("run", &open.render())?;
-            flushed.full += 2;
+        let mut bytes = open.render().into_bytes();
+        bytes.push(b'\n');
+        self.replace_bytes_as_with(
+            "run",
+            &bytes,
+            Some(aterm_durable::Flush::Durable),
+            0o666,
+            std::convert::identity,
+        )?;
+        let (file, record) = self.run_file()?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the published run record is missing",
+            )
+        })?;
+        if record != open {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the published run record changed",
+            ));
         }
+        *known = Some(file);
+        drop(previous);
+        flushed.full += 2;
         Ok(flushed)
     }
 
@@ -3575,7 +3689,8 @@ impl StateDir {
     /// # Errors
     ///
     /// The first record read, directory admission, file flush or directory
-    /// flush that fails.
+    /// flush that fails. Unlike legacy directory flushes, both the phase-A
+    /// directories and the record's final root flush must actually succeed.
     /// Invalid marker evidence is left untouched, and paths still needing a
     /// flush remain pending for another attempt. No marker is removed to force
     /// a legacy fallback.
@@ -4601,22 +4716,56 @@ mod tests {
     #[test]
     fn a_directory_flush_tolerates_a_gone_directory_and_refuses_a_broken_path() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = scratch("syncdir");
+        struct RestoreMode(PathBuf, std::fs::Permissions);
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
+        let owned = aterm_tempfile::Builder::new()
+            .prefix("syncdir")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let dir = owned.path();
         let locked = dir.join("locked");
         std::fs::create_dir_all(&locked).expect("scratch");
-        assert!(sync_dir(&dir).is_ok());
+        let flush = aterm_durable::Flush::Ordered;
+        assert!(sync_dir(dir).is_ok());
+        assert!(sync_dir_required_as(dir, flush).is_ok());
         assert!(sync_dir(&dir.join("gone")).is_ok());
+        assert_eq!(
+            sync_dir_required_as(&dir.join("gone"), flush).map_err(|e| e.kind()),
+            Err(io::ErrorKind::NotFound)
+        );
+        let known = locked.join("known");
+        std::fs::write(&known, b"still reachable").expect("a known file");
+        let restore = RestoreMode(
+            locked.clone(),
+            std::fs::metadata(&locked).expect("its mode").permissions(),
+        );
         let mode = |m| std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(m));
         mode(0o300).expect("write but not read");
+        let file = std::fs::read(&known);
+        let direct = std::fs::File::open(&locked)
+            .map(|_| ())
+            .map_err(|e| e.kind());
+        let required = sync_dir_required_as(&locked, flush).map_err(|e| e.kind());
         let opened = sync_dir(&locked);
-        mode(0o700).expect("readable again");
+        drop(restore);
+        assert_eq!(
+            file.expect("known file remains readable"),
+            b"still reachable"
+        );
+        assert_eq!(
+            required, direct,
+            "required flush preserves the directory-open result, even when only known files are reachable"
+        );
         assert!(opened.is_ok());
         std::fs::write(dir.join("file"), b"").expect("a file");
         assert_eq!(
             sync_dir(&dir.join("file").join("dir")).map_err(|e| e.kind()),
             Err(io::ErrorKind::NotADirectory)
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The node id (the node's mail address) is minted once and read back on reopen.
@@ -7198,6 +7347,108 @@ mod tests {
     /// stopped — boot 2 sets the damage aside, as after a power cut.
     #[test]
     fn after_a_clean_stop_damage_is_refused_across_a_reboot() {
+        use aterm_durable::Flush;
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Unsupported] {
+            for reopen in [false, true] {
+                let dir = aterm_tempfile::Builder::new()
+                    .prefix("clean-open-error")
+                    .tempdir_in("/tmp")
+                    .expect("scratch");
+                let st = StateDir::open(dir.path()).expect("open");
+                st.set_inc_seam(in_boot(1));
+                st.begin_run().expect("initial OPEN");
+                st.end_run_clean().expect("prior clean stop");
+                st.refuse_directory_flush(Some((dir.path(), Flush::Durable, kind)));
+                assert_eq!(
+                    st.begin_run().expect_err("OPEN publication refused").kind(),
+                    kind
+                );
+                assert!(
+                    !st.last_run().unwrap().unwrap().clean,
+                    "rename already visible"
+                );
+                let st = if reopen {
+                    drop(st);
+                    let st = StateDir::open(dir.path()).expect("reopen after failed publication");
+                    st.set_inc_seam(in_boot(1));
+                    st.refuse_directory_flush(Some((dir.path(), Flush::Durable, kind)));
+                    st
+                } else {
+                    st
+                };
+                assert_eq!(
+                    st.begin_run()
+                        .expect_err("visible OPEN is not admission")
+                        .kind(),
+                    kind
+                );
+                st.refuse_directory_flush(None);
+                assert_eq!(st.begin_run().expect("successful OPEN retry").full, 2);
+                let before = st.ops();
+                assert_eq!(
+                    st.begin_run().expect("same open reconnect"),
+                    Flushed::default()
+                );
+                assert_eq!(st.ops() - before, FileOps::default());
+                let replacement = st.path("run-replacement");
+                std::fs::write(&replacement, std::fs::read(st.path("run")).unwrap()).unwrap();
+                std::fs::rename(replacement, st.path("run")).unwrap();
+                assert_eq!(
+                    st.begin_run().expect("replacement needs a new fence").full,
+                    2
+                );
+            }
+        }
+        for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Unsupported] {
+            for final_root in [false, true] {
+                let dir = aterm_tempfile::Builder::new()
+                    .prefix("clean-dir-error")
+                    .tempdir_in("/tmp")
+                    .expect("scratch");
+                let st = StateDir::open(dir.path()).expect("open");
+                st.set_inc_seam(in_boot(1));
+                st.begin_run().expect("an open run");
+                let entry = in_flight_entry(7);
+                st.set_in_flight(&entry).expect("an entry");
+                st.set_post_pin("s-a", 1, &entry.pin)
+                    .expect("a reservation");
+                st.set_receipt_pin("s-a", 4, &entry.pin)
+                    .expect("a receipt pin");
+                let pending = st.unflushed.lock().unwrap().clone();
+                assert_eq!(pending.len(), 3);
+                let open = std::fs::read(st.path("run")).expect("the open marker");
+                let (path, tier) = if final_root {
+                    (st.root.clone(), Flush::Durable)
+                } else {
+                    (st.path("sent"), Flush::Ordered)
+                };
+                *st.dir_flush_refusal.lock().unwrap() = Some((path, tier, kind));
+                assert_eq!(
+                    st.end_run_clean()
+                        .expect_err("a required directory barrier")
+                        .kind(),
+                    kind
+                );
+                assert_eq!(
+                    *st.unflushed.lock().unwrap(),
+                    pending,
+                    "a failed stop retains every pending file for retry"
+                );
+                if !final_root {
+                    assert_eq!(std::fs::read(st.path("run")).unwrap(), open);
+                    assert!(!st.last_run().unwrap().unwrap().clean);
+                }
+                // The final root error may follow the marker's rename. It is
+                // still an error, not a successful durability claim or a rollback.
+                *st.dir_flush_refusal.lock().unwrap() = None;
+                let flushed = st.end_run_clean().expect("a complete retry");
+                assert_eq!(flushed.files, pending.len() as u64);
+                assert_eq!(flushed.dirs, 3);
+                assert_eq!(flushed.full, 1);
+                assert!(st.unflushed.lock().unwrap().is_empty());
+                assert!(st.last_run().unwrap().unwrap().clean);
+            }
+        }
         for clean in [true, false] {
             let dir = aterm_tempfile::Builder::new()
                 .prefix("clean")
@@ -7604,6 +7855,7 @@ mod tests {
             inc: 1,
             total,
             key: Some(key),
+            win: Vec::new(),
             slots: vec![crate::mirror::PinSlot {
                 pseq: 9,
                 sid: "s-a".to_string(),

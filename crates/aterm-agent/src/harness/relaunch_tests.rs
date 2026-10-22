@@ -1478,6 +1478,92 @@ fn the_resumed_prompt_is_one_line_and_keeps_going() {
     }
 }
 
+/// THE PERSON'S GRACE STILL TO RUN ([`grace_left`]): what is left of
+/// `human_grace_s` since the status's `human_ms=` stamp. NEGATIVE CONTROLS:
+/// input older than the grace, none ever, no stamp and no `OK` reply leave
+/// nothing to wait.
+#[test]
+fn the_persons_grace_left_is_read_off_the_status_stamp() {
+    assert_eq!(
+        grace_left("OK program=node human_ms=800 hold=0", 120),
+        Duration::from_millis(119_200)
+    );
+    assert_eq!(grace_left("OK human_ms=0", 120), Duration::from_secs(120));
+    for status in [
+        "OK human_ms=120000",
+        "OK human_ms=900000",
+        "OK human_ms=-",
+        "OK program=node",
+        "ERR no such session",
+    ] {
+        assert_eq!(grace_left(status, 120), Duration::ZERO, "{status}");
+    }
+}
+
+/// A GEMINI CLI'S OWN RESTART IS READ AS THE EXIT IS SEEN
+/// ([`restarted_itself`]; the review of b9/spawn-residuals, F2): looked at
+/// until its shell's word is drawn, at most [`EXIT_GONE`], and only a told
+/// crash that is its own restart refused for its own id says so. NEGATIVE
+/// CONTROLS: a plain crash, a refused start, an unreadable look, a process
+/// still running past the wait and a word never told say no; a wait cut
+/// short says no.
+#[test]
+fn a_gemini_clis_own_restart_is_read_as_the_exit_is_seen() {
+    let look = |running: bool, crashed: Option<bool>, itself: bool| ExitLook {
+        running,
+        record: None,
+        agent: upgrade::Agent::Gemini,
+        crashed,
+        refused: crashed == Some(false),
+        restarted_itself: itself,
+    };
+    // Running a moment, then no word, then its own restart told.
+    let mut seq = vec![
+        look(true, None, false),
+        look(false, None, false),
+        look(false, Some(true), true),
+    ]
+    .into_iter();
+    let mut waits = 0;
+    assert!(restarted_itself(
+        || seq.next(),
+        |_| {
+            waits += 1;
+            true
+        }
+    ));
+    assert_eq!(waits, 2);
+    assert!(!restarted_itself(
+        || Some(look(false, Some(true), false)),
+        |_| true
+    ));
+    assert!(!restarted_itself(
+        || Some(look(false, Some(false), false)),
+        |_| true
+    ));
+    assert!(!restarted_itself(|| None, |_| true));
+    let mut looks = 0;
+    assert!(!restarted_itself(
+        || {
+            looks += 1;
+            Some(look(true, None, false))
+        },
+        |_| true
+    ));
+    assert_eq!(
+        looks,
+        usize::try_from(EXIT_GONE.as_millis() / EXIT_LOOK.as_millis()).unwrap() + 1
+    );
+    assert!(!restarted_itself(
+        || Some(look(false, None, true)),
+        |_| true
+    ));
+    assert!(!restarted_itself(
+        || Some(look(false, None, false)),
+        |_| false
+    ));
+}
+
 /// AN EXIT NO LOOK DECIDES IS READ BY NOTHING: a Codex's end is aterm's copy of codex-alab's
 /// own record's to decide (the Codex screen lane's retirement, 2026-10-16). A look handed in
 /// for one decides nothing at once ([`ExitRecord::Unread`]) — never Claude Code's record-gone
@@ -1493,6 +1579,7 @@ fn an_exit_of_an_agent_with_no_lane_is_read_by_nothing() {
         agent,
         crashed: Some(true),
         refused: false,
+        restarted_itself: false,
     };
     {
         let agent = upgrade::Agent::Codex;
@@ -1574,6 +1661,7 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
             agent: upgrade::Agent::Claude,
             crashed: None,
             refused: false,
+            restarted_itself: false,
         })
     };
     let steps =
@@ -1635,6 +1723,7 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
                 agent: upgrade::Agent::Claude,
                 crashed: None,
                 refused: false,
+                restarted_itself: false,
             })
         },
         |_| {
@@ -1655,6 +1744,7 @@ fn the_look_at_an_exit_waits_out_its_own_removal_and_no_longer() {
                 agent: upgrade::Agent::Claude,
                 crashed: None,
                 refused: false,
+                restarted_itself: false,
             })
         },
         |_| true,
@@ -1870,6 +1960,7 @@ fn a_muse_exit_is_decided_on_its_shells_word() {
             agent: upgrade::Agent::Muse,
             crashed,
             refused: false,
+            restarted_itself: false,
         })
     };
     assert_eq!(
@@ -1910,6 +2001,7 @@ fn a_muse_exit_is_decided_on_its_shells_word() {
             agent: upgrade::Agent::Claude,
             crashed: None,
             refused: false,
+            restarted_itself: false,
         })
     };
     assert_eq!(exit_record(claude, |_| true), ExitRecord::Removed);

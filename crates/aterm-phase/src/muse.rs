@@ -2629,6 +2629,7 @@ fn muse_card_at(rows: &[String], top: usize) -> Option<CardPlace> {
     Some(CardPlace {
         top,
         rows: 1,
+        mascot_row: 0,
         text_col: 2,
         mascot_end: 0,
         ends: [end0, end0, end0],
@@ -2727,22 +2728,40 @@ fn newest_cards(rows: &[String]) -> Vec<std::ops::Range<usize>> {
 /// The newest labelled value over the cards ([`newest_cards`]): a row of
 /// `label` at the label column, its value after the run of spaces.
 fn card_value<'a>(rows: &'a [String], label: &str) -> Option<&'a str> {
-    newest_cards(rows).into_iter().rev().find_map(|body| {
-        body.rev().find_map(|j| {
-            let t = card_text(&rows[j])?;
-            let rest = t.strip_prefix(label)?;
-            if !rest.starts_with(|c: char| c.is_whitespace()) {
-                return None;
-            }
-            let value = crate::text::trim(rest);
-            (!value.is_empty()).then_some(value)
-        })
+    newest_cards(rows)
+        .into_iter()
+        .rev()
+        .find_map(|body| card_body_value(rows, body, label))
+}
+
+fn card_body_value<'a>(
+    rows: &'a [String],
+    body: std::ops::Range<usize>,
+    label: &str,
+) -> Option<&'a str> {
+    body.rev().find_map(|j| {
+        let t = card_text(&rows[j])?;
+        let rest = t.strip_prefix(label)?;
+        if !rest.starts_with(|c: char| c.is_whitespace()) {
+            return None;
+        }
+        let value = crate::text::trim(rest);
+        (!value.is_empty()).then_some(value)
     })
 }
 
+fn subscription_tier(line: &str) -> Option<String> {
+    let (_, tier) = line.rsplit_once(" · ")?;
+    let tier = crate::text::trim(tier);
+    (!tier.is_empty()).then(|| tier.to_owned())
+}
+
 /// The subscription tier a card names (`Subscription · Muse Code Max
-/// Usage`): the words after the `·`.
-fn card_plan(rows: &[String]) -> Option<String> {
+/// Usage`): the words after the `·`, on a `/status` card's `BILLING` row
+/// or a `/usage` card's own subscription line. A `/usage` card alone
+/// names it: [`status_card_account`] is not the only way to it.
+#[must_use]
+pub fn subscription_card_plan(rows: &[String]) -> Option<String> {
     let billing = card_value(rows, const { anchor_text("muse.card.billing") });
     let line = billing.or_else(|| {
         newest_cards(rows).into_iter().rev().find_map(|body| {
@@ -2753,19 +2772,25 @@ fn card_plan(rows: &[String]) -> Option<String> {
             })
         })
     })?;
-    let (_, tier) = line.rsplit_once(" · ")?;
-    let tier = crate::text::trim(tier);
-    (!tier.is_empty()).then(|| tier.to_owned())
+    subscription_tier(line)
 }
 
 /// The signed-in address and subscription tier on Muse Code's `/status`
 /// card (`ACCOUNT  Name (address)`, `BILLING  Subscription · <tier>`;
 /// MEASURED signed in, [`fixtures::USAGE_SIGNED_IN`]). An API-key session
-/// draws no `ACCOUNT` row: `None`, never a guess. The tier may also be
-/// read off a `/usage` card's own subscription line.
+/// draws no `ACCOUNT` row: `None`, never a guess. The plan returned here
+/// belongs to that same card; a separate usage or older status card may
+/// describe another account.
 #[must_use]
 pub fn status_card_account(rows: &[String]) -> Option<(String, Option<String>)> {
-    let account = card_value(rows, const { anchor_text("muse.card.account") })?;
+    let (account, body) = newest_cards(rows).into_iter().rev().find_map(|body| {
+        let account = card_body_value(
+            rows,
+            body.clone(),
+            const { anchor_text("muse.card.account") },
+        )?;
+        Some((account, body))
+    })?;
     let email = account
         .strip_suffix(')')
         .and_then(|s| s.rsplit_once(" ("))
@@ -2773,7 +2798,19 @@ pub fn status_card_account(rows: &[String]) -> Option<(String, Option<String>)> 
     if !email.contains('@') || email.chars().any(char::is_whitespace) {
         return None;
     }
-    Some((email.to_owned(), card_plan(rows)))
+    let plan = card_body_value(rows, body, const { anchor_text("muse.card.billing") })
+        .and_then(subscription_tier);
+    Some((email.to_owned(), plan))
+}
+
+/// Muse Code's weekly subscription quota as its `/usage` card names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageCardWeekly {
+    /// The footer's words (`weekly 29% left`).
+    pub text: String,
+    /// The words after `Resets ` naming when the window resets, where the
+    /// card names them: the caller's expiry bound for `text`.
+    pub reset: Option<String>,
 }
 
 /// The weekly subscription quota on Muse Code's `/usage` card (`Weekly
@@ -2781,14 +2818,21 @@ pub fn status_card_account(rows: &[String]) -> Option<(String, Option<String>)> 
 /// [`fixtures::USAGE_SIGNED_IN`]), as the footer's words (`weekly 29%
 /// left`). Past 100% used the quota left is none: `weekly 0% left`.
 #[must_use]
-pub fn usage_card_weekly(rows: &[String]) -> Option<String> {
+pub fn usage_card_weekly(rows: &[String]) -> Option<UsageCardWeekly> {
     let weekly = card_value(rows, const { anchor_text("muse.card.weekly") })?;
     let (used, rest) = weekly.split_once('%')?;
     if !crate::text::trim(rest).starts_with("used") {
         return None;
     }
     let used: u32 = crate::text::trim(used).parse().ok()?;
-    Some(format!("weekly {}% left", 100u32.saturating_sub(used)))
+    let reset = weekly
+        .split_once("Resets ")
+        .map(|(_, words)| crate::text::trim(words).to_owned())
+        .filter(|words| !words.is_empty());
+    Some(UsageCardWeekly {
+        text: format!("weekly {}% left", 100u32.saturating_sub(used)),
+        reset,
+    })
 }
 
 fn parse_muse_footer_model(row: &str) -> Option<(String, Option<String>)> {

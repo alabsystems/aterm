@@ -5,12 +5,16 @@
 //! decoration Claude Code's launch card wears while the aterm harness has the
 //! session on Autopilot. Owner, 2026-10-15: "a rainbow border and a similar
 //! pixel art with an aterm kitty and fancy rainbows and star power to show off
-//! the power of the harness".
+//! the power of the harness". Its colours are the Autopilot's
+//! ([`CardPalette`]): Cruise's spectrum, Land's sunset, and Off's moonbow,
+//! white → pearl → silver → steel (owner, 2026-10-19: "I want a white themed
+//! for 'off'").
 //!
 //! This module is the card's pure emitter. The host finds the card
 //! (`aterm_phase::launch_card_place`), resolves its geometry into a
 //! [`CardScene`] in window pixels, and each frame asks
-//! [`HarnessCard::replay`] for the settled frame it keeps, else
+//! [`HarnessCard::replay`] for the held frame it keeps (or, while the card
+//! flows, [`HarnessCard::replay_step`] for the step it keeps), else
 //! [`HarnessCard::draw`]s one: two fx contents (`docs/DESIGN-card-engine-2026-10-19.md`
 //! §4.8), card-local — the border and the trail under the glyph ink, the
 //! kitty, its rim and the stars over it — which it lays at the card's origin
@@ -34,9 +38,10 @@
 //!   kitty's back, as tall as the kitty's BODY (§10.6: the cat leads, the
 //!   rainbow trails). It runs on under the
 //!   art to the haunch's outline ([`KittyArt::rear`]), so the rainbow meets
-//!   the cat flush on every row it spans. Settled, a stripe is one quad end
-//!   to end; during an episode it steps and shimmers in segments, but for
-//!   the stretch the cat's rim could reach, which holds still.
+//!   the cat flush on every row it spans. Settled, a stripe is one ramp end
+//!   to end; during the intro it steps and shimmers in segments, but for
+//!   the stretch the cat's rim could reach, which holds still, and in the
+//!   flow it lies still while the ripple's glints run along its segments.
 //! * **Kitty** (into `over`): a blocky cat with pink-lined pointed ears,
 //!   an iris beside a dark pupil, a pale muzzle and belly, four legs and
 //!   its tail up. Each of its six authored frames is one opaque sprite,
@@ -49,42 +54,74 @@
 //!   where it would lie on the trail, and runs under each paw but not under
 //!   the toes' gaps, which open onto the ground.
 //! * **Stars** (into `over`): one to three glints on the rainbow, flaring
-//!   as its sheen passes; five to nine field stars, the ride's sparkles,
+//!   as its sheen passes (in the flow, as the ripple's crest does); five to
+//!   nine field stars, the ride's sparkles,
 //!   and a burst of [`BURST_STARS`] where the kitty lands. All use the same
 //!   cached star arts. The glints are small and steady once settled.
 //!
-//! # Episodes, then stillness
+//! # An intro, then the flow
 //!
-//! [`HarnessCard::arm`] starts an episode ([`EPISODE_MS`]): the border's hue
-//! drifts (one trip through the palette per [`TRIP_MS`] at first, easing to a
-//! stop) and a white-hot head laps the perimeter twice; on the card's first
-//! showing, for the episode's first [`RIDE_MS`], the kitty RIDES in (§10.6)
-//! — from the trail's start to its seat, easing out, the trail laid behind
-//! it to its back, the field's stars coming up as it passes them and
-//! sparkles shed as it goes — and lands with the burst; once the glass has
-//! shown it seated it plays every later episode in its seat, the burst at
-//! the start ([`Ride`]); the trail steps and shimmers, its glints flaring
-//! under the sheen; the kitty blinks and flicks its tail; the stars twinkle.
-//! When it ends the frame is the settled one: constant bytes, a constant
-//! fingerprint and no deadline ([`HarnessCard::deadline`] asks for the
-//! settled frame — `now`, until a tick draws it or [`SETTLE_GRACE_MS`] past
-//! the episode's end — then is `None`), so the host idles at zero (the
-//! upgrade rim's `level_up.rs` lifecycle). Every
-//! animated quantity converges on its settled value, so the last episode frame
-//! runs into the settled frame without a jump.
+//! [`HarnessCard::arm`] starts an INTRO, an episode of [`EPISODE_MS`]: the
+//! border's hue drifts (one trip through the palette per [`TRIP_MS`] at
+//! first, easing onto the flow's pace) and a white-hot head laps the
+//! perimeter twice; on the card's first showing, for the episode's first
+//! [`RIDE_MS`], the kitty RIDES in (§10.6) — from the trail's start to its
+//! seat, easing out, the trail laid behind it to its back, the field's
+//! stars coming up as it passes them and sparkles shed as it goes — and
+//! lands with the burst; once the glass has shown it seated it plays every
+//! later episode in its seat, the burst at the start ([`Ride`]); the trail
+//! steps and shimmers, its glints flaring under the sheen; the kitty blinks
+//! and flicks its tail; the stars twinkle.
+//!
+//! Then THE FLOW, for as long as the card may animate (owner, 2026-10-19:
+//! "Make the rainbow at the banner continue to shimmer and flow
+//! continuously, which is also aligned with how the claude alien
+//! shimmers"): the border's and the rim's hue keep travelling clockwise,
+//! one trip per [`FLOW_TRIP_MS`], and CLAUDE'S RIPPLE ([`crate::ripple`]) —
+//! the glint wave its mascot shimmers with, a ring born at the wand every
+//! [`GLINT_PERIOD_MS`] and running outward at seven cells a second — runs on
+//! out from the wand ([`CardScene::wand`]) across the border, the trail,
+//! the rim, the stars and the line, a crest toward white on dark and a
+//! deeper print on light. Its frames step on the ripple's grid, every
+//! [`FLOW_STEP_MS`] — the frame grid of Claude's ripple — so a step's frame
+//! is a function of the step alone, replayed between steps
+//! ([`HarnessCard::replay_step`]); the host may PHASE-LOCK the grid to
+//! Claude's ripple where it sees the wand flare ([`HarnessCard::lock_glint`]:
+//! taken whole while no glint shows, else slewed, never more than a step a
+//! flare), and free-runs where it does not — the normal case: only Claude's
+//! fullscreen renderer with the key on shimmers its mascot and flares its
+//! wand. The intro hands over without a jump:
+//! its drift eases onto the flow's speed, its head fades as the glints
+//! rise over its last eighth.
+//!
+//! A flow step is a new PALETTE on the same arts (design
+//! `docs/DESIGN-card-engine-2026-10-19.md` §4.8, reconciled in its §4.8.1):
+//! the trail lies flat in the flow (its step wave is the intro's), so the
+//! rim's art stays the picture of its kitty frame, cut round the trail in
+//! one hole, and only its strips' entries, the border's and the trail's
+//! ramps and the stars' inks move with the hue and the ripple (on the
+//! crest a field star's dots and a rainbow glint's arm pick another of the
+//! registered star arts, [`CardArts`]). A step is
+//! drawn once, into the card's ring of contents, and replayed as the same
+//! `Arc`s until the next ([`HarnessCard::replay_step`]); the SETTLED frame,
+//! kept and replayed with no clock read, is the held card's.
 //!
 //! `animate == false` (reduced motion, an unfocused window, the load-shed
-//! latch) gives the settled frame from the first tick and wants no frames,
-//! but does not throw the episode away: one not yet drawn animating is OWED
-//! and plays from the first tick that may animate, so a latch that forces
-//! Reduced just as the card is first found delays the show rather than
-//! cancelling it. A tick with nothing to draw (an empty clip, no rows or
-//! columns: a pane mid-layout) holds the episode back the same way. The debt
-//! lapses [`OWED_MAX_MS`] after the arm, a margin past the latch's dwells: an
-//! episode never plays minutes later on an unrelated redraw, and a latch held
-//! longer by sustained load forfeits the show. Serious mode ends any
-//! episode and also drops the kitty, the trail and the stars, leaving a
-//! static border ([`crate::motion::SeriousEffect::HarnessCard`]).
+//! latch) gives the SETTLED frame at once — constant contents, replayed as
+//! the kept `Arc`s ([`HarnessCard::replay`]), and no deadline
+//! ([`HarnessCard::deadline`]), so the host idles at zero — and resumes the flow from the settled colours when it
+//! may animate again, the glints coming up over a few steps. It does not
+//! throw an intro away: one not yet drawn animating is OWED and plays from
+//! the first tick that may animate, so a latch that forces Reduced just as
+//! the card is first found delays the show rather than cancelling it. A
+//! tick with nothing to draw (an empty clip, no rows or columns: a pane
+//! mid-layout) holds the intro back the same way. The debt lapses
+//! [`OWED_MAX_MS`] after the arm, a margin past the latch's dwells: an
+//! intro never plays minutes later on an unrelated redraw, and a latch held
+//! longer by sustained load forfeits the show (the card flows on, with no
+//! intro). Serious mode ends any intro and the flow and also drops the
+//! kitty, the trail and the stars, leaving a static border
+//! ([`crate::motion::SeriousEffect::HarnessCard`]).
 //!
 //! # Laws the host can rely on
 //!
@@ -107,7 +144,8 @@
 //!   light (`alpha == 0`); on a light theme every item is source-over
 //!   (`alpha > 0`), since additive light is invisible on white. There the
 //!   border, trail and rim are opaque card art in print inks
-//!   ([`PRINT_CRUISE`], [`PRINT_LAND`]), as a printer lays a rainbow on
+//!   ([`PRINT_CRUISE`], [`PRINT_LAND`], and Off's pearl to graphite,
+//!   [`PRINT_OFF`]: white ink would vanish on paper), as a printer lays a rainbow on
 //!   paper: none of them ever lies on a glyph, so they leave the light-ink law
 //!   (`cursor_glow`'s `InkRole`), which washes a hue out to keep text
 //!   legible under it. The stars, the sparkles and the burst join them (one
@@ -119,17 +157,20 @@
 //!   (`alpha == 255`) on both.
 //! * **Photosensitivity.** Every twinkle runs on `effect_util::twinkle_env`,
 //!   under the crate's certified 3.2 Hz bound; the trail's step wave cycles
-//!   below it too; a glint flares once a shimmer pass (all const-asserted
-//!   here). The burst only fades, and the
-//!   blink comes once per 2.5 s.
+//!   below it too, a rainbow glint flares once a shimmer pass, and the
+//!   ripple glints a point at most twice a cycle (0.65 Hz), the flow's
+//!   blink once every two (all const-asserted). The burst only fades, and
+//!   the intro's blink comes once per 2.5 s.
 
 use std::sync::Arc;
 
 use aterm_render::{InkCell, premul_rgb};
 use aterm_time::Instant;
+use std::ops::Range;
 use std::time::Duration;
 
 use crate::color_math::relative_luminance;
+use crate::cursor_glow::InkRole;
 use crate::effect_util::{
     STAR_ARM_FINE, STAR_ARM_HERO, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE_ADD, STAR_GLINT_COV,
     TWINKLE_FLASH_BOUND_HZ, TWINKLE_FLASH_HZ, mix_rgb, star_arm, star_arm_px, twinkle_env,
@@ -137,7 +178,10 @@ use crate::effect_util::{
 };
 use crate::genome::mix;
 use crate::rainbow_kitty::meteor::tri;
-use crate::rainbow_kitty::ribbon::paper_mark_ink;
+use crate::rainbow_kitty::ribbon::{PAPER_MARK_CONTRAST, paper_mark_ink};
+use crate::ripple::{
+    FLOW_STEP_MS, GLINT_CREST_DARK, GLINT_CREST_LIGHT, GLINT_PERIOD_MS, cell_distance, glint,
+};
 use crate::spectrum::{SPECTRUM_ANCHOR_AT, SPECTRUM_LUT_LEN, spectrum, spectrum_stop};
 
 #[cfg(test)]
@@ -146,26 +190,28 @@ mod layers;
 #[cfg(test)]
 mod oracle;
 
-pub use layers::{CardArts, CardFrame, CardFrames, CardShape, SettledFrame, card_layer_id};
+pub use layers::{CardArts, CardFrame, CardFrames, CardShape, KeptFrame, card_layer_id};
 
 // ─── the clock ──────────────────────────────────────────────────────────────
 
-/// One episode's length (ms): the card animates this long after
-/// [`HarnessCard::arm`], then holds its settled frame.
+/// The intro's length (ms): the card plays its episode this long after
+/// [`HarnessCard::arm`], then flows ([`HarnessCard::flowing`]).
 pub const EPISODE_MS: u64 = 6000;
 
-/// The animation cadence (ms, ~30 fps): [`HarnessCard::deadline`]'s step and
-/// the fingerprint's frame quantum while an episode runs.
+/// The intro's cadence (ms, ~30 fps): [`HarnessCard::deadline`]'s step and
+/// the fingerprint's frame quantum while an intro runs. The flow steps on
+/// the ripple's [`FLOW_STEP_MS`].
 pub const FRAME_MS: u64 = 33;
 
-/// How long past an episode's end (ms) [`HarnessCard::deadline`] keeps
-/// asking for the settled frame, `now`, when no tick has drawn it. A host
-/// that ticks on its deadline draws the settled frame a frame after the end,
-/// well inside this; one that stopped ticking (the frame scrolled back, the
-/// card's version no longer the process's, the pane hidden) but still asks
-/// each loop is asked to wake at once for at most this long, then is let
-/// idle — never a spin for as long as the card goes unticked. A host later
-/// than this draws the settled frame on its next wake.
+/// How long past the last frame drawn (ms) [`HarnessCard::deadline`] keeps
+/// asking: for the flow's first frame, `now`, once the intro has run out,
+/// and for the flow's next step. A host that draws on its deadline draws
+/// the next frame well inside this; one that stopped drawing (the frame
+/// scrolled back, the card's version no longer the process's, the pane
+/// hidden, the window occluded) but still asks each loop is asked to wake
+/// for at most this long, then is let idle — never a spin for as long as
+/// the card goes undrawn. A host later than this draws the card's frame on
+/// its next wake.
 pub const SETTLE_GRACE_MS: u64 = 500;
 
 /// How long after its arm (ms) an OWED episode — held back before any of it
@@ -244,16 +290,105 @@ const _: () = assert!(
 );
 
 /// The border's hue drift at an episode's start: one trip through the palette
-/// (`φ` moves by 1) per this many ms, easing to a stop at the episode's end.
+/// (`φ` moves by 1) per this many ms, easing to the flow's own pace
+/// ([`FLOW_TRIP_MS`]) by the episode's end.
 pub const TRIP_MS: u64 = 3000;
 
-/// How far `φ` drifts over the episode: the integral of a speed that starts at
-/// one trip per [`TRIP_MS`] and eases linearly to zero, `EPISODE / (2·TRIP)`.
+/// How far `φ` would drift over the episode at a speed that starts at one
+/// trip per [`TRIP_MS`] and eases linearly to zero, `EPISODE / (2·TRIP)`.
 const PHI_DRIFT: f32 = EPISODE_MS as f32 / (2.0 * TRIP_MS as f32);
 
 /// The settled border phase. Red sits at the top-left corner and the loop
 /// reaches violet halfway round.
 const PHI_SETTLED: f32 = 0.0;
+
+/// THE FLOW'S HUE (owner, 2026-10-19: "Make the rainbow at the banner
+/// continue to shimmer and flow continuously"): after the intro the border's
+/// and the rim's hue keep travelling clockwise — rightward along the top
+/// edge, away from the mascot, the way Claude's ripple runs — one trip
+/// through the palette per this many ms: four of the ripple's cycles. A
+/// time, not a speed along the box, so a border that gains or loses its air
+/// (a longer perimeter) moves its hue no faster, and the rim, which shares
+/// `φ`, keeps its pace too.
+pub const FLOW_TRIP_MS: u64 = 4 * GLINT_PERIOD_MS;
+
+/// The intro's eased part of the drift: the speed starts at one trip per
+/// [`TRIP_MS`] and eases linearly onto the flow's one per [`FLOW_TRIP_MS`],
+/// so the hand-off to the flow is continuous in place and in speed. The
+/// integral of the eased excess, `PHI_DRIFT − EPISODE / (2·FLOW_TRIP)`.
+const PHI_INTRO: f32 = PHI_DRIFT - EPISODE_MS as f32 / (2.0 * FLOW_TRIP_MS as f32);
+
+/// How long the flow's glints take to come up where the flow starts from the
+/// settled frame (a gate reopened: focus, motion, the load latch, serious
+/// mode off): three of the ripple's steps.
+const GLINT_FADE_MS: u64 = 3 * FLOW_STEP_MS;
+
+/// How far ahead of the frame that SAW Claude's wand flare the lock puts a
+/// ring's birth on the card's grid — a step's start (ms): half the flow's
+/// slack ([`FLOW_SLACK_MS`]). Claude's repaint shows the frame its clock is
+/// in, so its first flaring repaint shows its cycle's frame 0, and it
+/// repaints about once a step after it (127.7 ms on a real window, design
+/// §10.6.11); locked so, the card shows its own step 0 on that frame, and
+/// each of Claude's later repaints lands this far into one of the card's
+/// steps, inside the slack: its present draws the card's step, and the
+/// card's own wake ([`HarnessCard::deadline`]) finds it drawn. The card's
+/// step changes this far ahead of Claude's on screen; the lock this
+/// replaced aimed at Claude's cycle's estimated start (the flare seen half
+/// a median repaint, 67 ms, late, and 16 ms more for the frame's
+/// composition) and changed it up to 83 ms ahead — past the slack, so each
+/// step cost a present of its own.
+pub const FLARE_STEP_LEAD_MS: u64 = FLOW_SLACK_MS / 2;
+
+/// THE LOCK'S GAIN: the share of its error one lock takes out where the
+/// card's glints show. Claude's first flaring repaint lands up to a repaint
+/// (118–142 ms, lab M2: [`crate::ripple::CLAUDE_REPAINT_P90_MS`]) after its
+/// cycle's start, so one flare's error is
+/// as much that jitter as any drift: taken a quarter at a time it averages
+/// out (about 15 ms of wander) instead of being chased flare by flare —
+/// the half-step rule this replaced took up to 64 ms whole, and adopted a
+/// larger error with a fade, every few flares.
+const LOCK_GAIN: i64 = 4;
+
+/// The most one lock moves a grid whose glints show (ms): one step, so the
+/// ring at most skips or repeats one of its frames; a larger error is taken
+/// out a step a flare.
+const LOCK_SLEW_MS: i64 = FLOW_STEP_MS as i64;
+
+/// How long past a flow step's start the flowing card's own wake lands
+/// ([`HarnessCard::deadline`]): a present that lands in the step's first
+/// [`FLOW_SLACK_MS`] anyway — Claude's own repaint, the vitals band, a
+/// keystroke — draws the card's step first, and the card's own wake then
+/// finds it drawn. Claude's repaints come about once a step, and the lock
+/// puts each [`FLARE_STEP_LEAD_MS`] into a step, inside this slack, so with
+/// the key on a flowing card rides Claude's presents (MEASURED on a real
+/// window, design §10.6.11); the lock before it put them 83 ms in, past the
+/// slack, and nearly every step was a present of its own.
+pub const FLOW_SLACK_MS: u64 = 40;
+
+/// The flow's blink: once every two ripple cycles (6.1 s), for two steps.
+const FLOW_BLINK_PERIOD_MS: u64 = 2 * GLINT_PERIOD_MS;
+const FLOW_BLINK_MS: u64 = 2 * FLOW_STEP_MS;
+
+/// The intro's glints come up over its last eighth (from `u = 0.88`, the
+/// head's mirror: the head fades as the rings rise), so the flow takes them
+/// over already up.
+const GLINT_INTRO_FROM: f32 = 0.88;
+
+const _: () = {
+    assert!(
+        FLOW_SLACK_MS < FLOW_STEP_MS,
+        "the flow's wake lands inside its step"
+    );
+    assert!(
+        FLARE_STEP_LEAD_MS > 0 && FLARE_STEP_LEAD_MS < FLOW_SLACK_MS,
+        "Claude's repaints land inside the slack, after the step starts"
+    );
+    assert!(PHI_INTRO > 0.0, "the intro starts faster than the flow");
+    assert!(
+        1000.0 / (FLOW_BLINK_PERIOD_MS as f32) <= TWINKLE_FLASH_BOUND_HZ,
+        "the flow's blink stays under the photosensitivity bound"
+    );
+};
 
 // ─── the border ─────────────────────────────────────────────────────────────
 
@@ -338,6 +473,10 @@ const TRAIL_COV: u8 = 200;
 // halved on the band's top and bottom stripes ([`LIGHT_GLINT_EDGE`]) so the
 // silhouette holds while it passes. Each is a table read or a few multiplies
 // per paint, cheaper than the `light_ink_bold` call each paint made before.
+//
+// Off's white card is printed in silver ([`PRINT_OFF`]): pearl at the top,
+// where the dark moonbow is white, down to graphite, so the trail holds its
+// edge on paper as the moonbow's steel holds it on dark.
 
 /// Cruise's six stripes on a light ground (red, orange, golden yellow, green,
 /// blue, violet): each within a few degrees of OKLCh hue of its dark twin
@@ -384,6 +523,7 @@ const PRINT_CRUISE_RAMP: [(usize, u32); 8] = [
 
 /// Where Cruise's trail stripe `k` sits in the spectrum table: its stop's
 /// index ([`SPECTRUM_ANCHOR_AT`]).
+#[inline]
 const fn stripe_at(k: usize) -> usize {
     SPECTRUM_ANCHOR_AT[TRAIL_STOPS[k]]
 }
@@ -414,6 +554,25 @@ const PRINT_LAND: [u32; 6] = [
     0x00FF_B81C, // gold
     0x00FF_6F59, // coral
     0x00E8_336D, // rose
+];
+
+/// Off's six stripes on a light ground, the moonbow in print ([`MOONBOW`]'s
+/// paper twin): pearl → silver → platinum → steel → pewter → graphite, lit
+/// from above as the dark moonbow runs white → steel. A cool silver (OKLCh
+/// hue about 261-267°, chroma 0.015-0.028), never a tinted grey, falling in
+/// OKLab L from 0.84 to 0.45 at least 0.071 apart (ΔE) pair by pair. The
+/// pearl holds 1.45:1 or more on every built-in light ground (Aterm Day
+/// 1.58, Linen 1.49, Solarized Light 1.53, Gruvbox Light 1.45, Latte 1.46):
+/// a white ink would vanish on paper as white light vanishes on white. Off
+/// leaves the trail's vividness law (`vivid_on_paper` in the tests) and
+/// keeps its own, a pearl on paper (`pearl_on_paper`).
+const PRINT_OFF: [u32; 6] = [
+    0x00C4_CAD4, // pearl
+    0x00AA_B1BE, // silver
+    0x0093_9BA9, // platinum
+    0x007C_8494, // steel
+    0x0065_6D7D, // pewter
+    0x004F_5666, // graphite
 ];
 
 /// Print art's opacity: opaque, as the kitty is.
@@ -687,6 +846,7 @@ struct KittyArt {
 
 impl KittyArt {
     /// The art's frame in `pose`.
+    #[inline]
     const fn frame(&self, pose: KittyPose) -> &'static [&'static str] {
         match pose {
             KittyPose::Open => self.open,
@@ -696,11 +856,13 @@ impl KittyArt {
     }
 
     /// The art's height in pixels.
+    #[inline]
     const fn h(&self) -> usize {
         self.open.len()
     }
 
     /// How many cell rows it is laid over.
+    #[inline]
     const fn rows(&self) -> usize {
         self.h() / KITTY_HALF
     }
@@ -712,6 +874,7 @@ impl KittyArt {
     /// a pixel further in than the open frame's. The art's own opaque pixels
     /// hide the stripes left of it on a row that starts sooner
     /// ([`trail_meets_flush`]).
+    #[inline]
     const fn rear(&self) -> usize {
         let frames = [self.open, self.blink, self.flick];
         let mut rear = 0;
@@ -1106,7 +1269,24 @@ const LINE_SWEEP_GAIN: f32 = 0.55;
 const LINE_SWEEP_GAIN_LIGHT: f32 = 0.3;
 /// A dark theme's line ink is lifted to at least this WCAG relative luminance
 /// (about 5:1 on a near-black ground), so blue and violet letters read.
-const LINE_DARK_LUMA_FLOOR: f32 = 0.30;
+pub(crate) const LINE_DARK_LUMA_FLOOR: f32 = 0.30;
+/// THE HERO WORD (owner, 2026-10-19: "emphasize aterm in the banner"): the
+/// line's `aterm` ([`LineAt::hero`]) spans this much of the palette across
+/// its own letters — a whole run, red to violet under Cruise, inside the
+/// line's slow gradient.
+const LINE_HERO_SPREAD: f32 = 1.0;
+/// A dark ground lifts the hero's letters to at least this WCAG luminance: a
+/// step above the line's [`LINE_DARK_LUMA_FLOOR`], so the bold word leads
+/// it, short of white so its blue and violet keep their hue.
+const LINE_HERO_DARK_LUMA_FLOOR: f32 = 0.36;
+/// How far a sweep or a glint pulls a hero letter toward white on a dark
+/// ground: Claude's own mascot crest ([`GLINT_CREST_DARK`]), against the
+/// rest of the line's [`LINE_SWEEP_GAIN`] — the word flares as the shimmer
+/// passes. On light the hero is the rest of the line's own letters: the
+/// paper law's ink at its place ([`LineInks`], 4.5:1 or more against the
+/// pane's ground), deepened toward black by [`LINE_SWEEP_GAIN_LIGHT`], so
+/// this gain is the dark ground's alone.
+const LINE_HERO_SWEEP_GAIN: f32 = GLINT_CREST_DARK;
 /// The light line's palette positions, `0..=1` in this many even steps: a
 /// letter wears the ink of the nearest one ([`LineInks`]). Neighbouring
 /// steps differ by at most 0.017 in OKLab (Cruise on Aterm Day and Gruvbox
@@ -1136,6 +1316,7 @@ struct LineInks {
 }
 
 impl Default for LineInks {
+    #[inline]
     fn default() -> Self {
         Self {
             key: None,
@@ -1146,6 +1327,7 @@ impl Default for LineInks {
 
 impl LineInks {
     /// Solve every step for `palette` on `ground`, unless they are kept.
+    #[inline]
     fn solve(&mut self, palette: CardPalette, ground: u32) {
         if self.key == Some((palette, ground)) {
             return;
@@ -1204,6 +1386,10 @@ const _: () = {
         "the trail's step wave cycles under the photosensitivity bound"
     );
     assert!(
+        LINE_HERO_SWEEP_GAIN > LINE_SWEEP_GAIN && LINE_HERO_DARK_LUMA_FLOOR > LINE_DARK_LUMA_FLOOR,
+        "the hero word flares harder and stands brighter than the line"
+    );
+    assert!(
         1000.0 / SHIMMER_MS <= TWINKLE_FLASH_BOUND_HZ,
         "a glint flares under the photosensitivity bound"
     );
@@ -1211,6 +1397,17 @@ const _: () = {
 
 /// The sunset ramp for [`CardPalette::Land`]: red → orange → gold → rose.
 const SUNSET: [u32; 4] = [0x00FF_3B30, 0x00FF_8A1F, 0x00FF_C83D, 0x00FF_6F91];
+
+/// The moonbow ramp for [`CardPalette::Off`], as light on a dark ground: white
+/// → pearl → silver → steel — a rainbow by moonlight, which the eye sees
+/// white. Cool (OKLCh hue about 259°, chroma at most 0.027) and falling in
+/// OKLab L 1.00 / 0.94 / 0.84 / 0.74, each stop at least 0.066 from the next
+/// (ΔE). The silver and steel half is what lets the white head and the
+/// trail's shimmer, both mixes toward white, read on it, as Claude's mascot
+/// mixes its body toward a white crest; every stop is at least 0.41 WCAG
+/// relative luminance, so the line's lift ([`LINE_DARK_LUMA_FLOOR`]) never
+/// moves it.
+const MOONBOW: [u32; 4] = [0x00FF_FFFF, 0x00E4_EAF3, 0x00C3_CCDA, 0x00A2_ADBE];
 
 const WHITE: u32 = 0x00FF_FFFF;
 
@@ -1222,6 +1419,10 @@ pub enum CardPalette {
     Cruise,
     /// Land: a sunset, red → orange → gold → rose.
     Land,
+    /// Off: the moonbow — a rainbow by moonlight, which the eye sees white:
+    /// white → pearl → silver → steel on dark ([`MOONBOW`]), pearl → graphite
+    /// in print ([`PRINT_OFF`]).
+    Off,
 }
 
 impl CardPalette {
@@ -1231,19 +1432,85 @@ impl CardPalette {
         match self {
             Self::Cruise => spectrum(t),
             Self::Land => sunset(t),
+            Self::Off => moonbow(t),
         }
     }
 
     /// The card art's colour at position `t` on a dark or a light ground:
     /// [`at`](Self::at) on dark, its print twin on light
     /// ([`PRINT_CRUISE_RAMP`], so a hue sits where it does on dark;
-    /// [`PRINT_LAND`] evenly, each stripe its own ink).
+    /// [`PRINT_LAND`] and [`PRINT_OFF`] evenly, each stripe its own ink).
     #[inline]
     fn art_at(self, t: f32, dark: bool) -> u32 {
         match (self, dark) {
             (_, true) => self.at(t),
             (Self::Cruise, false) => knot_ramp(&PRINT_CRUISE_RAMP, t),
             (Self::Land, false) => even_ramp(&PRINT_LAND, t),
+            (Self::Off, false) => even_ramp(&PRINT_OFF, t),
+        }
+    }
+
+    /// The card art's colour at position `t` (`0..=1`; clamps, and a NaN
+    /// reads as `0`) on a dark or a light ground — the border's, the rim's —
+    /// for a host's own mark in the card's colours (the composer's rule):
+    /// light on dark, opaque print ink on light. Not for letters: on a light
+    /// ground the print's gold and pearl are too pale to read as text
+    /// ([`Self::letter`] is).
+    #[must_use]
+    #[inline]
+    pub fn art(self, t: f32, dark: bool) -> u32 {
+        self.art_at(t, dark)
+    }
+
+    /// The palette's legible letter ink at position `t` (`0..=1`; clamps)
+    /// by polarity alone: on dark, the colour lifted toward white to at
+    /// least [`LINE_DARK_LUMA_FLOOR`] (about 5:1 on a near-black ground, so
+    /// blue and violet letters read) — the card's line at rest; on light,
+    /// the shared light-ink law for marks over text (`InkRole::OverText`),
+    /// for a host that tints toward its own ink (the agents panel's names).
+    /// That is not the card's line on light: its letters, the hero's too,
+    /// take the paper law's ink against the pane's ground ([`LineInks`],
+    /// [`Self::text_at`]), as letters that must read on the pane's own
+    /// ground do through [`Self::letter_on`].
+    #[must_use]
+    #[inline]
+    pub fn letter(self, t: f32, dark: bool) -> u32 {
+        let base = self.at(t);
+        if dark {
+            lift_to_luminance(base, LINE_DARK_LUMA_FLOOR)
+        } else {
+            InkRole::OverText.ink(base)
+        }
+    }
+
+    /// The card's line letter at position `t` (`0..=1`; clamps) at rest on
+    /// the pane's `ground` (`0x00RRGGBB`, dark or light by [`dark_ground`]),
+    /// for a host's own letters in the card's colours (the composer rule's
+    /// harness switch): on dark [`Self::letter`]'s lift; on light the line's
+    /// paper-law ink ([`Self::text_at`]), 4.5:1 or more against `ground`.
+    #[must_use]
+    #[inline]
+    pub fn letter_on(self, t: f32, ground: u32) -> u32 {
+        let ground = ground & 0x00FF_FFFF;
+        if dark_ground(ground) {
+            self.letter(t, true)
+        } else {
+            self.text_at(t, ground)
+        }
+    }
+
+    /// Where trail stripe `k` (`0` top … `5` bottom, wrapping) sits on the
+    /// palette, as a position for [`Self::art`] and [`Self::letter`]: Cruise's
+    /// stripe at its spectrum stop (so `art` there is the stripe's own colour,
+    /// on dark and in print), Land's and Off's evenly. The agents panel's
+    /// rows take their hues from it, top down (`crate::harness_panel`).
+    #[must_use]
+    #[inline]
+    pub fn stripe_t(self, k: usize) -> f32 {
+        let k = k % TRAIL_STOPS.len();
+        match self {
+            Self::Cruise => stripe_at(k) as f32 / (SPECTRUM_LUT_LEN - 1) as f32,
+            Self::Land | Self::Off => k as f32 / (TRAIL_STOPS.len() - 1) as f32,
         }
     }
 
@@ -1251,11 +1518,14 @@ impl CardPalette {
     #[inline]
     fn stripe(self, k: usize, dark: bool) -> u32 {
         let k = k % TRAIL_STOPS.len();
+        let even = k as f32 / (TRAIL_STOPS.len() - 1) as f32;
         match (self, dark) {
             (Self::Cruise, true) => spectrum_stop(TRAIL_STOPS[k]),
-            (Self::Land, true) => sunset(k as f32 / (TRAIL_STOPS.len() - 1) as f32),
+            (Self::Land, true) => sunset(even),
+            (Self::Off, true) => moonbow(even),
             (Self::Cruise, false) => PRINT_CRUISE[k],
             (Self::Land, false) => PRINT_LAND[k],
+            (Self::Off, false) => PRINT_OFF[k],
         }
     }
 
@@ -1266,6 +1536,7 @@ impl CardPalette {
         match self {
             Self::Cruise => spectrum_stop(k % 7),
             Self::Land => SUNSET[k % SUNSET.len()],
+            Self::Off => MOONBOW[k % MOONBOW.len()],
         }
     }
 
@@ -1280,16 +1551,57 @@ impl CardPalette {
     /// The line's letter at position `t` (`0..=1`; clamps) on the light
     /// `ground`: the print ramp's ink there as the paper law's point-mark
     /// ink ([`paper_mark_ink`]), text at 4.5:1 or more against `ground`.
+    /// Off's print is a silver, not a hue, and the vivid law would saturate
+    /// it to a blue: its letter is the same bar reached the same way —
+    /// darkened along its own tint only as far as the bar needs
+    /// ([`paper_silver_ink`]) — so the white theme reads as graphite and
+    /// steel on paper.
     #[inline]
     fn text_at(self, t: f32, ground: u32) -> u32 {
-        paper_mark_ink(self.art_at(t, false), ground)
+        match self {
+            Self::Off => paper_silver_ink(self.art_at(t, false), ground),
+            Self::Cruise | Self::Land => paper_mark_ink(self.art_at(t, false), ground),
+        }
     }
+}
+
+/// A silver's letter ink on the light `ground`: `rgb` darkened toward black
+/// (its tint kept) by the least step of a 24-step bisection that reaches
+/// WCAG [`PAPER_MARK_CONTRAST`] against `ground`, as the paper law's vivid
+/// inks are; a colour already there is unchanged.
+#[inline]
+fn paper_silver_ink(rgb: u32, ground: u32) -> u32 {
+    let y_bg = relative_luminance(ground & 0x00FF_FFFF);
+    let holds = |k: f32| {
+        let y = relative_luminance(mix_rgb(rgb, 0, 1.0 - k));
+        (y.max(y_bg) + 0.05) / (y.min(y_bg) + 0.05) >= PAPER_MARK_CONTRAST
+    };
+    if holds(1.0) {
+        return rgb;
+    }
+    // On a light page darker is further from the page: black holds.
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..24 {
+        let mid = 0.5 * (lo + hi);
+        if holds(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    mix_rgb(rgb, 0, 1.0 - lo)
 }
 
 /// The sunset ramp at `t` (`0..=1`; clamps, and a NaN reads as `0`).
 #[inline]
 fn sunset(t: f32) -> u32 {
     even_ramp(&SUNSET, t)
+}
+
+/// The moonbow ramp at `t` (`0..=1`; clamps, and a NaN reads as `0`).
+#[inline]
+fn moonbow(t: f32) -> u32 {
+    even_ramp(&MOONBOW, t)
 }
 
 /// The ramp through evenly spaced `stops` at `t` (`0..=1`; clamps, and a NaN
@@ -1328,7 +1640,7 @@ fn knot_ramp(knots: &[(usize, u32)], t: f32) -> u32 {
 /// saturation kept) until its Rec. 709 luma is at most
 /// [`LIGHT_LINE_MAX_LUMA`]; a colour under the bar is unchanged.
 #[inline]
-fn print_line(rgb: u32) -> u32 {
+pub(crate) fn print_line(rgb: u32) -> u32 {
     let ch = |sh: u32| ((rgb >> sh) & 0xff) as f32;
     let y = 0.2126 * ch(16) + 0.7152 * ch(8) + 0.0722 * ch(0);
     if y <= LIGHT_LINE_MAX_LUMA {
@@ -1383,7 +1695,10 @@ pub struct CardScene {
     /// (`origin_x + (cols + 1)·cw`), so the box spans `cols + 1` columns: a
     /// host that passes the pane's width in columns puts the right border
     /// one column past the pane, where [`clip`](Self::clip) cuts it away.
-    /// Pass at most the pane's last column index.
+    /// Pass at most the pane's width: its last column index for a box whose
+    /// right side shows, the width itself for one whose text fills the
+    /// pane's last column (the box open at the pane's edge, no stroke over
+    /// that column's glyph).
     pub cols: u16,
     /// The pixels the card may touch, `(x0, y0, x1, y1)` half-open in the
     /// stream's pixel space: the pane's rect, so a box larger than the pane
@@ -1426,6 +1741,13 @@ pub struct CardScene {
     pub coat: u32,
     /// The kitty's eyes, `0x00RRGGBB`.
     pub eye: u32,
+    /// Where Claude's ripple starts, `(grid column, grid row)`: its mascot's
+    /// wand (the `✦` the workspace card holds, the mascot's last column on
+    /// the banner row) or the mascot's right edge — the flow's glints run
+    /// outward from there across the border, the trail and the stars, as
+    /// Claude's own run across its mascot ([`crate::ripple`]). `None`: the
+    /// box's inner top-left corner.
+    pub wand: Option<(u16, u16)>,
 }
 
 /// The border's stroke at cell height `ch`: a fourteenth of the cell, at
@@ -1482,14 +1804,52 @@ pub struct HarnessCard {
     /// and after an arm, so an armed card asks for the frame that will draw
     /// its episode.
     still: bool,
-    /// The last tick drew an EPISODE frame (`Clock::t_ms` was `Some`): the
-    /// settled frame is still to be drawn once the episode runs out, and
-    /// [`Self::deadline`] asks for it — for [`SETTLE_GRACE_MS`] past the
-    /// episode's end at most.
-    drew_episode: bool,
+    /// What the last tick drew ([`Drew`]): an INTRO frame leaves the flow's
+    /// first frame (or, for a card that does not flow, the settled frame)
+    /// to be drawn once the intro runs out, which [`Self::deadline`] asks
+    /// for; a FLOW frame, the next step.
+    drew: Drew,
     /// Where the kitty's ride stands ([`Ride`]): once, on the card's first
     /// showing.
     ride: Ride,
+    /// THE FLOW: once armed, the card flows on after its intro for as long
+    /// as it may animate ([`Self::flowing`]).
+    flows: bool,
+    /// The ripple's clock ([`crate::ripple`]): a ring is born at the wand at
+    /// `glint0 + k·GLINT_PERIOD_MS`, and the flow's steps fall at `glint0 +
+    /// k·FLOW_STEP_MS`. Set by the card's first arm, kept by every later one
+    /// (the grid is the card's for life) and moved only by a lock onto
+    /// Claude's own ripple ([`Self::lock_glint`]).
+    glint0: Option<Instant>,
+    /// Where the flow's hue started from: the intro's start where the flow
+    /// takes the intro over, so the hue runs on without a jump; the instant
+    /// it resumed from the settled frame, so it starts from the settled
+    /// colours.
+    hue0: Option<Instant>,
+    /// When the flow's glints started to come up ([`GLINT_FADE_MS`]): set
+    /// where the flow starts from the settled frame; `None` where they are
+    /// up.
+    fade0: Option<Instant>,
+    /// The last frame a tick put on the glass: when, and its flow step and
+    /// the grid it was drawn on (`None`: not a flow frame).
+    /// [`Self::deadline`]'s next step follows it, and its backstop
+    /// ([`SETTLE_GRACE_MS`]) runs from it.
+    drawn: Option<(Instant, Option<(u64, u32)>)>,
+    /// Bumped by every lock that moves [`Self::glint0`]: a kept flow frame
+    /// is a step of one grid ([`KeptFrame`]), and a moved grid draws anew.
+    grid_gen: u32,
+}
+
+/// What a tick last put on the glass ([`HarnessCard::drew`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Drew {
+    /// The settled frame (or nothing: no tick yet, or nothing to draw).
+    #[default]
+    Settled,
+    /// An intro frame.
+    Intro,
+    /// A flow frame.
+    Flow,
 }
 
 /// Where the kitty's ride stands (§10.6.5). It rides in ONCE, on the episode
@@ -1536,37 +1896,81 @@ enum Episode {
     Playing(Instant),
 }
 
-/// Where in an episode a frame falls: `Some(ms)` while it runs, `None` for
-/// the settled frame; and how far into the kitty's ride ([`Ride`]), `None`
-/// where this episode does not ride (or settled).
+/// Where in the card's life a frame falls: `t_ms` into its intro (`None`
+/// past it: the flow, or the settled frame), how far into the kitty's ride
+/// ([`Ride`]; `None` where this intro does not ride, and past it), where on
+/// the ripple's clock ([`crate::ripple`]) and in the flow ([`Flow`]).
 #[derive(Clone, Copy, Debug)]
 struct Clock {
     t_ms: Option<u64>,
     ride_ms: Option<u64>,
+    /// The ripple at this frame: ms on its clock (since the card's
+    /// `glint0`, on the step grid: Claude's mascot steps every
+    /// [`FLOW_STEP_MS`]) and how far up its glints are, `0..=1` (the
+    /// intro's rise over its last eighth, times the fade after a resume or a
+    /// re-phase, [`GLINT_FADE_MS`]). `None`: no glints (the settled frame).
+    glint: Option<(u64, f32)>,
+    /// The flow: `None` outside it.
+    flow: Option<Flow>,
+}
+
+/// A flow frame's place: its step on the ripple's grid (whole
+/// [`FLOW_STEP_MS`] since the card's `glint0`) and how far its hue has
+/// travelled since the flow's anchor (ms, at the step's start).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Flow {
+    step: u64,
+    hue_ms: u64,
 }
 
 impl Clock {
     const SETTLED: Self = Self {
         t_ms: None,
         ride_ms: None,
+        glint: None,
+        flow: None,
     };
+
+    /// `t` ms into an intro on a ripple whose clock started with it: the
+    /// glints rise over the intro's last eighth.
+    #[inline]
+    fn intro(t: u64, ride_ms: Option<u64>) -> Self {
+        let mut clock = Self {
+            t_ms: Some(t),
+            ride_ms,
+            glint: None,
+            flow: None,
+        };
+        clock.glint = Some((on_grid(t), clock.intro_rise()));
+        clock
+    }
 
     /// `t` ms into a card's first episode, which rides from its start.
     #[cfg(test)]
-    const fn riding(t: u64) -> Self {
-        Self {
-            t_ms: Some(t),
-            ride_ms: Some(t),
-        }
+    fn riding(t: u64) -> Self {
+        Self::intro(t, Some(t))
     }
 
     /// `t` ms into an episode that does not ride: the kitty seated
     /// throughout, the burst at the start.
     #[cfg(test)]
-    const fn seated(t: u64) -> Self {
+    fn seated(t: u64) -> Self {
+        Self::intro(t, None)
+    }
+
+    /// The flow `ms` after its ripple's clock started, its hue anchored
+    /// there and its glints up.
+    #[cfg(test)]
+    fn flowing(ms: u64) -> Self {
+        let step = ms / FLOW_STEP_MS;
         Self {
-            t_ms: Some(t),
+            t_ms: None,
             ride_ms: None,
+            glint: Some((step * FLOW_STEP_MS, 1.0)),
+            flow: Some(Flow {
+                step,
+                hue_ms: step * FLOW_STEP_MS,
+            }),
         }
     }
 
@@ -1577,12 +1981,47 @@ impl Clock {
             .map_or(1.0, |t| (t as f32 / EPISODE_MS as f32).min(1.0))
     }
 
-    /// The border's (and line's) drift phase offset: `−drift·(1 − u)²`, which
-    /// starts at one trip per [`TRIP_MS`] and eases to zero at the end.
+    /// The intro's glints: up from `u = GLINT_INTRO_FROM` to its end, the
+    /// head's mirror (it fades as they rise), so the flow takes them over
+    /// already up.
     #[inline]
-    fn drift(self, drift: f32) -> f32 {
+    fn intro_rise(self) -> f32 {
+        smooth((self.u() - GLINT_INTRO_FROM) / (1.0 - GLINT_INTRO_FROM))
+    }
+
+    /// The border's (and the rim's) phase `φ`. In the intro, `PHI_INTRO·(1 −
+    /// u)² − t / FLOW_TRIP`: one trip through the palette per [`TRIP_MS`] at
+    /// its start, easing onto the flow's one per [`FLOW_TRIP_MS`]; in the
+    /// flow, `−hue / FLOW_TRIP`, run on from where the intro left it (or from
+    /// the settled phase where the flow resumed from the settled frame);
+    /// settled, [`PHI_SETTLED`]. `φ` falls, so a colour travels clockwise:
+    /// rightward along the top edge, away from the mascot, as Claude's
+    /// ripple runs. `tri`'s period is 2, so only `φ mod 2` is seen — taken
+    /// in whole ms, so a flow hours long keeps its precision.
+    #[inline]
+    fn phi(self) -> f32 {
+        let trip = FLOW_TRIP_MS as f32;
+        match (self.t_ms, self.flow) {
+            (Some(t), _) => {
+                let v = 1.0 - self.u();
+                PHI_SETTLED + PHI_INTRO * v * v - t as f32 / trip
+            }
+            (None, Some(f)) => PHI_SETTLED - (f.hue_ms % (2 * FLOW_TRIP_MS)) as f32 / trip,
+            (None, None) => PHI_SETTLED,
+        }
+    }
+
+    /// The line's drift phase offset over the intro, `drift·(1 − u)²`: one
+    /// trip of the line's gradient at the start, easing to a stop — the same
+    /// way round as the border's; `0` past the intro (the line's hue holds:
+    /// it takes the flow's glints, not its hue).
+    #[inline]
+    fn line_drift(self, drift: f32) -> f32 {
+        if self.t_ms.is_none() {
+            return 0.0;
+        }
         let v = 1.0 - self.u();
-        -drift * v * v
+        drift * v * v
     }
 
     /// The head's strength: ramps in over the first 4 % and out over the last
@@ -1602,6 +2041,24 @@ impl Clock {
 fn smooth(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
+}
+
+/// `ms` floored onto the ripple's step grid ([`FLOW_STEP_MS`]).
+#[inline]
+const fn on_grid(ms: u64) -> u64 {
+    ms / FLOW_STEP_MS * FLOW_STEP_MS
+}
+
+/// Whole ms from `from` to `to` (`0` where `to` is not later).
+#[inline]
+fn ms_between(from: Instant, to: Instant) -> u64 {
+    u64::try_from(to.saturating_duration_since(from).as_millis()).unwrap_or(u64::MAX)
+}
+
+/// `at` plus `ms`, saturating at `at` where the instant does not exist.
+#[inline]
+fn later(at: Instant, ms: u64) -> Instant {
+    at.checked_add(Duration::from_millis(ms)).unwrap_or(at)
 }
 
 /// A pixel rectangle `[x0, x1) × [y0, y1)`.
@@ -1672,6 +2129,9 @@ struct Geo {
     /// The outer rectangle clipped to the scene's [`clip`](CardScene::clip)
     /// and to the `u16` pixel space: no quad leaves it.
     clip: Rect,
+    /// The ripple's origin in pixels ([`CardScene::wand`]): the wand cell's
+    /// centre, or the inner box's top-left corner.
+    wand: (f32, f32),
 }
 
 impl Geo {
@@ -1715,6 +2175,14 @@ impl Geo {
         if clip.is_empty() {
             return None;
         }
+        let t = i64::from(stroke_px(s.ch));
+        let wand = match s.wand {
+            Some((c, r)) => (
+                (ox + i64::from(c) * cw) as f32 + 0.5 * cw as f32,
+                (oy + i64::from(r) * ch) as f32 + 0.5 * ch as f32,
+            ),
+            None => ((core.x0 + t) as f32, (core.y0 + t) as f32),
+        };
         Some(Self {
             cw,
             ch,
@@ -1726,8 +2194,9 @@ impl Geo {
             row_base: i64::from(s.row_base),
             core,
             outer,
-            t: i64::from(stroke_px(s.ch)),
+            t,
             clip,
+            wand,
         })
     }
 
@@ -1891,11 +2360,22 @@ impl KittyInk {
 
 /// Which frame of its art the kitty shows `t_ms` into an episode (the open
 /// frame when settled): a blink every [`BLINK_PERIOD_MS`], a tail flick
-/// between them. [`KittyArt::frame`] reads it.
+/// between them. In the flow, a blink once every [`FLOW_BLINK_PERIOD_MS`]
+/// (two ripple cycles, half a cycle off the rings' births) for
+/// [`FLOW_BLINK_MS`], and no flick: the cat at ease. [`KittyArt::frame`]
+/// reads it.
 #[inline]
 fn kitty_frame(clock: Clock) -> KittyPose {
     let Some(t) = clock.t_ms else {
-        return KittyPose::Open;
+        return match clock.flow {
+            Some(f)
+                if (f.step * FLOW_STEP_MS + GLINT_PERIOD_MS / 2) % FLOW_BLINK_PERIOD_MS
+                    < FLOW_BLINK_MS =>
+            {
+                KittyPose::Blink
+            }
+            _ => KittyPose::Open,
+        };
     };
     let in_window = |at: u64, period: u64, len: u64| t >= at && (t - at) % period < len;
     if in_window(BLINK_AT_MS, BLINK_PERIOD_MS, BLINK_MS) {
@@ -2259,7 +2739,7 @@ fn glint_arms(g: &Geo, dark: bool, h: i64, amp: i64) -> (i64, i64) {
     (arm(STAR_ARM_STD), arm(STAR_ARM_HERO))
 }
 
-/// The glints' spots for this seed and geometry (§10.6.11): one per
+/// The glints' spots for this seed and geometry (§10.6.16): one per
 /// [`GLINT_CELLS`] of the trail's free stretch, at most [`GLINTS_MAX`], each
 /// in its own slice of it, ON a stripe — the four inner ones by turns from
 /// a seeded start, so neighbours sit on different stripes — and, at its
@@ -2428,6 +2908,29 @@ fn field_spots(
     (spots, n)
 }
 
+/// Where a line of the card's ink lies ([`HarnessCard::line_ink_into`]): one
+/// grid row's cells `col..col + len`, the hero word among them, and the
+/// ripple's origin in the same grid.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LineAt {
+    /// The line's row.
+    pub row: u16,
+    /// Its first column.
+    pub col: u16,
+    /// Its length in cells.
+    pub len: u16,
+    /// THE HERO WORD's cells (owner, 2026-10-19: "emphasize aterm in the
+    /// banner"), offsets into the line (`0..0`: none): they wear their own
+    /// whole run of the palette ([`LINE_HERO_SPREAD`]) and, on dark, are
+    /// lifted a step above the line ([`LINE_HERO_DARK_LUMA_FLOOR`]) and flare
+    /// harder as a sweep or a glint passes ([`LINE_HERO_SWEEP_GAIN`]). The
+    /// host sets them bold.
+    pub hero: Range<u16>,
+    /// Where Claude's ripple starts, `(column, row)` in the line's grid
+    /// ([`CardScene::wand`]); `None`: the line's first cell.
+    pub wand: Option<(u16, u16)>,
+}
+
 impl HarnessCard {
     /// Start an episode at `now` (the card first found for a process, the
     /// Autopilot changed, the window regained focus). `seed` places and phases
@@ -2437,12 +2940,18 @@ impl HarnessCard {
     /// Arming forgets the last tick's motion verdict, so [`Self::deadline`]
     /// asks for the frame whose tick learns the new one: a card armed under
     /// reduced motion costs that one frame, and one armed as motion came back
-    /// (focus regained) is never left waiting on an unrelated wake.
+    /// (focus regained) is never left waiting on an unrelated wake. The first
+    /// arm starts the ripple's clock, which every later one keeps; an armed
+    /// card flows on past its intro ([`Self::flowing`]).
     #[inline]
     pub fn arm(&mut self, now: Instant, seed: u64) {
         self.episode = Episode::Armed(now);
         self.seed = seed;
         self.still = false;
+        self.flows = true;
+        self.glint0.get_or_insert(now);
+        // The frames drawn before the arm are not this episode's to finish.
+        self.drawn = None;
         // A ride run out stays out: the new episode bursts at its start.
         if let Ride::Since(from) = self.ride
             && now.saturating_duration_since(from) >= Duration::from_millis(RIDE_MS)
@@ -2453,62 +2962,219 @@ impl HarnessCard {
 
     /// Whether [`Self::deadline`] is `None` at EVERY instant — known without
     /// a clock: the last tick held the card still (`animate == false`, a
-    /// serious scene, nothing to draw), or no episode's clock is armed or
-    /// playing (none armed, one owed, one played out and let go). A host
-    /// asks this first and reads its clock only for a card that is not at
-    /// rest, so a settled card costs its host's repaint key and wake judge
-    /// no clock read.
+    /// serious scene, nothing to draw), or it was never armed and no intro's
+    /// clock is armed or playing. A host asks this first and reads its clock
+    /// only for a card that is not at rest, so a held card costs its host's
+    /// repaint key and wake judge no clock read.
     #[must_use]
     #[inline]
     pub fn at_rest(&self) -> bool {
-        self.still || !matches!(self.episode, Episode::Armed(_) | Episode::Playing(_))
+        self.still || (!self.intro_live() && !self.flows)
     }
 
-    /// Whether the card holds STILL at its settled frame: no episode's clock
-    /// is armed or playing (none armed, one owed, one played out). Its
-    /// [`Self::line_ink`] is then the settled gradient at every instant.
+    /// Whether the card holds STILL at its settled frame: no intro's clock
+    /// is armed or playing, and it does not flow (never armed, or held by
+    /// its last tick). Its [`Self::line_ink`] is then the settled gradient
+    /// at every instant.
     #[must_use]
     #[inline]
     pub fn is_still(&self) -> bool {
-        !matches!(self.episode, Episode::Armed(_) | Episode::Playing(_))
+        !self.intro_live() && !(self.flows && !self.still)
+    }
+
+    /// Whether an intro is armed or playing: the card's six seconds of show
+    /// ([`EPISODE_MS`]), not yet let go. `false` once a tick has let a
+    /// played-out intro go, while one is owed, and in the flow.
+    #[must_use]
+    #[inline]
+    pub fn intro_live(&self) -> bool {
+        matches!(self.episode, Episode::Armed(_) | Episode::Playing(_))
+    }
+
+    /// Whether the card FLOWS at `now`: armed once, its intro over (or
+    /// none owed), and its last tick allowed to animate — the next tick that
+    /// may animate draws a flow frame. Its frames step on the ripple's grid
+    /// ([`Self::flow_step`]), and [`Self::deadline`] asks for each step.
+    #[must_use]
+    #[inline]
+    pub fn flowing(&self, now: Instant) -> bool {
+        self.flows
+            && !self.still
+            && self.glint0.is_some()
+            && !matches!(self.episode, Episode::Owed(_))
+            && self.running(now).is_none()
+    }
+
+    /// The step of the ripple's grid `now` falls in: whole [`FLOW_STEP_MS`]
+    /// since its clock started (`None` before the first arm). Two instants
+    /// in one step draw the same flow frame.
+    #[must_use]
+    #[inline]
+    pub fn flow_step(&self, now: Instant) -> Option<u64> {
+        self.glint0.map(|g0| ms_between(g0, now) / FLOW_STEP_MS)
+    }
+
+    /// The ripple's clock's zero: the instant its glints' cycles and the
+    /// flow's steps count from ([`Self::flow_step`]); `None` before the
+    /// first arm or lock. Another ripple on the same glass that counts from
+    /// it — the agents panel's crest, a second card — runs in phase with
+    /// this one, its frames on this one's steps.
+    #[must_use]
+    #[inline]
+    pub fn ripple_origin(&self) -> Option<Instant> {
+        self.glint0
+    }
+
+    /// Start the ripple's clock at `origin` for a card whose clock has not
+    /// started (never armed nor locked): a card armed on a glass where
+    /// another already flows takes that one's steps, so the window draws
+    /// one frame a step for both. A started clock keeps its own — a no-op —
+    /// and a later lock moves an adopted one as it would any.
+    #[inline]
+    pub fn adopt_ripple(&mut self, origin: Instant) {
+        if self.glint0.is_none() {
+            self.glint0 = Some(origin);
+            self.grid_gen = self.grid_gen.wrapping_add(1);
+        }
+    }
+
+    /// PHASE-LOCK the ripple to Claude's own AS SEEN: its wand's flare
+    /// (frame 0 of its cycle, where its ring is born) on the frame composed
+    /// at `seen`. The card's ring birth — a step's start — is put
+    /// [`FLARE_STEP_LEAD_MS`] before it, so Claude's repaints land inside
+    /// the flow's slack, and the error `e` is that instant's distance from
+    /// the nearest ring birth on the card's clock, folded into a half cycle
+    /// either way. Where no glint of the
+    /// card shows (its intro before the glints rise, a settled or held card)
+    /// the grid takes `e` whole, unseen; where they show, it SLEWS by a
+    /// quarter of `e` ([`LOCK_GAIN`]: Claude's repaint jitter averaged out,
+    /// never chased) and at most one step ([`LOCK_SLEW_MS`]) a flare — never
+    /// a jump of more than one step, and no fade; an error under four ms
+    /// moves nothing. A grid moved bumps [`Self::grid_gen`], so a kept flow frame
+    /// of the old one is drawn anew ([`Self::replay_step`]). A card never
+    /// armed takes the flare's start as its clock's for its first arm. With
+    /// no flare — the inline renderer, the plain mascot, a blurred Claude,
+    /// the key turned off — no lock comes, and the grid free-runs where the
+    /// last one left it.
+    #[inline]
+    pub fn lock_glint(&mut self, seen: Instant) {
+        if self.glint0.is_none() {
+            let at = seen
+                .checked_sub(Duration::from_millis(FLARE_STEP_LEAD_MS))
+                .unwrap_or(seen);
+            self.glint0 = Some(at);
+            self.grid_gen = self.grid_gen.wrapping_add(1);
+            return;
+        }
+        self.slew(seen, GLINT_PERIOD_MS);
+    }
+
+    /// PHASE-LOCK the flow's STEPS to Claude's repaints AS SEEN: the frame
+    /// composed at `seen` showed Claude's mascot repainted (its shimmer, a
+    /// frame of its ripple). A step's start is put [`FLARE_STEP_LEAD_MS`]
+    /// before it by [`Self::lock_glint`]'s rules — the error folded into
+    /// half a step either way, taken whole where no glint shows, else a
+    /// quarter of it ([`LOCK_GAIN`]) — so the repaints, which come about
+    /// once a step, keep landing inside the flow's slack however Claude's
+    /// repaint period sits off the step (127.7 ms on a real window: 7 ms a
+    /// cycle, which a lock once a flare follows a quarter at a time, 28 ms
+    /// behind). The ring's birth stays on the step [`Self::lock_glint`]
+    /// chose. A card never armed has no grid, and nothing moves.
+    #[inline]
+    pub fn lock_step(&mut self, seen: Instant) {
+        if self.glint0.is_some() {
+            self.slew(seen, FLOW_STEP_MS);
+        }
+    }
+
+    /// The locks' one rule: the grid's error against `seen` less
+    /// [`FLARE_STEP_LEAD_MS`], folded into half of `period` either way,
+    /// taken whole where no glint shows, else slewed a quarter of it and at
+    /// most a step.
+    #[inline]
+    fn slew(&mut self, seen: Instant, period: u64) {
+        let Some(g0) = self.glint0 else {
+            return;
+        };
+        let at = seen
+            .checked_sub(Duration::from_millis(FLARE_STEP_LEAD_MS))
+            .unwrap_or(seen);
+        let period = i64::try_from(period).unwrap_or(i64::MAX);
+        let ahead = i64::try_from(ms_between(g0, at)).unwrap_or(i64::MAX);
+        let behind = i64::try_from(ms_between(at, g0)).unwrap_or(i64::MAX);
+        let mut e = (ahead - behind).rem_euclid(period);
+        if e > period / 2 {
+            e -= period;
+        }
+        let shift = if self.glints_shown(seen) {
+            (e / LOCK_GAIN).clamp(-LOCK_SLEW_MS, LOCK_SLEW_MS)
+        } else {
+            e
+        };
+        if shift == 0 {
+            return;
+        }
+        let by = Duration::from_millis(shift.unsigned_abs());
+        self.glint0 = Some(if shift > 0 {
+            g0.checked_add(by).unwrap_or(g0)
+        } else {
+            g0.checked_sub(by).unwrap_or(g0)
+        });
+        self.grid_gen = self.grid_gen.wrapping_add(1);
+    }
+
+    /// Whether any glint of the card shows on the glass at `now`, as its
+    /// last tick left it: an intro past the glints' rise
+    /// ([`GLINT_INTRO_FROM`]), or the flow; never a settled or held card.
+    #[inline]
+    fn glints_shown(&self, now: Instant) -> bool {
+        !self.still
+            && match self.running(now) {
+                Some(ms) => Clock::intro(ms, None).intro_rise() > 0.0,
+                None => self.flowing(now),
+            }
     }
 
     /// Whether a frame with motion verdict `animate` on a scene that is
     /// `serious` or not, and has something to draw or not (`drawable`),
     /// draws the SETTLED frame and leaves the episode where it is, at any
-    /// instant: the card has no episode, or owes or plays one that this
-    /// frame holds back (it may not animate — the window lost focus, Reduce
-    /// Motion, the load latch — or has nothing to draw, and the scene is not
-    /// serious, which would end it). Such a frame is a function of the
-    /// scene's shape and the seed alone (`the_card_is_deterministic`), so
-    /// its host may replay the last one ([`Self::replay`]). An owed episode
-    /// whose debt lapsed meanwhile ([`OWED_MAX_MS`]) is let go by the next
-    /// frame that draws, which starts nothing either way.
+    /// instant: the card has no episode and does not flow, or owes or plays
+    /// one that this frame holds back, or flows and this frame holds it back
+    /// (it may not animate — the window lost focus, Reduce Motion, the load
+    /// latch — or has nothing to draw, and the scene is not serious, which
+    /// would end an episode). Such a frame is a function of the scene's
+    /// shape and the seed alone (`the_card_is_deterministic`), so its host
+    /// may replay the last one ([`Self::replay`]). An owed episode whose
+    /// debt lapsed meanwhile ([`OWED_MAX_MS`]) is let go by the next frame
+    /// that draws, which starts nothing either way.
     #[inline]
     fn holds(&self, serious: bool, drawable: bool, animate: bool) -> bool {
+        let may = animate && drawable;
         match self.episode {
-            Episode::Idle => true,
-            Episode::Owed(_) | Episode::Playing(_) => !serious && !(animate && drawable),
+            Episode::Idle => !(self.flows && may && !serious),
+            Episode::Owed(_) | Episode::Playing(_) => !serious && !may,
             Episode::Armed(_) => false,
         }
     }
 
-    /// The settled frame `frames` keeps, REPLAYED: where a frame on `scene`
-    /// with motion verdict `animate` would draw the very settled frame
-    /// `frames` holds — the card holds still ([`Self::holds`]) and the
-    /// scene's [`CardShape`] is the kept frame's — the card is left as that
-    /// frame would leave it and the kept contents come back at the scene's
-    /// origin: the SAME `Arc`s frame after frame, so the renderer compares
-    /// two pointers and builds nothing, and a scene that only moved (an
-    /// inline scroll under a settled card) is the same contents at a new
+    /// The settled frame `frames` keeps, REPLAYED — a HELD card's: where a
+    /// frame on `scene` with motion verdict `animate` would draw the very
+    /// settled frame `frames` holds — the card holds still ([`Self::holds`])
+    /// and the scene's [`CardShape`] is the kept frame's — the card is left
+    /// as that frame would leave it and the kept contents come back at the
+    /// scene's origin: the SAME `Arc`s frame after frame, so the renderer
+    /// compares two pointers and builds nothing, and a scene that only moved
+    /// (an inline scroll under a held card) is the same contents at a new
     /// offset. `None`, the card untouched, where a frame must be drawn
-    /// ([`Self::draw`]). No clock is read.
+    /// ([`Self::replay_step`], [`Self::draw`]). No clock is read. A kept
+    /// FLOW frame is never replayed here: the first held frame after the
+    /// flow is drawn, and the later ones replay it.
     ///
     /// `frames` serves ONE card: every way into a state that replays (no
-    /// episode, or one owed) is a [`Self::draw`] — an arm leaves both — and
-    /// every draw of the settled frame keeps it, so what `frames` holds is
-    /// this card's settled frame at its current seed whenever it is
-    /// replayed. An episode frame lets it go.
+    /// episode, one owed, the flow) is a [`Self::draw`] — an arm leaves them
+    /// all — and every draw of a settled or a flow frame keeps it, so what
+    /// `frames` holds is this card's frame at its current seed whenever it
+    /// is replayed. An intro frame lets it go.
     pub fn replay(
         &mut self,
         scene: &CardScene,
@@ -2516,6 +3182,9 @@ impl HarnessCard {
         frames: &CardFrames,
     ) -> Option<CardFrame> {
         let kept = frames.kept()?;
+        if kept.step.is_some() {
+            return None;
+        }
         let (shape, origin) = CardShape::of(scene);
         if kept.shape != shape {
             return None;
@@ -2528,7 +3197,46 @@ impl HarnessCard {
         // `advance` leaving the episode where it is.
         self.palette = scene.palette;
         self.still = !(animate && drawable) || scene.serious;
-        self.drew_episode = false;
+        self.drew = Drew::Settled;
+        Some(kept.at(origin))
+    }
+
+    /// The flow's replay BETWEEN TWO STEPS: where the card flows, may
+    /// animate, and `frames` keeps the flow frame of `now`'s very step on
+    /// the ripple's current grid for this very scene's [`CardShape`], the
+    /// card is left as the frame would leave it and the kept contents come
+    /// back at the scene's origin, the same `Arc`s; `None`, the card
+    /// untouched, where a frame must be drawn ([`Self::draw`]). A
+    /// keystroke's present, or streamed output's, between two steps costs
+    /// the flowing card the clock read that found the step and two pointer
+    /// copies.
+    pub fn replay_step(
+        &mut self,
+        scene: &CardScene,
+        animate: bool,
+        frames: &CardFrames,
+        now: Instant,
+    ) -> Option<CardFrame> {
+        if !animate
+            || scene.serious
+            || !self.flows
+            || self.drew != Drew::Flow
+            || self.episode != Episode::Idle
+        {
+            return None;
+        }
+        let kept = frames.kept()?;
+        let step = self.flow_step(now)?;
+        if kept.step != Some((step, self.grid_gen)) {
+            return None;
+        }
+        let (shape, origin) = CardShape::of(scene);
+        if kept.shape != shape {
+            return None;
+        }
+        self.palette = scene.palette;
+        self.still = false;
+        self.drawn = Some((now, Some((step, self.grid_gen))));
         Some(kept.at(origin))
     }
 
@@ -2540,31 +3248,33 @@ impl HarnessCard {
         let (Episode::Armed(start) | Episode::Playing(start)) = self.episode else {
             return None;
         };
-        let ms =
-            u64::try_from(now.saturating_duration_since(start).as_millis()).unwrap_or(u64::MAX);
+        let ms = ms_between(start, now);
         (ms < EPISODE_MS).then_some(ms)
     }
 
-    /// The next wake: one [`FRAME_MS`] ahead while an episode animates;
-    /// `now` itself when the last frame drawn was an episode frame and the
-    /// episode has run out since — so the settled frame is drawn promptly
-    /// rather than on the host's next unrelated wake — but only until
-    /// [`SETTLE_GRACE_MS`] past the playing episode's end: the frame that
-    /// draws the settled frame ends the asking, and a host that stopped
-    /// drawing yet asks each loop is let idle after the grace instead of
-    /// spinning; `None` otherwise (settled, unarmed, an episode owed, after
-    /// a frame with `animate == false`, a serious scene or nothing to draw),
-    /// so a settled card idles at zero.
+    /// The next wake: one [`FRAME_MS`] ahead while an intro animates; while
+    /// the card flows, the next step's start on the ripple's grid plus
+    /// [`FLOW_SLACK_MS`] — so a present that lands at the step anyway
+    /// (the vitals band, a keystroke) draws it first — a fixed instant
+    /// however often it is asked; `now` itself when the last tick drew an
+    /// intro frame and the intro has run out since (or the grid moved under
+    /// the last flow frame), so the flow's first frame is drawn promptly
+    /// rather than on the host's next unrelated wake. Every answer but the
+    /// intro's stops [`SETTLE_GRACE_MS`] past the last frame a tick drew: a
+    /// host that stopped ticking yet asks each loop is let idle after the
+    /// grace instead of spinning. `None` otherwise (unarmed, an episode
+    /// owed, after a tick with `animate == false`, a serious scene or
+    /// nothing to draw), so a held card idles at zero.
     ///
-    /// THE HOST'S CONTRACT: ask this only of a card the host DREW THIS
-    /// FRAME ([`Self::draw`] or [`Self::replay`]). The answer describes the
-    /// card as its last frame left it, and only the host knows whether that
-    /// frame still stands on the glass: a card the host did not draw — a
-    /// frame scrolled back, the pane hidden, the card shown bare (Off, the
-    /// master switch, `card = false`) or its version not the process's —
-    /// registers no deadline, else the last episode's frames would be asked
-    /// for after the card left the screen. [`SETTLE_GRACE_MS`] is the
-    /// backstop for a host that breaks this, not the rule.
+    /// THE HOST'S CONTRACT: ask this only of a card the host TICKED THIS
+    /// FRAME. The answer describes the card as its last tick left it, and
+    /// only the host knows whether that tick still stands on the glass: a
+    /// card the host did not tick — a frame scrolled back, the pane hidden,
+    /// the card shown bare (Off, the master switch, `card = false`) or its
+    /// version not the process's — registers no deadline, else the card's
+    /// frames would be asked for after it left the screen.
+    /// [`SETTLE_GRACE_MS`] is the backstop for a host that breaks this, not
+    /// the rule.
     #[inline]
     #[must_use]
     pub fn deadline(&self, now: Instant) -> Option<Instant> {
@@ -2574,11 +3284,20 @@ impl HarnessCard {
         if self.running(now).is_some() {
             return now.checked_add(Duration::from_millis(FRAME_MS));
         }
-        let Episode::Playing(start) = self.episode else {
+        if matches!(self.episode, Episode::Owed(_)) {
             return None;
-        };
-        let ask_until = start.checked_add(Duration::from_millis(EPISODE_MS + SETTLE_GRACE_MS));
-        (self.drew_episode && ask_until.is_some_and(|end| now < end)).then_some(now)
+        }
+        let (at, step) = self.drawn?;
+        if now >= later(at, SETTLE_GRACE_MS) {
+            return None;
+        }
+        match (self.drew, step, self.glint0) {
+            (Drew::Flow, Some((k, grid)), Some(g0)) if grid == self.grid_gen => g0.checked_add(
+                Duration::from_millis((k + 1) * FLOW_STEP_MS + FLOW_SLACK_MS),
+            ),
+            (Drew::Intro | Drew::Flow, _, _) if self.flows => Some(now),
+            _ => None,
+        }
     }
 
     /// Draw this frame: the border and the trail into its `under` content
@@ -2587,20 +3306,20 @@ impl HarnessCard {
     /// ([`CardFrame`], [`card_layers`]). `animate` is the motion policy's
     /// verdict ([`crate::motion::MotionEffect::HarnessCard`]).
     ///
-    /// `false` gives the settled frame and holds the episode: one not yet
+    /// `false` gives the settled frame and holds the card: an intro not yet
     /// drawn animating is OWED ([`Episode::Owed`]) and plays from the first
     /// frame with `animate == true`, from that frame's `now` (within
-    /// [`OWED_MAX_MS`] of the arm); one already playing keeps its clock.
-    /// A scene with nothing to draw (an empty or inverted clip, no rows,
-    /// columns or cell size: a pane mid-layout) is held back the same way,
-    /// whatever `animate` says, so an episode is never spent on frames
-    /// nobody saw; its frame holds nothing. `scene.serious` gives the
-    /// settled frame and ends any episode.
+    /// [`OWED_MAX_MS`] of the arm); one already playing keeps its clock; the
+    /// flow resumes from the settled colours. A scene with nothing to draw
+    /// (an empty or inverted clip, no rows, columns or cell size: a pane
+    /// mid-layout) is held back the same way, whatever `animate` says, so an
+    /// intro is never spent on frames nobody saw; its frame holds nothing.
+    /// `scene.serious` gives the settled frame and ends any intro.
     ///
-    /// The settled frame is kept in `frames`, which [`Self::replay`] hands
-    /// back while the card holds still; an episode frame is built in
-    /// `frames`' ring, refilled in place, so an episode allocates nothing
-    /// once the ring is warm.
+    /// Every frame is built in `frames`' ring, refilled in place, so the
+    /// card allocates nothing once the ring is warm; the settled frame and a
+    /// flow step are kept there too, which [`Self::replay`] (a held card) and
+    /// [`Self::replay_step`] (a flowing one, until its next step) hand back.
     pub fn draw(
         &mut self,
         now: Instant,
@@ -2616,8 +3335,10 @@ impl HarnessCard {
             Some((geo, clock)) => frames.fill(&Emit::new(local, geo, clock, self.seed)),
             None => CardFrames::nothing(),
         };
-        frames.keep((!self.drew_episode).then(|| SettledFrame {
+        let step = clock.and_then(|c| c.flow).map(|f| (f.step, self.grid_gen));
+        frames.keep((self.drew != Drew::Intro).then(|| KeptFrame {
             shape,
+            step,
             under: Arc::clone(&under),
             over: Arc::clone(&over),
         }));
@@ -2647,13 +3368,19 @@ impl HarnessCard {
         let animate = animate && drawable;
         self.still = !animate || scene.serious;
         let clock = self.advance(now, animate, scene.serious);
-        self.drew_episode = clock.t_ms.is_some();
+        self.drew = match (clock.t_ms, clock.flow) {
+            (Some(_), _) => Drew::Intro,
+            (None, Some(_)) => Drew::Flow,
+            (None, None) => Drew::Settled,
+        };
+        self.drawn = Some((now, clock.flow.map(|f| (f.step, self.grid_gen))));
         if !drawable {
             return None;
         }
         if clock.t_ms.is_none() {
-            // The settled frame goes on the glass: the kitty is seated there,
-            // and stays seated through every episode after ([`Ride`]).
+            // The settled frame or the flow's goes on the glass: the kitty
+            // is seated there, and stays seated through every episode after
+            // ([`Ride`]).
             self.ride = Ride::Done;
         }
         Some(clock)
@@ -2664,7 +3391,7 @@ impl HarnessCard {
     /// older than [`OWED_MAX_MS`] lapses; a held-back tick owes an episode
     /// not yet drawn and keeps a playing one's clock; a tick that may
     /// animate starts an owed one from `now`, draws a running one, and lets
-    /// one that ran out go.
+    /// one that ran out go — into the flow, for a card armed once.
     fn advance(&mut self, now: Instant, animate: bool, serious: bool) -> Clock {
         if serious {
             self.episode = Episode::Idle;
@@ -2692,30 +3419,87 @@ impl HarnessCard {
                         self.ride = Ride::Since(start);
                         Some(ms)
                     }
-                    Ride::Since(from) => Some(
-                        u64::try_from(now.saturating_duration_since(from).as_millis())
-                            .unwrap_or(u64::MAX),
-                    ),
+                    Ride::Since(from) => Some(ms_between(from, now)),
                     Ride::Done => None,
                 };
-                Clock {
-                    t_ms: Some(ms),
-                    ride_ms,
-                }
+                self.on_ripple(Clock::intro(ms, ride_ms), now)
             }
-            _ => {
+            (episode, _) => {
                 self.episode = Episode::Idle;
-                Clock::SETTLED
+                if !self.flows {
+                    return Clock::SETTLED;
+                }
+                // Where the flow runs on from: the intro it takes over
+                // (the hue continues from where it left it, its glints
+                // already up), the flow it continues, or — a resume from
+                // the settled frame — the settled colours, now.
+                let intro = match episode {
+                    Episode::Armed(start) | Episode::Playing(start) => Some(start),
+                    _ => None,
+                };
+                match (self.drew, intro) {
+                    (Drew::Intro, Some(start)) => self.hue0 = Some(start),
+                    (Drew::Flow, _) if self.hue0.is_some() => {}
+                    _ => {
+                        self.hue0 = Some(now);
+                        self.fade0 = Some(now);
+                    }
+                }
+                self.glint0.get_or_insert(now);
+                self.flow_at(now)
             }
         }
     }
 
-    /// The colours of the line under the card ("enhanced by the aterm
-    /// harness …"), one [`InkCell`] per cell of `row`, columns `col..col + len`,
-    /// sorted and unique. During an episode (and `animate`) the palette drifts
-    /// and a bright band sweeps the line twice; otherwise it is the settled
-    /// gradient, the palette end to end, constant bytes. The line wears the
-    /// last tick's palette.
+    /// The intro's `clock` with its glints on the card's own ripple — the
+    /// clock its first arm started, not the intro's — at `now`'s step.
+    #[inline]
+    fn on_ripple(&self, mut clock: Clock, now: Instant) -> Clock {
+        if let Some(g0) = self.glint0 {
+            let ms = on_grid(ms_between(g0, now));
+            clock.glint = Some((ms, clock.intro_rise() * self.fade_at(later(g0, ms))));
+        }
+        clock
+    }
+
+    /// How far up the glints are at `at` after the last fade's start
+    /// ([`GLINT_FADE_MS`]); `1` with none.
+    #[inline]
+    fn fade_at(&self, at: Instant) -> f32 {
+        self.fade0.map_or(1.0, |f| {
+            smooth(ms_between(f, at) as f32 / GLINT_FADE_MS as f32)
+        })
+    }
+
+    /// The flow's clock at `now`, as the card stands: `now`'s step on the
+    /// ripple's grid, the hue and the glints' fade read at the step's start
+    /// (so a step's frame is a function of the step alone).
+    #[inline]
+    fn flow_at(&self, now: Instant) -> Clock {
+        let Some(g0) = self.glint0 else {
+            return Clock::SETTLED;
+        };
+        let step = ms_between(g0, now) / FLOW_STEP_MS;
+        let ms = step * FLOW_STEP_MS;
+        let step_at = later(g0, ms);
+        Clock {
+            t_ms: None,
+            ride_ms: None,
+            glint: Some((ms, self.fade_at(step_at))),
+            flow: Some(Flow {
+                step,
+                hue_ms: self.hue0.map_or(ms, |h| ms_between(h, step_at)),
+            }),
+        }
+    }
+
+    /// The colours of the line under the card ("enhanced by aterm harness
+    /// …"), one [`InkCell`] per cell of `row`, columns `col..col + len`,
+    /// sorted and unique. During the intro (and `animate`) the palette
+    /// drifts and a bright band sweeps the line twice; in the flow the
+    /// ripple's glints run along it from the line's first cell; otherwise
+    /// it is the settled gradient, the palette end to end, constant bytes.
+    /// The line wears the last tick's palette. No hero word ([`LineAt`]).
     ///
     /// `ground` is the pane's background, `0x00RRGGBB`: dark or light by
     /// [`dark_ground`]. Ink stays legible: on dark every letter is lifted to
@@ -2734,75 +3518,114 @@ impl HarnessCard {
         animate: bool,
     ) -> Vec<InkCell> {
         let mut out = Vec::with_capacity(usize::from(len));
-        self.line_ink_into(Some(now), row, col, len, ground, animate, &mut out);
+        let at = LineAt {
+            row,
+            col,
+            len,
+            ..LineAt::default()
+        };
+        self.line_ink_into(Some(now), &at, ground, animate, &mut out);
         out
     }
 
-    /// [`Self::line_ink`] appended to `out`: a host that keeps the line's
-    /// buffer allocates nothing for an episode's frames once it is grown.
-    /// `now` is `None` for a card the host knows is still
-    /// ([`Self::is_still`], a frame it replayed): a still card's line is the
-    /// settled gradient at every instant, and no clock need be read for it.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "line_ink's own inputs and the buffer it fills"
-    )]
+    /// [`Self::line_ink`] at `at` — its hero word ([`LineAt::hero`]) in its
+    /// own run, its glints from the wand ([`LineAt::wand`]) — appended to
+    /// `out`: a host that keeps the line's buffer allocates nothing for the
+    /// card's frames once it is grown. `now` is `None` for a card the host
+    /// knows is still ([`Self::is_still`], a frame it replayed): a still
+    /// card's line is the settled gradient at every instant, and no clock
+    /// need be read for it.
     pub fn line_ink_into(
         &self,
         now: Option<Instant>,
-        row: u16,
-        col: u16,
-        len: u16,
+        at: &LineAt,
         ground: u32,
         animate: bool,
         out: &mut Vec<InkCell>,
     ) {
         let ground = ground & 0x00FF_FFFF;
         let dark = dark_ground(ground);
-        let running = now.and_then(|now| self.running(now));
         debug_assert!(
             now.is_some() || self.is_still() || !animate,
-            "a card whose episode runs needs the clock for its line"
+            "a card that moves needs the clock for its line"
         );
-        let clock = match (animate, running) {
-            (true, Some(ms)) => Clock {
-                t_ms: Some(ms),
-                ride_ms: None,
+        let clock = match now {
+            Some(now) if animate => match self.running(now) {
+                Some(ms) => self.on_ripple(Clock::intro(ms, None), now),
+                None if self.flowing(now) => self.flow_at(now),
+                None => Clock::SETTLED,
             },
             _ => Clock::SETTLED,
         };
-        let phi = clock.drift(LINE_DRIFT);
+        let phi = clock.line_drift(LINE_DRIFT);
         let env = clock.head_env();
         let pos = (clock.u() * LINE_SWEEPS).fract() * 1.4 - 0.2;
-        let span = f32::from(len.saturating_sub(1).max(1));
-        let (palette, inks) = (self.palette, &self.inks);
-        let gain = if dark {
-            LINE_SWEEP_GAIN
-        } else {
-            LINE_SWEEP_GAIN_LIGHT
+        let span = f32::from(at.len.saturating_sub(1).max(1));
+        let hero = at.hero.clone();
+        let hero_span = f32::from(hero.end.saturating_sub(hero.start).saturating_sub(1).max(1));
+        let (wc, wr) = at.wand.unwrap_or((at.col, at.row));
+        let glint_at = |c: u16| match clock.glint {
+            Some((ms, up)) if up > 0.0 => {
+                let d = cell_distance(
+                    f32::from(c) - f32::from(wc),
+                    f32::from(at.row) - f32::from(wr),
+                );
+                up * glint(d, ms)
+            }
+            _ => 0.0,
         };
+        let (palette, inks) = (self.palette, &self.inks);
         out.extend(
-            (0..len)
-                .map_while(|i| Some((i, col.checked_add(i)?)))
+            (0..at.len)
+                .map_while(|i| Some((i, at.col.checked_add(i)?)))
                 .map(|(i, c)| {
                     let x = f32::from(i) / span;
-                    let at = tri(x + phi);
-                    let w = if env == 0.0 {
+                    let place = tri(x + phi);
+                    let sweep = if env == 0.0 {
                         0.0
                     } else {
                         let d = (x - pos) / LINE_SWEEP_SIGMA;
-                        env * (-d * d).exp() * gain
+                        env * (-d * d).exp()
                     };
-                    let rgb = if dark {
-                        let base = palette.at(at);
-                        mix_rgb(lift_to_luminance(base, LINE_DARK_LUMA_FLOOR), WHITE, w)
+                    // The sweep's crest (the intro's) or the ripple's glint
+                    // (its last eighth, and the flow), whichever is higher.
+                    let crest = sweep.max(glint_at(c));
+                    let rgb = if hero.contains(&i) {
+                        // The hero: its own whole run of the palette, a
+                        // step brighter on dark, flaring harder.
+                        let k = f32::from(i - hero.start) / hero_span;
+                        let place = tri(k * LINE_HERO_SPREAD + phi);
+                        if dark {
+                            mix_rgb(
+                                lift_to_luminance(palette.at(place), LINE_HERO_DARK_LUMA_FLOOR),
+                                WHITE,
+                                crest * LINE_HERO_SWEEP_GAIN,
+                            )
+                        } else {
+                            // Text: the paper law's ink at its place, as the
+                            // rest of the line; the crest only deepens it.
+                            mix_rgb(
+                                inks.at(palette, ground, place),
+                                0,
+                                crest * LINE_SWEEP_GAIN_LIGHT,
+                            )
+                        }
+                    } else if dark {
+                        // The palette's letter ink (the badge a host draws
+                        // in the card's colours shares it), swept toward
+                        // white.
+                        mix_rgb(palette.letter(place, true), WHITE, crest * LINE_SWEEP_GAIN)
                     } else {
                         // Toward black: on a light ground darker only reads
                         // further from it.
-                        mix_rgb(inks.at(palette, ground, at), 0, w)
+                        mix_rgb(
+                            inks.at(palette, ground, place),
+                            0,
+                            crest * LINE_SWEEP_GAIN_LIGHT,
+                        )
                     };
                     InkCell {
-                        row,
+                        row: at.row,
                         col: c,
                         color: [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8],
                     }
@@ -2824,7 +3647,8 @@ impl HarnessCard {
 /// entries), so both find the grid's first `t` that reaches the floor, and
 /// every point either tests is a multiple of `2^-14` at most 1, exact in an
 /// `f32` (`a_lift_finds_the_bisections_mix`).
-fn lift_to_luminance(rgb: u32, floor: f32) -> u32 {
+#[inline]
+pub(crate) fn lift_to_luminance(rgb: u32, floor: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     if crate::color_math::relative_luminance_with(table, rgb) >= floor {
         return rgb;
@@ -2919,6 +3743,9 @@ struct Emit<'a> {
     geo: Geo,
     clock: Clock,
     seed: u64,
+    /// The frame's border and rim phase ([`Clock::phi`]), the head's
+    /// strength ([`Clock::head_env`]) and place on the arc, and the intro
+    /// sheen's place on the trail: each read once a frame, not per pixel.
     phi: f32,
     head_env: f32,
     head_pos: f32,
@@ -2940,7 +3767,7 @@ impl<'a> Emit<'a> {
             geo,
             clock,
             seed,
-            phi: PHI_SETTLED + clock.drift(PHI_DRIFT),
+            phi: clock.phi(),
             head_env: clock.head_env(),
             head_pos: (clock.u() * HEAD_LAPS).fract(),
             shimmer_pos: clock
@@ -2953,13 +3780,34 @@ impl<'a> Emit<'a> {
 
     /// Whether the kitty rides in this episode: it is drawn, and there is a
     /// trail to ride.
+    #[inline]
     fn rides(&self) -> bool {
         self.seat
             .is_some_and(|seat| ride_span(&self.geo, self.scene, &seat).is_some())
     }
 
-    /// The border's paint at arc fraction `s`.
-    fn border_paint(&self, s: f32) -> Paint {
+    /// The ripple's glint at pixel `(x, y)` this frame (`0..=1`, times how
+    /// far up the glints are): Claude's ring train ([`glint`]) at the
+    /// point's distance in cells from the wand ([`Geo::wand`],
+    /// [`cell_distance`]). `0` with no glints (the settled frame, the
+    /// intro's first seven eighths).
+    #[inline]
+    fn ring_at(&self, x: f32, y: f32) -> f32 {
+        let Some((ms, up)) = self.clock.glint.filter(|&(_, up)| up > 0.0) else {
+            return 0.0;
+        };
+        let g = self.geo;
+        let d = cell_distance((x - g.wand.0) / g.cw as f32, (y - g.wand.1) / g.ch as f32);
+        up * glint(d, ms)
+    }
+
+    /// The border's paint at arc fraction `s`, at pixel `(x, y)` (where the
+    /// glint is read): the palette at `tri(2s + φ)`, pulled toward white on
+    /// dark (toward its own deeper shade on light: a white glint would be a
+    /// hole in white) by the intro's head or the ripple's crest, whichever
+    /// is higher.
+    #[inline]
+    fn border_paint(&self, s: f32, (x, y): (f32, f32)) -> Paint {
         let base = self
             .scene
             .palette
@@ -2972,9 +3820,12 @@ impl<'a> Emit<'a> {
         } else {
             0.0
         };
+        let ring = self.ring_at(x, y);
         if self.scene.dark {
-            light(mix_rgb(base, WHITE, w * HEAD_GAIN), f32::from(BORDER_COV))
+            let w = (w * HEAD_GAIN).max(GLINT_CREST_DARK * ring);
+            light(mix_rgb(base, WHITE, w), f32::from(BORDER_COV))
         } else {
+            let w = w.max(GLINT_CREST_LIGHT * ring);
             ink(
                 mix_rgb(print_line(base), 0, w * LIGHT_HEAD_DEEPEN),
                 PRINT_ALPHA,
@@ -3008,7 +3859,8 @@ impl<'a> Emit<'a> {
                     (x - o.x0) as f32
                 }
             };
-            let mut pa = self.border_paint(arc(o.x0) / per);
+            let mid = (y0 + t / 2) as f32;
+            let mut pa = self.border_paint(arc(o.x0) / per, (o.x0 as f32, mid));
             for k in 0..n {
                 let xa = o.x0 + w * k / n;
                 let xb = o.x0 + w * (k + 1) / n;
@@ -3018,7 +3870,7 @@ impl<'a> Emit<'a> {
                     x1: xb,
                     y1: y0 + t,
                 };
-                let pb = self.border_paint(arc(xb) / per);
+                let pb = self.border_paint(arc(xb) / per, (xb as f32, mid));
                 out.ramp(all, r, pa, pb);
                 pa = pb;
             }
@@ -3043,7 +3895,10 @@ impl<'a> Emit<'a> {
                 if yb <= ya {
                     continue;
                 }
-                let p = self.border_paint(arc((ya + yb) / 2) / per);
+                let p = self.border_paint(
+                    arc((ya + yb) / 2) / per,
+                    ((x0 + t / 2) as f32, ((ya + yb) / 2) as f32),
+                );
                 let slice = Rect {
                     x0,
                     y0: ya,
@@ -3080,38 +3935,49 @@ impl<'a> Emit<'a> {
         }
     }
 
-    /// The shimmer's weight at trail fraction `x`.
+    /// The shimmer at trail fraction `x`, pixel `(px, py)`: the intro's
+    /// sweep weight, and the ripple's glint ([`Self::ring_at`]).
     #[inline]
-    fn shimmer(&self, x: f32) -> f32 {
-        if self.clock.t_ms.is_none() {
-            return 0.0;
-        }
-        let d = (x - self.shimmer_pos) / SHIMMER_SIGMA;
-        self.head_env * (-d * d).exp() * SHIMMER_GAIN
+    fn shimmer(&self, x: f32, (px, py): (f32, f32)) -> (f32, f32) {
+        let sweep = if self.clock.t_ms.is_none() {
+            0.0
+        } else {
+            let d = (x - self.shimmer_pos) / SHIMMER_SIGMA;
+            self.head_env * (-d * d).exp() * SHIMMER_GAIN
+        };
+        (sweep, self.ring_at(px, py))
     }
 
-    /// One stripe's paint under shimmer weight `w`: lifted toward white by
-    /// `w` on both grounds, light on dark and a gloss on a light ground's
-    /// print ink, where the top and bottom stripes take
-    /// [`LIGHT_GLINT_EDGE`] of it.
+    /// One stripe's paint under the shimmer `(w, ring)` ([`Self::shimmer`]):
+    /// on dark, light lifted toward white by the sweep `w` or the ripple's
+    /// crest, whichever is higher; on a light ground the sweep is a gloss
+    /// on the print ink, and the ripple's crest deepens it (as the border's
+    /// does), the top and bottom stripes taking [`LIGHT_GLINT_EDGE`] of
+    /// both.
     #[inline]
-    fn stripe_paint(&self, k: usize, w: f32) -> Paint {
+    fn stripe_paint(&self, k: usize, (w, ring): (f32, f32)) -> Paint {
         let base = self.scene.palette.stripe(k, self.scene.dark);
         if self.scene.dark {
+            let w = w.max(GLINT_CREST_DARK * ring);
             light(mix_rgb(base, WHITE, w), f32::from(TRAIL_COV))
         } else {
             let edge = k == 0 || k + 1 == TRAIL_STOPS.len();
-            let w = if edge { w * LIGHT_GLINT_EDGE } else { w };
-            ink(mix_rgb(base, WHITE, w), PRINT_ALPHA)
+            let share = if edge { LIGHT_GLINT_EDGE } else { 1.0 };
+            let deep = GLINT_CREST_LIGHT * ring * LIGHT_HEAD_DEEPEN * share;
+            ink(
+                mix_rgb(mix_rgb(base, WHITE, w * share), 0, deep),
+                PRINT_ALPHA,
+            )
         }
     }
 
     /// The rainbow trail: six stripes from the text's end to the kitty's
     /// rear, under its art to the haunch ([`KittyAt::rear`]), as tall as the
     /// kitty's body ([`trail_band`]: the cat leads, the rainbow trails).
-    /// During an episode it steps and shimmers in segments; settled, every
-    /// segment of a stripe would wear the same paint, so each stripe is one
-    /// ramp end to end: six items of trail, not ninety six.
+    /// During the intro it steps and shimmers in segments, and in the flow
+    /// the ripple's glints run along them; settled, every segment of a
+    /// stripe would wear the same paint, so each stripe is one ramp end to
+    /// end: six items of trail, not ninety six.
     ///
     /// The step wave moves the ribbon's outline, not its stripes: a segment
     /// stepped up `d` px grows the top stripe up by `d` and shrinks the bottom
@@ -3137,13 +4003,14 @@ impl<'a> Emit<'a> {
         let mut xa = tx0;
         // A segment's left end is the last one's right end: its shimmer and
         // its stripes' paints are that one's, not computed again.
-        let mut wa = self.shimmer(0.0);
+        let mid = (ya + yb) as f32 * 0.5;
+        let mut wa = self.shimmer(0.0, (tx0 as f32, mid));
         let mut ends: [Paint; TRAIL_STOPS.len()] =
             std::array::from_fn(|s| self.stripe_paint(s, wa));
         while xa < drawn {
             let xb = (xa + seg).min(drawn);
             let d = self.wave(&lay, k);
-            let wb = self.shimmer((xb - tx0) as f32 / len as f32);
+            let wb = self.shimmer((xb - tx0) as f32 / len as f32, (xb as f32, mid));
             let same_w = wb == wa;
             for (s, end) in ends.iter_mut().enumerate() {
                 let si = s as i64;
@@ -3204,7 +4071,7 @@ impl<'a> Emit<'a> {
             .map(|at| at.rect.x0 - rim_px(at.p, g.t))
             .filter(|&held| drawn > held)
             .unwrap_or(i64::MAX);
-        let seg = if self.clock.t_ms.is_some() {
+        let seg = if self.clock.t_ms.is_some() || self.clock.flow.is_some() {
             (TRAIL_SEG_CELLS * g.cw).max((len + MAX_TRAIL_SEGMENTS - 1) / MAX_TRAIL_SEGMENTS)
         } else {
             len
@@ -3224,6 +4091,7 @@ impl<'a> Emit<'a> {
     /// The pixels segment `k` of the trail `lay` covers: its stripes, the
     /// top one's top and the bottom one's bottom stepped by the wave — one
     /// rectangle, `[xa, xb) × [ya − d, yb − d)`.
+    #[inline]
     fn trail_cover(&self, lay: &TrailLay, k: i64) -> Rect {
         let d = self.wave(lay, k);
         let xa = lay.tx0 + k * lay.seg;
@@ -3238,18 +4106,27 @@ impl<'a> Emit<'a> {
     /// The rim's paint for a strip centred at `(x, y)`: the border's spectrum
     /// at the strip's angle round the kitty's centre `(cx, cy)`, measured
     /// from straight up — `palette(tri(2s + φ))`, the border's own sweep and
-    /// drift, so the hue runs round the cat once with no seam and settles
-    /// with the border's.
+    /// drift, so the hue runs round the cat once with no seam and flows and
+    /// settles with the border's — and the ripple's crest at the strip, as
+    /// on the border (toward white on dark, deeper on light).
+    #[inline]
     fn rim_paint(&self, (x, y): (f32, f32), (cx, cy): (f32, f32)) -> Paint {
         let s = ((x - cx).atan2(cy - y) / std::f32::consts::TAU).rem_euclid(1.0);
         let base = self
             .scene
             .palette
             .art_at(tri(2.0 * s + self.phi), self.scene.dark);
+        let ring = self.ring_at(x, y);
         if self.scene.dark {
-            light(base, f32::from(RIM_COV))
+            light(
+                mix_rgb(base, WHITE, GLINT_CREST_DARK * ring),
+                f32::from(RIM_COV),
+            )
         } else {
-            ink(base, PRINT_ALPHA)
+            ink(
+                mix_rgb(base, 0, GLINT_CREST_LIGHT * ring * LIGHT_HEAD_DEEPEN),
+                PRINT_ALPHA,
+            )
         }
     }
 
@@ -3261,6 +4138,7 @@ impl<'a> Emit<'a> {
     /// never lies on the trail (the rainbow is no dark ground to set the
     /// coat off, and light on light doubles to white). `None` where no trail
     /// is drawn.
+    #[inline]
     fn rim_hole(&self) -> Option<Rect> {
         let t = self.trail_lay()?;
         Some(Rect {
@@ -3303,7 +4181,10 @@ impl<'a> Emit<'a> {
         }
     }
 
-    /// The rainbow's glints: steady at rest, flaring as the sheen passes.
+    /// The rainbow's glints: steady at rest; flaring as the intro's sheen
+    /// passes, and as the ripple's crest does (the intro's last eighth and
+    /// the flow), Claude's `✦` flaring with its ring. Gold at rest (pearl
+    /// on the moonbow, whose stars are starlight), white at a flare's peak.
     fn glints(&self, lay: &mut impl FnMut(StarCall)) {
         let Some(region) = star_region(&self.geo, self.scene) else {
             return;
@@ -3319,7 +4200,10 @@ impl<'a> Emit<'a> {
             .seat
             .and_then(|seat| ride_span(&self.geo, self.scene, &seat));
         let t_sec = self.clock.t_ms.map(|t| t as f32 / 1000.0);
-        let gold = twinkle_rgb(true);
+        let rest_rgb = match self.scene.palette {
+            CardPalette::Off => MOONBOW[1],
+            CardPalette::Cruise | CardPalette::Land => twinkle_rgb(true),
+        };
         for (i, s) in glints.spots().iter().enumerate() {
             let up = match (self.clock.ride_ms, riding) {
                 (Some(t), Some((from, dist))) => {
@@ -3331,15 +4215,19 @@ impl<'a> Emit<'a> {
             if up <= 0.0 {
                 continue;
             }
-            let (env, w) = match t_sec {
+            let (sweep, ring) = self.shimmer(
+                (s.x - trail.tx0) as f32 / trail.len as f32,
+                (s.x as f32, s.y as f32),
+            );
+            let w = (sweep / SHIMMER_GAIN).max(ring).clamp(0.0, 1.0);
+            let env = match t_sec {
                 Some(t_sec) => {
                     let e = twinkle_env(t_sec, s.phase);
-                    let w =
-                        self.shimmer((s.x - trail.tx0) as f32 / trail.len as f32) / SHIMMER_GAIN;
-                    ((e + (STAR_STEADY_ENV - e) * settle) * up, w.clamp(0.0, 1.0))
+                    (e + (STAR_STEADY_ENV - e) * settle) * up
                 }
-                None => (STAR_STEADY_ENV, 0.0),
+                None => STAR_STEADY_ENV,
             };
+            let env = (env + (1.0 - STAR_STEADY_ENV) * ring).min(1.0);
             let arm = rest + ((flare - rest) as f32 * w).round() as i64;
             lay(StarCall {
                 clip: region,
@@ -3347,13 +4235,15 @@ impl<'a> Emit<'a> {
                 arm,
                 cov: GLINT_COV * env,
                 gold: w >= GLINT_FLARE_DOTS,
-                color: self.mark_ink(i, mix_rgb(gold, WHITE, w)),
+                color: self.mark_ink(i, mix_rgb(rest_rgb, WHITE, w)),
             });
         }
     }
 
-    /// The steady field: twinkling during an episode (easing onto a steady
-    /// brightness over its last fifth), fixed once settled.
+    /// The steady field: twinkling during the intro (easing onto a steady
+    /// brightness over its last fifth), fixed once settled; in the flow
+    /// steady but for the ripple, each star flaring (and glinting gold) as
+    /// a ring passes it, twice a cycle — as the intro's last eighth does.
     fn field(&self, lay: &mut impl FnMut(StarCall)) {
         let Some(region) = star_region(&self.geo, self.scene) else {
             return;
@@ -3369,10 +4259,11 @@ impl<'a> Emit<'a> {
             .and_then(|seat| Some((seat, ride_span(&self.geo, self.scene, &seat)?)));
         let t_sec = self.clock.t_ms.map(|t| t as f32 / 1000.0);
         let chf = self.geo.ch as f32;
-        let even_rgb = twinkle_rgb(true);
-        let odd_rgb = match self.scene.palette {
-            CardPalette::Cruise => twinkle_rgb(false),
-            CardPalette::Land => mix_rgb(SUNSET[3], WHITE, 0.5),
+        let (even_rgb, odd_rgb) = match self.scene.palette {
+            CardPalette::Cruise => (twinkle_rgb(true), twinkle_rgb(false)),
+            CardPalette::Land => (twinkle_rgb(true), mix_rgb(SUNSET[3], WHITE, 0.5)),
+            // White stars and pearl ones: starlight by the moonbow.
+            CardPalette::Off => (WHITE, MOONBOW[1]),
         };
         for (i, s) in spots[..n].iter().enumerate() {
             let arm = i64::from(star_arm_px(star_arm(chf, s.ratio)));
@@ -3386,13 +4277,18 @@ impl<'a> Emit<'a> {
             if up <= 0.0 {
                 continue;
             }
+            let ring = self.ring_at(s.x as f32, s.y as f32);
             let (env, gold) = match t_sec {
                 Some(t_sec) => {
                     let e = twinkle_env(t_sec, s.phase);
                     let e = (e + (STAR_STEADY_ENV - e) * settle) * up;
-                    (e, s.gold || (i % 2 == 0 && twinkle_peak(e)))
+                    let e = (e + (1.0 - STAR_STEADY_ENV) * ring).min(1.0);
+                    (e, s.gold || (i % 2 == 0 && twinkle_peak(e)) || ring >= 0.5)
                 }
-                None => (STAR_STEADY_ENV, s.gold),
+                None => (
+                    STAR_STEADY_ENV + (1.0 - STAR_STEADY_ENV) * ring,
+                    s.gold || ring >= 0.5,
+                ),
             };
             let light_rgb = if i % 2 == 0 { even_rgb } else { odd_rgb };
             lay(StarCall {
@@ -3670,6 +4566,7 @@ struct TrailInk {
 }
 
 impl Default for TrailInk {
+    #[inline]
     fn default() -> Self {
         Self {
             covers: [Rect {
@@ -3685,6 +4582,7 @@ impl Default for TrailInk {
 
 impl TrailInk {
     /// The segments' covers, left to right.
+    #[inline]
     fn covers(&self) -> &[Rect] {
         &self.covers[..self.n]
     }
@@ -3695,7 +4593,6 @@ mod tests {
     use super::oracle::{QuadSink, Sink, kitty_quads, lay_star, rim_quads};
     use super::*;
     use crate::cursor_glow::Geom;
-    use crate::cursor_glow::InkRole;
     use crate::effect_util::{STAR_GLINT, push_twinkle_star, star_core_px, star_waist_px};
     use aterm_render::GlowQuad;
 
@@ -3725,6 +4622,7 @@ mod tests {
             serious: false,
             coat: 0x00E8_A060,
             eye: 0x0040_C080,
+            wand: Some((10, 3)),
         }
     }
 
@@ -3773,7 +4671,8 @@ mod tests {
         }
     }
 
-    /// The scenes every law is checked on: both themes and palettes, odd cell
+    /// The scenes every law is checked on: both themes and all three palettes
+    /// (Off's moonbow aired on light too), odd cell
     /// sizes, a grid origin inside the padding, no padding, a negative origin
     /// (the box clipped at the stream's left edge), a card with no line row,
     /// a cell height whose kitty would reach into the top border sized from
@@ -3810,6 +4709,15 @@ mod tests {
             ..base
         });
         v.push(CardScene {
+            palette: CardPalette::Off,
+            ..base
+        });
+        v.push(CardScene {
+            palette: CardPalette::Off,
+            dark: false,
+            ..base
+        });
+        v.push(CardScene {
             cw: 8,
             ch: 16,
             pad_left: 0,
@@ -3818,6 +4726,7 @@ mod tests {
             origin_y: 0,
             row_base: 0,
             top: 0,
+            wand: Some((10, 0)),
             ..base
         });
         v.push(CardScene {
@@ -3858,6 +4767,11 @@ mod tests {
         v.push(aired(CardScene {
             dark: false,
             palette: CardPalette::Land,
+            ..base
+        }));
+        v.push(aired(CardScene {
+            dark: false,
+            palette: CardPalette::Off,
             ..base
         }));
         v.push(CardScene {
@@ -3922,12 +4836,13 @@ mod tests {
         card
     }
 
-    /// The settled frame for `s` with the test seed.
+    /// The settled frame for `s` with the test seed: an armed card held
+    /// (`animate == false`) past its intro.
     fn settled(s: &CardScene) -> (Vec<GlowQuad>, Vec<GlowQuad>, u64) {
         let t0 = Instant::now();
         let mut card = HarnessCard::default();
         card.arm(t0, 7);
-        frame(&mut card, t0 + ms(EPISODE_MS + 1), s, true)
+        frame(&mut card, t0 + ms(EPISODE_MS + 1), s, false)
     }
 
     /// One frame's marks, each drawn alone into its own stream: what the
@@ -4293,24 +5208,42 @@ mod tests {
         );
     }
 
-    /// Idle to zero: after the episode every tick is the same bytes and the
-    /// same fingerprint, and the card wants no frames.
+    /// A card armed at `t0` whose intro played on `s` (its first frame and
+    /// its last): the next tick that may animate flows.
+    fn played(s: &CardScene, t0: Instant) -> HarnessCard {
+        let mut card = HarnessCard::default();
+        card.arm(t0, 7);
+        frame(&mut card, t0, s, true);
+        frame(&mut card, t0 + ms(EPISODE_MS - 5), s, true);
+        card
+    }
+
+    /// Idle to zero once held: a card whose gate closed (the window
+    /// unfocused, Reduce Motion, the load latch) after its intro and while
+    /// it flowed draws the settled frame on its very next tick and on every
+    /// tick after — the same bytes and the same fingerprint — and wants no
+    /// frames; an unarmed card, animating or not, is constant and idles.
     #[test]
-    fn the_settled_frame_is_static_and_wants_no_frames() {
+    fn a_held_card_is_static_and_wants_no_frames() {
         for s in scenes() {
             let t0 = Instant::now();
-            let mut card = HarnessCard::default();
-            card.arm(t0, 7);
-            let first = frame(&mut card, t0 + ms(EPISODE_MS), &s, true);
-            assert_ne!(first.2, 0, "a settled card still draws");
+            let rest = settled(&s);
+            assert_ne!(rest.2, 0, "a settled card still draws");
+            let mut card = played(&s, t0);
+            frame(&mut card, t0 + ms(EPISODE_MS + 500), &s, true);
+            assert!(!card.at_rest(), "CONTROL: it flows");
             for k in 1..6 {
-                let now = t0 + ms(EPISODE_MS + k * 977);
-                assert_eq!(
-                    frame(&mut card, now, &s, true),
-                    first,
-                    "settled frame moved at {k}"
-                );
-                assert_eq!(card.deadline(now), None, "a settled card wants no frames");
+                let now = t0 + ms(EPISODE_MS + 500 + k * 977);
+                assert_eq!(frame(&mut card, now, &s, false), rest, "held {k}");
+                assert!(card.at_rest(), "held {k}: at rest");
+                assert_eq!(card.deadline(now), None, "a held card wants no frames");
+            }
+            let mut unarmed = HarnessCard::default();
+            let first = frame(&mut unarmed, t0, &s, true);
+            for k in 1..4 {
+                let now = t0 + ms(k * 977);
+                assert_eq!(frame(&mut unarmed, now, &s, true), first, "unarmed {k}");
+                assert_eq!(unarmed.deadline(now), None, "an unarmed card idles");
             }
         }
         assert_eq!(
@@ -4320,9 +5253,482 @@ mod tests {
         );
     }
 
-    /// While an episode runs every frame has a new fingerprint and a deadline
+    /// THE FLOW (owner, 2026-10-19: "Make the rainbow at the banner continue
+    /// to shimmer and flow continuously"): past its intro a card that may
+    /// animate draws a new frame at every step of the ripple's grid — new
+    /// quads, a new fingerprint — and the same frame at every instant
+    /// inside a step; its deadline is the next step's start plus the slack,
+    /// one fixed instant however often it is asked; and its grid is the
+    /// ripple's, counted from the first arm. Over two whole ripple cycles,
+    /// on every scene.
+    #[test]
+    fn after_the_intro_the_card_flows_on_the_step_grid() {
+        for s in scenes() {
+            let t0 = Instant::now();
+            let mut card = played(&s, t0);
+            let end = t0 + ms(EPISODE_MS);
+            assert_eq!(
+                card.deadline(end),
+                Some(end),
+                "the flow's first frame is owed"
+            );
+            let first = EPISODE_MS / FLOW_STEP_MS + 1;
+            let mut prev: Option<(Vec<GlowQuad>, Vec<GlowQuad>, u64)> = None;
+            for k in first..first + 2 * GLINT_PERIOD_MS / FLOW_STEP_MS {
+                let at = t0 + ms(k * FLOW_STEP_MS + 3);
+                let f = frame(&mut card, at, &s, true);
+                assert!(card.flowing(at) && !card.intro_live(), "step {k}: flowing");
+                assert_eq!(card.flow_step(at), Some(k), "step {k}: the grid");
+                let due = t0 + ms((k + 1) * FLOW_STEP_MS + FLOW_SLACK_MS);
+                assert_eq!(card.deadline(at), Some(due), "step {k}: the next step");
+                assert_eq!(card.deadline(at + ms(90)), Some(due), "step {k}: fixed");
+                let again = frame(&mut card, at + ms(FLOW_STEP_MS - 10), &s, true);
+                assert_eq!(again, f, "step {k}: a step's frame is the step's alone");
+                if let Some(p) = &prev {
+                    assert_ne!(p.2, f.2, "step {k}: the fingerprint held");
+                    assert!(p.0 != f.0 || p.1 != f.1, "step {k}: the quads held");
+                }
+                prev = Some(f);
+            }
+        }
+    }
+
+    /// A GATE CLOSING SETTLES THE FLOW AT ONCE, AND IT RESUMES FROM THE
+    /// SETTLED COLOURS: the first held tick is the settled frame, bit for
+    /// bit, with no deadline; the first tick after the gate reopens flows
+    /// again — the border, the kitty, its rim and the stars exactly the
+    /// settled frame's (the hue starts from the settled phase, the glints
+    /// from nothing: no jump) — and the glints come up over
+    /// [`GLINT_FADE_MS`], the hue travelling on from there. On every scene.
+    #[test]
+    fn the_flow_settles_when_a_gate_closes_and_resumes_from_the_settled_colours() {
+        for s in scenes() {
+            let t0 = Instant::now();
+            let rest = settled(&s);
+            let border = parts(&s, Clock::SETTLED).border.len();
+            let mut card = played(&s, t0);
+            frame(&mut card, t0 + ms(EPISODE_MS + 200), &s, true);
+            let shut = t0 + ms(EPISODE_MS + 300);
+            assert_eq!(frame(&mut card, shut, &s, false), rest, "settled at once");
+            assert_eq!(card.deadline(shut), None, "held: no wake");
+            // Reopened on a step where the kitty does not blink.
+            let back = t0 + ms(EPISODE_MS + 5300);
+            let (under, over, fp) = frame(&mut card, back, &s, true);
+            assert!(card.flowing(back), "it flows again");
+            assert_ne!(fp, rest.2, "a flow frame");
+            assert_eq!(
+                under[..border],
+                rest.0[..border],
+                "the border resumes settled"
+            );
+            assert_eq!(
+                over, rest.1,
+                "the kitty, its rim and the stars resume settled"
+            );
+            // The glints are up a fade later, and the hue has moved on.
+            let up = back + ms(GLINT_FADE_MS + 2 * FLOW_STEP_MS);
+            let (later_under, _, _) = frame(&mut card, up, &s, true);
+            assert_ne!(
+                later_under[..border],
+                rest.0[..border],
+                "the border flows on"
+            );
+        }
+    }
+
+    /// A SECOND RIPPLE ON THE FIRST'S STEPS (the cross-track review of
+    /// 2026-10-19): a card that adopts another's clock before its first arm
+    /// flows on that clock's steps — its deadlines are the other's, step for
+    /// step — and its arm keeps it. A started clock is not moved by an
+    /// adoption. CONTROL: armed alone 50 ms later, its steps fall 50 ms off.
+    #[test]
+    fn an_adopted_ripple_flows_on_the_first_cards_steps() {
+        let s = scene();
+        let t0 = Instant::now();
+        let mut first = HarnessCard::default();
+        first.arm(t0, 7);
+        let origin = first.ripple_origin().expect("armed");
+        assert_eq!(origin, t0);
+        let t1 = t0 + ms(50);
+        let mut second = HarnessCard::default();
+        second.adopt_ripple(origin);
+        second.arm(t1, 9);
+        assert_eq!(second.ripple_origin(), Some(origin), "the arm keeps it");
+        second.adopt_ripple(t1);
+        assert_eq!(
+            second.ripple_origin(),
+            Some(origin),
+            "a started clock stays"
+        );
+        let mut alone = HarnessCard::default();
+        alone.arm(t1, 9);
+        let flow = t1 + ms(EPISODE_MS + 1000);
+        for card in [&mut first, &mut second, &mut alone] {
+            frame(card, t1, &s, true);
+            frame(card, flow, &s, true);
+            assert!(card.flowing(flow), "CONTROL: it flows");
+        }
+        let (a, b, c) = (
+            first.deadline(flow).expect("a step"),
+            second.deadline(flow).expect("a step"),
+            alone.deadline(flow).expect("a step"),
+        );
+        assert_eq!(a, b, "one step for both");
+        assert_eq!(first.flow_step(flow), second.flow_step(flow));
+        let off = c.max(a).duration_since(c.min(a)).as_millis() % u128::from(FLOW_STEP_MS);
+        assert_eq!(
+            off.min(u128::from(FLOW_STEP_MS) - off),
+            50,
+            "CONTROL: 50 ms off"
+        );
+    }
+
+    /// THE PHASE LOCK (`HarnessCard::lock_glint`), its ring's birth put
+    /// [`FLARE_STEP_LEAD_MS`] before the flare was seen. While no glint shows (the
+    /// intro before its glints rise) the grid takes the error whole, unseen.
+    /// Once they show it slews and never fades, by a quarter of the error
+    /// (+40 ms by +10, −30 by −7, and 3040 ms past a birth, which is 32 ms
+    /// before the next, by −8) and at most one step: a second off moves it
+    /// one step, either way. An error under four ms moves nothing, so a kept
+    /// frame stands. A moved grid draws a kept flow frame anew. A card never
+    /// armed takes the flare's start for its first arm.
+    #[test]
+    fn a_lock_is_whole_while_unseen_and_slews_a_step_at_most_once_seen() {
+        let s = scene();
+        let t0 = Instant::now();
+        let mut card = HarnessCard::default();
+        card.arm(t0, 7);
+        frame(&mut card, t0, &s, true);
+        // In the intro, its glints not up: taken whole.
+        let seen = t0 + ms(1000);
+        assert!(!card.glints_shown(seen), "CONTROL: no glint shows yet");
+        card.lock_glint(seen);
+        let g0 = t0 + ms(1000 - FLARE_STEP_LEAD_MS);
+        assert_eq!(card.glint0, Some(g0), "adopted, unseen");
+        frame(&mut card, t0 + ms(EPISODE_MS - 5), &s, true);
+        let mut kept = CardFrames::default();
+        let at = t0 + ms(EPISODE_MS + 200);
+        let _ = card.draw(at, &s, true, &mut kept);
+        assert!(card.glints_shown(at), "CONTROL: the flow's glints show");
+        assert!(
+            card.replay_step(&s, true, &kept, at + ms(1)).is_some(),
+            "CONTROL: kept"
+        );
+        let flare = |birth_after_g0: u64, off: i64| {
+            let birth = later(g0, birth_after_g0);
+            let start = if off >= 0 {
+                later(birth, off.unsigned_abs())
+            } else {
+                birth - ms(off.unsigned_abs())
+            };
+            later(start, FLARE_STEP_LEAD_MS)
+        };
+        let grid = card.grid_gen;
+        // An error under four ms: nothing moves.
+        card.lock_glint(flare(3 * GLINT_PERIOD_MS, 3));
+        assert_eq!(
+            (card.glint0, card.grid_gen),
+            (Some(g0), grid),
+            "a 3 ms error is noise"
+        );
+        assert!(
+            card.replay_step(&s, true, &kept, at + ms(1)).is_some(),
+            "still kept"
+        );
+        // 40 ms after the third ring's birth: a quarter of it.
+        card.lock_glint(flare(3 * GLINT_PERIOD_MS, 40));
+        assert_eq!(card.glint0, Some(g0 + ms(10)), "slewed by +10");
+        assert_eq!(card.fade0, None, "the glints stay up");
+        assert!(
+            !card.replay_step(&s, true, &kept, at + ms(1)).is_some(),
+            "a frame of the old grid is drawn anew"
+        );
+        // 30 ms before the tenth's (of the moved grid): −7.
+        let g1 = g0 + ms(10);
+        card.lock_glint(later(
+            later(g1, 10 * GLINT_PERIOD_MS) - ms(30),
+            FLARE_STEP_LEAD_MS,
+        ));
+        assert_eq!(card.glint0, Some(g1 - ms(7)), "slewed by −7");
+        // 3040 ms after the eleventh's: 32 ms before the twelfth's, −8.
+        let g2 = g1 - ms(7);
+        card.lock_glint(later(g2, 11 * GLINT_PERIOD_MS + 3040 + FLARE_STEP_LEAD_MS));
+        let g3 = g2 - ms(8);
+        assert_eq!(card.glint0, Some(g3), "folded, slewed by −8");
+        // A second off, either way: one step a flare.
+        card.lock_glint(later(g3, 13 * GLINT_PERIOD_MS + 1000 + FLARE_STEP_LEAD_MS));
+        let g4 = later(g3, FLOW_STEP_MS);
+        assert_eq!(card.glint0, Some(g4), "a step toward it");
+        card.lock_glint(later(
+            later(g4, 15 * GLINT_PERIOD_MS) - ms(1000),
+            FLARE_STEP_LEAD_MS,
+        ));
+        assert_eq!(card.glint0, Some(g4 - ms(FLOW_STEP_MS)), "a step back");
+        assert_eq!(card.fade0, None, "no lock fades the glints");
+        let mut fresh = HarnessCard::default();
+        let first = t0 + ms(20 * GLINT_PERIOD_MS);
+        fresh.lock_glint(first);
+        fresh.arm(first + ms(500), 7);
+        assert_eq!(
+            fresh.glint0,
+            Some(first - ms(FLARE_STEP_LEAD_MS)),
+            "the first arm keeps the flare's grid"
+        );
+    }
+
+    /// THE LOCK AVERAGES CLAUDE'S REPAINT JITTER OUT (lab M2: the wand
+    /// repaints every 134 ms at the median, p10 118, p90 142, unaligned with
+    /// its 3072 ms cycle, so its first flaring repaint lands up to a repaint
+    /// after the cycle's start). The simulated Claude runs 500 ms off the
+    /// card's first arm. Its first two flares come inside the intro, before
+    /// the glints rise, and are taken whole, the card's ring born
+    /// [`FLARE_STEP_LEAD_MS`] before each was seen. Then 300 more come, each
+    /// seen 0 to [`crate::ripple::CLAUDE_REPAINT_P90_MS`] late, one in eight
+    /// late by a 250 ms stall (more than the measured p90 allows). No lock
+    /// moves the grid by more than 40 ms (a stall's by more than 64, half a
+    /// step), none fades, and after the first ten flares the card's ring
+    /// births stay within half a cell of the ring's travel (71 ms at seven
+    /// cells a second) of Claude's flares as seen, on average, less the
+    /// lead. NEGATIVE
+    /// CONTROL: the rule this one replaced takes an error of at most 64 ms
+    /// whole and adopts a larger one with a fade. On the same flares it
+    /// chases the jitter (moves of more than 40 ms) and re-fades again and
+    /// again.
+    #[test]
+    fn the_lock_averages_claudes_repaint_jitter_out() {
+        let s = scene();
+        let t0 = Instant::now();
+        let mut card = HarnessCard::default();
+        card.arm(t0, 7);
+        frame(&mut card, t0, &s, true);
+        let claude0 = t0 + ms(500);
+        let late = |k: u64| {
+            if k % 8 == 5 {
+                250
+            } else {
+                (k * 53) % (crate::ripple::CLAUDE_REPAINT_P90_MS + 1)
+            }
+        };
+        let seen = |k: u64| later(claude0, k * GLINT_PERIOD_MS + late(k));
+        // The card's ring births against Claude's, folded: ms.
+        let p = GLINT_PERIOD_MS as i64;
+        let fold = |e: i64| {
+            let e = e.rem_euclid(p);
+            if e > p / 2 { e - p } else { e }
+        };
+        let offset = |card: &HarnessCard| {
+            let g0 = card.glint0.expect("a grid");
+            fold(
+                i64::try_from(ms_between(claude0, g0)).unwrap()
+                    - i64::try_from(ms_between(g0, claude0)).unwrap(),
+            )
+        };
+        let lead = i64::try_from(FLARE_STEP_LEAD_MS).unwrap();
+        for k in 0..2 {
+            assert!(
+                !card.glints_shown(seen(k)),
+                "flare {k}: in the intro, unseen"
+            );
+            card.lock_glint(seen(k));
+            assert_eq!(
+                offset(&card),
+                i64::try_from(late(k)).unwrap() - lead,
+                "flare {k}: taken whole"
+            );
+        }
+        frame(&mut card, t0 + ms(EPISODE_MS - 5), &s, true);
+        frame(&mut card, t0 + ms(EPISODE_MS + 200), &s, true);
+        let (mut worst, mut max_move) = (0i64, 0i64);
+        let mean = (2..302)
+            .map(|k| i64::try_from(late(k)).unwrap())
+            .sum::<i64>()
+            / 300;
+        for k in 2..302 {
+            let before = offset(&card);
+            assert!(card.glints_shown(seen(k)), "flare {k}: the glints show");
+            card.lock_glint(seen(k));
+            let moved = (offset(&card) - before).abs();
+            let bound = if late(k) == 250 { 64 } else { 40 };
+            assert!(moved <= bound, "flare {k}: moved {moved} ms");
+            max_move = max_move.max(moved);
+            assert_eq!(card.fade0, None, "flare {k}: no fade");
+            if k >= 12 {
+                worst = worst.max((offset(&card) - (mean - lead)).abs());
+            }
+        }
+        let half_cell = (500.0 / crate::ripple::GLINT_CELLS_PER_S) as i64;
+        assert!(worst <= half_cell, "locked within {worst} ms");
+        assert!(max_move > 0, "CONTROL: the lock does move the grid");
+        // NEGATIVE CONTROL: the replaced rule on the same flares.
+        let (mut off, mut refades, mut chased) = (0i64, 0, 0i64);
+        for k in 2..302 {
+            let e = fold(i64::try_from(late(k)).unwrap() - off);
+            if e.abs() <= 64 {
+                chased = chased.max(e.abs());
+                off += e;
+            } else {
+                refades += 1;
+                off = i64::try_from(late(k)).unwrap();
+            }
+        }
+        assert!(
+            refades > 30 && chased > 40,
+            "CONTROL: the old rule re-fades ({refades}) and chases the jitter ({chased} ms)"
+        );
+    }
+
+    /// THE STEP LOCK (`HarnessCard::lock_step`): a repaint seen puts a
+    /// step's start [`FLARE_STEP_LEAD_MS`] before it, its error folded into
+    /// half a step either way. Unseen (the intro before its glints rise),
+    /// whole: 50 ms past a step's start moves the grid +50 less the lead.
+    /// Seen, a quarter: +40 by +10, and 100 ms past a start — 28 before the
+    /// next — by −7; an error under four ms moves nothing and keeps the kept
+    /// frame. The step lock never moves the grid a whole step, so the ring's
+    /// birth stays on the step the flare's lock chose. CONTROL: a card never
+    /// armed has no grid and gains none.
+    #[test]
+    fn a_step_lock_folds_into_half_a_step() {
+        let s = scene();
+        let mut fresh = HarnessCard::default();
+        fresh.lock_step(Instant::now());
+        assert_eq!(fresh.glint0, None, "CONTROL: no grid, none made");
+        let t0 = Instant::now();
+        let mut card = HarnessCard::default();
+        card.arm(t0, 7);
+        frame(&mut card, t0, &s, true);
+        let g0 = card.glint0.expect("armed");
+        let seen = later(g0, 5 * FLOW_STEP_MS + 50 + FLARE_STEP_LEAD_MS);
+        assert!(!card.glints_shown(seen), "CONTROL: no glint shows yet");
+        card.lock_step(seen);
+        let g1 = later(g0, 50);
+        assert_eq!(card.glint0, Some(g1), "taken whole, unseen");
+        frame(&mut card, t0 + ms(EPISODE_MS - 5), &s, true);
+        let mut kept = CardFrames::default();
+        let at = t0 + ms(EPISODE_MS + 200);
+        let _ = card.draw(at, &s, true, &mut kept);
+        assert!(card.glints_shown(at), "CONTROL: the flow's glints show");
+        let seen_at = |g: Instant, step: u64, off: u64| {
+            later(g, step * FLOW_STEP_MS + off + FLARE_STEP_LEAD_MS)
+        };
+        card.lock_step(seen_at(g1, 60, 3));
+        assert_eq!(card.glint0, Some(g1), "a 3 ms error is noise");
+        assert!(
+            card.replay_step(&s, true, &kept, at + ms(1)).is_some(),
+            "still kept"
+        );
+        card.lock_step(seen_at(g1, 61, 40));
+        let g2 = later(g1, 10);
+        assert_eq!(card.glint0, Some(g2), "slewed by +10");
+        card.lock_step(seen_at(g2, 62, 100));
+        assert_eq!(card.glint0, Some(g2 - ms(7)), "folded, slewed by −7");
+    }
+
+    /// CLAUDE'S REPAINTS CARRY THE FLOWING CARD'S STEPS (design §10.6.11):
+    /// a simulated Claude repaints its mascot every 127.7 ms (the real
+    /// window's MEASURED rate), each repaint 0 to 12 ms late on its beat, on
+    /// a 3072 ms cycle 500 ms off the card's first arm, its flare its first
+    /// repaint in its cycle's first two frames; a host draws or replays the
+    /// card on each repaint's present, locking the ring on the flare's
+    /// rising edge and the steps on every other repaint as the GUI does, and
+    /// draws on the card's own wake when it comes first. Over 30 s of flow
+    /// after 20 s of settling, the card's own wake fires on under a
+    /// twentieth of its steps — Claude's presents draw the rest — and on
+    /// under a fifth with Claude repainting at 128 to 129 ms. NEGATIVE
+    /// CONTROLS: the flare's lock alone follows a 127.7 ms repaint a quarter
+    /// at a time, behind it, and the wake fires on more than half the steps;
+    /// the lock this replaced — the ring born 83 ms before the flare was
+    /// seen — leaves the repaints past the slack, and it fires on nine steps
+    /// in ten or more.
+    #[test]
+    fn claudes_repaints_carry_the_flowing_cards_steps() {
+        let s = scene();
+        // `period`: Claude's repaint period (µs); `extra`: how much further
+        // before the flare the ring is put; `steps_lock`: whether each
+        // repaint locks the steps.
+        let run = |period: u64, extra: u64, steps_lock: bool| {
+            let t0 = Instant::now();
+            let us = |n: u64| t0 + Duration::from_micros(n);
+            let mut card = HarnessCard::default();
+            card.arm(t0, 7);
+            let mut kept = CardFrames::default();
+            let mut draw = |card: &mut HarnessCard, now: Instant| {
+                if card.replay_step(&s, true, &kept, now).is_none() {
+                    let _ = card.draw(now, &s, true, &mut kept);
+                }
+            };
+            draw(&mut card, t0);
+            let claude0 = 500_000u64;
+            let repaint = |n: u64| claude0 + n * period + ((n * 37) % 13) * 1000;
+            let flaring = |at: u64| (at.saturating_sub(claude0) % 3_072_000) < 2 * 128_000;
+            let (mut n, mut lit) = (0u64, false);
+            let (mut fires, mut steps) = (0u64, 0u64);
+            let settle = 20_000_000u64;
+            let end = settle + 30_000_000;
+            let mut last_step = None;
+            loop {
+                let at = repaint(n);
+                if at > end {
+                    break;
+                }
+                // The card's own wake, where it comes before the repaint.
+                while let Some(wake) = card.deadline(us(at)).filter(|&w| w < us(at)) {
+                    let w = u64::try_from(wake.duration_since(t0).as_micros()).unwrap();
+                    draw(&mut card, wake);
+                    if w >= settle {
+                        fires += 1;
+                    }
+                    if card.deadline(wake) == Some(wake) {
+                        break;
+                    }
+                }
+                let flare = flaring(at);
+                if flare && !lit {
+                    card.lock_glint(us(at) - ms(extra));
+                } else if steps_lock {
+                    card.lock_step(us(at) - ms(extra));
+                }
+                lit = flare;
+                draw(&mut card, us(at));
+                if at >= settle {
+                    let step = card.flow_step(us(at));
+                    if step != last_step {
+                        steps += 1;
+                        last_step = step;
+                    }
+                }
+                n += 1;
+            }
+            (fires, steps)
+        };
+        let (fires, steps) = run(127_700, 0, true);
+        assert!(steps > 200, "CONTROL: 30 s of flow ({steps} steps)");
+        assert!(
+            fires * 20 < steps,
+            "rides Claude's repaints: {fires} wakes in {steps} steps"
+        );
+        for period in [128_000, 128_600, 129_000] {
+            let (fires, steps) = run(period, 0, true);
+            assert!(
+                fires * 5 < steps,
+                "{period} µs: still rides them: {fires} wakes in {steps} steps"
+            );
+        }
+        let (fires, steps) = run(127_700, 0, false);
+        assert!(
+            fires * 2 > steps,
+            "NEGATIVE CONTROL: the flare's lock alone falls behind: {fires} of {steps}"
+        );
+        let (fires, steps) = run(127_700, 83 - FLARE_STEP_LEAD_MS, false);
+        assert!(
+            fires * 10 >= steps * 9,
+            "NEGATIVE CONTROL: the old lock's wakes: {fires} of {steps} steps"
+        );
+    }
+
+    /// While an intro runs every frame has a new fingerprint and a deadline
     /// one frame out, and the quads themselves move (for the first five
-    /// seconds at every frame; the last second eases onto the settled frame).
+    /// seconds at every frame; the last second eases into the flow); at its
+    /// end the flow's first frame is owed at once, then the step grid.
     #[test]
     fn episode_frames_move_and_keep_a_deadline() {
         for s in scenes() {
@@ -4344,16 +5750,25 @@ mod tests {
                 prev = Some(f);
                 at += FRAME_MS;
             }
-            // One last wake for the settled frame, then none.
             let end = t0 + ms(EPISODE_MS);
-            assert_eq!(card.deadline(end), Some(end));
+            assert_eq!(
+                card.deadline(end),
+                Some(end),
+                "the flow's first frame is owed"
+            );
             frame(&mut card, end, &s, true);
-            assert_eq!(card.deadline(end), None);
+            let step = EPISODE_MS / FLOW_STEP_MS;
+            assert_eq!(
+                card.deadline(end),
+                Some(t0 + ms((step + 1) * FLOW_STEP_MS + FLOW_SLACK_MS)),
+                "then the step grid"
+            );
         }
     }
 
     /// Every quad of every frame lies in exactly one row band, tagged with it,
-    /// and inside the box.
+    /// and inside the box: through the intro and two whole ripple cycles of
+    /// the flow after it.
     #[test]
     fn every_quad_lies_in_one_band_inside_the_box() {
         for s in scenes() {
@@ -4361,7 +5776,7 @@ mod tests {
             let mut card = HarnessCard::default();
             card.arm(t0, 3);
             let mut at = 0;
-            while at <= EPISODE_MS + 100 {
+            while at <= EPISODE_MS + 2 * GLINT_PERIOD_MS + 100 {
                 let (under, over, _) = frame(&mut card, t0 + ms(at), &s, true);
                 for q in &under {
                     assert_in_band_and_box(q, &s, &format!("under at {at} ms"));
@@ -4381,7 +5796,9 @@ mod tests {
     /// side gains one slice in each of those bands (four quads in all), and
     /// the left and right edges stay where they were. The trail, the kitty,
     /// its rim, the field, the sparkles and the burst are the same quads,
-    /// settled, riding and seated, at both heights and on both grounds. At
+    /// settled, riding, seated and flowing (the glints measured from the
+    /// wand's cell, the hue's pace a time: neither reads the border's
+    /// length), at both heights and on both grounds. At
     /// the pane's first row the air over the box is ignored: the border is
     /// the airless one. CONTROL: with no air the border's edges lie on the
     /// boxed rows' bands, and no quad is tagged with a row over or under them.
@@ -4416,6 +5833,8 @@ mod tests {
                 Clock::riding(150),
                 Clock::riding(1300),
                 Clock::seated(150),
+                Clock::flowing(EPISODE_MS + 500),
+                Clock::flowing(EPISODE_MS + 1900),
             ] {
                 let (a, b) = (parts(&bare, clock), parts(&aired(bare), clock));
                 let what = format!("{} rows, {clock:?}", bare.kitty_rows);
@@ -4565,13 +5984,14 @@ mod tests {
             .collect()
     }
 
-    /// On a light theme every quad is source-over, through an episode, and
-    /// the card is one printed piece: the border, the trail, the rim and the
-    /// kitty are opaque, and a mark that lets the ground through (a star's
-    /// taper, a twinkle's dip, a fading burst or sparkle) is exactly one of
-    /// the print inks or the paper's white at its opacity — no washed-out
-    /// light ink anywhere. CONTROL: the light-ink law's red, laid as a star
-    /// was before, is none of them.
+    /// On a light theme every quad is source-over, through the intro and two
+    /// whole ripple cycles of the flow, and the card is one printed piece:
+    /// the border, the trail, the rim and the kitty are opaque, and a mark
+    /// that lets the ground through (a star's taper, a twinkle's dip, a
+    /// fading burst or sparkle) is exactly one of the print inks or the
+    /// paper's white at its opacity — no washed-out light ink anywhere.
+    /// CONTROL: the light-ink law's red, laid as a star was before, is none
+    /// of them.
     #[test]
     fn a_light_theme_is_source_over_ink_throughout() {
         for s in scenes().into_iter().filter(|s| !s.dark) {
@@ -4580,7 +6000,9 @@ mod tests {
             let t0 = Instant::now();
             let mut card = HarnessCard::default();
             card.arm(t0, 5);
-            for at in (0..=EPISODE_MS).step_by(30) {
+            let flow =
+                (EPISODE_MS..=EPISODE_MS + 2 * GLINT_PERIOD_MS).step_by(FLOW_STEP_MS as usize);
+            for at in (0..EPISODE_MS).step_by(30).chain(flow) {
                 let (under, over, _) = frame(&mut card, t0 + ms(at), &s, true);
                 for q in under.iter().chain(&over) {
                     assert!(
@@ -4609,12 +6031,21 @@ mod tests {
     }
 
     /// The breaches of the one-printed-piece law in one light frame's point
-    /// marks (`marks`) over its trail (`trail`): a white pixel off the
-    /// trail's ink, or an ink pixel on it. Empty when it holds.
-    fn print_breaches(marks: &[GlowQuad], trail: &[GlowQuad]) -> Vec<String> {
+    /// marks (`marks`, laid in `palette`'s inks) over its trail (`trail`): a
+    /// white pixel off the trail's ink, or an ink pixel on it. A mark so
+    /// faint that the paper's white and one of the palette's inks come to
+    /// the same colour at its opacity (Off's silvers at alpha 1) prints the
+    /// same either way and breaches nothing. Empty when it holds.
+    fn print_breaches(marks: &[GlowQuad], trail: &[GlowQuad], palette: CardPalette) -> Vec<String> {
+        let inks: Vec<u32> = (0..TRAIL_STOPS.len())
+            .map(|k| palette.star_ink(k))
+            .collect();
         let mut out = Vec::new();
         for q in marks {
             let white = q.color == premul_rgb(WHITE, q.alpha);
+            if white && inks.iter().any(|&k| premul_rgb(k, q.alpha) == q.color) {
+                continue;
+            }
             for y in i64::from(q.y)..i64::from(q.y) + i64::from(q.h) {
                 for x in i64::from(q.x)..i64::from(q.x) + i64::from(q.w) {
                     if white != on_any(trail, x, y) {
@@ -4626,8 +6057,8 @@ mod tests {
         out
     }
 
-    /// ONE PRINTED PIECE (§10.6.10): on a light ground, at both heights, both
-    /// palettes, through the ride, the burst and the twinkle, and settled,
+    /// ONE PRINTED PIECE (§10.6.10): on a light ground, at both heights, every
+    /// palette, through the ride, the burst and the twinkle, and settled,
     /// every pixel of a star, a sparkle or the burst that lies on the
     /// trail's ink is the paper's white (a glint cut out of the print) and
     /// every other is print ink: no ink star ever lies on a stripe, where it
@@ -4650,7 +6081,12 @@ mod tests {
         {
             for t in (0..=EPISODE_MS).step_by(30).map(Some).chain([None]) {
                 for ride_ms in [t, None] {
-                    let clock = Clock { t_ms: t, ride_ms };
+                    let clock = Clock {
+                        t_ms: t,
+                        ride_ms,
+                        glint: None,
+                        flow: None,
+                    };
                     let p = parts(&s, clock);
                     let marks: Vec<GlowQuad> = p
                         .stars
@@ -4659,7 +6095,7 @@ mod tests {
                         .chain(&p.burst)
                         .copied()
                         .collect();
-                    let bad = print_breaches(&marks, &p.trail);
+                    let bad = print_breaches(&marks, &p.trail, s.palette);
                     assert!(
                         bad.is_empty(),
                         "{t:?}/{ride_ms:?}: {:?}",
@@ -4700,11 +6136,14 @@ mod tests {
             &[],
             false,
         );
-        assert!(!print_breaches(&old, &p.trail).is_empty(), "CONTROL");
+        assert!(
+            !print_breaches(&old, &p.trail, s.palette).is_empty(),
+            "CONTROL"
+        );
     }
 
     /// THE LIGHT MARKS LIE ONLY ON CELLS THE HOST READ BLANK: on a light
-    /// ground, at both heights, both palettes, through the ride, the burst
+    /// ground, at both heights, every palette, through the ride, the burst
     /// and the twinkle, every star, sparkle and burst quad lies in the
     /// card's first two rows between the trail's start and the border's
     /// column (`claude_card.rs`'s `layout` reads `[start, cols)` blank on
@@ -4729,7 +6168,15 @@ mod tests {
             };
             for t in (0..=EPISODE_MS).step_by(30).map(Some).chain([None]) {
                 for ride_ms in [t, None] {
-                    let p = parts(&s, Clock { t_ms: t, ride_ms });
+                    let p = parts(
+                        &s,
+                        Clock {
+                            t_ms: t,
+                            ride_ms,
+                            glint: None,
+                            flow: None,
+                        },
+                    );
                     for q in p.stars.iter().chain(&p.sparkles).chain(&p.burst) {
                         marks_seen += 1;
                         let (x, y) = (i64::from(q.x), i64::from(q.y));
@@ -4787,8 +6234,8 @@ mod tests {
         assert!(across_dark > 0, "CONTROL");
     }
 
-    /// THE KEPT LINE INKS ARE THE LAW: for each palette, a table solved on
-    /// white gives every step's [`CardPalette::text_at`] there, on white and,
+    /// THE KEPT LINE INKS ARE THE LAW: for each palette (Off's silver
+    /// included), a table solved on white gives every step's [`CardPalette::text_at`] there, on white and,
     /// asked for Gruvbox Light's cream, on the cream — a reader asking for
     /// another ground than the kept one gets the law's answer. A light tick
     /// keeps its palette's and ground's inks, and solves again for another
@@ -4799,7 +6246,7 @@ mod tests {
     fn the_kept_line_inks_are_the_law() {
         let cream = 0x00FB_F1C7;
         let step = |i: usize| i as f32 / LINE_INK_STEPS as f32;
-        for palette in [CardPalette::Cruise, CardPalette::Land] {
+        for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
             let mut inks = LineInks::default();
             inks.solve(palette, WHITE);
             for i in 0..=LINE_INK_STEPS {
@@ -4898,7 +6345,7 @@ mod tests {
     }
 
     /// THE RIDE'S SPARKLES LIE WHOLE ON THE TRAIL'S INK on a light ground: at
-    /// every scene's cell turned light, both palettes and heights, through
+    /// every scene's cell turned light, every palette and height, through
     /// the ride, each sparkle shed on the fresh trail is the paper's white
     /// (a glint cut out of the print) and whole — its box as tall as it is
     /// wide, never cut at the band's edge into half a star — wherever the
@@ -4920,6 +6367,8 @@ mod tests {
                     Clock {
                         t_ms: Some(t),
                         ride_ms: Some(t),
+                        glint: None,
+                        flow: None,
                     },
                 );
                 for b in star_boxes(&p.sparkles) {
@@ -4952,6 +6401,8 @@ mod tests {
         let clock = Clock {
             t_ms: Some(300),
             ride_ms: Some(300),
+            glint: None,
+            flow: None,
         };
         let cx = Emit::new(&s, geo, clock, 7);
         let region = star_region(&geo, &s).expect("a region");
@@ -5136,7 +6587,7 @@ mod tests {
     }
 
     /// THE BURST'S STARS LIE WHOLE (§10.6.10): on a light ground, in every
-    /// scene with a trail, both palettes and heights, five seeds, on the
+    /// scene with a trail, every palette and height, five seeds, on the
     /// ride and re-armed, through the burst, the burst covers exactly the
     /// pixels its stars reach in the region, each star laid alone in one
     /// tone: a star that crosses the trail's edge, or reaches past its end
@@ -5160,6 +6611,8 @@ mod tests {
                         let clock = Clock {
                             t_ms: Some(t),
                             ride_ms: ride.then_some(t),
+                            glint: None,
+                            flow: None,
                         };
                         let cx = Emit::new(&s, geo, clock, seed);
                         let Some(ring) = cx.burst_ring() else {
@@ -5213,7 +6666,7 @@ mod tests {
     /// THE LIGHT SWEEP ONLY DEEPENS A SHADE: through a light episode, every
     /// letter of the line keeps at least 0.69 of the value (its brightest
     /// channel) of its unswept ink — the paper law's ink at its place — on
-    /// the brightest and the dimmest light built-in, both palettes; at the
+    /// the brightest and the dimmest light built-in, every palette; at the
     /// dark ground's gain a vivid letter would pass through a near-black
     /// brown. The sweep does deepen: its darkest letter falls under 0.8.
     /// NEGATIVE CONTROL: the dark ground's gain takes a letter under 0.69.
@@ -5225,7 +6678,7 @@ mod tests {
         let dimmest = grounds.iter().min_by(|a, b| lum(a).total_cmp(&lum(b)));
         let value = |rgb: u32| (rgb >> 16).max((rgb >> 8) & 0xff).max(rgb & 0xff) as f32;
         for &(name, g) in brightest.into_iter().chain(dimmest) {
-            for palette in [CardPalette::Cruise, CardPalette::Land] {
+            for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
                 let t0 = Instant::now();
                 let mut card = HarnessCard::default();
                 let page = CardScene {
@@ -5246,8 +6699,10 @@ mod tests {
                     let clock = Clock {
                         t_ms: Some(run),
                         ride_ms: None,
+                        glint: None,
+                        flow: None,
                     };
-                    let phi = clock.drift(LINE_DRIFT);
+                    let phi = clock.line_drift(LINE_DRIFT);
                     for (i, c) in card.line_ink(now, 0, 0, len, g, true).iter().enumerate() {
                         let rgb = (u32::from(c.color[0]) << 16)
                             | (u32::from(c.color[1]) << 8)
@@ -5382,7 +6837,8 @@ mod tests {
     }
 
     /// THE LINE READS ON EVERY LIGHT GROUND: through an episode and
-    /// settled, both palettes, every letter at 4.5:1 or more against its
+    /// settled, every palette (Off's silver letters as well as Cruise's and
+    /// Land's hues), every letter at 4.5:1 or more against its
     /// ground — every light built-in, and a light ground dimmer than any of
     /// them, which the law reads. NEGATIVE CONTROL: the letters solved for
     /// white paper, laid on that dim ground, fall under AA.
@@ -5392,7 +6848,7 @@ mod tests {
         assert!(!dark_ground(dim));
         let mut grounds: Vec<u32> = light_builtins().into_iter().map(|(_, g)| g).collect();
         grounds.push(dim);
-        for palette in [CardPalette::Cruise, CardPalette::Land] {
+        for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
             for &g in &grounds {
                 // The card ticked on the ground, as the host does, so its
                 // kept inks are read.
@@ -5488,13 +6944,14 @@ mod tests {
         }
     }
 
-    /// An episode held back before it was ever drawn animating is OWED, not
-    /// thrown away: the load-shed latch (or reduced motion, an unfocused
-    /// window) forcing `animate == false` just as the card is first found
-    /// delays the show. The first tick that may animate plays it from that
-    /// tick — the burst flies, a deadline is wanted — even when the held-back
-    /// stretch outlasted the episode; it then settles a whole episode later.
-    /// The held-back ticks put the settled frame on the glass, so the kitty
+    /// An episode held back before any of it was drawn — reduced motion, an
+    /// unfocused window, the load-shed latch on as the card is found — is
+    /// owed, not lost: the held-back ticks draw the settled frame and want
+    /// no frames, which delays the show. The first tick that may animate
+    /// plays it from that tick — the burst flies, a deadline is wanted —
+    /// even when the held-back stretch outlasted the episode; its intro then
+    /// runs a whole episode from there, and the flow takes over. The
+    /// held-back ticks put the settled frame on the glass, so the kitty
     /// plays the owed episode in its seat ([`Ride`]): no ride.
     #[test]
     fn an_episode_held_back_before_it_played_is_owed() {
@@ -5527,16 +6984,21 @@ mod tests {
             assert_eq!(frame(&mut shown, go, &s, true).1, first, "held {held}");
             // A whole episode from `go`, not from the arm.
             let late = go + ms(EPISODE_MS - FRAME_MS);
-            assert_ne!(frame(&mut card, late, &s, true).2, rest_fp, "held {held}");
+            frame(&mut card, late, &s, true);
+            assert!(card.intro_live(), "held {held}: the intro still runs");
             let done = go + ms(EPISODE_MS);
-            assert_eq!(frame(&mut card, done, &s, true).2, rest_fp, "held {held}");
+            assert_ne!(frame(&mut card, done, &s, true).2, rest_fp, "held {held}");
+            assert!(
+                !card.intro_live() && card.flowing(done),
+                "held {held}: then the flow"
+            );
         }
     }
 
     /// An episode already drawn animating keeps its clock while motion is
     /// withheld (the settled frame, no deadline) and resumes on that clock
-    /// when motion comes back inside it; past its end it is simply settled.
-    /// It is not owed again.
+    /// when motion comes back inside it; past its end the card flows from
+    /// the settled colours the glass last showed. It is not owed again.
     #[test]
     fn a_playing_episode_held_back_keeps_its_clock() {
         let s = scene();
@@ -5558,17 +7020,27 @@ mod tests {
             "resumed on the arm's clock"
         );
         frame(&mut card, t0 + ms(2100), &s, false);
-        let (_, after, fp) = frame(&mut card, t0 + ms(EPISODE_MS + 100), &s, true);
-        assert_eq!((after, fp), (rest, rest_fp), "past its end it is settled");
-        assert_eq!(card.deadline(t0 + ms(EPISODE_MS + 100)), None);
+        let past = t0 + ms(EPISODE_MS + 100);
+        let (_, after, fp) = frame(&mut card, past, &s, true);
+        assert!(
+            !card.intro_live() && card.flowing(past),
+            "past its end it flows"
+        );
+        assert_ne!(fp, rest_fp, "a flow frame");
+        assert_eq!(after, rest, "from the settled colours");
+        let step = (EPISODE_MS + 100) / FLOW_STEP_MS;
+        assert_eq!(
+            card.deadline(past),
+            Some(t0 + ms((step + 1) * FLOW_STEP_MS + FLOW_SLACK_MS))
+        );
     }
 
-    /// The deadline is not a function of `now` alone: once the episode runs
+    /// The deadline is not a function of `now` alone: once the intro runs
     /// out after a tick that drew one of its frames, the card asks for
-    /// `now`, so the settled frame is drawn promptly; the tick that draws it
-    /// ends the asking.
+    /// `now`, so the flow's first frame is drawn promptly; the tick that
+    /// draws it asks for the next step instead.
     #[test]
-    fn the_settled_frame_is_asked_for_until_it_is_drawn() {
+    fn the_flows_first_frame_is_asked_for_until_it_is_drawn() {
         let s = scene();
         let t0 = Instant::now();
         let mut card = HarnessCard::default();
@@ -5577,12 +7049,17 @@ mod tests {
         frame(&mut card, last, &s, true);
         assert_eq!(card.deadline(last), Some(last + ms(FRAME_MS)));
         let past = t0 + ms(EPISODE_MS + 250);
-        assert_eq!(card.deadline(past), Some(past), "the settled frame is owed");
+        assert_eq!(
+            card.deadline(past),
+            Some(past),
+            "the flow's first frame is owed"
+        );
         assert_eq!(card.deadline(past), Some(past), "asked until drawn");
         let (_, _, fp) = frame(&mut card, past, &s, true);
-        assert_eq!(fp, settled(&s).2);
-        assert_eq!(card.deadline(past), None, "drawn: idle at zero");
-        assert_eq!(card.deadline(past + ms(5000)), None);
+        assert_ne!(fp, settled(&s).2, "a flow frame");
+        let k = (EPISODE_MS + 250) / FLOW_STEP_MS;
+        let next = t0 + ms((k + 1) * FLOW_STEP_MS + FLOW_SLACK_MS);
+        assert_eq!(card.deadline(past), Some(next), "drawn: the next step");
         // A held-back tick draws the settled frame itself: nothing is owed.
         let mut held = HarnessCard::default();
         held.arm(t0, 7);
@@ -5591,13 +7068,14 @@ mod tests {
         assert_eq!(held.deadline(past), None);
     }
 
-    /// A host that stops ticking after the last episode frame (the frame
+    /// A host that stops ticking after the last intro frame (the frame
     /// scrolled back, the card's version no longer the process's, the pane
     /// hidden) but asks for the deadline every loop is asked to wake at
-    /// once only until [`SETTLE_GRACE_MS`] past the episode's end, then let
-    /// idle: never a spin for as long as the card goes unticked. A re-armed
-    /// card that is never ticked asks for frames while its episode would
-    /// run, then nothing — not the settled frame of the episode before it.
+    /// once only until [`SETTLE_GRACE_MS`] past the last frame it drew,
+    /// then let idle: never a spin for as long as the card goes unticked.
+    /// A re-armed card that is never ticked asks for frames while its
+    /// episode would run, then nothing — not the flow of the episode before
+    /// it.
     #[test]
     fn an_unticked_card_stops_asking_after_the_grace() {
         let s = scene();
@@ -5605,27 +7083,32 @@ mod tests {
         let mut card = HarnessCard::default();
         card.arm(t0, 7);
         let mut at = 0;
+        let mut last = 0;
         while at < EPISODE_MS {
             frame(&mut card, t0 + ms(at), &s, true);
+            last = at;
             at += FRAME_MS;
         }
         let end = t0 + ms(EPISODE_MS);
-        assert_eq!(card.deadline(end), Some(end), "the settled frame is owed");
+        assert_eq!(
+            card.deadline(end),
+            Some(end),
+            "the flow's first frame is owed"
+        );
         // The host asks every millisecond for ten seconds and never ticks.
         let asked: Vec<u64> = (0..10_000)
             .filter(|&k| card.deadline(end + ms(k)).is_some())
             .collect();
         assert_eq!(
             asked,
-            (0..SETTLE_GRACE_MS).collect::<Vec<_>>(),
+            (0..last + SETTLE_GRACE_MS - EPISODE_MS).collect::<Vec<_>>(),
             "asked only inside the grace"
         );
-        let after = end + ms(SETTLE_GRACE_MS);
-        assert_eq!(card.deadline(after), None);
-        // The tick that comes late still draws the settled frame.
+        assert_eq!(card.deadline(t0 + ms(last + SETTLE_GRACE_MS)), None);
+        // The tick that comes late still draws, and flows.
         let late = end + ms(60_000);
-        assert_eq!(frame(&mut card, late, &s, true).2, settled(&s).2);
-        assert_eq!(card.deadline(late), None);
+        assert_ne!(frame(&mut card, late, &s, true).2, settled(&s).2);
+        assert!(card.flowing(late) && card.deadline(late).is_some_and(|d| d > late));
 
         // Re-armed after an episode frame, then never ticked.
         let mut rearmed = HarnessCard::default();
@@ -5638,15 +7121,44 @@ mod tests {
         assert_eq!(rearmed.deadline(gone), None, "no frame of its own drawn");
     }
 
+    /// The backstop holds for a FLOWING card too: a host that stops ticking
+    /// it (an occluded window, whose splice never runs) but asks every loop
+    /// is told the same next step, a fixed instant, until
+    /// [`SETTLE_GRACE_MS`] past the last frame it drew, then nothing; the
+    /// tick that comes late draws the late step and asks for the one after.
+    #[test]
+    fn an_unticked_flowing_card_stops_asking_after_the_grace() {
+        let s = scene();
+        let t0 = Instant::now();
+        let mut card = played(&s, t0);
+        let drawn = t0 + ms(EPISODE_MS + 300);
+        frame(&mut card, drawn, &s, true);
+        let step = |at: u64| at / FLOW_STEP_MS;
+        let next = |k: u64| t0 + ms((k + 1) * FLOW_STEP_MS + FLOW_SLACK_MS);
+        let k = step(EPISODE_MS + 300);
+        let asked: Vec<u64> = (0..10_000)
+            .filter(|&j| card.deadline(drawn + ms(j)).is_some())
+            .collect();
+        assert_eq!(asked, (0..SETTLE_GRACE_MS).collect::<Vec<_>>(), "the grace");
+        assert!(
+            (0..SETTLE_GRACE_MS).all(|j| card.deadline(drawn + ms(j)) == Some(next(k))),
+            "one fixed instant"
+        );
+        let late = drawn + ms(60_000);
+        frame(&mut card, late, &s, true);
+        assert_eq!(card.deadline(late), Some(next(step(EPISODE_MS + 60_300))));
+    }
+
     /// A tick with nothing to draw — an inverted or empty clip, no columns,
     /// no rows, no cell size: a pane mid-layout — draws nothing and holds
     /// the episode back like `animate == false`: an episode not yet drawn is
     /// owed (no deadline meanwhile) and plays whole from the first tick that
-    /// draws, even past the episode's length; a playing one keeps its clock.
+    /// draws, even past the episode's length; a playing one keeps its clock,
+    /// and the flow takes over at its end.
     #[test]
     fn nothing_to_draw_holds_the_episode_back() {
         let s = scene();
-        let (_, rest, rest_fp) = settled(&s);
+        let (_, rest, _) = settled(&s);
         for (what, blank) in [
             (
                 "an inverted clip",
@@ -5708,19 +7220,21 @@ mod tests {
                 "{what}: resumed on the arm's clock"
             );
             let done = t0 + ms(EPISODE_MS + 100);
-            assert_eq!(frame(&mut card, done, &s, true).2, rest_fp, "{what}");
+            assert_ne!(frame(&mut card, done, &s, true).2, 0, "{what}");
+            assert!(card.flowing(done), "{what}: the flow takes over");
         }
     }
 
     /// An owed episode's debt lapses [`OWED_MAX_MS`] after the arm: a tick
-    /// that may animate before then plays it, one at or after it draws the
-    /// settled frame and wants no frames, so the show never plays minutes
-    /// later on an unrelated redraw. Held back by `animate == false` or by
-    /// nothing to draw alike; a fresh arm owes a fresh episode.
+    /// that may animate before then plays it; one at or after it plays no
+    /// intro — the card flows, from the settled colours and with no burst —
+    /// so the show never plays minutes later on an unrelated redraw. Held
+    /// back by `animate == false` or by nothing to draw alike; a fresh arm
+    /// owes a fresh episode.
     #[test]
     fn an_owed_episode_lapses_after_its_dwell() {
         let s = scene();
-        let (_, _, rest_fp) = settled(&s);
+        let (_, rest_over, rest_fp) = settled(&s);
         let blank = CardScene { cols: 0, ..s };
         for (held_by, animate, by) in [("reduced", false, &s), ("nothing to draw", true, &blank)] {
             for (at, plays) in [
@@ -5733,18 +7247,26 @@ mod tests {
                 card.arm(t0, 7);
                 frame(&mut card, t0 + ms(10), by, animate);
                 let now = t0 + ms(at);
-                let (_, _, fp) = frame(&mut card, now, &s, true);
+                let (_, over, fp) = frame(&mut card, now, &s, true);
                 let what = format!("{held_by}: paid at {at} ms");
-                assert_eq!(fp != rest_fp, plays, "{what}");
-                let want = plays.then(|| now + ms(FRAME_MS));
-                assert_eq!(card.deadline(now), want, "{what}");
+                assert_ne!(fp, rest_fp, "{what}: it moves either way");
+                assert_eq!(card.intro_live(), plays, "{what}");
+                let want = if plays {
+                    now + ms(FRAME_MS)
+                } else {
+                    t0 + ms((at / FLOW_STEP_MS + 1) * FLOW_STEP_MS + FLOW_SLACK_MS)
+                };
+                assert_eq!(card.deadline(now), Some(want), "{what}");
                 if !plays {
-                    // Lapsed for good: a later tick is settled too…
+                    assert_eq!(over, rest_over, "{what}: no burst, the settled colours");
+                    // Lapsed for good: a later tick flows on…
                     let after = now + ms(1000);
-                    assert_eq!(frame(&mut card, after, &s, true).2, rest_fp, "{what}");
+                    frame(&mut card, after, &s, true);
+                    assert!(!card.intro_live() && card.flowing(after), "{what}");
                     // …until an arm owes a fresh episode.
                     card.arm(after, 7);
-                    assert_ne!(frame(&mut card, after, &s, true).2, rest_fp, "{what}");
+                    frame(&mut card, after, &s, true);
+                    assert!(card.intro_live(), "{what}: a fresh episode");
                 }
             }
         }
@@ -5896,10 +7418,7 @@ mod tests {
                     let f = frame(&mut card, t0 + ms(t), &s, true);
                     (f.0, f.1)
                 };
-                let clock = Clock {
-                    t_ms: Some(t - re),
-                    ride_ms: Some(t),
-                };
+                let clock = Clock::intro(t - re, Some(t));
                 assert_eq!((under, over.clone()), whole(&s, clock), "{what}: {t} ms");
                 let x0 = kitty_left(&over).expect("a kitty");
                 assert!(x0 >= last, "{what}: {t} ms, back from {last} to {x0}");
@@ -5911,15 +7430,9 @@ mod tests {
                 "{what}: control"
             );
             assert!(
-                !parts(
-                    &s,
-                    Clock {
-                        t_ms: Some(RIDE_MS + 10 - re),
-                        ride_ms: Some(RIDE_MS + 10),
-                    }
-                )
-                .burst
-                .is_empty(),
+                !parts(&s, Clock::intro(RIDE_MS + 10 - re, Some(RIDE_MS + 10)))
+                    .burst
+                    .is_empty(),
                 "{what}: the burst where the ride ends"
             );
             // Armed again once the ride ran out: the burst at the start.
@@ -6357,7 +7870,7 @@ mod tests {
         }
     }
 
-    /// THE RAINBOW'S GLINTS LIE ON ITS STRIPES (§10.6.11): on every scene
+    /// THE RAINBOW'S GLINTS LIE ON ITS STRIPES (§10.6.16): on every scene
     /// with a trail, settled and through a whole episode, riding in and
     /// seated, every glint's quad lies inside the trail's band less the
     /// wave's step (so on the rainbow in every frame, the stripes' edges
@@ -6471,10 +7984,13 @@ mod tests {
     /// diffraction glints when the trail's shimmer reaches it, and is back
     /// at its rest size between passes; it flares on every pass the episode
     /// holds (the shimmer's, under the photosensitivity bound), and the
-    /// episode's last frame lays the settled glints' very pixels, so the
-    /// settled frame follows without a jump. At the shipping cell sizes, on
-    /// both grounds and at both heights. NEGATIVE CONTROL: away from the
-    /// sheen a glint is its settled size and throws no glints.
+    /// intro's last frame hands the flow its glints: each the size, and
+    /// throwing its glints or not, as the flow's first step lays it, so the
+    /// flow follows without a jump (§10.6.16, composed with the flow: the
+    /// ripple's crest flares a glint over the intro's last eighth as it does
+    /// in the flow). At the shipping cell sizes, on both grounds and at both
+    /// heights. NEGATIVE CONTROL: away from the sheen a glint is its settled
+    /// size and throws no glints.
     #[test]
     fn a_glint_flares_as_the_sheen_passes() {
         for s in glint_scenes()
@@ -6543,15 +8059,103 @@ mod tests {
                 );
                 assert!(rest_between, "{what}: CONTROL, back at rest between passes");
             }
-            // The episode's last frame lays the settled glints' very
-            // pixels: the same quads, colour and coverage included, not only
-            // the same rectangles, so neither a size nor a brightness pops
-            // when the settled frame replaces it.
+            // The intro's last frame and the flow's first lay each glint
+            // alike: neither a size nor the dots pop at the handover.
             let last = parts(&s, Clock::seated(EPISODE_MS - 1));
-            assert_eq!(
-                last.glints, settled.glints,
-                "{what}: no jump into the settled frame"
-            );
+            let first = parts(&s, Clock::flowing(EPISODE_MS));
+            for spot in glints.spots() {
+                assert_eq!(
+                    read(&last, spot),
+                    read(&first, spot),
+                    "{what}: no jump into the flow"
+                );
+            }
+        }
+    }
+
+    /// A FLOWING GLINT FLARES AS THE RIPPLE PASSES — Claude's `✦` flaring
+    /// with its ring (§10.6.16, composed with the flow): through one cycle
+    /// of the flow, on its step grid, each glint grows past its rest size
+    /// and throws its four diffraction glints at some step, where the
+    /// ripple's crest is on it, and is the standard star with no glints at
+    /// another; never larger than its flare. Under Off, on dark, a glint is
+    /// the moonbow's starlight, not Cruise's gold. At the shipping cell
+    /// sizes, on both grounds and at both heights. CONTROL: the held card
+    /// (the settled frame) lays every glint at rest, with no glints.
+    #[test]
+    fn a_flowing_glint_flares_as_the_ripple_passes() {
+        let chroma = |rgb: u32| {
+            let [_, r, g, b] = rgb.to_be_bytes();
+            r.max(g).max(b) - r.min(g).min(b)
+        };
+        for s in glint_scenes()
+            .into_iter()
+            .filter(|s| s.trail == Some((32, 52)))
+        {
+            let what = format!("{}x{} {} rows dark {}", s.cw, s.ch, s.kitty_rows, s.dark);
+            let g = Geo::new(&s).expect("a scene");
+            let glints = glint_spots(&g, &s, 7);
+            assert_eq!(glints.n, GLINTS_MAX, "{what}");
+            let reach = glints.flare + 1;
+            let read = |p: &Parts, spot: &GlintSpot| {
+                let mine: Vec<Rect> = p
+                    .glints
+                    .iter()
+                    .map(rect_of)
+                    .filter(|r| (r.x0 - spot.x).abs() <= reach && (r.y0 - spot.y).abs() <= reach)
+                    .collect();
+                let half = mine
+                    .iter()
+                    .map(|r| (r.x1 - 1 - spot.x).max(spot.x - r.x0))
+                    .max()
+                    .expect("a glint");
+                let dots = mine.iter().any(|r| {
+                    r.x1 - r.x0 == 1 && r.y1 - r.y0 == 1 && r.x0 != spot.x && r.y0 != spot.y
+                });
+                (half, dots)
+            };
+            let held = parts(&s, Clock::SETTLED);
+            let steps: Vec<Parts> = (0..GLINT_PERIOD_MS / FLOW_STEP_MS)
+                .map(|k| parts(&s, Clock::flowing(EPISODE_MS + k * FLOW_STEP_MS)))
+                .collect();
+            for spot in glints.spots() {
+                assert_eq!(
+                    read(&held, spot),
+                    (glints.rest, false),
+                    "{what}: CONTROL, the held card's glint at rest"
+                );
+                let seen: Vec<(i64, bool)> = steps.iter().map(|p| read(p, spot)).collect();
+                assert!(
+                    seen.iter()
+                        .all(|&(half, _)| (glints.rest..=glints.flare).contains(&half)),
+                    "{what}: {seen:?}"
+                );
+                assert!(
+                    seen.iter().any(|&(half, dots)| half > glints.rest && dots),
+                    "{what}: the crest flares the glint at ({}, {}): {seen:?}",
+                    spot.x,
+                    spot.y
+                );
+                assert!(
+                    seen.contains(&(glints.rest, false)),
+                    "{what}: and it is back at rest off the crest: {seen:?}"
+                );
+            }
+            if s.dark {
+                let off = CardScene {
+                    palette: CardPalette::Off,
+                    ..s
+                };
+                let starlight = parts(&off, Clock::SETTLED).glints;
+                assert!(
+                    !starlight.is_empty() && starlight.iter().all(|q| chroma(q.color) < 0x20),
+                    "{what}: Off's glints are starlight"
+                );
+                assert!(
+                    held.glints.iter().any(|q| chroma(q.color) >= 0x20),
+                    "{what}: CONTROL, Cruise's are gold"
+                );
+            }
         }
     }
 
@@ -6640,7 +8244,8 @@ mod tests {
         }
     }
 
-    /// Equal inputs give equal bytes, and the seed moves the stars.
+    /// Equal inputs give equal bytes — the intro's frames and the flow's, two
+    /// ripple cycles on — and the seed moves the stars.
     #[test]
     fn the_card_is_deterministic() {
         for s in scenes() {
@@ -6648,7 +8253,13 @@ mod tests {
             let (mut a, mut b) = (HarnessCard::default(), HarnessCard::default());
             a.arm(t0, 42);
             b.arm(t0, 42);
-            for at in [0, 33, 700, 2600, EPISODE_MS + 5] {
+            let flow = [
+                EPISODE_MS + 5,
+                EPISODE_MS + 900,
+                EPISODE_MS + 3100,
+                EPISODE_MS + 6200,
+            ];
+            for at in [0, 33, 700, 2600].into_iter().chain(flow) {
                 assert_eq!(
                     frame(&mut a, t0 + ms(at), &s, true),
                     frame(&mut b, t0 + ms(at), &s, true)
@@ -6707,68 +8318,92 @@ mod tests {
         )
     }
 
-    /// A CARD AT REST IS REPLAYED, BIT FOR BIT ([`HarnessCard::replay`]):
+    /// A CARD AT REST IS REPLAYED, BIT FOR BIT, AND A FLOWING ONE BETWEEN
+    /// ITS STEPS ([`HarnessCard::replay`], [`HarnessCard::replay_step`]):
     /// beside a twin that draws every step, a card driven the host's way
-    /// (`replay`, else `draw`) hands back the same contents at the same
-    /// origin and shows its host the same card (its deadlines, its line, at
-    /// rest and still) after every step of a life — an episode, its end,
-    /// still frames, a scene that changes, serious mode, a window that loses
-    /// motion and an episode owed until motion comes back, and an owed debt
-    /// that lapses. A replay takes no clock, and hands back the kept `Arc`s
-    /// themselves: it seals nothing and copies nothing. CONTROL: every
-    /// episode frame, every first frame of a new scene and every step out
-    /// of an owed episode is drawn (and seals its contents), and the
-    /// replays happen — on every still step after the first.
+    /// (`replay`, else the clock and `replay_step`, else `draw`) hands back
+    /// the same contents at the same origin and shows its host the same card
+    /// (its deadlines, its line, at rest and still) after every step of a
+    /// life — an intro, the flow after it, still frames, a scene that
+    /// changes, serious mode, a window that loses motion and an episode owed
+    /// until motion comes back, and an owed debt that lapses into the flow.
+    /// A held replay takes no clock; a flow step's second frame takes one.
+    /// Both hand back the kept `Arc`s themselves: they seal nothing and copy
+    /// nothing. CONTROL: every intro frame, every first frame of a new scene
+    /// or a new step and every step out of an owed episode is drawn (and
+    /// seals its contents), and the replays happen — on every held step
+    /// after the first and every flow frame inside its step after the first.
     #[test]
     fn a_card_at_rest_is_replayed_bit_for_bit() {
+        /// How a step reaches the glass.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum Way {
+            /// Drawn: the clock read and the frame computed.
+            Draw,
+            /// The held card's settled frame, replayed with no clock read.
+            Held,
+            /// The flow's frame of this step, replayed after one clock read.
+            Step,
+        }
+        use Way::{Draw, Held, Step};
         for s in scenes() {
-            // The other Autopilot's palette: another scene.
+            // The next Autopilot's palette: another scene.
             let land = CardScene {
                 palette: match s.palette {
-                    CardPalette::Land => CardPalette::Cruise,
                     CardPalette::Cruise => CardPalette::Land,
+                    CardPalette::Land => CardPalette::Off,
+                    CardPalette::Off => CardPalette::Cruise,
                 },
                 ..s
             };
             let serious = CardScene { serious: true, ..s };
             let t0 = Instant::now();
-            // (ms after t0, scene, animate, arm, whether the step replays)
-            let steps: Vec<(u64, CardScene, bool, bool, bool)> = vec![
-                (0, s, true, true, false),
-                (33, s, true, false, false),
+            let lapse = 3 * EPISODE_MS + OWED_MAX_MS;
+            // (ms after t0, scene, animate, arm, how it reaches the glass)
+            let steps: Vec<(u64, CardScene, bool, bool, Way)> = vec![
+                (0, s, true, true, Draw),
+                (33, s, true, false, Draw),
                 // Motion lost mid-episode (focus, Reduce Motion, the load
-                // latch): the first held frame is ticked, the rest
+                // latch): the first held frame is drawn, the rest
                 // replayed; motion back resumes the clock.
-                (100, s, false, false, false),
-                (140, s, false, false, true),
-                (180, s, false, false, true),
-                (220, s, true, false, false),
-                (2000, s, true, false, false),
-                (EPISODE_MS + 1, s, true, false, false),
-                (EPISODE_MS + 40, s, true, false, true),
-                (EPISODE_MS + 90, s, false, false, true),
-                (EPISODE_MS + 95, land, true, false, false),
-                (EPISODE_MS + 99, land, true, false, true),
-                (EPISODE_MS + 120, serious, true, false, false),
-                (EPISODE_MS + 130, serious, true, false, true),
-                (EPISODE_MS + 140, s, true, false, false),
+                (100, s, false, false, Draw),
+                (140, s, false, false, Held),
+                (180, s, false, false, Held),
+                (220, s, true, false, Draw),
+                (2000, s, true, false, Draw),
+                // The flow: step 46 drawn, then replayed inside it; step 47
+                // drawn.
+                (EPISODE_MS + 1, s, true, false, Draw),
+                (EPISODE_MS + 10, s, true, false, Step),
+                (EPISODE_MS + 40, s, true, false, Draw),
+                // Held: the settled frame drawn once, then replayed.
+                (EPISODE_MS + 90, s, false, false, Draw),
+                (EPISODE_MS + 92, s, false, false, Held),
+                (EPISODE_MS + 95, land, true, false, Draw),
+                (EPISODE_MS + 99, land, true, false, Step),
+                (EPISODE_MS + 120, serious, true, false, Draw),
+                (EPISODE_MS + 130, serious, true, false, Held),
+                (EPISODE_MS + 140, s, true, false, Draw),
                 // The window loses motion and the card is armed: owed.
-                (EPISODE_MS + 200, s, false, true, false),
-                (EPISODE_MS + 300, s, false, false, true),
-                (EPISODE_MS + 400, s, false, false, true),
+                (EPISODE_MS + 200, s, false, true, Draw),
+                (EPISODE_MS + 300, s, false, false, Held),
+                (EPISODE_MS + 400, s, false, false, Held),
                 // Motion back: the owed episode plays from here.
-                (EPISODE_MS + 500, s, true, false, false),
-                (EPISODE_MS + 533, s, true, false, false),
-                // Armed unfocused again, held past the debt's lapse.
-                (3 * EPISODE_MS, s, false, true, false),
-                (3 * EPISODE_MS + OWED_MAX_MS + 10, s, false, false, true),
-                (3 * EPISODE_MS + OWED_MAX_MS + 20, s, true, false, false),
-                (3 * EPISODE_MS + OWED_MAX_MS + 30, s, true, false, true),
+                (EPISODE_MS + 500, s, true, false, Draw),
+                (EPISODE_MS + 533, s, true, false, Draw),
+                // Armed unfocused again, held past the debt's lapse: the
+                // flow, no intro.
+                (3 * EPISODE_MS, s, false, true, Draw),
+                (lapse + 10, s, false, false, Held),
+                (lapse + 20, s, true, false, Draw),
+                (lapse + 30, s, true, false, Step),
+                (lapse + 200, s, true, false, Draw),
+                (lapse + 210, s, true, false, Step),
             ];
             let (mut twin, mut twin_frames) = (HarnessCard::default(), CardFrames::default());
             let (mut host, mut frames) = (HarnessCard::default(), CardFrames::default());
             let mut last: Option<CardFrame> = None;
-            for (at, scene, animate, arm, replays) in steps {
+            for (at, scene, animate, arm, way) in steps {
                 let now = t0 + ms(at);
                 if arm {
                     twin.arm(now, 9);
@@ -6776,22 +8411,31 @@ mod tests {
                 }
                 let want = twin.draw(now, &scene, animate, &mut twin_frames);
                 let before = aterm_core::render::fx_counts_here();
-                let replayed = host.replay(&scene, animate, &frames);
+                // The host's way (`claude_card`): `replay`, else the clock
+                // and `replay_step`.
+                let mut clock_reads = 0;
+                let replayed = match host.replay(&scene, animate, &frames) {
+                    Some(f) => Some((f, Held)),
+                    None => {
+                        clock_reads += 1;
+                        host.replay_step(&scene, animate, &frames, now)
+                            .map(|f| (f, Step))
+                    }
+                };
                 let spent = aterm_core::render::fx_counts_here();
                 assert_eq!(
                     (spent.0 - before.0, spent.1 - before.1),
                     (0, 0),
                     "{at} ms: a replay builds nothing and copies nothing"
                 );
-                assert_eq!(replayed.is_some(), replays, "{at} ms: replayed?");
-                let got = match replayed {
-                    Some(f) => {
+                let (got, how) = match replayed {
+                    Some((f, how)) => {
                         let prev = last.as_ref().expect("a frame before a replay");
                         assert!(
                             Arc::ptr_eq(&f.under, &prev.under) && Arc::ptr_eq(&f.over, &prev.over),
                             "{at} ms: the kept Arcs themselves"
                         );
-                        f
+                        (f, how)
                     }
                     None => {
                         let f = host.draw(now, &scene, animate, &mut frames);
@@ -6800,9 +8444,15 @@ mod tests {
                             built > 0 || f.is_empty(),
                             "{at} ms: CONTROL, a draw seals its contents"
                         );
-                        f
+                        (f, Draw)
                     }
                 };
+                assert_eq!(how, way, "{at} ms: how it reached the glass");
+                assert_eq!(
+                    clock_reads,
+                    usize::from(way != Held),
+                    "{at} ms: clock reads"
+                );
                 assert_eq!(frame_text(&got), frame_text(&want), "{at} ms: the frame");
                 assert_eq!(observed(&host, now), observed(&twin, now), "{at} ms: host");
                 last = Some(got);
@@ -6858,8 +8508,8 @@ mod tests {
 
     /// THE BORDER'S AND THE TRAIL'S SEGMENTS MEET: a horizontal border
     /// segment's left end is the last one's right end, and so is each trail
-    /// stripe's, in every frame — settled, mid-episode, both themes, Land's
-    /// ramp. The emitter reuses the last segment's right-end paint instead of
+    /// stripe's, in every frame — settled, mid-episode, flowing (two ripple
+    /// cycles), both themes, Land's ramp and Off's. The emitter reuses the last segment's right-end paint instead of
     /// painting the same arc point again; a reuse that kept the wrong paint
     /// (the first segment's, or a stripe's first) would break every seam.
     /// CONTROL: the check sees seams (the scenes' borders and trails have
@@ -6872,7 +8522,9 @@ mod tests {
             let t0 = Instant::now();
             let mut card = HarnessCard::default();
             card.arm(t0, 7);
-            for at in [0, 40, 450, 1300, 2600, 4100, EPISODE_MS + 1] {
+            let flow = (EPISODE_MS + 1..EPISODE_MS + 2 * GLINT_PERIOD_MS)
+                .step_by(FLOW_STEP_MS as usize * 5);
+            for at in [0, 40, 450, 1300, 2600, 4100].into_iter().chain(flow) {
                 let (under, _, _) = frame(&mut card, t0 + ms(at), &s, true);
                 let (bad, n) = seams(&under);
                 assert!(bad.is_empty(), "at {at} ms: {bad:#?}");
@@ -6938,8 +8590,9 @@ mod tests {
 
     /// AT REST IS KNOWN WITHOUT A CLOCK (`HarnessCard::at_rest`): wherever
     /// it says so, the card wants no frame at any instant; and a card it
-    /// does not call at rest is one whose episode is armed or playing.
-    /// CONTROL: an episode's frames are not at rest.
+    /// does not call at rest is one whose intro is armed or playing, or that
+    /// flows. CONTROL: the intro's frames and the flow's are not at rest; a
+    /// held tick is.
     #[test]
     fn at_rest_means_no_deadline_at_any_instant() {
         let s = scene();
@@ -6953,18 +8606,22 @@ mod tests {
             (500, true),
             (EPISODE_MS + 1, true),
             (EPISODE_MS + 2, true),
+            (EPISODE_MS + 3, false),
+            (EPISODE_MS + 900, true),
         ] {
             let now = t0 + ms(at);
             let _ = frame(&mut card, now, &s, animate);
+            assert_eq!(card.at_rest(), !animate, "{at} ms");
             if card.at_rest() {
                 for dt in [0, 1, FRAME_MS, EPISODE_MS, 10 * EPISODE_MS] {
                     assert_eq!(card.deadline(now + ms(dt)), None, "{at} ms + {dt}");
                 }
             } else {
-                assert!(card.deadline(now).is_some(), "CONTROL: {at} ms plays");
+                assert!(card.deadline(now).is_some(), "CONTROL: {at} ms moves");
             }
         }
-        assert!(card.at_rest(), "settled");
+        frame(&mut card, t0 + ms(EPISODE_MS + 1000), &s, false);
+        assert!(card.at_rest(), "held");
     }
 
     /// An empty scene draws nothing and says so.
@@ -6983,18 +8640,36 @@ mod tests {
     }
 
     /// The line's ink: one cell per column, sorted and unique; a sweep during
-    /// the episode; the settled gradient (constant bytes) after it and under
-    /// reduced motion; legible on both grounds (on light, WCAG AA against
-    /// the ground, frame by frame).
+    /// the episode; the ripple's glints along it in the flow after; the
+    /// settled gradient (constant bytes) whenever it is held and under
+    /// reduced motion; legible on both grounds — Cruise's spectrum, Land's
+    /// sunset and Off's moonbow alike (white letters on dark, silver ink on
+    /// light), glints included: on dark over the luminance floor, on light
+    /// at WCAG AA against the ground, frame by frame.
     #[test]
     fn the_line_sweeps_then_settles() {
         let t0 = Instant::now();
-        let mut card = HarnessCard::default();
-        card.arm(t0, 3);
         let (row, col, len) = (7u16, 11u16, 64u16);
-        for ground in [NIGHT, DAY] {
+        for (palette, ground) in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off]
+            .into_iter()
+            .flat_map(|p| [(p, NIGHT), (p, DAY)])
+        {
             let dark = ground == NIGHT;
-            let rest = card.line_ink(t0 + ms(EPISODE_MS), row, col, len, ground, true);
+            let mut card = HarnessCard::default();
+            card.tick(
+                t0,
+                &CardScene {
+                    palette,
+                    dark,
+                    ground,
+                    ..scene()
+                },
+                false,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+            card.arm(t0, 3);
+            let rest = card.line_ink(t0 + ms(EPISODE_MS), row, col, len, ground, false);
             assert_eq!(rest.len(), usize::from(len));
             for (i, c) in rest.iter().enumerate() {
                 assert_eq!(
@@ -7005,7 +8680,7 @@ mod tests {
             }
             assert_eq!(
                 rest,
-                card.line_ink(t0 + ms(EPISODE_MS + 5000), row, col, len, ground, true),
+                card.line_ink(t0 + ms(EPISODE_MS + 5000), row, col, len, ground, false),
                 "settled is constant"
             );
             assert_eq!(
@@ -7017,34 +8692,336 @@ mod tests {
             let next = card.line_ink(t0 + ms(900 + FRAME_MS), row, col, len, ground, true);
             assert_ne!(mid, rest, "the episode moves the line");
             assert_ne!(mid, next, "frame to frame");
+            // The flow: the glints run along the line, step by step, over a
+            // whole ripple cycle.
+            let flow: Vec<Vec<InkCell>> = (0..GLINT_PERIOD_MS / FLOW_STEP_MS)
+                .map(|k| {
+                    let at = t0 + ms(EPISODE_MS + 200 + k * FLOW_STEP_MS);
+                    card.line_ink(at, row, col, len, ground, true)
+                })
+                .collect();
+            assert!(
+                flow.iter().filter(|f| **f != rest).count() > flow.len() / 2,
+                "{palette:?}: the flow's glints run along the line"
+            );
             assert_ne!(
                 rest[0].color,
                 rest[rest.len() - 1].color,
                 "the settled line is a gradient"
             );
-            for c in rest.iter().chain(&mid) {
+            for c in rest.iter().chain(&mid).chain(flow.iter().flatten()) {
                 let rgb = (u32::from(c.color[0]) << 16)
                     | (u32::from(c.color[1]) << 8)
                     | u32::from(c.color[2]);
                 if dark {
                     assert!(
                         relative_luminance(rgb) >= LINE_DARK_LUMA_FLOOR - 0.01,
-                        "{rgb:06x} too dark"
+                        "{palette:?}: {rgb:06x} too dark"
                     );
                 } else {
                     assert!(
                         contrast(rgb, ground) >= 4.5,
-                        "{rgb:06x} under AA on {ground:06x}: {:.2}:1",
+                        "{palette:?}: {rgb:06x} under AA on {ground:06x}: {:.2}:1",
                         contrast(rgb, ground)
                     );
                 }
             }
         }
         // The line stops at the last column rather than wrapping.
+        let mut card = HarnessCard::default();
+        card.arm(t0, 3);
         assert_eq!(card.line_ink(t0, 0, u16::MAX - 1, 5, NIGHT, true).len(), 2);
     }
 
-    /// The line wears the last tick's palette.
+    /// THE HERO WORD (owner, 2026-10-19: "emphasize aterm in the banner"):
+    /// the line's `aterm` ([`LineAt::hero`], cells 12 to 16 of "enhanced by
+    /// aterm harness …") wears its own whole run of the card's palette —
+    /// under Cruise a red letter and a blue one among its five, under Land
+    /// the sunset's, never a blue — lifted a step above the line on dark
+    /// and the paper law's ink at its place on light (4.5:1 or more against
+    /// the ground, [`LineInks`]), in every palette; settled it
+    /// is constant bytes and the same under reduced motion, in the intro it
+    /// moves, and in the flow it glints (flaring harder than the line round
+    /// it, by its own gains, const-asserted). NEGATIVE CONTROL: the hero
+    /// touches only its own cells — every other cell is the hero-less
+    /// line's, byte for byte — and it changes its own.
+    #[test]
+    fn the_lines_hero_word_wears_its_own_rainbow() {
+        let t0 = Instant::now();
+        let plain = LineAt {
+            row: 5,
+            col: 13,
+            len: 55,
+            hero: 0..0,
+            wand: Some((10, 3)),
+        };
+        let at = LineAt {
+            hero: 12..17,
+            ..plain.clone()
+        };
+        let rgb = |c: &InkCell| {
+            (u32::from(c.color[0]) << 16) | (u32::from(c.color[1]) << 8) | u32::from(c.color[2])
+        };
+        let ink = |card: &HarnessCard, now: Option<Instant>, at: &LineAt, ground, animate| {
+            let mut out = Vec::new();
+            card.line_ink_into(now, at, ground, animate, &mut out);
+            out
+        };
+        for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
+            for ground in [NIGHT, DAY] {
+                let dark = ground == NIGHT;
+                let what = format!("{palette:?} dark {dark}");
+                let mut card = HarnessCard::default();
+                card.tick(
+                    t0,
+                    &CardScene {
+                        palette,
+                        dark,
+                        ground,
+                        ..scene()
+                    },
+                    false,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                );
+                let rest = ink(&card, None, &at, ground, false);
+                let bare = ink(&card, None, &plain, ground, false);
+                assert_eq!(rest.len(), 55, "{what}");
+                for (i, c) in rest.iter().enumerate() {
+                    assert_eq!((c.row, c.col), (5, 13 + i as u16), "{what}: contiguous");
+                }
+                for i in (0..55).filter(|i| !(12..17).contains(i)) {
+                    assert_eq!(rest[i], bare[i], "{what}: cell {i} is the line's");
+                }
+                let hero: Vec<u32> = rest[12..17].iter().map(rgb).collect();
+                let changed = (12..17).filter(|&i| rest[i] != bare[i]).count();
+                assert!(
+                    changed >= 3,
+                    "{what}: the hero wears its own ink ({changed})"
+                );
+                let distinct = hero
+                    .iter()
+                    .enumerate()
+                    .all(|(i, a)| hero[..i].iter().all(|b| b != a));
+                assert!(distinct, "{what}: five letters, five colours {hero:06x?}");
+                let ch = |c: u32, sh: u32| (c >> sh) & 0xff;
+                let red = hero
+                    .iter()
+                    .any(|&c| ch(c, 16) > ch(c, 8) + 40 && ch(c, 16) > ch(c, 0) + 40);
+                let blue = hero
+                    .iter()
+                    .any(|&c| ch(c, 0) > ch(c, 16) + 30 && ch(c, 0) > ch(c, 8));
+                match palette {
+                    CardPalette::Cruise => assert!(red && blue, "{what}: red to blue {hero:06x?}"),
+                    CardPalette::Land => assert!(!blue, "{what}: a sunset {hero:06x?}"),
+                    CardPalette::Off => {}
+                }
+                for &c in &hero {
+                    if dark {
+                        assert!(
+                            relative_luminance(c) >= LINE_HERO_DARK_LUMA_FLOOR - 0.01,
+                            "{what}: {c:06x} under the hero's floor"
+                        );
+                    } else {
+                        assert!(
+                            contrast(c, ground) >= 4.5,
+                            "{what}: {c:06x} under AA on {ground:06x}"
+                        );
+                    }
+                }
+                // Settled: constant, and the same under reduced motion.
+                card.arm(t0, 3);
+                assert_eq!(
+                    ink(&card, Some(t0 + ms(900)), &at, ground, false),
+                    rest,
+                    "{what}: reduced motion"
+                );
+                // The intro: it moves, frame after frame.
+                let mut seen: Vec<Vec<InkCell>> = Vec::new();
+                for t in (0..EPISODE_MS / 2).step_by(FRAME_MS as usize) {
+                    let hero = ink(&card, Some(t0 + ms(t)), &at, ground, true)[12..17].to_vec();
+                    if !seen.contains(&hero) {
+                        seen.push(hero);
+                    }
+                }
+                assert!(
+                    seen.len() > 20,
+                    "{what}: the intro moves it ({})",
+                    seen.len()
+                );
+                // The flow: it glints.
+                let flow = (0..GLINT_PERIOD_MS / FLOW_STEP_MS).any(|k| {
+                    let now = t0 + ms(EPISODE_MS + 200 + k * FLOW_STEP_MS);
+                    ink(&card, Some(now), &at, ground, true)[12..17] != rest[12..17]
+                });
+                assert!(flow, "{what}: the flow's glints reach the hero");
+            }
+        }
+    }
+
+    /// THE GLINTS RUN OUTWARD FROM THE WAND: the card lays Claude's ripple
+    /// with its origin at the wand cell's centre ([`CardScene::wand`]) and a
+    /// row two cells tall, as Claude does: along the wand's row the crest
+    /// stands `7 cells/s · T` either side of it as its ring runs out, and
+    /// three cells either way of the front it is down; a point two rows
+    /// under the wand sees the crest when the ring has run four cells.
+    /// CONTROL: with no wand the origin is the inner box's top-left corner.
+    #[test]
+    fn the_cards_glints_run_outward_from_the_wand() {
+        use crate::ripple::GLINT_CELLS_PER_S;
+        let s = scene();
+        let g = Geo::new(&s).expect("a scene");
+        let (cw, ch) = (g.cw as f32, g.ch as f32);
+        let (wx, wy) = (g.ox as f32 + 10.5 * cw, g.band(3) as f32 + 0.5 * ch);
+        let at = |ms: u64| Clock {
+            t_ms: None,
+            ride_ms: None,
+            glint: Some((ms, 1.0)),
+            flow: None,
+        };
+        for k in 3..15u64 {
+            let ms = k * FLOW_STEP_MS;
+            let cx = Emit::new(&s, g, at(ms), 7);
+            let front = GLINT_CELLS_PER_S * ms as f32 / 1000.0;
+            assert_eq!(
+                cx.ring_at(wx + front * cw, wy),
+                1.0,
+                "{ms} ms: the front, right"
+            );
+            assert_eq!(
+                cx.ring_at(wx - front * cw, wy),
+                1.0,
+                "{ms} ms: the front, left"
+            );
+            for off in [-3.0, 3.0] {
+                assert!(
+                    cx.ring_at(wx + (front + off) * cw, wy) < 0.5,
+                    "{ms} ms: {off} cells off the front"
+                );
+            }
+        }
+        let four = (4000.0 / GLINT_CELLS_PER_S).round() as u64;
+        let cx = Emit::new(&s, g, at(four), 7);
+        assert_eq!(
+            cx.ring_at(wx, wy + 2.0 * ch),
+            1.0,
+            "two rows down: four cells"
+        );
+        assert!(
+            cx.ring_at(wx, wy + 3.0 * ch) < 0.5,
+            "three rows down: not yet"
+        );
+        let bare = CardScene { wand: None, ..s };
+        let gb = Geo::new(&bare).expect("a scene");
+        let inner = gb.inner();
+        let ms = 10 * FLOW_STEP_MS;
+        let cx = Emit::new(&bare, gb, at(ms), 7);
+        let front = GLINT_CELLS_PER_S * ms as f32 / 1000.0;
+        assert_eq!(
+            cx.ring_at(inner.x0 as f32 + front * cw, inner.y0 as f32),
+            1.0,
+            "CONTROL: no wand, the inner box's corner"
+        );
+    }
+
+    /// THE FLOW STAYS UNDER THE PHOTOSENSITIVITY BOUND: over a minute of
+    /// flow on dark (additive light, where a flash reads brightest) under
+    /// each palette, a point on the border's top edge, one on the trail and
+    /// one on the line flash — a rise in relative luminance of 0.1 or more
+    /// from the last trough, after a fall as deep — at most
+    /// [`TWINKLE_FLASH_BOUND_HZ`] times a second. CONTROL: each does flash,
+    /// the ring passing it, at least every other ripple cycle.
+    #[test]
+    fn the_flow_stays_under_the_photosensitivity_bound() {
+        const SWING: f32 = 0.1;
+        const MINUTE_MS: u64 = 60_000;
+        let flashes = |series: &[f32]| {
+            let (mut n, mut lo, mut hi, mut rising) = (0, f32::MAX, f32::MIN, true);
+            for &v in series {
+                if rising {
+                    lo = lo.min(v);
+                    if v - lo >= SWING {
+                        n += 1;
+                        rising = false;
+                        hi = v;
+                    }
+                } else {
+                    hi = hi.max(v);
+                    if hi - v >= SWING {
+                        rising = true;
+                        lo = v;
+                    }
+                }
+            }
+            n
+        };
+        let lum = |premul: u32| relative_luminance(premul);
+        for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
+            let s = CardScene { palette, ..scene() };
+            let g = Geo::new(&s).expect("a scene");
+            let covering = |quads: &[GlowQuad], x: i64, y: i64| {
+                quads
+                    .iter()
+                    .find(|q| {
+                        let (qx, qy) = (i64::from(q.x), i64::from(q.y));
+                        (qx..qx + i64::from(q.w)).contains(&x)
+                            && (qy..qy + i64::from(q.h)).contains(&y)
+                    })
+                    .map(|q| q.color)
+            };
+            let border = (g.col(26) + 2, g.outer.y0);
+            let (_, yb) = trail_band(&g, &s);
+            // The trail's bottom stripe and a late letter of the line: the
+            // palette's deep end (violet, rose, steel), where a glint
+            // lifts the luminance most.
+            let trail = (g.col(36) + 2, yb - 2);
+            let line = LineAt {
+                row: 6,
+                col: 13,
+                len: 50,
+                hero: 12..17,
+                wand: Some((10, 3)),
+            };
+            let t0 = Instant::now();
+            let mut card = HarnessCard::default();
+            card.arm(t0, 7);
+            frame(&mut card, t0, &s, true);
+            frame(&mut card, t0 + ms(EPISODE_MS - 5), &s, true);
+            let (mut b, mut t, mut l) = (Vec::new(), Vec::new(), Vec::new());
+            let mut ink = Vec::new();
+            for at in (EPISODE_MS..EPISODE_MS + MINUTE_MS).step_by(FLOW_STEP_MS as usize) {
+                let now = t0 + ms(at);
+                let (under, _, _) = frame(&mut card, now, &s, true);
+                b.push(lum(
+                    covering(&under, border.0, border.1).expect("the border")
+                ));
+                t.push(lum(covering(&under, trail.0, trail.1).expect("the trail")));
+                ink.clear();
+                card.line_ink_into(Some(now), &line, NIGHT, true, &mut ink);
+                let c = ink[46].color;
+                l.push(lum((u32::from(c[0]) << 16)
+                    | (u32::from(c[1]) << 8)
+                    | u32::from(c[2])));
+            }
+            for (what, series) in [("border", &b), ("trail", &t), ("line", &l)] {
+                let n = flashes(series);
+                let hz = n as f32 * 1000.0 / MINUTE_MS as f32;
+                assert!(
+                    hz <= TWINKLE_FLASH_BOUND_HZ,
+                    "{palette:?} {what}: {n} flashes a minute, {hz} Hz"
+                );
+                assert!(
+                    n as u64 >= MINUTE_MS / (2 * GLINT_PERIOD_MS),
+                    "{palette:?} {what}: CONTROL, {n} flashes a minute"
+                );
+            }
+        }
+    }
+
+    /// The line wears the last tick's palette: Land's differs from Cruise's,
+    /// and Off's from both — its letters are [`CardPalette::letter_on`]'s,
+    /// on both grounds (on light at the nearest of the kept steps,
+    /// [`LineInks::at`]).
     #[test]
     fn the_line_wears_the_cards_palette() {
         let t0 = Instant::now();
@@ -7052,17 +9029,39 @@ mod tests {
         let cruise = card.line_ink(t0, 0, 0, 30, NIGHT, false);
         let mut under = Vec::new();
         let mut over = Vec::new();
-        card.tick(
-            t0,
-            &CardScene {
-                palette: CardPalette::Land,
-                ..scene()
-            },
-            false,
-            &mut under,
-            &mut over,
-        );
-        assert_ne!(card.line_ink(t0, 0, 0, 30, NIGHT, false), cruise);
+        let mut wear = |card: &mut HarnessCard, palette| {
+            card.tick(
+                t0,
+                &CardScene { palette, ..scene() },
+                false,
+                &mut under,
+                &mut over,
+            );
+            card.line_ink(t0, 0, 0, 30, NIGHT, false)
+        };
+        let land = wear(&mut card, CardPalette::Land);
+        assert_ne!(land, cruise);
+        let off = wear(&mut card, CardPalette::Off);
+        assert_ne!(off, cruise, "Off is not Cruise");
+        assert_ne!(off, land, "Off is not Land");
+        for ground in [NIGHT, DAY] {
+            let line = card.line_ink(t0, 0, 0, 30, ground, false);
+            let steps = LINE_INK_STEPS as f32;
+            for (i, c) in line.iter().enumerate() {
+                let t = tri(i as f32 / 29.0);
+                let t = if dark_ground(ground) {
+                    t
+                } else {
+                    (t * steps).round() / steps
+                };
+                let want = CardPalette::Off.letter_on(t, ground);
+                assert_eq!(
+                    c.color,
+                    [(want >> 16) as u8, (want >> 8) as u8, want as u8],
+                    "on {ground:06x}: cell {i} is the palette's letter ink"
+                );
+            }
+        }
     }
 
     /// The sunset ramp runs red → orange → gold → rose and is total.
@@ -7073,6 +9072,30 @@ mod tests {
         assert_eq!(sunset(1.0 / 3.0), SUNSET[1]);
         assert_eq!(sunset(f32::NAN), SUNSET[0]);
         assert_eq!(sunset(7.0), SUNSET[3]);
+    }
+
+    /// The moonbow ramp runs white → pearl → silver → steel and is total;
+    /// Off's art and stripes read it on dark and [`PRINT_OFF`] on light.
+    #[test]
+    fn the_moonbow_ramp_hits_its_stops() {
+        assert_eq!(moonbow(0.0), WHITE);
+        assert_eq!(moonbow(0.0), MOONBOW[0]);
+        assert_eq!(moonbow(1.0 / 3.0), MOONBOW[1]);
+        assert_eq!(moonbow(2.0 / 3.0), MOONBOW[2]);
+        assert_eq!(moonbow(1.0), MOONBOW[3]);
+        assert_eq!(moonbow(f32::NAN), MOONBOW[0]);
+        assert_eq!(moonbow(-3.0), MOONBOW[0]);
+        assert_eq!(moonbow(7.0), MOONBOW[3]);
+        assert_eq!(CardPalette::Off.art(0.0, true), WHITE);
+        assert_eq!(CardPalette::Off.art(1.0, false), PRINT_OFF[5]);
+        assert_eq!(CardPalette::Off.stripe(0, true), WHITE);
+        assert_eq!(CardPalette::Off.stripe(5, true), MOONBOW[3]);
+        assert_eq!(CardPalette::Off.stripe(5, false), PRINT_OFF[5]);
+        // Every stop is bright enough that the line's lift leaves it be.
+        for c in MOONBOW {
+            assert!(relative_luminance(c) >= 0.41, "{c:06x}");
+            assert_eq!(lift_to_luminance(c, LINE_DARK_LUMA_FLOOR), c);
+        }
     }
 
     /// Whether quad `q` lies on the border's rim (within the stroke of the
@@ -7309,6 +9332,218 @@ mod tests {
         }
     }
 
+    /// OFF WEARS THE MOONBOW (owner, 2026-10-19: "a white themed for 'off'"):
+    /// every settled border colour is a point on the moonbow at the border's
+    /// coverage, every trail stripe its stop at the trail's — white at the
+    /// top through pearl and silver to steel at the bottom as light on dark
+    /// ([`MOONBOW`]), pearl to graphite in opaque ink on light ([`PRINT_OFF`],
+    /// the border's held under its line bar) — on both heights. NEGATIVE
+    /// CONTROL: Cruise's and Land's borders are off the moonbow (their hues
+    /// are not silver).
+    #[test]
+    fn off_wears_the_moonbow() {
+        for dark in [true, false] {
+            for kitty_rows in [2u8, 3] {
+                let off = CardScene {
+                    palette: CardPalette::Off,
+                    dark,
+                    kitty_rows,
+                    ..scene()
+                };
+                let border = |t: f32| {
+                    if dark {
+                        light(moonbow(t), f32::from(BORDER_COV)).color
+                    } else {
+                        ink(print_line(even_ramp(&PRINT_OFF, t)), PRINT_ALPHA).color
+                    }
+                };
+                let stripe = |rgb: u32| {
+                    if dark {
+                        light(rgb, f32::from(TRAIL_COV)).color
+                    } else {
+                        ink(rgb, PRINT_ALPHA).color
+                    }
+                };
+                let (under, _, _) = settled(&off);
+                let (rim, trail): (Vec<&GlowQuad>, Vec<&GlowQuad>) =
+                    under.iter().partition(|q| on_rim(q, &off));
+                assert!(!rim.is_empty() && !trail.is_empty(), "dark {dark}");
+                for q in &rim {
+                    for c in [q.color, q.color2] {
+                        let gap = gap_to_ramp(c, border);
+                        assert!(
+                            gap <= 2,
+                            "dark {dark}, {kitty_rows} rows: border {c:06x} off the moonbow by {gap}"
+                        );
+                    }
+                }
+                let stops: Vec<u32> = (0..TRAIL_STOPS.len())
+                    .map(|k| {
+                        stripe(if dark {
+                            moonbow(k as f32 / (TRAIL_STOPS.len() - 1) as f32)
+                        } else {
+                            PRINT_OFF[k]
+                        })
+                    })
+                    .collect();
+                let worn: std::collections::BTreeSet<u32> =
+                    trail.iter().flat_map(|q| [q.color, q.color2]).collect();
+                assert_eq!(
+                    worn,
+                    stops.iter().copied().collect(),
+                    "dark {dark}, {kitty_rows} rows: the trail is the moonbow's six stops"
+                );
+                let top = if dark { WHITE } else { PRINT_OFF[0] };
+                assert_eq!(stops[0], stripe(top), "white (pearl in print) on top");
+                assert_eq!(
+                    stops[5],
+                    stripe(if dark { MOONBOW[3] } else { PRINT_OFF[5] }),
+                    "steel (graphite in print) at the bottom"
+                );
+                // The negative control: the rainbows leave the moonbow.
+                for other in [CardPalette::Cruise, CardPalette::Land] {
+                    let s = CardScene {
+                        palette: other,
+                        ..off
+                    };
+                    let (under, _, _) = settled(&s);
+                    let off_by = under
+                        .iter()
+                        .filter(|q| on_rim(q, &s))
+                        .map(|q| gap_to_ramp(q.color, border))
+                        .max()
+                        .unwrap_or(0);
+                    assert!(
+                        off_by > 40,
+                        "dark {dark}: {other:?}'s border is not a moonbow ({off_by})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Off's light trail is SILVER, not tinted: at most this OKLCh chroma a
+    /// stripe.
+    const PRINT_OFF_MAX_CHROMA: f64 = 0.04;
+
+    /// Off's light trail law for six stripes, each a quad end's
+    /// `(premultiplied colour, alpha)` top to bottom: a PEARL ON PAPER —
+    /// every stripe opaque; on white paper at most
+    /// [`PRINT_OFF_MAX_CHROMA`] (a silver, not a colour), at least
+    /// [`PRINT_MIN_PAPER_CONTRAST`] against the paper (white ink vanishes);
+    /// no two stripes within [`PRINT_MIN_STRIPE_DE`]; and OKLab L falling
+    /// top to bottom, as the dark moonbow runs white to steel. Every breach,
+    /// empty when it holds.
+    fn pearl_on_paper(stripes: &[(u32, u8)]) -> Vec<String> {
+        use aterm_types::Rgb;
+        use aterm_types::scheme_signature::{chroma_hue, oklab, oklab_distance};
+        if stripes.len() != TRAIL_STOPS.len() {
+            return vec![format!("{} stripes", stripes.len())];
+        }
+        let mut breaches = Vec::new();
+        let paper = |(c, a): (u32, u8)| {
+            let ch = |sh: u32| (((c >> sh) & 0xff) + 255 - u32::from(a)).min(255) as u8;
+            Rgb::new(ch(16), ch(8), ch(0))
+        };
+        let on: Vec<Rgb> = stripes.iter().map(|&s| paper(s)).collect();
+        for (k, (&(c, a), rgb)) in stripes.iter().zip(&on).enumerate() {
+            if a != 255 {
+                breaches.push(format!("stripe {k} ({c:06x}) is not opaque: alpha {a}"));
+            }
+            let px = (u32::from(rgb.r) << 16) | (u32::from(rgb.g) << 8) | u32::from(rgb.b);
+            let (chroma, _) = chroma_hue(*rgb);
+            if chroma > PRINT_OFF_MAX_CHROMA {
+                breaches.push(format!(
+                    "stripe {k} ({px:06x}) is tinted: chroma {chroma:.3}"
+                ));
+            }
+            let contrast = 1.05 / (relative_luminance(px) + 0.05);
+            if contrast < PRINT_MIN_PAPER_CONTRAST {
+                breaches.push(format!(
+                    "stripe {k} ({px:06x}) vanishes on the paper: {contrast:.2}:1"
+                ));
+            }
+        }
+        for i in 0..on.len() {
+            for j in i + 1..on.len() {
+                let d = oklab_distance(on[i], on[j]);
+                if d < PRINT_MIN_STRIPE_DE {
+                    breaches.push(format!("stripes {i} and {j} are one colour (dE {d:.3})"));
+                }
+            }
+        }
+        for k in 1..on.len() {
+            let (above, here) = (oklab(on[k - 1]).0, oklab(on[k]).0);
+            if here >= above {
+                breaches.push(format!(
+                    "stripe {k} is out of order: L {here:.3} under {above:.3}"
+                ));
+            }
+        }
+        breaches
+    }
+
+    /// THE LIGHT OFF TRAIL IS PEARL PRINT: at both heights the settled light
+    /// Off trail passes [`pearl_on_paper`] — opaque, silver, on the paper,
+    /// distinct, falling in lightness. NEGATIVE CONTROLS, each caught for
+    /// its own reason: Cruise's inks are tinted, every one; six opaque
+    /// whites vanish and are one colour; the dark moonbow's stripes laid as
+    /// print vanish (its white, its first pearl and the one after it); Off's
+    /// inks upside down are out of order, every step; and Off's inks fail
+    /// the rainbow's vividness law as washed out, which is why Off leaves
+    /// that law for this one.
+    #[test]
+    fn the_light_off_trail_is_pearl_print() {
+        for kitty_rows in [2u8, 3] {
+            let s = CardScene {
+                dark: false,
+                palette: CardPalette::Off,
+                kitty_rows,
+                ..scene()
+            };
+            let trail = parts(&s, Clock::SETTLED).trail;
+            let mut ends: Vec<(u16, u32, u8)> =
+                trail.iter().map(|q| (q.y, q.color, q.alpha)).collect();
+            ends.sort_unstable();
+            ends.dedup_by_key(|e| (e.1, e.2));
+            let stripes: Vec<(u32, u8)> = ends.iter().map(|e| (e.1, e.2)).collect();
+            assert_eq!(
+                pearl_on_paper(&stripes),
+                Vec::<String>::new(),
+                "{kitty_rows} rows"
+            );
+        }
+        let lay = |rgb: u32| {
+            let p = ink(rgb, PRINT_ALPHA);
+            (p.color, p.alpha)
+        };
+        let count =
+            |breaches: &[String], what: &str| breaches.iter().filter(|b| b.contains(what)).count();
+        let cruise: Vec<(u32, u8)> = PRINT_CRUISE.iter().map(|&c| lay(c)).collect();
+        let cruise = pearl_on_paper(&cruise);
+        assert_eq!(count(&cruise, "is tinted"), 6, "{cruise:?}");
+        let white = pearl_on_paper(&[lay(WHITE); 6]);
+        assert!(breached(&white, "vanishes"), "{white:?}");
+        assert!(breached(&white, "one colour"), "{white:?}");
+        let moon: Vec<(u32, u8)> = (0..TRAIL_STOPS.len())
+            .map(|k| lay(CardPalette::Off.stripe(k, true)))
+            .collect();
+        let moon = pearl_on_paper(&moon);
+        assert_eq!(count(&moon, "vanishes"), 3, "{moon:?}");
+        for k in 0..3 {
+            assert!(
+                breached(&moon, &format!("stripe {k} (")),
+                "stripe {k}: {moon:?}"
+            );
+        }
+        let flipped: Vec<(u32, u8)> = PRINT_OFF.iter().rev().map(|&c| lay(c)).collect();
+        let flipped = pearl_on_paper(&flipped);
+        assert_eq!(count(&flipped, "out of order"), 5, "{flipped:?}");
+        let vivid: Vec<(u32, u8)> = PRINT_OFF.iter().map(|&c| lay(c)).collect();
+        let vivid = vivid_on_paper(CardPalette::Off, &vivid);
+        assert!(breached(&vivid, "washed out"), "{vivid:?}");
+    }
+
     /// A LIGHT GROUND PRINTS THE RAINBOW: on a light theme the settled trail
     /// is Cruise's six print inks top to bottom, one colour a stripe, and the
     /// trail, the border and the rim are opaque — card art, off the shared
@@ -7319,10 +9554,7 @@ mod tests {
     /// red it prints.
     #[test]
     fn a_light_ground_prints_the_rainbow() {
-        let mid = Clock {
-            t_ms: Some(1500 + 750),
-            ride_ms: None,
-        };
+        let mid = Clock::seated(1500 + 750);
         for kitty_rows in [2u8, 3] {
             let s = CardScene {
                 dark: false,
@@ -7460,6 +9692,10 @@ mod tests {
         let peak = match palette {
             CardPalette::Cruise => hues.len() - 1,
             CardPalette::Land => 3,
+            // Off is no rainbow and leaves this law (its own is
+            // [`pearl_on_paper`]): checked here only as the negative control
+            // that says why — its silver is washed out by this law's measure.
+            CardPalette::Off => hues.len() - 1,
         };
         for k in 1..hues.len() {
             if (k <= peak) != (step(hues[k - 1], hues[k]) > 0.0) {
@@ -7565,10 +9801,10 @@ mod tests {
     /// The light border and rim stay bright all the way round, and the
     /// one-pixel border reads on white: every point of Cruise's light ramp
     /// ([`PRINT_CRUISE_RAMP`]) keeps OKLCh chroma 0.11 or more; every settled
-    /// light border quad end, both palettes, both heights, is a point on its
+    /// light border quad end, all three palettes, both heights, is a point on its
     /// palette's print ramp ([`CardPalette::art_at`]) held under the line
-    /// bar ([`print_line`]), and every border quad end, settled or with the
-    /// head passing, is under the bar ([`LIGHT_LINE_MAX_LUMA`]) while the rim
+    /// bar ([`print_line`]), and every border quad end, settled, with the
+    /// head passing or with a glint passing, is under the bar ([`LIGHT_LINE_MAX_LUMA`]) while the rim
     /// keeps the full ink, above it at the gold; and the bar only darkens (a
     /// colour under it is untouched, the gold keeps its hue). NEGATIVE
     /// CONTROLS: the six inks mixed straight, without the peridot and the
@@ -7624,7 +9860,7 @@ mod tests {
             washed.0,
             washed.1
         );
-        for palette in [CardPalette::Cruise, CardPalette::Land] {
+        for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
             for kitty_rows in [2u8, 3] {
                 let s = CardScene {
                     dark: false,
@@ -7645,10 +9881,10 @@ mod tests {
                 }
                 for clock in [
                     Clock::SETTLED,
-                    Clock {
-                        t_ms: Some(900),
-                        ride_ms: None,
-                    },
+                    Clock::seated(900),
+                    Clock::flowing(600),
+                    Clock::flowing(1400),
+                    Clock::flowing(2300),
                 ] {
                     let p = parts(&s, clock);
                     let line = p
@@ -7910,10 +10146,7 @@ mod tests {
                         ("blink", Some(BLINK_AT_MS + 10)),
                         ("flick", Some(FLICK_AT_MS + 10)),
                     ] {
-                        let clock = Clock {
-                            t_ms,
-                            ride_ms: t_ms,
-                        };
+                        let clock = t_ms.map_or(Clock::SETTLED, Clock::riding);
                         let frame = at.art.frame(kitty_frame(clock));
                         // The first flick falls on the ride.
                         let at = ridden(&g, &s, at, clock);

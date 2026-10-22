@@ -88,13 +88,13 @@ const NUKE_HOST_SALT: u64 = 0xB0FF_1E5E_D0D0_CA57;
 /// Cache key for one baked part at one size.
 #[inline]
 #[must_use]
-pub fn nuke_host_id(part: NukePart, w: u16, h: u16) -> u64 {
+pub const fn nuke_host_id(part: NukePart, w: u16, h: u16) -> u64 {
     let k = match part {
         NukePart::Cap => 1u64,
         NukePart::Stem => 2,
         NukePart::Skirt => 3,
     };
-    let mut x = NUKE_HOST_SALT ^ (k << 32) ^ (u64::from(w) << 16) ^ u64::from(h);
+    let mut x = NUKE_HOST_SALT ^ (k << 32) ^ ((w as u64) << 16) ^ (h as u64);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)

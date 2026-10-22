@@ -188,17 +188,20 @@ impl GlArmLive {
     }
 
     /// The program for `row` if built.
+    #[inline]
     pub(crate) fn pipeline(&self, row: Pipeline) -> Option<&GlPipeline> {
         self.pipelines[row as usize].as_ref()
     }
 
     /// The NEAREST clamp sampler.
-    pub(crate) fn nearest(&self) -> &GlSampler {
+    #[inline]
+    pub(crate) const fn nearest(&self) -> &GlSampler {
         &self.nearest
     }
 
     /// The LINEAR clamp sampler.
-    pub(crate) fn linear(&self) -> &GlSampler {
+    #[inline]
+    pub(crate) const fn linear(&self) -> &GlSampler {
         &self.linear
     }
 
@@ -301,6 +304,7 @@ impl GlArmLive {
 /// (`Rgba8Unorm` with its sRGB alias, both views on one `SRGB8_ALPHA8`
 /// texture) where the device has the sRGB view extensions, else the
 /// downlevel plan's sRGB texture.
+#[inline]
 pub(crate) fn offscreen_format(dev: &GlDevice) -> (TexelFormat, Option<TexelFormat>) {
     if dev.caps().srgb_views {
         (TexelFormat::Rgba8Unorm, Some(TexelFormat::Rgba8UnormSrgb))
@@ -644,7 +648,8 @@ impl GpuRenderer {
     /// Linux flip a renderer is unarmed unless a test arms it; presents stay on
     /// wgpu either way.
     #[doc(hidden)]
-    pub fn arm_gl(&mut self) {
+    #[inline]
+    pub const fn arm_gl(&mut self) {
         self.gl_armed = true;
     }
 
@@ -653,13 +658,15 @@ impl GpuRenderer {
     /// build carrying the oracle arm has it.
     #[doc(hidden)]
     #[cfg(wgpu_arm)]
-    pub fn disarm_gl_for_oracle(&mut self) {
+    #[inline]
+    pub const fn disarm_gl_for_oracle(&mut self) {
         self.gl_armed = false;
     }
 
     /// Whether the last encoded frame drew on the GL arm.
     #[doc(hidden)]
-    pub fn last_frame_on_gl(&self) -> bool {
+    #[inline]
+    pub const fn last_frame_on_gl(&self) -> bool {
         self.last_frame_arm_gl
     }
 
@@ -882,6 +889,7 @@ impl GpuRenderer {
     /// alias, raw)`, where `raw` is the Unorm view's read and write (the
     /// native plan) and false on the downlevel plan, which samples decoded
     /// and always encodes, as wgpu's GL backend does.
+    #[inline]
     fn gl_post_plan(live: &GlArmLive) -> (TexelFormat, Option<TexelFormat>, bool) {
         let (format, alias) = offscreen_format(&live.dev);
         (format, alias, alias.is_some())

@@ -974,26 +974,26 @@ impl Geom {
     /// `y ∈ [fx_top, fx_bot)`. Every pixel clamp uses these bounds; see
     /// [`Geom::head`].
     #[inline]
-    pub(crate) fn fx_left(&self) -> i32 {
-        i32::from(self.origin_x)
+    pub(crate) const fn fx_left(&self) -> i32 {
+        self.origin_x as i32
     }
     #[inline]
-    pub(crate) fn fx_right(&self) -> i32 {
-        i32::from(self.origin_x) + (self.cols * self.cw) as i32
+    pub(crate) const fn fx_right(&self) -> i32 {
+        self.origin_x as i32 + (self.cols * self.cw) as i32
     }
     #[inline]
-    pub(crate) fn fx_top(&self) -> i32 {
-        i32::from(self.origin_y) - i32::from(self.head)
+    pub(crate) const fn fx_top(&self) -> i32 {
+        self.origin_y as i32 - self.head as i32
     }
     #[inline]
-    pub(crate) fn fx_bot(&self) -> i32 {
-        i32::from(self.origin_y) + (self.rows * self.ch) as i32
+    pub(crate) const fn fx_bot(&self) -> i32 {
+        self.origin_y as i32 + (self.rows * self.ch) as i32
     }
 
     /// Window-px centre of a grid cell — `origin + (index + 0.5) · cell` on
     /// each axis, the one cell→pixel anchor every emitter shares.
     #[inline]
-    pub(crate) fn cell_center(&self, row: u16, col: u16) -> (f32, f32) {
+    pub(crate) const fn cell_center(&self, row: u16, col: u16) -> (f32, f32) {
         (
             self.origin_x as f32 + (col as f32 + 0.5) * self.cw as f32,
             self.origin_y as f32 + (row as f32 + 0.5) * self.ch as f32,
@@ -1002,14 +1002,14 @@ impl Geom {
 
     /// The beam rasterizers' clip for this geometry — the effects box + grid anchor.
     #[inline]
-    pub(crate) fn beam_clip(&self) -> BeamClip {
+    pub(crate) const fn beam_clip(&self) -> BeamClip {
         BeamClip {
             x0: self.fx_left(),
             y0: self.fx_top(),
             x1: self.fx_right(),
             y1: self.fx_bot(),
             cell_h: self.ch as i32,
-            origin_y: i32::from(self.origin_y),
+            origin_y: self.origin_y as i32,
         }
     }
 }
@@ -1149,6 +1149,7 @@ impl FrameFingerprint {
         self.write(u64::try_from(len).unwrap_or(u64::MAX));
     }
 
+    #[inline]
     fn glow_quads(&mut self, tag: u64, quads: &[GlowQuad]) {
         if quads.is_empty() {
             return;
@@ -1173,6 +1174,7 @@ impl FrameFingerprint {
         self.0 = Some(hash);
     }
 
+    #[inline]
     fn fire_patches(&mut self, patches: &[FirePatch]) {
         if patches.is_empty() {
             return;
@@ -1187,6 +1189,7 @@ impl FrameFingerprint {
         self.0 = Some(hash);
     }
 
+    #[inline]
     fn chars(&mut self, chars: &[CharFg]) {
         if chars.is_empty() {
             return;
@@ -1202,6 +1205,7 @@ impl FrameFingerprint {
         self.0 = Some(hash);
     }
 
+    #[inline]
     fn fire_halos(&mut self, cells: &[FireHaloCell]) {
         if cells.is_empty() {
             return;
@@ -1217,6 +1221,7 @@ impl FrameFingerprint {
         self.0 = Some(hash);
     }
 
+    #[inline]
     fn rain_halos(&mut self, halos: &[RainHalo]) {
         if halos.is_empty() {
             return;
@@ -1816,9 +1821,11 @@ impl CursorGlow {
     /// arm any candidate; a reset/unseeded pair cannot reconstruct a path.
     #[inline]
     #[must_use]
-    pub fn cursor_anchor(&self) -> Option<(u16, u16)> {
-        self.last
-            .or_else(|| self.last_visible.map(|(cell, _)| cell))
+    pub const fn cursor_anchor(&self) -> Option<(u16, u16)> {
+        match (self.last, self.last_visible) {
+            (Some(cell), _) | (None, Some((cell, _))) => Some(cell),
+            (None, None) => None,
+        }
     }
 
     /// Reduced-motion arm for the fresh-ink pop (see the `reduced_motion`
@@ -2094,6 +2101,7 @@ impl CursorGlow {
     /// dark but heard and keeps its credits), cursor-position tracking
     /// (`last` / `last_visible` / `last_move`), and `ctx_alt`. The classic
     /// engine is the exception: its tracking is cleared with its light.
+    #[inline]
     fn clear_transient_state(&mut self) {
         self.clear_modern_transient_state();
         // The classic engine keeps its own light and its own cursor memory, and
@@ -2106,6 +2114,7 @@ impl CursorGlow {
     /// [`Self::clear_transient_state`] for this engine alone, leaving the
     /// classic wake's light and memory: the teardown the classic branch runs
     /// when it takes the frame from a style whose light is still live.
+    #[inline]
     fn clear_modern_transient_state(&mut self) {
         self.recent_typed_run = None;
         self.park_source_intact = None;
@@ -2138,6 +2147,7 @@ impl CursorGlow {
 
     /// Clear output-bearing geometry and the per-frame accessor caches, while
     /// leaving classifier/audio state untouched.
+    #[inline]
     fn clear_visual_geometry(&mut self) {
         self.fading.clear();
         self.ramp_in_at = None;

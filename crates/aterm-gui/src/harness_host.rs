@@ -9674,6 +9674,40 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     });
     let pid = snap.as_ref().map(|s| s.pid);
     let restarted = lane.is_some_and(|agent| (hooks.acts.restarted)(sid, agent, pid));
+    // A GEMINI CLI'S OWN RESTART REFUSED FOR ITS OWN SESSION ID
+    // ([`relaunch::restarted_itself`]; the review of b9/spawn-residuals, F2):
+    // a worker's `/settings`, `/permissions`, IDE trust or admin settings
+    // restart ran its argv again and met the `--session-id` its first start
+    // wrote (`42`). A
+    // person's keystroke before it asked for that restart, never the exit:
+    // no grace is read for it ([`relaunch::on_exit`]'s `PersonAsked`), and it
+    // is decided and counted as the same exit with no keys before it is (a
+    // crash's budget, its first step 1 s). Its attempt resumes the session
+    // by id, quiet (`upgrade_gemini_drive`'s `ExitKind::Restarted`). Read before whose exit
+    // it is: read after the grace, the restart the person asked for left the
+    // worker at its shell. A hold or a lease on the tab, another supervisor's
+    // claim and the owner's limit still own it. Only Gemini CLI's parent
+    // re-runs the argv it read once; no other program's exit is its own
+    // restart.
+    let restarts_itself = match job.agent {
+        Program::Gemini => true,
+        Program::Claude | Program::Codex | Program::Generic | Program::Agy | Program::Muse => false,
+    };
+    let itself = restarts_itself
+        && asked.is_none()
+        && !restarted
+        && snap.as_ref().is_some_and(|snap| {
+            relaunch::restarted_itself(
+                || (hooks.acts.exit_look)(sid, snap),
+                |step| !wait_for(Instant::now() + (hooks.pause)(step), || !exit_handed(job)),
+            )
+        });
+    if itself {
+        aterm_log::info!(
+            "harness @{sid}: Gemini CLI restarted itself and met its own session id; a \
+             keystroke before it asked for the restart, not the exit"
+        );
+    }
     // AN EXIT WHOSE PROGRAM STILL RUNS IS NOBODY'S YET (rulings 15 and 17,
     // review of 1a733ed60): the act's stamped program stopped from elsewhere
     // inside its grace — or put in the background — reads as an exit here
@@ -9788,7 +9822,7 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
         let decision = relaunch::on_exit(
             allowed,
             status.as_deref(),
-            grace,
+            if itself { 0 } else { grace },
             asked.is_some(),
             restarted,
         );
@@ -9840,6 +9874,21 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
             left_alone(job, hooks, decision, said, false);
             return;
         }
+    };
+    // AN OWN RESTART A PERSON'S KEYS ASKED FOR (`itself`): its line holds for
+    // a person at the keyboard until their keys are `grace` old
+    // (`upgrade_drive::held_by_status`), each try a counted wait. Live (lab
+    // r15g, 2026-10-21) the tries at 1, 10 and 60 s were held and the next
+    // was ten minutes on, past the lane's five-minute bound on an exit's
+    // record (`failed:stale-exit`): the session came back as a crash's, its
+    // note typed. Its first try waits out what is left of the person's
+    // grace, and a second more.
+    let pause = match (hooks.acts.status)(sid).filter(|_| itself) {
+        Some(status) => match relaunch::grace_left(&status, grace) {
+            left if left.is_zero() => pause,
+            left => pause.max(left + Duration::from_secs(1)),
+        },
+        None => pause,
     };
     if let Some(agent) = lane.filter(|_| restarted) {
         aterm_log::info!(
@@ -24065,6 +24114,7 @@ impl HostHandle {
                 agent: aterm_agent::harness::upgrade::Agent::Claude,
                 crashed: None,
                 refused: false,
+                restarted_itself: false,
             })
         });
         let lands = Arc::clone(&landed);

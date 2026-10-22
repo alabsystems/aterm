@@ -127,6 +127,67 @@ where
     }
 }
 
+/// THE FLOOR A READ WAS TOLD (astream's R4, session log Phase 6 step 6E-2):
+/// `Some(<oldest>)` when `e` is a broker's refusal of a `Fetch` from `from`
+/// below what its filter still keeps — `ERR retained-from=<oldest>`, the
+/// records below `<oldest>` given up by the broker's retention rules
+/// ([`crate::broker_rules`]) — with `<oldest>` past `from`. `None` for every
+/// other error, the same words under another code, and a floor at or below
+/// `from` (which no read from `from` could have been refused for).
+#[must_use]
+pub fn retained_past(e: &io::Error, from: u64) -> Option<u64> {
+    astream_broker::broker_refusal(e)
+        .and_then(astream_broker::BrokerRefusal::retained_from)
+        .filter(|oldest| *oldest > from)
+}
+
+/// How many times [`fetch_kept`] follows a floor that rose under it: each
+/// refusal names a higher floor than the read it refused, so a retention tick
+/// between two reads costs one more; past this many the refusal is the
+/// caller's.
+pub const KEPT_TRIES: usize = 4;
+
+/// A `Fetch` of `filter` from `from` that READS ON AT THE FLOOR (session log
+/// Phase 6 step 6E-2): a broker that retains its log (`aterm link broker`
+/// does by default, [`crate::broker_rules`]) refuses a read below what the
+/// filter still keeps, `ERR retained-from=<oldest>`, instead of a page that
+/// silently starts later; this reads from `<oldest>` then, and answers the
+/// page with the floor it read on from, so the caller SAYS what it missed
+/// (the records below it are gone from the log, a mail among them given up
+/// by its age or its class's bytes). `None` beside a page read where it was
+/// asked.
+///
+/// The refusal is an answer on a connection that stands, so the second read
+/// goes on the same connection. Every cursor read of a log a retaining broker
+/// serves goes through here or [`retained_past`]: a plain `fetch` from a
+/// cursor below the floor would be refused at every retry, for ever.
+///
+/// # Errors
+///
+/// The broker's or the transport's, as `fetch`'s; a refusal past
+/// [`KEPT_TRIES`] floors.
+pub fn fetch_kept<S: io::Read + io::Write>(
+    conn: &mut astream_broker::Client<S>,
+    from: u64,
+    filter: &str,
+    max: u32,
+) -> io::Result<(astream_broker::Page, Option<u64>)> {
+    let mut at = from;
+    let mut tries = 0usize;
+    loop {
+        match conn.fetch(at, filter, max) {
+            Ok(page) => return Ok((page, (at != from).then_some(at))),
+            Err(e) => match retained_past(&e, at) {
+                Some(floor) if tries < KEPT_TRIES => {
+                    tries = tries.saturating_add(1);
+                    at = floor;
+                }
+                _ => return Err(e),
+            },
+        }
+    }
+}
+
 /// RECORDS ONE `Fetch` PAGE ASKS FOR ON A FACE OF ROWS: presence, `ev`, halts —
 /// bodies a bridge writes from closed grammars and capped fields (a presence
 /// field is at most [`crate::glance::FIELD_CAP`] bytes), a few hundred bytes a row.
@@ -443,6 +504,52 @@ mod tests {
                 .expect_err("a zero bound is still refused")
                 .kind(),
             io::ErrorKind::InvalidInput
+        );
+    }
+
+    /// A READ BELOW A RETAINING BROKER'S FLOOR READS ON FROM IT (session log
+    /// Phase 6 step 6E-2): three records on one face, the log cut below the
+    /// second. A plain `Fetch` from the first is refused `retained-from=` the
+    /// second ([`retained_past`] reads it; a floor at the read is none past
+    /// it), and [`fetch_kept`] from the first answers the kept two with the
+    /// floor it read on from, on the same connection; from the floor itself it
+    /// answers them with none. NEGATIVE CONTROL, run: a `fetch_kept` that hands
+    /// the refusal back fails it.
+    #[test]
+    fn a_fetch_below_the_retained_floor_reads_on_from_it() {
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("atlink-kept")
+            .tempdir_in("/tmp")
+            .expect("scratch");
+        let sock = dir.path().join("b.sock");
+        let broker = crate::test_broker(dir.path().join("b.log")).expect("a broker");
+        let _served = broker.serve(&sock).expect("serve the broker");
+        let (mut conn, _closer) =
+            connect(sock.to_str().expect("utf8"), aterm_spec::wait::MUST_HAPPEN).expect("connect");
+        let ev = "/f/f/pub/n-a/s-a/ev";
+        let offs: Vec<u64> = (1..=3u64)
+            .map(|seq| conn.publish(91, seq, ev, b"v=2 x").expect("publish").0)
+            .collect();
+        broker.retain_before(offs[1]).expect("the cut");
+
+        let refused = conn
+            .fetch(offs[0], ev, 8)
+            .expect_err("PRECONDITION: a plain read below the floor is refused");
+        assert_eq!(retained_past(&refused, offs[0]), Some(offs[1]));
+        assert_eq!(
+            retained_past(&refused, offs[1]),
+            None,
+            "no floor past the read"
+        );
+        let ((rows, _), floor) = fetch_kept(&mut conn, offs[0], ev, 8).expect("reads on");
+        assert_eq!(floor, Some(offs[1]), "the floor it read on from");
+        let got: Vec<u64> = rows.iter().map(|r| r.0).collect();
+        assert_eq!(got, offs[1..], "the kept records");
+        let ((rows, _), floor) = fetch_kept(&mut conn, offs[1], ev, 8).expect("at the floor");
+        assert_eq!(
+            (rows.len(), floor),
+            (2, None),
+            "a read at the floor is no read on"
         );
     }
 

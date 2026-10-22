@@ -66,15 +66,15 @@ impl DogBakeKey {
     /// FNV-1a over the salt and the key's integer fields, high bit set.
     #[inline]
     #[must_use]
-    pub fn host_id(&self) -> u64 {
+    pub const fn host_id(&self) -> u64 {
         host_tile_id(&[
             DOG_HOST_SALT,
             self.breed as u64,
-            u64::from(self.coat),
-            u64::from(self.colors.accent),
-            u64::from(self.colors.background),
-            u64::from(self.w),
-            u64::from(self.h),
+            self.coat as u64,
+            self.colors.accent as u64,
+            self.colors.background as u64,
+            self.w as u64,
+            self.h as u64,
         ])
     }
 }
@@ -122,8 +122,9 @@ impl DogBaker {
     /// degenerate asset cannot produce a NaN/∞ destination rect.
     #[inline]
     #[must_use]
-    pub fn aspect(breed: DogGlyphId) -> f32 {
-        (f32::from(DOG_GLYPHS[breed as usize].aspect_x1000) / 1000.0).max(0.001)
+    pub const fn aspect(breed: DogGlyphId) -> f32 {
+        let a = (DOG_GLYPHS[breed as usize].aspect_x1000 as f32) / 1000.0;
+        if a > 0.001 { a } else { 0.001 }
     }
 }
 

@@ -117,7 +117,7 @@ const fn release_host(name: &'static str, at: &'static [&'static str], why: &'st
     }
 }
 
-/// A tool the Linux guest's apt list provides.
+/// A tool the Linux guest's provisioning provides (`linux_guest::provision_steps`).
 const fn guest(name: &'static str, at: &'static [&'static str], why: &'static str) -> Tool {
     Tool {
         name,
@@ -179,6 +179,13 @@ pub const TOOLS: &[Tool] = &[
         "bash",
         &["/bin/bash", "/usr/bin/bash"],
         "a shell aterm integrates: macOS's 3.2 is what people run, so the bash integration's tests run it",
+    ),
+    guest(
+        "bash-3.2",
+        &["/usr/local/bin/bash-3.2", "/bin/bash"],
+        "the spare hold's SIGWINCH negative control needs a bash whose `read < fifo` fails when a \
+         signal interrupts the open: 3.2, macOS's /bin/bash (bash 5 restarts it); the Linux guest \
+         builds GNU's 3.2.57 as /usr/local/bin/bash-3.2",
     ),
     os(
         "zsh",

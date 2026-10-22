@@ -17,14 +17,17 @@ use crate::{CellCoord, CellExtra, CellExtras};
 
 /// `Dimensions` for `Grid`, so consumers need no foreign impl.
 impl Dimensions for Grid {
+    #[inline]
     fn total_lines(&self) -> usize {
         self.storage.total_lines()
     }
 
+    #[inline]
     fn screen_lines(&self) -> usize {
         usize::from(self.storage.visible_rows())
     }
 
+    #[inline]
     fn columns(&self) -> usize {
         usize::from(self.storage.cols())
     }
@@ -36,14 +39,14 @@ impl Grid {
     /// Get the number of visible rows.
     #[must_use]
     #[inline]
-    pub fn rows(&self) -> u16 {
+    pub const fn rows(&self) -> u16 {
         self.storage.visible_rows()
     }
 
     /// Get the number of columns.
     #[must_use]
     #[inline]
-    pub fn cols(&self) -> u16 {
+    pub const fn cols(&self) -> u16 {
         self.storage.cols()
     }
 
@@ -66,21 +69,24 @@ impl Grid {
     /// Get total lines in buffer (visible + scrollback).
     #[must_use]
     #[inline]
-    pub fn total_lines(&self) -> usize {
+    pub const fn total_lines(&self) -> usize {
         self.storage.total_lines()
     }
 
     /// Get the display offset (scroll position).
     #[must_use]
     #[inline]
-    pub fn display_offset(&self) -> usize {
+    pub const fn display_offset(&self) -> usize {
         self.storage.display_offset()
     }
 
     /// Take the accumulated content scroll delta, resetting it to 0.
     #[inline]
-    pub fn take_content_scroll_delta(&mut self) -> i32 {
-        self.storage.take_content_scroll_delta()
+    pub const fn take_content_scroll_delta(&mut self) -> i32 {
+        self.storage
+            .cursor_state
+            .presentation
+            .take_content_scroll_delta()
     }
 
     /// Take the pending change to the monotonic absolute-row coordinate space.
@@ -88,8 +94,11 @@ impl Grid {
     /// Terminal metadata consumers must apply splices in order. `Invalidate`
     /// means multiple non-composable changes accumulated before this call.
     #[inline]
-    pub fn take_absolute_row_update(&mut self) -> Option<crate::AbsoluteRowUpdate> {
-        self.storage.presentation.take_absolute_row_update()
+    pub const fn take_absolute_row_update(&mut self) -> Option<crate::AbsoluteRowUpdate> {
+        self.storage
+            .cursor_state
+            .presentation
+            .take_absolute_row_update()
     }
 
     /// Take the logical-row insertion retained for text-selection remapping.
@@ -97,8 +106,11 @@ impl Grid {
     /// This is independent of [`Self::take_absolute_row_update`], because the
     /// parser may drain metadata updates before terminal post-processing.
     #[inline]
-    pub fn take_selection_row_update(&mut self) -> Option<crate::AbsoluteRowUpdate> {
-        self.storage.presentation.take_selection_row_update()
+    pub const fn take_selection_row_update(&mut self) -> Option<crate::AbsoluteRowUpdate> {
+        self.storage
+            .cursor_state
+            .presentation
+            .take_selection_row_update()
     }
 
     /// Force selection invalidation (`content_scroll_delta = i32::MAX`) for a
@@ -197,11 +209,13 @@ impl Grid {
     /// Drain this batch's accumulated selection damage (see [`SelectionDamage`]).
     ///
     /// [`SelectionDamage`]: crate::SelectionDamage
+    #[inline]
     pub fn take_selection_damage(&mut self) -> crate::SelectionDamage {
         self.storage.take_selection_damage()
     }
 
     /// Drain this batch's host-coordinate invalidation flag.
+    #[inline]
     pub fn take_coordinates_invalidated(&mut self) -> bool {
         self.storage.take_coordinates_invalidated()
     }
@@ -210,6 +224,7 @@ impl Grid {
     /// the numbers behind `take_coordinates_invalidated`. Read it in the same
     /// post-processing step as the flag: a non-empty, exact record means rows
     /// moved only as the listed bands say.
+    #[inline]
     pub fn take_row_band_moves(&mut self) -> crate::RowBandMoves {
         self.storage.presentation.take_row_band_moves()
     }
@@ -217,6 +232,7 @@ impl Grid {
     /// Drain the most recent resize's revealed-history row shift (see
     /// `last_resize_row_shift`). Read from the active grid: `Terminal::resize`
     /// resizes both the active and the saved grid, so each records its own.
+    #[inline]
     pub fn take_last_resize_row_shift(&mut self) -> u16 {
         self.storage.take_last_resize_row_shift()
     }
@@ -226,14 +242,16 @@ impl Grid {
     /// [`take_last_resize_row_shift`](Self::take_last_resize_row_shift), the
     /// selection's one input: draining either leaves the other intact. Every
     /// resize overwrites the whole record.
+    #[inline]
     pub fn take_last_resize_shape(&mut self) -> crate::ResizeShape {
         self.storage.presentation.take_last_resize_shape()
     }
 
     /// Read the most recent resize's [`crate::ResizeShape`] without draining it.
     #[must_use]
-    pub fn last_resize_shape(&self) -> crate::ResizeShape {
-        self.storage.presentation.last_resize_shape
+    #[inline]
+    pub const fn last_resize_shape(&self) -> crate::ResizeShape {
+        self.storage.cursor_state.presentation.last_resize_shape
     }
 
     /// Record that visible rows `top..=bottom` had their content moved or
@@ -246,6 +264,7 @@ impl Grid {
     /// `display_offset`, so it is sound mid-batch while the processing prologue
     /// forces the offset to 0 (`top_visible_absolute_row` subtracts it and would
     /// be wrong here).
+    #[inline]
     pub fn damage_selection_visible_rows_ext(
         &mut self,
         top: u16,
@@ -346,22 +365,22 @@ impl Grid {
     /// Get the cursor position.
     #[must_use]
     #[inline]
-    pub fn cursor(&self) -> super::Cursor {
-        self.storage.cursor()
+    pub const fn cursor(&self) -> super::Cursor {
+        self.storage.cursor_state.cursor()
     }
 
     /// Get cursor row.
     #[must_use]
     #[inline]
-    pub fn cursor_row(&self) -> u16 {
-        self.storage.cursor().row
+    pub const fn cursor_row(&self) -> u16 {
+        self.storage.cursor_state.cursor().row
     }
 
     /// Get cursor column.
     #[must_use]
     #[inline]
-    pub fn cursor_col(&self) -> u16 {
-        self.storage.cursor().col
+    pub const fn cursor_col(&self) -> u16 {
+        self.storage.cursor_state.cursor().col
     }
 
     /// Soft-wrap flag for a visible row: `true` if this row is a wrap
@@ -399,8 +418,8 @@ impl Grid {
     /// Check if the cursor has a deferred wrap pending.
     #[must_use]
     #[inline]
-    pub fn pending_wrap(&self) -> bool {
-        self.storage.pending_wrap()
+    pub const fn pending_wrap(&self) -> bool {
+        self.storage.cursor_state.pending_wrap()
     }
 
     /// Set the pending wrap flag directly.
@@ -408,11 +427,11 @@ impl Grid {
     /// Used by DECRC (cursor restore) to restore the saved wrap-next state.
     /// Normal cursor operations clear pending_wrap automatically.
     #[inline]
-    pub fn set_pending_wrap(&mut self, wrap: bool) {
+    pub const fn set_pending_wrap(&mut self, wrap: bool) {
         if wrap {
-            self.storage.mark_pending_wrap();
+            self.storage.cursor_state.mark_pending_wrap();
         } else {
-            self.storage.clear_pending_wrap();
+            self.storage.cursor_state.clear_pending_wrap();
         }
     }
 
@@ -435,7 +454,7 @@ impl Grid {
     /// do not carry it.
     #[must_use]
     #[inline]
-    pub fn wrap_serial(&self) -> u64 {
+    pub const fn wrap_serial(&self) -> u64 {
         self.storage.wrap_serial
     }
 
@@ -444,14 +463,14 @@ impl Grid {
     /// Get damage state.
     #[must_use]
     #[inline]
-    pub fn damage(&self) -> &Damage {
-        self.storage.damage()
+    pub const fn damage(&self) -> &Damage {
+        self.storage.cursor_state.presentation.damage()
     }
 
     /// Get mutable damage state.
     #[inline]
-    pub fn damage_mut(&mut self) -> &mut Damage {
-        self.storage.damage_mut()
+    pub const fn damage_mut(&mut self) -> &mut Damage {
+        self.storage.cursor_state.presentation.damage_mut()
     }
 
     /// Monotonic content-generation counter.
@@ -462,27 +481,27 @@ impl Grid {
     /// nonzero, so `0` is a usable "never observed" sentinel.
     #[must_use]
     #[inline]
-    pub fn content_gen(&self) -> u64 {
+    pub const fn content_gen(&self) -> u64 {
         self.storage.content_gen
     }
 
     /// Get cell extras storage.
     #[must_use]
     #[inline]
-    pub fn extras(&self) -> &CellExtras {
-        self.storage.extras()
+    pub const fn extras(&self) -> &CellExtras {
+        self.storage.cursor_state.presentation.extras()
     }
 
     /// Get mutable cell extras storage.
     #[inline]
-    pub fn extras_mut(&mut self) -> &mut CellExtras {
-        self.storage.extras_mut()
+    pub const fn extras_mut(&mut self) -> &mut CellExtras {
+        self.storage.cursor_state.presentation.extras_mut()
     }
 
     /// Mark that the grid has at least one double-width row (DECDWL/DECDHL),
     /// enabling the per-row `line_size` lookup in `effective_cols_for_row`.
     #[inline]
-    pub fn mark_has_double_width(&mut self) {
+    pub const fn mark_has_double_width(&mut self) {
         self.storage.any_double_width = true;
     }
 
@@ -490,7 +509,7 @@ impl Grid {
     #[must_use]
     #[inline]
     #[cfg(test)]
-    pub fn has_any_double_width(&self) -> bool {
+    pub const fn has_any_double_width(&self) -> bool {
         self.storage.any_double_width
     }
 
@@ -640,26 +659,26 @@ impl Grid {
     /// Get the current scroll region.
     #[must_use]
     #[inline]
-    pub fn scroll_region(&self) -> crate::ScrollRegion {
+    pub const fn scroll_region(&self) -> crate::ScrollRegion {
         self.storage.scroll_region()
     }
 
     /// Set the scroll region (DECSTBM).
     #[inline]
-    pub fn set_scroll_region(&mut self, top: u16, bottom: u16) {
+    pub const fn set_scroll_region(&mut self, top: u16, bottom: u16) {
         self.storage.set_scroll_region(top, bottom);
     }
 
     /// Reset scroll region to full screen.
     #[inline]
-    pub fn reset_scroll_region(&mut self) {
+    pub const fn reset_scroll_region(&mut self) {
         self.storage.reset_scroll_region();
     }
 
     /// Get the current horizontal margins (DECSLRM).
     #[must_use]
     #[inline]
-    pub fn horizontal_margins(&self) -> crate::HorizontalMargins {
+    pub const fn horizontal_margins(&self) -> crate::HorizontalMargins {
         self.storage.horizontal_margins()
     }
 
@@ -671,7 +690,7 @@ impl Grid {
     /// call to choose between a batched and a per-glyph writer.
     #[must_use]
     #[inline]
-    pub fn has_horizontal_margins(&self) -> bool {
+    pub const fn has_horizontal_margins(&self) -> bool {
         self.storage.has_horizontal_margins
     }
 
@@ -692,24 +711,24 @@ impl Grid {
     /// it, so the cursor column decides that case too.
     #[must_use]
     #[inline]
-    pub fn cursor_outside_margin_span(&self) -> bool {
+    pub const fn cursor_outside_margin_span(&self) -> bool {
         if !self.storage.has_horizontal_margins {
             return false;
         }
         let margins = self.storage.horizontal_margins();
-        let col = self.storage.cursor.col;
+        let col = self.storage.cursor_state.cursor.col;
         col < margins.left || col > margins.right
     }
 
     /// Set horizontal margins (DECSLRM, VT420+).
     #[inline]
-    pub fn set_horizontal_margins(&mut self, left: u16, right: u16) {
+    pub const fn set_horizontal_margins(&mut self, left: u16, right: u16) {
         self.storage.set_horizontal_margins(left, right);
     }
 
     /// Reset horizontal margins to full width.
     #[inline]
-    pub fn reset_horizontal_margins(&mut self) {
+    pub const fn reset_horizontal_margins(&mut self) {
         self.storage.reset_horizontal_margins();
     }
 
@@ -728,8 +747,8 @@ impl Grid {
     /// array crosses; see [`Self::restore_tab_stops`].
     #[must_use]
     #[inline]
-    pub fn tab_defaults_suppressed(&self) -> bool {
-        self.storage.tab_defaults_suppressed
+    pub const fn tab_defaults_suppressed(&self) -> bool {
+        self.storage.cursor_state.tab_defaults_suppressed
     }
 
     /// Replace the tab stops and the TBC 3 suppression flag that goes with them
@@ -756,7 +775,7 @@ impl Grid {
     /// Get a reference to the scrollback storage.
     #[must_use]
     #[inline]
-    pub fn scrollback(&self) -> Option<&aterm_scrollback::ScrollbackStorage> {
+    pub const fn scrollback(&self) -> Option<&aterm_scrollback::ScrollbackStorage> {
         self.storage.scrollback()
     }
 
@@ -1018,11 +1037,12 @@ impl Grid {
     /// Number of lines in the ring buffer scrollback (not tiered).
     #[must_use]
     #[inline]
-    pub fn ring_buffer_scrollback(&self) -> usize {
+    pub const fn ring_buffer_scrollback(&self) -> usize {
         self.storage.ring_buffer_scrollback()
     }
 
     /// Clear damage after rendering.
+    #[inline]
     pub fn clear_damage(&mut self) {
         let visible_rows = self.storage.visible_rows();
         self.storage.clear_damage(visible_rows);
@@ -1039,6 +1059,7 @@ impl Grid {
     /// comparing two reads.
     ///
     /// `&mut self` because the fold latches; the grid's content is untouched.
+    #[inline]
     pub fn row_revisions(&mut self) -> &[u64] {
         let visible_rows = self.storage.visible_rows();
         self.storage.presentation.fold_row_revisions(visible_rows);
@@ -1046,6 +1067,7 @@ impl Grid {
     }
 
     /// Mark the cursor cell as damaged.
+    #[inline]
     pub fn mark_cursor_damage(&mut self) {
         let cursor = self.storage.cursor();
         self.storage.damage.mark_cell(cursor.row, cursor.col);
@@ -1061,6 +1083,7 @@ impl Grid {
     /// Damage the whole screen and bump `content_gen`, invalidating every
     /// content-keyed cache (search index, cross-session polls).
     #[cfg(test)]
+    #[inline]
     pub fn mark_content_full(&mut self) {
         self.storage.mark_content_full();
     }
@@ -1068,7 +1091,8 @@ impl Grid {
     /// Check if the grid needs a full redraw (tests).
     #[cfg(test)]
     #[must_use]
-    pub fn needs_full_redraw(&self) -> bool {
-        self.storage.damage.is_full()
+    #[inline]
+    pub const fn needs_full_redraw(&self) -> bool {
+        self.storage.cursor_state.presentation.damage.is_full()
     }
 }

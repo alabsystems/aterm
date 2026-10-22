@@ -69,24 +69,28 @@ struct StripRect {
 
 impl SpillGeom {
     /// Grid content's Y origin: `pad_top + head` (the renderer's `grid_top`).
-    fn grid_top(&self) -> usize {
+    #[inline]
+    const fn grid_top(&self) -> usize {
         self.pad_top + self.head
     }
 
     /// The trailing band absorbs the top-pad reduction so the fixed frame
     /// extent still contains exactly `2 * pad` vertical padding pixels.
-    fn trailing_h(&self) -> usize {
+    #[inline]
+    const fn trailing_h(&self) -> usize {
         self.pad.saturating_mul(2).saturating_sub(self.pad_top)
     }
 
-    fn grid_bottom(&self) -> usize {
+    #[inline]
+    const fn grid_bottom(&self) -> usize {
         self.frame_h.saturating_sub(self.trailing_h())
     }
 
     /// The four band strips in packed buffer order (top including head, bottom, left,
     /// right), each row-major, concatenated. Zero-area strips (e.g. `pad == 0` with a
     /// head band) stay in the layout with 0 bytes.
-    fn strips(&self) -> [StripRect; 4] {
+    #[inline]
+    const fn strips(&self) -> [StripRect; 4] {
         let grid_bottom = self.grid_bottom();
         let grid_h = grid_bottom.saturating_sub(self.grid_top());
         [
@@ -119,15 +123,29 @@ impl SpillGeom {
 
     /// A window-pixel rect clipped to the frame, as a [`Rect`]; `None` when
     /// nothing of it lies in the frame. Unbounded edges clip like any other.
-    fn frame_rect(&self, r: PxRect) -> Option<Rect> {
-        let clamp = |v: i32, hi: usize| usize::try_from(v.max(0)).map_or(hi, |v| v.min(hi));
+    #[inline]
+    const fn frame_rect(&self, r: PxRect) -> Option<Rect> {
+        #[inline]
+        const fn clamp(v: i32, hi: usize) -> usize {
+            if v <= 0 {
+                0
+            } else {
+                let u = v as usize;
+                if u < hi { u } else { hi }
+            }
+        }
         let (x0, x1) = (clamp(r.x0, self.frame_w), clamp(r.x1, self.frame_w));
         let (y0, y1) = (clamp(r.y0, self.frame_h), clamp(r.y1, self.frame_h));
-        (x0 < x1 && y0 < y1).then_some((x0, y0, x1 - x0, y1 - y0))
+        if x0 < x1 && y0 < y1 {
+            Some((x0, y0, x1 - x0, y1 - y0))
+        } else {
+            None
+        }
     }
 
     /// The window pixels `layer` may write ([`FxLayer::extent`] at its space's
     /// origin), clipped to the frame.
+    #[inline]
     fn layer_rect(&self, layer: &FxLayer) -> Option<Rect> {
         let e = layer.extent();
         if e.is_empty() {
@@ -144,16 +162,29 @@ impl SpillGeom {
     }
 
     /// Total band pixels across the four strips.
-    fn band_px(&self) -> usize {
-        self.strips().iter().map(|s| s.w * s.h).sum()
+    #[inline]
+    const fn band_px(&self) -> usize {
+        let s = self.strips();
+        s[0].w * s[0].h + s[1].w * s[1].h + s[2].w * s[2].h + s[3].w * s[3].h
     }
 
     /// Whether a frame-space rect reaches the band: non-empty after the frame clip and
     /// not inside the grid box. Mirrors the renderer's clipping, so grid-interior
     /// emissions never advance the revision.
-    fn rect_touches_band(&self, (x, y, w, h): Rect) -> bool {
-        let xe = (x + w).min(self.frame_w);
-        let ye = (y + h).min(self.frame_h);
+    #[inline]
+    const fn rect_touches_band(&self, (x, y, w, h): Rect) -> bool {
+        let xe_raw = x + w;
+        let ye_raw = y + h;
+        let xe = if xe_raw < self.frame_w {
+            xe_raw
+        } else {
+            self.frame_w
+        };
+        let ye = if ye_raw < self.frame_h {
+            ye_raw
+        } else {
+            self.frame_h
+        };
         if x >= xe || y >= ye {
             return false;
         }
@@ -168,17 +199,19 @@ impl SpillGeom {
 /// round-half). Additive light contributes its max channel as a pseudo-coverage, veils
 /// their real one.
 #[inline]
-fn cover_union(a: u8, s: u8) -> u8 {
-    (u32::from(s) + (u32::from(a) * (255 - u32::from(s)) + 127) / 255) as u8
+const fn cover_union(a: u8, s: u8) -> u8 {
+    ((s as u32) + ((a as u32) * (255 - (s as u32)) + 127) / 255) as u8
 }
 
 /// The max RGB channel of a premultiplied light colour — the pseudo-alpha an
 /// additive emission contributes to the spill coverage.
 #[inline]
-fn max_channel(premul: u32) -> u8 {
-    ((premul >> 16) & 0xff)
-        .max((premul >> 8) & 0xff)
-        .max(premul & 0xff) as u8
+const fn max_channel(premul: u32) -> u8 {
+    let r = (premul >> 16) & 0xff;
+    let g = (premul >> 8) & 0xff;
+    let b = premul & 0xff;
+    let rg = if r > g { r } else { g };
+    (if rg > b { rg } else { b }) as u8
 }
 
 /// Solve one band pixel to a straight `(r, g, b, a)` with `over_rgb(base, rgb, a) == c`
@@ -190,6 +223,7 @@ fn max_channel(premul: u32) -> u8 {
 /// `a`, so lifting `a` to the per-channel minima below makes every channel solvable with
 /// one shared alpha (`a = 255` always works). The natural `a0` is kept when feasible so
 /// the spill stays translucent light, not paint.
+#[inline]
 fn solve_spill_px(base: u32, c: u32, a0: u8) -> [u8; 4] {
     if a0 == 0 {
         debug_assert_eq!(c, base, "untouched spill pixel must still hold the band bg");
@@ -280,7 +314,8 @@ struct BandStreams {
 }
 
 impl BandStreams {
-    fn is_empty(&self) -> bool {
+    #[inline]
+    const fn is_empty(&self) -> bool {
         self.glow_under.is_empty()
             && self.fire.is_empty()
             && self.glow.is_empty()
@@ -331,6 +366,7 @@ fn clip_stream<T: Emission>(
 }
 
 impl SpillBand {
+    #[inline]
     pub fn new() -> Self {
         Self::default()
     }
@@ -338,27 +374,31 @@ impl SpillBand {
     /// Band-content revision: advances only when the exported bytes changed (band
     /// emissions appeared, moved or vanished; the bg, the veil policy or the geometry
     /// changed under live content). Unchanged ⇒ the host may skip its blit.
-    pub fn rev(&self) -> u32 {
+    #[inline]
+    pub const fn rev(&self) -> u32 {
         self.rev
     }
 
     /// The last update's dirty rects, packed `x,y,w,h` (frame-absolute device px), 4
     /// `i32`s per rect. Empty on a no-change frame. Content changes report the prev∪cur
     /// emission bbox clipped per strip; geometry/bg/policy changes report the full band.
-    pub fn rects(&self) -> &[i32] {
-        &self.rects
+    #[inline]
+    pub const fn rects(&self) -> &[i32] {
+        self.rects.as_slice()
     }
 
     /// The straight-alpha RGBA strip buffer (packing in the module docs); empty at 0/0
     /// chrome.
-    pub fn rgba(&self) -> &[u8] {
-        &self.rgba
+    #[inline]
+    pub const fn rgba(&self) -> &[u8] {
+        self.rgba.as_slice()
     }
 
     /// Include `HaloMode::Over` veils in the spill (default `true`), from the next
     /// [`Self::update`]. A flip re-rasters and ticks the revision only when veils are
     /// in the band.
-    pub fn set_include_veils(&mut self, on: bool) {
+    #[inline]
+    pub const fn set_include_veils(&mut self, on: bool) {
         self.veils_excluded = !on;
     }
 

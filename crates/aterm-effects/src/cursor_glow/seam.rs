@@ -482,7 +482,8 @@ impl CursorGlow {
     /// The caret was shown at `cur` this tick (or not shown at all): the
     /// classifier's source follows it, and a shown caret closes the hide
     /// bridge's estimate witness.
-    pub(super) fn track_shown_caret(&mut self, cur: Option<(u16, u16)>, now: Instant) {
+    #[inline]
+    pub(super) const fn track_shown_caret(&mut self, cur: Option<(u16, u16)>, now: Instant) {
         self.last = cur;
         if let Some(c) = cur {
             self.last_visible = Some((c, now));
@@ -629,8 +630,8 @@ impl CursorGlow {
     /// echo and their presses are forgotten; on it, the presses are held to the
     /// hand's row ([`Self::hold_the_live_presses`]).
     #[inline]
-    pub(super) fn refused_below_the_caret(caret: Option<(u16, u16)>, row: u16) -> bool {
-        caret.is_some_and(|(cr, _)| row > cr)
+    pub(super) const fn refused_below_the_caret(caret: Option<(u16, u16)>, row: u16) -> bool {
+        matches!(caret, Some((cr, _)) if row > cr)
     }
 
     /// Whether the hand is typing on the drawn `caret`'s row
@@ -639,8 +640,8 @@ impl CursorGlow {
     /// ([`Self::clear_typed_keeping_hand`]). Another row's run meanwhile is a
     /// program's.
     #[inline]
-    pub(super) fn hand_types_at_the_caret(&self, caret: Option<(u16, u16)>) -> bool {
-        caret.is_some_and(|(cr, _)| self.hand_row.is_some_and(|hand| hand.row == cr))
+    pub(super) const fn hand_types_at_the_caret(&self, caret: Option<(u16, u16)>) -> bool {
+        matches!((caret, self.hand_row), (Some((cr, _)), Some(hand)) if hand.row == cr)
     }
 
     /// Hold the live presses to the hand's row ([`PressCredits::held_through`])
@@ -2121,11 +2122,8 @@ impl CursorGlow {
     /// holds only the adjacent row's park. A cursor-only jump onto a retained
     /// endpoint from an earlier tick does not supply fresh print evidence.
     #[inline]
-    pub(super) fn landing_ends_a_print(&self, row: u16, col: u16) -> bool {
-        self.print_in_tick
-            && self
-                .print_anchor
-                .is_some_and(|(r, c, _)| r == row && c == col)
+    pub(super) const fn landing_ends_a_print(&self, row: u16, col: u16) -> bool {
+        self.print_in_tick && matches!(self.print_anchor, Some((r, c, _)) if r == row && c == col)
     }
 
     /// A cross-row park needs content evidence: the exact source prefix sampled

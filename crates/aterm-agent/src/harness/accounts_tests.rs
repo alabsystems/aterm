@@ -5118,6 +5118,39 @@ fn the_machine_id_is_minted_once_and_kept() {
     );
 }
 
+/// A NAME PUT IN PLACE AFTER ITS OPEN FOUND NOTHING READS ABSENT, A LINK TO
+/// NOTHING IS REFUSED ([`absent_at_open`]): the look that tells a dangling
+/// link from an absent name can come after another instance linked its
+/// machine id in, as the eight keepers race in
+/// `the_machine_id_is_minted_once_and_kept`; the name was absent when it was
+/// opened, so the keeper mints, loses the link and reads the winner's id,
+/// where it was handed the open's `NotFound`. NEGATIVE CONTROL: a dangling
+/// link is still refused, by the look and by the read.
+#[test]
+fn a_name_put_in_place_after_its_open_reads_absent() {
+    let dir = tmp("absent-at-open");
+    let name = dir.path().join("machine");
+    assert!(
+        absent_at_open(std::fs::symlink_metadata(&name)),
+        "nothing there"
+    );
+    std::fs::write(&name, "ab\n").expect("put in place");
+    assert!(
+        absent_at_open(std::fs::symlink_metadata(&name)),
+        "put in place between the open and the look"
+    );
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &link).expect("link");
+        assert!(
+            !absent_at_open(std::fs::symlink_metadata(&link)),
+            "CONTROL: a link to nothing is not absent"
+        );
+        assert!(read_bounded(&link, 64).is_err(), "CONTROL: and is refused");
+    }
+}
+
 #[test]
 fn a_torn_state_file_is_an_empty_state_and_a_note_never_a_panic() {
     let dir = tmp("torn");

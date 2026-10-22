@@ -37,6 +37,7 @@ pub struct UnderlineColorSpan {
 impl UnderlineColorSpan {
     /// Create a new underline-colour span.
     #[must_use]
+    #[inline]
     pub const fn new(start_col: u16, end_col: u16, color: u32) -> Self {
         Self {
             start_col,

@@ -45,13 +45,30 @@ pub fn broker_opts(tier: aterm_link::durability::Durability) -> OpenOptions {
     opts
 }
 
-/// Open a guarded broker on `log` with `opts` ([`broker_opts`]).
+/// Open a guarded broker on `log` with `opts` ([`broker_opts`]), RETAINED by
+/// aterm's default rules ([`aterm_link::broker_rules::retain`], session log
+/// Phase 6 step 6E-2, ruling U24): the one constructor `aterm link broker`
+/// opens with too, so a world's broker is the production default. The rules
+/// are set per open, as `aterm link broker` sets them at every start.
+///
+/// # Panics
+///
+/// The open, or the rules, failed.
+#[must_use]
+pub fn open_broker(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
+    let broker = open_broker_unretained(log, opts);
+    aterm_link::broker_rules::retain(&broker).expect("the default retention rules");
+    broker
+}
+
+/// [`open_broker`] with NO retention rules: a broker from before astream's R4,
+/// which never compacts and advertises no rule ([`World::without_retention`]).
 ///
 /// # Panics
 ///
 /// The open failed.
 #[must_use]
-pub fn open_broker(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
+pub fn open_broker_unretained(log: impl AsRef<Path>, opts: &OpenOptions) -> Broker {
     Broker::open_opts(log, opts.clone(), || Ok(Prepared::Nothing)).expect("guarded broker")
 }
 
@@ -625,6 +642,10 @@ pub struct World {
     /// notifier's wait) is the ordered suite's (`ordered.rs`, `notify.rs`)
     /// and the bench's default arm's. A restarted broker keeps it.
     pub opts: OpenOptions,
+    /// Whether this world's broker retains its log by aterm's default rules
+    /// ([`open_broker`]): every world's does but [`World::without_retention`]'s.
+    /// A restarted broker keeps it.
+    pub retained: bool,
     /// The read connection every polled broker read shares ([`World::read`]).
     watch: std::sync::Mutex<Option<Client>>,
 }
@@ -798,6 +819,45 @@ impl World {
         )
     }
 
+    /// A world whose broker keeps NO retention rules: a broker from before
+    /// astream's R4 ([`open_broker_unretained`]), the named unretaining case
+    /// (ruling U24). Restarted, it stays unretained.
+    pub fn without_retention(tag: &str) -> Self {
+        Self::boot_retained(
+            tag,
+            &[],
+            &[],
+            broker_opts(aterm_link::durability::Durability::Strict),
+            false,
+        )
+    }
+
+    /// [`World::without_retention`] with extra `serve` flags and environment
+    /// for the bridge child.
+    pub fn without_retention_flags(
+        tag: &str,
+        extra_serve_flags: &[&str],
+        env: &[(&str, &str)],
+    ) -> Self {
+        Self::boot_retained(
+            tag,
+            extra_serve_flags,
+            env,
+            broker_opts(aterm_link::durability::Durability::Strict),
+            false,
+        )
+    }
+
+    fn boot_retained(
+        tag: &str,
+        extra_serve_flags: &[&str],
+        env: &[(&str, &str)],
+        opts: OpenOptions,
+        retained: bool,
+    ) -> Self {
+        Self::boot_inner(tag, &[], env, None, extra_serve_flags, None, opts, retained)
+    }
+
     fn boot_full(
         tag: &str,
         accept_from: &[&str],
@@ -806,6 +866,32 @@ impl World {
         extra_serve_flags: &[&str],
         grants: Option<GrantsFor<'_>>,
         opts: OpenOptions,
+    ) -> Self {
+        Self::boot_inner(
+            tag,
+            accept_from,
+            env,
+            broker_at,
+            extra_serve_flags,
+            grants,
+            opts,
+            true,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one private constructor every boot names"
+    )]
+    fn boot_inner(
+        tag: &str,
+        accept_from: &[&str],
+        env: &[(&str, &str)],
+        broker_at: Option<&str>,
+        extra_serve_flags: &[&str],
+        grants: Option<GrantsFor<'_>>,
+        opts: OpenOptions,
+        retained: bool,
     ) -> Self {
         // ONE PERMIT PER STACK COMING UP (see [`boot_permit`]). Dropped when this
         // function returns, which is after the control socket answers — so the
@@ -840,7 +926,11 @@ impl World {
         let (broker, handle) = if broker_at.is_some() {
             (None, None)
         } else {
-            let broker = open_broker(&broker_log, &opts);
+            let broker = if retained {
+                open_broker(&broker_log, &opts)
+            } else {
+                open_broker_unretained(&broker_log, &opts)
+            };
             let handle = broker.serve(&broker_sock).expect("serve the broker");
             (Some(broker), Some(handle))
         };
@@ -904,6 +994,7 @@ impl World {
             state,
             gui_log,
             opts,
+            retained,
             watch: std::sync::Mutex::new(None),
         };
         let gui = world.gui.as_mut().expect("the gui just spawned");
@@ -1020,7 +1111,11 @@ impl World {
     /// waits for can only be the new attach's.
     pub fn start_broker(&mut self) {
         let _ = std::fs::remove_file(&self.broker_sock);
-        let broker = open_broker(&self.broker_log, &self.opts);
+        let broker = if self.retained {
+            open_broker(&self.broker_log, &self.opts)
+        } else {
+            open_broker_unretained(&self.broker_log, &self.opts)
+        };
         let handle = broker
             .serve(&self.broker_sock)
             .expect("serve the broker again");

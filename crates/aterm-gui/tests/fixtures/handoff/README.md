@@ -164,8 +164,14 @@ A field or variant no handoff writes (one the update's producer never sets:
 written by another writer of its struct, as the crash carry's `Wire.turn_ids`,
 retired, or set by nothing in this build, as DECSCL's missing levels) goes in
 the generator's `NO_HANDOFF_WRITES` with why. The hold refuses a row there that
-a desk writes, and one that names nothing a desk reaches. v0.107.0's file was recorded after its cut, at its
-tag, by the same walk over these bytes.
+a desk writes, and one absent from both the current walk and the newest
+release's written fields. A deleted field needs its retirement row only while
+that newest record still lists it as written. Once a release records its
+omission, remove the stale row; older immutable fixtures continue to hold the
+consumer to their bytes. For example, v0.110.0 no longer records the deleted
+`SessionRecord.identity` and `TerminalLeafRestore.identity` fields, whose old
+keys the consumer reads past without writing them again. v0.107.0's file was
+recorded after its cut, at its tag, by the same walk over these bytes.
 
 ## The other direction
 

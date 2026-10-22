@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (80x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the agents panel at 80 columns in bypass mode, fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1), about 10 s after the turn that started one background general-purpose agent (the stub hands it a Bash `sleep 600`): the mode row `⏵⏵ bypass permissions on (shift+tab to cycle) · ↓ to manage`, one blank row, `  ⏺ main` (bold), `  ◯ general-purpose  bling probe` with `<elapsed> · ↓ 6.2k tokens` ending at column 77, two cells short of the edge as at 120 columns (column 117)
+
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.JhpC/proj
+
+
+❯ toolstart
+
+⏺ Agent(bling probe)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Tool call done.
+
+✻ Waiting for 1 background agent to finish
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ↓ to manage
+
+  ⏺ main
+  ◯ general-purpose  bling probe                           10s · ↓ 6.2k tokens

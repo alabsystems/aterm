@@ -465,11 +465,11 @@ const STARTER_CONFIG: &str = concat!(
 # split_focus_mark = true          # in a split, ink the divider edge of the pane taking keystrokes
 # scrollbar = true                 # overlay scrollbar in each pane's right gutter (default: Windows on, else off: the brief scroll pill)
 # window_colorspace = \"srgb\"       # macOS GPU CAMetalLayer tag: srgb (colour-managed) | display-p3 (legacy stretched)
-# minimum_contrast = 1.0           # per-cell WCAG contrast floor, 1.0 (off) ..= 21.0; unset on Windows: theme colours held to 4.5:1
-# background_opacity = 1.0         # macOS GPU window glass, 0.0 (transparent) ..= 1.0 (solid); other renderers stay solid; <1.0 auto-floors contrast to 4.5:1
+# minimum_contrast = 1             # per-cell WCAG contrast floor, 1 (off) ..= 21; unset on Windows: theme colours held to 4.5:1
+# background_opacity = 1           # macOS GPU window glass, 0 (transparent) ..= 1 (solid); other renderers stay solid; <1 auto-floors contrast to 4.5:1
 # background_material = \"none\"     # macOS vibrancy behind glass: none | hud | sidebar | under-window
-# window_padding = 12.0            # interior padding, logical px per edge (0..=64; hot-applies)
-# window_padding_top = 2.0         # tighter TOP-edge override (0..=window_padding; the titlebar band supplies the rest)
+# window_padding = 12              # interior padding, logical px per edge (0..=64; hot-applies)
+# window_padding_top = 2           # tighter TOP-edge override (0..=window_padding; the titlebar band supplies the rest)
 # bold_is_bright = true            # SGR bold promotes ANSI 0-7 to bright 8-15
 # faint_opacity = 0.5              # SGR dim: fg fraction kept, blended toward the bg
 # scrollback_lines = 100000        # total history across ring + tiered store (default 100k, 0 = unlimited)
@@ -496,12 +496,12 @@ const STARTER_CONFIG: &str = concat!(
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
 # cursor_trail_ms = 260                # fade duration in ms (30..=2000)
 # cursor_trail_length = 24             # max comet length in cells (1..=512)
-# cursor_trail_intensity = 1.0         # trail brightness 0.0..=1.0 (every style)
-# cursor_trail_radius = 0.6            # bloom-crown radius in cells (0.0..=2.0)
+# cursor_trail_intensity = 1           # trail brightness 0..=1 (every style)
+# cursor_trail_radius = 0.6            # bloom-crown radius in cells (0..=2)
 # cursor_trail_ring = true             # expanding landing \"ping\" ring on a jump (default ON)
 # --- sound (Settings > Sound) -------------------------------------------------
 # trail_sounds = true              # Music effects: every synth sound on or off together (typing notes, song, ambient bed, chimes, bonk); macOS-only (parsed but inert elsewhere). Typing notes are silent while the cursor trail is off; the other sounds still play (default ON)
-# trail_sound_volume = 0.4         # 0.0..=1.0 trail sound level (default 0.4 ~= -22 dBFS peaks, far under the bell); does NOT scale bell_sound
+# trail_sound_volume = 0.4         # 0..=1 trail sound level (default 0.4 ~= -22 dBFS peaks, far under the bell); does NOT scale bell_sound
 # trail_sound_style = \"auto\"     # typing sound: auto = follow the trail style; or an instrument for every keystroke whatever the trail looks like:
 #                                  #   music box | warm pluck | glitter | ice chime | droplet | pew | zap | tick | crackle  (the nine palettes, by sound)
 #                                  #   mechanical (keyboard click + thock) | typewriter (clack + platen, bell + carriage on Enter) | marimba | felt (muted piano)
@@ -511,8 +511,8 @@ const STARTER_CONFIG: &str = concat!(
 # trail_sound_riff = true          # the held-key SING-ALONG song (the loudest voice); false quiets just the song and keeps its visuals (default ON)
 # bell_sound = true                # the audible BEL beep (macOS NSBeep / Windows MessageBeep); false keeps the visual flash and window attention (default ON)
 # cursor_trail_bloom = true            # GPU-only soft halo around the comet (default ON)
-# cursor_trail_bloom_strength = 0.85   # 0.0..=3.0 (halo intensity)
-# cursor_trail_bloom_radius = 2.2      # 0.5..=8.0 half-res blur texels; default 2.2, 1.8 for rainbow kitty; set to override
+# cursor_trail_bloom_strength = 0.85   # 0..=3 (halo intensity)
+# cursor_trail_bloom_radius = 2.2      # 0.5..=8 half-res blur texels; default 2.2, 1.8 for rainbow kitty; set to override
 # cursor_fire_shimmer = true           # GPU-only heat-haze refraction above burning cells (default ON)
 # hdr_glow = true                      # EDR cursor glow above SDR white (GPU + HDR panel, macOS EDR or Windows scRGB; provably inert on SDR; default ON)
 # cursor_glow_sdr_boost = 0.25         # GPU-only SDR crown strength 0..=1 (dark themes only — light themes self-degrade; 0 = off)
@@ -521,8 +521,8 @@ const STARTER_CONFIG: &str = concat!(
 # --- text shaping -------------------------------------------------------------
 # ligatures = true                 # programming ligatures (=>, !=, >=, ===, ...)
 # cursor_break_ligatures = true    # break the cursor cell out of ligatures (default false leaves ligatures intact)
-# line_height = 1.0                # cell-box multiplier 0.8..=2.0 (leading splits half above/below; default 1.1 on Windows, 1.0 elsewhere)
-# font_size_scale = 1.0            # multiplies font_px or the auto size, 0.8..=1.25 (a theme may set it; this wins)
+# line_height = 1                  # cell-box multiplier 0.8..=2 (leading splits half above/below; default 1.1 on Windows, 1 elsewhere)
+# font_size_scale = 1              # multiplies font_px or the auto size, 0.8..=1.25 (a theme may set it; this wins)
 # adjust_baseline = 0              # px baseline escape hatch (±32) for off-metric faces
 # adjust_underline_position = 0    # px underline shift (±32, + = down) over the font's post table
 # adjust_underline_thickness = 0   # px underline thickness delta (±32) over the font's post table
@@ -532,7 +532,7 @@ const STARTER_CONFIG: &str = concat!(
 # ambiguous_width = \"narrow\"       # East-Asian ambiguous width: narrow | wide
 # text_blending = \"linear-corrected\" # AA weight: linear-corrected (native feel) | linear
 # font_thicken = false             # macOS: CoreText font smoothing (heavier glyphs)
-# stem_gamma = 1.0                 # aesthetic stem weight (<1 thicker, >1 thinner)
+# stem_gamma = 1                   # aesthetic stem weight (<1 thicker, >1 thinner)
 # font_hinting = \"full\"           # Linux/Windows grid fitting: full (crispest, default) | light
 #                                  # (hintslight look) | off
 # font_subpixel = \"off\"           # Linux subpixel-RGB text (CPU renderer only, stage 1):
@@ -608,7 +608,7 @@ const STARTER_CONFIG: &str = concat!(
 # density = 3                      # sparks per word per frame (1..=12)
 # anim_ms = 2500                   # how long a word sparkles after appearing (350..=10000)
 # jitter = 2                       # sub-cell sparkle jitter in px (0..=6)
-# intensity = 0.85                 # opacity 0.0..=1.0
+# intensity = 0.85                 # opacity 0..=1
 # bonk = true                      # the curse BONK sound effect on a TYPED curse (default ON; scaled by trail_sound_volume; Settings > Sound shows it)
 # bonk_detonation = false          # also bonk when an on-screen curse's supernova ignites (default OFF; typed provenance only unless opted in)
 # extra_words = [\"frak\"]           # extra words to treat as profanity
@@ -631,7 +631,7 @@ const STARTER_CONFIG: &str = concat!(
 # graphic = { collection = \"cats\" }             # the peeking cat on your own word
 # [sparkle_words.ink]              # animated glyph-ink shimmer
 # enabled = true                   # takes effect only when sparkle_words.enabled is on
-# strength = 0.75                  # ink tint vs original fg; clamp 0.0..=1.0
+# strength = 0.75                  # ink tint vs original fg; clamp 0..=1
 # sweep_ms = 2200                  # one specular sweep window; clamp 350..=6000
 # loop = false                     # true: re-sweep while visible (keeps focused wakes live;
 #                                  #   raises the sweep_ms floor to 600 — flash margin)
@@ -811,6 +811,77 @@ fn unwaited_answer_line(argv: &[String]) -> String {
     )
 }
 
+/// Ordinary window options shared by parsing and first-launch classification.
+/// Scope controls, commands and utility verbs have their own parser branches.
+#[derive(Clone, Copy)]
+enum OrdinaryWindowOption {
+    WorkingDirectory,
+    Hold,
+    FontPx,
+    Font,
+    Scale,
+    Gpu,
+    Cpu,
+    Shell,
+    Columns,
+    Lines,
+    ShellIntegration,
+    NoShellIntegration,
+    Verbose,
+}
+
+impl OrdinaryWindowOption {
+    fn parse(arg: &str) -> Option<Self> {
+        Some(match arg {
+            "-d" | "--working-directory" => Self::WorkingDirectory,
+            "--hold" => Self::Hold,
+            "--font-px" => Self::FontPx,
+            "--font" => Self::Font,
+            "--scale" => Self::Scale,
+            "--gpu" => Self::Gpu,
+            "--cpu" => Self::Cpu,
+            "--shell" => Self::Shell,
+            "--columns" => Self::Columns,
+            "--lines" => Self::Lines,
+            "--shell-integration" => Self::ShellIntegration,
+            "--no-shell-integration" => Self::NoShellIntegration,
+            "--verbose" => Self::Verbose,
+            _ => return None,
+        })
+    }
+
+    fn takes_value(self) -> bool {
+        matches!(
+            self,
+            Self::WorkingDirectory
+                | Self::FontPx
+                | Self::Font
+                | Self::Scale
+                | Self::Shell
+                | Self::Columns
+                | Self::Lines
+        )
+    }
+}
+
+/// Whether a command line contains only ordinary window options. The front
+/// door removes its own mode switches before calling this pure classifier.
+/// Numeric values and paths are validated by the real parser before setup can
+/// start; values that resemble other options still belong to their option.
+#[must_use]
+pub fn initial_setup_window_args(args: &[std::ffi::OsString]) -> bool {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let Some(option) = arg.to_str().and_then(OrdinaryWindowOption::parse) else {
+            return false;
+        };
+        if option.takes_value() && args.next().is_none() {
+            return false;
+        }
+    }
+    true
+}
+
 /// CLI: `aterm-gui [OPTIONS] [-e CMD ARGS… | --help | --version]`.
 /// `--help`/`--version` print and exit; an unknown option, a bad `-d`, `-e` without a command,
 /// or a value flag missing its argument prints a hint and exits 2. With no args (a Finder/.app
@@ -837,6 +908,91 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
     let mut exec_command: Option<Vec<std::ffi::OsString>> = None;
     let mut launch = crate::launch::Launch::default();
     while let Some(arg) = args.next() {
+        if let Some(option) = arg.to_str().and_then(OrdinaryWindowOption::parse) {
+            match option {
+                OrdinaryWindowOption::WorkingDirectory => {
+                    let dir = flag_value("-d/--working-directory", &mut args);
+                    if let Some(refusal) = start_dir_refusal(&dir, update_successor) {
+                        eprintln!("aterm: {refusal}");
+                        std::process::exit(2);
+                    }
+                    cwd = Some(dir);
+                }
+                OrdinaryWindowOption::Hold => hold = true,
+                OrdinaryWindowOption::FontPx => {
+                    let v = flag_value("--font-px", &mut args);
+                    if valid_font_px_flag(&v) {
+                        launch.font_px = v.parse().ok();
+                    } else {
+                        eprintln!(
+                            "aterm: --font-px expects a number from {} through {}, got '{v}' (try --help)",
+                            crate::FONT_PX_MIN,
+                            crate::FONT_PX_MAX,
+                        );
+                        std::process::exit(2);
+                    }
+                }
+                OrdinaryWindowOption::Font => {
+                    let v = flag_value("--font", &mut args);
+                    launch.font_family = (!v.trim().is_empty()).then_some(v);
+                }
+                OrdinaryWindowOption::Scale => {
+                    let v = flag_value("--scale", &mut args);
+                    match v.parse::<f64>() {
+                        Ok(f) if f.is_finite() && f > 0.0 => launch.scale = Some(f),
+                        _ => {
+                            eprintln!(
+                                "aterm: --scale expects a positive number, got '{v}' (try --help)"
+                            );
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                // The last renderer option wins, and either outranks config.
+                OrdinaryWindowOption::Gpu => {
+                    launch.renderer = Some(crate::launch::RendererFlag::Gpu);
+                }
+                OrdinaryWindowOption::Cpu => {
+                    launch.renderer = Some(crate::launch::RendererFlag::Cpu);
+                }
+                OrdinaryWindowOption::Shell => {
+                    let shell = flag_value("--shell", &mut args);
+                    set_launch_flag(|f| f.shell = Some(shell));
+                }
+                OrdinaryWindowOption::Columns => {
+                    let v = flag_value("--columns", &mut args);
+                    if let Some(n) = initial_dimension_flag(&v, 20, 500) {
+                        set_launch_flag(|f| f.columns = Some(n));
+                    } else {
+                        eprintln!(
+                            "aterm: --columns expects an integer from 20 through 500, got '{v}' (try --help)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+                OrdinaryWindowOption::Lines => {
+                    let v = flag_value("--lines", &mut args);
+                    if let Some(n) = initial_dimension_flag(&v, 5, 300) {
+                        set_launch_flag(|f| f.lines = Some(n));
+                    } else {
+                        eprintln!(
+                            "aterm: --lines expects an integer from 5 through 300, got '{v}' (try --help)"
+                        );
+                        std::process::exit(2);
+                    }
+                }
+                // Accepted and ignored: shell integration is on by default.
+                OrdinaryWindowOption::ShellIntegration => {}
+                OrdinaryWindowOption::NoShellIntegration => {
+                    set_launch_flag(|f| f.no_shell_integration = true);
+                }
+                OrdinaryWindowOption::Verbose => {
+                    set_launch_flag(|f| f.verbose = true);
+                    aterm_gpu::set_verbose(true);
+                }
+            }
+            continue;
+        }
         match &*arg.to_string_lossy() {
             "-h" | "--help" => {
                 let help = format!(
@@ -1021,53 +1177,6 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
                 };
                 answer_and_exit(&argv, &said, 0);
             }
-            "-d" | "--working-directory" => {
-                let dir = flag_value("-d/--working-directory", &mut args);
-                if let Some(refusal) = start_dir_refusal(&dir, update_successor) {
-                    eprintln!("aterm: {refusal}");
-                    std::process::exit(2);
-                }
-                cwd = Some(dir);
-            }
-            "--hold" => hold = true,
-            // --- The render/font flags: carried by `launch`. ---
-            "--font-px" => {
-                let v = flag_value("--font-px", &mut args);
-                if valid_font_px_flag(&v) {
-                    launch.font_px = v.parse().ok();
-                } else {
-                    eprintln!(
-                        "aterm: --font-px expects a number from {} through {}, got '{v}' (try --help)",
-                        crate::FONT_PX_MIN,
-                        crate::FONT_PX_MAX,
-                    );
-                    std::process::exit(2);
-                }
-            }
-            "--font" => {
-                let v = flag_value("--font", &mut args);
-                launch.font_family = (!v.trim().is_empty()).then_some(v);
-            }
-            "--scale" => {
-                let v = flag_value("--scale", &mut args);
-                match v.parse::<f64>() {
-                    Ok(f) if f.is_finite() && f > 0.0 => launch.scale = Some(f),
-                    _ => {
-                        eprintln!(
-                            "aterm: --scale expects a positive number, got '{v}' (try --help)"
-                        );
-                        std::process::exit(2);
-                    }
-                }
-            }
-            // `--gpu` / `--cpu`: the last one given wins, and either outranks config `gpu`.
-            "--gpu" => launch.renderer = Some(crate::launch::RendererFlag::Gpu),
-            "--cpu" => launch.renderer = Some(crate::launch::RendererFlag::Cpu),
-            // --- The rest of the launch flags: recorded in `LaunchFlags`. ---
-            "--shell" => {
-                let shell = flag_value("--shell", &mut args);
-                set_launch_flag(|f| f.shell = Some(shell));
-            }
             // Containment: the last of these wins (`--sandbox --containment
             // user` is user); the fail-closed parse is the launch funnel's.
             "--containment" => {
@@ -1087,35 +1196,6 @@ pub(crate) fn parse_cli(os_argv: Vec<std::ffi::OsString>) -> Cli {
             "--lifeline-fd" => lifeline_fd = Some(flag_value("--lifeline-fd", &mut args)),
             // As `--lifeline-fd`: validated once the whole command line is read.
             "--ready-fd" => ready_fd = Some(flag_value("--ready-fd", &mut args)),
-            "--columns" => {
-                let v = flag_value("--columns", &mut args);
-                if let Some(n) = initial_dimension_flag(&v, 20, 500) {
-                    set_launch_flag(|f| f.columns = Some(n));
-                } else {
-                    eprintln!(
-                        "aterm: --columns expects an integer from 20 through 500, got '{v}' (try --help)"
-                    );
-                    std::process::exit(2);
-                }
-            }
-            "--lines" => {
-                let v = flag_value("--lines", &mut args);
-                if let Some(n) = initial_dimension_flag(&v, 5, 300) {
-                    set_launch_flag(|f| f.lines = Some(n));
-                } else {
-                    eprintln!(
-                        "aterm: --lines expects an integer from 5 through 300, got '{v}' (try --help)"
-                    );
-                    std::process::exit(2);
-                }
-            }
-            // Accepted and ignored: shell integration is on by default.
-            "--shell-integration" => {}
-            "--no-shell-integration" => set_launch_flag(|f| f.no_shell_integration = true),
-            "--verbose" => {
-                set_launch_flag(|f| f.verbose = true);
-                aterm_gpu::set_verbose(true);
-            }
             "-e" | "--command" => {
                 let cmd: Vec<std::ffi::OsString> = args.by_ref().collect();
                 if cmd.is_empty() {
@@ -1227,6 +1307,37 @@ fn ready_request(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn setup_window_classification_consumes_values_before_scope_flags() {
+        let classify = |args: &[&str]| {
+            super::initial_setup_window_args(
+                &args
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for args in [
+            &["--font", "--headless"][..],
+            &["--shell", "--control-sock"][..],
+            &["-d", "--diagnose", "--gpu"][..],
+        ] {
+            assert!(classify(args), "option values keep their place: {args:?}");
+        }
+        for args in [
+            &["--font", "Menlo", "--headless"][..],
+            &["--gpu", "--containment", "user"][..],
+            &["--gpu", "--control-sock", "off"][..],
+            &["--font-px"][..],
+            &["--shell"][..],
+        ] {
+            assert!(
+                !classify(args),
+                "a scope flag or missing value refuses setup: {args:?}"
+            );
+        }
+    }
+
     /// A `-d` folder that has gone since the window opened stops a person's launch (exit 2) and
     /// never an update's relaunch of that window.
     #[test]
@@ -1569,6 +1680,38 @@ mod tests {
                 checked.push(key.to_string());
             }
         }
+        // Every number the starter shows, in any table, is spelled as aterm writes one
+        // (`prefs::written_number`: `window_padding = 12`, never `12.0`), so a file that
+        // mixes uncommented starter lines with Settings' own writes has one spelling.
+        let mut numbers = 0;
+        for raw in super::STARTER_CONFIG.lines() {
+            let Some(rest) = raw.trim_start().strip_prefix('#') else {
+                continue;
+            };
+            let Some((key, value)) = rest.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            if key.is_empty() || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            let literal = value.split('#').next().unwrap_or_default().trim();
+            let Some(number) = literal
+                .parse::<i64>()
+                .ok()
+                .map(|n| n as f64)
+                .or_else(|| literal.parse::<f64>().ok())
+            else {
+                continue;
+            };
+            assert_eq!(
+                literal,
+                crate::prefs::written_number(number).to_string().trim(),
+                "STARTER_CONFIG spells `{key}` as aterm never writes it"
+            );
+            numbers += 1;
+        }
+        assert!(numbers > 30, "only {numbers} numbers checked");
         // Bare top-level keys must sit above `[keybindings]` (the last section), or the
         // table-scope skip never checks them: assert each security opt-in was reached.
         for must in [

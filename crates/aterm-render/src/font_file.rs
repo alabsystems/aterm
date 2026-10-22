@@ -246,6 +246,7 @@ fn read_admitted_handle(
 }
 
 /// Production-font-budget wrapper used by renderer and GUI config seams.
+#[inline]
 pub fn read_font_file(path: &Path) -> io::Result<Vec<u8>> {
     read_bounded_font_file(path, MAX_FONT_FILE_BYTES)
 }
@@ -428,9 +429,10 @@ impl MappedFontFile {
 impl MappedFontFile {
     /// Whether `self` and `other` map the same file — the same bytes, without
     /// touching a page of either.
+    #[inline]
     #[must_use]
-    pub fn same_file(&self, other: &Self) -> bool {
-        self.identity == other.identity
+    pub const fn same_file(&self, other: &Self) -> bool {
+        self.identity.0 == other.identity.0 && self.identity.1 == other.identity.1
     }
 }
 
@@ -466,6 +468,7 @@ impl core::ops::Deref for MappedFontFile {
 }
 
 impl AsRef<[u8]> for MappedFontFile {
+    #[inline]
     fn as_ref(&self) -> &[u8] {
         self
     }
@@ -785,12 +788,14 @@ mod win {
 
 /// Production-font-budget twin of [`read_bounded_font_file_into`], for a caller that reads the
 /// whole font tree and keeps only a summary of it.
+#[inline]
 pub fn read_font_file_into(path: &Path, buf: &mut Vec<u8>) -> io::Result<()> {
     read_bounded_font_file_into(path, MAX_FONT_FILE_BYTES, buf)
 }
 
 /// Production-font-budget validation wrapper used for exact diagnostics before
 /// committing a config path to the live renderer.
+#[inline]
 pub fn validate_font_file(path: &Path) -> io::Result<()> {
     validate_bounded_font_file(path, MAX_FONT_FILE_BYTES)
 }

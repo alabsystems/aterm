@@ -1,0 +1,29 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (120x28, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the same screen at 28 rows (`ctl resize 28 120`): of the card only its working-directory row is left, at row 0, then the blank row and the whole notice
+ ▝▝   ▝▝   /private/tmp/at.r3cj/proj
+
+  Updated to latest. Got 66 features, 424 bugfixes, and 126 other changes.
+  code.claude.com/docs/en/changelog for details
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 2)
+
+✻ Cooked for 0s · done 12:10 AM
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 3)
+
+✻ Baked for 0s · done 12:10 AM
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 4)
+
+✻ Cooked for 0s · done 12:10 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

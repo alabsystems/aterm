@@ -80,8 +80,8 @@ impl RowBandMoves {
     /// The recorded moves, oldest first.
     #[must_use]
     #[inline]
-    pub fn as_slice(&self) -> &[RowBandMove] {
-        &self.moves[..usize::from(self.len)]
+    pub const fn as_slice(&self) -> &[RowBandMove] {
+        self.moves.split_at(self.len as usize).0
     }
 }
 
@@ -119,8 +119,8 @@ impl BandSet {
     /// The bands, ascending, pairwise disjoint and non-adjacent.
     #[must_use]
     #[inline]
-    pub fn as_slice(&self) -> &[(u64, u64)] {
-        &self.bands[..usize::from(self.len)]
+    pub const fn as_slice(&self) -> &[(u64, u64)] {
+        self.bands.split_at(self.len as usize).0
     }
 }
 
@@ -419,7 +419,8 @@ pub struct GridPresentationState {
     pub row_rev_folded_seq: u64,
 }
 
-fn coalesce_row_splice(
+#[inline]
+const fn coalesce_row_splice(
     pending: Option<AbsoluteRowUpdate>,
     at: u64,
     inserted: u64,
@@ -498,7 +499,7 @@ impl GridPresentationState {
     }
 
     #[inline]
-    pub(crate) fn take_content_scroll_delta(&mut self) -> i32 {
+    pub(crate) const fn take_content_scroll_delta(&mut self) -> i32 {
         let delta = self.content_scroll_delta;
         self.content_scroll_delta = 0;
         delta
@@ -570,7 +571,7 @@ impl GridPresentationState {
     /// the fail-closed bit every non-band coordinate move sets (see
     /// [`RowBandMoves::inexact`]).
     #[inline]
-    pub(crate) fn poison_row_band_moves(&mut self) {
+    pub(crate) const fn poison_row_band_moves(&mut self) {
         self.row_band_moves.inexact = true;
     }
 
@@ -594,7 +595,8 @@ impl GridPresentationState {
 
     /// Record a logical-row insertion, coalescing the consecutive form emitted
     /// by repeated scrolls through one top-anchored region.
-    pub(crate) fn record_absolute_row_splice(&mut self, at: u64, inserted: u64) {
+    #[inline]
+    pub(crate) const fn record_absolute_row_splice(&mut self, at: u64, inserted: u64) {
         debug_assert!(inserted > 0);
         self.pending_absolute_row_update = Some(coalesce_row_splice(
             self.pending_absolute_row_update,
@@ -609,34 +611,34 @@ impl GridPresentationState {
     }
 
     #[inline]
-    pub(crate) fn take_absolute_row_update(&mut self) -> Option<AbsoluteRowUpdate> {
+    pub(crate) const fn take_absolute_row_update(&mut self) -> Option<AbsoluteRowUpdate> {
         self.pending_absolute_row_update.take()
     }
 
     #[inline]
-    pub(crate) fn take_selection_row_update(&mut self) -> Option<AbsoluteRowUpdate> {
+    pub(crate) const fn take_selection_row_update(&mut self) -> Option<AbsoluteRowUpdate> {
         self.pending_selection_row_update.take()
     }
 
     #[must_use]
     #[inline]
-    pub(crate) fn damage(&self) -> &Damage {
+    pub(crate) const fn damage(&self) -> &Damage {
         &self.damage
     }
 
     #[inline]
-    pub(crate) fn damage_mut(&mut self) -> &mut Damage {
+    pub(crate) const fn damage_mut(&mut self) -> &mut Damage {
         &mut self.damage
     }
 
     #[must_use]
     #[inline]
-    pub(crate) fn extras(&self) -> &CellExtras {
+    pub(crate) const fn extras(&self) -> &CellExtras {
         &self.extras
     }
 
     #[inline]
-    pub(crate) fn extras_mut(&mut self) -> &mut CellExtras {
+    pub(crate) const fn extras_mut(&mut self) -> &mut CellExtras {
         &mut self.extras
     }
 

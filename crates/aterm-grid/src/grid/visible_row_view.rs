@@ -45,25 +45,30 @@ pub enum CellDataView<'a> {
 impl<'a> CellDataView<'a> {
     /// Foreground RGB overflow color, if any.
     #[must_use]
-    pub fn fg_rgb(self) -> Option<[u8; 3]> {
+    #[inline]
+    pub const fn fg_rgb(self) -> Option<[u8; 3]> {
         match self {
             Self::Live(r) => r.fg_rgb(),
-            Self::History(e) => e.and_then(|x| x.fg_rgb()),
+            Self::History(Some(x)) => x.fg_rgb(),
+            Self::History(None) => None,
         }
     }
 
     /// Background RGB overflow color, if any.
     #[must_use]
-    pub fn bg_rgb(self) -> Option<[u8; 3]> {
+    #[inline]
+    pub const fn bg_rgb(self) -> Option<[u8; 3]> {
         match self {
             Self::Live(r) => r.bg_rgb(),
-            Self::History(e) => e.and_then(|x| x.bg_rgb()),
+            Self::History(Some(x)) => x.bg_rgb(),
+            Self::History(None) => None,
         }
     }
 
     /// Base codepoint for a complex cell (the first scalar of the complex
     /// string). Mirrors [`CellRenderData::complex_char`] for both tiers.
     #[must_use]
+    #[inline]
     pub fn complex_base(self) -> Option<char> {
         match self {
             Self::Live(r) => r.complex_char(),
@@ -76,7 +81,8 @@ impl<'a> CellDataView<'a> {
     /// The cell's [`CellExtra`] (underline color, hyperlink). For combining marks and cluster
     /// tails use [`marks`](Self::marks): live and history store them differently.
     #[must_use]
-    pub fn cell_extra(self) -> Option<&'a CellExtra> {
+    #[inline]
+    pub const fn cell_extra(self) -> Option<&'a CellExtra> {
         match self {
             Self::Live(r) => r.cell_extra(),
             Self::History(e) => e,
@@ -90,6 +96,7 @@ impl<'a> CellDataView<'a> {
     /// materialized cell folds the grapheme into its complex string (base = first scalar), so
     /// the marks are that string's tail plus any separately stored combining marks. Borrowed,
     /// so repainting cached history does not allocate; clone the iterator for a second pass.
+    #[inline]
     pub fn marks(self) -> impl Iterator<Item = char> + Clone + 'a {
         let extra = self.cell_extra();
         let complex = match self {
@@ -108,6 +115,7 @@ impl<'a> CellDataView<'a> {
 impl<'a> VisibleRowView<'a> {
     /// Effective column count of this row (matches `Row::len` / `MaterializedRow::len`).
     #[must_use]
+    #[inline]
     pub fn len(&self) -> u16 {
         match self {
             Self::Live { row, .. } => row.len(),
@@ -120,6 +128,7 @@ impl<'a> VisibleRowView<'a> {
     /// recorded early-wrap hole is not text, also when BCE put it inside
     /// `len`, live or painted on a history row.
     #[must_use]
+    #[inline]
     pub fn written_len(&self) -> u16 {
         match self {
             Self::Live { row, .. } => row.written_len(),
@@ -130,6 +139,7 @@ impl<'a> VisibleRowView<'a> {
 
     /// Whether the row has no occupied columns.
     #[must_use]
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -137,6 +147,7 @@ impl<'a> VisibleRowView<'a> {
     /// Whether this row is a soft-wrap continuation of the previous line; `false` for
     /// `Empty`.
     #[must_use]
+    #[inline]
     pub fn is_wrapped(&self) -> bool {
         match self {
             Self::Live { row, .. } => row.is_wrapped(),
@@ -147,6 +158,7 @@ impl<'a> VisibleRowView<'a> {
 
     /// The cell at `col`, or `None` if out of range.
     #[must_use]
+    #[inline]
     pub fn cell(&self, col: u16) -> Option<Cell> {
         match self {
             Self::Live { row, .. } => row.get(col).copied(),
@@ -180,6 +192,7 @@ impl<'a> VisibleRowView<'a> {
     /// WIDE_CONTINUATION, so a real continuation is not itself WIDE and sits right of a WIDE
     /// cell.
     #[must_use]
+    #[inline]
     pub fn is_wide_continuation(&self, col: u16) -> bool {
         self.cell(col)
             .is_some_and(|c| c.is_wide_continuation() && !c.is_wide())
@@ -209,6 +222,7 @@ impl<'a> VisibleRowView<'a> {
 
     /// The extras view for `col`; `cell` lets the live probe flag-gate.
     #[must_use]
+    #[inline]
     pub fn cell_data(&self, col: u16, cell: Cell) -> CellDataView<'_> {
         match self {
             Self::Live {
@@ -275,6 +289,7 @@ impl Grid {
     /// [`Live`]: VisibleRowView::Live
     /// [`History`]: VisibleRowView::History
     #[must_use]
+    #[inline]
     pub fn visible_row_view(&self, visible_row: u16) -> VisibleRowView<'_> {
         let d = self.display_offset();
         if usize::from(visible_row) >= d {

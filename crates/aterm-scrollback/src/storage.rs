@@ -112,6 +112,7 @@ impl ScrollbackStorage {
 
     /// Get the total number of lines.
     #[must_use]
+    #[inline]
     pub fn line_count(&self) -> usize {
         dispatch!(self, line_count())
     }
@@ -123,6 +124,7 @@ impl ScrollbackStorage {
     ///
     /// Returns `Ok(None)` for out-of-bounds, `Err` for I/O or decompression failures.
     #[must_use = "line data is discarded if not consumed"]
+    #[inline]
     pub fn get_line(&self, idx: usize) -> Result<Option<Cow<'_, Line>>, ScrollbackError> {
         dispatch!(self, get_line(idx))
     }
@@ -131,54 +133,63 @@ impl ScrollbackStorage {
     ///
     /// Returns `Ok(None)` for out-of-bounds, `Err` for I/O or decompression failures.
     #[must_use = "line data is discarded if not consumed"]
+    #[inline]
     pub fn get_line_rev(&self, rev_idx: usize) -> Result<Option<Cow<'_, Line>>, ScrollbackError> {
         dispatch!(self, get_line_rev(rev_idx))
     }
 
     /// Get the hot tier limit.
     #[must_use]
+    #[inline]
     pub fn hot_limit(&self) -> usize {
         dispatch!(self, hot_limit())
     }
 
     /// Get the warm tier limit.
     #[must_use]
+    #[inline]
     pub fn warm_limit(&self) -> usize {
         dispatch!(self, warm_limit())
     }
 
     /// Get the line limit.
     #[must_use]
+    #[inline]
     pub fn line_limit(&self) -> Option<usize> {
         dispatch!(self, line_limit())
     }
 
     /// Get the memory budget.
     #[must_use]
+    #[inline]
     pub fn memory_budget(&self) -> usize {
         dispatch!(self, memory_budget())
     }
 
     /// Get reclaimable storage bytes used for budget enforcement.
     #[must_use]
+    #[inline]
     pub fn budgeted_memory_used(&self) -> usize {
         dispatch!(self, budgeted_memory_used())
     }
 
     /// Get total memory usage across all tiers (bytes).
     #[must_use]
+    #[inline]
     pub fn total_memory_used(&self) -> usize {
         dispatch!(self, total_memory_used())
     }
 
     /// Get the number of lines in cold tier.
     #[must_use]
+    #[inline]
     pub fn cold_line_count(&self) -> usize {
         dispatch!(self, cold_line_count())
     }
 
     /// Get cold tier memory usage (bytes).
     #[must_use]
+    #[inline]
     #[cfg(test)]
     pub fn cold_memory_used(&self) -> usize {
         dispatch!(self, cold_memory_used())
@@ -188,6 +199,7 @@ impl ScrollbackStorage {
     ///
     /// Lightweight O(1) read — the level is precomputed on every accounting sync.
     #[must_use]
+    #[inline]
     pub fn watermark_level(&self) -> WatermarkLevel {
         dispatch!(self, watermark_level())
     }
@@ -198,7 +210,8 @@ impl ScrollbackStorage {
     /// [`line_count`](Self::line_count) as blank rows when older history sits
     /// before them, so the two can overlap.
     #[must_use]
-    pub fn pressure_evicted_lines(&self) -> u64 {
+    #[inline]
+    pub const fn pressure_evicted_lines(&self) -> u64 {
         match self {
             ScrollbackStorage::Memory(sb) => sb.pressure_evicted_lines(),
         }
@@ -208,6 +221,7 @@ impl ScrollbackStorage {
     /// compressed, reported out of band. See
     /// [`Scrollback::image_rows_dropped_by_compression`].
     #[must_use]
+    #[inline]
     pub fn image_rows_dropped_by_compression(&self) -> u64 {
         dispatch!(self, image_rows_dropped_by_compression())
     }
@@ -216,6 +230,7 @@ impl ScrollbackStorage {
     // Skip: the tier-promotion driver — the blanket-drain/alloc class of the
     // tier operations it dispatches into (each individually classified).
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     pub fn push_line(&mut self, line: Line) -> std::io::Result<()> {
         dispatch!(self, push_line(line))
     }
@@ -223,6 +238,7 @@ impl ScrollbackStorage {
     /// Clear all lines from scrollback.
     // Skip: dispatches the per-tier clears (drop-glue lane).
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     pub fn clear(&mut self) -> std::io::Result<()> {
         dispatch!(self, clear())
     }
@@ -234,6 +250,7 @@ impl ScrollbackStorage {
     ///
     /// Returns an error if decompression or I/O fails during line extraction;
     /// the scrollback is then unchanged.
+    #[inline]
     pub fn remove_newest(&mut self, n: usize) -> Result<(), ScrollbackError> {
         dispatch!(self, remove_newest(n))
     }
@@ -249,6 +266,7 @@ impl ScrollbackStorage {
     // Skip: dispatches into the tier truncations (blanket-drain class), like
     // `set_line_limit` below.
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     pub fn truncate_oldest(&mut self, n: usize) -> Result<(), ScrollbackError> {
         if n == 0 {
             return Ok(());
@@ -262,6 +280,7 @@ impl ScrollbackStorage {
     /// Set the line limit.
     // Skip: dispatches into the tier truncations (blanket-drain class).
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     pub fn set_line_limit(&mut self, limit: Option<usize>) {
         dispatch!(self, set_line_limit(limit));
     }
@@ -272,6 +291,7 @@ impl ScrollbackStorage {
     /// eviction and usage still exceeds the new budget).
     // Skip: dispatches into the tier evictions (blanket-drain/alloc class).
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     pub fn set_memory_budget(&mut self, budget: usize) -> Result<(), ScrollbackError> {
         dispatch!(self, set_memory_budget(budget))
     }
@@ -280,6 +300,7 @@ impl ScrollbackStorage {
 
     /// Iterate over all lines (oldest to newest).
     #[must_use]
+    #[inline]
     pub fn iter(&self) -> ScrollbackStorageIter<'_> {
         ScrollbackStorageIter {
             storage: self,
@@ -291,6 +312,7 @@ impl ScrollbackStorage {
     /// Bulk segment read backing [`ScrollbackStorageIter`] — devirtualized
     /// dispatch to the concrete backend's `read_segment` (see the `dispatch!`
     /// rationale above).
+    #[inline]
     pub(crate) fn read_segment(&self, idx: usize) -> crate::iter::SegmentResult {
         match self {
             ScrollbackStorage::Memory(sb) => sb.read_segment(idx),
@@ -299,12 +321,14 @@ impl ScrollbackStorage {
 }
 
 impl Default for ScrollbackStorage {
+    #[inline]
     fn default() -> Self {
         ScrollbackStorage::Memory(Scrollback::with_defaults())
     }
 }
 
 impl From<Scrollback> for ScrollbackStorage {
+    #[inline]
     fn from(sb: Scrollback) -> Self {
         ScrollbackStorage::Memory(sb)
     }

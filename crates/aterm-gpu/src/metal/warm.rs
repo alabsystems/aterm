@@ -117,7 +117,8 @@ pub(crate) enum WarmItem {
 
 impl WarmItem {
     /// The build of `row` against a `present`-format swapchain.
-    pub(crate) fn pipeline(row: Pipeline, present: PixelFormat) -> Self {
+    #[inline]
+    pub(crate) const fn pipeline(row: Pipeline, present: PixelFormat) -> Self {
         Self::Pipeline(row, pipelines::metal_format(row.spec().target, present))
     }
 }
@@ -157,8 +158,9 @@ enum Lane {
 }
 
 impl Lane {
-    fn of(library: ShaderLibrary) -> Self {
-        if library == ShaderLibrary::Cell {
+    #[inline]
+    const fn of(library: ShaderLibrary) -> Self {
+        if matches!(library, ShaderLibrary::Cell) {
             Self::Cell
         } else {
             Self::Present
@@ -193,6 +195,7 @@ impl WarmLatch {
     /// A latch whose window waits at most `deadline` after the warm began:
     /// [`DEADLINE`] in the process, a hang detector in a test that holds the
     /// warm and so must not race the shipped window.
+    #[inline]
     pub(crate) const fn new(deadline: Duration) -> Self {
         Self {
             phase: Mutex::new(Phase::Idle),
@@ -309,6 +312,7 @@ impl WarmLatch {
     }
 
     /// Whether a warm began on this latch.
+    #[inline]
     pub(crate) fn began(&self) -> bool {
         self.current_phase() != Phase::Idle
     }

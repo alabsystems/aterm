@@ -37,7 +37,7 @@ impl Host {
         pipeline.set_cursor_glow(
             true,
             "rainbow kitty",
-            None,
+            crate::cursor_fx::TrailColor::Automatic,
             None,
             400,
             24,

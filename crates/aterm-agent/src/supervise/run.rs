@@ -1650,8 +1650,17 @@ fn seed_done_check(
     now: Instant,
 ) {
     let Some(mut owed) = approvals::done_check_owed_in(body, sid) else {
+        // Its answer judged at the point recorded last: a wall there, read again, cut it.
+        if let Some(rule) = approvals::check_point_last_in(body, sid) {
+            state.seed_check_point(rule);
+        }
         return;
     };
+    // A `/compact` typed at its point: the compaction's continuation types it again.
+    if owed.compact {
+        state.seed_compact_check(owed.rule);
+        return;
+    }
     // AN OLDER BUILD'S BOOKS: the points its journal says it judged after the
     // check, no wall cutting it, as [`approvals::done_check_owed_in`] counts
     // the records of a newer one — the first the check's answer (the task
@@ -5316,6 +5325,11 @@ impl<'a, C: Ctl> Session<'a, C> {
             if !(writing && unsettled) {
                 saw.busy = true;
                 saw.live |= !writing && !signing_in;
+                // Gemini CLI's usage-limit dialog kept trying: a try in
+                // flight keeps its episode, a try that got through ends it
+                // ([`Self::limit_retry_busy`]). A screen only `writing` is
+                // no agent's read.
+                let try_in_flight = !writing && self.limit_retry_busy();
                 // The worker works: the wait the host was told ended (the
                 // try was typed) — told here, not at the next point, which
                 // the busy turn keeps this loop from reaching. `/login`'s own
@@ -5347,7 +5361,12 @@ impl<'a, C: Ctl> Session<'a, C> {
                     if self.wall_memory.is_none() && !self.turn_end.compacting() && !signing_in {
                         self.exception_ended(screen.seq, Some("the agent working"), review);
                     }
-                    if self.box_ask.is_some() && !writing {
+                    // The escalated point's badge goes with it — save while a
+                    // `Keep trying` of Gemini CLI's usage-limit dialog is in
+                    // flight under its spinner: the badge its ladder raised
+                    // stands till the try got through
+                    // ([`Self::limit_retry_busy`]).
+                    if self.box_ask.is_some() && !writing && !try_in_flight {
                         self.close_box(screen.seq, review)?;
                     }
                     // Likewise the told choice: a dialog the loop answered is
@@ -5986,6 +6005,17 @@ impl<'a, C: Ctl> Session<'a, C> {
                 let ago = Duration::from_millis(u64::try_from(now_ms - act.at_ms).unwrap_or(0));
                 self.turn_end
                     .seed_land_act(act.said, act.lead, ago, self.fx.mono());
+            }
+            // …and which act a retry or a compaction's continuation delivers again: a `/compact`
+            // typed at its point owes it to the continuation, and its point recorded last, read
+            // again, a wall there cut it.
+            if let Some(rule) = land.owed {
+                self.turn_end.seed_land_owed(rule);
+            }
+            if land.compact {
+                self.turn_end.seed_compact_land();
+            } else if land.judged {
+                self.turn_end.seed_land_point();
             }
         }
         // A turn read running since the point recorded last: a later turn
@@ -9736,6 +9766,11 @@ pub use turn_end_loop::standing_rules;
 /// The composer's cursor-row guard, for the live upgrade's pressed notice too
 /// (`harness::upgrade_drive`).
 pub(crate) use turn_end_loop::{composer_guard, composer_guard_at};
+/// The act executor's fold of an act's text and the loop's reader of the
+/// standing rules, for the policy's tests of what agy reads back
+/// (`policy/turn_end_agy_message_tests.rs`).
+#[cfg(test)]
+pub(crate) use turn_end_loop::{one_turn, standing_rules_in};
 
 #[cfg(test)]
 #[path = "run_tests.rs"]

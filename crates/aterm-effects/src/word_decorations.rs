@@ -269,7 +269,7 @@ impl CompanionOnGlass {
     /// stands in, under-covering the sprite. Prefer [`Self::at_head`].
     #[inline]
     #[must_use]
-    pub fn at_cell(cell: (u16, u16)) -> Self {
+    pub const fn at_cell(cell: (u16, u16)) -> Self {
         Self {
             cell: Some(cell),
             body_px: None,
@@ -281,7 +281,7 @@ impl CompanionOnGlass {
     /// [`WordDecorations::kitty_cursor_footprint`]. Guards the caret band too.
     #[inline]
     #[must_use]
-    pub fn at_head(cell: (u16, u16), head_px: (i32, i32, i32, i32)) -> Self {
+    pub const fn at_head(cell: (u16, u16), head_px: (i32, i32, i32, i32)) -> Self {
         Self {
             cell: Some(cell),
             body_px: Some(head_px),
@@ -293,7 +293,7 @@ impl CompanionOnGlass {
     /// temporarily withholds the caret; callers must never guess a stale cell.
     #[inline]
     #[must_use]
-    pub fn at_body(cell: Option<(u16, u16)>, body_px: (i32, i32, i32, i32)) -> Self {
+    pub const fn at_body(cell: Option<(u16, u16)>, body_px: (i32, i32, i32, i32)) -> Self {
         Self {
             cell,
             body_px: Some(body_px),
@@ -304,24 +304,21 @@ impl CompanionOnGlass {
     /// The rects an ambient cat must not stack on this frame.
     #[inline]
     #[must_use]
-    fn footprint(self, geom: EffectGeom) -> CompanionFootprint {
+    const fn footprint(self, geom: EffectGeom) -> CompanionFootprint {
+        let caret_rect = if let (true, Some((row, col))) = (self.guards_caret, self.cell) {
+            let cw = geom.cell_w as i32;
+            let ch = geom.cell_h as i32;
+            let x0 = (col as i32) * cw;
+            let y0 = (row as i32) * ch;
+            // Two cells wide, the caret's own row band; not the
+            // head's extent (that is `body_px`), so a cat peeking
+            // up past the caret's rows still draws.
+            Some((x0, x0 + 2 * cw, y0, y0 + ch))
+        } else {
+            None
+        };
         CompanionFootprint {
-            rects: [
-                self.body_px,
-                self.guards_caret
-                    .then(|| {
-                        let (row, col) = self.cell?;
-                        let cw = i32::from(geom.cell_w);
-                        let ch = i32::from(geom.cell_h);
-                        let x0 = i32::from(col) * cw;
-                        let y0 = i32::from(row) * ch;
-                        // Two cells wide, the caret's own row band; not the
-                        // head's extent (that is `body_px`), so a cat peeking
-                        // up past the caret's rows still draws.
-                        Some((x0, x0 + 2 * cw, y0, y0 + ch))
-                    })
-                    .flatten(),
-            ],
+            rects: [self.body_px, caret_rect],
         }
     }
 }
@@ -451,7 +448,7 @@ pub struct KittyCursorPlacement {
 
 impl KittyCursorPlacement {
     #[inline]
-    fn settled(sample: CatFootprint) -> Self {
+    const fn settled(sample: CatFootprint) -> Self {
         Self {
             sample,
             leg: KittyCursorPlacementLeg::Settled,
@@ -464,7 +461,7 @@ impl KittyCursorPlacement {
     /// Emitters keep signed X instead of clamping onto the opposite edge.
     #[inline]
     #[must_use]
-    pub fn in_motion(self) -> bool {
+    pub const fn in_motion(self) -> bool {
         !matches!(self.leg, KittyCursorPlacementLeg::Settled)
     }
 }
@@ -705,7 +702,7 @@ fn class_default_spec(class: Class, cfg: &DecoConfig) -> WordEffectSpec {
 /// similar contexts start at similar (not identical) hues.
 const RAINBOW_HUE_SALT: u64 = 0x5A1A_D0FF_BEAD_5EED;
 #[inline]
-pub(crate) fn rainbow_base_hue(gkey: u64) -> f32 {
+pub(crate) const fn rainbow_base_hue(gkey: u64) -> f32 {
     (mix(gkey ^ RAINBOW_HUE_SALT) % 360) as f32
 }
 
@@ -868,12 +865,16 @@ struct Episode {
 
 impl Episode {
     /// A fresh (just-born) episode.
-    fn fresh(now: Instant, genome: Genome, seed: u64, row: u16, seq: u64) -> Self {
+    #[inline]
+    const fn fresh(now: Instant, genome: Genome, seed: u64, row: u16, seq: u64) -> Self {
         Episode {
             appeared: now,
             last_seen: now,
             genome,
-            cat_colors: CatColorKey::default(),
+            cat_colors: CatColorKey {
+                accent: 0,
+                background: 0,
+            },
             nova_done: false,
             nova_start: None,
             logged: false,
@@ -908,7 +909,7 @@ impl Episode {
     /// the episode leaves the persist map. Born-settled episodes are never
     /// marked; born-done ones refresh their mark.
     #[inline]
-    fn one_shot_started(&self) -> bool {
+    const fn one_shot_started(&self) -> bool {
         !self.born_settled
             && (self.peek_started
                 || self.peek_done
@@ -922,7 +923,7 @@ impl Episode {
 
     /// Born-done and born-settled episodes share the inert emission path.
     #[inline]
-    fn inert(&self) -> bool {
+    const fn inert(&self) -> bool {
         self.born_done || self.born_settled
     }
 }
@@ -1065,13 +1066,13 @@ struct AlignScore {
 
 impl AlignScore {
     #[inline]
-    fn with_edge(self, stationary: bool, tier: u8, distance: u32) -> Self {
+    const fn with_edge(self, stationary: bool, tier: u8, distance: u32) -> Self {
         Self {
-            stationary: self.stationary.saturating_add(u16::from(stationary)),
+            stationary: self.stationary.saturating_add(stationary as u16),
             matches: self.matches.saturating_add(1),
-            seed_matches: self.seed_matches.saturating_add(u16::from(tier == 0)),
-            context_matches: self.context_matches.saturating_add(u16::from(tier == 1)),
-            distance: self.distance.saturating_add(u64::from(distance)),
+            seed_matches: self.seed_matches.saturating_add((tier == 0) as u16),
+            context_matches: self.context_matches.saturating_add((tier == 1) as u16),
+            distance: self.distance.saturating_add(distance as u64),
         }
     }
 
@@ -1080,7 +1081,7 @@ impl AlignScore {
     /// survives, row 4 is new) from a global insertion (`[0,2] -> [1,3]`, both
     /// transfer). Ties prefer stronger context and less motion.
     #[inline]
-    fn better_than(self, other: Self) -> bool {
+    const fn better_than(self, other: Self) -> bool {
         self.stationary > other.stationary
             || (self.stationary == other.stationary
                 && (self.matches > other.matches
@@ -2130,8 +2131,13 @@ struct ParkedPane {
 /// 3600 ms, and no tier goes below the classic 2400 ms (the emitter has no
 /// short Flash arc).
 #[inline]
-fn super_window_of(tier: supernova::SuperTier) -> Duration {
-    Duration::from_millis(supernova::total_ms(tier).max(supernova::SUPER_TOTAL_MS))
+const fn super_window_of(tier: supernova::SuperTier) -> Duration {
+    let ms = supernova::total_ms(tier);
+    Duration::from_millis(if ms > supernova::SUPER_TOTAL_MS {
+        ms
+    } else {
+        supernova::SUPER_TOTAL_MS
+    })
 }
 
 /// The instant a granted burst window ends: the §3.2 burst-mutex predicate,
@@ -2453,8 +2459,11 @@ impl WordDecorations {
     /// ([`Self::set_scan_session`]). `None` only when unknown; session tests
     /// then match everything.
     #[inline]
-    fn scan_scope(&self) -> Option<u64> {
-        self.bound.or(self.scan_session)
+    const fn scan_scope(&self) -> Option<u64> {
+        match self.bound {
+            Some(b) => Some(b),
+            None => self.scan_session,
+        }
     }
 
     /// Declare the absolute row of the top visible line (`RenderInput::base_y`,
@@ -2465,6 +2474,7 @@ impl WordDecorations {
     /// row `caret.row − (base_y_now − base_y_then)`. Without it every delta
     /// reads as zero and the flash falls back to a bounded upward search. Spent
     /// by the next rescan in its scope.
+    #[inline]
     pub fn set_scan_base_y(&mut self, base_y: Option<i64>) {
         let scope = self.scan_scope();
         self.trick_flash.declare_base_y(scope, base_y);
@@ -2476,7 +2486,8 @@ impl WordDecorations {
     /// presented frame: a window compositing N panes bakes at most two tiles in
     /// total. Latches `host_brackets_frames`; a host that never calls this gets
     /// one prologue per tick.
-    pub fn begin_host_frame(&mut self) {
+    #[inline]
+    pub const fn begin_host_frame(&mut self) {
         self.host_brackets_frames = true;
         self.cat_baker_ready = false;
         // A new frame: the one-body law's door reopens for exactly one
@@ -2580,8 +2591,9 @@ impl WordDecorations {
     ///
     /// Idempotent: compares the metric and returns, so every companion entry
     /// can call it.
-    fn drop_holds_if_metric_moved(&mut self, cell_w: u16, cell_h: u16) {
-        if (cell_w, cell_h) == self.held_tile_metric {
+    #[inline]
+    const fn drop_holds_if_metric_moved(&mut self, cell_w: u16, cell_h: u16) {
+        if cell_w == self.held_tile_metric.0 && cell_h == self.held_tile_metric.1 {
             return;
         }
         self.held_tile_metric = (cell_w, cell_h);
@@ -2594,6 +2606,7 @@ impl WordDecorations {
     /// clock + bake budget; a cell-metric change clears and version-bumps the
     /// atlas (§5.5). Guarded by `cat_baker_ready`, so N panes share one
     /// two-bake budget; unbracketed hosts clear the flag at tick start.
+    #[inline]
     fn begin_baker_frame(&mut self, geom: EffectGeom, _animals: bool) {
         if self.cat_baker_ready {
             return;
@@ -2657,7 +2670,8 @@ impl WordDecorations {
 
     /// Suspend the engine's clocks (perf_reduced latch, suppressed alt screen).
     /// Idempotent: the first call latches the freeze instant.
-    pub fn freeze(&mut self, now: Instant) {
+    #[inline]
+    pub const fn freeze(&mut self, now: Instant) {
         if self.frozen_at.is_none() {
             self.frozen_at = Some(now);
         }
@@ -2740,6 +2754,7 @@ impl WordDecorations {
     /// Drain this tick's Kitty Log sightings (§F4.2), keeping capacity. Hosts
     /// drain at both tick sites (render and introspection); undrained growth
     /// is bounded by the tick-start clear.
+    #[inline]
     pub fn drain_kitty_sightings(&mut self) -> std::vec::Drain<'_, KittySighting> {
         self.sightings.drain(..)
     }
@@ -2747,6 +2762,7 @@ impl WordDecorations {
     /// Drain this tick's curse bonk cues, keeping capacity. Hosts drain right
     /// after [`tick`](Self::tick) (the vec clears at the next tick start); a
     /// disabled bonk knob drains and drops.
+    #[inline]
     pub fn drain_curse_cues(&mut self) -> std::vec::Drain<'_, CurseCue> {
         self.curse_cues.drain(..)
     }
@@ -2754,6 +2770,7 @@ impl WordDecorations {
     /// Drain this tick's positioned ambient-peek landings (the pet's bat).
     /// Drain right after [`tick`](Self::tick); a pet-less host drains and
     /// drops.
+    #[inline]
     pub fn drain_peek_cues(&mut self) -> std::vec::Drain<'_, PeekCue> {
         self.peek_cues.drain(..)
     }
@@ -2762,7 +2779,8 @@ impl WordDecorations {
     /// deco-suspended). Nothing is scanned while away, so on return
     /// `spend_next_births` latches: the next rescan's births are born-settled,
     /// as if their peek elapsed unwatched. `now` is unused (API compatibility).
-    pub fn set_presentable(&mut self, _now: Instant, presentable: bool) {
+    #[inline]
+    pub const fn set_presentable(&mut self, _now: Instant, presentable: bool) {
         if self.away != presentable {
             return; // no transition (`away` is the inverse of `presentable`)
         }
@@ -2775,7 +2793,7 @@ impl WordDecorations {
     /// The host's last [`Self::set_presentable`] verdict.
     #[must_use]
     #[inline]
-    pub fn presentable(&self) -> bool {
+    pub const fn presentable(&self) -> bool {
         !self.away
     }
 
@@ -2993,8 +3011,8 @@ impl WordDecorations {
     /// footprint and the companion router's seat law both read.
     #[must_use]
     #[inline]
-    pub fn kitty_cursor_lead_px(cell_w: u16) -> i32 {
-        i32::from(cell_w).saturating_mul(Self::KITTY_LEAD_NUM) / Self::KITTY_LEAD_DEN
+    pub const fn kitty_cursor_lead_px(cell_w: u16) -> i32 {
+        (cell_w as i32).saturating_mul(Self::KITTY_LEAD_NUM) / Self::KITTY_LEAD_DEN
     }
 
     /// Time constant, in seconds, of the settled placement follower: each
@@ -3382,7 +3400,7 @@ impl WordDecorations {
     /// ([`Self::companion_body_drawn`]). Taken before baking: over-claiming on
     /// a frame whose bake misses costs nothing.
     #[inline]
-    fn claim_companion_body(&mut self) -> bool {
+    const fn claim_companion_body(&mut self) -> bool {
         if !self.host_brackets_frames {
             return true;
         }
@@ -3866,7 +3884,7 @@ impl WordDecorations {
     }
 
     #[inline]
-    fn pet_mote_kind_tag(kind: crate::kitty_pet::PetMoteKind) -> u64 {
+    const fn pet_mote_kind_tag(kind: crate::kitty_pet::PetMoteKind) -> u64 {
         match kind {
             crate::kitty_pet::PetMoteKind::Dust => 1,
             // The z and its startled pop share one tile family: same art,
@@ -3880,11 +3898,11 @@ impl WordDecorations {
     /// Stable atlas identity for one mote tile: kind, rotation bucket and exact
     /// size. Tint is absent: tiles bake white and are tinted per sprite.
     #[inline]
-    fn pet_mote_host_id(kind: crate::kitty_pet::PetMoteKind, bucket: u32, side: u16) -> u64 {
+    const fn pet_mote_host_id(kind: crate::kitty_pet::PetMoteKind, bucket: u32, side: u16) -> u64 {
         let mut x = Self::PET_MOTE_HOST_SALT
             ^ (Self::pet_mote_kind_tag(kind) << 40)
-            ^ (u64::from(bucket) << 20)
-            ^ u64::from(side);
+            ^ ((bucket as u64) << 20)
+            ^ (side as u64);
         x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         x ^ (x >> 31)
@@ -4188,28 +4206,33 @@ impl WordDecorations {
     /// Diagnosable, allocation-free installed source identity for host
     /// conformance tests and capture/glass generation checks.
     #[doc(hidden)]
-    pub fn kitty_sprite_source_fingerprint(&self) -> Option<u64> {
+    #[inline]
+    pub const fn kitty_sprite_source_fingerprint(&self) -> Option<u64> {
         if self.kitty_disabled {
             None
         } else {
-            Some(
-                self.kitty_custom
-                    .as_ref()
-                    .map_or(0, |custom| custom.source_fp),
-            )
+            Some(match &self.kitty_custom {
+                Some(custom) => custom.source_fp,
+                None => 0,
+            })
         }
     }
 
     /// Borrow the exact immutable RGBA Arc supplied by the host.
     #[doc(hidden)]
-    pub fn kitty_sprite_rgba(&self) -> Option<&Arc<[u8]>> {
-        self.kitty_custom.as_ref().map(|custom| &custom.rgba)
+    #[inline]
+    pub const fn kitty_sprite_rgba(&self) -> Option<&Arc<[u8]>> {
+        match &self.kitty_custom {
+            Some(custom) => Some(&custom.rgba),
+            None => None,
+        }
     }
 
     /// Whether a user-configured kitty sprite currently overrides the built-in
     /// homage. Exposed for host conformance checks and diagnostics.
     #[must_use]
-    pub fn has_custom_kitty_sprite(&self) -> bool {
+    #[inline]
+    pub const fn has_custom_kitty_sprite(&self) -> bool {
         self.kitty_custom.is_some()
     }
 
@@ -4260,6 +4283,7 @@ impl WordDecorations {
     /// The typed line was not pet talk after all (`sit tight`): a visible flash
     /// leaves within a tenth of a second instead of finishing, and one not yet
     /// found is dropped. Idempotent.
+    #[inline]
     pub fn revoke_trick_flash(&mut self, now: Instant) {
         self.trick_flash.revoke(now);
     }
@@ -4281,6 +4305,7 @@ impl WordDecorations {
     /// Where the trick flash stands at `now` (pending, live, revoked or idle),
     /// for tests, the lifecycle model's conformance and driven validation.
     #[must_use]
+    #[inline]
     pub fn trick_flash_phase(&self, now: Instant) -> TrickFlashPhase {
         self.trick_flash.phase(now)
     }
@@ -4310,7 +4335,7 @@ impl WordDecorations {
     /// [`Self::typed_edit_witness`]'s time/pane half. See
     /// [`TYPED_EDIT_REACH_COLS`].
     #[inline]
-    fn typed_edit_reached(&self, row: u16, start_col: u16, end_col: u16) -> bool {
+    const fn typed_edit_reached(&self, row: u16, start_col: u16, end_col: u16) -> bool {
         let Some(e) = self.typed_edit else {
             return false;
         };
@@ -4349,15 +4374,16 @@ impl WordDecorations {
     /// Consume the edit witness: this keystroke has now re-armed a cat, and the
     /// repaints that follow it must not ride the same key ([`TypedEdit::spent`]).
     #[inline]
-    fn spend_typed_edit(&mut self) {
+    const fn spend_typed_edit(&mut self) {
         if let Some(e) = self.typed_edit.as_mut() {
             e.spent = true;
         }
     }
 
     /// True if the grid changed since the last scan and a rescan is due.
+    #[must_use]
     #[inline]
-    pub fn needs_rescan(&self, epoch: u64) -> bool {
+    pub const fn needs_rescan(&self, epoch: u64) -> bool {
         !self.have_scanned || epoch != self.last_epoch
     }
 
@@ -6795,11 +6821,11 @@ impl WordDecorations {
 /// Pixel center of a burst word's span. DEC rows anchor via the row's real
 /// advance (2× on DECDWL). Shared by both burst prepasses.
 #[inline]
-fn burst_center(occ: &Occurrence, geom: EffectGeom) -> (i32, i32) {
-    let advance = i32::from(geom.cell_w) * if occ.dec_line { 2 } else { 1 };
-    let ch = i32::from(geom.cell_h);
-    let cx = (i32::from(occ.start_col) + i32::from(occ.end_col) + 1) * advance / 2;
-    let cy = i32::from(occ.row) * ch + ch / 2;
+const fn burst_center(occ: &Occurrence, geom: EffectGeom) -> (i32, i32) {
+    let advance = geom.cell_w as i32 * if occ.dec_line { 2 } else { 1 };
+    let ch = geom.cell_h as i32;
+    let cx = (occ.start_col as i32 + occ.end_col as i32 + 1) * advance / 2;
+    let cy = occ.row as i32 * ch + ch / 2;
     (cx, cy)
 }
 
@@ -7265,15 +7291,18 @@ fn split_super_selection(quads: &mut Vec<GlowQuad>, n0: usize, geom: EffectGeom,
 /// visual span (along its row-band center line) — the §6.5 coupling metric
 /// and the ring-crossing distance.
 #[inline]
-fn span_dist2(occ: &Occurrence, center: (i32, i32), geom: EffectGeom) -> u64 {
-    let advance = i32::from(geom.cell_w) * if occ.dec_line { 2 } else { 1 };
-    let ch = i32::from(geom.cell_h);
-    let x0 = i32::from(occ.start_col) * advance;
-    let x1 = (i32::from(occ.end_col) + 1) * advance;
-    let y = i32::from(occ.row) * ch + ch / 2;
-    let dx = (x0 - center.0).max(center.0 - x1).max(0);
+const fn span_dist2(occ: &Occurrence, center: (i32, i32), geom: EffectGeom) -> u64 {
+    let advance = geom.cell_w as i32 * if occ.dec_line { 2 } else { 1 };
+    let ch = geom.cell_h as i32;
+    let x0 = occ.start_col as i32 * advance;
+    let x1 = (occ.end_col as i32 + 1) * advance;
+    let y = occ.row as i32 * ch + ch / 2;
+    let dx0 = x0 - center.0;
+    let dx1 = center.0 - x1;
+    let dx_max = if dx0 > dx1 { dx0 } else { dx1 };
+    let dx = if dx_max > 0 { dx_max } else { 0 };
     let dy = (center.1 - y).abs();
-    (i64::from(dx) * i64::from(dx) + i64::from(dy) * i64::from(dy)) as u64
+    ((dx as i64) * (dx as i64) + (dy as i64) * (dy as i64)) as u64
 }
 
 /// Resolve one live nova's pure-emitter environment (§6.3 geometry + §6.2
@@ -7504,15 +7533,16 @@ fn fit_glyph(glyph: &GlyphDef, desired_h: f32, max_w: u16, cell_h: u16) -> (u16,
 
 /// §5.6 rest reveal: full Hart for every identity — bobs and entrances
 /// terminate at the same fixed point for everyone.
+#[must_use]
 #[inline]
-pub fn cat_rest_reveal(hart: u16) -> u16 {
+pub const fn cat_rest_reveal(hart: u16) -> u16 {
     hart
 }
 
 /// cat-art v4 eligibility gate: the cat `feline_style` plus [`peek_eligible`].
 #[inline]
-fn cat_eligible(occ: &Occurrence, cfg: &DecoConfig, geom: EffectGeom) -> bool {
-    cfg.feline_style == FelineStyle::Cat && peek_eligible(occ, geom)
+const fn cat_eligible(occ: &Occurrence, cfg: &DecoConfig, geom: EffectGeom) -> bool {
+    matches!(cfg.feline_style, FelineStyle::Cat) && peek_eligible(occ, geom)
 }
 
 /// The peek eligibility both rosters share: the word is wide enough
@@ -7522,7 +7552,7 @@ fn cat_eligible(occ: &Occurrence, cfg: &DecoConfig, geom: EffectGeom) -> bool {
 /// draw [`FreeZ::UnderText`] and only a text wall on both sides is rejected.
 /// Ineligible words draw no graphic, just ink.
 #[inline]
-fn peek_eligible(occ: &Occurrence, geom: EffectGeom) -> bool {
+const fn peek_eligible(occ: &Occurrence, geom: EffectGeom) -> bool {
     if geom.cell_h < CAT_MIN_CELL_H
         || geom.cell_w < CAT_MIN_CELL_W
         || occ.dec_line
@@ -7530,8 +7560,8 @@ fn peek_eligible(occ: &Occurrence, geom: EffectGeom) -> bool {
     {
         return false;
     }
-    let word_px = (i32::from(occ.end_col) - i32::from(occ.start_col) + 1) * i32::from(geom.cell_w);
-    (word_px as f32) >= 0.8 * f32::from(geom.cell_h)
+    let word_px = (occ.end_col as i32 - occ.start_col as i32 + 1) * geom.cell_w as i32;
+    (word_px as f32) >= 0.8 * geom.cell_h as f32
 }
 
 /// §5.2 geometry: uniformly age-scaled authored aspect, word-midpoint anchor,
@@ -7646,7 +7676,7 @@ fn overshoot_c(amp: f32) -> f32 {
 
 /// v3 §1.2 descend easing (easeInOutCubic), `f(0) = 0`, `f(1) = 1`.
 #[inline]
-fn ease_in_out_cubic(p: f32) -> f32 {
+const fn ease_in_out_cubic(p: f32) -> f32 {
     let p = p.clamp(0.0, 1.0);
     if p < 0.5 {
         4.0 * p * p * p
@@ -7664,26 +7694,33 @@ fn ease_in_out_cubic(p: f32) -> f32 {
 /// Dwell base over the spec range (`2200..=3598 ms` default) in 4 genome
 /// steps (step `(hi − lo)/3` — 466 ms at the default range).
 #[inline]
-fn dwell_base_ms(gkey: u64, range: (u32, u32)) -> u64 {
-    let lo = u64::from(range.0.min(range.1));
-    let hi = u64::from(range.0.max(range.1));
+const fn dwell_base_ms(gkey: u64, range: (u32, u32)) -> u64 {
+    let (lo, hi) = if range.0 < range.1 {
+        (range.0 as u64, range.1 as u64)
+    } else {
+        (range.1 as u64, range.0 as u64)
+    };
     lo + (mix(gkey ^ DWELL_SALT) % 4) * ((hi - lo) / 3)
 }
 
 /// The episode's dwell: base − `mix(ident) % 300` twin-desync jitter,
 /// + 500 ms for magic/accessory episodes, capped at 3750 ms.
 #[inline]
-fn peek_dwell_ms(ident: u64, gkey: u64, magical: bool, range: (u32, u32)) -> u64 {
+const fn peek_dwell_ms(ident: u64, gkey: u64, magical: bool, range: (u32, u32)) -> u64 {
     let mut d = dwell_base_ms(gkey, range).saturating_sub(mix(ident) % CAT_DWELL_JITTER_MS);
     if magical {
         d += CAT_DWELL_MAGIC_BONUS_MS;
     }
-    d.min(CAT_DWELL_CAP_MS)
+    if d < CAT_DWELL_CAP_MS {
+        d
+    } else {
+        CAT_DWELL_CAP_MS
+    }
 }
 
 /// The optional 60 ms pre-descend anticipation lift (~50% of genomes).
 #[inline]
-fn anticipation_ms(gkey: u64) -> u64 {
+const fn anticipation_ms(gkey: u64) -> u64 {
     if mix(gkey ^ ANTIC_SALT) & 1 == 0 {
         CAT_ANTICIPATION_MS
     } else {
@@ -7695,7 +7732,7 @@ fn anticipation_ms(gkey: u64) -> u64 {
 /// like magic. The decode is structurally `None` on special-build cats, so the
 /// bonus never double-counts a special.
 #[inline]
-fn has_accessory(magic: u64) -> bool {
+const fn has_accessory(magic: u64) -> bool {
     accessory_variant_v4(magic).is_some()
 }
 
@@ -7703,7 +7740,7 @@ fn has_accessory(magic: u64) -> bool {
 /// case `450 + 3750 + 60 + 320 = 4580 ms` ([`CAT_DWELL_CAP_MS`] binds custom
 /// spec ranges and rare cats too).
 #[inline]
-fn peek_total_ms(ident: u64, gkey: u64, magical: bool, range: (u32, u32)) -> u64 {
+const fn peek_total_ms(ident: u64, gkey: u64, magical: bool, range: (u32, u32)) -> u64 {
     CAT_RISE_MS
         + peek_dwell_ms(ident, gkey, magical, range)
         + anticipation_ms(gkey)
@@ -7715,7 +7752,7 @@ fn peek_total_ms(ident: u64, gkey: u64, magical: bool, range: (u32, u32)) -> u64
 /// retype witness, and the one-cat-per-caret suppression — features that must
 /// stay in agreement about what "at the caret" means.
 #[inline]
-fn caret_on_span(cell: (u16, u16), row: u16, start_col: u16, end_col: u16) -> bool {
+const fn caret_on_span(cell: (u16, u16), row: u16, start_col: u16, end_col: u16) -> bool {
     let (caret_row, caret_col) = cell;
     caret_row == row && caret_col >= start_col && caret_col <= end_col.saturating_add(1)
 }
@@ -7724,7 +7761,7 @@ fn caret_on_span(cell: (u16, u16), row: u16, start_col: u16, end_col: u16) -> bo
 /// means zero [`InkCell`]s for everyone; and reduced motion never arms the
 /// scheduler, so it could never take a transient tint off again: no flash.
 #[inline]
-fn trick_flash_paintable(cfg: &DecoConfig) -> bool {
+const fn trick_flash_paintable(cfg: &DecoConfig) -> bool {
     cfg.ink_enabled && !cfg.reduced_motion
 }
 
@@ -8279,7 +8316,7 @@ fn emit_peek<'a>(
 /// The class base ink pair `(c0, c1)` (§4.2/§4.6), `0x00RRGGBB`. `None` = the
 /// class carries no ink.
 #[inline]
-fn ink_pair(class: Class) -> Option<(u32, u32)> {
+const fn ink_pair(class: Class) -> Option<(u32, u32)> {
     match class {
         Class::Emphasis => Some((0x007C_C8FF, 0x00C8_9AFF)),
         Class::Profanity => Some((0x00FF_D447, 0x00FF_7CE5)),
@@ -8743,8 +8780,8 @@ fn dim_rgb(c: u32, f: f32) -> u32 {
 }
 
 #[inline]
-pub(crate) fn rgb3_to_u32(c: [u8; 3]) -> u32 {
-    (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
+pub(crate) const fn rgb3_to_u32(c: [u8; 3]) -> u32 {
+    ((c[0] as u32) << 16) | ((c[1] as u32) << 8) | (c[2] as u32)
 }
 
 /// Sample a bounded eight-cell neighborhood around a matched word. This runs
@@ -9068,7 +9105,7 @@ fn cat_peek_plan(
 }
 
 #[inline]
-pub(crate) fn u32_to_rgb3(c: u32) -> [u8; 3] {
+pub(crate) const fn u32_to_rgb3(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
 
@@ -9094,7 +9131,7 @@ fn seed_of(start_col: u16, class: Class, form_hash: u64) -> u64 {
 }
 
 #[inline]
-fn class_tag(c: Class) -> u64 {
+const fn class_tag(c: Class) -> u64 {
     match c {
         Class::Profanity => 1,
         Class::Feline => 2,
@@ -9107,7 +9144,7 @@ fn class_tag(c: Class) -> u64 {
 }
 
 #[inline]
-fn glyph_id(g: DecoGlyph) -> u64 {
+const fn glyph_id(g: DecoGlyph) -> u64 {
     match g {
         DecoGlyph::Star4 => 0,
         DecoGlyph::Star5 => 1,
@@ -9206,12 +9243,12 @@ fn twinkle(s: u64, age_s: f32) -> f32 {
 
 /// A signed sub-cell jitter in `[-j, j]` derived from `s`.
 #[inline]
-fn jitter(j: i8, s: u64) -> i8 {
+const fn jitter(j: i8, s: u64) -> i8 {
     if j <= 0 {
         return 0;
     }
-    let span = 2 * i64::from(j) + 1;
-    (((s % span as u64) as i64) - i64::from(j)) as i8
+    let span = 2 * j as i64 + 1;
+    (((s % span as u64) as i64) - j as i64) as i8
 }
 
 #[inline]

@@ -130,6 +130,14 @@ impl EditorBufferView {
             .unwrap_or(&NO_SELECTION)
     }
 
+    /// Find may start or repeat a search without interrupting another prompt.
+    pub fn can_start_search(&self) -> bool {
+        matches!(
+            self.minibuffer,
+            Minibuffer::Inactive | Minibuffer::Search { .. }
+        )
+    }
+
     pub fn has_search_query(&self) -> bool {
         match &self.minibuffer {
             Minibuffer::Search { query, .. } => {

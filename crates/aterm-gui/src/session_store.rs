@@ -3721,12 +3721,13 @@ title = \"zsh\"
         store.register(handle(0, None));
         let worker = handle(1, None);
         mark_session_task(&worker.ctx, 1, &TaskMark::new(TaskState::Working)).expect("unfenced");
+        let folder = "/Users//me/work proj";
         worker
             .ctx
             .timeline
             .lock()
             .unwrap()
-            .set_task_agent(aterm_phase::Program::Gemini);
+            .set_task_worker(aterm_phase::Program::Gemini, Some(folder.to_string()));
         let mut done = TaskMark::new(TaskState::Done);
         done.why = Some("marker");
         done.result_bytes = 5;
@@ -3737,10 +3738,14 @@ title = \"zsh\"
         let row = manifest.sessions[1].task.clone().expect("the worker's row");
         assert!(row.starts_with("rev=2 state=done from=ctl since="), "{row}");
         assert!(
-            row.ends_with(" agent=gemini"),
-            "a mark keeps the agent: {row}"
+            row.ends_with(&format!(
+                " agent=gemini trusted_cwd={}",
+                crate::control::pct_encode(folder)
+            )),
+            "a mark keeps the agent and the trusted folder: {row}"
         );
         assert_eq!(record.agent, Some(aterm_phase::Program::Gemini));
+        assert_eq!(record.trusted_cwd.as_deref(), Some(folder));
         let wire = manifest.to_toml().expect("serializes");
         assert_eq!(
             wire.matches("\ntask = ").count(),
@@ -3771,6 +3776,41 @@ title = \"zsh\"
             record,
             "the same record, its since re-anchored"
         );
+        let seeded_folder = |h: &SessionHandle| {
+            h.ctx
+                .timeline
+                .lock()
+                .unwrap()
+                .task()
+                .and_then(|t| t.trusted_cwd.clone())
+        };
+        assert_eq!(seeded_folder(&adopted), Some(folder.to_string()));
+        // NEGATIVE CONTROLS: a folder this build cannot vouch for — relative,
+        // climbing, a second spelling, a control character — crosses as none,
+        // the record's other facts with it; a row from before the field
+        // carries none.
+        let carried = back.sessions[1].task.as_deref().expect("the row");
+        let encoded = crate::control::pct_encode(folder);
+        for bad in [
+            "work".to_string(),
+            crate::control::pct_encode("/Users//me/../etc"),
+            crate::control::pct_encode("/Users//me/"),
+            "/Users//me/a%0Ab".to_string(),
+        ] {
+            let other = handle(10, None);
+            seed_carried(&other.ctx, Some(&carried.replace(&encoded, &bad)));
+            let seeded = other.ctx.timeline.lock().unwrap().task().cloned();
+            let seeded = seeded.unwrap_or_else(|| panic!("{bad}: the record crosses"));
+            assert_eq!(seeded.trusted_cwd, None, "{bad}");
+            assert_eq!(seeded.agent, Some(aterm_phase::Program::Gemini), "{bad}");
+        }
+        let other = handle(11, None);
+        seed_carried(
+            &other.ctx,
+            Some(&carried.replace(&format!(" trusted_cwd={encoded}"), "")),
+        );
+        assert!(other.ctx.timeline.lock().unwrap().task().is_some());
+        assert_eq!(seeded_folder(&other), None, "a row from before the field");
         // The attention flag is the SEEDED META's, never the row's: a row
         // saying `attention=1` over a meta whose supervisor entry the claims
         // seed refused reports no news.

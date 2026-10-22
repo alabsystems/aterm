@@ -2358,9 +2358,9 @@ impl SettingsViewState {
     /// A LANDING STANDS UNTIL A RENDER HAS SEATED IT: only the render that
     /// found the landed control on the list and followed it lets the landing
     /// go — not an event that comes before any render has drawn it. A page
-    /// already open is landed on by `Harness settings…` (Settings ▸ Harness's
-    /// `harness/land`) while the refreshes its arrival started are still
-    /// out, and their replies (`HarnessChanged`, `PackagesChanged`,
+    /// already open is landed on by the Autopilot menu's `Harness settings…`
+    /// (Settings ▸ Harness's `harness/land`) while the refreshes its arrival
+    /// started are still out, and their replies (`HarnessChanged`, `PackagesChanged`,
     /// `UpdateChanged`) reach the view before its next frame: each settles
     /// against the record of the frame drawn BEFORE the landing, which
     /// never saw it.
@@ -2577,7 +2577,8 @@ impl SettingsViewState {
         }
     }
 
-    /// A page opened FOR one of its controls (the Autopilot menu's `Harness settings…`,
+    /// A page opened FOR one of its controls (Settings ▸ Harness from the
+    /// Autopilot menu's `Harness settings…`,
     /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §10.3.3 item 8): the
     /// list LANDS on `key`'s stop — a landing's reveal, which the render
     /// follows whether or not one has measured the list yet, and which a

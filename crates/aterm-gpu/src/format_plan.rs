@@ -21,8 +21,9 @@ use wgpu::TextureFormat;
 /// Every pipeline whose pass attaches `off.view` (additive glow and deco-add,
 /// bloom composite and extract, tray, test/readback blit) builds with this.
 #[must_use]
+#[inline]
 #[cfg(wgpu_arm)]
-pub(crate) fn offscreen_format(srgb_offscreen: bool) -> TextureFormat {
+pub(crate) const fn offscreen_format(srgb_offscreen: bool) -> TextureFormat {
     if srgb_offscreen {
         TextureFormat::Rgba8Unorm
     } else {
@@ -34,6 +35,7 @@ pub(crate) fn offscreen_format(srgb_offscreen: bool) -> TextureFormat {
 /// blending composites in linear light. Always `Rgba8UnormSrgb` (the alias on
 /// native, the texture's own format on downlevel).
 #[must_use]
+#[inline]
 #[cfg(wgpu_arm)]
 pub(crate) fn offscreen_srgb_view_format(srgb_offscreen: bool) -> TextureFormat {
     offscreen_format(srgb_offscreen).add_srgb_suffix()
@@ -43,8 +45,9 @@ pub(crate) fn offscreen_srgb_view_format(srgb_offscreen: bool) -> TextureFormat 
 /// view can be created (wgpu panics otherwise). Native only; downlevel needs
 /// none.
 #[must_use]
+#[inline]
 #[cfg(wgpu_arm)]
-pub(crate) fn offscreen_view_formats(srgb_offscreen: bool) -> &'static [TextureFormat] {
+pub(crate) const fn offscreen_view_formats(srgb_offscreen: bool) -> &'static [TextureFormat] {
     if srgb_offscreen {
         &[TextureFormat::Rgba8UnormSrgb]
     } else {
@@ -85,7 +88,8 @@ pub struct HdrPlan {
 
 /// Attach: pick `Rgba16Float` for the swapchain? See [`HdrPlan`].
 #[must_use]
-pub fn hdr_swapchain_wants_f16(hdr_glow: bool, supports_f16: bool) -> bool {
+#[inline]
+pub const fn hdr_swapchain_wants_f16(hdr_glow: bool, supports_f16: bool) -> bool {
     hdr_glow && supports_f16
 }
 
@@ -101,6 +105,7 @@ pub fn hdr_swapchain_wants_f16(hdr_glow: bool, supports_f16: bool) -> bool {
 /// [`hdr_screen_upgrade_wants_f16`]. `None` (unresolved screen) keeps the
 /// unconditional pick; a non-finite potential counts as SDR.
 #[must_use]
+#[inline]
 pub fn hdr_swapchain_wants_f16_on_screen(
     hdr_glow: bool,
     supports_f16: bool,
@@ -118,6 +123,7 @@ pub fn hdr_swapchain_wants_f16_on_screen(
 /// [`hdr_swapchain_wants_f16_on_screen`]. `swapchain_is_f16` keeps the function
 /// total; callers short-circuit f16 surfaces before the AppKit read.
 #[must_use]
+#[inline]
 pub fn hdr_screen_upgrade_wants_f16(
     hdr_glow: bool,
     supports_f16: bool,
@@ -135,6 +141,7 @@ pub fn hdr_screen_upgrade_wants_f16(
 /// pay for every 8-bit window. Equal to [`hdr_screen_upgrade_wants_f16`] over
 /// the potential it reads.
 #[must_use]
+#[inline]
 pub fn hdr_screen_upgrade_decision(
     hdr_glow: bool,
     supports_f16: bool,
@@ -149,7 +156,12 @@ pub fn hdr_screen_upgrade_decision(
 
 /// PRESENT: what the HDR path does THIS present. See [`HdrPlan`].
 #[must_use]
-pub fn hdr_present_plan(hdr_glow: bool, swapchain_is_f16: bool, glow_nonempty: bool) -> HdrPlan {
+#[inline]
+pub const fn hdr_present_plan(
+    hdr_glow: bool,
+    swapchain_is_f16: bool,
+    glow_nonempty: bool,
+) -> HdrPlan {
     HdrPlan {
         blit_linear_encode: swapchain_is_f16,
         glow_boost_pass: hdr_glow && swapchain_is_f16 && glow_nonempty,
@@ -276,7 +288,11 @@ pub(crate) struct HdrReconfigureProjection {
     )
 )]
 #[must_use]
-pub fn hdr_reconfigure_plan(swapchain_is_f16: bool, scrgb_retagged: bool) -> HdrReconfigurePlan {
+#[inline]
+pub const fn hdr_reconfigure_plan(
+    swapchain_is_f16: bool,
+    scrgb_retagged: bool,
+) -> HdrReconfigurePlan {
     match (swapchain_is_f16, scrgb_retagged) {
         (false, _) => HdrReconfigurePlan::KeepSdr,
         (true, true) => HdrReconfigurePlan::KeepHdr,
@@ -289,7 +305,8 @@ pub fn hdr_reconfigure_plan(swapchain_is_f16: bool, scrgb_retagged: bool) -> Hdr
 /// can be hot-reloaded); `output_hdr_enabled` is the throttled Windows output
 /// probe. The scRGB tag still goes through [`hdr_reconfigure_plan`].
 #[must_use]
-pub fn hdr_live_upgrade_wants_f16(
+#[inline]
+pub const fn hdr_live_upgrade_wants_f16(
     hdr_glow: bool,
     supports_f16: bool,
     output_hdr_enabled: bool,
@@ -302,7 +319,8 @@ pub fn hdr_live_upgrade_wants_f16(
 /// Separate from [`HdrPlan`] so the Tier-1 model stays stable. It draws into the
 /// swapchain only; the offscreen is untouched.
 #[must_use]
-pub fn sdr_boost_pass(swapchain_is_f16: bool, glow_nonempty: bool, budget: f32) -> bool {
+#[inline]
+pub const fn sdr_boost_pass(swapchain_is_f16: bool, glow_nonempty: bool, budget: f32) -> bool {
     !swapchain_is_f16 && glow_nonempty && budget > 0.0
 }
 

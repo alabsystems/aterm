@@ -5,8 +5,9 @@
 //! authorize a run or replace its durable record of work already performed.
 
 use super::{
-    Action, InitialHost, LiveInitial, NativeHost, Path, Plan, Report, Row, Selection, Stage,
-    ensure_person_scope, execute, item_rows, readiness_row, rows_ready, state_root,
+    Action, InitialHost, InitialSetupObserved, LiveInitial, NativeHost, Path, Plan, Report, Row,
+    Selection, Stage, ensure_person_scope, execute, item_rows, observe_read_only, readiness_row,
+    rows_ready, state_root,
 };
 use aterm_secrets::client::{self, Membership, Paths, Status};
 use aterm_secrets::service::{self, Job, State};
@@ -115,7 +116,10 @@ fn vault_rows(
         Membership::In { .. } | Membership::Plain => {
             "vault files are incomplete; Apply to retry".into()
         }
-        Membership::Pending => "waiting for vault approval".into(),
+        Membership::Pending => match &status.machine {
+            Some((_, code)) => format!("waiting for vault approval, code {code}"),
+            None => "no machine identity is available; Apply to enroll".into(),
+        },
         Membership::Revoked { .. } => "this machine no longer has vault membership".into(),
         Membership::Unconfigured => "no vault membership is configured".into(),
     };
@@ -193,8 +197,15 @@ fn check_with(host: &mut dyn InitialCheckHost, root: &Path, plan: &Plan) -> Repo
 /// Observe only the displayed checklist, without joining a vault, changing
 /// credentials, cloning repositories, or altering setup authorization/progress.
 pub fn check_initial_setup(plan: &Plan) -> Result<Report, String> {
-    ensure_person_scope()?;
-    Ok(check_with(&mut LiveCheck, &state_root()?, plan))
+    check_initial_setup_observed(plan).result
+}
+
+/// Return Check rows only with the observation spanning all of their probes.
+pub fn check_initial_setup_observed(plan: &Plan) -> InitialSetupObserved<Report> {
+    observe_read_only(state_root(), |root| {
+        ensure_person_scope()?;
+        Ok(check_with(&mut LiveCheck, root, plan))
+    })
 }
 
 #[cfg(test)]
@@ -347,6 +358,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows[0].status, "blocked");
+        assert!(!rows_ready(&rows));
+    }
+
+    #[test]
+    fn vault_check_recovers_saved_pending_approval_code() {
+        let code = "AB12-CD34";
+        let mut status = vault_status(Membership::Pending);
+        status.machine = Some((aterm_secrets::age::Recipient([7; 32]), code.into()));
+        let rows = vault_rows(
+            &Plan::default(),
+            Path::new("/fixture"),
+            &status,
+            |_| panic!("pending membership cannot verify files"),
+            || Ok(true),
+        )
+        .unwrap();
+        assert_eq!(rows[0].status, "blocked");
+        assert!(
+            rows[0].detail.contains(code),
+            "Check must recover the durable machine approval code"
+        );
+        assert!(!rows_ready(&rows));
+    }
+
+    #[test]
+    fn vault_check_does_not_show_another_vaults_approval_code() {
+        let code = "AB12-CD34";
+        let mut status = vault_status(Membership::Pending);
+        status.machine = Some((aterm_secrets::age::Recipient([7; 32]), code.into()));
+        let plan = Plan {
+            vault_url: "http://different.invalid:7484/v1/other".into(),
+            ..Plan::default()
+        };
+        let rows = vault_rows(
+            &plan,
+            Path::new("/fixture"),
+            &status,
+            |_| panic!("unadmitted files"),
+            || panic!("unadmitted subscriber"),
+        )
+        .unwrap();
+        assert_eq!(rows[0].status, "drift");
+        assert!(rows.iter().all(|row| !row.detail.contains(code)));
+    }
+
+    #[test]
+    fn vault_check_does_not_invent_approval_code_without_machine_identity() {
+        let status = vault_status(Membership::Pending);
+        assert!(status.machine.is_none());
+        let rows = vault_rows(
+            &Plan::default(),
+            Path::new("/fixture"),
+            &status,
+            |_| panic!("pending membership cannot verify files"),
+            || Ok(true),
+        )
+        .unwrap();
+        assert_eq!(rows[0].status, "blocked");
+        assert!(!rows[0].detail.contains("code"));
         assert!(!rows_ready(&rows));
     }
 

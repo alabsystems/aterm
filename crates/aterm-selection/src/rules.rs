@@ -90,7 +90,8 @@ impl SelectionRule {
 
     /// Set the priority for this rule.
     #[must_use]
-    pub(crate) fn with_priority(mut self, priority: RulePriority) -> Self {
+    #[inline]
+    pub(crate) const fn with_priority(mut self, priority: RulePriority) -> Self {
         self.priority = priority;
         self
     }
@@ -108,6 +109,7 @@ impl SelectionRule {
     ///
     /// Returns `None` if no match contains that position.
     #[must_use]
+    #[inline]
     pub(crate) fn find_at_position<'a>(
         &self,
         text: &'a str,
@@ -215,7 +217,8 @@ impl Default for SmartSelection {
 impl SmartSelection {
     /// Create a new empty smart selection engine.
     #[must_use]
-    pub fn new() -> Self {
+    #[inline]
+    pub const fn new() -> Self {
         Self {
             rules: Vec::new(),
             word_separators: None,
@@ -316,6 +319,7 @@ impl SmartSelection {
     ///
     /// A column at or past the end of the text names an empty cell: `None`.
     #[must_use]
+    #[inline]
     pub fn word_boundaries_at_column(&self, text: &str, column: usize) -> Option<(usize, usize)> {
         self.word_boundaries_at_column_with(text, column, AmbiguousWidth::Single)
     }

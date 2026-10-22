@@ -25,8 +25,12 @@ pub(crate) const LABEL: &str = "aterm terminal";
 /// glyph's continuation cell with a space (`aterm_core::terminal::render_cells`),
 /// so `漢 字` reads as separate words. The pad preserves cell-column offsets
 /// within each emitted row, before trailing blanks are trimmed.
-pub(crate) fn push_visible_row(text: &mut String, cells: &[RenderCell], cols: usize) {
-    for cell in cells.iter().take(cols) {
+pub(crate) fn push_visible_row<'a>(
+    text: &mut String,
+    cells: impl IntoIterator<Item = &'a RenderCell>,
+    cols: usize,
+) {
+    for cell in cells.into_iter().take(cols) {
         text.push(if cell.ch == '\0' || cell.ch.is_control() {
             ' '
         } else {
@@ -37,6 +41,31 @@ pub(crate) fn push_visible_row(text: &mut String, cells: &[RenderCell], cols: us
         text.pop();
     }
     text.push('\n');
+}
+
+/// Rendered rows as a snapshot reads them: row `r`'s cells over the columns
+/// `cols` — fewer for a short row, none for a row past the end. The rendered
+/// rows themselves are one source; the presented frame read as its programs
+/// wrote it, under aterm's glass, is another
+/// (`claude_footer::ProgramCells`).
+#[cfg(any(a11y_tree, test))]
+pub(crate) trait CellRows {
+    /// Row `r`'s cells in `cols`, left to right.
+    fn cells_in(&self, r: usize, cols: std::ops::Range<usize>)
+    -> impl Iterator<Item = &RenderCell>;
+}
+
+#[cfg(any(a11y_tree, test))]
+impl CellRows for [Vec<RenderCell>] {
+    fn cells_in(
+        &self,
+        r: usize,
+        cols: std::ops::Range<usize>,
+    ) -> impl Iterator<Item = &RenderCell> {
+        let row: &[RenderCell] = self.get(r).map_or(&[], Vec::as_slice);
+        let end = cols.end.max(cols.start).min(row.len());
+        row[cols.start.min(row.len())..end].iter()
+    }
 }
 
 /// A plain-text + cursor snapshot of the visible grid for assistive technology.
@@ -56,10 +85,12 @@ pub(crate) struct AccessibleSnapshot {
 
 #[cfg(any(a11y_tree, test))]
 impl AccessibleSnapshot {
-    /// Build a snapshot from rendered rows of cells.
+    /// Build a snapshot from rendered rows of cells (the tests' engine grids; the
+    /// App reads its frame through [`Self::from_cells_in`]).
     ///
     /// `cursor` is `Some((row, col))` only when the cursor is visible; pass `None`
     /// to omit it (e.g. when hidden via DECTCEM).
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn from_cells(
         rows_cells: &[Vec<RenderCell>],
@@ -80,7 +111,7 @@ impl AccessibleSnapshot {
     /// short line.
     #[must_use]
     pub(crate) fn from_cells_in(
-        rows_cells: &[Vec<RenderCell>],
+        rows_cells: &(impl CellRows + ?Sized),
         rows: std::ops::Range<usize>,
         cols: std::ops::Range<usize>,
         cursor: Option<(usize, usize)>,
@@ -88,10 +119,7 @@ impl AccessibleSnapshot {
         let width = cols.len();
         let mut text = String::with_capacity(rows.len() * (width + 1));
         for r in rows.clone() {
-            let row: &[RenderCell] = rows_cells.get(r).map_or(&[], Vec::as_slice);
-            let start = cols.start.min(row.len());
-            let end = cols.end.max(cols.start).min(row.len());
-            push_visible_row(&mut text, &row[start..end], width);
+            push_visible_row(&mut text, rows_cells.cells_in(r, cols.clone()), width);
         }
         Self {
             text,
@@ -127,8 +155,8 @@ mod tests {
             "the composed row carries both panes: {composed:?}"
         );
 
-        let left = AccessibleSnapshot::from_cells_in(&cells, 0..2, 0..10, None);
-        let right = AccessibleSnapshot::from_cells_in(&cells, 0..2, 11..21, Some((0, 5)));
+        let left = AccessibleSnapshot::from_cells_in(&cells[..], 0..2, 0..10, None);
+        let right = AccessibleSnapshot::from_cells_in(&cells[..], 0..2, 11..21, Some((0, 5)));
         assert_eq!(left.value(), "left\n\n", "no divider, no neighbour");
         assert_eq!(right.value(), "right\n\n");
         assert_eq!((left.rows, left.cols), (2, 10));

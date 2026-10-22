@@ -24,6 +24,10 @@
 //! leader is this edge's own, read with it, and moves where the new holder's
 //! run begins to the end of the batch ([`ExecEdges::absorb`]), since its bytes
 //! may follow that `exec` anywhere after the cut.
+//!
+//! Every drain that holds an event (a fork, an `exec`, an exit) also tells the
+//! stuck engine's kernel edge (`crate::vitals_host::ProcEdge`): a parked
+//! engine looks again when a job may have started or ended, output or none.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -81,6 +85,10 @@ pub(crate) struct ExecEdges {
     read: ReadImage,
     /// The watch's overflow count last booked in `metrics`.
     overflow: u64,
+    /// The stuck engine's kernel edge, told of every drain that held an
+    /// event (a fork, an `exec`, an exit: a job may have started or ended):
+    /// the process's [`crate::vitals_host::PROC_EDGE`]; a test's own.
+    proc_edge: &'static crate::vitals_host::ProcEdge,
 }
 
 impl ExecEdges {
@@ -102,6 +110,7 @@ impl ExecEdges {
             folded: None,
             read,
             overflow: 0,
+            proc_edge: &crate::vitals_host::PROC_EDGE,
         }
     }
 
@@ -125,6 +134,7 @@ impl ExecEdges {
         let mut events = std::mem::take(&mut self.events);
         self.watch.drain(&mut events);
         crate::metrics::note_proc_events(events.len());
+        self.tell_vitals(&events);
         let mut fg = FgOnce::new(fg);
         let mut deliver = false;
         for ev in events.drain(..) {
@@ -135,6 +145,15 @@ impl ExecEdges {
         self.book_overflow();
         crate::metrics::note_proc_drain(crate::metrics::leg_elapsed_ns(start));
         deliver
+    }
+
+    /// A drain that held an event tells the stuck engine's kernel edge
+    /// ([`crate::vitals_host::ProcEdge`]): one atomic swap, and one wake to
+    /// the loop only while it is armed.
+    fn tell_vitals(&self, events: &[ProcEvent]) {
+        if !events.is_empty() {
+            self.proc_edge.heard();
+        }
     }
 
     /// Whether `exec`s wait for a byte-free edge of their own.
@@ -233,6 +252,7 @@ impl ExecEdges {
         let mut events = std::mem::take(&mut self.events);
         self.watch.drain(&mut events);
         crate::metrics::note_proc_events(events.len());
+        self.tell_vitals(&events);
         let mut absorbed = false;
         for ev in events.drain(..) {
             match ev {

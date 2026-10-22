@@ -192,6 +192,7 @@ impl CursorGlow {
     /// styles' paste sounds as its echo's Jump); it carries the keystroke's echo
     /// credit, so the strum is the gesture's one sound. Returns whether a cue was
     /// recorded.
+    #[inline]
     pub fn cue_paste(&mut self, now: Instant) -> bool {
         if !self.v2.engaged() {
             return false;
@@ -206,6 +207,7 @@ impl CursorGlow {
     /// τ and gain come from the last drawing tick's snapshot (Fire's overrides
     /// included). A zero τ, unreachable behind `sound_live`,
     /// falls back to the standing heat instead of producing NaN.
+    #[inline]
     pub(super) fn keyed_blaze(&self, now: Instant) -> f32 {
         let (heat, flare) = self.cooled_blaze(now);
         let gap = self
@@ -236,6 +238,7 @@ impl CursorGlow {
     /// Spend one fresh key-time click credit: `true` means this echo's click
     /// already played at the key. Stale credits are dropped wholesale (see
     /// [`Self::KEYED_CLICK_FRESH`]).
+    #[inline]
     pub(super) fn take_keyed_click(&mut self, now: Instant) -> bool {
         if self.keyed_clicks == 0 {
             return false;
@@ -271,6 +274,7 @@ impl CursorGlow {
 
     /// Record one cursor-movement cue (Glide/Sweep) with its travel direction,
     /// carried inside `kind` for the synth and on `dir` for the host.
+    #[inline]
     pub(super) fn cue_cursor(&mut self, kind: crate::trail_sound::SoundKind, col: u16, dir: i8) {
         if self.sound_cues.len() < Self::MAX_SOUND_CUES {
             self.sound_cues.push(SoundCue {
@@ -288,6 +292,7 @@ impl CursorGlow {
     /// Drain the sound cues recorded since the last call (the host feeds them to
     /// the synth after [`Self::tick`]). Empty whenever the aurora is disabled,
     /// so a muted session does no sound work.
+    #[inline]
     pub fn drain_sound_cues(&mut self) -> std::vec::Drain<'_, SoundCue> {
         // v2 flushes its cues into this backlog inside `tick`; appending its
         // drain here leaves no cue behind on a non-ticking path.
@@ -312,6 +317,7 @@ impl CursorGlow {
     /// [`Self::settle_key_seam`] only when the tick is inaudible, since a shed
     /// or motion-reduced frame is still heard and its echoes need their credits.
     /// Nothing visual belongs here: that state clears on every dark tick.
+    #[inline]
     pub(super) fn clear_sound_ledger(&mut self) {
         self.sound_cues.clear();
         self.v2_cues.clear();

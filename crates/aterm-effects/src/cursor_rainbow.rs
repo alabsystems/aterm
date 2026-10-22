@@ -257,6 +257,7 @@ struct RimMemo {
 ///
 /// The display spine is an eased chase, so the fit has a small residual of
 /// either sign; the caller absorbs it by waking one frame early.
+#[inline]
 fn release_forecast(now_v: f32, prev_v: f32, dt: f32, ahead: f32) -> Option<f32> {
     if now_v <= 0.0 {
         return Some(0.0);
@@ -408,6 +409,7 @@ impl CursorRainbow {
     /// is charged or a twinkle is in flight. Once settled the caret sits solid
     /// inside its resting rim with no wakeups.
     #[must_use]
+    #[inline]
     pub fn is_active(&self) -> bool {
         // Fingerprint law: charged or mid-flare keeps the tick; a cooling block
         // keeps it only while its last two frames differed.
@@ -422,6 +424,7 @@ impl CursorRainbow {
     /// one u8 level every few frames, so this is not "settled"; the host paces it by
     /// [`Self::next_change_deadline`]. Disjoint from [`Self::is_active`].
     #[must_use]
+    #[inline]
     pub fn settling(&self) -> bool {
         !self.is_active() && self.paint > SETTLED_ENERGY
     }
@@ -548,6 +551,7 @@ impl CursorRainbow {
     /// additive halo (and any twinkle) to `out` and returns the block fill
     /// colour and a fingerprint. Pure in the injected inputs.
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -581,6 +585,7 @@ impl CursorRainbow {
     /// clock still advances while locked, so falling back later is continuous in its own
     /// domain; it never contributes colour on this path.
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     pub fn tick_with_family_phase(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -1145,6 +1150,7 @@ impl CursorRainbow {
     /// [`Self::RIM_LIGHT_SLACK`], one scalar on every ring's target is bisected
     /// (eight halvings) and the rings re-solved; hues are untouched. Skipped
     /// when already within the slack.
+    #[inline]
     fn apply_equalised_rings(
         quads: &mut [GlowQuad],
         rings: &[(usize, u8, u32, u32)],
@@ -1351,6 +1357,7 @@ impl CursorRainbow {
 /// Push one additive halo ring as four thin bars (top/bottom/left/right), each
 /// clamped and row-split via [`push_ring_rect`] so every quad is single-row and
 /// grid-interior.
+#[inline]
 fn push_ring(out: &mut Vec<GlowQuad>, geom: Geom, x: i32, y: i32, w: i32, h: i32, premul: u32) {
     if w <= 0 || h <= 0 || premul == 0 {
         return;
@@ -1373,6 +1380,7 @@ fn push_ring(out: &mut Vec<GlowQuad>, geom: Geom, x: i32, y: i32, w: i32, h: i32
 
 /// Clamp a pixel rect to the effects box and split it into per-cell-row [`GlowQuad`]s, so the
 /// dirty gate and scissor stay exact (the `effect_util::push_fx_rect` contract).
+#[inline]
 fn push_ring_rect(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -1499,6 +1507,7 @@ pub(crate) fn lift_to_light_floor(rgb: u32, floor: f32) -> u32 {
 /// Equalising only the first term leaves a visible swell on EDR panels. The
 /// headroom clamp is not modelled (rim bytes are far below it). SDR panels and
 /// the CPU renderer skip the aurora pass.
+#[inline]
 fn light_on_glass(page: u32, premul: u32) -> f32 {
     light_on_glass_with(crate::color_math::relative_luminance_table(), page, premul)
 }

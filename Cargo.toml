@@ -79,7 +79,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.110.0"
+version = "0.111.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -391,6 +391,16 @@ opt-level = 2
 # recompiles in 2.1-3.3 s at either level. Only opt-level moves; debug
 # assertions and overflow checks stay on.
 [profile.dev.package.aterm-link]
+opt-level = 2
+
+# The vault in dev: X25519 is TweetNaCl's sixteen-limb ladder, first-party
+# (`aterm-secrets/src/x25519.rs`), and RFC 7748 §5.2's thousand-iteration
+# vector, the lib's longest test, ran 5.22 -> 0.42 s alone. Interleaved, two
+# per side at a load of 3.6-4.5: `-p aterm-secrets`'s tests 16.4, 15.6 ->
+# 9.9, 8.3 s wall (--lib 8.3 -> 4.2-4.8, flows 5.7 -> 3.5-3.9). A whole-crate
+# recompile of the lib test takes 3.7 s instead of 1.5. Only opt-level moves;
+# debug assertions and overflow checks stay on.
+[profile.dev.package.aterm-secrets]
 opt-level = 2
 
 [profile.dev.package.aterm-spec]

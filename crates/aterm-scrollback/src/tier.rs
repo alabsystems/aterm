@@ -176,14 +176,14 @@ impl WarmBlock {
     /// Get the number of lines in this block.
     #[must_use]
     #[inline]
-    pub(crate) fn line_count(&self) -> usize {
+    pub(crate) const fn line_count(&self) -> usize {
         self.line_count
     }
 
     /// Returns true if this block has been quarantined due to repeated failures.
     #[must_use]
     #[inline]
-    pub(crate) fn is_quarantined(&self) -> bool {
+    pub(crate) const fn is_quarantined(&self) -> bool {
         self.decompress_failures.get() >= QUARANTINE_THRESHOLD
     }
 
@@ -275,7 +275,8 @@ pub(crate) struct WarmTier {
 impl WarmTier {
     /// Create a new warm tier.
     #[must_use]
-    pub(crate) fn new() -> Self {
+    #[inline]
+    pub(crate) const fn new() -> Self {
         Self {
             blocks: VecDeque::new(),
             line_count: 0,
@@ -293,7 +294,7 @@ impl WarmTier {
     /// Get the total number of lines.
     #[must_use]
     #[inline]
-    pub(crate) fn line_count(&self) -> usize {
+    pub(crate) const fn line_count(&self) -> usize {
         self.line_count
     }
 
@@ -577,14 +578,15 @@ impl WarmTier {
 
     /// Calculate memory used (diagnostic: includes cache + index + struct overhead).
     #[must_use]
-    pub(crate) fn memory_used(&self) -> usize {
+    #[inline]
+    pub(crate) const fn memory_used(&self) -> usize {
         self.bytes_used.get()
     }
 
     /// Reclaimable compressed block storage bytes (budget enforcement only).
     #[must_use]
     #[inline]
-    pub(crate) fn budgeted_bytes(&self) -> usize {
+    pub(crate) const fn budgeted_bytes(&self) -> usize {
         self.budgeted_bytes
     }
 
@@ -641,6 +643,7 @@ impl WarmTier {
         blocks_mem
     }
 
+    #[inline]
     fn index_bytes(&self) -> usize {
         // Saturating: a real Vec's capacity in bytes fits (see push_compressed).
         self.cumulative_lines
@@ -711,7 +714,8 @@ impl WarmTier {
         total
     }
 
-    fn adjust_bytes(current: usize, old_component: usize, new_component: usize) -> usize {
+    #[inline]
+    const fn adjust_bytes(current: usize, old_component: usize, new_component: usize) -> usize {
         if new_component >= old_component {
             current.saturating_add(new_component - old_component)
         } else {

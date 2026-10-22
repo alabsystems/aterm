@@ -31,12 +31,13 @@ aterm-tempfile = { workspace = true }
 # The bus: `cap` for the bound grant every fabric principal attaches with. Its
 # SHA-256 is astream's own astream-digest, so this crate takes no third-party
 # crate from astream. astream's `aead` (the sealed record layer) is not enabled.
-# `retention` compiles `Broker::retain_before`, which nothing shipped calls
-# (the unit tests drop a retained record and its dedup entry with it); it is
-# on here, not only in a dev row, so the broker the tests run is the broker
-# that ships and a `-p aterm` build shares every unit a `--workspace` test
-# build compiled. Its one effect on a log aterm writes: an open also
-# looks for the `.base` and `.state` sidecars, which nothing in aterm creates.
+# `retention` compiles astream's R4 retention classes: `aterm link broker`
+# (and the world harness's broker) retains its log by
+# `broker_rules::default_rules()` from every open (session log Phase 6 step
+# 6E-2), with the `<log>.held`, `.state` and `.base` sidecars that keeps beside
+# the log. It is a dependency feature, not a dev row, so the broker the tests
+# run is the broker that ships and a `-p aterm` build shares every unit a
+# `--workspace` test build compiled.
 astream-broker = { path = "../../vendor/astream/crates/astream-broker", features = ["cap", "retention"] }
 astream-cap = { path = "../../vendor/astream/crates/astream-cap" }
 # astream's address grammar (`subject::validate_filter_str`), the one the broker

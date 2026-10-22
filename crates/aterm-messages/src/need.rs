@@ -809,11 +809,18 @@ impl LaterAsk {
     }
 
     /// An exception the replayed log left open, rebuilt from its words (the reporter
-    /// re-asserts the real one at its first look). Crate only.
-    pub(crate) fn adopted(why: &str, then: &str, key: &str) -> Self {
+    /// re-asserts the real one at its first look). `first` is the record's first action:
+    /// an `Open in browser` there is the button only [`Mover::open_link`] makes (`notice
+    /// later … url=`), so it is the entry's own again and a press answers the entry, as
+    /// before the restart, though the tool may not say it again for days. Crate only.
+    pub(crate) fn adopted(why: &str, then: &str, key: &str, first: Option<&Intent>) -> Self {
+        let link = match first {
+            Some(Intent::OpenLink { url }) => Mover::open_link(url),
+            _ => None,
+        };
         Self {
             why: LaterWhy::Person(Why::OnlyYou(Reason::new(why))),
-            then: Then::step(then),
+            then: link.map_or_else(|| Then::step(then), |m| Then::press(m, then)),
             fingerprint: Fingerprint(clip(key, KEY_CAP)),
             resurface: Resurface::WAIT,
             at_once: false,

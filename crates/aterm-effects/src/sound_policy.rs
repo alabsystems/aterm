@@ -48,6 +48,7 @@ impl Voice {
     /// Reduce Motion and the load shed alike (a motion setting is not an audio
     /// setting, owner, 2026-09-22).
     #[must_use]
+    #[inline]
     pub const fn motion_twin(self) -> Option<crate::motion::MotionEffect> {
         match self {
             Self::Bonk => Some(crate::motion::MotionEffect::WordSparkles),
@@ -252,6 +253,7 @@ pub struct TrailSoundPolicy {
 /// gesture namespacing, and the policy stamp. The key-time typing click
 /// (`app_input`) and the frame drain both build events here, so the same
 /// keystroke sounds the same whichever seam carries it.
+#[inline]
 pub fn trail_sound_event(
     cue: &crate::cursor_glow::SoundCue,
     style: crate::cursor_glow::GlowStyle,
@@ -285,6 +287,7 @@ pub fn trail_sound_event(
 /// twin. Both single-pane and split-pane composition route through this seam,
 /// so muting never leaves a backlog and layouts cannot silently lose audio.
 #[allow(clippy::too_many_arguments)] // Explicit policy axes keep cue emission allocation-free.
+#[inline]
 pub fn drain_trail_sound_cues(
     glow: &mut crate::cursor_glow::CursorGlow,
     style: crate::cursor_glow::GlowStyle,
@@ -315,6 +318,7 @@ pub fn drain_trail_sound_cues(
 /// row's note (`prefs::TRAIL_SOUNDS_NOTE`) promises; the terminal bell (`lib.rs::on_bell`)
 /// is the one stated exception. The focus, master and volume terms delegate
 /// to [`trail_sound_gain`], as [`sing_riff_gain`] does.
+#[inline]
 pub fn bonk_sound_gain(
     raw_focused: bool,
     trail_sounds: bool,

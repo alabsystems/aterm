@@ -2505,7 +2505,8 @@ pub(crate) struct ClaudeFooterConfig {
     /// The harness card (`crate::claude_card`,
     /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §3): the rainbow border,
     /// kitty and `enhanced by aterm harness` line Claude Code's launch card
-    /// wears while the harness carries the session. On by default (absent and
+    /// wears while the harness carries the session (and in white, the
+    /// moonbow, under Autopilot Off: §10.6.15). On by default (absent and
     /// `true` are the same, [`Config::claude_footer_card`]); `false` leaves
     /// the vendor's card bare. A GUI table's switch, like `usage`: `[harness]`
     /// only takes power away.
@@ -2518,6 +2519,15 @@ pub(crate) struct ClaudeFooterConfig {
     /// the chip's title still lists the last acts, and Settings ▸ Harness
     /// still counts them. Serious mode withholds it too.
     pub(crate) acts: Option<bool>,
+    /// THE AGENTS PANEL'S GLASS (`crate::claude_panel`, design
+    /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §10.6.13): Claude
+    /// Code's agents panel under the footer wears the harness theme's
+    /// rainbow, and each agent's dot tells its work (hue = which agent,
+    /// brightness and glow = work rate, saturation = freshness, a grey
+    /// breath = stuck). ON BY DEFAULT (absent and `true` are the same,
+    /// [`Config::claude_footer_agents`]); `false` leaves the panel as
+    /// Claude drew it.
+    pub(crate) agents: Option<bool>,
 }
 
 /// The `[render]` table: how aterm repairs a displaced Claude Code tab.
@@ -4751,7 +4761,7 @@ impl Config {
 
     /// The `[claude_footer] card` bit (default on): whether Claude Code's
     /// launch card wears the harness card while the harness carries the
-    /// session. See [`ClaudeFooterConfig::card`].
+    /// session, or holds it Off (in white). See [`ClaudeFooterConfig::card`].
     pub(crate) fn claude_footer_card(&self) -> bool {
         self.claude_footer
             .as_ref()
@@ -4766,6 +4776,17 @@ impl Config {
         self.claude_footer
             .as_ref()
             .and_then(|c| c.acts)
+            .unwrap_or(true)
+    }
+
+    /// The `[claude_footer] agents` RESOLVED bit (default TRUE): whether
+    /// Claude Code's agents panel wears the harness theme's rainbow and its
+    /// dots their light while the harness's glass is on. See
+    /// [`ClaudeFooterConfig::agents`].
+    pub(crate) fn claude_footer_agents(&self) -> bool {
+        self.claude_footer
+            .as_ref()
+            .and_then(|c| c.agents)
             .unwrap_or(true)
     }
 

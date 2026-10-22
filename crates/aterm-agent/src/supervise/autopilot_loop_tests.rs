@@ -451,7 +451,9 @@ fn run_lifted(
     m.vanish_after = Some(20);
     m.stall_sleep = Some(Duration::from_millis(20));
     // Each case is judged by the act the new loop types: the run ends at it,
-    // and a loop that leaves the point types nothing and runs to its budget.
+    // and a loop that leaves the point types nothing and runs to its budget —
+    // a minute, the hang detector, never a latency budget: on a loaded host
+    // the back-offs and reads before the act outrun a second.
     m.exit_when = Some(|m| m.turns > 0);
     m.human = human.into_iter().collect();
     let opts = SuperviseOpts {
@@ -461,7 +463,7 @@ fn run_lifted(
         },
         journal: Some(journal.clone()),
         idle_host: lifted.map(|l| Arc::new(Lifted(l)) as Arc<dyn IdleHost>),
-        ..auto(1)
+        ..auto(aterm_spec::wait::MUST_HAPPEN.as_secs())
     };
     let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
         s.set_turn_end_timing(TurnEndTiming {

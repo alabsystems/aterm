@@ -215,7 +215,9 @@ fn remove(label: &str) {
 /// The job's definition: `args` (its first process's argv, [`band_main`]'s),
 /// `ProcessType` `App` (no QoS clamp, an APP-type task, as launchd starts an
 /// app), started at load and kept alive (a restart after the program ends
-/// removes the job, [`band_main`]).
+/// removes the job, [`band_main`]), restarted 1 s after an end rather than
+/// launchd's default 10 s: that restart only removes the job, so nothing
+/// gains by the wait.
 fn job_plist(label: &str, args: &[String]) -> String {
     let esc = |s: &str| {
         s.replace('&', "&amp;")
@@ -232,6 +234,7 @@ fn job_plist(label: &str, args: &[String]) -> String {
     ));
     out.push_str("<key>ProcessType</key><string>App</string>\n");
     out.push_str("<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n");
+    out.push_str("<key>ThrottleInterval</key><integer>1</integer>\n");
     out.push_str("<key>ProgramArguments</key><array>\n");
     for a in args {
         out.push_str(&format!("<string>{}</string>\n", esc(a)));

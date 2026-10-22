@@ -63,7 +63,7 @@ impl CursorGlow {
     /// A non-typing move slams the flare, except a fire jump (its meteor carries
     /// the drama) and a pure navigation move (no light).
     #[inline]
-    pub(super) fn retire_abandoned_light(&mut self, mv: &MoveCtx) {
+    pub(super) const fn retire_abandoned_light(&mut self, mv: &MoveCtx) {
         let &MoveCtx {
             typing,
             fire,
@@ -138,7 +138,7 @@ impl CursorGlow {
 
     /// Per-style birth brightness for a typing spark (1.0 on the jump path).
     #[inline]
-    pub(super) fn birth_boost(&self, mv: &MoveCtx) -> f32 {
+    pub(super) const fn birth_boost(&self, mv: &MoveCtx) -> f32 {
         let &MoveCtx { cfg, typing, .. } = mv;
         if typing {
             match cfg.style {

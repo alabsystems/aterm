@@ -28,6 +28,7 @@ pub(crate) struct GlFormat {
 }
 
 /// The GL spelling of `f`, or `Err` for a format GLES 3.0 cannot store.
+#[inline]
 pub(crate) fn gl_format(f: TexelFormat) -> Result<GlFormat, String> {
     let (internal, format, ty, bytes) = match f {
         TexelFormat::R8Unorm => (ffi::GL_R8, ffi::GL_RED, ffi::GL_UNSIGNED_BYTE, 1),
@@ -84,6 +85,7 @@ impl std::fmt::Debug for GlTexture {
 impl GlTexture {
     /// Whether this texture was made on `dev`'s context (a GL name means
     /// nothing on another context).
+    #[inline]
     pub(crate) fn on(&self, dev: &GlDevice) -> bool {
         Arc::ptr_eq(&self.shared, dev.shared())
     }
@@ -155,6 +157,7 @@ pub(crate) enum GlBufferRole {
 }
 
 impl GlBufferRole {
+    #[inline]
     const fn target(self) -> GLenum {
         match self {
             Self::Instance => ffi::GL_ARRAY_BUFFER,
@@ -163,6 +166,7 @@ impl GlBufferRole {
         }
     }
 
+    #[inline]
     const fn usage(self) -> GLenum {
         match self {
             Self::Instance => ffi::GL_STREAM_DRAW,
@@ -288,6 +292,7 @@ impl GlDevice {
 
     /// Upload rows `[y0, y0 + rows)` at full width from `bytes`, tightly
     /// packed at `bytes_per_row`: [`Self::upload_region`]'s full-width case.
+    #[inline]
     pub(crate) fn upload_rows(
         &self,
         tex: &GlTexture,

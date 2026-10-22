@@ -821,7 +821,7 @@ fn standing(list: &[(i64, String)], from: i64, until: i64) -> Vec<&(i64, String)
 
 /// Values actually observed in `(from, until)`. Unchanged reads resolve the
 /// value standing then; a value-change timestamp is itself an observation.
-fn observed<'a>(
+pub(super) fn observed<'a>(
     list: &'a [(i64, String)],
     reads: &[i64],
     from: i64,

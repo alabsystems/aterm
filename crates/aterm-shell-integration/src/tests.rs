@@ -3629,17 +3629,7 @@ fn spawn_live_fish(fish: &str, fx: &LiveFixture, extra: &[(&str, &str)]) -> Live
     let InjectionEnv { env_add, .. } = prepare_into(ShellType::Fish, &fx.base)
         .expect("prepare")
         .expect("fish injection");
-    let mut cmd = Command::new("script");
-    if cfg!(target_os = "macos") {
-        cmd.args(["-q", "/dev/null", fish, "-i"]);
-    } else {
-        // util-linux runs `-c`'s line through `$SHELL -c`: /bin/sh here, never a
-        // bash that reads `~/.bashrc` on the way (Debian's does for a `-c` run
-        // over ssh, `SSH_CLIENT` set), which ran the rig's startup file before
-        // the shell under test began.
-        cmd.args(["-q", "-c", &format!("{fish} -i"), "/dev/null"])
-            .env("SHELL", "/bin/sh");
-    }
+    let mut cmd = pty_script(&[fish, "-i"]);
     // The hermetic environment of `shell_command`, applied to `script` (fish
     // inherits it), then the fixture's home and the conf.d injection.
     let hermetic = shell_command(fish);
@@ -3686,6 +3676,36 @@ const ZSH_PRINT_PATH: &str = "print -r -- \"LIVEPATH=$PATH\"; print -r -- \"LIVE
 const BASH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' \"$PATH\"; printf 'LIVERR=%s\\n' \"$ATERM_REROUTE_DIR\"; echo \"MARK$((40+2))\"";
 #[cfg(unix)]
 const FISH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' (string join : -- $PATH); printf 'LIVERR=%s\\n' \"$ATERM_REROUTE_DIR\"; echo MARK(math 40 + 2)";
+
+/// `script(1)` running `argv` on a new pty, with the program `argv` names as its one
+/// child, so a signal a test sends the shell under test reaches it. macOS's `script`
+/// runs the argv itself. util-linux's runs `-c`'s line through `$SHELL -c`: /bin/sh
+/// here, never a bash that reads `~/.bashrc` on the way (Debian's does for a `-c` run
+/// over ssh, `SSH_CLIENT` set), which ran the rig's startup file before the shell under
+/// test began; and the line `exec`s the argv, because Ubuntu's dash forks a `-c` line's
+/// command and waits for it: `script`'s child was that `sh`, and the spare tests'
+/// SIGWINCH and SIGHUP went to it, never to the shell (the Linux lane's guest,
+/// 2026-10-21: `sh -c '…/bash' '--rcfile' … '-i'`, bash its child).
+#[cfg(unix)]
+fn pty_script(argv: &[&str]) -> Command {
+    let mut cmd = Command::new("script");
+    if cfg!(target_os = "macos") {
+        cmd.args(["-q", "/dev/null"]).args(argv);
+    } else {
+        let quoted: Vec<String> = argv
+            .iter()
+            .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
+            .collect();
+        cmd.args([
+            "-q",
+            "-c",
+            &format!("exec {}", quoted.join(" ")),
+            "/dev/null",
+        ])
+        .env("SHELL", "/bin/sh");
+    }
+    cmd
+}
 
 #[cfg(unix)]
 fn script_can_allocate_a_pty() -> bool {

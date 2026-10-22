@@ -41,6 +41,7 @@ pub struct OpenProbeGuard {
 
 #[cfg(debug_assertions)]
 impl OpenProbeGuard {
+    #[inline]
     #[must_use]
     pub fn attempts(&self) -> usize {
         self.attempts.get()
@@ -106,6 +107,7 @@ fn limit_plus_sentinel(max_bytes: usize) -> io::Result<usize> {
     })
 }
 
+#[inline]
 fn too_large(max_bytes: usize) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -113,6 +115,7 @@ fn too_large(max_bytes: usize) -> io::Error {
     )
 }
 
+#[inline]
 fn not_regular() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -247,6 +250,7 @@ pub fn fingerprint_admitted_utf8(contents: &str) -> u64 {
     seal_fingerprint(hash, contents.len() as u64)
 }
 
+#[inline]
 fn invalid_utf8() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,

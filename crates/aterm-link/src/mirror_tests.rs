@@ -18,10 +18,15 @@ fn slot(pseq: u64, sid: &str, ms: u64) -> PinSlot {
     }
 }
 
+/// D4, RULED (session log Phase 6 step 6E-3): the mode reads its three
+/// words, and the default is `auto`, the turn class on over a broker that
+/// retains it (the bridge's half is `bridge_mirror_tests.rs`'s
+/// `an_auto_mirror_runs_only_over_a_broker_that_retains_it`). NEGATIVE CONTROL, run:
+/// the old `off` default fails it.
 #[test]
-fn the_mode_reads_its_two_words_and_defaults_off() {
-    assert_eq!(LogMode::default(), LogMode::Off);
-    for m in [LogMode::Off, LogMode::Turns] {
+fn the_mode_reads_its_three_words_and_defaults_to_turns_on_a_retaining_broker() {
+    assert_eq!(LogMode::default(), LogMode::Auto);
+    for m in [LogMode::Auto, LogMode::Off, LogMode::Turns] {
         assert_eq!(LogMode::parse(m.word()), Some(m));
     }
     assert_eq!(LogMode::parse("on"), None);
@@ -62,6 +67,7 @@ fn a_pin_round_trips_and_a_damaged_one_reads_as_damage() {
         inc: 7,
         total: 12345,
         key: Some([0xab; 16]),
+        win: Vec::new(),
         slots: vec![
             slot(640, "s-a", 1),
             slot(641, "s-b", 1),
@@ -136,6 +142,7 @@ fn a_pin_cut_anywhere_short_of_its_last_byte_does_not_read() {
         inc: 7,
         total: 12345,
         key: Some([0xab; 16]),
+        win: vec![(9, 300)],
         slots: vec![slot(640, "s-a", 1), slot(641, "s-b", 1)],
     };
     let text = pin.render();
@@ -152,6 +159,122 @@ fn a_pin_cut_anywhere_short_of_its_last_byte_does_not_read() {
                 "a pin cut at {cut} of {}: {:?}",
                 whole.len(),
                 &whole[..cut]
+            );
+        }
+    }
+}
+
+/// THE WINDOW LEDGER (session log Phase 6 step 6E-2, ruling U41) rides the
+/// pin as `win=` after the key and reads back exactly, with or without a key;
+/// one that does not read is damage. The window from `oldest=` counts every
+/// batch whose highest offset is at or above it, a cut forgets the batches it
+/// passed whole, and past its bound the two oldest merge into one that loses
+/// no byte and counts no shorter. NEGATIVE CONTROL, run: a window that counts
+/// a batch only ABOVE `oldest=` fails it.
+#[test]
+fn the_window_ledger_rides_the_pin_and_counts_what_the_broker_keeps() {
+    let mut pin = Pin {
+        inc: 7,
+        total: 900,
+        key: Some([0xab; 16]),
+        win: Vec::new(),
+        slots: vec![slot(640, "s-a", 1)],
+    };
+    pin.note_window(10, 100);
+    pin.note_window(20, 200);
+    pin.note_window(30, 300);
+    let text = pin.render();
+    assert!(
+        text.starts_with(&format!(
+            "logpin v=2 inc=7 n=1 total=900 key={} win=10:100,20:200,30:300\n",
+            "ab".repeat(16)
+        )),
+        "{text}"
+    );
+    assert_eq!(Pin::parse(&text), Ok(pin.clone()));
+    let keyless = Pin {
+        key: None,
+        ..pin.clone()
+    };
+    assert_eq!(Pin::parse(&keyless.render()), Ok(keyless));
+    assert!(Pin::parse(&text.replace("win=10:100", "win=10:x")).is_err());
+    assert!(Pin::parse(&text.replace("win=10:100,", "win=10,")).is_err());
+    assert_eq!(
+        [20, 21, 0, 31].map(|oldest| pin.window_bytes(oldest)),
+        [500, 300, 600, 0],
+        "a batch counts while its highest offset is at or above oldest="
+    );
+    pin.prune_window(20);
+    assert_eq!(pin.win, vec![(20, 200), (30, 300)]);
+
+    let mut full = Pin::default();
+    let n = WINDOW_LEDGER_MAX as u64 + 1;
+    for i in 0..n {
+        full.note_window(i * 10, 1);
+    }
+    assert_eq!(full.win.len(), WINDOW_LEDGER_MAX);
+    assert_eq!(full.win[0], (10, 2), "the two oldest, merged");
+    assert_eq!(full.window_bytes(0), n, "no byte lost");
+    assert_eq!(full.window_bytes(5), n, "and none counted shorter");
+    assert_eq!(Pin::parse(&full.render()), Ok(full));
+}
+
+/// A FULL LEDGER GIVES ITS BYTES UP AS THE CUT PASSES THEM (session log
+/// Phase 6 step 6E-2, ruling U41). A busy node fills its window in far more
+/// batches than the ledger keeps entries, evenly and unevenly: at every cut
+/// the ledger counts at least the bytes truly at or above it, and at most one
+/// merged entry more (1/32 of what it holds), so a window filled in 1024
+/// small batches opens again once the cut has passed half of them. NEGATIVE
+/// CONTROL, run: merging the two oldest counts the whole window until the
+/// cut has passed nearly all of it.
+#[test]
+fn a_full_ledger_gives_its_bytes_up_as_the_cut_passes_them() {
+    const N: usize = 1024;
+    let small = NODE_WINDOW_BYTES / N as u64;
+    let even = vec![small; N];
+    let mut lcg = 0x5eed_u64;
+    let uneven: Vec<u64> = (0..N)
+        .map(|_| {
+            lcg = lcg
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            small / 8 + (lcg >> 33) % (small * 8)
+        })
+        .collect();
+    let his: Vec<u64> = (1..=N as u64).map(|i| i * 10).collect();
+    for (case, sizes) in [("even", even), ("uneven", uneven)] {
+        let mut pin = Pin::default();
+        for (hi, bytes) in his.iter().zip(&sizes) {
+            pin.note_window(*hi, *bytes);
+        }
+        assert_eq!(pin.win.len(), WINDOW_LEDGER_MAX, "{case}");
+        let held: u64 = sizes.iter().sum();
+        assert_eq!(pin.window_bytes(0), held, "{case}: no byte lost");
+        let slack = held / (WINDOW_LEDGER_MAX as u64 / 2);
+        for (k, oldest) in his.iter().enumerate() {
+            let exact: u64 = sizes[k..].iter().sum();
+            let counted = pin.window_bytes(*oldest);
+            assert!(
+                counted >= exact,
+                "{case} @{oldest}: counted {counted} < {exact}, shorter than the window"
+            );
+            assert!(
+                counted - exact <= slack,
+                "{case} @{oldest}: counted {counted}, {exact} truly there, more than one \
+                 entry's {slack} over: {:?}",
+                pin.win
+            );
+        }
+        if case == "even" {
+            assert!(
+                pin.window_bytes(0) >= NODE_WINDOW_BYTES,
+                "PRECONDITION: full"
+            );
+            let half = his[N / 2];
+            assert!(
+                pin.window_bytes(half) < NODE_WINDOW_BYTES,
+                "a cut past half the window opens it: {} counted from @{half}",
+                pin.window_bytes(half)
             );
         }
     }

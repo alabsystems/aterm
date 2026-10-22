@@ -6514,18 +6514,26 @@ fn a_restatement_carries_the_titles_short_form() {
 /// none and says so), and that answer holds against the next tab's post.
 #[test]
 fn a_tools_later_entry_is_one_digest_entry_its_link_press_files() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-later-cause-")
+        .tempdir()
+        .unwrap();
+    let path = dir.path().join(crate::messages_store::FILE_NAME);
+    let within = std::time::Duration::from_secs(60);
     let line = "later codex.security-setup.0123abcd tag=codex \
                 url=https://chatgpt.com/security/setup Set up Codex account security -- \
                 only you can enrol a second factor for your account -- \
                 Finish the setup in your browser";
     let req = || wire::NoticeRequest::parse(line).expect("a later line");
     let mut app = App::headless_for_test();
-    let first = app.take_notice(req());
+    app.messages_log = crate::messages_store::Writer::spawn(&path);
+    assert!(app.messages_log.is_some(), "the owned journal opened");
+    let first = app.take_notice_within(req(), within);
     assert!(
         first.starts_with("OK later=") && first.ends_with(" how=new"),
         "{first}"
     );
-    let again = app.take_notice(req());
+    let again = app.take_notice_within(req(), within);
     assert!(again.ends_with(" how=duplicate"), "{again}");
     assert_eq!(app.messages.wanted_rows(), 0, "never a band row");
     let digest = app.messages.digest();
@@ -6557,8 +6565,57 @@ fn a_tools_later_entry_is_one_digest_entry_its_link_press_files() {
         app.messages.log().get(id).and_then(LogRecord::retired),
         Some(Retired::Answered { .. })
     ));
-    let next_tab = app.take_notice(req());
+    let next_tab = app.take_notice_within(req(), within);
     assert!(next_tab.ends_with(" how=quiet"), "{next_tab}");
+    // Establish the already-filed baseline with a one-minute writer hang detector;
+    // the earlier press may have exhausted its normal UI wait. The Done readback
+    // below gets no manual flush, so only its reply path can persist that reset.
+    app.flush_messages_log();
+    let filed = crate::messages_store::load_tail(&path, u64::MAX);
+    assert_eq!(filed.skipped, 0);
+    assert!(matches!(
+        filed.log.get(id).and_then(LogRecord::retired),
+        Some(Retired::Answered { .. })
+    ));
+    let mut replayed = aterm_messages::MessageCenter::new(filed.log, Instant::now());
+    let quiet = wire::apply(
+        &mut replayed,
+        &mut wire::WireGate::default(),
+        req(),
+        wall_stamp_now(),
+        Instant::now(),
+    );
+    assert!(quiet.reply.ends_with(" how=quiet"), "{}", quiet.reply);
+
+    let revision = app.messages.projection_revision();
+    let done = app.take_notice_within(
+        wire::NoticeRequest::parse("done codex.security-setup.0123abcd").unwrap(),
+        within,
+    );
+    assert_eq!(done, "OK done=- how=gone");
+    assert_ne!(app.messages.projection_revision(), revision);
+    // The ended cause is written before the acknowledgement, although the open
+    // digest was empty throughout this request. No manual flush papers over it.
+    let ended = crate::messages_store::load_tail(&path, u64::MAX);
+    assert_eq!(ended.skipped, 0);
+    assert_eq!(
+        ended.log.get(id).and_then(LogRecord::retired),
+        Some(&Retired::Resolved(Outcome::Ok))
+    );
+    let mut replayed = aterm_messages::MessageCenter::new(ended.log, Instant::now());
+    let new_occurrence = wire::apply(
+        &mut replayed,
+        &mut wire::WireGate::default(),
+        req(),
+        wall_stamp_now(),
+        Instant::now(),
+    );
+    assert!(
+        new_occurrence.reply.ends_with(" how=new"),
+        "{}",
+        new_occurrence.reply
+    );
+    drop(app.messages_log.take()); // Join the writer before the scratch directory goes.
 }
 
 /// `Open in browser` opens only a web page on the host its entry named: the engine's

@@ -87,6 +87,7 @@ pub(crate) enum CbOutcome {
 /// non-nil, else `None`. The error is documented to be in
 /// `MTLCommandBufferErrorDomain`, so the code is read against that enum
 /// without comparing the domain string.
+#[inline]
 pub(crate) const fn classify(status: usize, error_code: Option<isize>) -> CbOutcome {
     match status {
         STATUS_COMPLETED => CbOutcome::Completed,
@@ -136,6 +137,7 @@ pub(crate) const fn classify(status: usize, error_code: Option<isize>) -> CbOutc
 
 /// `-[MTLCommandBuffer status]`, raw. Safe: an `NSUInteger` property readable
 /// from any thread at any time.
+#[inline]
 pub(crate) fn command_buffer_status(cb: Id) -> usize {
     // SAFETY: `-status` is an `NSUInteger` getter on a live `MTLCommandBuffer`.
     unsafe {
@@ -164,6 +166,7 @@ fn command_buffer_error_code(cb: Id) -> Option<isize> {
 
 /// Read a command buffer's `(status, error code)` and [`classify`] it.
 /// Meaningful once finished; earlier it reports [`CbOutcome::Unfinished`].
+#[inline]
 pub(crate) fn outcome_of(cb: Id) -> CbOutcome {
     let status = command_buffer_status(cb);
     let code = if status == STATUS_ERROR {
@@ -194,6 +197,7 @@ pub(crate) struct LossLatch {
 }
 
 impl LossLatch {
+    #[inline]
     pub(crate) const fn new() -> Self {
         Self {
             #[cfg(debug_assertions)]
@@ -205,6 +209,7 @@ impl LossLatch {
 
     /// Claim this latch for the encode session. `false` means one already holds
     /// it and the caller must refuse to construct.
+    #[inline]
     pub(crate) fn try_bind_encode_session(&self) -> bool {
         self.encode_bound
             .compare_exchange(
@@ -218,6 +223,7 @@ impl LossLatch {
 
     /// Release the encode-session claim — called from `EncodeSession::drop`
     /// only, so a torn-down session (device-loss rebuild) frees the slot.
+    #[inline]
     pub(crate) fn unbind_encode_session(&self) {
         self.encode_bound
             .store(false, std::sync::atomic::Ordering::Release);
@@ -226,6 +232,7 @@ impl LossLatch {
     /// Feed one finished command buffer's outcome through the latch.
     /// `Completed`, `Unfinished` and `Retryable` never move it; the first
     /// `Lost` sets it forever.
+    #[inline]
     pub(crate) fn record(&self, outcome: &CbOutcome) {
         // Debug builds count every feed, including `Completed`, so tests can
         // check the latch is fed even when nothing is lost.
@@ -246,11 +253,13 @@ impl LossLatch {
     }
 
     /// Sticky: `true` from the first recorded `Lost` onward.
+    #[inline]
     pub(crate) fn is_lost(&self) -> bool {
         self.lost.get().is_some()
     }
 
     /// The first loss's classification, for the downgrade path's diagnostics.
+    #[inline]
     pub(crate) fn reason(&self) -> Option<&str> {
         self.lost.get().map(String::as_str)
     }

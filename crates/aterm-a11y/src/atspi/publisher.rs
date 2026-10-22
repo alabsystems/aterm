@@ -185,8 +185,25 @@ pub trait Buses: Send + 'static {
 /// The desktop's buses: the session bus from `DBUS_SESSION_BUS_ADDRESS`, and
 /// at-spi2-core's accessibility bus from `AT_SPI_BUS_ADDRESS` when that is
 /// set, as libatspi and accesskit_unix read it.
-#[derive(Debug, Default)]
-pub struct SessionBuses;
+#[derive(Debug)]
+pub struct SessionBuses {
+    /// How long a join's handshake may wait: [`WRITE`] (a test's is short).
+    join: Duration,
+}
+
+impl Default for SessionBuses {
+    fn default() -> SessionBuses {
+        SessionBuses { join: WRITE }
+    }
+}
+
+#[cfg(test)]
+impl SessionBuses {
+    /// The desktop's buses, a join giving up after `join`.
+    pub(crate) fn joining_within(join: Duration) -> SessionBuses {
+        SessionBuses { join }
+    }
+}
 
 impl Buses for SessionBuses {
     fn session(&mut self) -> aterm_dbus::Result<Connection> {
@@ -197,7 +214,7 @@ impl Buses for SessionBuses {
     /// takes the connection into its backlog, and would otherwise hold each
     /// attempt to join for aterm-dbus's `HANDSHAKE_TIMEOUT`.
     fn open(&mut self, list: &str) -> aterm_dbus::Result<Connection> {
-        Connection::open_within(&address::parse(list)?, WRITE)
+        Connection::open_within(&address::parse(list)?, self.join)
     }
 
     fn address_override(&self) -> Option<String> {
@@ -234,7 +251,7 @@ impl Publisher {
             let name = std::env::current_exe()
                 .ok()
                 .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
-            Publisher::start(SessionBuses, name)
+            Publisher::start(SessionBuses::default(), name)
         })
     }
 

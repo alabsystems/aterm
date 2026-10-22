@@ -142,6 +142,7 @@ impl PanePlace {
 
 /// Move one pane's sparkle-word decorations into the composed window grid. `row`/`col` are
 /// viewport cells, so the shift is the pane's cell offset; the sub-cell `dx`/`dy` ride untouched.
+#[inline]
 pub fn translate_decos_into_pane(decos: &mut Vec<aterm_render::WordDecoration>, place: PanePlace) {
     if decos.is_empty() {
         return;
@@ -159,6 +160,7 @@ pub fn translate_decos_into_pane(decos: &mut Vec<aterm_render::WordDecoration>, 
 /// Move one pane's animated-ink fg overrides into the composed window grid. The caller must
 /// re-sort the merged stream by `(row, col)`: `aterm_render::sparse_row_slice` binary-searches
 /// it and debug-asserts strict column order.
+#[inline]
 pub fn translate_ink_into_pane(ink: &mut Vec<aterm_render::InkCell>, place: PanePlace) {
     if ink.is_empty() {
         return;
@@ -177,6 +179,7 @@ pub fn translate_ink_into_pane(ink: &mut Vec<aterm_render::InkCell>, place: Pane
 /// the composed window grid: dest origins are signed grid-interior pixels, and a sprite
 /// straddling an interior edge is cropped by [`crop_free_sprite`]. The crop is proportional
 /// (scaled by `aw/w`) because a pose-scaled dest can differ from the natural `aw/ah`.
+#[inline]
 pub fn translate_free_into_pane(free: &mut Vec<aterm_core::render::FreeSprite>, place: PanePlace) {
     if free.is_empty() {
         return;
@@ -192,6 +195,7 @@ pub fn translate_free_into_pane(free: &mut Vec<aterm_core::render::FreeSprite>, 
 
 /// Crop one free sprite to the pixel box `(x0, y0, x1, y1)`: dest rect and, in lockstep, its
 /// atlas source rect by the sprite's own scale. `false`: nothing of it is left in the box.
+#[inline]
 pub fn crop_free_sprite(
     s: &mut aterm_core::render::FreeSprite,
     px_box: (i32, i32, i32, i32),
@@ -243,6 +247,7 @@ pub fn crop_free_sprite(
 /// Move one pane's supernova additive light into the composed window grid. `nova_add` quads
 /// are grid-interior `u16` pixels plus a `row` damage hint, so both shift; the pixel shift
 /// saturates and the quad is clipped to the pane box.
+#[inline]
 pub fn translate_nova_into_pane(nova: &mut Vec<aterm_render::GlowQuad>, place: PanePlace) {
     if nova.is_empty() {
         return;

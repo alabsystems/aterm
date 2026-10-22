@@ -13,8 +13,16 @@ use super::cell::Cell;
 use super::page::{PageSlice, PageStore};
 
 #[inline]
-fn u16_from_usize(value: usize) -> u16 {
-    value.try_into().unwrap_or(u16::MAX)
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "guarded by value <= u16::MAX as usize before cast"
+)]
+const fn u16_from_usize(value: usize) -> u16 {
+    if value > u16::MAX as usize {
+        u16::MAX
+    } else {
+        value as u16
+    }
 }
 
 /// Where the halves of wide pairs an ICH/DCH/ECH blanked with its BCE fill ended
@@ -28,9 +36,9 @@ pub type BlankedHalves = [Option<u16>; 4];
 /// a wide glyph and no complex cluster. Its colours do not matter, since xterm
 /// blanks the hole with the current background (BCE).
 #[inline]
-fn is_wrap_hole_blank(cell: &Cell) -> bool {
+const fn is_wrap_hole_blank(cell: &Cell) -> bool {
     use super::CellFlags;
-    cell.char_data() == u16::from(b' ')
+    cell.char_data() == (b' ' as u16)
         && !cell.flags().intersects(
             CellFlags::WIDE
                 .union(CellFlags::WIDE_CONTINUATION)
@@ -202,28 +210,28 @@ impl Row {
     /// still holds content; a cell at or past it was never written.
     #[must_use]
     #[inline]
-    pub fn len(&self) -> u16 {
+    pub const fn len(&self) -> u16 {
         self.len
     }
 
     /// Check if the row is empty.
     #[must_use]
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Get row flags.
     #[must_use]
     #[inline]
-    pub fn flags(&self) -> RowFlags {
+    pub const fn flags(&self) -> RowFlags {
         self.flags
     }
 
     /// Check if this row is a continuation of the previous (soft wrap).
     #[must_use]
     #[inline]
-    pub fn is_wrapped(&self) -> bool {
+    pub const fn is_wrapped(&self) -> bool {
         self.flags.contains(RowFlags::WRAPPED)
     }
 
@@ -336,14 +344,14 @@ impl Row {
     #[cfg(test)]
     #[must_use]
     #[inline]
-    fn is_dirty(&self) -> bool {
+    const fn is_dirty(&self) -> bool {
         self.flags.contains(RowFlags::DIRTY)
     }
 
     /// Get the current line size attribute.
     #[must_use]
     #[inline]
-    pub fn line_size(&self) -> LineSize {
+    pub const fn line_size(&self) -> LineSize {
         if self.flags.contains(RowFlags::DOUBLE_HEIGHT_TOP) {
             LineSize::DoubleHeightTop
         } else if self.flags.contains(RowFlags::DOUBLE_HEIGHT_BOTTOM) {
@@ -679,7 +687,8 @@ pub(crate) struct RowSnapshot {
 }
 
 impl RowSnapshot {
-    pub(crate) fn heap_memory_used(&self) -> usize {
+    #[inline]
+    pub(crate) const fn heap_memory_used(&self) -> usize {
         self.cells.len().saturating_mul(std::mem::size_of::<Cell>())
     }
 }

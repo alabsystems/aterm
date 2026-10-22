@@ -58,6 +58,10 @@ pub(crate) const EDIT_CURSOR_MOMENTUM_GLOW: &str = "cursor_momentum_glow";
 /// pinned to what the file drew ([`apply_prefs_edits`]); named as retired by the
 /// config language service and Settings ▸ Modified ([`RETIRED_SPELLINGS`]).
 pub(crate) const RETIRED_CURSOR_TRAIL: &str = "cursor_trail";
+/// The two settings [`RETIRED_CURSOR_TRAIL`] reads as: a write of either takes
+/// it out of the file.
+pub(crate) const RETIRED_CURSOR_TRAIL_SUCCESSORS: [&str; 2] =
+    [EDIT_CURSOR_TRAIL_STYLE, EDIT_CURSOR_MOMENTUM_GLOW];
 pub(crate) const EDIT_CURSOR_TRAIL_STYLE: &str = "cursor_trail_style";
 /// THE STYLE OFF REPLACED: Off is a value of the one style key, so an edit
 /// that turns a drawn style Off would overwrite the person's style — their
@@ -181,7 +185,7 @@ pub(crate) const EDIT_CURSOR_TRAIL_ACCENT: &str = "cursor_trail_accent";
 /// cursor colour. It is what the old `classic mono` style spellings say beside
 /// Classic, so the writer can say it too when it rewrites one
 /// ([`apply_prefs_edits`]).
-pub(crate) const TRAIL_COLOR_CURSOR: &str = "cursor";
+pub(crate) const TRAIL_COLOR_CURSOR: &str = aterm_effects::cursor_fx::TrailColor::CURSOR_WORD;
 
 /// [`TRAIL_COLOR_CURSOR`] as a Settings row names it.
 pub(crate) const TRAIL_COLOR_CURSOR_LABEL: &str = "Cursor color";
@@ -228,6 +232,72 @@ pub(crate) fn trail_color_default_words(
         .map_or_else(|| TRAIL_COLOR_CURSOR_LABEL.to_string(), str::to_string)
 }
 
+/// WHAT THE TRAIL COLOUR ROWS DO for the cursor style aterm.toml spells
+/// `style_raw`, on a block cursor or a bar (`block`), with or without a
+/// cursor colour pinned (a configured `cursor_color`): the one note the
+/// colour and accent rows share, wherever they show (Cursor Styles' Adjust
+/// card, Modified, search). Composed from the colour law, never restated
+/// beside it: whether the style draws the trail colour at all
+/// ([`aterm_effects::cursor_glow::GlowStyle::draws_trail_color`]), what an
+/// unset colour draws ([`aterm_effects::cursor_fx::trail_color_default_name`],
+/// [`aterm_effects::cursor_fx::own_trail_color`]) and whether a pinned
+/// cursor colour moves it
+/// ([`aterm_effects::cursor_fx::glow_color_follows_live_cursor`]).
+pub(crate) fn trail_color_note(style_raw: &str, block: bool, cursor_color_pinned: bool) -> String {
+    use aterm_effects::cursor_fx::{glow_color_follows_live_cursor, own_trail_color};
+    use aterm_effects::cursor_glow::GlowStyle;
+    let resolved = crate::app_config::resolve_trail_style(style_raw);
+    let Some(style) = resolved.style else {
+        return "Cursor style is Off, so nothing draws these colors.".to_string();
+    };
+    let name = resolved
+        .canonical
+        .and_then(spellings::label)
+        .unwrap_or(DEFAULT_CURSOR_TRAIL_STYLE);
+    if !style.draws_trail_color() {
+        return if block {
+            format!(
+                "{name} draws its own colors on a block cursor and does not use these; on a bar \
+                 cursor, a color tints its rod."
+            )
+        } else {
+            format!(
+                "Blank: {name}\u{2019}s rod keeps its own color on a bar cursor; any color, \
+                 {TRAIL_COLOR_CURSOR_LABEL} among them, tints it."
+            )
+        };
+    }
+    if style == GlowStyle::Classic {
+        return if GlowStyle::style_names_classic_mono(style_raw.trim()) {
+            format!(
+                "Blank: Classic draws in the cursor color, as its older spelling in aterm.toml \
+                 says; any color, {TRAIL_COLOR_CURSOR_LABEL} among them, draws it in that one \
+                 color."
+            )
+        } else {
+            format!(
+                "Blank: Classic shifts through colors; any color, {TRAIL_COLOR_CURSOR_LABEL} \
+                 among them, draws it in that one color."
+            )
+        };
+    }
+    match own_trail_color(style, cursor_color_pinned) {
+        Some((_, own)) if glow_color_follows_live_cursor(style, true) => format!(
+            "Blank: {name} keeps its {} until you set a cursor color, then follows it; \
+             {TRAIL_COLOR_CURSOR_LABEL} makes it follow the cursor color now.",
+            own.to_lowercase()
+        ),
+        Some((_, own)) => format!(
+            "Blank: {name} keeps its {}; {TRAIL_COLOR_CURSOR_LABEL} makes it follow the cursor \
+             color.",
+            own.to_lowercase()
+        ),
+        None => {
+            format!("Blank: {name} follows the cursor color, as {TRAIL_COLOR_CURSOR_LABEL} does.")
+        }
+    }
+}
+
 /// Whether `raw` is a value colour key `key` takes: a colour the runtime
 /// parses (`RRGGBB`, `#RRGGBB`, `#RGB`), or, for the trail colour, the word
 /// [`TRAIL_COLOR_CURSOR`]. The writer and the config check both ask it.
@@ -237,21 +307,15 @@ pub(crate) fn color_value_is_valid(key: &str, raw: &str) -> bool {
         || (key == EDIT_CURSOR_TRAIL_COLOR && raw.eq_ignore_ascii_case(TRAIL_COLOR_CURSOR))
 }
 
-/// What a `cursor_trail_color` value says: unset, blank or not a colour is
-/// each style's automatic colour (the config check flags the last), the word
-/// [`TRAIL_COLOR_CURSOR`] (any case) the cursor's colour chosen, and a hex
-/// colour that colour.
+/// What a `cursor_trail_color` value says, read as a web page's setting is
+/// ([`aterm_effects::cursor_fx::TrailColor::parse`]): unset, blank or not a
+/// colour is each style's automatic colour (the config check flags the
+/// last), the word [`TRAIL_COLOR_CURSOR`] (any case) the cursor's colour
+/// chosen, and a hex colour that colour.
 pub(crate) fn trail_color_setting(raw: Option<&str>) -> aterm_effects::cursor_fx::TrailColor {
     use aterm_effects::cursor_fx::TrailColor;
-    let Some(raw) = raw.map(str::trim) else {
-        return TrailColor::Automatic;
-    };
-    if raw.eq_ignore_ascii_case(TRAIL_COLOR_CURSOR) {
-        return TrailColor::Cursor;
-    }
-    aterm_types::scheme::parse_hex(raw).map_or(TrailColor::Automatic, |color| {
-        TrailColor::Pinned(crate::app_config::rgb_u32(color))
-    })
+    raw.and_then(TrailColor::parse)
+        .unwrap_or(TrailColor::Automatic)
 }
 /// The rainbow kitty's user sprite. KEEPS the `nyan` spelling — unlike the
 /// trail-style VALUE (which has an alias table), a config KEY has no aliasing
@@ -2414,21 +2478,25 @@ pub(crate) fn apply_prefs_edits(
     Ok(doc.to_string())
 }
 
-/// AN OLD `classic mono` STYLE KEEPS ITS COLOUR when the writer rewrites it.
-/// The `classic mono` spellings ([`aterm_effects::cursor_glow::GlowStyle::style_names_classic_mono`])
-/// say two things: the style, Classic, and its colour, the cursor's — what
+/// AN OLD `classic mono` STYLE KEEPS ITS COLOUR when the writer rewrites it
+/// and Classic stays. The `classic mono` spellings
+/// ([`aterm_effects::cursor_glow::GlowStyle::style_names_classic_mono`]) say
+/// two things: the style, Classic, and Classic's colour, the cursor's — what
 /// Classic with `cursor_trail_color = "cursor"` ([`TRAIL_COLOR_CURSOR`]) says.
-/// The style list knows only the first half, so any edit that takes such a
-/// spelling out of `cursor_trail_style` (Off over it, whatever wrote the Off,
-/// which keeps the style as `classic`; another style; the retired master's
-/// fold) writes the second half as the trail colour in the same write — unless
-/// the file already names a trail colour that reads (with one, the old
-/// spelling drew in that colour, as Classic does; one the loader ignores, a
-/// typo, drew the cursor's, so the cursor's takes its place) or the edit names
-/// it (Reset All, Undo). So bringing Classic back, from Cursor Styles' "Your
-/// style before Off" or by hand, draws it in the cursor's colour again;
-/// nothing the spelling said is lost, and the trail colour row shows and
-/// resets it.
+/// The style list knows only the first half, so an edit that takes such a
+/// spelling out of `cursor_trail_style` while Classic is still the file's —
+/// the style it draws (`classic` chosen over it), or the style kept beside
+/// an Off ([`keep_cursor_style_before_off`], whatever wrote the Off) — writes
+/// the second half as the trail colour in the same write, unless the file
+/// already names a trail colour that reads (with one, the old spelling drew
+/// in that colour, as Classic does; one the loader ignores, a typo, drew the
+/// cursor's, so the cursor's takes its place) or the edit names it (Reset
+/// All, Undo). So bringing Classic back, from Cursor Styles' "Your style
+/// before Off" or by hand, draws it in the cursor's colour again. The colour
+/// is every style's ([`aterm_effects::cursor_fx::TrailColor::Cursor`]), so an
+/// edit that chooses another style writes the style alone: Comet draws its
+/// own pale blue, as its row and its preview say, never a colour the person
+/// never chose.
 fn keep_classic_mono_color(
     before: &CursorStyleFacts,
     doc: &mut aterm_toml::edit::DocumentMut,
@@ -2437,8 +2505,19 @@ fn keep_classic_mono_color(
     let names_mono = |style: Option<&str>| {
         style.is_some_and(aterm_effects::cursor_glow::GlowStyle::style_names_classic_mono)
     };
+    let is_classic = |style: &str| {
+        crate::app_config::resolve_trail_style(style).style
+            == Some(aterm_effects::cursor_glow::GlowStyle::Classic)
+    };
+    let after = CursorStyleFacts::of(doc);
+    let classic_stays = is_classic(after.drawn())
+        || doc
+            .get(EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF)
+            .and_then(aterm_toml::edit::Item::as_str)
+            .is_some_and(is_classic);
     if !names_mono(before.style.as_deref())
-        || names_mono(CursorStyleFacts::of(doc).style.as_deref())
+        || !classic_stays
+        || names_mono(after.style.as_deref())
         || trail_color_setting(
             doc.get(EDIT_CURSOR_TRAIL_COLOR)
                 .and_then(aterm_toml::edit::Item::as_str),
@@ -2551,8 +2630,10 @@ fn fold_retired_cursor_trail(
     doc: &mut aterm_toml::edit::DocumentMut,
     edits: &[(&str, Option<String>)],
 ) {
-    let successors = [EDIT_CURSOR_TRAIL_STYLE, EDIT_CURSOR_MOMENTUM_GLOW];
-    if !edits.iter().any(|(key, _)| successors.contains(key)) {
+    if !edits
+        .iter()
+        .any(|(key, _)| RETIRED_CURSOR_TRAIL_SUCCESSORS.contains(key))
+    {
         return;
     }
     let Some(master) = doc.get(RETIRED_CURSOR_TRAIL).map(|item| item.as_bool()) else {
@@ -2656,9 +2737,10 @@ pub(crate) fn unset_literal(field: &EditField) -> Option<String> {
 }
 
 /// Whether `value` is `field`'s [`unset_literal`]: compared as the kind reads
-/// it — a switch as a boolean, a choice case-insensitively, a number
-/// numerically (an older aterm.toml holds `12.0` where a slider sends `12`),
-/// text exactly.
+/// it — a switch as a boolean, a choice as the writer would store it (so an
+/// alias of the default, `kitty` for `rainbow kitty pet`, is the default; a
+/// value the writer refuses is not), a number numerically (an older
+/// aterm.toml holds `12.0` where a slider sends `12`), text exactly.
 pub(crate) fn is_unset_literal(field: &EditField, value: &str) -> bool {
     let Some(literal) = unset_literal(field) else {
         return false;
@@ -2669,7 +2751,20 @@ pub(crate) fn is_unset_literal(field: &EditField, value: &str) -> bool {
             let read = |text: &str| text.to_ascii_lowercase().parse::<bool>().ok();
             read(value).is_some() && read(value) == read(literal)
         }
-        EditKind::Enum { .. } => value.eq_ignore_ascii_case(literal),
+        EditKind::Enum { .. } => {
+            // THE WRITER'S SPELLING: the stored string, never the raw input,
+            // which the writer may rewrite to another row's name.
+            let stored = |text: &str| {
+                typed_item(field.key, text)
+                    .ok()
+                    .and_then(|item| item.as_str().map(str::to_string))
+            };
+            stored(value).is_some_and(|stored_value| {
+                stored(literal).is_some_and(|stored_literal| {
+                    stored_value.eq_ignore_ascii_case(&stored_literal)
+                })
+            })
+        }
         EditKind::Float | EditKind::Integer => match (value.parse::<f64>(), literal.parse::<f64>())
         {
             (Ok(set), Ok(default)) if set.is_finite() && default.is_finite() => {
@@ -2733,6 +2828,73 @@ pub(crate) fn unset_equivalent_edits(
         .collect()
 }
 
+/// Every retired spelling with a setting it reads as: the `[packages]`
+/// spellings, and the cursor-effects master as each of its two successors.
+fn retired_successor_pairs() -> impl Iterator<Item = (&'static str, &'static str)> {
+    RETIRED_PACKAGES_SPELLINGS.iter().copied().chain(
+        RETIRED_CURSOR_TRAIL_SUCCESSORS
+            .iter()
+            .map(|successor| (RETIRED_CURSOR_TRAIL, *successor)),
+    )
+}
+
+/// THE SETTINGS A RETIRED SPELLING STILL AUTHORS in `text`: each setting a
+/// retired key the file holds reads as ([`retired_successor_pairs`]) where
+/// that key makes it read other than it would without it — `cursor_trail =
+/// false` authors the cursor style (Off) and the typing glow (off) where
+/// they draw by default; `cursor_trail = true` over a default style authors
+/// nothing. Such a row is as changed as one the file names: it shows
+/// "Changed", Modified lists it, and its Reset (a write of the setting,
+/// which takes the retired key out) puts it back to its default. Empty for
+/// a text that does not parse.
+pub(crate) fn retired_authored_keys(text: &str) -> std::collections::BTreeSet<&'static str> {
+    let mut authored = std::collections::BTreeSet::new();
+    let Ok(doc) = text.parse::<aterm_toml::edit::DocumentMut>() else {
+        return authored;
+    };
+    let holds = |doc: &aterm_toml::edit::DocumentMut, path: &str| {
+        let mut parts = path.split('.');
+        let first = parts.next().and_then(|first| doc.get(first));
+        parts
+            .fold(first, |item, part| item.and_then(|item| item.get(part)))
+            .is_some()
+    };
+    let Ok(with) = Config::parse(text) else {
+        return authored;
+    };
+    let fields_with = editable_fields(&with);
+    for (retired, successor) in retired_successor_pairs() {
+        if !holds(&doc, retired) {
+            continue;
+        }
+        let mut without = doc.clone();
+        without.remove_path_pruning(&retired.split('.').collect::<Vec<_>>());
+        let Ok(without) = Config::parse(&without.to_string()) else {
+            continue;
+        };
+        // What the row reads as: its value, or the default its placeholder
+        // names (an explicit default style reads as the unset one does).
+        let reads = |fields: &[EditField]| {
+            fields
+                .iter()
+                .find(|field| field.key == successor)
+                .map(|field| {
+                    field.seed.clone().unwrap_or_else(|| {
+                        let shown = field.placeholder.trim();
+                        shown
+                            .strip_suffix(" (default)")
+                            .unwrap_or(shown)
+                            .to_string()
+                    })
+                })
+        };
+        if reads(&fields_with) != reads(&editable_fields(&without)) {
+            authored.insert(successor);
+        }
+    }
+    authored
+}
+
 /// Whether the theme `cfg` names sets the typography key `key`, on either
 /// side of a light/dark pair: a value of `key` equal to aterm's default is
 /// then a choice over the theme's, never the same as no value.
@@ -2778,20 +2940,6 @@ pub(crate) fn display_layer_under(cfg: &Config, themes: &crate::app_config::Them
         theme_value_for(&Config::default(), &typo, EDIT_FONT_FAMILY)
             .is_some_and(|family| draws(&family))
     })
-}
-
-/// What `key` reads as in `cfg`, in the words its Settings row shows: the
-/// greyed placeholder (the effective value, "implicit (default)", "Follow
-/// system"), or a switch's resolved state. `None` for a key no row edits.
-pub(crate) fn effective_value_label(cfg: &Config, key: &str) -> Option<String> {
-    let field = editable_fields(cfg)
-        .into_iter()
-        .find(|field| field.key == key)?;
-    if field.placeholder.trim().is_empty() {
-        field.seed
-    } else {
-        Some(field.placeholder)
-    }
 }
 
 /// The unset value of a free-text row whose resolver reads one literal
@@ -3289,6 +3437,12 @@ fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditE
         // in its canonical spelling; anything else is a BadValue, never a style
         // the reload would silently replace.
         EditKind::Enum { options } => {
+            // The refusal names what it takes, as a number's names its range.
+            let not_an_option = || PrefsEditError::BadValue {
+                key: key.to_string(),
+                raw: raw.to_string(),
+                expected: Some(format!("one of: {}", options.join(", "))),
+            };
             if key == EDIT_CURSOR_TRAIL_STYLE || key == EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF {
                 // Every spelling the loader accepts is accepted here too, and
                 // written as its canonical name: an alias (`rainbow kitty`,
@@ -3299,7 +3453,7 @@ fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditE
                 // from its row is the old `classic mono` face: it is written
                 // as `classic mono`, so the saved file draws what was asked
                 // instead of switching to the spectrum.
-                let canonical = cursor_trail_style_canonical(trimmed).ok_or_else(bad)?;
+                let canonical = cursor_trail_style_canonical(trimmed).ok_or_else(not_an_option)?;
                 if GlowStyle::style_names_classic_mono(trimmed) {
                     Value::from("classic mono")
                 } else {
@@ -3326,7 +3480,20 @@ fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditE
                         .iter()
                         .any(|part| aterm_render::display_face_bytes(part).is_none())
                 {
-                    return Err(bad());
+                    return Err(PrefsEditError::BadValue {
+                        key: key.to_string(),
+                        raw: raw.to_string(),
+                        expected: Some(format!(
+                            "2 to {} different faces joined by \"+\", each one of: {}",
+                            aterm_render::DISPLAY_FACE_MIX_MAX,
+                            options
+                                .iter()
+                                .filter(|option| **option != "off")
+                                .copied()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )),
+                    });
                 }
                 Value::from(parts.join("+"))
             } else if key == EDIT_DISPLAY_FONT
@@ -3338,7 +3505,7 @@ fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditE
                 let canon = options
                     .iter()
                     .find(|o| trimmed.eq_ignore_ascii_case(o))
-                    .ok_or_else(bad)?;
+                    .ok_or_else(not_an_option)?;
                 Value::from(*canon)
             }
         }
@@ -3448,7 +3615,7 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
             (
                 (mode != aterm_agent::supervise::Autopilot::Cruise)
                     .then(|| mode.word().to_string()),
-                "cruise".to_string(),
+                "cruise (default)".to_string(),
             )
         }
         // The supervisor's own resolved time, so a refused one shows the
@@ -3474,7 +3641,7 @@ fn nested_seed_placeholder(cfg: &Config, key: &str) -> (Option<String>, String) 
             let level = cfg.harness.policy.approve.word();
             (
                 (level != "all").then(|| level.to_string()),
-                "all".to_string(),
+                "all (default)".to_string(),
             )
         }
         // The word the supervisor reads; a refused word is no setting, read as
@@ -4127,17 +4294,7 @@ pub(crate) fn footnote_of(key: &str) -> Option<&'static str> {
             "Keyword kitties: a little cat peeks out by words like \u{201c}cat\u{201d} and \
              \u{201c}kitty\u{201d}."
         }
-        // One note for both rows. Blank is each style's own colour under the
-        // colour law (Laser's violet; Beam's, Comet's and Sparkle's hue until
-        // a cursor colour is set; else the cursor's, the accent a brighter
-        // one); the word is the cursor's colour chosen, which the trail
-        // colour's picker offers as Cursor color.
-        EDIT_CURSOR_TRAIL_COLOR | EDIT_CURSOR_TRAIL_ACCENT => {
-            "Blank: Lightning keeps its violet, and Beam, Comet and Sparkle keep their own \
-             color until you set a cursor color; other styles follow the cursor color. \
-             Cursor color (or \u{201c}cursor\u{201d}) makes every style follow it."
-        }
-        EDIT_MINIMUM_CONTRAST => "1.0 leaves colors as the theme draws them.",
+        EDIT_MINIMUM_CONTRAST => "1 leaves colors as the theme draws them.",
         // The one place the translucent contrast floor is stated.
         EDIT_BACKGROUND_OPACITY => {
             "Translucency needs GPU rendering (the default). Text over a translucent \
@@ -4347,14 +4504,26 @@ impl<'a> RowNote<'a> {
 /// alone. A note only one listed row has is that row's own, wherever the
 /// box is (a search hit, Modified).
 pub(crate) fn row_notes(keys: &[&str]) -> Vec<Option<RowNote<'static>>> {
-    keys.iter()
+    shared_row_notes(keys.iter().map(|key| footnote_of(key)))
+}
+
+/// [`row_notes`] for a box whose rows' notes are `notes` (each row's, top to
+/// bottom), where a page words some of them from what it shows (the trail
+/// colours' note names the saved style): a note several rows share is drawn
+/// once, after the last of them.
+pub(crate) fn shared_row_notes<'a>(
+    notes: impl IntoIterator<Item = Option<&'a str>>,
+) -> Vec<Option<RowNote<'a>>> {
+    let notes: Vec<Option<&'a str>> = notes.into_iter().collect();
+    notes
+        .iter()
         .enumerate()
-        .map(|(position, key)| {
-            let note = footnote_of(key)?;
-            let shares = |other: &&str| footnote_of(other) == Some(note);
-            if keys[position + 1..].iter().any(shares) {
+        .map(|(position, note)| {
+            let note = (*note)?;
+            let shares = |other: &Option<&str>| *other == Some(note);
+            if notes[position + 1..].iter().any(shares) {
                 None
-            } else if keys[..position].iter().any(shares) {
+            } else if notes[..position].iter().any(shares) {
                 Some(RowNote::Shared(note))
             } else {
                 Some(RowNote::Own(note))
@@ -5605,7 +5774,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: cfg.font_size_scale.map(|v| format!("{v}")),
             placeholder: match cfg.font_size_scale {
                 Some(v) => format!("{v}×"),
-                None => "1.0 (default)".to_string(),
+                None => "1 (default)".to_string(),
             },
         },
         EditField {
@@ -5666,7 +5835,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
                 // Unset, Windows holds text in theme colours to 4.5:1
                 // (`Config::indexed_minimum_contrast_or_default`).
                 None if cfg!(windows) => "auto (4.5:1 ANSI)".to_string(),
-                None => "1.0 (off)".to_string(),
+                None => "1 (off)".to_string(),
             },
         },
         EditField {
@@ -5725,7 +5894,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: cfg.stem_gamma.map(|v| format!("{v}")),
             placeholder: match cfg.stem_gamma {
                 Some(v) => format!("{v}"),
-                None => "1.0 (default)".to_string(),
+                None => "1 (default)".to_string(),
             },
         },
         EditField {
@@ -6386,7 +6555,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
                     .as_ref()
                     .and_then(|m| m.universal_control.as_deref()),
             ),
-            placeholder: "off".to_string(),
+            placeholder: "off (default)".to_string(),
         },
     ];
     // The remaining scalar keys, the list rows and the nested-table leaves, so
@@ -6482,7 +6651,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             seed: cfg.background_opacity.map(|v| format!("{v}")),
             placeholder: match cfg.background_opacity {
                 Some(v) => format!("{v}"),
-                None => "1.0 (solid)".to_string(),
+                None => "1 (solid)".to_string(),
             },
         },
         EditField {
@@ -8842,13 +9011,13 @@ auto_apply = true # hands off
         );
         assert_eq!(seed(EDIT_LIGATURES).as_deref(), Some("true"));
         // The [machine] Enum seeds the configured value (blank; "off" is only the
-        // placeholder).
+        // placeholder, marked as the default as every unset choice is).
         assert_eq!(seed(super::EDIT_MACHINE_UNIVERSAL_CONTROL), None);
         let placeholder = fields
             .iter()
             .find(|f| f.key == super::EDIT_MACHINE_UNIVERSAL_CONTROL)
             .map(|f| f.placeholder.as_str());
-        assert_eq!(placeholder, Some("off"));
+        assert_eq!(placeholder, Some("off (default)"));
     }
 
     /// Every numeric control is deliberately a bounded slider (`range_of` is
@@ -9173,9 +9342,27 @@ auto_apply = true # hands off
             let back = write(&off, &[(EDIT_CURSOR_TRAIL_STYLE, set("classic"))]);
             assert_eq!(drawn(&back), classic_in_cursor_color, "{mono:?}");
             assert_eq!(read(&back, BEFORE_OFF), None, "{mono:?}");
-            // Another style keeps the colour too, as it keeps any trail colour.
-            let comet = write(&file, &[(EDIT_CURSOR_TRAIL_STYLE, set("comet"))]);
-            assert_eq!(read(&comet, COLOR).as_deref(), Some("cursor"), "{mono:?}");
+            // Another style is that style alone, in its own colour: the
+            // cursor's colour was Classic's, and every style reads it.
+            for (style, glow) in [
+                ("comet", GlowStyle::Comet),
+                ("sparkle", GlowStyle::Sparkle),
+                ("beam", GlowStyle::Beam),
+                ("laser", GlowStyle::Laser),
+                ("fire", GlowStyle::Fire),
+            ] {
+                let other = write(&file, &[(EDIT_CURSOR_TRAIL_STYLE, set(style))]);
+                assert_eq!(read(&other, COLOR), None, "{mono:?} to {style}");
+                assert_eq!(
+                    drawn(&other),
+                    (
+                        Some(glow),
+                        false,
+                        aterm_effects::cursor_fx::TrailColor::Automatic
+                    ),
+                    "{mono:?} to {style}"
+                );
+            }
             // Classic chosen over it (its list name) draws what it drew; the
             // colour is now on its own row, whose Reset gives the shifting
             // colours.
@@ -9920,5 +10107,62 @@ enabled = true
         typo.display_font = Some("dooom".to_string());
         assert_eq!(typo.font_family_request(), typo.font_family);
         assert!(typo.display_faces_request().is_empty());
+    }
+
+    /// THE TRAIL COLOURS' NOTE IS THE COLOUR LAW'S, for every listed style on
+    /// a block and a bar, with and without a cursor colour pinned: a style
+    /// that does not draw the trail colour on a block says so; Classic says
+    /// it shifts through colours ([`aterm_effects::cursor_fx::trail_color_default_name`]);
+    /// a style with a colour of its own names it
+    /// ([`aterm_effects::cursor_fx::own_trail_color`]), and says a cursor
+    /// colour moves it exactly where the law says one does; every other
+    /// style follows the cursor colour. Negative control: the old one note
+    /// for every style ("other styles follow the cursor color") is none of
+    /// Classic's or a block Fire's.
+    #[test]
+    fn the_trail_color_note_follows_the_colour_law() {
+        use aterm_effects::cursor_fx::{
+            glow_color_follows_live_cursor, own_trail_color, trail_color_default_name,
+        };
+        use aterm_effects::cursor_glow::GlowStyle;
+        let old = "Blank: Lightning keeps its violet, and Beam, Comet and Sparkle keep their own \
+                   color until you set a cursor color; other styles follow the cursor color. \
+                   Cursor color (or \u{201c}cursor\u{201d}) makes every style follow it.";
+        let mut checked = 0;
+        for row in aterm_effects::cursor_glow::spellings::TRAIL_STYLES {
+            for block in [true, false] {
+                for pinned in [false, true] {
+                    let note = super::trail_color_note(row.name, block, pinned);
+                    let case = format!("{} block={block} pinned={pinned}: {note}", row.name);
+                    let Some(style) = row.style else {
+                        assert!(note.contains("Off"), "{case}");
+                        continue;
+                    };
+                    assert_ne!(note, old, "{case}");
+                    if !style.draws_trail_color() {
+                        assert_eq!(note.contains("does not use these"), block, "{case}");
+                        assert!(!note.contains("follows the cursor color"), "{case}");
+                    } else if style == GlowStyle::Classic {
+                        assert_eq!(
+                            trail_color_default_name(style, pinned),
+                            Some("Shifting colors")
+                        );
+                        assert!(note.contains("shifts through colors"), "{case}");
+                    } else if let Some((_, own)) = own_trail_color(style, pinned) {
+                        assert!(note.contains(&own.to_lowercase()), "{case}");
+                        assert_eq!(
+                            note.contains("until you set a cursor color"),
+                            glow_color_follows_live_cursor(style, true),
+                            "{case}"
+                        );
+                    } else {
+                        assert!(note.contains("follows the cursor color"), "{case}");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 40, "{checked}");
+        assert!(super::trail_color_note("classic mono", true, false).contains("cursor color"));
     }
 }

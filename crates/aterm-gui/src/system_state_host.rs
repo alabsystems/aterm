@@ -4,6 +4,7 @@
 //! The System State tab's boundary to the binary's setup workers. The view
 //! edits a plan; these callbacks own OS work and run away from the event loop.
 
+use std::cell::Cell;
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -23,7 +24,7 @@ pub struct InitialSetupHandlers {
     pub apply: fn(Plan, Option<SecretBytes>, InitialSetupApplyReceipt) -> bool,
     pub check: fn(Plan) -> bool,
     pub restore: fn() -> bool,
-    pub cancel: fn() -> bool,
+    pub cancel: fn(InitialSetupCancelReceipt) -> bool,
     pub status: fn() -> SetupStatus,
 }
 
@@ -65,6 +66,51 @@ impl Drop for InitialSetupApplyReceipt {
     }
 }
 
+/// Completes only after the exact Cancel choice is durably saved or superseded.
+/// Shutdown waits for accepted cancellation operations, independently of views.
+#[must_use = "complete only after cancellation is durable"]
+#[derive(Debug)]
+pub struct InitialSetupCancelReceipt {
+    complete: Sender<()>,
+}
+
+impl InitialSetupCancelReceipt {
+    fn new() -> (Self, Receiver<()>) {
+        let (complete, receive) = mpsc::channel();
+        (Self { complete }, receive)
+    }
+
+    pub fn complete(self) {
+        let _ = self.complete.send(());
+    }
+}
+
+struct CancelCompletion {
+    answer: Receiver<()>,
+    result: Cell<Option<bool>>,
+}
+
+impl CancelCompletion {
+    fn new(answer: Receiver<()>) -> Self {
+        Self {
+            answer,
+            result: Cell::new(None),
+        }
+    }
+
+    fn poll(&self) -> Option<bool> {
+        self.result.get().or_else(|| {
+            let result = match self.answer.try_recv() {
+                Ok(()) => Some(true),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => Some(false),
+            };
+            self.result.set(result);
+            result
+        })
+    }
+}
+
 struct PendingApply {
     instance: crate::native_app::AppInstanceId,
     plan: Plan,
@@ -91,6 +137,8 @@ pub(crate) struct Host {
     pending: Option<Request>,
     // Each private receiver is an attempt identity independent of status polls.
     pending_apply: Option<PendingApply>,
+    cancel_receipts: Vec<CancelCompletion>,
+    cancel_failed: bool,
     next_status: Option<Instant>,
     status_in_flight: bool,
     next_tick: Option<Instant>,
@@ -113,6 +161,62 @@ impl Host {
 }
 
 impl App {
+    fn resolve_system_state_cancellations(&mut self) -> bool {
+        let before = self.system_state_host.cancel_failed;
+        let failed = &mut self.system_state_host.cancel_failed;
+        self.system_state_host
+            .cancel_receipts
+            .retain(|receipt| match receipt.poll() {
+                Some(true) => false,
+                None => true,
+                Some(false) => {
+                    *failed = true;
+                    false
+                }
+            });
+        !before && self.system_state_host.cancel_failed
+    }
+
+    pub(crate) fn system_state_cancel_pending(&self) -> bool {
+        self.system_state_host.cancel_failed
+            || self
+                .system_state_host
+                .cancel_receipts
+                .iter()
+                .any(|receipt| receipt.poll() != Some(true))
+            || self
+                .native_runtime
+                .instance_by_kind(AppKind::SystemState)
+                .and_then(|instance| self.native_runtime.app(instance))
+                .is_some_and(
+                    |app| matches!(app, NativeApp::SystemState(state) if state.has_queued_cancel()),
+                )
+    }
+
+    /// The event loop has ended. Transfer only cancellation intents still owned
+    /// by its form, then wait for those workers without joining any Apply work.
+    pub(crate) fn finish_system_state_shutdown(&mut self) -> Result<(), &'static str> {
+        if let Some(instance) = self.native_runtime.instance_by_kind(AppKind::SystemState)
+            && self.native_runtime.take_system_state_cancel(instance)
+        {
+            let handlers = HANDLERS.lock().ok().and_then(|handlers| *handlers);
+            if !self.start_system_state_cancel(handlers) {
+                self.system_state_host.cancel_failed = true;
+            }
+        }
+        if let Some(request) = self.system_state_host.pending.take() {
+            request.finish(WorkstationSetupDecision::Unavailable);
+        }
+        self.resolve_system_state_cancellations();
+        let result =
+            wait_for_cancellations(std::mem::take(&mut self.system_state_host.cancel_receipts));
+        if self.system_state_host.cancel_failed {
+            Err("Cancel was not saved before shutdown")
+        } else {
+            result
+        }
+    }
+
     pub(crate) fn receive_system_state_status(
         &mut self,
         generation: Option<u64>,
@@ -136,17 +240,32 @@ impl App {
         self.publish_system_state(status);
     }
     pub(crate) fn offer_system_state(&mut self, request: Request) {
-        if self.headless || !self.open_system_state_tab() {
+        if !request.pending()
+            || self.headless
+            || !self.can_offer_system_state()
+            || !self.open_system_state_tab()
+        {
             request.finish(WorkstationSetupDecision::Unavailable);
             return;
         }
         self.attach_system_state_offer(request);
     }
 
+    fn can_offer_system_state(&self) -> bool {
+        self.system_state_host.pending.is_none()
+            && !self.system_state_cancel_pending()
+            && self
+                .native_runtime
+                .instance_by_kind(AppKind::SystemState)
+                .is_none_or(|instance| {
+                    matches!(self.native_runtime.app(instance), Some(NativeApp::SystemState(state)) if state.can_offer())
+                })
+    }
+
     /// Attach only after the host has opened the review. Keeping this separate
     /// also lets headless tests exercise the exact offer/focus boundary.
     fn attach_system_state_offer(&mut self, request: Request) {
-        if self.system_state_host.pending.is_some() {
+        if !request.pending() || !self.can_offer_system_state() {
             request.finish(WorkstationSetupDecision::Unavailable);
             return;
         }
@@ -154,12 +273,11 @@ impl App {
             request.finish(WorkstationSetupDecision::Unavailable);
             return;
         }
+        // Retain the hold's exact owner even if the waiting worker withdraws
+        // between model admission and the next UI tick.
+        self.system_state_host.pending = Some(request);
         self.hold_initial_setup_permissions();
         self.refresh_system_state_tab_indicators();
-        if !request.pending() {
-            return;
-        }
-        self.system_state_host.pending = Some(request);
         self.system_state_host.pending_apply = None;
         self.system_state_host.offer_presented = false;
         self.system_state_host.action_refusal = None;
@@ -192,9 +310,42 @@ impl App {
         self.request_redraw_all_windows();
     }
 
-    pub(crate) fn publish_system_state(&mut self, mut status: SetupStatus) {
+    pub(crate) fn publish_system_state(&mut self, status: SetupStatus) {
+        self.publish_system_state_with_notice(status, |app| app.present_system_state_indicator());
+    }
+
+    /// The non-modal attention surface: an existing System State tab's
+    /// indicator. It never opens a dialog, steals focus, or blocks a
+    /// window; with no such tab the notice stays deferred.
+    fn present_system_state_indicator(&mut self) -> bool {
+        let has_tab = self.windows.values().any(|window| {
+            window.tab_set.tabs().iter().any(|tab| {
+                tab.root.any_leaf(&mut |view| {
+                    matches!(self.view_store.get(*view), Some(crate::tab_model::View::Native(native))
+                        if matches!(self.native_runtime.app(native.instance), Some(NativeApp::SystemState(_))))
+                })
+            })
+        });
+        if has_tab {
+            self.refresh_system_state_tab_indicators();
+        }
+        has_tab
+    }
+
+    fn publish_system_state_with_notice(
+        &mut self,
+        mut status: SetupStatus,
+        present_notice: impl FnOnce(&mut Self) -> bool,
+    ) {
+        #[cfg(not(target_os = "macos"))]
+        let _ = present_notice;
         self.system_state_host.latest_status = status.clone();
-        if self.system_state_host.pending_apply.is_some() {
+        if self
+            .system_state_host
+            .pending_apply
+            .as_ref()
+            .is_some_and(|pending| self.system_state_instance_has_view(pending.instance))
+        {
             status.busy = true;
         }
         if let Some(refusal) = &self.system_state_host.action_refusal {
@@ -203,8 +354,20 @@ impl App {
             status.rows.insert(0, refusal.clone());
         }
         #[cfg(target_os = "macos")]
+        let reopened_attention =
+            status.needs_attention(Some(status.plan.as_ref().unwrap_or(&Plan::default())));
+        let changed = self.native_runtime.publish_system_state(status);
+        #[cfg(target_os = "macos")]
         if !self.system_state_host.notice_shown
-            && status.needs_attention()
+            && self
+                .native_runtime
+                .instance_by_kind(AppKind::SystemState)
+                .and_then(|instance| self.native_runtime.app(instance))
+                .and_then(|app| match app {
+                    NativeApp::SystemState(state) => Some(state.needs_attention()),
+                    _ => None,
+                })
+                .unwrap_or(reopened_attention)
             && self.system_state_host.pending.is_none()
             && !self.windows.keys().any(|wid| {
                 self.active_native_view(*wid).is_some_and(|(instance, _)| {
@@ -214,13 +377,13 @@ impl App {
                 })
             })
         {
-            self.system_state_host.notice_shown = true;
-            self.show_system_state_notice();
+            // Keep the notice deferred until a non-modal presenter can
+            // actually surface it.
+            self.system_state_host.notice_shown = present_notice(self);
         }
         self.system_state_host.status_in_flight = false;
         // Permission policy still converges when the review tab is closed.
         self.system_state_host.next_status = Some(Instant::now() + Duration::from_secs(1));
-        let changed = self.native_runtime.publish_system_state(status);
         let indicators_changed = self.refresh_system_state_tab_indicators();
         if changed || indicators_changed {
             self.request_redraw_all_windows();
@@ -265,6 +428,15 @@ impl App {
     }
 
     pub(crate) fn tick_system_state(&mut self, now: Instant) {
+        self.resolve_withdrawn_system_state_offer(now);
+        if self.resolve_system_state_cancellations() {
+            self.system_state_host.action_refusal = Some(SetupStatusRow {
+                name: "Cancel".into(),
+                status: "failed".into(),
+                detail: "Cancel was not saved. Try again.".into(),
+            });
+            self.publish_system_state(self.system_state_host.latest_status.clone());
+        }
         self.resolve_system_state_apply();
         if self
             .system_state_host
@@ -274,6 +446,10 @@ impl App {
             return;
         }
         let Some(instance) = self.native_runtime.instance_by_kind(AppKind::SystemState) else {
+            if let Some(request) = self.system_state_host.pending.take() {
+                request.finish(WorkstationSetupDecision::Unavailable);
+            }
+            self.system_state_host.next_tick = None;
             self.poll_system_state_status(now);
             return;
         };
@@ -281,7 +457,6 @@ impl App {
             matches!(view, crate::tab_model::View::Native(native) if native.instance == instance)
         });
         if !has_view {
-            self.system_state_host.pending_apply = None;
             if let Some(request) = self.system_state_host.pending.take() {
                 request.finish(WorkstationSetupDecision::Unavailable);
             }
@@ -290,14 +465,6 @@ impl App {
             return;
         }
         self.system_state_host.next_tick = Some(now + Duration::from_millis(250));
-        if self
-            .system_state_host
-            .pending
-            .as_ref()
-            .is_some_and(|request| !request.pending())
-        {
-            self.system_state_host.pending = None;
-        }
         let active = self.system_state_countdown_active(instance);
         let changed = self.native_runtime.tick_system_state(now, active);
         loop {
@@ -313,6 +480,25 @@ impl App {
         if changed || indicators_changed {
             self.request_redraw_all_windows();
         }
+    }
+
+    fn resolve_withdrawn_system_state_offer(&mut self, now: Instant) {
+        if !self
+            .system_state_host
+            .pending
+            .as_ref()
+            .is_some_and(|request| !request.pending())
+        {
+            return;
+        }
+        // Local Apply, Cancel and Restore consume this owner before setting
+        // their own hold. Only an abandoned automatic review remains here.
+        self.system_state_host.pending = None;
+        self.recheck_initial_setup_permissions();
+        self.system_state_host.generation = self.system_state_host.generation.wrapping_add(1);
+        self.system_state_host.status_in_flight = false;
+        self.system_state_host.next_status = Some(now);
+        self.system_state_host.next_tick = None;
     }
 
     fn system_state_countdown_active(
@@ -381,6 +567,26 @@ impl App {
         self.run_system_state_action_with_handlers(action, handlers);
     }
 
+    /// The final view can disappear before the park drains its action queue.
+    /// Hand explicit Cancel, or the automatic offer's existing Tab/View close
+    /// cancellation, to its coordinator. Queued Apply and Check stay unsubmitted.
+    pub(crate) fn finish_system_state_close(
+        &mut self,
+        instance: crate::native_app::AppInstanceId,
+        scope: crate::native_app::CloseScope,
+    ) {
+        let cancel = self.native_runtime.take_system_state_cancel(instance)
+            || (matches!(scope, crate::native_app::CloseScope::View | crate::native_app::CloseScope::Tab)
+                && self.system_state_host.pending.as_ref().is_some_and(|request| {
+                    matches!(self.native_runtime.app(instance), Some(NativeApp::SystemState(state)) if state.offered_request_matches(request))
+                }));
+        if cancel {
+            self.run_system_state_action(SystemStateAction::Cancel);
+        }
+        self.native_runtime
+            .finish_system_state_close(instance, scope);
+    }
+
     fn run_system_state_action_with_handlers(
         &mut self,
         action: SystemStateAction,
@@ -393,12 +599,15 @@ impl App {
             SystemStateAction::Restore => "Restore preferences",
         };
         if !matches!(&action, SystemStateAction::Check(_)) {
+            if let Some(instance) = self.native_runtime.instance_by_kind(AppKind::SystemState) {
+                self.retire_native_review(instance);
+            }
             self.hold_initial_setup_permissions();
+            // A newer mutating intent retires the prior admission receipt.
+            // A read-only Check cannot revoke its durable permission decision.
+            self.system_state_host.pending_apply = None;
         }
         self.system_state_host.action_refusal = None;
-        // A new action abandons only this UI receipt; the durable worker keeps
-        // its own plan and the old sender cannot answer a later receiver.
-        self.system_state_host.pending_apply = None;
         self.system_state_host.generation = self.system_state_host.generation.wrapping_add(1);
         self.system_state_host.status_in_flight = false;
         let started = match action {
@@ -435,14 +644,7 @@ impl App {
                 }
                 started
             }
-            SystemStateAction::Cancel => {
-                if let Some(request) = self.system_state_host.pending.take() {
-                    request.finish(WorkstationSetupDecision::Cancel);
-                    true
-                } else {
-                    handlers.is_some_and(|handlers| (handlers.cancel)())
-                }
-            }
+            SystemStateAction::Cancel => self.start_system_state_cancel(handlers),
             SystemStateAction::Check(plan) => {
                 handlers.is_some_and(|handlers| (handlers.check)(plan))
             }
@@ -459,6 +661,29 @@ impl App {
             }
         };
         self.finish_system_state_action(started, action_name);
+    }
+
+    /// The cancellation worker owns persistence. This handoff also runs after
+    /// the display connection has ended, so it must never touch presentation.
+    fn start_system_state_cancel(&mut self, handlers: Option<InitialSetupHandlers>) -> bool {
+        let (receipt, receiver) = InitialSetupCancelReceipt::new();
+        let started = if let Some(request) = self.system_state_host.pending.take() {
+            request.finish_answer(crate::workstation_setup::SetupAnswer {
+                decision: WorkstationSetupDecision::Cancel,
+                password: None,
+                receipt: None,
+                cancel_receipt: Some(receipt),
+            })
+        } else {
+            handlers.is_some_and(|handlers| (handlers.cancel)(receipt))
+        };
+        if started {
+            self.system_state_host.cancel_failed = false;
+            self.system_state_host
+                .cancel_receipts
+                .push(CancelCompletion::new(receiver));
+        }
+        started
     }
 
     fn finish_system_state_action(&mut self, started: bool, action_name: &str) {
@@ -478,13 +703,6 @@ impl App {
         let Some(pending) = self.system_state_host.pending_apply.as_ref() else {
             return;
         };
-        let live = self.view_store.iter().any(|(_, view)| {
-            matches!(view, crate::tab_model::View::Native(native) if native.instance == pending.instance)
-        }) && self.native_runtime.app(pending.instance).is_some_and(|app| app.kind() == AppKind::SystemState);
-        if !live {
-            self.system_state_host.pending_apply = None;
-            return;
-        }
         let accepted = match pending.answer.try_recv() {
             Ok(accepted) => accepted,
             Err(TryRecvError::Empty) => return,
@@ -497,13 +715,53 @@ impl App {
         self.system_state_host.status_in_flight = false;
         if accepted {
             self.accepted_initial_setup_apply();
-            self.native_runtime.accept_system_state_apply(pending.plan);
-            self.refresh_system_state_tab_indicators();
+            // Admission belongs to the accepted operation after its view
+            // closes. Consuming a draft belongs only to that original model.
+            if self.system_state_instance_has_view(pending.instance) {
+                self.native_runtime.accept_system_state_apply(pending.plan);
+                self.refresh_system_state_tab_indicators();
+            }
         }
         self.finish_system_state_action(accepted, "Apply");
         if accepted {
             self.publish_system_state(self.system_state_host.latest_status.clone());
         }
+    }
+
+    fn system_state_instance_has_view(&self, instance: crate::native_app::AppInstanceId) -> bool {
+        self.native_runtime
+            .app(instance)
+            .is_some_and(|app| app.kind() == AppKind::SystemState)
+            && self.view_store.iter().any(|(_, view)| {
+                matches!(view, crate::tab_model::View::Native(native) if native.instance == instance)
+            })
+    }
+}
+
+fn wait_for_cancellations(receipts: Vec<CancelCompletion>) -> Result<(), &'static str> {
+    let mut failed = false;
+    for receipt in receipts {
+        if let Some(complete) = receipt.poll() {
+            failed |= !complete;
+            continue;
+        }
+        loop {
+            match receipt.answer.recv_timeout(Duration::from_secs(60)) {
+                Ok(()) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    aterm_log::info!("Waiting for Cancel to be saved before quitting");
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+    }
+    if failed {
+        Err("Cancel was not saved before shutdown")
+    } else {
+        Ok(())
     }
 }
 
@@ -521,6 +779,9 @@ mod tests {
         static APPLY_RECEIPTS: std::cell::RefCell<Vec<InitialSetupApplyReceipt>> = const {
             std::cell::RefCell::new(Vec::new())
         };
+        static CANCEL_RECEIPTS: std::cell::RefCell<Vec<InitialSetupCancelReceipt>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
     }
 
     fn queued_apply_handlers() -> InitialSetupHandlers {
@@ -531,7 +792,7 @@ mod tests {
             },
             check: |_| false,
             restore: || false,
-            cancel: || false,
+            cancel: |_| false,
             status: SetupStatus::default,
         }
     }
@@ -637,7 +898,10 @@ mod tests {
         app.run_system_state_action_with_handlers(
             cancel,
             Some(InitialSetupHandlers {
-                cancel: || true,
+                cancel: |receipt| {
+                    receipt.complete();
+                    true
+                },
                 ..queued_apply_handlers()
             }),
         );
@@ -822,6 +1086,262 @@ mod tests {
     }
 
     #[test]
+    fn withdrawn_system_state_request_cannot_open_or_hold_a_finished_review() {
+        for route in ["window", "attach", "model"] {
+            let mut app = App::headless_for_test();
+            let wid = crate::WindowId(0);
+            app.workstation_setup =
+                crate::workstation_setup::Host::for_launch(Some(|| true), false);
+            if route != "window" {
+                assert!(app.open_system_state_tab());
+            }
+            app.receive_system_state_status(
+                Some(app.system_state_host.generation),
+                SetupStatus {
+                    permissions: Some(crate::InitialSetupPermissionPolicy {
+                        revision: 5,
+                        allowed: true,
+                    }),
+                    ..SetupStatus::default()
+                },
+            );
+            assert!(!app.workstation_setup.suppresses_permissions());
+            let active = app.windows[&wid].tab_set.active_id();
+            let focus = app.windows[&wid].window_focus;
+            let instance = app.native_runtime.instance_by_kind(AppKind::SystemState);
+            let (send, receive) = mpsc::channel();
+            let request = Request::new(Plan::default(), send);
+            // The real waiting worker can withdraw its queued wake when an
+            // explicit doctor operation completes in another process.
+            request.finish(WorkstationSetupDecision::Unavailable);
+            assert_eq!(
+                receive.try_recv().unwrap().decision,
+                WorkstationSetupDecision::Unavailable
+            );
+            match route {
+                "window" => {
+                    assert!(!app.apprt.probe_preferences);
+                    assert!(app.windows[&wid].os_window.is_none());
+                    app.headless = false;
+                    app.offer_system_state(request);
+                }
+                "attach" => app.attach_system_state_offer(request),
+                _ => assert!(!app.native_runtime.offer_system_state(request)),
+            }
+            assert_eq!(app.windows[&wid].tab_set.active_id(), active);
+            assert_eq!(app.windows[&wid].window_focus, focus);
+            assert_eq!(
+                app.native_runtime.instance_by_kind(AppKind::SystemState),
+                instance
+            );
+            assert!(app.system_state_host.pending.is_none());
+            assert!(!app.workstation_setup.suppresses_permissions());
+        }
+    }
+
+    #[test]
+    fn withdrawn_system_state_offer_restores_policy_only_after_a_fresh_read() {
+        let policy = || SetupStatus {
+            permissions: Some(crate::InitialSetupPermissionPolicy {
+                revision: 5,
+                allowed: true,
+            }),
+            ..SetupStatus::default()
+        };
+        let mut app = App::headless_for_test();
+        app.workstation_setup = crate::workstation_setup::Host::for_launch(Some(|| true), false);
+        app.receive_system_state_status(Some(app.system_state_host.generation), policy());
+        assert!(!app.workstation_setup.suppresses_permissions());
+        assert!(app.open_system_state_tab());
+        let (send, receive) = mpsc::channel();
+        let request = Request::new(Plan::default(), send);
+        app.attach_system_state_offer(request.clone());
+        let before_withdrawal = app.system_state_host.generation;
+        app.receive_system_state_status(Some(before_withdrawal), policy());
+        assert!(app.workstation_setup.suppresses_permissions());
+        request.finish(WorkstationSetupDecision::Unavailable);
+        assert_eq!(
+            receive.try_recv().unwrap().decision,
+            WorkstationSetupDecision::Unavailable
+        );
+        let now = Instant::now();
+        app.system_state_host.next_tick = Some(now + Duration::from_secs(60));
+        app.tick_system_state(now);
+        assert!(app.system_state_host.pending.is_none());
+        assert!(!app.native_runtime.system_state_mut().unwrap().pending());
+        assert!(app.native_runtime.take_system_state_action().is_none());
+        assert!(app.workstation_setup.suppresses_permissions());
+        app.publish_system_state(policy());
+        app.receive_system_state_status(Some(before_withdrawal), policy());
+        assert!(app.workstation_setup.suppresses_permissions());
+        app.receive_system_state_status(Some(app.system_state_host.generation), policy());
+        assert!(
+            !app.workstation_setup.suppresses_permissions(),
+            "a withdrawn review cannot retain consent after a fresh allowed snapshot"
+        );
+        assert_ne!(app.system_state_host.generation, before_withdrawal);
+    }
+
+    #[test]
+    fn withdrawn_system_state_offer_cannot_release_a_newer_local_decision() {
+        let policy = || SetupStatus {
+            permissions: Some(crate::InitialSetupPermissionPolicy {
+                revision: 6,
+                allowed: true,
+            }),
+            ..SetupStatus::default()
+        };
+        for action in ["apply", "cancel", "restore"] {
+            let mut app = App::headless_for_test();
+            let wid = crate::WindowId(0);
+            assert!(app.open_system_state_tab());
+            let (_, view) = app.active_native_view(wid).unwrap();
+            let (send, receive) = mpsc::channel();
+            let request = Request::new(Plan::default(), send);
+            app.attach_system_state_offer(request.clone());
+            let previous = app.system_state_host.generation;
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(format!("system-state/{action}")),
+                    value: None,
+                }),
+            )
+            .unwrap();
+            let queued = app.native_runtime.take_system_state_action().unwrap();
+            app.run_system_state_action_with_handlers(
+                queued,
+                Some(InitialSetupHandlers {
+                    restore: || true,
+                    ..queued_apply_handlers()
+                }),
+            );
+            let mut answer = receive.try_recv().unwrap();
+            let receipt = answer.receipt.take();
+            if let Some(cancel) = answer.cancel_receipt.take() {
+                cancel.complete();
+            }
+            // A late completion of that old channel cannot retire the newer
+            // local action's permission hold, even once its view is idle.
+            request.finish(WorkstationSetupDecision::Unavailable);
+            app.tick_system_state(Instant::now());
+            app.receive_system_state_status(Some(previous), policy());
+            app.receive_system_state_status(Some(app.system_state_host.generation), policy());
+            assert!(app.workstation_setup.suppresses_permissions());
+            if let Some(receipt) = receipt {
+                assert!(app.system_state_host.pending_apply.is_some());
+                let before_ack = app.system_state_host.generation;
+                receipt.accept();
+                app.resolve_system_state_apply();
+                app.receive_system_state_status(Some(before_ack), policy());
+                assert!(app.workstation_setup.suppresses_permissions());
+                app.receive_system_state_status(Some(app.system_state_host.generation), policy());
+                assert!(!app.workstation_setup.suppresses_permissions());
+            } else {
+                assert_ne!(action, "apply");
+                assert!(app.system_state_host.pending_apply.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn refused_automatic_system_state_offer_does_not_take_the_active_tab_or_focus() {
+        for busy in [false, true] {
+            let mut app = App::headless_for_test();
+            let wid = crate::WindowId(0);
+            let terminal = app.windows[&wid].tab_set.active_index().unwrap();
+            assert!(app.open_system_state_tab());
+            let (instance, view) = app.active_native_view(wid).unwrap();
+            if busy {
+                app.dispatch_native_view_event(
+                    wid,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new("system-state/check"),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            } else {
+                edit_review(&mut app, wid, view, "http://reviewed.local/v1/team");
+            }
+            app.switch_tab_in(wid, terminal);
+            let active = app.windows[&wid].tab_set.active_id();
+            let focus = app.windows[&wid].window_focus;
+            let snapshot = |app: &App| {
+                let Some(NativeApp::SystemState(model)) = app.native_runtime.app(instance) else {
+                    panic!("the manual review must remain live")
+                };
+                (
+                    model.reviewed_plan(),
+                    model.field_projection("system-state/password").unwrap(),
+                    app.native_runtime
+                        .presentation(instance, view)
+                        .unwrap()
+                        .indicators,
+                    app.native_runtime
+                        .view_state(view)
+                        .unwrap()
+                        .common()
+                        .last_focus
+                        .clone(),
+                )
+            };
+            let reviewed = snapshot(&app);
+            assert_eq!(reviewed.2.busy, busy);
+            assert_eq!(reviewed.2.dirty, !busy);
+
+            // Exercise the windowed offer route without an OS surface. The
+            // fixture's injected runtime keeps native preference probes inert.
+            assert!(!app.apprt.probe_preferences);
+            assert!(app.windows[&wid].os_window.is_none());
+            app.headless = false;
+            let (send, receive) = mpsc::channel();
+            app.offer_system_state(Request::new(Plan::default(), send));
+            assert_eq!(
+                receive.try_recv().unwrap().decision,
+                WorkstationSetupDecision::Unavailable
+            );
+            assert_eq!(app.windows[&wid].tab_set.active_id(), active);
+            assert_eq!(app.windows[&wid].window_focus, focus);
+            assert!(app.active_native_view(wid).is_none());
+            assert_eq!(snapshot(&app), reviewed);
+            assert!(app.system_state_host.pending.is_none());
+            assert_eq!(
+                matches!(
+                    app.native_runtime.take_system_state_action(),
+                    Some(SystemStateAction::Check(_))
+                ),
+                busy
+            );
+        }
+
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(!app.apprt.probe_preferences);
+        assert!(app.windows[&wid].os_window.is_none());
+        app.headless = false;
+        let (send, receive) = mpsc::channel();
+        let request = Request::new(Plan::default(), send);
+        app.offer_system_state(request.clone());
+        let (instance, _) = app.active_native_view(wid).unwrap();
+        assert!(matches!(
+            app.native_runtime.app(instance),
+            Some(NativeApp::SystemState(_))
+        ));
+        assert!(request.pending());
+        assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(
+            app.system_state_host
+                .pending
+                .as_ref()
+                .unwrap()
+                .same_offer(&request)
+        );
+    }
+
+    #[test]
     fn late_automatic_offer_cannot_replace_an_unchanged_apply_awaiting_its_receipt() {
         let mut app = App::headless_for_test();
         let wid = crate::WindowId(0);
@@ -899,6 +1419,665 @@ mod tests {
             .indicators;
         assert!(!indicators.dirty && indicators.busy);
         assert!(app.system_state_host.pending.is_none());
+    }
+
+    #[test]
+    fn manual_cancel_waits_for_durability_and_reports_a_worker_that_ends_unsaved() {
+        fn start_cancel(receipt: InitialSetupCancelReceipt) -> bool {
+            CANCEL_RECEIPTS.with(|receipts| receipts.borrow_mut().push(receipt));
+            true
+        }
+        for saved in [false, true] {
+            let mut app = App::headless_for_test();
+            let wid = crate::WindowId(0);
+            assert!(app.open_system_state_tab());
+            let (_, view) = app.active_native_view(wid).unwrap();
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("system-state/cancel"),
+                    value: None,
+                }),
+            )
+            .unwrap();
+            let action = app.native_runtime.take_system_state_action().unwrap();
+            app.run_system_state_action_with_handlers(
+                action,
+                Some(InitialSetupHandlers {
+                    cancel: start_cancel,
+                    ..queued_apply_handlers()
+                }),
+            );
+            app.close_active_native_tab(wid).unwrap();
+            assert!(app.system_state_cancel_pending());
+            // A reopened controller begins idle before any status poll. Its
+            // receipt, rather than that cached busy flag, must reject reoffers.
+            assert!(app.open_system_state_tab());
+            let refuse_offer = |app: &mut App| {
+                let (send, receive) = mpsc::channel();
+                app.attach_system_state_offer(Request::new(Plan::default(), send));
+                assert_eq!(
+                    receive.try_recv().unwrap().decision,
+                    WorkstationSetupDecision::Unavailable
+                );
+                assert!(app.system_state_host.pending.is_none());
+            };
+            refuse_offer(&mut app);
+            let receipt = CANCEL_RECEIPTS.with(|receipts| receipts.borrow_mut().pop().unwrap());
+            let fresh = if saved {
+                receipt.complete();
+                assert!(!app.system_state_cancel_pending());
+                let (send, receive) = mpsc::channel();
+                app.attach_system_state_offer(Request::new(Plan::default(), send));
+                assert!(app.system_state_host.pending.is_some());
+                assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+                Some(receive)
+            } else {
+                drop(receipt);
+                app.tick_system_state(Instant::now());
+                let failure = app.system_state_host.action_refusal.as_ref().unwrap();
+                assert_eq!(failure.name, "Cancel");
+                assert_eq!(failure.status, "failed");
+                assert!(app.system_state_cancel_pending());
+                refuse_offer(&mut app);
+                None
+            };
+            assert_eq!(app.finish_system_state_shutdown().is_ok(), saved);
+            if let Some(receive) = fresh {
+                assert_eq!(
+                    receive.try_recv().unwrap().decision,
+                    WorkstationSetupDecision::Unavailable
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_receipts_hold_relaunch_after_the_form_closes_until_saved() {
+        use crate::native_app::CloseScope;
+        for explicit in [false, true] {
+            let mut app = App::headless_for_test();
+            let wid = crate::WindowId(0);
+            assert!(app.open_system_state_tab());
+            let (_, view) = app.active_native_view(wid).unwrap();
+            let (send, receive) = mpsc::channel();
+            app.attach_system_state_offer(Request::new(Plan::default(), send));
+            if explicit {
+                app.dispatch_native_view_event(
+                    wid,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new("system-state/cancel"),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            }
+            app.close_active_native_tab(wid).unwrap();
+            let mut answer = receive.try_recv().unwrap();
+            assert_eq!(answer.decision, WorkstationSetupDecision::Cancel);
+            let receipt = answer.cancel_receipt.take().unwrap();
+            for scope in [CloseScope::Relaunch, CloseScope::CarriedRelaunch] {
+                assert!(
+                    !app.prepare_all_native_shutdown(
+                        scope,
+                        crate::app_tabs::ClosePreflightVisibility::Quiet
+                    )
+                    .unwrap()
+                );
+            }
+            receipt.complete();
+            // The read-only update preflight may poll completion before the UI
+            // tick. That success must remain known on later preflight checks.
+            for _ in 0..2 {
+                assert!(!app.system_state_cancel_pending());
+            }
+            assert!(
+                app.prepare_all_native_shutdown(
+                    CloseScope::Relaunch,
+                    crate::app_tabs::ClosePreflightVisibility::Quiet
+                )
+                .unwrap()
+            );
+            assert!(app.finish_system_state_shutdown().is_ok());
+        }
+    }
+
+    #[test]
+    fn quit_drains_a_queued_cancel_without_another_event_loop_tick() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_system_state_tab());
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let (send, receive) = mpsc::channel();
+        app.attach_system_state_offer(Request::new(Plan::default(), send));
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new("system-state/cancel"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        let generation = app.system_state_host.generation;
+        let review = app
+            .native_runtime
+            .view_state(view)
+            .unwrap()
+            .common()
+            .review_revision;
+        let worker = std::thread::spawn(move || {
+            let mut answer = receive.recv_timeout(Duration::from_secs(60)).unwrap();
+            assert_eq!(answer.decision, WorkstationSetupDecision::Cancel);
+            answer.cancel_receipt.take().unwrap().complete();
+        });
+        assert!(app.finish_system_state_shutdown().is_ok());
+        worker.join().unwrap();
+        assert!(app.system_state_host.pending.is_none());
+        assert!(app.native_runtime.take_system_state_action().is_none());
+        assert_eq!(app.system_state_host.generation, generation);
+        assert_eq!(
+            app.native_runtime
+                .view_state(view)
+                .unwrap()
+                .common()
+                .review_revision,
+            review
+        );
+        assert!(app.system_state_host.action_refusal.is_none());
+    }
+
+    #[test]
+    fn quit_reports_a_cancel_that_could_not_start_without_changing_presentation() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_system_state_tab());
+        let (_, view) = app.active_native_view(wid).unwrap();
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new("system-state/cancel"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        let generation = app.system_state_host.generation;
+        let review = app
+            .native_runtime
+            .view_state(view)
+            .unwrap()
+            .common()
+            .review_revision;
+        assert!(app.finish_system_state_shutdown().is_err());
+        assert!(app.system_state_host.cancel_failed);
+        assert_eq!(app.system_state_host.generation, generation);
+        assert_eq!(
+            app.native_runtime
+                .view_state(view)
+                .unwrap()
+                .common()
+                .review_revision,
+            review
+        );
+        assert!(app.system_state_host.action_refusal.is_none());
+    }
+
+    #[test]
+    fn cancel_shutdown_drains_other_operations_even_after_a_failed_receipt() {
+        for already_observed in [false, true] {
+            let mut app = App::headless_for_test();
+            let (failed, failed_receiver) = InitialSetupCancelReceipt::new();
+            app.system_state_host
+                .cancel_receipts
+                .push(CancelCompletion::new(failed_receiver));
+            drop(failed);
+            if already_observed {
+                assert!(app.resolve_system_state_cancellations());
+            }
+            // A rendezvous send succeeds only when shutdown actually receives
+            // this later completion; dropping it after the first failure fails
+            // deterministically, regardless of which thread is scheduled first.
+            let (finish, receive) = mpsc::sync_channel(0);
+            app.system_state_host
+                .cancel_receipts
+                .push(CancelCompletion::new(receive));
+            let worker = std::thread::spawn(move || finish.send(()));
+            assert!(app.finish_system_state_shutdown().is_err());
+            assert!(worker.join().unwrap().is_ok());
+        }
+    }
+
+    #[test]
+    fn cancel_shutdown_does_not_wait_for_apply_admission() {
+        let (mut app, wid, _, receipt) = reviewed_apply();
+        app.close_active_native_tab(wid).unwrap();
+        assert!(app.finish_system_state_shutdown().is_ok());
+        assert!(app.system_state_host.pending_apply.is_some());
+        drop(receipt);
+    }
+
+    #[test]
+    fn deferred_cancel_survives_closing_the_final_system_state_tab() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_system_state_tab());
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let (send, receive) = mpsc::channel();
+        let request = Request::new(Plan::default(), send);
+        app.attach_system_state_offer(request.clone());
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new("system-state/cancel"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        // A second input event can close the last view before the event-loop
+        // park drains the reducer's queued action.
+        app.close_active_native_tab(wid).unwrap();
+        assert!(app.native_runtime.app(instance).is_none());
+        assert!(app.structural_invariants_ok());
+        app.tick_system_state(Instant::now());
+        assert_eq!(
+            receive.try_recv().map(|answer| answer.decision),
+            Ok(WorkstationSetupDecision::Cancel)
+        );
+        assert!(!request.pending());
+        assert!(app.system_state_host.pending.is_none());
+        assert!(app.system_state_host.next_tick.is_none());
+    }
+
+    #[test]
+    fn closing_a_review_does_not_dispatch_its_queued_apply_or_check() {
+        for action in ["apply", "check"] {
+            let mut app = App::headless_for_test();
+            let wid = crate::WindowId(0);
+            assert!(app.open_system_state_tab());
+            let (_, view) = app.active_native_view(wid).unwrap();
+            let (send, receive) = mpsc::channel();
+            app.attach_system_state_offer(Request::new(Plan::default(), send));
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new(format!("system-state/{action}")),
+                    value: None,
+                }),
+            )
+            .unwrap();
+            let generation = app.system_state_host.generation;
+            app.close_active_native_tab(wid).unwrap();
+            app.tick_system_state(Instant::now());
+            assert_eq!(
+                receive.try_recv().map(|answer| answer.decision),
+                Ok(WorkstationSetupDecision::Cancel)
+            );
+            assert_eq!(app.system_state_host.generation, generation.wrapping_add(1));
+            assert!(app.system_state_host.action_refusal.is_none());
+            assert!(app.system_state_host.pending.is_none());
+            assert!(app.system_state_host.pending_apply.is_none());
+            assert!(app.structural_invariants_ok());
+        }
+    }
+
+    #[test]
+    fn deferred_manual_cancel_reaches_the_host_when_its_final_view_closes() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        assert!(app.open_system_state_tab());
+        let (_, view) = app.active_native_view(wid).unwrap();
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new("system-state/cancel"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        let generation = app.system_state_host.generation;
+        app.close_active_native_tab(wid).unwrap();
+        app.tick_system_state(Instant::now());
+        // Library tests have no provisioning handlers. The ordinary refusal is
+        // evidence that the manual action reached its host instead of vanishing.
+        let refusal = app.system_state_host.action_refusal.as_ref().unwrap();
+        assert_eq!(refusal.name, "Cancel");
+        assert_eq!(refusal.status, "not started");
+        assert_eq!(app.system_state_host.generation, generation.wrapping_add(1));
+        assert!(app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn deferred_cancel_stays_queued_when_a_linked_system_state_view_survives() {
+        for automatic in [false, true] {
+            let mut app = App::headless_for_test();
+            let wid = crate::WindowId(0);
+            assert!(app.open_system_state_tab());
+            let (instance, _) = app.active_native_view(wid).unwrap();
+            app.stage_system_state_tab(wid).unwrap();
+            let (_, view) = app.active_native_view(wid).unwrap();
+            let (send, receive) = mpsc::channel();
+            if automatic {
+                app.attach_system_state_offer(Request::new(Plan::default(), send));
+            }
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("system-state/cancel"),
+                    value: None,
+                }),
+            )
+            .unwrap();
+            let generation = app.system_state_host.generation;
+            app.close_active_native_tab(wid).unwrap();
+            assert!(app.native_runtime.app(instance).is_some());
+            assert_eq!(app.system_state_host.generation, generation);
+            assert!(app.system_state_host.action_refusal.is_none());
+            if automatic {
+                assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            }
+            app.tick_system_state(Instant::now());
+            assert_eq!(app.system_state_host.generation, generation.wrapping_add(1));
+            if automatic {
+                assert_eq!(
+                    receive.try_recv().map(|answer| answer.decision),
+                    Ok(WorkstationSetupDecision::Cancel)
+                );
+                assert!(app.system_state_host.action_refusal.is_none());
+            } else {
+                assert_eq!(
+                    app.system_state_host.action_refusal.as_ref().unwrap().name,
+                    "Cancel"
+                );
+            }
+            assert!(app.native_runtime.take_system_state_action().is_none());
+            app.tick_system_state(Instant::now() + Duration::from_secs(1));
+            assert_eq!(app.system_state_host.generation, generation.wrapping_add(1));
+            assert!(app.structural_invariants_ok());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn system_state_attention_surfaces_as_a_nonmodal_indicator_without_focus() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let terminal = app.windows[&wid].tab_set.active_index().unwrap();
+        assert!(app.open_system_state_tab());
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        app.switch_tab_in(wid, terminal);
+        app.windows.get_mut(&wid).unwrap().focused = false;
+        assert!(app.active_native_view(wid).is_none());
+        let status = SetupStatus {
+            rows: vec![SetupStatusRow {
+                name: "Secrets vault".into(),
+                status: "blocked".into(),
+                detail: "approval code NOTICE73".into(),
+            }],
+            ..SetupStatus::default()
+        };
+        for _ in 0..2 {
+            app.publish_system_state(status.clone());
+            assert!(
+                app.native_runtime
+                    .presentation(instance, view)
+                    .unwrap()
+                    .indicators
+                    .attention
+            );
+            assert!(
+                app.system_state_host.notice_shown,
+                "the existing tab indicator surfaces attention without focus or a dialog"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn system_state_notice_retries_deferred_presentation_until_one_success() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let terminal = app.windows[&wid].tab_set.active_index().unwrap();
+        assert!(app.open_system_state_tab());
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let status = SetupStatus {
+            rows: vec![SetupStatusRow {
+                name: "Secrets vault".into(),
+                status: "blocked".into(),
+                detail: "approval code NOTICE73".into(),
+            }],
+            ..SetupStatus::default()
+        };
+        app.publish_system_state_with_notice(status.clone(), |_| {
+            panic!("an active System State review needs no attention sheet")
+        });
+        assert!(!app.system_state_host.notice_shown);
+        app.switch_tab_in(wid, terminal);
+
+        let mut calls = 0;
+        let mut revision = None;
+        for shown in [false, false, true] {
+            app.publish_system_state_with_notice(status.clone(), |_| {
+                calls += 1;
+                shown
+            });
+            assert_eq!(app.system_state_host.notice_shown, shown);
+            assert!(
+                app.native_runtime
+                    .presentation(instance, view)
+                    .unwrap()
+                    .indicators
+                    .attention
+            );
+            let current = app
+                .native_runtime
+                .view_state(view)
+                .unwrap()
+                .common()
+                .presentation_revision;
+            if let Some(previous) = revision {
+                assert_eq!(
+                    current, previous,
+                    "notice retries must not repaint the form"
+                );
+            }
+            revision = Some(current);
+        }
+        assert_eq!(calls, 3);
+        for _ in 0..2 {
+            app.publish_system_state_with_notice(status.clone(), |_| {
+                panic!("a successfully presented notice must not be repeated")
+            });
+            assert!(app.system_state_host.notice_shown);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn closed_check_notices_match_the_plan_that_reopening_restores() {
+        use aterm_types::macos_setup::Setting;
+
+        // A completed Check can outlive its final view. Only results that the
+        // reopened form can show should summon the person back to that form.
+        for (saved, edit, action_failure) in [
+            (None, None, false),
+            (Some("http://saved.local/v1/team"), None, false),
+            (Some("http://saved.local/v1/team"), Some("url"), true),
+            (Some("http://saved.local/v1/team"), Some("url"), false),
+            (Some("http://saved.local/v1/team"), Some("choice"), false),
+            (None, Some("url"), false),
+        ] {
+            let mut app = App::headless_for_test();
+            let wid = crate::WindowId(0);
+            let saved = saved.map(|url| Plan {
+                vault_url: url.into(),
+                ..Plan::default()
+            });
+            let reopened_plan = saved.clone().unwrap_or_default();
+            let matches_reopened = edit.is_none();
+            assert!(app.open_system_state_tab());
+            let (instance, view) = app.active_native_view(wid).unwrap();
+            app.publish_system_state(SetupStatus {
+                plan: saved.clone(),
+                ..SetupStatus::default()
+            });
+            let edit = match edit {
+                Some("url") => Some((
+                    "system-state/url",
+                    SemanticInput::Text("http://checked.local/v1/team".into()),
+                )),
+                Some("choice") => Some(("system-state/setting/0", SemanticInput::Bool(false))),
+                _ => None,
+            };
+            if let Some((key, value)) = edit {
+                app.dispatch_native_view_event(
+                    wid,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(key),
+                        value: Some(value),
+                    }),
+                )
+                .unwrap();
+            }
+            app.dispatch_native_view_event(
+                wid,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("system-state/check"),
+                    value: None,
+                }),
+            )
+            .unwrap();
+            let Some(SystemStateAction::Check(checked)) =
+                app.native_runtime.take_system_state_action()
+            else {
+                panic!("the displayed review must dispatch Check")
+            };
+            assert_eq!(checked == reopened_plan, matches_reopened);
+            if !checked.selection.contains(Setting::CapsLock) {
+                assert!(reopened_plan.selection.contains(Setting::CapsLock));
+            }
+            app.run_system_state_action_with_handlers(
+                SystemStateAction::Check(checked.clone()),
+                Some(InitialSetupHandlers {
+                    check: |_| true,
+                    ..queued_apply_handlers()
+                }),
+            );
+            app.close_active_native_tab(wid).unwrap();
+            assert!(app.native_runtime.app(instance).is_none());
+            assert!(app.structural_invariants_ok());
+            let status = SetupStatus {
+                plan: saved,
+                check: Some(crate::SetupCheck {
+                    plan: checked,
+                    rows: vec![SetupStatusRow {
+                        name: "Check: Secrets vault".into(),
+                        status: "blocked".into(),
+                        detail: "approval code CLOSED73".into(),
+                    }],
+                }),
+                rows: if action_failure {
+                    vec![SetupStatusRow {
+                        name: "Restore preferences".into(),
+                        status: "failed".into(),
+                        detail: "injected action failure".into(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                ..SetupStatus::default()
+            };
+            let expected_attention = matches_reopened || action_failure;
+            let mut notices = 0;
+            app.publish_system_state_with_notice(status.clone(), |_| {
+                notices += 1;
+                true
+            });
+            assert_eq!(notices, usize::from(expected_attention));
+            assert_eq!(app.system_state_host.notice_shown, expected_attention);
+
+            assert!(app.open_system_state_tab());
+            app.publish_system_state(status);
+            let (reopened, _) = app.active_native_view(wid).unwrap();
+            let Some(NativeApp::SystemState(state)) = app.native_runtime.app(reopened) else {
+                panic!("the notice reopens System State")
+            };
+            assert_eq!(state.reviewed_plan(), reopened_plan);
+            assert_eq!(state.needs_attention(), expected_attention);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn check_plan_mismatch_does_not_announce_background_attention() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let terminal = app.windows[&wid].tab_set.active_index().unwrap();
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.rows = 90;
+        window.cols = 160;
+        assert!(app.open_system_state_tab());
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let url = "http://reviewed.local:7484/v1/team";
+        edit_review(&mut app, wid, view, url);
+        app.switch_tab_in(wid, terminal);
+        assert!(app.active_native_view(wid).is_none());
+        assert!(app.structural_invariants_ok());
+        let mut status = SetupStatus {
+            plan: Some(Plan::default()),
+            check: Some(crate::SetupCheck {
+                plan: Plan::default(),
+                rows: vec![SetupStatusRow {
+                    name: "Check: Secrets vault".into(),
+                    status: "blocked".into(),
+                    detail: "approval code CHECK73".into(),
+                }],
+            }),
+            ..SetupStatus::default()
+        };
+        for _ in 0..2 {
+            app.receive_system_state_status(Some(app.system_state_host.generation), status.clone());
+            assert!(!app.system_state_host.notice_shown);
+            assert!(
+                !app.native_runtime
+                    .presentation(instance, view)
+                    .unwrap()
+                    .indicators
+                    .attention
+            );
+        }
+        let check = status.check.as_mut().unwrap();
+        check.plan.vault_url = url.into();
+        check
+            .plan
+            .selection
+            .set(aterm_types::macos_setup::Setting::Dock, false);
+        app.receive_system_state_status(Some(app.system_state_host.generation), status.clone());
+        assert!(
+            app.system_state_host.notice_shown,
+            "a matching background check surfaces through the non-modal indicator"
+        );
+        assert!(
+            app.native_runtime
+                .presentation(instance, view)
+                .unwrap()
+                .indicators
+                .attention
+        );
+        app.publish_system_state_with_notice(status, |_| {
+            panic!("a shown non-modal notice is not presented again")
+        });
+        assert!(app.system_state_host.notice_shown);
+        assert!(app.open_system_state_tab());
+        assert_review(&mut app, wid, view, url, false);
     }
 
     #[test]
@@ -1200,7 +2379,10 @@ mod tests {
                 app.run_system_state_action_with_handlers(
                     action,
                     Some(InitialSetupHandlers {
-                        cancel: || true,
+                        cancel: |receipt| {
+                            receipt.complete();
+                            true
+                        },
                         restore: || false,
                         ..queued_apply_handlers()
                     }),
@@ -1265,8 +2447,29 @@ mod tests {
     fn manual_apply_receipt_accepts_once_and_old_answers_cannot_clear_a_new_review() {
         let (mut app, wid, view, stale) = reviewed_apply();
         app.run_system_state_action_with_handlers(
-            SystemStateAction::Check(Plan::default()),
-            Some(queued_apply_handlers()),
+            SystemStateAction::Cancel,
+            Some(InitialSetupHandlers {
+                cancel: |receipt| {
+                    receipt.complete();
+                    true
+                },
+                ..queued_apply_handlers()
+            }),
+        );
+        app.receive_system_state_status(
+            Some(app.system_state_host.generation),
+            SetupStatus {
+                plan: Some(Plan::default()),
+                ..SetupStatus::default()
+            },
+        );
+        assert!(app.system_state_host.pending_apply.is_none());
+        assert_review(
+            &mut app,
+            wid,
+            view,
+            "http://reviewed.local:7484/v1/team",
+            false,
         );
         edit_review(&mut app, wid, view, "http://newer.local:7484/v1/team");
         let current = queue_review(&mut app, wid, view);
@@ -1344,6 +2547,106 @@ mod tests {
         assert!(app.system_state_host.pending_apply.is_none());
     }
 
+    #[test]
+    fn detached_admission_updates_permissions_without_accepting_a_reopened_review() {
+        for reopen in [false, true] {
+            let (mut app, wid, _, receipt) = reviewed_apply();
+            app.close_active_native_tab(wid).unwrap();
+            app.tick_system_state(Instant::now());
+            let policy = SetupStatus {
+                permissions: Some(crate::InitialSetupPermissionPolicy {
+                    revision: 9,
+                    allowed: true,
+                }),
+                ..SetupStatus::default()
+            };
+            let new_view = if reopen {
+                assert!(app.open_system_state_tab());
+                let (_, view) = app.active_native_view(wid).unwrap();
+                app.receive_system_state_status(
+                    Some(app.system_state_host.generation),
+                    policy.clone(),
+                );
+                let url = "http://reopened.local:7484/v1/team";
+                edit_review(&mut app, wid, view, url);
+                assert_review(&mut app, wid, view, url, false);
+                // A read-only action does not replace the accepted Apply's
+                // outstanding admission or its permission authorization.
+                app.run_system_state_action_with_handlers(
+                    SystemStateAction::Check(Plan::default()),
+                    Some(InitialSetupHandlers {
+                        check: |_| true,
+                        ..queued_apply_handlers()
+                    }),
+                );
+                Some(view)
+            } else {
+                None
+            };
+            receipt.accept();
+            app.resolve_system_state_apply();
+            assert!(app.workstation_setup.suppresses_permissions());
+            app.receive_system_state_status(Some(app.system_state_host.generation), policy);
+            assert!(!app.workstation_setup.suppresses_permissions());
+            if let Some(view) = new_view {
+                assert_review(
+                    &mut app,
+                    wid,
+                    view,
+                    "http://reopened.local:7484/v1/team",
+                    false,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn newer_system_state_intents_retire_detached_admission() {
+        for next in ["cancel", "restore", "apply"] {
+            let (mut app, wid, _, old_receipt) = reviewed_apply();
+            app.close_active_native_tab(wid).unwrap();
+            assert!(app.open_system_state_tab());
+            let (_, view) = app.active_native_view(wid).unwrap();
+            let url = "http://reopened.local:7484/v1/team";
+            edit_review(&mut app, wid, view, url);
+            let new_receipt = if next == "apply" {
+                Some(queue_review(&mut app, wid, view))
+            } else {
+                app.run_system_state_action_with_handlers(
+                    if next == "cancel" {
+                        SystemStateAction::Cancel
+                    } else {
+                        SystemStateAction::Restore
+                    },
+                    Some(InitialSetupHandlers {
+                        cancel: |receipt| {
+                            receipt.complete();
+                            true
+                        },
+                        restore: || true,
+                        ..queued_apply_handlers()
+                    }),
+                );
+                None
+            };
+            old_receipt.accept();
+            app.resolve_system_state_apply();
+            app.receive_system_state_status(
+                Some(app.system_state_host.generation),
+                SetupStatus {
+                    permissions: Some(crate::InitialSetupPermissionPolicy {
+                        revision: 9,
+                        allowed: true,
+                    }),
+                    ..SetupStatus::default()
+                },
+            );
+            assert!(app.workstation_setup.suppresses_permissions());
+            assert_review(&mut app, wid, view, url, next == "apply");
+            drop(new_receipt);
+        }
+    }
+
     fn press(key: NamedKey) -> InputEvent {
         InputEvent::Key {
             key: Key::Named(key),
@@ -1352,6 +2655,71 @@ mod tests {
             layout_text: None,
             event_type: KeyEventType::Press,
         }
+    }
+
+    #[test]
+    fn held_return_cannot_repeat_system_state_apply_after_the_first_pass_finishes() {
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let window = app.windows.get_mut(&wid).unwrap();
+        window.rows = 90;
+        window.cols = 160;
+        assert!(app.open_system_state_tab());
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        app.dispatch_native_view_event(
+            wid,
+            view,
+            AppEvent::FocusChanged(Some(UiKey::new("system-state/apply"))),
+        )
+        .unwrap();
+        let enter = press(NamedKey::Enter);
+        let mut repeat = enter.clone();
+        let InputEvent::Key { event_type, .. } = &mut repeat else {
+            unreachable!()
+        };
+        *event_type = KeyEventType::Repeat;
+        assert!(app.native_input_event(wid, &enter));
+        let Some(action @ SystemStateAction::Apply(_)) =
+            app.native_runtime.take_system_state_action()
+        else {
+            panic!("the initial press must activate the focused Apply button")
+        };
+        assert!(app.native_runtime.take_system_state_action().is_none());
+        app.run_system_state_action_with_handlers(
+            action,
+            Some(InitialSetupHandlers {
+                apply: |_, _, receipt| {
+                    receipt.accept();
+                    true
+                },
+                ..queued_apply_handlers()
+            }),
+        );
+        assert!(app.native_input_event(wid, &repeat));
+        assert!(app.native_runtime.take_system_state_action().is_none());
+        app.resolve_system_state_apply();
+        app.publish_system_state(SetupStatus::default());
+        assert!(
+            !app.native_runtime
+                .presentation(instance, view)
+                .unwrap()
+                .indicators
+                .busy
+        );
+        // A held key still belongs to that one press after the worker becomes
+        // idle. It cannot authorize another pass by taking the text fallback.
+        assert!(app.native_input_event(wid, &repeat));
+        assert!(
+            app.native_runtime.take_system_state_action().is_none(),
+            "Return auto-repeat must not queue another Apply"
+        );
+        // A new press remains an intentional activation of the focused button.
+        assert!(app.native_input_event(wid, &enter));
+        assert!(matches!(
+            app.native_runtime.take_system_state_action(),
+            Some(SystemStateAction::Apply(_))
+        ));
+        assert!(app.native_runtime.take_system_state_action().is_none());
     }
 
     #[test]
@@ -1860,6 +3228,7 @@ mod tests {
                     decision: WorkstationSetupDecision::Begin(plan),
                     password,
                     receipt: None,
+                    cancel_receipt: None,
                 })
             });
             receipt.accept();
@@ -1869,7 +3238,7 @@ mod tests {
             apply: |_, _, _| false,
             check: |_| false,
             restore: || false,
-            cancel: || false,
+            cancel: |_| false,
             status: SetupStatus::default,
         };
         for closed_receiver in [false, true] {

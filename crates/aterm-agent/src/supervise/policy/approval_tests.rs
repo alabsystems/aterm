@@ -3782,17 +3782,19 @@ fn full_power_answers_gemini_cli_boxes_by_role() {
     );
 }
 
-/// GEMINI CLI'S USAGE-LIMIT DIALOG THAT NAMES NO RESET IS NEVER PRESSED
-/// (`Usage limit reached for <model>.` over `1. Keep trying` and `2. Stop`,
-/// measured on 0.46.0; a key's per-day quota): at every level it goes to a
-/// person, with its own words — `Keep trying` sends the turn again into a
-/// quota whose reset nothing names, so a supervisor's press would repeat at
-/// every return — and its `/stats model`, even with the loop's clock saying
-/// a retry is due. NEGATIVE CONTROL: the dialog is read whole, a usage-limit
-/// box the reader vouches for, the focus on `Keep trying`, so it is the rule
-/// and not the read that leaves it unpressed.
+/// GEMINI CLI'S USAGE-LIMIT DIALOG THAT NAMES NO RESET IS PRESSED ONLY AT
+/// ITS LADDER'S DUE (`Usage limit reached for <model>.` over `1. Keep
+/// trying` and `2. Stop`, measured on 0.46.0; a key's per-day quota): at
+/// every level, its `1` by digit ([`RULE_LIMIT_RETRY`]) once the loop's
+/// clock says the back-off ladder's rung has come
+/// ([`ApprovalCtx::limit_retry`]), guarded on its title's row (no reset row
+/// to guard on), so another dialog drawn in its place is judged again; before
+/// then it goes to a person in its own words — the ladder named, and its
+/// `/stats model` — whole in a badge. NEGATIVE CONTROLS: the dialog is read
+/// whole, a usage-limit box the reader vouches for, the focus on `Keep
+/// trying`; with `limit_wait` off it is a person's however due.
 #[test]
-fn gemini_clis_usage_limit_is_never_pressed() {
+fn gemini_clis_usage_limit_with_no_reset_is_pressed_only_at_its_ladders_due() {
     let rows = phase_fixtures::screen(aterm_phase::gemini::fixtures::LIMIT_DIALOG);
     let reading = aterm_phase::read(Some("node"), &rows, None);
     let p = reading.prompt.as_ref().expect("the dialog");
@@ -3802,22 +3804,58 @@ fn gemini_clis_usage_limit_is_never_pressed() {
         "the control"
     );
     assert_eq!(p.focused().map(|o| o.label.as_str()), Some("Keep trying"));
+    let title_row = rows
+        .iter()
+        .find(|r| r.contains("Usage limit reached for"))
+        .expect("the title row")
+        .clone();
     for level in [full(), ctx(), none(full())] {
-        for due in [false, true] {
-            let level = ApprovalCtx {
-                limit_retry: due,
-                ..level.clone()
-            };
-            let d = decide_screen(Some("node"), &rows, &level).expect("a box");
-            assert_eq!(approved(&d), None, "{:?}: {d:?}", level.approve);
-            let why = reason(&d);
-            assert!(why.starts_with("Gemini CLI's usage limit"), "{why}");
-            assert!(
-                why.contains("Keep trying") && why.contains("/stats model"),
-                "{why}"
-            );
-            assert!(why.chars().count() <= 120, "kept whole in its badge: {why}");
-        }
+        let early = decide_screen(Some("node"), &rows, &level).expect("a box");
+        assert_eq!(approved(&early), None, "{:?}: {early:?}", level.approve);
+        let why = reason(&early);
+        assert!(
+            why.starts_with("Gemini CLI's usage limit names no reset"),
+            "{why}"
+        );
+        assert!(
+            why.contains("Keep trying") && why.contains("ladder") && why.contains("/stats model"),
+            "{why}"
+        );
+        assert!(why.chars().count() <= 120, "kept whole in its badge: {why}");
+
+        let due = ApprovalCtx {
+            limit_retry: true,
+            ..level.clone()
+        };
+        let d = decide_screen(Some("node"), &rows, &due).expect("a box");
+        let Decision::Approve {
+            rule_id,
+            choice,
+            guard,
+            subject,
+            unproven,
+        } = &d
+        else {
+            panic!("{:?}: expected a press, got {d:?}", level.approve);
+        };
+        assert_eq!(
+            (*rule_id, choice, unproven),
+            (RULE_LIMIT_RETRY, &Choice::Digit(1), &None)
+        );
+        assert_eq!(subject, "Keep trying (no reset named)");
+        let m = aterm_observe::row_matcher(guard).expect("compiles");
+        let hits: Vec<&String> = rows.iter().filter(|r| m.matches(r)).collect();
+        assert_eq!(hits, [&title_row], "the title's own row");
+        let other = title_row.replacen("gemini-3.5-flash.", "gemini-3.5-pro.  ", 1);
+        assert!(!m.matches(&other), "another model's dialog is judged again");
+
+        let off = ApprovalCtx {
+            limit_wait: false,
+            ..due.clone()
+        };
+        let d = decide_screen(Some("node"), &rows, &off).expect("a box");
+        assert_eq!(approved(&d), None, "{d:?}");
+        assert!(reason(&d).contains("limit_wait is off"), "{d:?}");
     }
 }
 
@@ -3830,8 +3868,8 @@ fn gemini_clis_usage_limit_is_never_pressed() {
 /// NEGATIVE CONTROLS: before the reset it is not pressed, and the reason
 /// names the reset; with `limit_wait` off it is a person's; the dialog with
 /// its options in another order is a person's; and the dialog that names no
-/// reset stays a person's with the clock due
-/// ([`gemini_clis_usage_limit_is_never_pressed`]).
+/// reset is pressed only at its ladder's due, guarded on its title
+/// ([`gemini_clis_usage_limit_with_no_reset_is_pressed_only_at_its_ladders_due`]).
 #[test]
 fn gemini_clis_usage_limit_with_its_reset_named_is_kept_trying_past_it() {
     let rows = phase_fixtures::screen(aterm_phase::gemini::fixtures::LIMIT_DIALOG_ACCOUNT);
@@ -3860,7 +3898,7 @@ fn gemini_clis_usage_limit_with_its_reset_named_is_kept_trying_past_it() {
             (*rule_id, choice, unproven),
             (RULE_LIMIT_RETRY, &Choice::Digit(1), &None)
         );
-        assert_eq!(subject, "Keep trying (reset 5:06 AM)");
+        assert_eq!(subject, "Keep trying (reset 5:06 AM PDT)");
         let m = aterm_observe::row_matcher(guard).expect("compiles");
         let hits: Vec<&String> = rows.iter().filter(|r| m.matches(r)).collect();
         assert_eq!(hits, [&reset_row], "the reset's own row");

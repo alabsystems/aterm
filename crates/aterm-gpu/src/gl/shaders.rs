@@ -8,6 +8,7 @@
 use crate::pipeline_table::ShaderLibrary;
 
 /// The GLSL twin of one library.
+#[inline]
 pub(crate) const fn source(library: ShaderLibrary) -> &'static str {
     match library {
         ShaderLibrary::Cell => include_str!("../../shaders/cell.glsl"),

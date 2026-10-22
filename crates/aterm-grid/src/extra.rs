@@ -85,6 +85,7 @@ impl ImageRef {
     /// Where this layer stacks among the images sharing its cell, lowest
     /// first ([`aterm_types::layer_order`]).
     #[must_use]
+    #[inline]
     pub fn draw_key(&self) -> (i32, u32, u32) {
         aterm_types::layer_order(self.image.z_index, self.kitty)
     }
@@ -151,13 +152,13 @@ impl CellExtra {
     #[must_use]
     #[inline]
     #[cfg(test)]
-    pub fn extended_flags(&self) -> u16 {
+    pub const fn extended_flags(&self) -> u16 {
         self.flags >> extra_flags::EXTENDED_SHIFT
     }
 
     /// Set extended flags (bits 3-15 of flags field).
     #[inline]
-    pub fn set_extended_flags(&mut self, ext_flags: u16) {
+    pub const fn set_extended_flags(&mut self, ext_flags: u16) {
         self.flags =
             (self.flags & extra_flags::COLOR_MASK) | (ext_flags << extra_flags::EXTENDED_SHIFT);
     }
@@ -216,7 +217,7 @@ impl CellExtra {
     /// Get a packed RGB color by array offset and presence flag.
     #[must_use]
     #[inline]
-    fn get_color(&self, offset: usize, flag: u16) -> Option<[u8; 3]> {
+    const fn get_color(&self, offset: usize, flag: u16) -> Option<[u8; 3]> {
         if self.flags & flag != 0 {
             Some([
                 self.colors[offset],
@@ -230,7 +231,7 @@ impl CellExtra {
 
     /// Set a packed RGB color by array offset and presence flag.
     #[inline]
-    fn set_color(&mut self, offset: usize, flag: u16, rgb: Option<[u8; 3]>) {
+    const fn set_color(&mut self, offset: usize, flag: u16, rgb: Option<[u8; 3]>) {
         match rgb {
             Some([r, g, b]) => {
                 self.colors[offset] = r;
@@ -247,13 +248,13 @@ impl CellExtra {
     /// Get the underline color as RGB.
     #[must_use]
     #[inline]
-    pub fn underline_color(&self) -> Option<[u8; 3]> {
+    pub const fn underline_color(&self) -> Option<[u8; 3]> {
         self.get_color(0, extra_flags::HAS_UNDERLINE_COLOR)
     }
 
     /// Set the underline color from RGB, clearing any indexed palette color.
     #[inline]
-    pub fn set_underline_color(&mut self, color: Option<[u8; 3]>) {
+    pub const fn set_underline_color(&mut self, color: Option<[u8; 3]>) {
         self.set_color(0, extra_flags::HAS_UNDERLINE_COLOR, color);
         self.underline_color_idx = None;
     }
@@ -266,7 +267,7 @@ impl CellExtra {
     ///   from the live palette at draw time so OSC 4 changes apply.
     /// - Other: treated as RGB.
     #[inline]
-    pub fn set_underline_color_u32(&mut self, color: Option<u32>) {
+    pub const fn set_underline_color_u32(&mut self, color: Option<u32>) {
         match color {
             Some(c) if (c >> 24) & 0xFF == 0x02 => {
                 let index = (c & 0xFF) as u8;
@@ -295,52 +296,54 @@ impl CellExtra {
     /// not flattened to RGB across either boundary.
     #[must_use]
     #[inline]
-    pub fn underline_color_u32(&self) -> Option<u32> {
+    pub const fn underline_color_u32(&self) -> Option<u32> {
         if let Some(index) = self.underline_color_idx {
-            return Some(0x02_00_00_00 | u32::from(index));
+            return Some(0x02_00_00_00 | (index as u32));
         }
-        let [r, g, b] = self.underline_color()?;
-        Some(0x01_00_00_00 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b))
+        let Some([r, g, b]) = self.underline_color() else {
+            return None;
+        };
+        Some(0x01_00_00_00 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32))
     }
 
     /// Whether the underline color is an indexed palette color, which the
     /// renderer resolves from the live palette.
     #[must_use]
     #[inline]
-    pub fn is_underline_color_indexed(&self) -> bool {
+    pub const fn is_underline_color_indexed(&self) -> bool {
         self.underline_color_idx.is_some()
     }
 
     /// Get the palette index of an indexed underline color.
     #[must_use]
     #[inline]
-    pub fn underline_color_index(&self) -> Option<u8> {
+    pub const fn underline_color_index(&self) -> Option<u8> {
         self.underline_color_idx
     }
 
     /// Get foreground RGB color.
     #[must_use]
     #[inline]
-    pub fn fg_rgb(&self) -> Option<[u8; 3]> {
+    pub const fn fg_rgb(&self) -> Option<[u8; 3]> {
         self.get_color(3, extra_flags::HAS_FG_RGB)
     }
 
     /// Set foreground RGB color.
     #[inline]
-    pub fn set_fg_rgb(&mut self, rgb: Option<[u8; 3]>) {
+    pub const fn set_fg_rgb(&mut self, rgb: Option<[u8; 3]>) {
         self.set_color(3, extra_flags::HAS_FG_RGB, rgb);
     }
 
     /// Get background RGB color.
     #[must_use]
     #[inline]
-    pub fn bg_rgb(&self) -> Option<[u8; 3]> {
+    pub const fn bg_rgb(&self) -> Option<[u8; 3]> {
         self.get_color(6, extra_flags::HAS_BG_RGB)
     }
 
     /// Set background RGB color.
     #[inline]
-    pub fn set_bg_rgb(&mut self, rgb: Option<[u8; 3]>) {
+    pub const fn set_bg_rgb(&mut self, rgb: Option<[u8; 3]>) {
         self.set_color(6, extra_flags::HAS_BG_RGB, rgb);
     }
 
@@ -576,7 +579,7 @@ pub fn underline_color_sgr(packed: u32) -> String {
 #[cfg(any(test, debug_assertions))]
 #[must_use]
 #[inline]
-pub fn is_combining_mark(c: char) -> bool {
+pub const fn is_combining_mark(c: char) -> bool {
     matches!(c,
         '\u{0300}'..='\u{036F}' |  // Combining Diacritical Marks
         '\u{1AB0}'..='\u{1AFF}' |  // Combining Diacritical Marks Extended

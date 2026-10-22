@@ -334,11 +334,12 @@ impl Shared {
     }
 
     /// The newest snapshot's jobs view and when that snapshot landed,
-    /// without pulling (`brief`'s jobs line).
-    pub(crate) fn jobs_view(&self) -> Option<(Arc<aterm_vitals::jobs::JobsView>, Instant)> {
+    /// without pulling (`brief`'s jobs line), and whether its reader runs
+    /// (the probe thread's sender is installed: the quit takes it back).
+    pub(crate) fn jobs_view(&self) -> Option<(Arc<aterm_vitals::jobs::JobsView>, Instant, bool)> {
         let g = self.lock();
         let h = g.held.as_ref()?;
-        Some((Arc::clone(h.snap.jobs.as_ref()?), h.at))
+        Some((Arc::clone(h.snap.jobs.as_ref()?), h.at, g.tx.is_some()))
     }
 
     /// The layout and the machine's words.
@@ -1341,21 +1342,27 @@ pub(crate) fn job_event_payload(
     out
 }
 
-/// The jobs view that may speak for now, from where it was read: one at most
-/// [`crate::vitals_jobs::JOBS_FRESH`] old.
+/// The jobs view that may speak for now, from when it was read and whether
+/// its reader runs (`reader`): one at most [`crate::vitals_jobs::JOBS_FRESH`]
+/// old, or a parked one while its reader runs
+/// ([`crate::vitals_jobs::speaks_for_now`]).
 fn fresh_jobs(
     view: Option<(Arc<aterm_vitals::jobs::JobsView>, Instant)>,
     now: Instant,
+    reader: bool,
 ) -> Option<Arc<aterm_vitals::jobs::JobsView>> {
-    view.filter(|(_, at)| now.saturating_duration_since(*at) <= crate::vitals_jobs::JOBS_FRESH)
-        .map(|(v, _)| v)
+    view.filter(|(v, at)| {
+        crate::vitals_jobs::speaks_for_now(v, now.saturating_duration_since(*at), reader)
+    })
+    .map(|(v, _)| v)
 }
 
 /// `brief`'s jobs line for `session` (`jobs 2 jobs · 1 running · 1 stuck ·
 /// worst: …`), from the workers' copy without pulling; `None` when no fresh
 /// view says the session has a live job.
 pub(crate) fn brief_jobs_line(session: u64) -> Option<String> {
-    let view = fresh_jobs(SYS.jobs_view(), Instant::now())?;
+    let (view, at, reader) = SYS.jobs_view()?;
+    let view = fresh_jobs(Some((view, at)), Instant::now(), reader)?;
     aterm_vitals::sys::jobs_view::brief_line(&view, &[session])
 }
 
@@ -1402,8 +1409,9 @@ pub(crate) fn splice_brief_line(text: &str, line: &str, budget: usize) -> String
 impl crate::App {
     /// `status`'s `job=<verdict|none|-> job_quiet_ms=<ms|->` for `session`:
     /// its worst live job in the snapshot the loop adopted, when that is at
-    /// most [`crate::vitals_jobs::JOBS_FRESH`] old (`-` otherwise: nothing
-    /// read lately speaks for now). No lock, no I/O.
+    /// most [`crate::vitals_jobs::JOBS_FRESH`] old, or parked while the probe
+    /// thread runs (`-` otherwise: nothing read lately speaks for now). No
+    /// lock, no I/O.
     pub(crate) fn status_job_fields(&self, session: u64) -> String {
         let now = Instant::now();
         let view = self
@@ -1415,7 +1423,7 @@ impl crate::App {
         let age_ms = self.vitals.adopted_at.map_or(0, |at| {
             u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
         });
-        let view = fresh_jobs(view, now);
+        let view = fresh_jobs(view, now, self.vitals.reader_runs());
         aterm_vitals::sys::jobs_view::status_fields(view.as_deref(), &[session], age_ms)
     }
 }

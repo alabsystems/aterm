@@ -324,6 +324,100 @@ fn fx_occluders_compose_over_the_paste_banner_and_the_link_caption() {
     assert_chrome_cuts_the_light(&mut app, wid, &[banner, caption]);
 }
 
+/// A composer top line's mark (`aterm_effects::cli_marks`) laid over frame
+/// cell `(row, col)` as the footer lays it (`claude_footer::mark_layer`): the
+/// CLI's sprite in the Over slot, in grid space, at `(col·cw, row·ch)`.
+fn top_mark(app: &App, wid: WindowId, id: u64, (row, col): (usize, usize)) -> FxLayer {
+    use aterm_effects::cli_marks::{self, CliMark};
+    let (cw, ch) = app.win_cell_size(wid);
+    let side = |v: usize| u16::try_from(v).expect("a cell is small");
+    let fit = cli_marks::fit(CliMark::Claude, side(cw), side(ch)).expect("the mark fits the cell");
+    let px = |v: usize| i32::try_from(v).expect("a test frame is small");
+    cli_marks::layer(
+        id,
+        cli_marks::content(CliMark::Claude, fit, 0x0000_0000),
+        (px(col * cw), px(row * ch)),
+        PxRect::EVERYWHERE,
+    )
+}
+
+/// THE MARK IS CUT LIKE ANY LIGHT (spec §6.8): a top line's mark sprite in
+/// the Over slot, laid on the paste question's row and on the link
+/// caption's, draws nothing inside either band — each keeps the pixels it
+/// has without the mark — while the same mark on a row neither covers draws.
+///
+/// NEGATIVE CONTROL: with no occluder the marks land on both bands.
+#[test]
+fn fx_occluders_cut_a_top_line_mark_under_the_paste_banner_and_the_link_caption() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    feed(&app, wid, LINK);
+    hover(&mut app, wid, LINK_CELL);
+    ask_paste(&mut app, wid);
+    fill(&mut app, wid);
+    let banner = trace_splice(&mut app, wid, "paste banner", Shape::Band, |app| {
+        app.splice_paste_banner(wid);
+    });
+    let caption = trace_splice(&mut app, wid, "link caption", Shape::Band, |app| {
+        app.splice_link_target(wid);
+    });
+    let (_, ch) = app.win_cell_size(wid);
+    let grid_top = app.win_pad_top(wid) + app.win_head(wid);
+    let row_of = |y: i32| (usize::try_from(y).expect("on the frame") - grid_top) / ch;
+    let (banner_row, caption_row) = (row_of(banner.px.y0), row_of(caption.px.y0));
+    let free_row = (banner_row..caption_row)
+        .find(|&r| {
+            let y = i32::try_from(grid_top + r * ch).expect("small");
+            y >= banner.px.y1 && y + i32::try_from(ch).expect("small") <= caption.px.y0
+        })
+        .expect("a row between the bands");
+    let px = |v: usize| i32::try_from(v).expect("a test frame is small");
+    let free = PxRect::new(
+        i32::MIN,
+        px(grid_top + free_row * ch),
+        i32::MAX,
+        px(grid_top + (free_row + 1) * ch),
+    );
+    let marks = [
+        top_mark(&app, wid, 11, (banner_row, 3)),
+        top_mark(&app, wid, 12, (caption_row, 3)),
+        top_mark(&app, wid, 13, (free_row, 3)),
+    ];
+    let input: RenderInput = app.windows[&wid].input_scratch.clone();
+    assert!(input.fx_layers.is_empty(), "the fixture carries no light");
+    let cuts = input.fx_occluders.clone();
+    assert!(cuts.len() >= 2, "both bands cut: {cuts:?}");
+    let r = renderer(&mut app, wid);
+    let mut render = |layers: &[FxLayer], occluders: &[PxRect]| {
+        let mut frame = input.clone();
+        frame.fx_layers = layers.to_vec();
+        frame.fx_occluders = occluders.to_vec();
+        r.render_input(&frame)
+    };
+    let bare = render(&[], &cuts);
+    let lit = render(&marks, &cuts);
+    for b in [banner, caption] {
+        assert_eq!(
+            diff_in(&lit, &bare, b.px),
+            0,
+            "{}: the mark is cut from the band",
+            b.name
+        );
+    }
+    assert!(
+        diff_in(&lit, &bare, free) > 0,
+        "the mark draws on a row no band covers"
+    );
+    let uncut = render(&marks, &[]);
+    for b in [banner, caption] {
+        assert!(
+            diff_in(&uncut, &bare, b.px) > 0,
+            "CONTROL: with no occluder the mark lands on {}",
+            b.name
+        );
+    }
+}
+
 /// A band and a card: the paste question, then the tab menu hanging under
 /// the strip over it (the caption yields to an open menu).
 #[test]

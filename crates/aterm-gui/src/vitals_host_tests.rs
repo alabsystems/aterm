@@ -1415,11 +1415,11 @@ fn output_with_no_window_reads_and_never_faster_than_the_floor() {
     let t0 = Instant::now();
     app.service_vitals(t0);
     assert_eq!(asked(&rx), 0, "no output: nothing is read");
-    app.vitals.note_output();
+    app.vitals.note_edge();
     assert_eq!(app.vitals.edge_at(t0), Some(t0));
     app.service_vitals(t0);
     assert_eq!(asked(&rx), 1, "an edge: one reading");
-    app.vitals.note_output();
+    app.vitals.note_edge();
     app.service_vitals(t0 + Duration::from_millis(500));
     assert_eq!(asked(&rx), 0, "within the floor: nothing more");
     assert_eq!(app.vitals.edge_at(t0), Some(t0 + JOBS_FLOOR));
@@ -1431,7 +1431,7 @@ fn output_with_no_window_reads_and_never_faster_than_the_floor() {
     land(&app, 1, Vec::new(), Demand::Idle);
     app.on_vitals_wake();
     assert_eq!(app.vitals_deadline(), None, "an idle view: nothing due");
-    app.vitals.note_output();
+    app.vitals.note_edge();
     app.service_vitals(t0 + 3 * JOBS_FLOOR);
     assert_eq!(asked(&rx), 1, "output reads");
 }
@@ -1451,7 +1451,7 @@ fn a_job_with_no_window_is_read_until_it_ends_and_its_end_is_announced() {
     let mut app = crate::App::headless_for_test();
     let rx = with_reader(&mut app, &BOARD);
     let t0 = Instant::now();
-    app.vitals.note_output();
+    app.vitals.note_edge();
     app.service_vitals(t0);
     assert_eq!(asked(&rx), 1, "the typed command's output reads");
     let job = |verdict, class| JobRow {
@@ -1514,6 +1514,663 @@ fn a_job_with_no_window_is_read_until_it_ends_and_its_end_is_announced() {
     };
     assert_eq!(recorded, ["exited job=j41 class=exited rev=1 code=0"]);
     assert_eq!(app.vitals_deadline(), None, "nothing live: nothing due");
+}
+
+/// OUTPUT IS SERVED IN ITS OWN WAKE: with no window, the output wake's edge
+/// is asked right there, so it arms no deadline (left to the next turn, the
+/// loop's deadline at now fires a `system_vitals` timer wake for every write
+/// a program makes at rest). NEGATIVE CONTROL: output within the floor asks
+/// nothing and leaves the owed reading on the deadline at the floor.
+#[test]
+fn output_with_no_window_is_read_in_its_own_wake_and_arms_nothing() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    let t0 = Instant::now();
+    land(&app, 1, Vec::new(), Demand::Idle);
+    app.on_vitals_wake();
+    app.service_vitals(t0);
+    assert_eq!(asked(&rx), 0, "parked: nothing is read");
+    app.on_output_wake(0, t0);
+    assert_eq!(asked(&rx), 1, "the output's reading, in its wake");
+    assert_eq!(app.vitals_deadline(), None, "and nothing armed for it");
+    app.on_output_wake(0, t0 + Duration::from_millis(500));
+    assert_eq!(asked(&rx), 0, "within the floor: owed");
+    assert_eq!(app.vitals.edge_at(t0), Some(t0 + JOBS_FLOOR));
+}
+
+/// THE KERNEL EDGE (module docs, [`ProcEdge`]): with no window, the loop
+/// arms the latch; a session's process event (a fork, an `exec`, an exit)
+/// posts the loop one wake, and the loop takes it as an edge even with the
+/// held view parked: one whole reading the engine must look at (`jobs_now`),
+/// where output alone misses a job forked after its echo or started with no
+/// output. Another event before that reading is asked posts nothing more;
+/// the latch is armed again once it is, and an event then owes a reading at
+/// the floor, during which further events post nothing. NEGATIVE CONTROLS:
+/// parked with no event, nothing is read or armed; a window showing the bars
+/// leaves the latch disarmed (its cadence reads).
+#[test]
+fn a_process_event_with_no_window_asks_one_reading_the_engine_looks_at() {
+    use std::sync::atomic::AtomicUsize;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    let posts = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&posts);
+    app.vitals.proc_edge.install(move || {
+        counted.fetch_add(1, Ordering::AcqRel);
+    });
+    let t0 = Instant::now();
+    land(&app, 1, Vec::new(), Demand::Idle);
+    app.on_vitals_wake();
+    app.service_vitals(t0);
+    assert_eq!(asked(&rx), 0, "parked, no event: nothing is read");
+    assert_eq!(app.vitals_deadline(), None, "nothing armed at rest");
+
+    assert!(app.vitals.proc_edge.heard(), "armed: the event posts");
+    assert!(!app.vitals.proc_edge.heard(), "one wake an edge");
+    assert_eq!(posts.load(Ordering::Acquire), 1);
+    app.service_vitals(t0);
+    let req = read_req(&rx, "the kernel edge's reading");
+    assert!(req.jobs_now, "the engine looks at the edge's reading");
+
+    assert!(
+        app.vitals.proc_edge.heard(),
+        "armed again once that reading was asked"
+    );
+    app.service_vitals(t0 + Duration::from_millis(500));
+    assert_eq!(asked(&rx), 0, "within the floor: owed");
+    assert!(!app.vitals.proc_edge.heard(), "a reading owed: disarmed");
+    assert_eq!(app.vitals.edge_at(t0), Some(t0 + JOBS_FLOOR));
+    app.service_vitals(t0 + JOBS_FLOOR);
+    assert!(read_req(&rx, "the owed reading").jobs_now);
+    assert_eq!(posts.load(Ordering::Acquire), 2);
+
+    app.vitals.windowed = true;
+    app.vitals.arm_proc_edge();
+    assert!(!app.vitals.proc_edge.heard(), "the bars read: disarmed");
+}
+
+/// A whole reading with no window (here the disk watch's look) is one the
+/// engine looks at. NEGATIVE CONTROL: the bars' readings keep the engine's
+/// own cadence (a worker's pull too:
+/// `a_pull_reads_whole_and_the_quit_takes_the_workers_sender_back`).
+#[test]
+fn only_a_windowless_whole_reading_makes_the_engine_look() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    let t0 = Instant::now();
+    app.vitals.disk_pull = true;
+    app.serve_windowless_vitals(Audience::None, t0, false);
+    assert!(read_req(&rx, "the disk look's reading").jobs_now);
+    app.ask_reading(t0, FOCUSED_PERIOD, false, false);
+    assert!(!read_req(&rx, "the bars' reading").jobs_now);
+}
+
+/// A job at rest on a real terminal. An in-place helper owns and reaps the
+/// job, as its shell would. Closing `stop` tells it to end the job BEFORE it
+/// exits; the parent never kills the process that must reap it. Every owned
+/// resource is guarded before readiness (including a failed constructor).
+#[cfg(target_os = "macos")]
+struct JobAtRest {
+    master: Option<std::os::fd::OwnedFd>,
+    leader: Option<aterm_uds::spawnfd::Child>,
+    stop: Option<std::io::PipeWriter>,
+    stdout: Option<std::process::ChildStdout>,
+    said: String,
+    eof: bool,
+    job: Option<i32>,
+    ended: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl JobAtRest {
+    fn new(raw: bool) -> Self {
+        Self::starting(raw, |_| {})
+    }
+
+    /// The failure seam runs only after custody is armed, before the
+    /// constructor hands that custody to its caller.
+    fn starting(raw: bool, before_ready: impl FnOnce(&mut Self)) -> Self {
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+        let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+        // SAFETY: both fresh descriptors are transferred to their only
+        // owners before any assertion or other fallible setup.
+        let master = unsafe { OwnedFd::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        if raw {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: this test owns the live PTY and local termios.
+            unsafe {
+                let mut t: libc::termios = std::mem::zeroed();
+                assert_eq!(libc::tcgetattr(master.as_raw_fd(), &mut t), 0, "tcgetattr");
+                t.c_lflag &= !(libc::ICANON | libc::ECHO);
+                assert_eq!(
+                    libc::tcsetattr(master.as_raw_fd(), libc::TCSANOW, &t),
+                    0,
+                    "tcsetattr"
+                );
+            }
+        }
+        let (stop_read, stop) = std::io::pipe().expect("stop pipe");
+        let module = module_path!().split_once("::").expect("crate and module").1;
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test image"));
+        cmd.args([
+            "--exact",
+            &format!("{module}::job_at_rest_leader"),
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("ATERM_TEST_VITALS_JOB_LEADER", "1")
+        .setsid(true)
+        .stdin(slave)
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        // fd 2 is the private stop channel, not a diagnostic stream. The
+        // helper's job gets only the PTY, never this channel or stdout.
+        .stderr(stop_read);
+        let mut leader = cmd.spawn().expect("spawn the session leader");
+        let stdout = leader.stdout.take();
+        let mut guard = Self {
+            master: Some(master),
+            leader: Some(leader),
+            stop: Some(stop),
+            stdout,
+            said: String::new(),
+            eof: false,
+            job: None,
+            ended: false,
+        };
+        before_ready(&mut guard);
+        guard.ready();
+        guard
+    }
+
+    fn master(&self) -> i32 {
+        use std::os::fd::AsRawFd as _;
+        self.master.as_ref().expect("owned master").as_raw_fd()
+    }
+
+    fn message(&self, name: &str) -> Option<i32> {
+        self.said
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.parse().ok())
+    }
+
+    /// Drain only immediately readable bytes; `eof` means read returned 0,
+    /// never that the helper merely exited or its output was quiet.
+    fn drain(&mut self) -> std::io::Result<()> {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        let stdout = self.stdout.as_mut().expect("helper's stdout");
+        while !self.eof {
+            let mut p = libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll reads and fills this one owned descriptor's slot.
+            let n = unsafe { libc::poll(&mut p, 1, 0) };
+            if n == 0 {
+                break;
+            }
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            let mut bytes = [0; 512];
+            match stdout.read(&mut bytes) {
+                Ok(0) => self.eof = true,
+                Ok(n) => self.said.push_str(&String::from_utf8_lossy(&bytes[..n])),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    fn ready(&mut self) {
+        let leader = self.leader.as_ref().expect("owned leader").id();
+        self.job = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(10),
+            || {
+                self.drain().expect("read the helper");
+                let job = self.message("VITALS_JOB_READY ")?;
+                (crate::quit_safety::foreground_pgrp(self.master()) == job
+                    && aterm_uds::process::read_process_parent(job) == Some(leader))
+                .then_some(job)
+            },
+        );
+        assert!(
+            self.job.is_some(),
+            "the owned job leads the foreground: {}",
+            self.said
+        );
+    }
+
+    fn stop(&mut self) -> bool {
+        if self.ended {
+            return true;
+        }
+        drop(self.stop.take());
+        let ended = aterm_spec::wait::within(
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::from_millis(10),
+            || {
+                self.drain().ok()?;
+                let status = self.leader.as_mut()?.try_wait().ok()??;
+                (self.eof
+                    && status.success()
+                    && self
+                        .message("VITALS_JOB_REAPED ")
+                        .is_some_and(|pid| self.job.is_none_or(|j| j == pid)))
+                .then_some(())
+            },
+        );
+        self.ended = ended.is_some();
+        self.ended
+    }
+
+    /// A test App whose sink borrows the master. Its session's own master
+    /// stays the stub's -1, so App's drop signals nothing.
+    fn app(&self, board: &'static JobsBoard) -> (crate::App, Receiver<Msg>) {
+        let sink = Arc::new(aterm_session::sink::SinkWriter::new(self.master()));
+        let mut app = crate::App::headless_for_test_with_sink(sink);
+        app.pool.sessions.get_mut(&0).expect("tab 0").session.pid =
+            i32::try_from(self.leader.as_ref().expect("owned leader").id()).expect("pid");
+        let rx = with_reader(&mut app, board);
+        (app, rx)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for JobAtRest {
+    fn drop(&mut self) {
+        if !self.stop() {
+            // Do not kill the reaping parent, close its terminal or make its
+            // completion write hit a closed pipe while custody is unknown.
+            eprintln!(
+                "retaining vitals helper {:?}, master and stdout: {}",
+                self.leader.as_ref().map(|c| c.id()),
+                self.said
+            );
+            std::mem::forget(self.leader.take());
+            std::mem::forget(self.master.take());
+            std::mem::forget(self.stdout.take());
+            if !std::thread::panicking() {
+                panic!("vitals fixture cleanup was not confirmed; handles retained");
+            }
+        }
+    }
+}
+
+/// Only the owned helper reexec runs this body. It owns the unreaped job's
+/// handle, so signals never adopt an arbitrary foreground pid/group.
+#[cfg(target_os = "macos")]
+#[test]
+fn job_at_rest_leader() {
+    use std::io::Write as _;
+    use std::os::fd::BorrowedFd;
+    if std::env::var_os("ATERM_TEST_VITALS_JOB_LEADER").as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return;
+    }
+    // SAFETY: this helper is a new session; fd 0 is its explicitly handed
+    // slave. It alone changes its signal policy and controlling terminal.
+    unsafe {
+        assert_eq!(
+            libc::ioctl(0, libc::TIOCSCTTY as _, 0),
+            0,
+            "controlling terminal"
+        );
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+    }
+    // SAFETY: the live slave at 0 is borrowed, never transferred away.
+    let slave = unsafe { BorrowedFd::borrow_raw(0) };
+    let mut cmd = aterm_uds::spawnfd::command("/bin/sleep");
+    cmd.arg(aterm_spec::wait::PARKED_SECS.to_string())
+        .process_group(0)
+        .stdin(slave.try_clone_to_owned().expect("dup slave"))
+        .stdout(slave.try_clone_to_owned().expect("dup slave"))
+        .stderr(slave.try_clone_to_owned().expect("dup slave"));
+    struct Job(aterm_uds::spawnfd::Child);
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // The child remains this handle's unreaped child; even a child
+            // that exited already retains its pid until this wait collects it.
+            let _ = self.0.kill();
+            let reaped = aterm_spec::wait::within(
+                aterm_spec::wait::MUST_HAPPEN,
+                Duration::from_millis(10),
+                || self.0.try_wait().ok().flatten(),
+            );
+            if reaped.is_none() {
+                // The outer test has a bounded cleanup and retains this
+                // helper on failure. Keep its reaping custody until the
+                // child actually ends, rather than orphaning it to exit.
+                loop {
+                    if self.0.try_wait().ok().flatten().is_some() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            if self.0.try_wait().ok().flatten().is_some() {
+                println!("\nVITALS_JOB_REAPED {}", self.0.id());
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
+    let job = Job(cmd.spawn().expect("spawn the owned job"));
+    let pid = i32::try_from(job.0.id()).expect("pid");
+    // SAFETY: this session owns the live slave and its own child group.
+    assert_eq!(unsafe { libc::tcsetpgrp(0, pid) }, 0, "foreground job");
+    println!("\nVITALS_JOB_READY {pid}");
+    std::io::stdout().flush().expect("ready written");
+    let mut p = libc::pollfd {
+        fd: 2,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let until = Instant::now() + Duration::from_secs(aterm_spec::wait::PARKED_SECS);
+    loop {
+        let left = i32::try_from(until.saturating_duration_since(Instant::now()).as_millis())
+            .expect("small");
+        // SAFETY: fd 2 is the parent's explicitly handed stop pipe. EOF
+        // ends the fixture; the timeout is only its fallback parked life.
+        if unsafe { libc::poll(&mut p, 1, left) } >= 0
+            || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+        {
+            break;
+        }
+    }
+    drop(job);
+}
+
+/// THE PROBE THREAD'S PART, ON THIS MACHINE: drive `app`, no window in
+/// view, through 20 s of its clock in the loop's 100 ms turns. Each reading
+/// it asks is read here as the thread reads one, through the thread's own
+/// step ([`jobs_step`], which [`Reader::read`] takes): this machine's
+/// process table, the request as the loop built it (its words emptied when
+/// `words` is false: main's host built none), and the stuck engine at the
+/// turn's clock; its view lands as the thread's snapshot does, for the next
+/// turn to adopt. The job's screen came first: its output asks the edge's
+/// reading. The instants (ms into the 20 s) of the readings asked, each one
+/// main thread wake and one `system_vitals` fire in the product.
+#[cfg(target_os = "macos")]
+fn readings_at_rest(app: &mut crate::App, rx: &Receiver<Msg>, words: bool) -> Vec<u64> {
+    let t0 = Instant::now();
+    let mut pass = crate::vitals_jobs::JobsPass::new();
+    let mut asked = Vec::new();
+    app.vitals.note_edge();
+    for turn in 0..=200_u64 {
+        let ms = turn * 100;
+        let now = t0 + Duration::from_millis(ms);
+        app.adopt_vitals(Audience::None, now, false);
+        app.serve_windowless_vitals(Audience::None, now, false);
+        for msg in rx.try_iter() {
+            let Msg::Read(mut req) = msg else {
+                continue;
+            };
+            asked.push(ms);
+            if !words {
+                req.ttys.clear();
+            }
+            let sweep = aterm_sysprobe::processes().expect("this machine's process table");
+            // The engine's clock: the turn's, past zero.
+            let jobs = jobs_step(&mut pass, 1_000 + ms, Some(&sweep.procs), &req, false);
+            app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
+                seq: u64::try_from(asked.len()).expect("few"),
+                jobs,
+                ..Snapshot::default()
+            }));
+        }
+    }
+    asked
+}
+
+/// The wait the held view names for tab 0's job, and its demand.
+#[cfg(target_os = "macos")]
+fn held_wait(app: &crate::App) -> (Option<aterm_vitals::jobs::WaitName>, Demand) {
+    let view = app
+        .vitals
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.jobs.clone())
+        .expect("a jobs view");
+    let wait = view
+        .rows
+        .iter()
+        .find(|r| r.tab == 0 && r.verdict != aterm_vitals::jobs::Verdict::Exited)
+        .and_then(|r| r.wait.as_ref().map(|w| w.name));
+    (wait, view.demand)
+}
+
+/// A PROGRAM WAITING FOR THE PERSON AT ITS PROMPT ARMS NOTHING WITH NO
+/// WINDOW (design §6.1, "What arms nothing"; forever land's END, which saw 9
+/// to 10 timer wakes in its 20 s at rest on main, each a `system_vitals`
+/// fire, for Claude Code 2.1.306 and 2.1.307 and Gemini CLI): a raw program
+/// at rest on a real terminal, read through the probe thread's own step by
+/// the real engine on this machine's process table, is named `tty-raw` from
+/// the terminal word the loop hands it, and after the edge's reading nothing
+/// more is read in the 20 s. NEGATIVE CONTROL, main's request (no word): the
+/// same program reads as an unnamed wait, suspect, and the engine's demand
+/// reads it every 2 s to the end of this model's 20 s (its 100 ms turns put
+/// the readings 2.1 s apart, ten of them; END's own window saw 9 or 10).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_raw_program_at_its_prompt_is_read_once_and_then_arms_nothing() {
+    use aterm_vitals::jobs::WaitName;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let job = JobAtRest::new(true);
+    let (mut app, rx) = job.app(&BOARD);
+    let asked = readings_at_rest(&mut app, &rx, true);
+    assert_eq!(held_wait(&app), (Some(WaitName::TtyRaw), Demand::Idle));
+    assert!(
+        asked.iter().all(|ms| *ms < 5_000),
+        "after the edge, nothing at rest: {asked:?}"
+    );
+    assert_eq!(app.vitals_deadline(), None, "nothing armed at rest");
+
+    static MAIN: JobsBoard = JobsBoard::new();
+    let (mut app, rx) = job.app(&MAIN);
+    let asked = readings_at_rest(&mut app, &rx, false);
+    assert_eq!(held_wait(&app), (Some(WaitName::Unnamed), Demand::Fast));
+    assert!(
+        asked.len() >= 10 && asked.last().is_some_and(|ms| *ms >= 18_000),
+        "no word: read every 2 s to the end: {asked:?}"
+    );
+}
+
+/// The word silences only a person's own wait: a job that keeps the
+/// terminal canonical with echo (`sleep` typed at a prompt) names no tty
+/// wait from it, stays suspect (unnamed, §11.5), and is read every 2 s with
+/// no window, word or no word (§6.1 kind 3).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_canonical_job_at_rest_is_still_read_at_the_engines_cadence() {
+    use aterm_vitals::jobs::WaitName;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let job = JobAtRest::new(false);
+    let (mut app, rx) = job.app(&BOARD);
+    let asked = readings_at_rest(&mut app, &rx, true);
+    assert_eq!(held_wait(&app), (Some(WaitName::Unnamed), Demand::Fast));
+    assert!(
+        asked.len() >= 10 && asked.last().is_some_and(|ms| *ms >= 18_000),
+        "a suspect job is read to the end: {asked:?}"
+    );
+}
+
+/// THE WORD'S FRESHNESS (§6.6): read through the sink, it holds for the
+/// engine until the session's next output, and is stamped at the tick that
+/// uses it. NEGATIVE CONTROLS: output after the read leaves it unused; a
+/// key typed and left unread, and a master that is no terminal, give none.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_terminal_word_holds_until_output_and_never_over_an_unread_key() {
+    // Construction can fail AFTER both processes exist, before its caller
+    // receives the guard. The already-armed guard must still let the leader
+    // reap its own job, then reap the leader, even while unwinding.
+    let mut failed = None;
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = JobAtRest::starting(true, |guard| {
+            guard.ready();
+            let leader = i32::try_from(guard.leader.as_ref().expect("leader").id()).expect("pid");
+            let job = guard.job.expect("ready job");
+            failed = Some([
+                (
+                    leader,
+                    aterm_uds::process::read_process_start(leader).expect("leader start"),
+                ),
+                (
+                    job,
+                    aterm_uds::process::read_process_start(job).expect("job start"),
+                ),
+            ]);
+            panic!("injected failure before constructor admission");
+        });
+    }));
+    assert!(failure.is_err(), "the failure seam ran");
+    for (pid, start) in failed.expect("both original identities captured") {
+        assert_ne!(
+            aterm_uds::process::read_process_start(pid),
+            Some(start),
+            "original process {pid} survived failed construction"
+        );
+    }
+
+    let mut job = JobAtRest::new(true);
+    let sink = aterm_session::sink::SinkWriter::new(job.master());
+    let output = Arc::new(AtomicU64::new(5));
+    let word = TtyWord::read(3, &sink, &output).expect("a terminal's word");
+    assert_eq!((word.key, word.canonical, word.echo), (3, false, false));
+    assert_eq!(
+        word.current(40)
+            .map(|(key, m)| (key, m.canonical, m.echo, m.stamped_ms)),
+        Some((3, false, false, 40))
+    );
+    output.store(6, Ordering::Release);
+    assert_eq!(word.current(41), None, "output since the read: no word");
+
+    // SAFETY: writes one byte of a local buffer to this test's master.
+    let n = unsafe { libc::write(job.master(), b"x".as_ptr().cast(), 1) };
+    assert_eq!(n, 1, "typed");
+    aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(10),
+        || aterm_pty::input_queue_len(job.master()).filter(|n| *n > 0),
+    )
+    .expect("the key waits unread");
+    assert!(
+        TtyWord::read(3, &sink, &output).is_none(),
+        "a key unread: no word"
+    );
+    let none = aterm_session::sink::SinkWriter::new(-1);
+    assert!(
+        TtyWord::read(3, &none, &output).is_none(),
+        "no terminal: no word"
+    );
+    assert!(
+        job.stop(),
+        "the parent reaped its job, the leader was reaped and stdout reached EOF: {}",
+        job.said
+    );
+}
+
+/// The wait a whole [`Reader::read`] of `req`, by a fresh reader (as the
+/// probe thread reads one, and a worker's pull with the request it holds),
+/// names for tab 0's live job, and the engine's demand.
+#[cfg(target_os = "macos")]
+fn read_wait(req: &Request) -> (Option<aterm_vitals::jobs::WaitName>, Demand) {
+    let snap = Reader::new(Arc::default()).read(req);
+    let view = snap.jobs.expect("a jobs view");
+    let wait = view
+        .rows
+        .iter()
+        .find(|r| r.tab == 0 && r.verdict != aterm_vitals::jobs::Verdict::Exited)
+        .and_then(|r| r.wait.as_ref().map(|w| w.name));
+    (wait, view.demand)
+}
+
+/// THE PROBE THREAD'S WHOLE READING NAMES A RAW PROGRAM FROM THE LOOP'S
+/// WORD: one [`Reader::read`] of the request the loop builds for a raw
+/// program at rest names it `tty-raw` and parks the engine. NEGATIVE
+/// CONTROL: the same request read after the session printed (its own output
+/// stamp moved, the one the loop bound the word to) names the wait unnamed,
+/// suspect, read at the fast cadence.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_readers_whole_reading_names_a_raw_program_from_the_loops_word() {
+    use aterm_vitals::jobs::WaitName;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let job = JobAtRest::new(true);
+    let (app, _rx) = job.app(&BOARD);
+    let req = app.vitals_request(Duration::ZERO, false);
+    assert_eq!(
+        req.ttys.iter().map(|w| w.key).collect::<Vec<_>>(),
+        [0],
+        "tab 0's word"
+    );
+    assert_eq!(read_wait(&req), (Some(WaitName::TtyRaw), Demand::Idle));
+    app.pool
+        .get(0)
+        .expect("tab 0")
+        .latest_output_activity_ns
+        .fetch_add(1, Ordering::AcqRel);
+    assert_eq!(read_wait(&req), (Some(WaitName::Unnamed), Demand::Fast));
+}
+
+/// A KEY DRIVEN AFTER THE WORD WAS READ VOIDS IT (§11.5: the tty names need
+/// an empty queue): a key typed into the session's own sink, which the raw
+/// program leaves unread and answers with nothing, and a worker's pull,
+/// which reads with the request the thread last held, names the wait
+/// unnamed, never `tty-raw` over that key. NEGATIVE CONTROL: the same held
+/// request before the key names `tty-raw`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_key_driven_after_the_word_was_read_voids_it_for_a_pull() {
+    use aterm_vitals::jobs::WaitName;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let job = JobAtRest::new(true);
+    let (app, _rx) = job.app(&BOARD);
+    let held = app.vitals_request(Duration::ZERO, false);
+    assert!(held.ttys[0].current(1).is_some(), "the word holds");
+    assert_eq!(read_wait(&held), (Some(WaitName::TtyRaw), Demand::Idle));
+    let sink = Arc::clone(&app.pool.get(0).expect("tab 0").ctx.sink);
+    assert_eq!(sink.write_frame(b"k").expect("typed"), 1);
+    aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(10),
+        || aterm_pty::input_queue_len(job.master()).filter(|n| *n > 0),
+    )
+    .expect("the key waits unread");
+    assert_eq!(held.ttys[0].current(2), None, "a key since: no word");
+    assert_eq!(read_wait(&held), (Some(WaitName::Unnamed), Demand::Fast));
+}
+
+/// THE WORD TAKES ITS STAMPS BEFORE IT READS THE TERMINAL (§6.6): output
+/// that lands between them and the `tcgetattr` leaves the word unused.
+/// NEGATIVE CONTROL: output before the read is the word's own (the read saw
+/// it), and the word holds.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_word_takes_its_stamps_before_it_reads_the_terminal() {
+    let job = JobAtRest::new(true);
+    let sink = aterm_session::sink::SinkWriter::new(job.master());
+    let output = Arc::new(AtomicU64::new(5));
+    let word = TtyWord::read_seamed(3, &sink, &output, || {
+        output.fetch_add(1, Ordering::AcqRel);
+    })
+    .expect("a terminal's word");
+    assert_eq!(word.current(9), None, "output mid-read: unused");
+    output.fetch_add(1, Ordering::AcqRel);
+    let word = TtyWord::read_seamed(3, &sink, &output, || {}).expect("a terminal's word");
+    assert!(word.current(9).is_some(), "output before the read: its own");
 }
 
 /// A cold pull's unpublished first reading keeps its events: they ride the
@@ -1606,20 +2263,25 @@ fn the_hand_over_keeps_job_events_for_the_loop_and_says_when_one_moved() {
 /// notwithstanding) and publishes it there; the quit takes the copy's sender
 /// back, so the thread hears the hang-up and ends within the bound (a copy
 /// still holding a sender would keep it blocked on its channel for good).
-/// NEGATIVE CONTROL: the deck's own hidden reading stays machine-only.
+/// A pull keeps the stuck engine's cadence whatever the held request asked
+/// of it. NEGATIVE CONTROL: the deck's own reading stays machine-only, and
+/// keeps what it asked.
 #[test]
 fn a_pull_reads_whole_and_the_quit_takes_the_workers_sender_back() {
     static COPY: std::sync::LazyLock<crate::sys_host::Shared> =
         std::sync::LazyLock::new(crate::sys_host::Shared::new);
-    /// Records whether each reading was whole.
+    /// Records whether each reading was whole, and made the engine look.
     struct Whole {
         vitals: aterm_vitals::Vitals,
-        seen: Arc<Mutex<Vec<bool>>>,
+        seen: Arc<Mutex<Vec<(bool, bool)>>>,
         seq: u64,
     }
     impl Source for Whole {
         fn reading(&mut self, req: &Request) -> Snapshot {
-            self.seen.lock().unwrap().push(!req.machine_only);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((!req.machine_only, req.jobs_now));
             self.seq += 1;
             Snapshot {
                 seq: self.seq,
@@ -1648,6 +2310,7 @@ fn a_pull_reads_whole_and_the_quit_takes_the_workers_sender_back() {
     assert!(host.offer(Msg::Read(Box::new(Request {
         machine_only: true,
         cadence_ms: 10_000,
+        jobs_now: true,
         ..Request::default()
     }))));
     let hang = Instant::now() + Duration::from_secs(60);
@@ -1655,7 +2318,11 @@ fn a_pull_reads_whole_and_the_quit_takes_the_workers_sender_back() {
         assert!(Instant::now() < hang, "the hidden reading never landed");
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert_eq!(*seen.lock().unwrap(), [false], "the deck's: machine only");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(false, true)],
+        "the deck's: machine only, as asked"
+    );
     seen.lock().unwrap().clear();
     let (got, _) = COPY.fresh(Duration::ZERO, true);
     assert!(
@@ -1664,7 +2331,10 @@ fn a_pull_reads_whole_and_the_quit_takes_the_workers_sender_back() {
     );
     let seen_now = seen.lock().unwrap().clone();
     assert!(!seen_now.is_empty(), "the pull read");
-    assert!(seen_now.iter().all(|whole| *whole), "{seen_now:?}");
+    assert!(
+        seen_now.iter().all(|seen| *seen == (true, false)),
+        "whole, at the engine's cadence: {seen_now:?}"
+    );
     assert!(
         host.stop_at_exit(Duration::from_secs(60)),
         "the thread ended"

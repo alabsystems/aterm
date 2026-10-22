@@ -714,10 +714,11 @@ fn complete_control_field(app: &mut App, key: &str, value: Option<&str>) -> Resu
 }
 
 /// THE REPLY SAYS WHAT THE WRITE DID: `settings unset` answers "removed"
-/// with what the key now reads as (the words its Settings row shows), a
-/// `settings set` to the key's default is written as a removal and answered
-/// the same way, and a write that changed nothing says so. Negative
-/// controls: a real value is "saved: k = v".
+/// with what the key now reads as, in one grammar for every kind — the words
+/// its Settings row's control says, then "(default)" — a `settings set` to
+/// the key's default is written as a removal and answered the same way, and
+/// a write that changed nothing says so. Negative controls: a real value is
+/// "saved: k = v".
 #[test]
 fn control_settings_replies_name_removals_defaults_and_no_ops() {
     let mut app = App::headless_for_test();
@@ -728,11 +729,11 @@ fn control_settings_replies_name_removals_defaults_and_no_ops() {
     .unwrap();
     assert_eq!(
         complete_control_field(&mut app, crate::prefs::EDIT_BIDI, None),
-        Ok("removed: bidi; now implicit (default)".to_string())
+        Ok("removed: bidi; now Auto (default)".to_string())
     );
     assert_eq!(
         complete_control_field(&mut app, "matrix_rain.enabled", None),
-        Ok("removed: matrix_rain.enabled; now false".to_string())
+        Ok("removed: matrix_rain.enabled; now Off (default)".to_string())
     );
     assert_eq!(
         complete_control_field(&mut app, crate::prefs::EDIT_BIDI, None),
@@ -743,7 +744,7 @@ fn control_settings_replies_name_removals_defaults_and_no_ops() {
     let reply = complete_control_field(&mut app, crate::prefs::EDIT_WINDOW_THEME, Some("auto"));
     assert_eq!(
         reply,
-        Ok("removed: window_theme; now auto (default)".to_string())
+        Ok("removed: window_theme; now Auto (default)".to_string())
     );
     let reply = complete_control_field(
         &mut app,
@@ -752,7 +753,7 @@ fn control_settings_replies_name_removals_defaults_and_no_ops() {
     );
     assert_eq!(
         reply,
-        Ok("removed: allow_osc52_query; now false".to_string())
+        Ok("removed: allow_osc52_query; now Off (default)".to_string())
     );
     let text = app.native_config_service.snapshot().text;
     assert!(
@@ -770,6 +771,170 @@ fn control_settings_replies_name_removals_defaults_and_no_ops() {
         complete_control_field(&mut app, crate::prefs::EDIT_BIDI, Some("disabled")),
         Ok("saved: bidi = disabled".to_string())
     );
+}
+
+/// ONE GRAMMAR FOR WHAT A KEY NOW READS AS, from the row: a list's empty
+/// field says "none", never its input hint; a choice its picker's words, not
+/// its config token; a value a theme supplies is the theme's, never aterm's
+/// default (a theme setting `line_height = 1.5` and `ligatures = false` reads
+/// "1.5 … (from theme …)" and "Off (from theme …)"). Negative control: the
+/// same keys with no theme read as aterm's defaults.
+#[test]
+fn control_settings_unset_says_the_rows_value_and_where_it_comes_from() {
+    let mut app = App::headless_for_test();
+    app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+        "font_features = [\"ss01\"]\ncursor_trail_style = \"comet\"\nmotion = \"full\"\n"
+            .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        complete_control_field(&mut app, crate::prefs::EDIT_FONT_FEATURES, None),
+        Ok("removed: font_features; now none (default)".to_string())
+    );
+    assert_eq!(
+        complete_control_field(&mut app, crate::prefs::EDIT_CURSOR_TRAIL_STYLE, None),
+        Ok("removed: cursor_trail_style; now Rainbow kitty (default)".to_string())
+    );
+    assert_eq!(
+        complete_control_field(&mut app, crate::prefs::EDIT_MOTION, None),
+        Ok("removed: motion; now Automatic (default)".to_string())
+    );
+
+    let studio = {
+        let text =
+            "foreground = #e0e0e0\nbackground = #101418\nline_height = 1.5\nligatures = false\n";
+        let parsed = aterm_types::scheme::parse_theme_str(text).expect("a theme");
+        crate::app_config::ThemeCatalog::from_parsed([("Studio".to_string(), parsed)])
+    };
+    for (source, themed) in [
+        (
+            "theme = \"Studio\"\nline_height = 1.2\nligatures = true\n",
+            true,
+        ),
+        ("line_height = 1.2\nligatures = true\n", false),
+    ] {
+        let mut app = App::headless_for_test();
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::new_with_themes(
+                source.to_string(),
+                std::sync::Arc::clone(&studio),
+            )
+            .unwrap();
+        let line = complete_control_field(&mut app, crate::prefs::EDIT_LINE_HEIGHT, None).unwrap();
+        let ligatures =
+            complete_control_field(&mut app, crate::prefs::EDIT_LIGATURES, None).unwrap();
+        if themed {
+            assert!(
+                line.starts_with("removed: line_height; now 1.5")
+                    && line.ends_with("(from theme Studio)"),
+                "{line}"
+            );
+            assert_eq!(ligatures, "removed: ligatures; now Off (from theme Studio)");
+        } else {
+            assert!(
+                line.starts_with("removed: line_height; now 1") && line.ends_with("(default)"),
+                "{line}"
+            );
+            assert_eq!(ligatures, "removed: ligatures; now On (default)");
+        }
+    }
+}
+
+/// A ROW HELD OFF IS NEVER ITS KEY'S DEFAULT: under Serious Mode the cursor
+/// style and Music effects read Off, and with every word effect switched off
+/// Keyword kitties does, yet each key's own default is a trail or On; so
+/// `settings unset` says the key's value and then what holds the row Off,
+/// never "now Off (default)". A theme's font is named as from that theme
+/// once. Negative control: with nothing holding it, the switch is just "On
+/// (default)".
+#[test]
+fn control_settings_unset_never_calls_a_held_off_row_its_default() {
+    let unset = |source: &str, key: &str| {
+        let mut app = App::headless_for_test();
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::new(source.to_string()).unwrap();
+        complete_control_field(&mut app, key, None).unwrap()
+    };
+    let serious = "serious_mode = true\ncursor_trail_style = \"comet\"\ntrail_sounds = false\n";
+    if crate::app_config::DEFAULT_DECORATIVE_EFFECTS {
+        assert_eq!(
+            unset(serious, crate::prefs::EDIT_CURSOR_TRAIL_STYLE),
+            "removed: cursor_trail_style; now Rainbow kitty (default); Off while Serious Mode \
+             hides playful effects"
+        );
+    }
+    assert_eq!(
+        unset(serious, crate::prefs::EDIT_TRAIL_SOUNDS),
+        "removed: trail_sounds; now On (default); Off while Serious Mode silences sound"
+    );
+    assert_eq!(
+        unset(
+            "[sparkle_words]\nenabled = false\n[sparkle_words.feline]\nenabled = false\n",
+            "sparkle_words.feline.enabled",
+        ),
+        "removed: sparkle_words.feline.enabled; now On (default); Off while all word effects \
+         are switched off in aterm.toml"
+    );
+    assert_eq!(
+        unset("trail_sounds = false\n", crate::prefs::EDIT_TRAIL_SOUNDS),
+        "removed: trail_sounds; now On (default)"
+    );
+
+    let mut app = App::headless_for_test();
+    let studio = {
+        let text = "foreground = #e0e0e0\nbackground = #101418\nfont_family = Menlo\n";
+        let parsed = aterm_types::scheme::parse_theme_str(text).expect("a theme");
+        crate::app_config::ThemeCatalog::from_parsed([("Studio".to_string(), parsed)])
+    };
+    app.native_config_service =
+        crate::native_config_service::VersionedConfigService::new_with_themes(
+            "theme = \"Studio\"\nfont_family = \"Monaco\"\n".to_string(),
+            studio,
+        )
+        .unwrap();
+    assert_eq!(
+        complete_control_field(&mut app, crate::prefs::EDIT_FONT_FAMILY, None),
+        Ok("removed: font_family; now Menlo (from theme Studio)".to_string())
+    );
+}
+
+/// A CHOICE SET IN ITS ROW'S WORDS IS THE OPTION THEY NAME: `settings set
+/// motion Reduce` (the segment's word) and `Always animate` (the picker's)
+/// save `reduced` and `full`, a switch's "On"/"Off" its `true`/`false`; a
+/// value no option takes is refused with every option and its words, before
+/// anything is queued. Negative control: a config token still saves as is.
+#[test]
+fn control_settings_take_a_rows_words_and_refuse_with_every_option() {
+    let mut app = App::headless_for_test();
+    app.native_config_service =
+        crate::native_config_service::VersionedConfigService::new(String::new()).unwrap();
+    for (key, words, saved) in [
+        (crate::prefs::EDIT_MOTION, "Reduce", "reduced"),
+        (crate::prefs::EDIT_MOTION, "Always animate", "full"),
+        (crate::prefs::EDIT_MOTION, "reduced", "reduced"),
+        (crate::prefs::EDIT_BIDI, "If asked", "explicit"),
+        (crate::prefs::EDIT_COPY_ON_SELECT, "Off", "false"),
+    ] {
+        let reply = complete_control_field(&mut app, key, Some(words));
+        assert_eq!(
+            reply,
+            Ok(format!("saved: {key} = {saved}")),
+            "{key} {words:?}"
+        );
+    }
+    let (reply, answer) = std::sync::mpsc::channel();
+    app.queue_control_settings_field(
+        crate::prefs::EDIT_MOTION.to_string(),
+        Some("reduce motions".to_string()),
+        reply,
+    );
+    let refusal = answer.try_recv().expect("answered at once").unwrap_err();
+    assert_eq!(
+        refusal,
+        "save failed: invalid value for motion: \"reduce motions\"; it must be one of: auto \
+         (Automatic), full (Always animate, Animate), reduced (Reduce motion, Reduce)"
+    );
+    assert!(app.native_config_pending.is_empty(), "nothing is queued");
 }
 
 /// A DURABLE WRITE WHOSE DISK GENERATION COULD NOT BE ADMITTED ANSWERS WITH
@@ -810,7 +975,7 @@ fn a_durable_write_awaiting_reconciliation_answers_with_what_it_wrote() {
     assert_eq!(
         publish_unadmitted(&mut app, crate::prefs::EDIT_WINDOW_THEME, "auto"),
         Ok(
-            "removed: window_theme; now auto (default); reconciliation required: the file \
+            "removed: window_theme; now Auto (default); reconciliation required: the file \
             changed again before it could be read"
                 .to_string()
         )
@@ -836,7 +1001,7 @@ fn a_durable_write_awaiting_reconciliation_answers_with_what_it_wrote() {
     .unwrap();
     assert_eq!(
         complete_control_field(&mut app, crate::prefs::EDIT_WINDOW_THEME, Some("auto")),
-        Ok("removed: window_theme; now auto (default)".to_string())
+        Ok("removed: window_theme; now Auto (default)".to_string())
     );
     assert_eq!(
         complete_control_field(&mut app, crate::prefs::EDIT_FONT_PX, Some("15.0")),
@@ -1848,6 +2013,105 @@ fn plain_terminal_theme_os_flip_invalidates_auto_window_preview() {
         light.paint_revision, dark.paint_revision,
         "live OS appearance participates in retained native paint identity"
     );
+}
+
+#[test]
+fn shared_native_model_edits_invalidate_sibling_presentations() {
+    use crate::native_app::{ActionInvocation, AppEvent, DamageRegion, SemanticInput};
+    use crate::native_ui::{ActionId, UiKey};
+    use crate::system_state::SystemStateAction;
+    use crate::workstation_setup::WorkstationSetupDecision;
+    use aterm_types::macos_setup::{Plan, Setting};
+
+    let mut app = App::headless_for_test();
+    let first = WindowId(0);
+    {
+        let window = app.windows.get_mut(&first).unwrap();
+        window.rows = 90;
+        window.cols = 160;
+    }
+    assert!(app.open_system_state_tab_in_window(first));
+    let (instance, first_view) = app.active_native_view(first).unwrap();
+    let next_session = app.next_session_id;
+    let second = app.insert_logical_window(crate::stub_session(next_session), 90, 160);
+    assert!(app.open_system_state_tab_in_window(second));
+    let (sibling_instance, second_view) = app.active_native_view(second).unwrap();
+    assert_eq!(instance, sibling_instance);
+    let initial = app.native_ui_compile_stamp(second).unwrap();
+
+    // Focus and list position remain independent for each linked view.
+    for event in [
+        AppEvent::FocusChanged(Some(UiKey::new("system-state/url"))),
+        AppEvent::ScrollLines(1),
+    ] {
+        app.dispatch_native_view_event(first, first_view, event)
+            .unwrap();
+    }
+    assert_eq!(app.native_ui_compile_stamp(second).unwrap(), initial);
+    assert!(
+        app.native_runtime
+            .view_state(second_view)
+            .unwrap()
+            .common()
+            .last_focus
+            .is_none()
+    );
+    app.windows
+        .get_mut(&second)
+        .unwrap()
+        .leaf_render_cache
+        .entry(second_view)
+        .or_default()
+        .native_damage = None;
+
+    let mut selected = Plan {
+        vault_url: "http://selected.invalid:7484/v1/team".into(),
+        ..Plan::default()
+    };
+    selected.selection.set(Setting::ALL[0], false);
+    for (key, value) in [
+        ("system-state/setting/0", SemanticInput::Bool(false)),
+        (
+            "system-state/url",
+            SemanticInput::Text(selected.vault_url.clone()),
+        ),
+    ] {
+        let before = app.native_ui_compile_stamp(second).unwrap();
+        app.dispatch_native_view_event(
+            first,
+            first_view,
+            AppEvent::Action(ActionInvocation {
+                id: ActionId::new(key),
+                value: Some(value),
+            }),
+        )
+        .unwrap();
+        assert_ne!(
+            app.native_ui_compile_stamp(second)
+                .unwrap()
+                .presentation_revision,
+            before.presentation_revision,
+            "a linked view must invalidate the old choices before it can submit them"
+        );
+        assert_eq!(
+            app.windows[&second].leaf_render_cache[&second_view].native_damage,
+            Some(DamageRegion::All)
+        );
+    }
+    app.dispatch_native_view_event(
+        second,
+        second_view,
+        AppEvent::Action(ActionInvocation {
+            id: ActionId::new("system-state/apply"),
+            value: None,
+        }),
+    )
+    .unwrap();
+    let Some(SystemStateAction::Apply(answer)) = app.native_runtime.take_system_state_action()
+    else {
+        panic!("the sibling Apply must use the newly presented shared choices");
+    };
+    assert!(matches!(answer.decision, WorkstationSetupDecision::Begin(plan) if plan == selected));
 }
 
 #[test]

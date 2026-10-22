@@ -111,7 +111,8 @@ for what it left out; `!` exact, `+` strong, `~` heuristic, `?` claim. Read on w
 `since=<as_of> ep=<ep>` from its reply. A `gap` line is a fact to report, and silence is
 never a need. `blk=`, `ledger=` and `off=` point at the text (`blocktext`, `history`, `inbox
 get @<off>`), each read under its own verb's permission. `brief all` (owner only) is every
-session at once; `aterm fabric brief` reads the fabric's log mirror, off by default.
+session at once; `aterm fabric brief` reads the fabric's log mirror, on by default wherever
+the broker retains it (`[fabric] log = "off"` opts out).
 
 ## Follow up, stop
 

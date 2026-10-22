@@ -43,8 +43,9 @@ pub const BLOOM_CHROMA_RADIUS: f32 = 1.2;
 pub const BLOOM_CHROMA_SHARE: f32 = BLOOM_CHROMA_RADIUS / BLOOM_RADIUS;
 
 /// The chroma radius paired with a white blur `radius`.
+#[inline]
 #[must_use]
-pub fn chroma_radius(radius: f32) -> f32 {
+pub const fn chroma_radius(radius: f32) -> f32 {
     radius * BLOOM_CHROMA_SHARE
 }
 
@@ -53,6 +54,7 @@ pub fn chroma_radius(radius: f32) -> f32 {
 /// (the taps plus one texel of linear filtering) and one pixel of rounding.
 /// Outside it the added light is exactly zero, which lets the GPU scissor its
 /// composite there.
+#[inline]
 #[must_use]
 pub fn reach_px(radius: f32) -> u32 {
     (((2.0 * radius + 1.0) * BLOOM_DOWNSCALE as f32).ceil() as u32).saturating_add(1)
@@ -157,7 +159,8 @@ impl Default for BloomParams {
 
 /// The colour channels of a frame pixel (`0xTTRRGGBB`, `TT` transmittance)
 /// as floats in `0..=1`.
-fn channels(p: u32) -> [f32; 3] {
+#[inline]
+const fn channels(p: u32) -> [f32; 3] {
     [
         ((p >> 16) & 0xff) as f32 / 255.0,
         ((p >> 8) & 0xff) as f32 / 255.0,
@@ -168,6 +171,7 @@ fn channels(p: u32) -> [f32; 3] {
 /// SCREEN `src` (`0..=1` per channel, clamped first as a Unorm target clamps a
 /// fragment) over the pixel `dst`, rounded once on store; the transmittance
 /// byte rides through (the GPU writes colour only).
+#[inline]
 fn screen(dst: u32, src: [f32; 3]) -> u32 {
     let d = channels(dst);
     let mut out = dst & 0xFF00_0000;

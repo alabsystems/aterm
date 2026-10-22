@@ -44,12 +44,20 @@ use aterm_slog::BusCursor;
 /// `[fabric] log`: whether the bridge mirrors the session logs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LogMode {
-    /// The default (owner decision D4 is open): nothing is asked, taken,
-    /// pinned or published; the bridge's lanes carry the bytes they did.
+    /// THE DEFAULT (owner decision D4, session log Phase 6 step 6E-3): the
+    /// bus class is mirrored while the broker RETAINS it, its `Hello`
+    /// advertising a prefix rule over this node's `ev` faces
+    /// ([`crate::broker_rules::retains_ev`]), as `aterm link broker` does by
+    /// default. Over any other broker nothing is asked, taken or published,
+    /// and `fabric status` says `mirror=unretained`.
     #[default]
+    Auto,
+    /// `[fabric] log = "off"`, the opt-out: nothing is asked, taken, pinned
+    /// or published; the bridge's lanes carry the bytes they did.
     Off,
-    /// The bus class of every session log is mirrored onto its session's
-    /// `ev` face.
+    /// `[fabric] log = "turns"`: the bus class of every session log is
+    /// mirrored onto its session's `ev` face over any broker; over one that
+    /// retains nothing, up to [`TOTAL_MAX_BYTES`] (`mirror=capped`).
     Turns,
 }
 
@@ -58,6 +66,7 @@ impl LogMode {
     #[must_use]
     pub fn parse(word: &str) -> Option<LogMode> {
         match word {
+            "auto" => Some(LogMode::Auto),
             "off" => Some(LogMode::Off),
             "turns" => Some(LogMode::Turns),
             _ => None,
@@ -68,6 +77,7 @@ impl LogMode {
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
+            LogMode::Auto => "auto",
             LogMode::Off => "off",
             LogMode::Turns => "turns",
         }
@@ -84,11 +94,34 @@ pub const BATCH_MAX: usize = 32;
 pub const RATE_PER_SEC: u64 = 10;
 /// The rate bucket's burst.
 pub const RATE_BURST: u64 = 2048;
-/// THE NODE'S TOTAL of mirrored body bytes before the broker retains
-/// anything (ruling Q13): past it the mirror stops, said in `fabric status`
+/// THE NODE'S TOTAL of mirrored body bytes on a broker that retains nothing
+/// (ruling Q13): past it the mirror stops, said in `fabric status`
 /// (`mirror=capped`). 256 MiB of bodies is about two million records, some
 /// two hundred days of a busy agent node at the sustained rate's typical use.
+/// A lifetime gate, so it holds only where nothing is ever given up: on a
+/// broker whose `Hello` advertises a prefix rule over this node's `ev` faces
+/// ([`crate::broker_rules::retains_ev`]) the [`NODE_WINDOW_BYTES`] window
+/// budget replaces it (session log Phase 6 step 6E-2, ruling U41).
 pub const TOTAL_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// THE NODE'S WINDOW BUDGET on a retaining broker (session log Phase 6 step
+/// 6E-2, ruling U41; §5.5's "64 MiB per node"): the mirrored body bytes this
+/// node landed at offsets at or above the broker's `oldest=` for its `ev`
+/// faces are at most this, held by the producer. The broker's bulk stream
+/// keeps 256 MiB ([`crate::broker_rules::EV_BYTES`]): four nodes at their
+/// full share. Past it the mirror WAITS (`mirror=budget`), asks `oldest=`
+/// again at its retry cadence, and goes on once the broker's cut has passed
+/// enough of it; records wait in their rings and become exact covers if
+/// evicted, as past [`RATE_PER_SEC`]. It never stops for good.
+pub const NODE_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
+/// The most entries the pin's window ledger keeps ([`Pin::win`]): past it the
+/// two NEIGHBOURS WHOSE BYTES SUM LEAST are merged into one (the higher
+/// offset, the bytes summed, [`Pin::note_window`]). A merge only ever counts
+/// bytes in the window longer, never shorter, and by at most one entry's
+/// bytes: of 64 neighbour pairs, 32 are disjoint, so the cheapest sums to at
+/// most 1/32 of the ledger, which the budget keeps near [`NODE_WINDOW_BYTES`]
+/// (2 MiB of a full window). So a node at its budget goes on once the cut has
+/// passed that much more than its exact share, whatever its batch sizes.
+pub const WINDOW_LEDGER_MAX: usize = 64;
 /// THE FLOOR'S LEASE (ruling Q13 across a power cut): how far past a batch's
 /// bytes `logfloor` is raised, durably, when the batch would pass it — so the
 /// floor costs one durable write per MiB of bodies (some eight thousand
@@ -173,13 +206,17 @@ pub struct PinSlot {
 }
 
 /// THE PIN: the one batch in flight, the node's running total of mirrored
-/// body bytes (ruling Q13) and the node's ALIAS KEY (ruling Q6), as `logpin`
-/// holds them.
+/// body bytes (ruling Q13), the node's ALIAS KEY (ruling Q6) and its WINDOW
+/// LEDGER (ruling U41), as `logpin` holds them.
 ///
 /// ```text
-/// logpin v=2 inc=<inc> n=<k> total=<bytes> key=<32 hex>
+/// logpin v=2 inc=<inc> n=<k> total=<bytes> key=<32 hex> win=<off>:<bytes>,…
 /// <pseq> <sid> <ep>:<seq>:<ms> <body>        (k lines)
 /// ```
+///
+/// `win=` (session log Phase 6 step 6E-2) is read past by a reader from
+/// before it, as every word after `total=` is; a pin without it has an empty
+/// ledger.
 ///
 /// `n=0` is a bridge between batches. A pin that does not read stops the
 /// mirror for this bridge's life and is never deleted — save one a power cut
@@ -210,6 +247,12 @@ pub struct Pin {
     pub total: u64,
     /// The node's alias key (`None`: a pin written before it, or none minted).
     pub key: Option<[u8; 16]>,
+    /// THE WINDOW LEDGER (ruling U41): per landed batch, oldest first, the
+    /// highest offset it landed at and its body bytes. A batch counts against
+    /// [`NODE_WINDOW_BYTES`] while its highest offset is at or above the
+    /// broker's `oldest=` ([`Pin::window_bytes`]); at most
+    /// [`WINDOW_LEDGER_MAX`] entries ([`Pin::note_window`]).
+    pub win: Vec<(u64, u64)>,
     /// The batch.
     pub slots: Vec<PinSlot>,
 }
@@ -232,6 +275,43 @@ pub const PIN_HEADER: &str = "logpin v=2";
 const OLDER_PIN_HEADER: &str = "logpin v=1";
 
 impl Pin {
+    /// A batch of `bytes` landed, the highest of it at `hi`: one ledger
+    /// entry; while it holds more than [`WINDOW_LEDGER_MAX`], the two
+    /// neighbours whose bytes sum least (the oldest such pair on a tie) are
+    /// merged under the higher offset. Merging the two OLDEST instead piled
+    /// every batch but the newest few into one entry keyed near the window's
+    /// top, which the cut passed only once it had passed nearly all of them:
+    /// a node at its budget then waited for days its oldest batches had
+    /// already aged out of.
+    pub fn note_window(&mut self, hi: u64, bytes: u64) {
+        self.win.push((hi, bytes));
+        while self.win.len() > WINDOW_LEDGER_MAX {
+            let Some(i) = (0..self.win.len() - 1)
+                .min_by_key(|&i| self.win[i].1.saturating_add(self.win[i + 1].1))
+            else {
+                return;
+            };
+            let (a, b) = (self.win[i], self.win[i + 1]);
+            self.win[i + 1] = (a.0.max(b.0), a.1.saturating_add(b.1));
+            self.win.remove(i);
+        }
+    }
+
+    /// The body bytes the ledger counts in the broker's window from `oldest`:
+    /// every batch whose highest offset is at or above it.
+    #[must_use]
+    pub fn window_bytes(&self, oldest: u64) -> u64 {
+        self.win
+            .iter()
+            .filter(|(hi, _)| *hi >= oldest)
+            .fold(0u64, |sum, (_, bytes)| sum.saturating_add(*bytes))
+    }
+
+    /// Forget the batches the broker's cut at `oldest` gave up whole.
+    pub fn prune_window(&mut self, oldest: u64) {
+        self.win.retain(|(hi, _)| *hi >= oldest);
+    }
+
     /// Whether `bytes`, whole or cut short, begin as an OLDER BUILD'S pin
     /// (`v=1`): one written by a build that keeps neither `logkey` nor
     /// `logfloor`, so those copies need not cover what it holds. A prefix too
@@ -258,8 +338,12 @@ impl Pin {
         let key = self.key.map_or_else(String::new, |k| {
             format!(" key={}", aterm_codec::hex::encode_lower(&k))
         });
+        let mut win = String::new();
+        for (i, (hi, bytes)) in self.win.iter().enumerate() {
+            let _ = write!(win, "{}{hi}:{bytes}", if i == 0 { " win=" } else { "," });
+        }
         let mut out = format!(
-            "{PIN_HEADER} inc={} n={} total={}{key}\n",
+            "{PIN_HEADER} inc={} n={} total={}{key}{win}\n",
             self.inc,
             self.slots.len(),
             self.total
@@ -310,9 +394,10 @@ impl Pin {
         let inc = field("inc")?;
         let n = field("n")?;
         let total = field("total")?;
-        // Past the total, a newer writer's words are read past; `key=` is
-        // read, and refused when it does not.
-        let key = match toks.find_map(|t| t.strip_prefix("key=")) {
+        // Past the total, a newer writer's words are read past; `key=` and
+        // `win=` are read, and refused when they do not.
+        let rest: Vec<&str> = toks.collect();
+        let key = match rest.iter().find_map(|t| t.strip_prefix("key=")) {
             None => None,
             Some(hex) => {
                 let mut key = [0u8; 16];
@@ -321,6 +406,18 @@ impl Pin {
                 }
                 Some(key)
             }
+        };
+        let win = match rest.iter().find_map(|t| t.strip_prefix("win=")) {
+            None => Vec::new(),
+            Some(list) => list
+                .split(',')
+                .map(|e| {
+                    let (hi, bytes) = e.split_once(':')?;
+                    Some((hi.parse().ok()?, bytes.parse().ok()?))
+                })
+                .collect::<Option<Vec<(u64, u64)>>>()
+                .filter(|w| w.len() <= WINDOW_LEDGER_MAX)
+                .ok_or_else(|| format!("a logpin's window ledger: {head:?}"))?,
         };
         let mut slots = Vec::new();
         for line in lines {
@@ -347,6 +444,7 @@ impl Pin {
             inc,
             total,
             key,
+            win,
             slots,
         })
     }

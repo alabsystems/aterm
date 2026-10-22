@@ -71,8 +71,9 @@ pub struct VfProbe {
 /// default. Exact when achievable: a finite request already inside the axis
 /// bounds is returned unchanged. Checked by the exhaustive lattice sweep in
 /// `tests/variation_instantiation.rs`.
+#[inline]
 #[must_use]
-pub fn clamp_axis(axis: &VfAxis, req: f32) -> f32 {
+pub const fn clamp_axis(axis: &VfAxis, req: f32) -> f32 {
     // `VfAxis` construction guarantees min <= def <= max, all finite; a hand-built
     // degenerate axis fails the range test and falls back to the default.
     if req.is_finite() && axis.min.is_finite() && axis.max.is_finite() && axis.min <= axis.max {
@@ -158,8 +159,9 @@ pub fn parse_variation_spec(spec: &str) -> Option<(u32, f32)> {
 /// ([`DARK_NUDGE_ADVANCE_TOL_PX`]). NaN/∞ (a failed measurement) can never
 /// pass, so the gate is a checked PRECONDITION, not a heuristic. Exhaustive
 /// lattice + negative controls in `tests/variation_instantiation.rs`.
+#[inline]
 #[must_use]
-pub fn dark_nudge_permitted(adv_nudged_px: f32, adv_default_px: f32) -> bool {
+pub const fn dark_nudge_permitted(adv_nudged_px: f32, adv_default_px: f32) -> bool {
     adv_nudged_px.is_finite()
         && adv_default_px.is_finite()
         && (adv_nudged_px - adv_default_px).abs() <= DARK_NUDGE_ADVANCE_TOL_PX
@@ -284,18 +286,19 @@ pub struct VariedMetricsUnits {
 impl VariedMetricsUnits {
     /// These metrics at `px`. `None` for a degenerate `units_per_em` or a
     /// non-finite size.
+    #[inline]
     #[must_use]
-    pub fn at_px(self, px: f32) -> Option<VariedMetricsPx> {
-        let upem = f32::from(self.units_per_em);
+    pub const fn at_px(self, px: f32) -> Option<VariedMetricsPx> {
+        let upem = self.units_per_em as f32;
         if upem <= 0.0 || !px.is_finite() {
             return None;
         }
         let scale = px / upem;
         Some(VariedMetricsPx {
-            ascent: f32::from(self.ascent) * scale,
-            descent: f32::from(self.descent) * scale,
-            line_gap: f32::from(self.line_gap) * scale,
-            m_advance: f32::from(self.m_advance) * scale,
+            ascent: (self.ascent as f32) * scale,
+            descent: (self.descent as f32) * scale,
+            line_gap: (self.line_gap as f32) * scale,
+            m_advance: (self.m_advance as f32) * scale,
         })
     }
 }
@@ -378,6 +381,7 @@ impl<'a> VariedFace<'a> {
     /// [`varied_glyph_raster`] through this instance: the same
     /// `(width, height, xmin, ymin, advance_width, coverage)` tuple and the same
     /// `None` cases (missing/oversized glyph, degenerate size).
+    #[inline]
     #[must_use]
     pub fn glyph_raster(
         &self,
@@ -395,6 +399,7 @@ impl<'a> VariedFace<'a> {
         windows,
         all(test, debug_assertions, feature = "embedded-font", target_os = "macos")
     ))]
+    #[inline]
     pub(crate) fn linear_advance(&self, gid: u16, px: f32) -> Option<f32> {
         let scale = px_scale(&self.face, px)?;
         Some(linear_advance(&self.face, aterm_font::GlyphId(gid), scale))
@@ -403,6 +408,7 @@ impl<'a> VariedFace<'a> {
 
 /// `px / units_per_em`, the scale every unhinted raster and linear advance in this module
 /// applies to design units. `None` for a degenerate size or `units_per_em`.
+#[inline]
 fn px_scale(face: &aterm_font::Face, px: f32) -> Option<f32> {
     let upem = f32::from(face.units_per_em());
     (upem > 0.0 && px.is_finite() && px > 0.0).then(|| px / upem)
@@ -411,6 +417,7 @@ fn px_scale(face: &aterm_font::Face, px: f32) -> Option<f32> {
 /// Glyph `g`'s linear advance at `scale`: its `hmtx` advance (`HVAR` applied at the
 /// face's coords, `0` past the table) times `scale`, the product `font::Font` reports for
 /// a static face.
+#[inline]
 fn linear_advance(face: &aterm_font::Face, g: aterm_font::GlyphId, scale: f32) -> f32 {
     f32::from(face.glyph_hor_advance(g).unwrap_or(0)) * scale
 }
@@ -419,6 +426,7 @@ fn linear_advance(face: &aterm_font::Face, g: aterm_font::GlyphId, scale: f32) -
 /// caller can amortize the parse (e.g. after resolving the gid through the same face's
 /// cmap). The caller must build `face` at the right collection index and apply the
 /// variation coords first, as [`varied_glyph_raster`] does.
+#[inline]
 #[must_use]
 pub fn varied_glyph_raster_with_face(
     face: &aterm_font::Face,

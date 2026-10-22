@@ -456,6 +456,7 @@ pub fn face_for_id(_id: &str) -> Option<&'static [u8]> {
 }
 
 /// Whether `path` is a bundled virtual identity in this build.
+#[inline]
 #[must_use]
 pub fn is_bundled_id(path: &str) -> bool {
     face_for_id(path).is_some()
@@ -463,6 +464,7 @@ pub fn is_bundled_id(path: &str) -> bool {
 
 /// Whether `family` is spelled as a bundled virtual identity (`bundled:…`) rather than a
 /// family name: the spelling that always means the compiled-in face, never an installed one.
+#[inline]
 #[must_use]
 pub fn is_identity(family: &str) -> bool {
     family.trim().starts_with(SCHEME)
@@ -625,6 +627,7 @@ pub fn letter_descent_floor(bytes: &[u8]) -> Option<f32> {
 
 /// Whether `bytes` are the bundled `face`: the same allocation or the same contents (a
 /// renderer may hold its own copy). The length check spares a different face the comparison.
+#[inline]
 fn same_face(face: &[u8], bytes: &[u8]) -> bool {
     face.len() == bytes.len() && (std::ptr::eq(face.as_ptr(), bytes.as_ptr()) || face == bytes)
 }
@@ -669,8 +672,9 @@ pub fn yields_private_use(bytes: &[u8]) -> bool {
 /// `⟵`..`⟿` (U+27F5..27FF) and `⬳` (U+2B33). MEASURED 2026-10-16 over the
 /// cmaps of all eight Iosevka Term faces, both sets; JetBrains Mono and
 /// Cascadia Mono PL draw no glyph wider than their cell.
+#[inline]
 #[must_use]
-pub fn is_two_cell_glyph(ch: char) -> bool {
+pub const fn is_two_cell_glyph(ch: char) -> bool {
     matches!(
         ch,
         '\u{27DD}' | '\u{27DE}' | '\u{27F5}'..='\u{27FF}' | '\u{2B33}'
@@ -697,6 +701,7 @@ pub fn is_two_cell_glyph(ch: char) -> bool {
 ///
 /// BY THE BYTES, like [`yields_private_use`]: a face can arrive without its
 /// identity (`Renderer::set_primary_font` takes bytes).
+#[inline]
 #[must_use]
 pub fn fits_two_cell_glyphs(bytes: &[u8]) -> bool {
     is_iosevka_semibold(bytes)
@@ -731,6 +736,7 @@ pub fn fits_two_cell_glyphs(bytes: &[u8]) -> bool {
 ///
 /// BY THE BYTES, like [`yields_private_use`]: a face can arrive without its
 /// identity (`Renderer::set_primary_font` takes bytes).
+#[inline]
 #[must_use]
 pub fn yields_wide_characters(bytes: &[u8]) -> bool {
     is_iosevka_semibold(bytes)
@@ -748,8 +754,9 @@ pub fn yields_wide_characters(bytes: &[u8]) -> bool {
 /// Segoe UI Symbol's at 597..837 of 2048, Iosevka Term's at 301..379. Ahead
 /// of the symbol tier it drew `⚊` as a low underscore beside the mid-line
 /// bars of a `☰`; left to that tier, every one sits at mid-line.
+#[inline]
 #[must_use]
-pub fn is_yijing_line_symbol(ch: char) -> bool {
+pub const fn is_yijing_line_symbol(ch: char) -> bool {
     matches!(ch, '\u{2630}'..='\u{2637}' | '\u{268A}'..='\u{268F}')
 }
 
@@ -758,8 +765,9 @@ pub fn is_yijing_line_symbol(ch: char) -> bool {
 /// (U+23F4..23F7) — Claude Code's spinner (`· ✢ ✳ ✶ ✻ ✽`) and its
 /// `⏵⏵ bypass permissions on` footer, the glyphs an agent session shows all
 /// day. See [`yields_small_dingbats`].
+#[inline]
 #[must_use]
-pub fn is_small_dingbat(ch: char) -> bool {
+pub const fn is_small_dingbat(ch: char) -> bool {
     matches!(ch, '\u{2722}'..='\u{273D}' | '\u{23F4}'..='\u{23F7}')
 }
 
@@ -783,6 +791,7 @@ pub fn is_small_dingbat(ch: char) -> bool {
 /// soft (8.5% and 14% of their ink solid, about half `✽`'s ink, measured
 /// 2026-10-18), so below [`SPINNER_STARS_CRISP_PX`] the renderer draws those
 /// from the cell, ahead of every face (`procedural::is_spinner_star`).
+#[inline]
 #[must_use]
 pub fn yields_small_dingbats(bytes: &[u8]) -> bool {
     is_iosevka_semibold(bytes)
@@ -852,6 +861,7 @@ impl LoweredAsterisk {
     /// on an italic left by the glyph's left edge rounded where it lands
     /// before and after. Measured on the raster because the hinter places
     /// the raised glyph's rows, not its outline's box.
+    #[inline]
     #[must_use]
     pub fn shift_px(&self, px: f32, inked_mid: f32) -> (i32, i32) {
         let x = ((self.x_min + self.dx) * px).round() as i32 - (self.x_min * px).round() as i32;
@@ -972,8 +982,9 @@ fn deepest_latin_letter(ids: &[&str; 4]) -> Option<f32> {
 /// system's variable Cascadia Mono — no longer wins by default) and behind any
 /// configured family (so a user's choice still wins). Empty when the stack is
 /// inactive.
+#[inline]
 #[must_use]
-pub fn default_primary_candidates() -> &'static [&'static str] {
+pub const fn default_primary_candidates() -> &'static [&'static str] {
     if ACTIVE { &[PRIMARY_ID] } else { &[] }
 }
 
@@ -983,15 +994,17 @@ pub fn default_primary_candidates() -> &'static [&'static str] {
 /// DejaVu Sans Mono alone, on Windows too: JetBrains Mono's arrows and keycaps overhang its
 /// 0.6 em advance (`⇔` 0.76 em, `⌫` 0.82 em), so in Cascadia Mono PL's 9 px cell the symbol
 /// fit shrank each unevenly. DejaVu's arrows (0.538 em of ink) fit the cell unscaled.
+#[inline]
 #[must_use]
-pub fn broad_fallback_ids() -> &'static [&'static str] {
+pub const fn broad_fallback_ids() -> &'static [&'static str] {
     if ACTIVE { &[DEJAVU_ID] } else { &[] }
 }
 
 /// The bundled symbol-tier chain entries, in order, placed after a configured
 /// `symbol_font` and ahead of the system symbol faces. Additive.
+#[inline]
 #[must_use]
-pub fn symbol_fallback_ids() -> &'static [&'static str] {
+pub const fn symbol_fallback_ids() -> &'static [&'static str] {
     if ACTIVE {
         &[NOTO_SYMBOLS2_ID, NOTO_MATH_ID]
     } else {
@@ -1020,8 +1033,9 @@ pub fn supersedes_system_face(path: &str) -> bool {
 /// primary first, on Windows Cascadia Mono PL (the default before it) and
 /// JetBrains Mono beside it, and Iosevka Term everywhere (macOS included,
 /// where it is the one).
+#[inline]
 #[must_use]
-pub fn selectable_families() -> &'static [&'static str] {
+pub const fn selectable_families() -> &'static [&'static str] {
     if !IOSEVKA_ACTIVE {
         return &[];
     }

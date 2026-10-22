@@ -12,7 +12,7 @@ impl CursorGlow {
     /// past the configured intensity (~1.2×). Jump comets and landing rings
     /// are navigation feedback, so they stay at 1×.
     #[inline]
-    pub(super) fn typing_boost(&self) -> f32 {
+    pub(super) const fn typing_boost(&self) -> f32 {
         0.28 + 0.92 * self.heat
     }
 
@@ -24,7 +24,7 @@ impl CursorGlow {
     /// [`Self::tick`], which applies the lazy heat/flare decay.
     #[inline]
     #[must_use]
-    pub fn blaze(&self) -> f32 {
+    pub const fn blaze(&self) -> f32 {
         self.heat.max(self.flare).clamp(0.0, 1.0)
     }
 
@@ -33,7 +33,7 @@ impl CursorGlow {
     /// with the key-time click's timbre prediction so the click matches the
     /// light it is the twin of.
     #[inline]
-    pub(super) fn heat_cadence(gap: f32) -> f32 {
+    pub(super) const fn heat_cadence(gap: f32) -> f32 {
         1.0 - ((gap - Self::HEAT_GAP_FULL) / (Self::HEAT_GAP_ZERO - Self::HEAT_GAP_FULL))
             .clamp(0.0, 1.0)
     }
@@ -41,7 +41,7 @@ impl CursorGlow {
     /// The per-keystroke heat gain this style charges. Fire earns its blaze
     /// over ~30-40 keys; every other style keeps the shared [`Self::HEAT_GAIN`].
     #[inline]
-    pub(super) fn heat_gain(fire: bool) -> f32 {
+    pub(super) const fn heat_gain(fire: bool) -> f32 {
         if fire {
             Self::FIRE_HEAT_GAIN
         } else {
@@ -53,7 +53,7 @@ impl CursorGlow {
     /// (momentum survives a short thought); every other style keeps
     /// [`Self::HEAT_DECAY_TAU`].
     #[inline]
-    pub(super) fn heat_tau(cfg: &GlowConfig) -> f32 {
+    pub(super) const fn heat_tau(cfg: &GlowConfig) -> f32 {
         if matches!(cfg.style, GlowStyle::Fire) {
             Self::FIRE_HEAT_TAU
         } else {
@@ -67,7 +67,7 @@ impl CursorGlow {
     /// look ramps as one body). Evolved once per tick in the lazy-decay block,
     /// before any spawn, so every consumer in one frame agrees.
     #[inline]
-    pub(super) fn fire_t(&self) -> f32 {
+    pub(super) const fn fire_t(&self) -> f32 {
         self.disp_t.clamp(0.0, 1.0)
     }
 
@@ -89,6 +89,7 @@ impl CursorGlow {
     /// change fingerprint identically and early-out: a cool cursor is a static
     /// ember (the heating arc keeps the timer armed via `is_active`'s
     /// `cursor_temp` term).
+    #[inline]
     pub fn forge_fill(&self) -> Option<u32> {
         let band = self
             .forge_band
@@ -103,6 +104,7 @@ impl CursorGlow {
 
     /// Re-solve the [`ForgeBand`] when the page under the caret changed (a
     /// theme switch, DECSCNM): one bisection per new ground, nothing per frame.
+    #[inline]
     pub(super) fn refresh_forge_band(&mut self, cfg: &GlowConfig) {
         let ground = if cfg.theme_bg & 0xFF00_0000 != 0 {
             // No resolved page (`COLOR_UNSET`): the reference ground of the
@@ -128,6 +130,7 @@ impl CursorGlow {
     /// clock): the full-dark half that master-off and [`Self::reset`] add on top of
     /// [`Self::clear_transient_state`]. The zero-amplitude path does not call this: a momentary
     /// unfocus only cools by the elapsed gap, so earned forge momentum survives a focus blip.
+    #[inline]
     pub(super) fn clear_thermals(&mut self) {
         self.heat = 0.0;
         self.heat_at = None;
@@ -369,7 +372,7 @@ impl ForgeBand {
     /// past what the page allows (on the bright side the breath may ride up
     /// to [`Self::TOP`]).
     #[inline]
-    pub(super) fn at(self, t: f32, breathe: f32) -> f32 {
+    pub(super) const fn at(self, t: f32, breathe: f32) -> f32 {
         let ceiling = if self.bright { Self::TOP } else { self.hi };
         (self.lo + (self.hi - self.lo) * t + breathe).clamp(self.lo, ceiling.max(self.lo))
     }
@@ -379,6 +382,7 @@ impl ForgeBand {
 /// well under one ramp step; the caller has checked it holds at `lo` and
 /// fails at `hi`. Returns the last point known to hold and the first known to
 /// fail.
+#[inline]
 fn bisect_edge(mut lo: f32, mut hi: f32, holds: impl Fn(f32) -> bool) -> (f32, f32) {
     for _ in 0..16 {
         let mid = 0.5 * (lo + hi);

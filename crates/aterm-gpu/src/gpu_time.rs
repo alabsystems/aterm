@@ -116,6 +116,7 @@ struct Slot {
 
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
 impl Slot {
+    #[inline]
     const fn new() -> Self {
         Self {
             pending: AtomicU32::new(0),
@@ -159,12 +160,14 @@ impl FrameRing {
         }
     }
 
+    #[inline]
     fn slot(&self, serial: u64) -> &Slot {
         &self.slots[usize::try_from(serial % RING as u64).unwrap_or(0)]
     }
 
     /// A present found no room to time it outside the ring (every wgpu
     /// readback slot still in flight): counted with the ring's own skips.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn note_skipped(&self) {
         #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
@@ -186,8 +189,9 @@ impl FrameRing {
 
 /// The process's ring, for an arm that opens frames through its own
 /// readback machinery (`crate::wgpu_timer`).
+#[inline]
 #[cfg(wgpu_arm)]
-pub(crate) fn frames() -> &'static FrameRing {
+pub(crate) const fn frames() -> &'static FrameRing {
     &FRAMES
 }
 
@@ -210,6 +214,7 @@ pub fn install_sink(sink: GpuTimeSink) -> bool {
 /// no completion handler, opens no readback and counts nothing. The effects
 /// harness prices the clock with it: the same frame presented timed and
 /// paused.
+#[inline]
 #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
 pub fn set_paused(paused: bool) {
     #[cfg(any(target_os = "macos", wgpu_arm, test))]
@@ -220,6 +225,7 @@ pub fn set_paused(paused: bool) {
 
 /// Whether a sink is installed — presents open frames only then.
 #[must_use]
+#[inline]
 pub fn sink_installed() -> bool {
     #[cfg(any(target_os = "macos", wgpu_arm, test))]
     {
@@ -233,6 +239,7 @@ pub fn sink_installed() -> bool {
 
 /// Frames delivered to the sink since process start.
 #[must_use]
+#[inline]
 pub fn delivered() -> u64 {
     #[cfg(any(target_os = "macos", wgpu_arm, test))]
     {
@@ -246,6 +253,7 @@ pub fn delivered() -> u64 {
 
 /// Frames dropped because a part failed or reported no clock.
 #[must_use]
+#[inline]
 pub fn dropped() -> u64 {
     #[cfg(any(target_os = "macos", wgpu_arm, test))]
     {
@@ -259,6 +267,7 @@ pub fn dropped() -> u64 {
 
 /// Presents that went untimed because their ring slot was still in flight.
 #[must_use]
+#[inline]
 pub fn skipped() -> u64 {
     #[cfg(any(target_os = "macos", wgpu_arm, test))]
     {
@@ -283,6 +292,7 @@ pub(crate) struct FrameToken<'a> {
 /// Open a frame for the present about to run, or `None` when nothing listens
 /// (no sink: zero cost at rest) or its ring slot is still in flight. Metal's
 /// encoder asks it; the wgpu timer opens frames on its own ring.
+#[inline]
 pub(crate) fn open_frame() -> Option<FrameToken<'static>> {
     FRAMES.open_frame()
 }
@@ -319,12 +329,14 @@ impl FrameRing {
 #[cfg(any(target_os = "macos", wgpu_arm, test))]
 impl FrameToken<'_> {
     /// The frame's serial.
+    #[inline]
     pub(crate) const fn serial(self) -> u64 {
         self.serial
     }
 
     /// One more part is about to be submitted. Call before the work can
     /// complete (before `commit`), so the frame cannot be delivered without it.
+    #[inline]
     pub(crate) fn hold(self) {
         self.ring
             .slot(self.serial)
@@ -334,6 +346,7 @@ impl FrameToken<'_> {
 
     /// A held part finished: `Some(ns)` is its GPU span, `None` a failure or
     /// a missing clock (the frame is then dropped), as is an overflowing sum.
+    #[inline]
     pub(crate) fn complete(self, span_ns: Option<u64>) {
         self.complete_parts(span_ns, 1);
     }
@@ -362,6 +375,7 @@ impl FrameToken<'_> {
 
     /// The present returned: release the frame's own hold. The frame is
     /// delivered here when every part already completed.
+    #[inline]
     pub(crate) fn seal(self) {
         release(self);
     }
@@ -428,6 +442,7 @@ fn deliver(token: FrameToken<'_>, s: &Slot) {
 /// reused; `None` while any part is outstanding, and for a serial never
 /// opened or already evicted.
 #[must_use]
+#[inline]
 pub fn settled(serial: u64) -> Option<Settled> {
     #[cfg(any(target_os = "macos", wgpu_arm, test))]
     {
@@ -478,6 +493,7 @@ impl FrameRing {
 /// clock: a zero or non-finite reading, an end before the start, or a span
 /// outside the unsigned 64-bit nanosecond domain.
 #[must_use]
+#[inline]
 pub(crate) fn span_ns(start_s: f64, end_s: f64) -> Option<u64> {
     if !(start_s.is_finite() && end_s.is_finite()) || start_s <= 0.0 || end_s < start_s {
         return None;

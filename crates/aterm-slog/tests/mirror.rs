@@ -1465,8 +1465,9 @@ fn a_mirrored_carry_is_read_whatever_the_writers_bus_class() {
 }
 
 /// WHICH SIDS CROSS (fixer F18, for D4): a restored session's open and its
-/// `amend - restore` carry `prev=` and `lineage=` (and a spawned one's open
-/// `parent=`) as sids, unaliased; no other key of theirs carries one.
+/// `amend - restore` carry `prev=` and `lineage=` as sids, unaliased; no
+/// other key of theirs carries one. A spawned one's open `parent=` stays
+/// local (HOST since session log Phase 6 step 6E-4, ruling U23(c)).
 #[test]
 fn a_restored_sessions_lineage_sids_reach_the_bus() {
     let a = "s-aaaaaaaaaaaaaaaaaaaa";
@@ -1501,7 +1502,7 @@ fn a_restored_sessions_lineage_sids_reach_the_bus() {
             }
         }
     }
-    let want: std::collections::BTreeSet<String> = ["lineage", "parent", "prev"]
+    let want: std::collections::BTreeSet<String> = ["lineage", "prev"]
         .iter()
         .map(|s| (*s).to_string())
         .collect();

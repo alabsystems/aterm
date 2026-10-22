@@ -144,7 +144,9 @@ impl Cmd {
     /// tail about half again as slow. `nice -n 15` keeps the full speed and loses
     /// what the clamp is for: a raw-mode child beside CPU-bound processes echoes
     /// on time only while they are demoted, not while they are niced or at the
-    /// inherited tier. Both measured on a named trustc build:
+    /// inherited tier. Nor does any band verify could move a running compile in
+    /// and out of to free the tail: each measured either let keys wait or ran
+    /// slower than the clamp. All measured on a named trustc build:
     /// `docs/measured/test-compile-tail-2026-10-21.md`. The serial tail is the
     /// compiler's to shorten (`[profile.test]` in the root manifest says where it
     /// goes).

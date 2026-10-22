@@ -25,6 +25,7 @@ use crate::types::{Grapheme, GraphemeInfo};
 /// assert_eq!(info.grapheme_count, 9);
 /// assert_eq!(info.display_width, 11); // 7 ASCII + 2 wide chars
 /// ```
+#[inline]
 pub fn grapheme_width(s: &str) -> GraphemeInfo {
     grapheme_width_inner(s, false)
 }
@@ -77,6 +78,7 @@ fn grapheme_width_inner(s: &str, cjk: bool) -> GraphemeInfo {
 /// This is cluster presentation width. Use [`crate::GridColumns`] for terminal
 /// cursor columns: minimally-qualified `❤‍🔥` presents as 2 here while the grid
 /// keeps its narrow base's 1, and grid fold state can cross cluster boundaries.
+#[inline]
 pub fn grapheme_display_width(grapheme: &str) -> usize {
     grapheme_display_width_inner(grapheme, false)
 }
@@ -147,12 +149,14 @@ fn grapheme_display_width_inner(grapheme: &str, cjk: bool) -> usize {
 /// let info = grapheme_width_with_config("\u{00B0}test", &cjk);
 /// assert_eq!(info.display_width, 6); // degree(2) + t(1) + e(1) + s(1) + t(1)
 /// ```
+#[inline]
 pub fn grapheme_width_with_config(s: &str, config: &TextShapingConfig) -> GraphemeInfo {
     grapheme_width_inner(s, is_cjk(config))
 }
 
 /// [`split_graphemes`] with ambiguous-width characters sized by
 /// `config.ambiguous_width`.
+#[inline]
 pub fn split_graphemes_with_config<'a>(
     s: &'a str,
     config: &TextShapingConfig,
@@ -163,11 +167,13 @@ pub fn split_graphemes_with_config<'a>(
 /// [`grapheme_display_width`] with East Asian Ambiguous characters (degree
 /// sign, em dash, some box drawing) 2 cells wide when
 /// `config.ambiguous_width` is `Double`.
+#[inline]
 pub fn grapheme_display_width_with_config(grapheme: &str, config: &TextShapingConfig) -> usize {
     grapheme_display_width_inner(grapheme, is_cjk(config))
 }
 
-fn is_cjk(config: &TextShapingConfig) -> bool {
+#[inline]
+const fn is_cjk(config: &TextShapingConfig) -> bool {
     matches!(config.ambiguous_width, AmbiguousWidth::Double)
 }
 
@@ -175,10 +181,12 @@ fn is_cjk(config: &TextShapingConfig) -> bool {
 ///
 /// REQUIRES: `s` is valid UTF-8 (`&str` invariant).
 /// ENSURES: iterator yields graphemes in byte order with non-overlapping byte ranges that cover `s`.
+#[inline]
 pub fn split_graphemes(s: &str) -> impl Iterator<Item = Grapheme<'_>> {
     split_graphemes_inner(s, false)
 }
 
+#[inline]
 fn split_graphemes_inner(s: &str, cjk: bool) -> impl Iterator<Item = Grapheme<'_>> {
     s.grapheme_indices().map(move |(offset, g)| {
         let codepoint_count = g.chars().count();
@@ -196,6 +204,7 @@ fn split_graphemes_inner(s: &str, cjk: bool) -> impl Iterator<Item = Grapheme<'_
 
 /// The cluster from its first spacing base. Ambiguous-width policy changes
 /// positive widths only, so the zero-width prefix is shared by both modes.
+#[inline]
 fn spacing_chars(grapheme: &str) -> impl Iterator<Item = char> + '_ {
     grapheme
         .chars()
@@ -204,6 +213,7 @@ fn spacing_chars(grapheme: &str) -> impl Iterator<Item = char> + '_ {
 
 /// Whether the spacing base [`is_emoji_char`]. A cluster with no spacing
 /// base retains the coarse first-character classification (such as VS16).
+#[inline]
 fn is_emoji_grapheme(grapheme: &str) -> bool {
     spacing_chars(grapheme)
         .next()
@@ -214,7 +224,8 @@ fn is_emoji_grapheme(grapheme: &str) -> bool {
 /// Whether `c` is in an emoji-heavy block, a regional indicator or VS16: a
 /// coarse block test for width clustering, not the `Emoji` property (see
 /// [`crate::is_emoji_presentation`]).
-pub fn is_emoji_char(c: char) -> bool {
+#[inline]
+pub const fn is_emoji_char(c: char) -> bool {
     matches!(
         c as u32,
         0x2600..=0x27BF // Miscellaneous Symbols, Dingbats
@@ -230,7 +241,7 @@ pub fn is_emoji_char(c: char) -> bool {
 ///
 /// Skin tone modifiers (Fitzpatrick scale) are U+1F3FB through U+1F3FF.
 #[inline]
-pub fn is_skin_tone_modifier(c: char) -> bool {
+pub const fn is_skin_tone_modifier(c: char) -> bool {
     matches!(c, '\u{1F3FB}'..='\u{1F3FF}')
 }
 
@@ -242,7 +253,7 @@ pub fn is_skin_tone_modifier(c: char) -> bool {
 /// fold skin tones on this, so a skin-toned emoji is one cell either way.
 #[must_use]
 #[inline]
-pub fn is_emoji_modifier_base(c: char) -> bool {
+pub const fn is_emoji_modifier_base(c: char) -> bool {
     let cp = c as u32;
     matches!(
         cp,
@@ -292,6 +303,6 @@ pub fn is_emoji_modifier_base(c: char) -> bool {
 ///
 /// Regional indicators (A-Z) are used in pairs to create flag emoji.
 #[inline]
-pub fn is_regional_indicator(c: char) -> bool {
+pub const fn is_regional_indicator(c: char) -> bool {
     matches!(c, '\u{1F1E6}'..='\u{1F1FF}')
 }

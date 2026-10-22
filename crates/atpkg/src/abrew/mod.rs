@@ -309,8 +309,6 @@ fn mutates(cmd: &str) -> bool {
             | "untap"
             | "bundle"
             | "fetch"
-            | "doctor"
-            | "dr"
     )
 }
 

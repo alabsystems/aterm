@@ -21,7 +21,7 @@ impl AdmissionPhase {
     /// The wire token the `trail` control verb prints.
     #[inline]
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Licensed => "licensed",
             Self::Declined => "declined",
@@ -465,7 +465,7 @@ impl TrailStatus<'_> {
     /// monochrome bar). The verb's headline verdict.
     #[inline]
     #[must_use]
-    pub fn ribbon_active(&self) -> bool {
+    pub const fn ribbon_active(&self) -> bool {
         // A falling curtain is still a ribbon: `ribbon_segments` is floored at
         // the arc's dimmest stop, so late in a curtain every boundary is under
         // it while the band is still visible. Under a curtain the whole band is
@@ -479,8 +479,11 @@ impl TrailStatus<'_> {
     /// default it draws; `issue=` says why), else `off`.
     #[inline]
     #[must_use]
-    pub fn resolved_label(&self) -> &'static str {
-        self.style.map_or("off", GlowStyle::label)
+    pub const fn resolved_label(&self) -> &'static str {
+        match self.style {
+            Some(style) => style.label(),
+            None => "off",
+        }
     }
 
     /// The wire tail after `OK ` — one line, `key=value` pairs in a fixed
@@ -681,14 +684,14 @@ impl CursorGlow {
     /// the ring; served by `trail status`.
     #[inline]
     #[must_use]
-    pub fn admission_tally(&self) -> AdmissionTally {
+    pub const fn admission_tally(&self) -> AdmissionTally {
         self.admission_log.tally
     }
 
     /// Moves the spawn seam has licensed over this engine's life.
     #[inline]
     #[must_use]
-    pub fn spawns(&self) -> u64 {
+    pub const fn spawns(&self) -> u64 {
         self.spawns
     }
 
@@ -696,7 +699,7 @@ impl CursorGlow {
     /// ([`Self::note_band_move`]) over its life.
     #[inline]
     #[must_use]
-    pub fn band_moves(&self) -> u64 {
+    pub const fn band_moves(&self) -> u64 {
         self.coord_band_moves
     }
 
@@ -824,6 +827,7 @@ impl CursorGlow {
     /// (v2's `spine.disp()`), the display twin of the raw
     /// [`Self::typing_momentum`]; they differ during attack and release. `0.0`
     /// unless v2 owns the frame.
+    #[inline]
     #[must_use]
     pub fn momentum_display(&self) -> f32 {
         if self.v2.engaged() {
@@ -869,12 +873,14 @@ impl CursorGlow {
 
     /// This frame's radial light (see `halo_out`), for the host to splice
     /// into `RenderInput.glow_halo` right beside the `GlowQuad` scratch.
+    #[inline]
     pub fn halos(&self) -> &[RainHalo] {
         &self.halo_out
     }
 
     /// This frame's under-ink flame body (see `under_out`), for
     /// `RenderInput.glow_under`.
+    #[inline]
     pub fn under_quads(&self) -> &[GlowQuad] {
         &self.under_out
     }
@@ -884,18 +890,21 @@ impl CursorGlow {
     /// light rod, the typing glow), so every host's `glow_under` carries them
     /// with no host change. Each body bounds its own few quads; their
     /// fingerprints move the frame's.
+    #[inline]
     pub(crate) fn under_sink(&mut self) -> &mut Vec<GlowQuad> {
         &mut self.under_out
     }
 
     /// This frame's per-pixel fire (see `patch_out`), for
     /// `RenderInput.fire_patch`.
+    #[inline]
     pub fn patches(&self) -> &[FirePatch] {
         &self.patch_out
     }
 
     /// This frame's charred-ink overrides (see `char_out`), for
     /// `RenderInput.char_fg`.
+    #[inline]
     pub fn charred(&self) -> &[CharFg] {
         &self.char_out
     }
@@ -904,8 +913,9 @@ impl CursorGlow {
     /// will be laid in. Read after [`Self::tick`] and hand it to
     /// [`crate::cursor_phaser::CursorPhaser`] so the emitter cursor and the
     /// streak are one piece of light.
+    #[inline]
     #[must_use]
-    pub fn beam_hue(&self) -> f32 {
+    pub const fn beam_hue(&self) -> f32 {
         self.hue
     }
 
@@ -915,6 +925,7 @@ impl CursorGlow {
     /// caret, its halo and the ribbon under that cell resolve one spectrum
     /// position. Authoritative only while this engine runs
     /// [`GlowStyle::RainbowKitty`].
+    #[inline]
     #[must_use]
     pub fn rainbow_phase(&self) -> f32 {
         // While v2 owns the frame the shared phase ring is v2's spine clock; at
@@ -928,6 +939,7 @@ impl CursorGlow {
     /// The caret's spectrum position, `0` red … `1` violet: v2's seated stop
     /// (`v2_stop`, held across a cell death under a parked caret), else its live
     /// field; `0.0` (the arc's origin) while v2 does not own the frame.
+    #[inline]
     pub fn rainbow_field(&self) -> f32 {
         if self.v2.engaged() {
             return self.v2_stop.map_or_else(|| self.v2.field(), |(t, _)| t);
@@ -941,6 +953,7 @@ impl CursorGlow {
     /// dark, that stop's caret ink on the page on light. The two agree to the
     /// byte on every seat frame
     /// (`the_caret_settles_on_its_own_stop_without_a_pop`).
+    #[inline]
     pub(super) fn v2_caret_stop_rgb(t: f32, cfg: &rk::Config) -> u32 {
         rk::ribbon::caret_ink(crate::spectrum::spectrum(rk::ribbon::walk_arc(t)), cfg)
     }
@@ -953,6 +966,7 @@ impl CursorGlow {
     /// once. Dark themes return the authored spectrum colour; light themes the
     /// caret's ink on the page at that same field position. A non-rainbow config,
     /// or an engine that has not observed a cursor yet, returns `None`.
+    #[inline]
     #[must_use]
     pub fn rainbow_head_rgb(&self, cfg: &GlowConfig) -> Option<u32> {
         // While v2 owns the frame the head colour is read off the seated stop,
@@ -982,6 +996,7 @@ impl CursorGlow {
 
     /// This frame's fire contrast-halo strengths (see `fire_halo_out`), for
     /// `RenderInput.fire_halo`.
+    #[inline]
     pub fn halo_cells(&self) -> &[FireHaloCell] {
         &self.fire_halo_out
     }
@@ -1000,30 +1015,35 @@ impl CursorGlow {
     ///
     /// `dst`'s previous contents come back in exchange and are cleared by the
     /// next [`Self::tick`]; never read them off the engine.
+    #[inline]
     pub fn swap_halos(&mut self, dst: &mut Vec<RainHalo>) {
         std::mem::swap(dst, &mut self.halo_out);
     }
 
     /// Move this frame's under-ink flame body into `dst` (see
     /// [`Self::under_quads`]). Same previous-frame caveat as [`Self::swap_halos`].
+    #[inline]
     pub fn swap_under_quads(&mut self, dst: &mut Vec<GlowQuad>) {
         std::mem::swap(dst, &mut self.under_out);
     }
 
     /// Move this frame's per-pixel fire into `dst` (see [`Self::patches`]).
     /// Same previous-frame caveat as [`Self::swap_halos`].
+    #[inline]
     pub fn swap_patches(&mut self, dst: &mut Vec<FirePatch>) {
         std::mem::swap(dst, &mut self.patch_out);
     }
 
     /// Move this frame's charred-ink overrides into `dst` (see
     /// [`Self::charred`]). Same previous-frame caveat as [`Self::swap_halos`].
+    #[inline]
     pub fn swap_charred(&mut self, dst: &mut Vec<CharFg>) {
         std::mem::swap(dst, &mut self.char_out);
     }
 
     /// Move this frame's fire contrast-halo strengths into `dst` (see
     /// [`Self::halo_cells`]). Same previous-frame caveat as [`Self::swap_halos`].
+    #[inline]
     pub fn swap_halo_cells(&mut self, dst: &mut Vec<FireHaloCell>) {
         std::mem::swap(dst, &mut self.fire_halo_out);
     }
@@ -1043,6 +1063,7 @@ impl TextSpans {
     /// glyph, or a blank between two of a line's glyphs (a mark in the gap
     /// between words reads as punctuation, a hyphen or a middle dot, as
     /// surely as one over a letter reads as noise).
+    #[inline]
     pub(super) fn covers_cell(&self, row: i32, col: i32) -> bool {
         self.rows
             .iter()
@@ -1052,12 +1073,14 @@ impl TextSpans {
 
     /// Each probed line of text as `(row, first, end)`: the column span from
     /// its first glyph to one past its last.
+    #[inline]
     pub(super) fn lines(&self) -> impl Iterator<Item = (i32, i32, i32)> + '_ {
         self.rows.iter().flatten().copied()
     }
 
     /// Whether the probe read grid row `row` this frame, so a cell of it off
     /// every line ([`Self::covers_cell`]) is known blank rather than unknown.
+    #[inline]
     pub(super) fn reads_row(&self, row: i32) -> bool {
         self.read.contains(&Some(row))
     }
@@ -1082,6 +1105,7 @@ pub(crate) struct FrameText {
 impl FrameText {
     /// The ink (`None` for a blank cell) and ground of cell `(row, col)` in
     /// the frame's own cells, or `None` for a cell the frame did not read.
+    #[inline]
     pub(crate) fn pair(&self, row: i32, col: i32) -> Option<(Option<u32>, u32)> {
         let i = row - self.lo;
         if i < 0 || i as usize >= self.rows.len() || col < 0 || col as usize >= self.cols {
@@ -1107,6 +1131,7 @@ pub(crate) struct TextView<'a> {
 impl<'a> TextView<'a> {
     /// The probe's lines and the frame's rows `frame` (`None` for a frame
     /// that handed none).
+    #[inline]
     pub(crate) fn new(spans: TextSpans, frame: Option<&'a FrameText>) -> Self {
         match frame {
             Some(f) => Self {
@@ -1124,6 +1149,7 @@ impl<'a> TextView<'a> {
 
     /// The frame's own read of `row`: `Some(span)` for a row it read
     /// (`span` `None` when blank), `None` for a row it did not.
+    #[inline]
     fn frame_row(&self, row: i32) -> Option<Option<(i32, i32)>> {
         let i = row - self.lo;
         (i >= 0)
@@ -1132,6 +1158,7 @@ impl<'a> TextView<'a> {
     }
 
     /// Whether the frame says what row `row` holds (the probe or the cells).
+    #[inline]
     pub(crate) fn knows_row(&self, row: i32) -> bool {
         self.spans.reads_row(row) || self.frame_row(row).is_some()
     }
@@ -1139,6 +1166,7 @@ impl<'a> TextView<'a> {
     /// The text line of a row the probe did not read but the frame's cells
     /// did: `Some(Some((first, end)))` for a row with glyphs, `Some(None)`
     /// for a blank one, `None` where neither read it.
+    #[inline]
     pub(crate) fn frame_line(&self, row: i32) -> Option<Option<(i32, i32)>> {
         if self.spans.reads_row(row) {
             return None;
@@ -1148,6 +1176,7 @@ impl<'a> TextView<'a> {
 
     /// Whether grid cell `(row, col)` lies on a line of text the frame
     /// shows (a glyph, or a blank between two of a line's glyphs).
+    #[inline]
     pub(crate) fn covers_cell(&self, row: i32, col: i32) -> bool {
         if self.spans.reads_row(row) {
             return self.spans.covers_cell(row, col);
@@ -1160,6 +1189,7 @@ impl<'a> TextView<'a> {
     /// Whether the frame shows grid row `row` blank: read (by the probe or
     /// the frame's own cells) and holding no glyph. A row nobody read is
     /// not known blank.
+    #[inline]
     pub(crate) fn row_is_blank(&self, row: i32) -> bool {
         if self.spans.reads_row(row) {
             !self.spans.lines().any(|line| line.0 == row)
@@ -1171,6 +1201,7 @@ impl<'a> TextView<'a> {
     /// Whether the dark streak treats cell `(row, col)` as text: a cell on
     /// a line of text, or one on a row nobody read (so the full beam lands
     /// only where the frame showed air).
+    #[inline]
     pub(crate) fn over_text(&self, row: i32, col: i32) -> bool {
         !self.knows_row(row) || self.covers_cell(row, col)
     }

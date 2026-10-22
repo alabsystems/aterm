@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the update notice under the plain launch card, fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1), `lastReleaseNotesSeen` seeded to 2.1.290 before launch: the card from row 1 (one row of top air), one blank row, the bold summary (74 cells with its indent) and the dim (#999999) details row at column 2, no OSC 8 link on either; the composer pinned to the bottom
+
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.JhpC/proj
+
+  Updated to latest. Got 66 features, 424 bugfixes, and 126 other changes.
+  code.claude.com/docs/en/changelog for details
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

@@ -138,7 +138,7 @@ pub const RAINBOW_DRIFT_MS: u32 = 2500;
 /// The default rainbow ink spec.
 #[inline]
 #[must_use]
-pub fn rainbow_ink() -> InkSpec {
+pub const fn rainbow_ink() -> InkSpec {
     InkSpec {
         colorway: Colorway::Rainbow {
             sat: RAINBOW_SAT,
@@ -612,35 +612,41 @@ pub struct CompiledToyPack {
 }
 
 impl CompiledToyPack {
+    #[inline]
     #[must_use]
-    pub fn metadata(&self) -> &ToyPackMetadata {
+    pub const fn metadata(&self) -> &ToyPackMetadata {
         &self.metadata
     }
 
+    #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn spec_table(&self) -> &SpecTable {
+    pub const fn spec_table(&self) -> &SpecTable {
         &self.spec_table
     }
 
     /// Scanner entries to append to the normal user lexicon override.
+    #[inline]
     #[must_use]
     #[cfg(test)]
     pub fn lexicon_toml(&self) -> &str {
         &self.lexicon_toml
     }
 
+    #[inline]
     #[must_use]
-    pub fn toy_count(&self) -> usize {
+    pub const fn toy_count(&self) -> usize {
         self.toy_count
     }
 
+    #[inline]
     #[must_use]
-    pub fn word_count(&self) -> usize {
+    pub const fn word_count(&self) -> usize {
         self.word_count
     }
 
     /// Consume the pack into the two runtime dispatch artifacts plus metadata.
+    #[inline]
     #[must_use]
     pub fn into_parts(self) -> (ToyPackMetadata, SpecTable, String) {
         (self.metadata, self.spec_table, self.lexicon_toml)

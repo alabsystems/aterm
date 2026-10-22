@@ -22,6 +22,7 @@ use crate::pipeline_table::{
 };
 
 /// The Metal spelling of one [`Factor`].
+#[inline]
 const fn metal_factor(f: Factor) -> BlendFactor {
     match f {
         Factor::Zero => BlendFactor::Zero,
@@ -36,8 +37,11 @@ const fn metal_factor(f: Factor) -> BlendFactor {
 /// [`RenderPipelineDescriptor::set_color_attachment`], or `None` for no
 /// blending: a row with `blend: None` or a row whose blend is REPLACE
 /// ([`Blend::is_replace`]).
-pub(crate) fn metal_blend(blend: Option<Blend>) -> Option<BlendState> {
-    let b = blend?;
+#[inline]
+pub(crate) const fn metal_blend(blend: Option<Blend>) -> Option<BlendState> {
+    let Some(b) = blend else {
+        return None;
+    };
     if b.is_replace() {
         return None;
     }
@@ -52,6 +56,7 @@ pub(crate) fn metal_blend(blend: Option<Blend>) -> Option<BlendState> {
 }
 
 /// The Metal spelling of one [`BlendOp`].
+#[inline]
 const fn metal_operation(op: BlendOp) -> BlendOperation {
     match op {
         BlendOp::Add => BlendOperation::Add,
@@ -59,6 +64,7 @@ const fn metal_operation(op: BlendOp) -> BlendOperation {
 }
 
 /// The Metal spelling of one [`WriteMask`].
+#[inline]
 pub(crate) const fn metal_write_mask(m: WriteMask) -> ColorWriteMask {
     match m {
         WriteMask::Color => ColorWriteMask::COLOR,
@@ -67,6 +73,7 @@ pub(crate) const fn metal_write_mask(m: WriteMask) -> ColorWriteMask {
 }
 
 /// The Metal spelling of one [`AttrFormat`].
+#[inline]
 const fn metal_attr_format(f: AttrFormat) -> VertexFormat {
     match f {
         AttrFormat::Uint16x4 => VertexFormat::UShort4,
@@ -86,7 +93,8 @@ const fn metal_attr_format(f: AttrFormat) -> VertexFormat {
 ///
 /// Hand-written because no wgpu type may enter this module; the Metal-vs-wgpu
 /// byte differentials in `metal::tests` catch a role it resolves differently.
-pub(crate) fn metal_format(role: TargetRole, present: PixelFormat) -> PixelFormat {
+#[inline]
+pub(crate) const fn metal_format(role: TargetRole, present: PixelFormat) -> PixelFormat {
     match role {
         TargetRole::OffscreenSrgb => PixelFormat::Rgba8UnormSrgb,
         TargetRole::OffscreenUnorm => PixelFormat::Rgba8Unorm,

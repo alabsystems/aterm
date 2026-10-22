@@ -52,9 +52,12 @@ const MENU_ROWS: u64 = 64;
 /// The bits of a menu's epoch: with [`MENU_ROWS`] slots each, the last item id stays
 /// below [`CHIP_BASE`] (`MENU_BASE + 1 + (2^22 − 1) · 64 + 63 < 2^30`).
 const MENU_EPOCH_BITS: u32 = 22;
-/// The chips in a Claude Code composer rule (design §9.2.1, owner surfaces §5) are
-/// `CHIP_BASE + session · 4 + chip` ([`chip_for`]): Autopilot `0`, Team `1`, and on the
-/// top rule the harness switch `2` and its `on` button `3`.
+/// The chips and facts in a Claude Code composer's rules (design §9.2.1, owner surfaces
+/// §5, `crate::claude_facts`) are `CHIP_BASE + session · 16 + slot` ([`chip_for`]):
+/// Autopilot `0`, Team `1`, the top rule's key `2`, the model `3`, the effort `4`, the
+/// working directory `5`, the branch `6`, the usage `7`, the permission-mode light `8`,
+/// the top rule's harness switch `9`, the title slot `10`, the context `11`, the
+/// switch's `on` button `12`; `13..16` are free and decode as nothing.
 /// Between the menu's range and [`TAB_BASE`], so [`tab_index_for`] and
 /// [`ChromeMessage::from_node`] refuse a chip and a click on one never decodes as a tab
 /// switch or a band's capsule.
@@ -480,9 +483,12 @@ pub(crate) struct GridMessage {
     pub(crate) capsules: Vec<BandCapsule>,
 }
 
-/// One of the chips in a Claude Code composer rule the tree publishes: the harness's
-/// Autopilot (design §9.2.1, §2.3) and the Team chip (owner surfaces §5). No settings
-/// button stands in the rule (owner, 2026-10-20), so none is published.
+/// One of the targets in a Claude Code composer's rules the tree publishes: the harness's
+/// Autopilot (design §9.2.1, §2.3), the Team chip (owner surfaces §5), the top rule's
+/// effort key, the bottom rule's facts (`crate::claude_facts`), the permission-mode light,
+/// the top rule's harness switch and the chips' title slot — everything aterm draws in
+/// the rules, so a reader that hears Claude's own `─` there (the grid's text is Claude's)
+/// loses none of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HarnessChip {
     /// The Autopilot chip: a click steps the session's word (or, where a switch of
@@ -491,24 +497,109 @@ pub(crate) enum HarnessChip {
     /// The Team chip (`✋ you`, `⇠ <manager>`, `⇉N`): a click hands the tab back, goes to
     /// the manager, or opens the Overview at a manager.
     Team,
-    /// The harness switch on the composer's top rule (`claude harness ● on`, `claude
-    /// harness ○ off`): a `Role::Switch` with its on/off state; a click flips it.
+    /// The top rule's effort key (Claude's tag, or aterm's ghost of it): a
+    /// click toggles it for the session.
+    TopEffort,
+    /// The model fact (`◆ Opus 5.5`): a click hides or shows it.
+    Model,
+    /// The effort fact (`xhigh`): a click hides or shows it.
+    Effort,
+    /// The working directory fact (`⌂ ~/aterm`): a click hides or shows it.
+    Path,
+    /// The branch fact (`⎇ main`): a click hides or shows it.
+    Branch,
+    /// The context fact (`◐ ctx 84% left`): a click hides or shows it.
+    Context,
+    /// The usage fact (`Σ 6m33s ↑20M ↓82k`).
+    Usage,
+    /// The permission-mode light (`⏸ plan`), drawn only where the mode is not one the
+    /// owner expects: a click presses Claude's own shift+tab toward bypass or auto.
+    Mode,
+    /// The harness switch on the composer's top rule (`alab harness ● on`, `alab
+    /// harness ○ off`), named with the product (`alab harness on: Claude Code`): a
+    /// `Role::Switch` with its on/off state; a click flips it.
     Switch,
     /// An off switch's `on` button: a click turns the harness on.
     SwitchOn,
+    /// The chips' title slot beside them (a chip's title, a refusal, a toggle's notice,
+    /// the act's label): text, published as a status node no reader is interrupted by.
+    Title,
 }
 
 impl HarnessChip {
-    /// The chips a session's ids have room for.
-    const SLOTS: u64 = 4;
+    /// The targets a session's ids have room for.
+    const SLOTS: u64 = 16;
 
     /// Its place in its session's ids.
     const fn index(self) -> u64 {
         match self {
             Self::Autopilot => 0,
             Self::Team => 1,
-            Self::Switch => 2,
-            Self::SwitchOn => 3,
+            Self::TopEffort => 2,
+            Self::Model => 3,
+            Self::Effort => 4,
+            Self::Path => 5,
+            Self::Branch => 6,
+            Self::Usage => 7,
+            Self::Mode => 8,
+            Self::Switch => 9,
+            Self::Title => 10,
+            Self::Context => 11,
+            Self::SwitchOn => 12,
+        }
+    }
+
+    /// The target in slot `index` of a session's ids, or `None` for a free slot.
+    const fn at(index: u64) -> Option<Self> {
+        Some(match index {
+            0 => Self::Autopilot,
+            1 => Self::Team,
+            2 => Self::TopEffort,
+            3 => Self::Model,
+            4 => Self::Effort,
+            5 => Self::Path,
+            6 => Self::Branch,
+            7 => Self::Usage,
+            8 => Self::Mode,
+            9 => Self::Switch,
+            10 => Self::Title,
+            11 => Self::Context,
+            12 => Self::SwitchOn,
+            _ => return None,
+        })
+    }
+
+    /// The node of a fact.
+    pub(crate) const fn of_fact(fact: crate::claude_lights::Fact) -> Self {
+        use crate::claude_lights::Fact;
+        match fact {
+            Fact::Model => Self::Model,
+            Fact::Effort => Self::Effort,
+            Fact::Path => Self::Path,
+            Fact::Branch => Self::Branch,
+            Fact::Context => Self::Context,
+            Fact::Usage => Self::Usage,
+            Fact::TopEffort => Self::TopEffort,
+        }
+    }
+
+    /// The fact it is, where it is one.
+    pub(crate) const fn fact(self) -> Option<crate::claude_lights::Fact> {
+        use crate::claude_lights::Fact;
+        match self {
+            Self::Model => Some(Fact::Model),
+            Self::Effort => Some(Fact::Effort),
+            Self::Path => Some(Fact::Path),
+            Self::Branch => Some(Fact::Branch),
+            Self::Context => Some(Fact::Context),
+            Self::Usage => Some(Fact::Usage),
+            Self::TopEffort => Some(Fact::TopEffort),
+            Self::Autopilot
+            | Self::Team
+            | Self::Mode
+            | Self::Switch
+            | Self::SwitchOn
+            | Self::Title => None,
         }
     }
 }
@@ -593,13 +684,10 @@ pub(crate) fn chip_for(node: NodeId) -> Option<(u64, HarnessChip)> {
         .0
         .checked_sub(CHIP_BASE)
         .filter(|_| node.0 < TAB_BASE)?;
-    let chip = match at % HarnessChip::SLOTS {
-        0 => HarnessChip::Autopilot,
-        1 => HarnessChip::Team,
-        2 => HarnessChip::Switch,
-        _ => HarnessChip::SwitchOn,
-    };
-    Some((at / HarnessChip::SLOTS, chip))
+    Some((
+        at / HarnessChip::SLOTS,
+        HarnessChip::at(at % HarnessChip::SLOTS)?,
+    ))
 }
 
 /// Fold a hash of the menu's rows to a menu epoch ([`GridMenu::epoch`]).
@@ -643,7 +731,11 @@ fn cells_rect(g: GridGeometry, row: usize, col: usize, width: usize, height: usi
 /// words with its newest act as its description; return their ids in painted order. The
 /// Autopilot chip also says it has a popup menu (`HasPopup::Menu`) and offers
 /// `Action::ShowContextMenu`, which opens it (design §9.3.3: what its right-click does,
-/// where a click cycles the mode); Team has no menu.
+/// where a click cycles the mode), and so does every fact — the model's, the effort's, the
+/// folder's and the branch's menus, the usage's Traffic card (`crate::fact_menu`); Team has
+/// none. The title slot is no button: a `Role::Status` named by its words, with no action
+/// and no live politeness, so a reader finds it beside the chips and is never interrupted
+/// by it.
 fn push_chips(
     nodes: &mut Vec<(NodeId, Node)>,
     chips: &[GridChip],
@@ -654,7 +746,10 @@ fn push_chips(
         let Some(id) = chip_node_id(chip.session, chip.chip) else {
             continue;
         };
-        let mut node = Node::new(if chip.toggled.is_some() {
+        let title = chip.chip == HarnessChip::Title;
+        let mut node = Node::new(if title {
+            Role::Status
+        } else if chip.toggled.is_some() {
             Role::Switch
         } else {
             Role::Button
@@ -669,8 +764,11 @@ fn push_chips(
         if let Some(g) = geom {
             node.set_bounds(cells_rect(g, chip.row, chip.col, chip.width, 1));
         }
-        node.add_action(Action::Click);
-        if chip.chip == HarnessChip::Autopilot {
+        if !title {
+            node.add_action(Action::Click);
+        }
+        let menu = chip.chip == HarnessChip::Autopilot || chip.chip.fact().is_some();
+        if menu {
             node.set_has_popup(aterm_a11y::model::HasPopup::Menu);
             node.add_action(Action::ShowContextMenu);
         }
@@ -2514,6 +2612,90 @@ mod tests {
         assert!(!spoken("\u{221e} cruise"));
         let bare = grid_tree(&snap, Some(GEOM), &GridFrame::default());
         assert!(bare.nodes.iter().all(|(id, _)| chip_for(*id).is_none()));
+    }
+
+    /// THE LIGHT, THE SWITCH AND THE TITLE SLOT HAVE IDS OF THEIR OWN (review G1):
+    /// every target round-trips through its id, two sessions' ids never meet, and the
+    /// title slot is a `Role::Status` named by its words with no action and no live
+    /// politeness, where the light and the switch's `on` are clickable buttons. NEGATIVE
+    /// CONTROL: a free slot of a session's ids decodes as nothing, never as a target.
+    #[test]
+    fn the_light_the_switch_and_the_title_slot_have_ids_of_their_own() {
+        let all = [
+            HarnessChip::Autopilot,
+            HarnessChip::Team,
+            HarnessChip::TopEffort,
+            HarnessChip::Model,
+            HarnessChip::Effort,
+            HarnessChip::Path,
+            HarnessChip::Branch,
+            HarnessChip::Usage,
+            HarnessChip::Mode,
+            HarnessChip::Switch,
+            HarnessChip::Title,
+            HarnessChip::Context,
+            HarnessChip::SwitchOn,
+        ];
+        let mut ids = std::collections::HashSet::new();
+        for session in [0, 1, 7] {
+            for chip in all {
+                let id = chip_node_id(session, chip).expect("an id");
+                assert_eq!(chip_for(id), Some((session, chip)));
+                assert!(ids.insert(id), "{session} {chip:?}: one id each");
+            }
+        }
+        for free in u64::try_from(all.len()).unwrap()..HarnessChip::SLOTS {
+            assert_eq!(
+                chip_for(NodeId(CHIP_BASE + HarnessChip::SLOTS + free)),
+                None,
+                "slot {free}: free"
+            );
+        }
+        let snap = live_grid(3, 40, b"hi", Some((0, 2)));
+        let at = |chip, label: &str, col| GridChip {
+            session: 2,
+            chip,
+            label: label.to_string(),
+            description: None,
+            row: 2,
+            col,
+            width: 4,
+            toggled: None,
+        };
+        let chips = [
+            at(HarnessChip::Mode, "Permission mode: plan.", 2),
+            at(
+                HarnessChip::SwitchOn,
+                "on: turn the Claude Code harness on",
+                20,
+            ),
+            at(
+                HarnessChip::Title,
+                "Permission mode: click for bypass or auto",
+                8,
+            ),
+        ];
+        let update = grid_tree(
+            &snap,
+            Some(GEOM),
+            &GridFrame {
+                chips: &chips,
+                ..GridFrame::default()
+            },
+        );
+        for chip in &chips {
+            let n = node(&update, chip_node_id(2, chip.chip).expect("an id"));
+            let title = chip.chip == HarnessChip::Title;
+            assert_eq!(n.role(), if title { Role::Status } else { Role::Button });
+            assert_eq!(n.supports_action(Action::Click), !title, "{:?}", chip.chip);
+            assert!(
+                !n.supports_action(Action::ShowContextMenu),
+                "{:?}",
+                chip.chip
+            );
+            assert_eq!(n.label(), Some(chip.label.as_str()));
+            assert_eq!(n.live(), None, "never a live region");
+        }
     }
 
     /// THE OPEN AUTOPILOT MENU IS A MENU (design §9.3.3): a `Role::Menu` named by its

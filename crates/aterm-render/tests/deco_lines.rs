@@ -104,6 +104,35 @@ fn resolved_bands_always_inside_the_cell() {
     }
     assert!(checked > 100_000, "lattice must be adversarial ({checked})");
 
+    // A positive value beyond a 32-bit pixel index saturates before the in-cell clamp.
+    let past_u32 = 4_294_967_296.0;
+    let thick = resolve_deco_metrics(
+        20,
+        0,
+        1.0,
+        Some(DecoTables {
+            underline: Some((0.0, past_u32)),
+            strikeout: Some((0.0, past_u32)),
+        }),
+        0,
+        0,
+    );
+    assert_eq!((thick.underline_y, thick.underline_t), (0, 20));
+    assert_eq!((thick.strike_y, thick.strike_t), (0, 20));
+    let low = resolve_deco_metrics(
+        20,
+        0,
+        1.0,
+        Some(DecoTables {
+            underline: Some((-past_u32, 1.0)),
+            strikeout: Some((-past_u32, 1.0)),
+        }),
+        0,
+        0,
+    );
+    assert_eq!((low.underline_y, low.underline_t), (19, 1));
+    assert_eq!((low.strike_y, low.strike_t), (19, 1));
+
     // Non-finite and extreme inputs, including a zero `cell_h` (treated as 1) and one past
     // the signed range: the casts saturate, and the adjust and clamp arithmetic must be total.
     for cell_h in [0, 1, 27, usize::MAX] {

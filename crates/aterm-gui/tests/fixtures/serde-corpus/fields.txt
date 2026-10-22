@@ -15,7 +15,7 @@ Config/sparkle_words.ink	ok	enabled strength sweep_ms loop
 Config/sparkle_words.emphasis	ok	enabled extra_words ignore_words
 Config/matrix_rain	ok	enabled fps density speed trail alpha head_alpha hue mutation_ms idle_secs suppress_in_alt_screen materialize output_material turn_wave bell_alert exit_tint ink_text phosphor seed
 Config/presence	ok	rim
-Config/claude_footer	ok	usage card acts
+Config/claude_footer	ok	usage card acts agents
 Config/render	ok	repaint_nudge
 Config/output_streak	ok	enabled intensity tail max_streaks idle_secs sound
 Config/packages	ok	enabled auto_update auto_install seed_install account exclude

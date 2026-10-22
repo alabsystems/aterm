@@ -3749,6 +3749,7 @@ impl Wake {
             | Wake::OpenApp { .. }
             | Wake::FrontControlSurface { .. }
             | Wake::OpenAuxWindow { .. }
+            | Wake::OpenFactMenu { .. }
             | Wake::PkgSeed { .. }
             | Wake::AgentUpgrade { .. }
             | Wake::AgentUpgradeWord { .. }
@@ -3856,8 +3857,6 @@ impl Wake {
             Wake::CommitSessionRename { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::CancelSessionRename { .. } => None,
-            #[cfg(target_os = "macos")]
-            Wake::OpenSystemState => None,
             Wake::WorkstationSetup(_)
             | Wake::InitialSetupStatus { .. }
             | Wake::InitialSetupApplyResolved => None,

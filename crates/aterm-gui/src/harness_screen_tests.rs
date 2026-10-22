@@ -3343,7 +3343,8 @@ fn a_landing_stands_until_a_render_has_drawn_it() {
     let landed = drawn(&app, late);
     assert!(selected(&landed), "listed, and landed on: {landed:?}");
     // A LATER OPEN REPLACES A LANDING STILL WAITING FOR ITS ROW (the review
-    // of the fix): `Harness settings…` for a session not listed yet, then View ▸ Coding
+    // of the fix): a session's landing (the Autopilot menu's `Harness
+    // settings…`) for a session not listed yet, then View ▸ Coding
     // Agent Harness… (the page's top) — the session listed afterwards moves
     // nothing: the page stays at its top, STATUS on screen, and no row is
     // drawn selected.
@@ -3387,7 +3388,7 @@ fn a_landing_stands_until_a_render_has_drawn_it() {
 }
 
 /// THE PAGE LANDS ON THE ROW (§10.3.3, item 8): the Autopilot menu's
-/// `Harness settings…` (`open_harness_settings` with the session) for a session whose row
+/// `Harness settings…` for a session whose row
 /// is off the page's first screen opens the page with that row in view and
 /// its Show drawn selected — before any render has measured the page, and
 /// again after one has, for another row; the next press lets the selection
@@ -3395,7 +3396,7 @@ fn a_landing_stands_until_a_render_has_drawn_it() {
 /// the page opened at its top shows the far row off screen and nothing
 /// selected.
 #[test]
-fn harness_settings_lands_the_page_on_its_sessions_row_drawn_selected() {
+fn a_sessions_landing_puts_its_row_in_view_drawn_selected() {
     use crate::app_introspect::AuxTarget;
     use crate::harness_screen::HarnessFocus;
     let mut app = App::headless_for_test();

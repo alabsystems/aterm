@@ -90,8 +90,19 @@ pub use visible_row_view::{CellDataView, VisibleRowView};
 /// Convert an i32 to u16 after clamping to non-negative (cursor math).
 #[cfg(test)]
 #[inline]
-fn clamp_u16(val: i32) -> u16 {
-    val.max(0).try_into().unwrap_or(u16::MAX)
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped to 0..=u16::MAX before cast"
+)]
+const fn clamp_u16(val: i32) -> u16 {
+    if val <= 0 {
+        0
+    } else if val > u16::MAX as i32 {
+        u16::MAX
+    } else {
+        val as u16
+    }
 }
 
 use state::GridStorage;
@@ -112,6 +123,7 @@ pub struct Grid {
 impl Grid {
     /// Get a row by visible row index.
     #[must_use]
+    #[inline]
     pub fn row(&self, visible_row: u16) -> Option<&Row> {
         self.storage.row(visible_row)
     }
@@ -124,12 +136,14 @@ impl Grid {
 
     /// Get a cell at the given position.
     #[must_use]
+    #[inline]
     pub fn cell(&self, row: u16, col: u16) -> Option<&Cell> {
         self.row(row).and_then(|r| r.get(col))
     }
 
     /// Get a mutable cell at the given position.
     #[cfg(test)]
+    #[inline]
     pub fn cell_mut(&mut self, row: u16, col: u16) -> Option<&mut Cell> {
         self.row_mut(row).and_then(|r| r.get_mut(col))
     }
@@ -151,8 +165,8 @@ impl Grid {
     /// `bg_rgb` is `Some([r, g, b])` for a truecolor background; erases write
     /// it into the `RgbColorRing` for every filled cell.
     #[inline]
-    pub fn set_cursor_template(&mut self, template: Cell, bg_rgb: Option<[u8; 3]>) {
-        self.storage.cursor_template = template;
-        self.storage.cursor_template_bg_rgb = bg_rgb;
+    pub const fn set_cursor_template(&mut self, template: Cell, bg_rgb: Option<[u8; 3]>) {
+        self.storage.cursor_state.cursor_template = template;
+        self.storage.cursor_state.cursor_template_bg_rgb = bg_rgb;
     }
 }

@@ -91,77 +91,95 @@ pub trait ScrollbackAccess: sealed::Sealed {
 impl sealed::Sealed for Scrollback {}
 
 impl ScrollbackAccess for Scrollback {
+    #[inline]
     fn line_count(&self) -> usize {
         self.line_count()
     }
 
+    #[inline]
     fn get_line(&self, idx: usize) -> Result<Option<Cow<'_, Line>>, ScrollbackError> {
         self.get_line(idx)
     }
 
+    #[inline]
     fn get_line_rev(&self, rev_idx: usize) -> Result<Option<Cow<'_, Line>>, ScrollbackError> {
         self.get_line_rev(rev_idx)
     }
 
+    #[inline]
     fn hot_limit(&self) -> usize {
         self.hot_limit()
     }
 
+    #[inline]
     fn warm_limit(&self) -> usize {
         self.warm_limit()
     }
 
+    #[inline]
     fn line_limit(&self) -> Option<usize> {
         self.line_limit()
     }
 
+    #[inline]
     fn memory_budget(&self) -> usize {
         self.memory_budget()
     }
 
+    #[inline]
     fn budgeted_memory_used(&self) -> usize {
         self.budgeted_memory_used()
     }
 
+    #[inline]
     fn total_memory_used(&self) -> usize {
         self.total_memory_used()
     }
 
+    #[inline]
     fn cold_line_count(&self) -> usize {
         self.cold_line_count()
     }
 
+    #[inline]
     fn cold_memory_used(&self) -> usize {
         self.cold_memory_used()
     }
 
+    #[inline]
     fn watermark_level(&self) -> WatermarkLevel {
         self.watermark_level()
     }
 
+    #[inline]
     fn image_rows_dropped_by_compression(&self) -> u64 {
         self.image_rows_dropped_by_compression()
     }
 
+    #[inline]
     fn push_line(&mut self, line: Line) -> std::io::Result<()> {
         // The inherent push_line and clear are infallible.
         Scrollback::push_line(self, line);
         Ok(())
     }
 
+    #[inline]
     fn clear(&mut self) -> std::io::Result<()> {
         Scrollback::clear(self);
         Ok(())
     }
 
+    #[inline]
     fn remove_newest(&mut self, n: usize) -> Result<(), ScrollbackError> {
         self.remove_newest(n)
     }
 
+    #[inline]
     fn set_line_limit(&mut self, limit: Option<usize>) {
         self.set_line_limit(limit);
     }
 
+    #[inline]
     fn set_memory_budget(&mut self, budget: usize) -> Result<(), ScrollbackError> {
         self.set_memory_budget(budget)
     }

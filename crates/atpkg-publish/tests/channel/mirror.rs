@@ -172,6 +172,11 @@ fn a_publish_creates_the_signed_set_and_confirms_it_then_a_rerun_skips() {
         rel.assets.keys().map(String::as_str).collect::<Vec<_>>(),
         [TARBALL, "pkg-ay-8256.toml", "pkg-ay-8256.toml.sig"]
     );
+    // A program ALab does not build names no upstream base: the paragraph alone.
+    assert_eq!(
+        rig.host.notes_of(&public(), "atpkg-ay-8256").as_deref(),
+        Some(mirror::PUBLIC_NOTES)
+    );
     assert!(
         rig.host
             .calls()

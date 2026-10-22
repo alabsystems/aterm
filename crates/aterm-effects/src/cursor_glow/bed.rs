@@ -193,35 +193,46 @@ impl BedShape {
     /// body; the rainbow kitty's ribbon is its own bed). `beam_pw` is the
     /// beam's power envelope, which thins its tube.
     #[inline]
-    pub(super) fn of(style: GlowStyle, beam_pw: f32) -> Option<Self> {
-        let shape = |reach, thin, sat, full| {
-            Some(Self {
-                reach,
-                thin,
-                sat,
-                full,
-                ..Self::BASE
-            })
-        };
+    pub(super) const fn of(style: GlowStyle, beam_pw: f32) -> Option<Self> {
         match style {
             // A quiet tracer in the cursor's colour, through the x-height.
-            GlowStyle::Lumen => shape(0.26, 0.45, 0.90, 215.0),
+            GlowStyle::Lumen => Some(Self {
+                reach: 0.26,
+                thin: 0.45,
+                sat: 0.90,
+                full: 215.0,
+                ..Self::BASE
+            }),
             // The icy tail: whole under the caret, a wedge thinning and
             // fading to nothing three and a half cells behind it, over an
             // icy rail that tapers with it.
-            GlowStyle::Comet => shape(0.40, 0.75, 0.85, 215.0).map(|s| Self {
+            GlowStyle::Comet => Some(Self {
+                reach: 0.40,
+                thin: 0.75,
+                sat: 0.85,
+                full: 215.0,
                 wedge: 3.5,
                 rail: 0.16,
-                ..s
+                ..Self::BASE
             }),
             // The charged conductor: a narrow violet cable the bolts fork off.
-            GlowStyle::Laser => shape(0.22, 0.30, 0.85, 255.0),
+            GlowStyle::Laser => Some(Self {
+                reach: 0.22,
+                thin: 0.30,
+                sat: 0.85,
+                full: 255.0,
+                ..Self::BASE
+            }),
             // The fat bar of spectrum, each cell in the hue it was laid in:
             // the bar in the night arc, the spectrum itself on the rail.
-            GlowStyle::Phaser => shape(0.40, 0.15, 1.0, 126.0).map(|s| Self {
+            GlowStyle::Phaser => Some(Self {
+                reach: 0.40,
+                thin: 0.15,
+                sat: 1.0,
+                full: 126.0,
                 rail: 0.18,
                 hue: BedHue::Night,
-                ..s
+                ..Self::BASE
             }),
             // The gold comet the grains fall out of: nothing under the
             // letters (any colour dark enough to keep them at the bar is a
@@ -229,16 +240,26 @@ impl BedShape {
             // is its rail, soft at both edges and fading by alpha as a
             // comet's tail four cells behind the head, with its bridge onto
             // the caret and its crown.
-            GlowStyle::Sparkle => shape(0.40, 0.30, 0.0, 215.0).map(|s| Self {
+            GlowStyle::Sparkle => Some(Self {
+                reach: 0.40,
+                thin: 0.30,
+                sat: 0.0,
+                full: 215.0,
                 wedge: 4.0,
                 rail: SPARKLE_RAIL,
                 rail_rise: SPARKLE_RAIL_RISE,
                 core: 0.12,
                 dim: 0.0,
-                ..s
+                ..Self::BASE
             }),
             // The tube: even girth, collapsing as it powers down.
-            GlowStyle::Beam => shape(0.14 + 0.26 * beam_pw, 0.0, 0.85, 235.0),
+            GlowStyle::Beam => Some(Self {
+                reach: 0.14 + 0.26 * beam_pw,
+                thin: 0.0,
+                sat: 0.85,
+                full: 235.0,
+                ..Self::BASE
+            }),
             _ => None,
         }
     }
@@ -248,8 +269,8 @@ impl BedShape {
     /// middle, times `k` (the wedge's and the tail's taper): the reach never
     /// crosses the row's edges.
     #[inline]
-    fn at(self, cov: u8, ch: f32, k: f32) -> (f32, f32) {
-        let share = (f32::from(cov) / self.full).clamp(0.0, 1.0) * k.clamp(0.0, 1.0);
+    const fn at(self, cov: u8, ch: f32, k: f32) -> (f32, f32) {
+        let share = ((cov as f32) / self.full).clamp(0.0, 1.0) * k.clamp(0.0, 1.0);
         let reach = ch * self.reach * (1.0 - self.thin * (1.0 - share));
         let room = (ch * (0.5 - DARK_BED_DY)).max(0.0);
         (
@@ -925,16 +946,18 @@ impl CursorGlow {
     }
 
     /// The pixel box of the caret's cell `(row, col)`, window px.
-    pub(crate) fn caret_box(geom: Geom, row: u16, col: u16) -> (i32, i32, i32, i32) {
+    #[inline]
+    pub(crate) const fn caret_box(geom: Geom, row: u16, col: u16) -> (i32, i32, i32, i32) {
         let (cw, ch) = (geom.cw as i32, geom.ch as i32);
-        let x0 = i32::from(geom.origin_x) + i32::from(col) * cw;
-        let y0 = i32::from(geom.origin_y) + i32::from(row) * ch;
+        let x0 = (geom.origin_x as i32) + (col as i32) * cw;
+        let y0 = (geom.origin_y as i32) + (row as i32) * ch;
         (x0, y0, x0 + cw, y0 + ch)
     }
 
     /// Whether an air run is only the head's bridge: a knee on the head
     /// letter's edge (zero coverage) and the caret's own sample.
-    pub(super) fn is_bridge(run: &[CometSample]) -> bool {
+    #[inline]
+    pub(super) const fn is_bridge(run: &[CometSample]) -> bool {
         matches!(run, [knee, _] if knee.cov == 0)
     }
 

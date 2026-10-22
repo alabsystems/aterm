@@ -41,12 +41,14 @@ impl MotionMode {
     /// it) does nothing. The host's latch and envelope and Settings' note on
     /// that switch read this one rule.
     #[must_use]
+    #[inline]
     pub const fn admits_load_shed(self) -> bool {
         !matches!(self, Self::Full)
     }
 
     /// Parse a config string (case-insensitive, trimmed); unknown → [`Self::Auto`]
     /// (use the platform accessibility sample when available).
+    #[inline]
     pub fn parse(s: &str) -> Self {
         let s = s.trim();
         if s.eq_ignore_ascii_case("full") {
@@ -96,11 +98,15 @@ pub enum MotionEffect {
     /// `Pace::Still`: a bar moving only with its data, a busy row's glyph over
     /// its unlit track, a still ✓ on completion.
     BandProgress,
-    /// The harness card's motion (`HarnessCard::tick`'s `animate`): the border's
-    /// drift and specular head, the trail's step wave and shimmer, the kitty's
-    /// blink and tail flick, the stars' twinkle and burst. At 0 the card draws
-    /// its settled frame from the first tick: border, trail, kitty and steady
-    /// stars stay (they show the session is wrapped); nothing moves.
+    /// The harness card's motion (`HarnessCard::tick`'s `animate`): its
+    /// intro — the border's drift and specular head, the trail's step wave
+    /// and shimmer, the kitty's blink and tail flick, the stars' twinkle and
+    /// burst — and the FLOW after it, for as long as this verdict allows: the
+    /// border's hue travelling on and Claude's mascot ripple running out
+    /// from its wand across the card (`crate::ripple`). At 0 the card draws
+    /// its settled frame from the next tick: border, trail, kitty and steady
+    /// stars stay (they show the session is wrapped); nothing moves, and no
+    /// frame is asked for.
     HarnessCard,
 }
 
@@ -128,6 +134,7 @@ impl MotionEffect {
     /// Accessibility is not exemptable: OS Reduce Motion, `motion = "reduced"`
     /// and unfocused demotion still zero an exempt effect through `resolve`.
     #[must_use]
+    #[inline]
     pub const fn load_shed_exempt(self) -> bool {
         match self {
             Self::SmoothScroll | Self::ScrollPill => true,
@@ -217,11 +224,13 @@ pub struct SeriousModePolicy {
 
 impl SeriousModePolicy {
     #[must_use]
+    #[inline]
     pub const fn resolve(serious: bool) -> Self {
         Self { serious }
     }
 
     #[must_use]
+    #[inline]
     pub const fn allows(self, effect: SeriousEffect) -> bool {
         match effect {
             SeriousEffect::TerminalSound

@@ -35,6 +35,7 @@ impl TierCapabilities {
     /// Capabilities of the running build. `const` so embedders can brand
     /// protocol/config structs with the answer at compile time.
     #[must_use]
+    #[inline]
     pub const fn current() -> Self {
         Self {
             cold_codec: ColdTierCodec::Lz4,

@@ -56,7 +56,8 @@ use crate::{add_sat, blend, glow_lerp, glow_lerp_rgb, over_premul};
 /// [`crate::Renderer::row_pixel_band`] (Phase A's band reset, the free-sprite
 /// stamp, a presenter's partial copy) and the fx slicer both read it, and it
 /// is the GPU scissor's edge rule (`frame_load_and_scissor`).
-pub(crate) fn band_px(
+#[inline]
+pub(crate) const fn band_px(
     r: usize,
     rows: usize,
     h: usize,
@@ -66,12 +67,14 @@ pub(crate) fn band_px(
     let y0 = if r == 0 {
         0
     } else {
-        (grid_top + r * cell_h).min(h)
+        let p = grid_top + r * cell_h;
+        if p < h { p } else { h }
     };
     let y1 = if r + 1 >= rows {
         h
     } else {
-        (grid_top + (r + 1) * cell_h).min(h)
+        let p = grid_top + (r + 1) * cell_h;
+        if p < h { p } else { h }
     };
     (y0, y1)
 }
@@ -95,16 +98,20 @@ pub struct FxFrame {
 }
 
 impl FxFrame {
-    fn band(&self, b: usize) -> (usize, usize) {
+    #[inline]
+    const fn band(&self, b: usize) -> (usize, usize) {
         band_px(b, self.rows, self.h, self.grid_top, self.cell_h)
     }
 
     /// The band holding pixel row `y` (`y < h`, `rows > 0`).
-    fn band_of(&self, y: usize) -> usize {
+    #[inline]
+    const fn band_of(&self, y: usize) -> usize {
         if y < self.grid_top {
             0
         } else {
-            ((y - self.grid_top) / self.cell_h.max(1)).min(self.rows - 1)
+            let pitch = if self.cell_h > 1 { self.cell_h } else { 1 };
+            let r = (y - self.grid_top) / pitch;
+            if r < self.rows - 1 { r } else { self.rows - 1 }
         }
     }
 }
@@ -121,12 +128,16 @@ pub(crate) struct Area {
 
 impl Area {
     /// `r` moved by `(dx, dy)`; an unbounded [`PxRect`] edge stays unbounded.
-    fn of(r: PxRect, dx: i64, dy: i64) -> Self {
-        let edge = |e: i32, d: i64| match e {
-            i32::MIN => i64::MIN,
-            i32::MAX => i64::MAX,
-            e => i64::from(e) + d,
-        };
+    #[inline]
+    const fn of(r: PxRect, dx: i64, dy: i64) -> Self {
+        #[inline]
+        const fn edge(e: i32, d: i64) -> i64 {
+            match e {
+                i32::MIN => i64::MIN,
+                i32::MAX => i64::MAX,
+                e => (e as i64) + d,
+            }
+        }
         Self {
             x0: edge(r.x0, dx),
             y0: edge(r.y0, dy),
@@ -135,25 +146,28 @@ impl Area {
         }
     }
 
-    fn at(x: i64, y: i64, w: u16, h: u16) -> Self {
+    #[inline]
+    const fn at(x: i64, y: i64, w: u16, h: u16) -> Self {
         Self {
             x0: x,
             y0: y,
-            x1: x + i64::from(w),
-            y1: y + i64::from(h),
+            x1: x + (w as i64),
+            y1: y + (h as i64),
         }
     }
 
-    fn is_empty(self) -> bool {
+    #[inline]
+    const fn is_empty(self) -> bool {
         self.x0 >= self.x1 || self.y0 >= self.y1
     }
 
-    fn intersect(self, o: Self) -> Self {
+    #[inline]
+    const fn intersect(self, o: Self) -> Self {
         Self {
-            x0: self.x0.max(o.x0),
-            y0: self.y0.max(o.y0),
-            x1: self.x1.min(o.x1),
-            y1: self.y1.min(o.y1),
+            x0: if self.x0 > o.x0 { self.x0 } else { o.x0 },
+            y0: if self.y0 > o.y0 { self.y0 } else { o.y0 },
+            x1: if self.x1 < o.x1 { self.x1 } else { o.x1 },
+            y1: if self.y1 < o.y1 { self.y1 } else { o.y1 },
         }
     }
 }
@@ -204,7 +218,8 @@ pub(crate) struct FramePx<'a> {
 
 impl<'a> FramePx<'a> {
     /// The frame `px`, `w` pixels wide (its height is `px.len() / w`).
-    pub(crate) fn new(px: &'a mut [u32], w: usize) -> Self {
+    #[inline]
+    pub(crate) const fn new(px: &'a mut [u32], w: usize) -> Self {
         Self { px, w }
     }
 
@@ -215,6 +230,7 @@ impl<'a> FramePx<'a> {
 }
 
 impl FxCanvas for FramePx<'_> {
+    #[inline]
     fn bounds(&self) -> Slice {
         Slice {
             x0: 0,
@@ -253,6 +269,7 @@ pub struct FxSlicer {
 
 /// Whether the engine draws `layer` at all: its blend accepts its content,
 /// and it is not a Linear layer at Glow (§4.5 has no Linear Glow group).
+#[inline]
 fn layer_draws(layer: &FxLayer) -> bool {
     layer.content.accepts(layer.blend)
         && !(layer.blend == FxBlend::Linear && layer.slot == FxSlot::Glow)
@@ -263,6 +280,7 @@ fn layer_draws(layer: &FxLayer) -> bool {
 /// non-empty art, at a non-zero size, in a layer the engine draws. Its clip
 /// and the frame do not matter: the art budget is ruled on what the layers
 /// hold, so a sprite's drawing never depends on damage or scroll.
+#[inline]
 pub fn for_each_drawn_sprite<'a>(layers: &'a [FxLayer], mut f: impl FnMut(&'a FxSprite)) {
     for layer in layers.iter().filter(|l| layer_draws(l)) {
         for item in layer.content.items() {
@@ -281,7 +299,7 @@ pub fn for_each_drawn_sprite<'a>(layers: &'a [FxLayer], mut f: impl FnMut(&'a Fx
 /// The frame art budget's two widths: the one-byte arts (Index8) and the
 /// four-byte ones (Rgba8Premul and Rgba8Straight), one GPU atlas each.
 #[inline]
-fn budget_width(t: FxTexels) -> usize {
+const fn budget_width(t: FxTexels) -> usize {
     match t {
         FxTexels::Index8 => 0,
         FxTexels::Rgba8Premul | FxTexels::Rgba8Straight => 1,
@@ -368,14 +386,16 @@ impl FxBudget {
     }
 
     /// Whether the last ruling refused `art`.
+    #[inline]
     #[must_use]
     pub fn refuses(&self, art: &FxArt) -> bool {
         !self.refused.is_empty() && self.refused.contains(&art.id())
     }
 
     /// The sprites the last ruling refused (each draws nothing).
+    #[inline]
     #[must_use]
-    pub fn refused_items(&self) -> u64 {
+    pub const fn refused_items(&self) -> u64 {
         self.refused_items
     }
 }
@@ -388,8 +408,9 @@ fn area(art: &FxArt) -> u64 {
 
 impl FxSlicer {
     /// The frame art budget the last [`slice_layers`] ruled by.
+    #[inline]
     #[must_use]
-    pub fn budget(&self) -> &FxBudget {
+    pub const fn budget(&self) -> &FxBudget {
         &self.budget
     }
 }
@@ -418,6 +439,7 @@ pub struct SpriteCols {
 impl SpriteCols {
     /// `sp`'s column table: the kept one when its `(art width, dw)` matches,
     /// else built afresh.
+    #[inline]
     pub(crate) fn of(&mut self, sp: &FxSprite) -> &[u32] {
         let key = (sp.art.w(), sp.dw);
         if self.key != Some(key) {
@@ -602,21 +624,24 @@ pub(crate) fn draw_layers_on<C: FxCanvas>(
 /// Where `layer` lands in the frame: the window-pixel shift of its content
 /// origin (offset plus the Grid origin) and its clip in window pixels within
 /// the frame, or `None` when that clip is empty.
-fn layer_place(f: &FxFrame, layer: &FxLayer) -> Option<((i64, i64), Area)> {
+#[inline]
+const fn layer_place(f: &FxFrame, layer: &FxLayer) -> Option<((i64, i64), Area)> {
     let (gx, gy) = space_origin(f, layer);
     let clip = Area::of(layer.clip, gx, gy).intersect(frame_area(f));
-    (!clip.is_empty()).then_some((
-        (
-            i64::from(layer.offset.0) + gx,
-            i64::from(layer.offset.1) + gy,
-        ),
-        clip,
-    ))
+    if clip.is_empty() {
+        None
+    } else {
+        Some((
+            ((layer.offset.0 as i64) + gx, (layer.offset.1 as i64) + gy),
+            clip,
+        ))
+    }
 }
 
 /// The window pixel of `layer`'s space origin: `(0, 0)`, or the Grid origin
 /// `(pad, grid_top)`.
-fn space_origin(f: &FxFrame, layer: &FxLayer) -> (i64, i64) {
+#[inline]
+const fn space_origin(f: &FxFrame, layer: &FxLayer) -> (i64, i64) {
     match layer.space {
         FxSpace::Window => (0, 0),
         FxSpace::Grid => (f.pad as i64, f.grid_top as i64),
@@ -624,7 +649,8 @@ fn space_origin(f: &FxFrame, layer: &FxLayer) -> (i64, i64) {
 }
 
 /// The frame's pixels as an [`Area`].
-fn frame_area(f: &FxFrame) -> Area {
+#[inline]
+const fn frame_area(f: &FxFrame) -> Area {
     Area {
         x0: 0,
         y0: 0,
@@ -655,18 +681,19 @@ fn reaches_an_open_band(f: &FxFrame, layer: &FxLayer, band_open: &dyn Fn(usize) 
 
 /// An item's window-pixel origin `O` under the layer shift `(lx, ly)`, and its
 /// box at `O` within its own clip (a sprite's), before the layer clip.
-fn item_place(item: &FxItem, (lx, ly): (i64, i64)) -> ((i64, i64), Area) {
+#[inline]
+const fn item_place(item: &FxItem, (lx, ly): (i64, i64)) -> ((i64, i64), Area) {
     match item {
         FxItem::Rect(r) => {
-            let o = (i64::from(r.x) + lx, i64::from(r.y) + ly);
+            let o = ((r.x as i64) + lx, (r.y as i64) + ly);
             (o, Area::at(o.0, o.1, r.w, r.h))
         }
         FxItem::Ramps(r) => {
-            let o = (i64::from(r.x) + lx, i64::from(r.y) + ly);
+            let o = ((r.x as i64) + lx, (r.y as i64) + ly);
             (o, Area::at(o.0, o.1, r.w, r.h))
         }
         FxItem::Sprite(s) => {
-            let o = (i64::from(s.x) + lx, i64::from(s.y) + ly);
+            let o = ((s.x as i64) + lx, (s.y as i64) + ly);
             (
                 o,
                 Area::at(o.0, o.1, s.dw, s.dh).intersect(Area::of(s.clip, lx, ly)),
@@ -764,6 +791,7 @@ fn ink_at(palette: &[FxInk], j: u64) -> Option<FxInk> {
 
 /// Stamp one item over one slice, addressed from the item origin `o`. `cols`
 /// is a sprite's column table ([`sprite_cols`]); a rect ignores it.
+#[inline]
 pub(crate) fn stamp<C: FxCanvas>(
     canvas: &mut C,
     s: Slice,
@@ -795,6 +823,7 @@ pub(crate) fn sprite_cols(sp: &FxSprite, out: &mut Vec<u32>) {
     out.extend((0..=aw).map(|d| (d * dw).div_ceil(aw) as u32));
 }
 
+#[inline]
 fn stamp_rect<C: FxCanvas>(canvas: &mut C, s: Slice, o: (i64, i64), r: &FxRect, palette: &[FxInk]) {
     let j = u64::from(r.ink);
     let (Some(c0), Some(c1)) = (ink_at(palette, j), ink_at(palette, j + 1)) else {
@@ -807,6 +836,7 @@ fn stamp_rect<C: FxCanvas>(canvas: &mut C, s: Slice, o: (i64, i64), r: &FxRect, 
     }
 }
 
+#[inline]
 fn stamp_ramps<C: FxCanvas>(
     canvas: &mut C,
     s: Slice,
@@ -827,12 +857,20 @@ fn stamp_ramps<C: FxCanvas>(
 /// The linear-light paint of a straight texel `A<<24 | RGB` under `tint`:
 /// FreeSprite's law, `(mul8(rgb, tint.rgb), mul8(A, tint.alpha))`.
 #[inline]
-fn straight_paint(texel: u32, tint: FxInk) -> (u32, u8) {
-    let mul8 = |c: u32, f: u32| (c * f + 127) / 255;
-    let ch = |sh: u32| mul8((texel >> sh) & 0xff, (tint.color >> sh) & 0xff);
+const fn straight_paint(texel: u32, tint: FxInk) -> (u32, u8) {
+    #[inline]
+    const fn mul8(c: u32, f: u32) -> u32 {
+        (c * f + 127) / 255
+    }
+    #[inline]
+    const fn ch(texel: u32, color: u32, sh: u32) -> u32 {
+        mul8((texel >> sh) & 0xff, (color >> sh) & 0xff)
+    }
     (
-        ch(16) << 16 | ch(8) << 8 | ch(0),
-        mul8(texel >> 24, u32::from(tint.alpha)) as u8,
+        (ch(texel, tint.color, 16) << 16)
+            | (ch(texel, tint.color, 8) << 8)
+            | ch(texel, tint.color, 0),
+        mul8(texel >> 24, tint.alpha as u32) as u8,
     )
 }
 
@@ -935,6 +973,7 @@ fn sprite_spans(
     }
 }
 
+#[inline]
 fn stamp_sprite<C: FxCanvas>(
     canvas: &mut C,
     s: FxSlice,

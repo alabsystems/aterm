@@ -4,6 +4,13 @@
 use super::*;
 use std::path::PathBuf;
 
+/// A probe's deadline in these tests: a one-minute hang detector, never
+/// [`PROBE_LIMIT`]'s latency budget — on a loaded host a scratch
+/// repository's reads outrun ten seconds, and a probe cut short reads as
+/// less work than the repository holds.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const HANG: Duration = Duration::from_secs(60);
+
 /// `git <args>` in `dir`, hermetic: no system or global config, a fixed
 /// author.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -59,7 +66,7 @@ fn repo(tmp: &Path, remote: bool) -> PathBuf {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn found(dir: &Path) -> Option<RepoWork> {
-    probe(dir, Some(dir), PROBE_LIMIT)
+    probe(dir, Some(dir), HANG)
 }
 
 /// THE READS' OUTPUT, PARSED ([`RepoWork::of_git`]): a tracked change
@@ -249,7 +256,7 @@ fn the_persons_global_excludes_hold() {
     std::fs::write(work.join(".DS_Store"), "x").expect("ds");
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).expect("home");
-    let probe_at = |xdg: Option<&Path>| probe_with(&work, Some(&home), xdg, PROBE_LIMIT);
+    let probe_at = |xdg: Option<&Path>| probe_with(&work, Some(&home), xdg, HANG);
     // NEGATIVE CONTROL: no excludes.
     let w = probe_at(None).expect("untracked");
     assert_eq!(
@@ -309,7 +316,7 @@ fn the_repositorys_own_excludes_win_over_the_persons() {
     let own = tmp.path().join("repo-ignore");
     std::fs::write(&own, "local.tmp\n").expect("own ignore");
     let untracked = || {
-        probe_with(&work, Some(&home), None, PROBE_LIMIT)
+        probe_with(&work, Some(&home), None, HANG)
             .map(|w| w.paths)
             .unwrap_or_default()
     };
@@ -339,7 +346,7 @@ fn the_persons_excludes_set_through_an_include_hold() {
         "[core]\n\texcludesFile = ~/my-ignore\n",
     )
     .expect("extra");
-    let probe_at = || probe_with(&work, Some(&home), None, PROBE_LIMIT);
+    let probe_at = || probe_with(&work, Some(&home), None, HANG);
     std::fs::write(
         home.join(".gitconfig"),
         "[include]\n\tpath = ~/extra.gitconfig\n",
@@ -384,7 +391,7 @@ fn the_persons_excludes_set_for_this_repository_by_an_include_if_hold() {
         )
     };
     std::fs::write(home.join(".gitconfig"), gitdir(&work)).expect("gitconfig");
-    let probe_at = || probe_with(&work, Some(&home), None, PROBE_LIMIT);
+    let probe_at = || probe_with(&work, Some(&home), None, HANG);
     assert_eq!(probe_at(), None, "the conditional excludes hold");
     // NEGATIVE CONTROL: the condition names another folder.
     std::fs::write(home.join(".gitconfig"), gitdir(&home)).expect("gitconfig");
@@ -413,7 +420,7 @@ fn a_repositorys_own_home_relative_path_is_read_under_the_persons_home() {
     std::fs::create_dir_all(&home).expect("home");
     std::fs::write(home.join("repo-ignore"), "local.tmp\n").expect("ignore");
     scratch_git(&work, &["config", "core.excludesFile", "~/repo-ignore"]);
-    let w = probe_with(&work, Some(&home), None, PROBE_LIMIT).expect("the untracked file");
+    let w = probe_with(&work, Some(&home), None, HANG).expect("the untracked file");
     assert_eq!(w.paths, ["notes.md"], "{w:?}");
     // The person's own global configuration is no part of the reads.
     std::fs::write(
@@ -421,7 +428,7 @@ fn a_repositorys_own_home_relative_path_is_read_under_the_persons_home() {
         "[core]\n\texcludesFile = ~/no-such-file\n[status]\n\tshowUntrackedFiles = no\n",
     )
     .expect("gitconfig");
-    let w = probe_with(&work, Some(&home), None, PROBE_LIMIT).expect("still read");
+    let w = probe_with(&work, Some(&home), None, HANG).expect("still read");
     assert_eq!(w.paths, ["notes.md"], "{w:?}");
 }
 
@@ -557,13 +564,10 @@ fn a_guarded_folder_is_never_probed() {
         Some(work.clone())
     );
     assert_eq!(unattended_dir(&docs, Some(&home), &table), None);
-    assert_eq!(probe(&docs, Some(&home), PROBE_LIMIT), None);
+    assert_eq!(probe(&docs, Some(&home), HANG), None);
     assert_eq!(unattended_dir(&work, None, &table), None);
-    assert_eq!(probe(&work, None, PROBE_LIMIT), None);
-    assert_eq!(
-        probe(Path::new("/Volumes/unasked"), None, PROBE_LIMIT),
-        None
-    );
+    assert_eq!(probe(&work, None, HANG), None);
+    assert_eq!(probe(Path::new("/Volumes/unasked"), None, HANG), None);
     assert_eq!(
         unattended_dir(
             &home.join("Developer/../Documents/work"),

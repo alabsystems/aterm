@@ -36,7 +36,8 @@ enum Size {
 }
 
 impl Size {
-    fn scale(self) -> f32 {
+    #[inline]
+    const fn scale(self) -> f32 {
         match self {
             Size::Small => 0.52,
             Size::Medium => 0.8,
@@ -162,7 +163,8 @@ use Prim::{
 use Size::{Full, Large, Medium, Small};
 
 /// The symbol table: every code point this module draws, and how.
-fn lookup(cp: u32) -> Option<Spec> {
+#[inline]
+const fn lookup(cp: u32) -> Option<Spec> {
     let s = match cp {
         // ---- Miscellaneous Technical: media controls ----------------------
         0x23E9 => spec(Medium, &[Poly(FF_A), Poly(FF_B)]), // ⏩
@@ -291,8 +293,9 @@ fn lookup(cp: u32) -> Option<Spec> {
 }
 
 /// Whether this module can draw `ch` without any font.
-pub(super) fn covers(ch: char) -> bool {
-    lookup(u32::from(ch)).is_some()
+#[inline]
+pub(super) const fn covers(ch: char) -> bool {
+    lookup(ch as u32).is_some()
 }
 
 /// Row-major coverage for `ch` at `span * cell_w` × `cell_h` (`span` clamped
@@ -481,8 +484,12 @@ fn directions(n: u32) -> Vec<(f32, f32)> {
 /// yields them and the text is smaller than `bundled::SPINNER_STARS_CRISP_PX`
 /// (`Renderer::spinner_star_preempts`); everywhere else they are only the
 /// last resort for a host with no face for them.
-pub(crate) fn is_spinner_star(ch: char) -> bool {
-    SPINNER_STARS.contains(&ch)
+#[inline]
+pub(crate) const fn is_spinner_star(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2722}' | '\u{2733}' | '\u{2736}' | '\u{273B}' | '\u{273D}'
+    )
 }
 
 /// The [`is_spinner_star`] frames, in Claude Code's order: `✢ ✳ ✶ ✻ ✽`.

@@ -131,35 +131,63 @@ pub fn resolve_deco_metrics(
 
 /// Clamp a `(top, thickness)` band into the cell: thickness into `[1, cell_h]` first, then
 /// top into `[0, cell_h - thickness]`, which guarantees `top + thickness <= cell_h`.
-fn clamp_band(top: i64, thickness: i64, cell_h: usize) -> (usize, usize) {
-    let nonnegative = |value: i64| usize::try_from(value.max(0)).unwrap_or(usize::MAX);
-    let t = nonnegative(thickness).clamp(1, cell_h);
-    let y = nonnegative(top).min(cell_h - t);
+#[inline]
+const fn clamp_band(top: i64, thickness: i64, cell_h: usize) -> (usize, usize) {
+    const fn nonnegative(value: i64) -> usize {
+        if value <= 0 {
+            0
+        } else if value as i128 > usize::MAX as i128 {
+            usize::MAX
+        } else {
+            value as usize
+        }
+    }
+    let thick_nonneg = nonnegative(thickness);
+    let top_nonneg = nonnegative(top);
+    let t = if thick_nonneg < 1 {
+        1
+    } else if thick_nonneg > cell_h {
+        cell_h
+    } else {
+        thick_nonneg
+    };
+    let max_y = cell_h - t;
+    let y = if top_nonneg < max_y {
+        top_nonneg
+    } else {
+        max_y
+    };
     (y, t)
 }
 
 /// Whether the dotted underline is on at absolute column `x`: square dots of side
 /// `thickness` with equal gaps, phased from `x == 0`.
 #[must_use]
-pub fn dotted_on(x: usize, thickness: usize) -> bool {
-    let t = thickness.max(1);
+#[inline]
+pub const fn dotted_on(x: usize, thickness: usize) -> bool {
+    let t = if thickness > 1 { thickness } else { 1 };
     (x / t).is_multiple_of(2)
 }
 
 /// Whether the dashed underline is on at absolute column `x`: ~2/3 duty over a
 /// `max(cell_w/2, 2)` period, so a dash crosses cell seams unbroken.
 #[must_use]
-pub fn dashed_on(x: usize, cell_w: usize) -> bool {
-    let p = (cell_w / 2).max(2);
-    let d = (2 * p).div_ceil(3).max(1);
+#[inline]
+pub const fn dashed_on(x: usize, cell_w: usize) -> bool {
+    let half = cell_w / 2;
+    let p = if half > 2 { half } else { 2 };
+    let div = (2 * p).div_ceil(3);
+    let d = if div > 1 { div } else { 1 };
     x % p < d
 }
 
 /// Whether absolute column `x` is in the raised half of the square-wave curly fallback,
 /// used when [`undercurl_supported`] is false.
 #[must_use]
-pub fn squarewave_up(x: usize, cell_h: usize) -> bool {
-    let seg = (cell_h / 6).max(2);
+#[inline]
+pub const fn squarewave_up(x: usize, cell_h: usize) -> bool {
+    let sixth = cell_h / 6;
+    let seg = if sixth > 2 { sixth } else { 2 };
     (x / seg) % 2 == 1
 }
 
@@ -178,7 +206,8 @@ pub const UNDERCURL_SPRITE: usize = 7;
 /// Whether the AA undercurl mask fits the shared deco atlas at this base cell size. When
 /// `false`, both renderers draw the square-wave fallback.
 #[must_use]
-pub fn undercurl_supported(cell_w: usize, cell_h: usize) -> bool {
+#[inline]
+pub const fn undercurl_supported(cell_w: usize, cell_h: usize) -> bool {
     cell_w > 0
         && cell_h > 0
         && cell_w <= DECO_ATLAS_MAX_DIM / DECO_ATLAS_SPRITES
@@ -204,16 +233,28 @@ pub fn undercurl_supported(cell_w: usize, cell_h: usize) -> bool {
 /// CPU blend loop, the GPU's full-cell curl sprite (the tile carries no
 /// coverage outside it) and [`underline_band`].
 #[must_use]
-pub fn undercurl_band(cell_h: usize, deco: DecoMetrics) -> (usize, usize) {
+#[inline]
+pub const fn undercurl_band(cell_h: usize, deco: DecoMetrics) -> (usize, usize) {
     if cell_h == 0 {
         return (0, 0);
     }
-    let t = deco.underline_t.clamp(1, cell_h);
-    let floor = (t + 3).max(4);
-    let top = deco
-        .underline_y
-        .min(cell_h - 1)
-        .min(cell_h.saturating_sub(floor));
+    let t = if deco.underline_t < 1 {
+        1
+    } else if deco.underline_t > cell_h {
+        cell_h
+    } else {
+        deco.underline_t
+    };
+    let floor = if t + 3 > 4 { t + 3 } else { 4 };
+    let cap1 = cell_h - 1;
+    let cap2 = cell_h.saturating_sub(floor);
+    let mut top = deco.underline_y;
+    if top > cap1 {
+        top = cap1;
+    }
+    if top > cap2 {
+        top = cap2;
+    }
     (top, cell_h)
 }
 
@@ -264,29 +305,46 @@ pub fn undercurl_coverage(cell_w: usize, cell_h: usize, deco: DecoMetrics) -> Ve
 /// `pad`. The wave tiles per advance and nearest-samples like the GPU atlas sampler, so CPU
 /// and GPU read the same byte; no cell index enters, so the phase never resets at a seam.
 #[must_use]
-pub fn undercurl_tile_col(x: usize, pad: usize, rcw: usize, base_cw: usize) -> usize {
+#[inline]
+pub const fn undercurl_tile_col(x: usize, pad: usize, rcw: usize, base_cw: usize) -> usize {
     debug_assert!(x >= pad && rcw > 0 && base_cw > 0);
-    let tx = (x - pad) % rcw.max(1);
-    ((((tx as f32) + 0.5) / rcw as f32) * base_cw as f32) as usize % base_cw.max(1)
+    let rcw_pos = if rcw > 1 { rcw } else { 1 };
+    let bcw_pos = if base_cw > 1 { base_cw } else { 1 };
+    let tx = (x - pad) % rcw_pos;
+    ((((tx as f32) + 0.5) / rcw as f32) * base_cw as f32) as usize % bcw_pos
 }
 
 /// The cell-relative `[y0, y1)` rows an underline style occupies (the band descender
 /// ink-skip probes), shared by both renderers; `None` for `UnderlineStyle::None`.
 #[must_use]
-pub fn underline_band(
+#[inline]
+pub const fn underline_band(
     style: UnderlineStyle,
     cell_h: usize,
     deco: DecoMetrics,
 ) -> Option<(usize, usize)> {
-    let t = deco.underline_t.clamp(1, cell_h.max(1));
-    let uy = deco.underline_y.min(cell_h.saturating_sub(t));
+    let ch = if cell_h > 1 { cell_h } else { 1 };
+    let t = if deco.underline_t < 1 {
+        1
+    } else if deco.underline_t > ch {
+        ch
+    } else {
+        deco.underline_t
+    };
+    let max_uy = cell_h.saturating_sub(t);
+    let uy = if deco.underline_y < max_uy {
+        deco.underline_y
+    } else {
+        max_uy
+    };
     match style {
         UnderlineStyle::None => None,
         UnderlineStyle::Single | UnderlineStyle::Dotted | UnderlineStyle::Dashed => {
             Some((uy, uy + t))
         }
         UnderlineStyle::Double => {
-            let gap = t.saturating_mul(2).max(2);
+            let t2 = t.saturating_mul(2);
+            let gap = if t2 > 2 { t2 } else { 2 };
             Some((uy.saturating_sub(gap), uy + t))
         }
         UnderlineStyle::Curly => Some(undercurl_band(cell_h, deco)),
@@ -333,7 +391,8 @@ pub fn underline_band(
 /// character is vanishingly rare in terminal text, and accepting one cosmetic
 /// miss is the price of a rule that is provably inert for every narrow cell.
 #[must_use]
-pub fn ink_skip_applies_to_width(cols: usize) -> bool {
+#[inline]
+pub const fn ink_skip_applies_to_width(cols: usize) -> bool {
     cols <= 1
 }
 
@@ -343,6 +402,7 @@ pub fn ink_skip_applies_to_width(cols: usize) -> bool {
 /// Kept spans are a subset of `[0, ink.len())` (the skip only erases), an all-false `ink`
 /// yields the one full span, and column `i` is skipped iff `ink` holds at `i-1`, `i` or
 /// `i+1` (`tests/deco_lines.rs`).
+#[inline]
 pub fn keep_spans_after_ink(ink: &[bool], out: &mut Vec<(usize, usize)>) {
     let w = ink.len();
     let skipped = |i: usize| ink[i] || (i > 0 && ink[i - 1]) || (i + 1 < w && ink[i + 1]);
@@ -362,6 +422,7 @@ pub fn keep_spans_after_ink(ink: &[bool], out: &mut Vec<(usize, usize)>) {
 
 /// Intersect the rect's x-extent with each `(start, len)` span, pushing the surviving
 /// `[x, y, w, h]` sub-rects: ink-skip applied to already-emitted underline rects.
+#[inline]
 pub fn intersect_rect_spans(out: &mut Vec<[usize; 4]>, rect: [usize; 4], spans: &[(usize, usize)]) {
     let [rx, ry, rw, rh] = rect;
     for &(sx, sw) in spans {

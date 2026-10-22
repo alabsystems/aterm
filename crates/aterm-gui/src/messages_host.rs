@@ -1702,6 +1702,14 @@ impl App {
     /// ([`wire::switching_reply`]), and its retry reaches the new version (or
     /// this one, if the switch stood down).
     pub(crate) fn take_notice(&mut self, req: wire::NoticeRequest) -> String {
+        self.take_notice_within(req, MESSAGES_FLUSH_UI_WAIT)
+    }
+
+    fn take_notice_within(
+        &mut self,
+        req: wire::NoticeRequest,
+        flush_within: std::time::Duration,
+    ) -> String {
         if self.update_handoff_parked() {
             aterm_log::info!("notice: refused while parked for an update");
             return wire::switching_reply();
@@ -1739,12 +1747,17 @@ impl App {
             wall_stamp_now(),
             Instant::now(),
         );
-        // A script's `notice dismiss review|<id>` filed an exception through
-        // the engine alone: flush the log before the reply (a dismissal must
-        // not die with the process) and move the menu-bar item and Settings.
-        if self.messages.digest_revision() != digest_before {
-            self.flush_messages_log_within(MESSAGES_FLUSH_UI_WAIT);
+        // A log-only change also needs the writer before the reply: ending the cause
+        // of an already-filed exception changes its record but no open digest entry.
+        let digest_changed = self.messages.digest_revision() != digest_before;
+        let log_dirty = self.messages.log().pending_len() != 0;
+        if digest_changed || log_dirty {
+            self.flush_messages_log_within(flush_within);
+        }
+        if digest_changed {
             self.digest_moved();
+        } else if log_dirty {
+            self.publish_native_messages_state_if_due(Instant::now());
         }
         if applied.paint == wire::Paint::Now {
             self.sync_messages();

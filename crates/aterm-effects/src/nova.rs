@@ -97,8 +97,8 @@ pub const NOVA_PALETTES: [(u32, u32); 8] = [
 
 /// The `(core, fringe)` pair for a Gray-decoded palette index.
 #[inline]
-pub fn palette(idx: u8) -> (u32, u32) {
-    NOVA_PALETTES[usize::from(idx & 7)]
+pub const fn palette(idx: u8) -> (u32, u32) {
+    NOVA_PALETTES[(idx & 7) as usize]
 }
 
 /// The §6.1 phase, a pure function of `(t = now − ignition, D)`. `t < 0` is
@@ -117,8 +117,8 @@ pub enum NovaPhase {
 }
 
 #[inline]
-pub fn phase(t_ms: i64, d_ms: u32) -> NovaPhase {
-    let d = i64::from(d_ms);
+pub const fn phase(t_ms: i64, d_ms: u32) -> NovaPhase {
+    let d = d_ms as i64;
     match t_ms {
         t if t < 0 => NovaPhase::Armed,
         t if t < DIP_MS as i64 => NovaPhase::Dip,

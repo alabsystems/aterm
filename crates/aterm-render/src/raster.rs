@@ -60,7 +60,7 @@ pub const fn point(x: f32, y: f32) -> Point {
 
 /// Linear interpolation between two points at parameter `t`.
 #[inline]
-fn lerp(t: f32, p0: Point, p1: Point) -> Point {
+const fn lerp(t: f32, p0: Point, p1: Point) -> Point {
     point(p0.x + t * (p1.x - p0.x), p0.y + t * (p1.y - p0.y))
 }
 
@@ -114,6 +114,7 @@ pub struct Rasterizer {
 
 impl Rasterizer {
     /// A cleared `width` × `height` grid.
+    #[inline]
     pub fn new(width: usize, height: usize) -> Self {
         Self {
             width,
@@ -333,6 +334,7 @@ impl Rasterizer {
     /// Coverage is the running prefix sum of the accumulators, folded to nonzero winding
     /// as `|acc|`. It is not clamped (a cell covered twice reports 2; callers clamp on
     /// the way to 8 bits), and the accumulator is not reset between rows (module docs).
+    #[inline]
     pub fn for_each_pixel<F: FnMut(usize, f32)>(&self, mut f: F) {
         let mut acc = 0.0f32;
         for (i, c) in self.a[..self.width * self.height].iter().enumerate() {

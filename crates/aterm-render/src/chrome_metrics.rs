@@ -35,6 +35,7 @@ pub const Q: i64 = 64;
 /// Quantize px to 26.6 fixed point (nearest subunit, ties away from zero). Non-finite input
 /// maps to 0.
 #[must_use]
+#[inline]
 pub fn px_to_q(px: f32) -> i64 {
     let q = (f64::from(px) * Q as f64).round();
     if q.is_finite() { q as i64 } else { 0 }
@@ -42,7 +43,8 @@ pub fn px_to_q(px: f32) -> i64 {
 
 /// 26.6 fixed point back to fractional px (exact: 2^-6 is a binary fraction).
 #[must_use]
-pub fn q_to_px(q: i64) -> f32 {
+#[inline]
+pub const fn q_to_px(q: i64) -> f32 {
     (q as f64 / Q as f64) as f32
 }
 
@@ -56,7 +58,8 @@ pub fn q_to_px(q: i64) -> f32 {
 /// advances were summed before it (`rounding_error_bounded_by_half_px`, which
 /// covers every residue mod `Q`).
 #[must_use]
-pub fn q_round_to_px(q: i64) -> i64 {
+#[inline]
+pub const fn q_round_to_px(q: i64) -> i64 {
     (q + Q / 2).div_euclid(Q)
 }
 
@@ -67,7 +70,8 @@ pub fn q_round_to_px(q: i64) -> i64 {
 /// For `0 <= cap_h <= row_h`, the gap above the cap box and the gap below the baseline
 /// differ by at most 1 subunit (`cap_centering_lattice`).
 #[must_use]
-pub fn baseline_in_row_q(row_top_q: i64, row_h_q: i64, cap_h_q: i64) -> i64 {
+#[inline]
+pub const fn baseline_in_row_q(row_top_q: i64, row_h_q: i64, cap_h_q: i64) -> i64 {
     row_top_q + (row_h_q + cap_h_q) / 2
 }
 

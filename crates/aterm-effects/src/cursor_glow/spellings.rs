@@ -228,6 +228,7 @@ pub const TRAIL_STYLE_NAMES: [&str; TRAIL_STYLES.len()] = row_names();
 /// The canonical [`TRAIL_STYLES`] name a spelling resolves to (a canonical
 /// name or an alias; trimmed, ASCII case-insensitive), or `None` for a
 /// spelling nothing recognises.
+#[inline]
 #[must_use]
 pub fn canonical(raw: &str) -> Option<&'static str> {
     let raw = raw.trim();
@@ -244,6 +245,7 @@ pub fn canonical(raw: &str) -> Option<&'static str> {
 }
 
 /// The [`TRAIL_STYLES`] row a spelling resolves to.
+#[inline]
 #[must_use]
 pub fn row(raw: &str) -> Option<&'static TrailStyleRow> {
     let name = canonical(raw)?;
@@ -251,12 +253,14 @@ pub fn row(raw: &str) -> Option<&'static TrailStyleRow> {
 }
 
 /// The Settings name of the style a spelling resolves to.
+#[inline]
 #[must_use]
 pub fn label(raw: &str) -> Option<&'static str> {
     row(raw).map(|row| row.label)
 }
 
 /// The one-line description of the style a spelling resolves to.
+#[inline]
 #[must_use]
 pub fn blurb(raw: &str) -> Option<&'static str> {
     row(raw).map(|row| row.blurb)

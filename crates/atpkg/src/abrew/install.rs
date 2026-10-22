@@ -330,7 +330,7 @@ pub fn install(
         if let Some(inst) = prefix.installed_one(Kind::Formula, &f.name) {
             if !opts.force && version_cmp(&inst.version, &version) != std::cmp::Ordering::Less {
                 if !opts.quiet {
-                    println!("abrew: {} {} already installed", f.name, inst.version);
+                    eprintln!("Warning: {} {} is already installed", f.name, inst.version);
                 }
                 last = inst.version;
                 continue;

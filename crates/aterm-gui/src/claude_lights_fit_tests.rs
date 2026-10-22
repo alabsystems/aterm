@@ -129,7 +129,7 @@ impl World {
     /// Autopilot's title as a reading builds it ([`App::claude_lights_block`]):
     /// `whole`, numbered from the window's fits, under the pointer.
     fn title(&mut self, whole: &str) {
-        self.w.hover = Some((S, Chip::Autopilot));
+        self.w.hover = Some((S, Target::from(Chip::Autopilot)));
         self.focus.1 = Some(Chip::Autopilot);
         self.titled = true;
         self.w.fits += 1;
@@ -147,6 +147,14 @@ impl World {
             Some(r) => *r = reading,
             None => self.w.readings.push(reading),
         }
+    }
+
+    /// The selection and the hover, as the lights hold them.
+    fn targets(&self) -> (Option<Target>, Option<Target>) {
+        (
+            self.focus.0.map(Target::Chip),
+            self.focus.1.map(Target::Chip),
+        )
     }
 
     fn at(&self) -> Option<usize> {
@@ -172,7 +180,7 @@ impl World {
                 self.focus.0,
                 self.focus.1,
                 self.room,
-                autopilot,
+                (autopilot, None, None),
                 &mut block,
             )
             .then(|| Laid::of(&block))
@@ -193,9 +201,15 @@ impl World {
             .map(|&pane| {
                 let anew = self.anew();
                 let _ = crate::work_counts::take_footer_block_fits();
-                let block =
-                    self.w
-                        .lend_block(S, pane, self.blank, self.accent, self.focus, self.room, at);
+                let block = self.w.lend_block(
+                    S,
+                    pane,
+                    self.blank,
+                    self.accent,
+                    self.targets(),
+                    self.room,
+                    at.map(TitleAt::Autopilot),
+                );
                 let fits = crate::work_counts::take_footer_block_fits();
                 let lent = block.as_ref().map(Laid::of);
                 if let Some(block) = block {
@@ -226,6 +240,14 @@ fn pending() -> Pending {
 }
 
 fn nothing(_: &mut World) {}
+
+/// Claude in plan mode: the light, a deviation, drawn beside Autopilot.
+fn planned(w: &mut World) {
+    w.session().shown = Reading {
+        mode: Some(Mode::Plan),
+        pill: true,
+    };
+}
 
 fn land(w: &mut World) {
     w.session().autopilot = Some(AutopilotView::Land);
@@ -271,7 +293,7 @@ fn cases() -> Vec<Case> {
         ("the pointer's chip", nothing, |w| {
             w.focus.1 = Some(Chip::Autopilot);
         }),
-        ("the room", nothing, |w| w.room = 0),
+        ("the room", planned, |w| w.room = 2),
         ("Autopilot's title built anew", titled, |w| {
             w.title(&cruise_title("\u{21bb} kept going 14:07"));
         }),
@@ -387,7 +409,7 @@ fn a_kept_block_costs_a_frame_nothing_and_each_pane_keeps_its_own() {
                     pane,
                     world.blank,
                     world.accent,
-                    world.focus,
+                    world.targets(),
                     world.room,
                     None,
                 );
@@ -421,7 +443,7 @@ fn a_kept_block_costs_a_frame_nothing_and_each_pane_keeps_its_own() {
             0,
             world.blank,
             world.accent,
-            world.focus,
+            world.targets(),
             world.room,
             None,
         )
@@ -433,7 +455,7 @@ fn a_kept_block_costs_a_frame_nothing_and_each_pane_keeps_its_own() {
             0,
             world.blank,
             world.accent,
-            world.focus,
+            world.targets(),
             world.room,
             None,
         )
@@ -732,7 +754,7 @@ fn script() -> Vec<Step> {
                 .get_mut(&wid)
                 .expect("window")
                 .claude_lights
-                .selected = chip.map(|c| (session, c));
+                .selected = chip.map(|c| (session, Target::Chip(c)));
         })
     };
     let word = |word: Autopilot| {

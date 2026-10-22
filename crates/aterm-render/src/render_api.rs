@@ -81,7 +81,8 @@ pub enum RenderView<'a> {
 impl RenderView<'_> {
     /// Frame width in pixels.
     #[must_use]
-    pub fn width(&self) -> usize {
+    #[inline]
+    pub const fn width(&self) -> usize {
         match self {
             RenderView::Borrowed { width, .. } => *width,
             RenderView::Owned(f) => f.width,
@@ -90,7 +91,8 @@ impl RenderView<'_> {
 
     /// Frame height in pixels.
     #[must_use]
-    pub fn height(&self) -> usize {
+    #[inline]
+    pub const fn height(&self) -> usize {
         match self {
             RenderView::Borrowed { height, .. } => *height,
             RenderView::Owned(f) => f.height,
@@ -101,6 +103,7 @@ impl RenderView<'_> {
     /// case (no copy), borrowed from the owned `Frame` otherwise. `TT` is
     /// transmittance (`0` opaque, `255` transparent), matching [`Frame`].
     #[must_use]
+    #[inline]
     pub fn pixels(&self) -> &[u32] {
         match self {
             RenderView::Borrowed { pixels, .. } => pixels,

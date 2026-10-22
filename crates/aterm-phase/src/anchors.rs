@@ -563,6 +563,30 @@ pub const ANCHORS: &[Anchor] = &[
     composed("mode.plan", "plan mode on", "2.1.283"),
     composed("mode.manual", "manual mode on", "2.1.283"),
     hint("mode.cycle", "to cycle", "2.1.283"),
+    // Vim's INSERT indicator at that row's head, before the pill, while the
+    // composer's vim editor mode (`editorMode: "vim"`) is in INSERT: drawn
+    // dim from parts (the 2.1.304 bundle's `FooterHintLine`: `["-- ", mode,
+    // " --"]`, none in NORMAL), then one cell, then the pill — MEASURED
+    // `  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)`, the pill at
+    // column 15 (`aterm_agent::harness::footer::vim_insert`).
+    composed("vim.insert", "-- INSERT --", "2.1.304"),
+    // The agents panel under that row (`crate::agents_panel`), read in the
+    // 2.1.304 bundle (its `TQ` panel, `bie` main row, `vie` agent row, `Cie`
+    // idle summary, `BB` workflow row, `PHe` status parts): the main row's
+    // word after its bullet, the `↑ N more` / `↓ N more` rows' word, the idle
+    // summary's noun (`1 idle agent`, `N idle agents`), the token count's
+    // word, the status's three words in place of an elapsed time, the queued
+    // count's word, and the large-workflow warning's two parts.
+    lit("panel.main", " main", "2.1.304"),
+    lit("panel.more", " more", "2.1.304"),
+    lit("panel.idle_agents", "idle agent", "2.1.304"),
+    lit("panel.tokens", " tokens", "2.1.304"),
+    lit("panel.awaiting", "awaiting approval", "2.1.304"),
+    lit("panel.idle", "idle", "2.1.304"),
+    lit("panel.waiting", "waiting", "2.1.304"),
+    lit("panel.queued", " queued", "2.1.304"),
+    lit("panel.large_workflow", "Large workflow", "2.1.304"),
+    lit("panel.workflows_stop", "/workflows to stop", "2.1.304"),
     // A turn a person stopped with Esc: the vendor's row under the last
     // message or tool row (`  ⎿  Interrupted · What should Claude do
     // instead?`, measured 2026-09-23 on the lane probe's worker).
@@ -664,6 +688,29 @@ pub const ANCHORS: &[Anchor] = &[
         "Update installed · Restart to update",
         "2.1.267",
     ),
+    // The UPDATE NOTICE under the launch card, drawn on the first launch of
+    // each new build (`lastReleaseNotesSeen` older than the build; forced by
+    // `CLAUDE_CODE_FORCE_FIRST_LAUNCH=<older version>`): a bold summary
+    // (`Updated to latest.`, or `Updated to latest. Got 33 features, 240
+    // bugfixes, and 103 other changes.`) over a dim details row whose link
+    // is the changelog's URL without its `https://` and ` for details` after
+    // it, in a Box with `paddingLeft: 2` (2.1.304's `ty`/`_a` render code;
+    // the inline captures `claude-2.1.283-effort-switch.txt` and the
+    // supervisor's 2.1.282 `cap-decline-*` screens). The harness banner is
+    // drawn over them on the glass (`crate::notice`). The details row is
+    // composed (the link, then ` for details`): matched whole, never
+    // canaried.
+    lit("notice.updated", "Updated to latest.", "2.1.282"),
+    lit(
+        "notice.changelog",
+        "code.claude.com/docs/en/changelog",
+        "2.1.282",
+    ),
+    composed(
+        "notice.updated_details",
+        "code.claude.com/docs/en/changelog for details",
+        "2.1.282",
+    ),
     // The vendor's OWN `⏺` paragraphs that are nobody's words: drawn as a
     // message row in the transcript, but no turn's reply, so the readers of
     // what the worker last said step over them (`phase::vendor_paragraph`).
@@ -695,6 +742,33 @@ pub const ANCHORS: &[Anchor] = &[
     lit("effort.set", "Set effort level to ", "2.1.283"),
     lit("effort.current", "Current effort level: ", "2.1.283"),
     lit("effort.auto", "Effort level set to auto", "2.1.283"),
+    // The top-effort key's own `/effort <key> on|off` results and refusals,
+    // READ in the 2.1.304 bundle (its `D()` answer and `A()` parser): `<Key>
+    // on (this session only): <what it does>. Effort stays <level>.`, `<Key>
+    // off. Effort stays <level>.`, `<Key> needs dynamic workflows enabled (see
+    // /config). …` and `<Key> isn't available on <model>. …`. SUFFIX-ONLY:
+    // the key's capitalised head is compared against
+    // `aterm_primer::CLAUDE_TOP_EFFORT_KEY` by the reader
+    // (`aterm_agent::harness::footer`), so no anchor spells the key.
+    lit("effort.top_on", " on (this session only): ", "2.1.304"),
+    lit("effort.top_off", " off. Effort stays ", "2.1.304"),
+    lit("effort.stays", ". Effort stays ", "2.1.304"),
+    lit(
+        "effort.top_needs",
+        " needs dynamic workflows enabled",
+        "2.1.304",
+    ),
+    lit("effort.top_unavailable", " isn't available on ", "2.1.304"),
+    // The effort result's last clause, the key's state (`… · <Key> off`:
+    // READ in the 2.1.304 bundle's `D()` answer, the state a word after the
+    // key; SUFFIX-ONLY, as above), and the tail of the level hint Claude
+    // draws over the top rule a moment after an `/effort` (`◐ medium ·
+    // /effort`, MEASURED on 2.1.304). COMPOSED: the bundle joins them. The
+    // clauses' ` · ` join is no anchor: aterm's own rows draw it too (the
+    // tap's `5h 42% · 7d 61%`), and no anchor's text is on one of them.
+    composed("effort.key_on", " on", "2.1.304"),
+    composed("effort.key_off", " off", "2.1.304"),
+    composed("effort.hint_tail", " \u{b7} /effort", "2.1.304"),
     lit("fast.on", "Fast mode ON", "2.1.283"),
     lit("fast.model_set", "model set to ", "2.1.283"),
     // The Usage tab of the Settings panel (`/usage`), for the accounts probe
@@ -1722,6 +1796,13 @@ pub const GEMINI_ANCHORS: &[Anchor] = &[
     // A turn's ends: Esc, and an API error with the notice under it.
     lit("gemini.turn.cancelled", "Request cancelled.", "0.46.0"),
     lit("gemini.error.api", "[API Error:", "0.46.0"),
+    // The error a turn ends on once its usage-limit (or no-access) dialog
+    // is answered `2. Stop`: `✕ [API Error: An unknown error occurred.]`.
+    lit(
+        "gemini.error.unknown",
+        "An unknown error occurred.",
+        "0.46.0",
+    ),
     lit("gemini.error.failed", "This request failed", "0.46.0"),
     // The approval boxes: their questions (the shell's tool name is drawn
     // as `[Shell]` after it), the write tool's title and their options.

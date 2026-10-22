@@ -2696,7 +2696,10 @@ fn a_member_rebound_on_the_issuer_is_read_under_its_new_key() {
     let read = |bound: NodeKey| {
         write_book(
             issuer_state.dir(),
-            &[keyed(0xd4, bound, [127, 0, 0, 1], m.port)],
+            &[Peer {
+                host: "127.0.0.1".to_owned(),
+                ..keyed(0xd4, bound, [127, 0, 0, 1], m.port)
+            }],
         );
         issue(issuer_state.dir());
         let issuing = Issuing::proving(
@@ -2710,7 +2713,13 @@ fn a_member_rebound_on_the_issuer_is_read_under_its_new_key() {
                 key: Some(issuing_as.key()),
                 ..issuer_entry(0x11, issuing.port)
             },
-            copy(keyed(0xd4, old.key(), [127, 0, 0, 1], m.port)),
+            // Named by its address, here and in the issuer's book: a key the
+            // dial there does not prove looks no `m7.local` up, which
+            // multicast DNS never answers before the read's deadline.
+            copy(Peer {
+                host: "127.0.0.1".to_owned(),
+                ..keyed(0xd4, old.key(), [127, 0, 0, 1], m.port)
+            }),
         ];
         let (reads, book) = read_whole(
             &peers,

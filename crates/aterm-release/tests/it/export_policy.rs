@@ -157,8 +157,11 @@ fn the_export_selects_no_gitlink_and_none_of_the_withheld_files() {
 }
 
 /// THE PUBLIC-CLONE COMMAND is one line the engine can read (`^CHECK_CMD_DEFAULT="([^"]*)"`,
-/// never sourced), and its version clause — run with the shell's own grep, as the gate
-/// runs it — admits a public `MAJOR.MINOR.0` and nothing else.
+/// never sourced), and its version clause — one `sh -c` step of the plain `&&` chain the
+/// known-red baseline needs, run whole with an owned version command — admits a successful
+/// public `MAJOR.MINOR.0` and refuses a failed command even when its output has that shape.
+/// The engine's own patch-slot rule reads
+/// Cargo.toml; this is the binary's answer.
 #[test]
 fn the_public_clone_command_reads_as_one_line_and_admits_only_a_public_version() {
     let config = std::fs::read_to_string(repo().join("publish/config.sh")).unwrap();
@@ -184,18 +187,29 @@ fn the_public_clone_command_reads_as_one_line_and_admits_only_a_public_version()
         .strip_prefix("sh -c '")
         .and_then(|c| c.strip_suffix('\''))
         .expect("the version clause is one sh -c step");
-    let (_, grep) = clause
-        .split_once(" | ")
-        .expect("the clause pipes the version into grep");
-    let admits = |line: &str| {
-        aterm_uds::spawnfd::command("sh")
-            .args(["-c", &format!("printf '%s\\n' \"$1\" | {grep}"), "sh", line])
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .stdout(aterm_uds::spawnfd::Stdio::null())
-            .stderr(aterm_uds::spawnfd::Stdio::null())
-            .status()
-            .unwrap()
-            .success()
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let target = scratch.path().join("target with spaces [*]");
+    let executable = target.join("debug/aterm");
+    std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf '%s\\n' \"$ATERM_TEST_VERSION\"\nexit \"$ATERM_TEST_EXIT\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let run = |line: &str, exit: u8| {
+        let mut command = aterm_uds::spawnfd::command("sh");
+        command
+            .args(["-c", clause])
+            .current_dir(scratch.path())
+            .env("CARGO_TARGET_DIR", &target)
+            .env("ATERM_TEST_VERSION", line)
+            .env("ATERM_TEST_EXIT", exit.to_string());
+        aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN).unwrap()
     };
     let toml = std::fs::read_to_string(repo().join("Cargo.toml")).unwrap();
     let workspace = toml
@@ -210,8 +224,20 @@ fn the_public_clone_command_reads_as_one_line_and_admits_only_a_public_version()
         "aterm 1.0.0".into(),
         "aterm 12.340.0".into(),
     ] {
-        assert!(admits(&good), "refuses a public version: {good:?}");
+        assert!(
+            run(&good, 0).status.success(),
+            "refuses a public version: {good:?}"
+        );
     }
+    assert!(
+        run("aterm 0.92.0\nby ALab\nbuild: 42", 0).status.success(),
+        "the normal multiline version answer remains public"
+    );
+    assert_eq!(
+        run("aterm 0.92.0", 7).status.code(),
+        Some(7),
+        "a failed version command cannot pass through grep's successful match"
+    );
     for bad in [
         "aterm 0.92.1",
         "aterm 0.92.10",
@@ -221,6 +247,6 @@ fn the_public_clone_command_reads_as_one_line_and_admits_only_a_public_version()
         "xaterm 0.92.0",
         "",
     ] {
-        assert!(!admits(bad), "admits {bad:?}");
+        assert!(!run(bad, 0).status.success(), "admits {bad:?}");
     }
 }

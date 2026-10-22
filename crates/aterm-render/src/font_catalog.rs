@@ -69,6 +69,7 @@ pub struct Stats {
 }
 
 impl Stats {
+    #[inline]
     #[must_use]
     pub fn truncated(&self) -> bool {
         !self.exhausted.is_empty()
@@ -86,6 +87,7 @@ pub struct AdmittedFont {
 
 impl AdmittedFont {
     /// The face this admission resolved to.
+    #[inline]
     #[must_use]
     pub fn face(&self) -> FaceRef {
         FaceRef::new(self.path.clone(), self.index)
@@ -129,6 +131,7 @@ pub struct Batch {
 
 impl Batch {
     /// Return the result corresponding to input index `index`.
+    #[inline]
     #[must_use]
     pub fn get(&self, index: usize) -> Option<&Result<AdmittedFont, String>> {
         self.entries.get(index).map(|entry| &entry.result)

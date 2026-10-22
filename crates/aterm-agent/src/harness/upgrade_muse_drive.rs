@@ -496,6 +496,7 @@ pub(super) fn look_at_exit(
         agent: Agent::Muse,
         crashed: word.map(|w| w == ExitKind::Crashed),
         refused: word == Some(ExitKind::Refused),
+        restarted_itself: false,
     }
 }
 

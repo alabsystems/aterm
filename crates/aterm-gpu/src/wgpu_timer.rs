@@ -68,8 +68,9 @@ const MAP_FAILED: u8 = 2;
 
 /// The bytes a readback of `pairs` passes resolves: a begin and an end tick
 /// (`u64`, little-endian) per pass.
-fn readback_bytes(pairs: u32) -> u64 {
-    u64::from(pairs * 2 * wgpu::QUERY_SIZE)
+#[inline]
+const fn readback_bytes(pairs: u32) -> u64 {
+    (pairs * 2 * wgpu::QUERY_SIZE) as u64
 }
 
 /// The device side of the ring: everything [`TimestampRing`] asks of wgpu,
@@ -105,10 +106,12 @@ pub(crate) struct WgpuSlot {
 impl Clock for WgpuClock<'_> {
     type Slot = WgpuSlot;
 
+    #[inline]
     fn poll(&self) {
         let _ = self.device.poll(wgpu::PollType::Poll);
     }
 
+    #[inline]
     fn on_done(&self, done: Arc<AtomicBool>) {
         self.queue
             .on_submitted_work_done(move || done.store(true, Ordering::Release));
@@ -235,6 +238,7 @@ impl WgpuGpuTimer {
 
     /// The timestamp writes for the next pass of the open frame, or `None`
     /// when no frame is open or the frame is out of pairs.
+    #[inline]
     pub(crate) fn pass_writes(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
         let (slot, pair) = self.next_pass()?;
         Some(wgpu::RenderPassTimestampWrites {

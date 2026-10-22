@@ -173,7 +173,8 @@ pub(crate) struct Current<'a> {
 
 impl Current<'_> {
     /// The GL function table.
-    pub(crate) fn gl(&self) -> &GlFns {
+    #[inline]
+    pub(crate) const fn gl(&self) -> &GlFns {
         &self.shared.gl
     }
 
@@ -253,7 +254,8 @@ impl Current<'_> {
     }
 
     /// The shared half, for the window-surface code.
-    pub(crate) fn shared(&self) -> &GlShared {
+    #[inline]
+    pub(crate) const fn shared(&self) -> &GlShared {
         self.shared
     }
 }
@@ -288,17 +290,20 @@ impl Drop for Current<'_> {
 #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
 impl GlShared {
     /// The EGL entry points.
-    pub(crate) fn egl(&self) -> &'static Egl {
+    #[inline]
+    pub(crate) const fn egl(&self) -> &'static Egl {
         self.egl
     }
 
     /// The display the context lives on.
-    pub(crate) fn display(&self) -> EGLDisplay {
+    #[inline]
+    pub(crate) const fn display(&self) -> EGLDisplay {
         self.display
     }
 
     /// The context's config (`EGL_NO_CONFIG_KHR` for a config-less context).
-    pub(crate) fn config(&self) -> EGLConfig {
+    #[inline]
+    pub(crate) const fn config(&self) -> EGLConfig {
         self.config
     }
 }
@@ -324,7 +329,8 @@ impl GlShared {
     }
 
     /// The window system whose display this is (`None`: headless).
-    pub(crate) fn window_system(&self) -> Option<WindowSystem> {
+    #[inline]
+    pub(crate) const fn window_system(&self) -> Option<WindowSystem> {
         self.window_system
     }
 }
@@ -333,12 +339,14 @@ impl GlShared {
     /// Whether EGL or GL has reported the context lost: at a frame's first
     /// `eglMakeCurrent` ([`Self::enter`]), a window's bind or swap, or a GL
     /// error check. A lost device stays lost.
+    #[inline]
     pub(crate) fn lost(&self) -> bool {
         self.lost.load(Ordering::Acquire)
     }
 
     /// Arm the injected-loss drill: the next [`Self::enter`] fails as a lost
     /// context's `eglMakeCurrent` does (`EGL_CONTEXT_LOST`), and latches.
+    #[inline]
     pub(crate) fn inject_context_loss(&self) {
         self.inject_loss.store(true, Ordering::Release);
     }
@@ -929,17 +937,20 @@ impl GlDevice {
     }
 
     /// Make the context current on this thread for the guard's life.
+    #[inline]
     pub(crate) fn enter(&self) -> Result<Current<'_>, String> {
         self.0.enter()
     }
 
     /// The device's capabilities.
+    #[inline]
     pub(crate) fn caps(&self) -> &GlCaps {
         &self.0.caps
     }
 
     /// The shared half, for resources to hold.
-    pub(crate) fn shared(&self) -> &Arc<GlShared> {
+    #[inline]
+    pub(crate) const fn shared(&self) -> &Arc<GlShared> {
         &self.0
     }
 }

@@ -112,7 +112,8 @@ aterm ctl subscribe "@$SID" log          # every new record, live
   never a need: no `need=` means nothing asked, not that the session is stuck.
 - `brief all` is every session of this instance in one budget (owner only); `aterm ctl
   survey` reads every instance. `aterm fabric brief` folds what the fabric's log mirror
-  publishes, and the mirror is off by default (`[fabric] log = "off"`). The session journal
+  publishes; the mirror is on by default wherever the broker retains it (`fabric status`
+  says `mirror=unretained` where it does not; `[fabric] log = "off"` opts out). The session journal
   is on by default on macOS and Linux (`[session_log] journal = false` turns it off; a
   headless instance keeps none), so `log @<sid>` and `brief @<sid>` also answer a session
   of an earlier aterm process.

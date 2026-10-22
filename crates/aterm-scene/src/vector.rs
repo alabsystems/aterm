@@ -81,8 +81,9 @@ pub struct PathTransform {
 
 impl PathTransform {
     /// Map the glyph's 0..1 frame onto a `w`×`h` pixel box at the tile origin.
+    #[inline]
     #[must_use]
-    pub fn fit(w: u32, h: u32) -> Self {
+    pub const fn fit(w: u32, h: u32) -> Self {
         Self {
             scale_x: w as f32,
             scale_y: h as f32,
@@ -372,6 +373,7 @@ pub fn fill_path_fixed(
 /// Accumulate one disjoint span `[a, b)` (device x) into the row: ±4 into `diff` for
 /// the fully-covered pixel range, exact subsample counts into `extra` for the (at most
 /// a few) partial boundary pixels. Grows the row's touched range.
+#[inline]
 fn add_span(
     diff: &mut [i32],
     extra: &mut [i32],
@@ -444,7 +446,8 @@ struct BBox {
 }
 
 impl BBox {
-    fn empty() -> Self {
+    #[inline]
+    const fn empty() -> Self {
         Self {
             min_x: f32::INFINITY,
             min_y: f32::INFINITY,
@@ -453,7 +456,8 @@ impl BBox {
         }
     }
 
-    fn add(&mut self, x: f32, y: f32) {
+    #[inline]
+    const fn add(&mut self, x: f32, y: f32) {
         self.min_x = self.min_x.min(x);
         self.min_y = self.min_y.min(y);
         self.max_x = self.max_x.max(x);
@@ -462,6 +466,7 @@ impl BBox {
 
     /// Clamp to the tile and widen by one pixel of slack for the AA lattice; `None`
     /// when nothing overlaps the tile.
+    #[inline]
     fn pixel_range(&self, w: u32, h: u32) -> Option<(usize, usize, usize, usize)> {
         if self.min_x > self.max_x || self.min_y > self.max_y {
             return None;
@@ -479,7 +484,8 @@ impl BBox {
 
 /// Non-finite → 0, magnitude clamped to [`COORD_LIMIT`] (the "out-of-range coords
 /// clamp" contract).
-fn sanitize(v: f32) -> f32 {
+#[inline]
+const fn sanitize(v: f32) -> f32 {
     if v.is_finite() {
         clampf(v, -COORD_LIMIT, COORD_LIMIT)
     } else {

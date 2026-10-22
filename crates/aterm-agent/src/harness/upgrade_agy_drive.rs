@@ -579,6 +579,7 @@ pub(super) fn look_at_exit(
             Some(ExitKind::Stopped | ExitKind::Unwitnessed) | None => None,
         },
         refused: word == Some(ExitKind::Refused),
+        restarted_itself: false,
     }
 }
 

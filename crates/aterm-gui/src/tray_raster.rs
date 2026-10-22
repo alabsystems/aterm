@@ -3333,6 +3333,36 @@ fn ui_text_wrap_walk(
     let breaks_before = |index: usize| {
         !ideographic.is_empty() && ideographic.binary_search(&byte_at(index)).is_ok()
     };
+    // Where white space is no place to break: before a run of nothing but
+    // closing punctuation or slashes, which goes with the word before it
+    // ([`aterm_grapheme::never_starts_a_line`], UAX #14 LB13): a spaced
+    // slash ends its line ("64 MiB /" / "2,048-file"), never starts one.
+    // The grapheme indices after each space that leads up to such a run.
+    let held: Vec<usize> = {
+        let mut held = Vec::new();
+        let mut index = 0;
+        while index < graphemes.len() {
+            if graphemes[index].2 {
+                index += 1;
+                continue;
+            }
+            let start = index;
+            while index < graphemes.len() && !graphemes[index].2 {
+                index += 1;
+            }
+            let token = &text[byte_at(start)..byte_at(index)];
+            if start > 0 && aterm_grapheme::never_starts_a_line(token) {
+                let mut space = start;
+                while space > 0 && graphemes[space - 1].2 {
+                    held.push(space);
+                    space -= 1;
+                }
+            }
+        }
+        held.sort_unstable();
+        held
+    };
+    let may_break_before = |index: usize| held.binary_search(&index).is_err();
     let mut ranges = Vec::new();
     let mut line_start = 0usize;
     let mut index = 0usize;
@@ -3359,7 +3389,15 @@ fn ui_text_wrap_walk(
                 while graphemes.get(split).is_some_and(|(_, _, space)| *space) {
                     split += 1;
                 }
-                split
+                // What follows goes with the word before the spaces: the
+                // line ends at the break before that word instead.
+                if may_break_before(split) {
+                    split
+                } else {
+                    soft_break
+                        .filter(|soft| *soft > line_start)
+                        .unwrap_or(split)
+                }
             } else {
                 soft_break
                     .filter(|split| *split > line_start)
@@ -3381,7 +3419,7 @@ fn ui_text_wrap_walk(
         width += advance;
         previous = next;
         index += 1;
-        if whitespace || breaks_before(index) {
+        if (whitespace && may_break_before(index)) || breaks_before(index) {
             soft_break = Some(index);
         }
     }

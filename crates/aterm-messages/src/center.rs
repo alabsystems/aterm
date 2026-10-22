@@ -3554,7 +3554,13 @@ impl MessageCenter {
     /// word is already a resolution, or that has no word, is left alone. `true`
     /// when a filing was resolved.
     pub fn forget_filing(&mut self, key: &str, wall: WallStamp, now: Instant) -> bool {
-        self.digest.find_key(key).is_none() && self.log.resolve_filing(key, wall.unix_ms, now)
+        let changed =
+            self.digest.find_key(key).is_none() && self.log.resolve_filing(key, wall.unix_ms, now);
+        if changed {
+            // The filed record's outcome changed, even though no digest entry moved.
+            self.revision += 1;
+        }
+        changed
     }
 
     /// A standing row's fact is new and nothing is live under its `key`: when
@@ -3640,7 +3646,7 @@ impl MessageCenter {
             msg.hold = Hold::LogOnly;
             let why = r.detail.first().map_or("", String::as_str);
             let then = r.detail.get(1).map_or("", String::as_str);
-            let ask = LaterAsk::adopted(why, then, &key);
+            let ask = LaterAsk::adopted(why, then, &key, r.actions.first());
             msg.need = Need::Later(ask.clone());
             let msg = msg.normalized();
             self.digest.push(DigestItem {

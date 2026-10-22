@@ -6370,8 +6370,22 @@ fn is_machine_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= WORD_MAX && aterm_codec::hex::is_hex(id, id.len())
 }
 
+/// Whether an open that found nothing at a name met an absent name, judged by
+/// `look`, the name's `symlink_metadata` taken after it: nothing there still,
+/// or a file put in place between the open and the look (another instance's
+/// machine id, linked in as eight keepers race in
+/// `the_machine_id_is_minted_once_and_kept`), which was not there when it was
+/// opened. A link there names nothing: not absent, refused.
+fn absent_at_open(look: io::Result<std::fs::Metadata>) -> bool {
+    match look {
+        Err(e) => e.kind() == io::ErrorKind::NotFound,
+        Ok(meta) => !meta.file_type().is_symlink(),
+    }
+}
+
 /// At most `max` bytes of a regular file at `path` as text; `None` only for
-/// a genuinely absent name. Unix opens do not wait on a FIFO. A larger file
+/// a name absent when it was opened ([`absent_at_open`]), never for a link
+/// to nothing. Unix opens do not wait on a FIFO. A larger file
 /// is [`io::ErrorKind::FileTooLarge`]; bytes that are not text are
 /// [`io::ErrorKind::InvalidData`].
 pub(crate) fn read_bounded(path: &Path, max: u64) -> io::Result<Option<String>> {
@@ -6386,9 +6400,10 @@ pub(crate) fn read_bounded(path: &Path, max: u64) -> io::Result<Option<String>> 
     let file = match options.open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return match std::fs::symlink_metadata(path) {
-                Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
-                _ => Err(e),
+            return if absent_at_open(std::fs::symlink_metadata(path)) {
+                Ok(None)
+            } else {
+                Err(e)
             };
         }
         Err(e) => return Err(e),

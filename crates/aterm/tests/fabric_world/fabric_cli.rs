@@ -841,6 +841,30 @@ fn publish(sock: &str, records: &[(String, String)]) -> Vec<u64> {
         .collect()
 }
 
+/// **`aterm link broker` OPENS WITH THE ONE CONSTRUCTOR** (session log Phase 6
+/// step 6E-2, ruling U24): the production broker binary retains its log by
+/// `aterm_link::broker_rules::default_rules` and its `Hello` advertises
+/// exactly them, as the world's in-process broker does
+/// (`broker_retention`'s test); a restart, on the same log, sets them again
+/// (astream advertises only the rules set since its open). NEGATIVE CONTROL,
+/// run: the binary without its `retain` call advertises none.
+#[test]
+fn the_broker_binary_advertises_the_default_rules() {
+    let s = Scratch::new("rules");
+    for start in ["first", "restart"] {
+        let broker = Broker::spawn(&s);
+        let mut c = root_client(&s.sock());
+        c.hello().expect("hello");
+        assert_eq!(
+            c.retention_rules(),
+            Some(aterm_link::broker_rules::default_rules()),
+            "{start}"
+        );
+        drop(c);
+        drop(broker);
+    }
+}
+
 /// **`doctor --retire-ghosts` IS DRY UNTIL IT IS TOLD OTHERWISE.**
 ///
 /// A presence row under THIS state dir's node says `state=live` and no aterm

@@ -61,7 +61,7 @@ pub(super) struct RecentTypedRun {
 
 impl RecentTypedRun {
     #[inline]
-    pub(super) fn end(&self) -> u16 {
+    pub(super) const fn end(&self) -> u16 {
         self.col0.saturating_add(self.len)
     }
 }
@@ -170,7 +170,7 @@ pub(super) struct UnownedCaret {
 impl HandRow {
     /// The hand's row after a licensed typed echo landed on `row`.
     #[inline]
-    pub(super) fn at(row: u16) -> Self {
+    pub(super) const fn at(row: u16) -> Self {
         Self {
             row,
             caret_row: None,
@@ -195,8 +195,10 @@ impl HandRow {
     /// composer stayed put and the hand's row follows the caret; on the
     /// content's row the doubt is over. Elsewhere nothing is settled.
     #[inline]
-    pub(super) fn settle(&mut self, caret_row: u16) {
-        if self.caret_row == Some(caret_row) {
+    pub(super) const fn settle(&mut self, caret_row: u16) {
+        if let Some(cr) = self.caret_row
+            && cr == caret_row
+        {
             *self = Self::at(caret_row);
         } else if self.row == caret_row {
             self.caret_row = None;
@@ -217,7 +219,8 @@ impl TypedStamps {
     }
 
     /// Wipe every banked stamp (the class-changing supersede / teardown).
-    pub(crate) fn clear(&mut self) {
+    #[inline]
+    pub(crate) const fn clear(&mut self) {
         self.slots = [None; TYPED_STAMP_DEPTH];
     }
 
@@ -291,7 +294,8 @@ impl TypedStamps {
 
     /// Whether any stamp is banked, fresh or stale.
     #[cfg(test)]
-    pub(crate) fn armed(&self) -> bool {
+    #[inline]
+    pub(crate) const fn armed(&self) -> bool {
         self.slots[0].is_some()
     }
 
@@ -405,7 +409,7 @@ impl Default for PressCredits {
 impl PressCredits {
     /// Bank one press worth `credits` cells.
     #[inline]
-    pub(super) fn bank(&mut self, now: Instant, credits: u8, glyph: Option<char>) {
+    pub(super) const fn bank(&mut self, now: Instant, credits: u8, glyph: Option<char>) {
         self.slots[self.head] = Some((now, credits, glyph));
         self.head = (self.head + 1) & STAMP_RING_MASK;
     }
@@ -735,7 +739,8 @@ impl PressCredits {
     }
 
     /// Forget every press — an observed edge the presses cannot explain.
-    pub(super) fn forget(&mut self) {
+    #[inline]
+    pub(super) const fn forget(&mut self) {
         self.slots = [None; TYPED_STAMP_DEPTH];
         self.head = 0;
         self.held_through = None;
@@ -1239,8 +1244,12 @@ pub(super) struct OrphanExactRun {
 
 impl OrphanExactRun {
     #[inline]
-    pub(super) fn current(self) -> Option<OrphanExactKey> {
-        self.keys.get(self.next).copied().flatten()
+    pub(super) const fn current(self) -> Option<OrphanExactKey> {
+        if self.next < self.keys.len() {
+            self.keys[self.next]
+        } else {
+            None
+        }
     }
 }
 
@@ -1349,14 +1358,15 @@ impl InsertSeam {
 
     /// Drop the licence and the credit it accumulated into.
     #[inline]
-    pub(super) fn clear(&mut self) {
+    pub(super) const fn clear(&mut self) {
         self.armed = None;
         self.undo.licence = None;
     }
 
     /// A coordinate-space teardown: the licence, its undo, the span and the
     /// hop go. The tally and undo width are readings and stay.
-    pub(super) fn teardown(&mut self) {
+    #[inline]
+    pub(super) const fn teardown(&mut self) {
         self.clear();
         self.span = None;
         self.pending_hop = None;
@@ -1407,7 +1417,8 @@ impl InsertSeam {
     /// exactly its width; an unknown width by the row witness alone, bounded at
     /// [`CursorGlow::INSERT_GESTURE_CELLS`] (the terms
     /// [`CursorGlow::insert_row_identity`] spends the live echo on).
-    pub(super) fn retro_hop_is_the_inserts(
+    #[inline]
+    pub(super) const fn retro_hop_is_the_inserts(
         hop: PendingHop,
         cells: u16,
         known: bool,
@@ -1417,7 +1428,9 @@ impl InsertSeam {
         if known {
             width == cells
         } else {
-            width > 0 && width <= CursorGlow::INSERT_GESTURE_CELLS && row == Some(hop.row)
+            width > 0
+                && width <= CursorGlow::INSERT_GESTURE_CELLS
+                && matches!(row, Some(r) if r == hop.row)
         }
     }
 
@@ -1437,7 +1450,8 @@ impl InsertSeam {
 
     /// The licence was laid as `span`: take the one-shot and its credit, drop
     /// the refused hop, open the rewrite window, and count the lit insert.
-    pub(super) fn laid(&mut self, span: InsertSpan) {
+    #[inline]
+    pub(super) const fn laid(&mut self, span: InsertSpan) {
         self.clear();
         self.pending_hop = None;
         self.span = Some(span);
@@ -1447,7 +1461,8 @@ impl InsertSeam {
 
     /// The laid span was retracted to the program's new caret `col`: the
     /// span memory shrinks to it, and `trail status` counts the rewrite.
-    pub(super) fn retracted(&mut self, col: u16) {
+    #[inline]
+    pub(super) const fn retracted(&mut self, col: u16) {
         if let Some(span) = self.span.as_mut() {
             span.col1 = col;
         }
@@ -1792,20 +1807,28 @@ impl CursorGlow {
     /// ([`Self::bs_baseline`]): this frame's probe if landed, else the last
     /// presented truth.
     #[inline]
-    pub(super) fn row_fill_at_key(&self) -> Option<(u16, u16)> {
-        self.row_cur_meta
-            .or(self.row_prev_meta)
-            .map(|m| (m.row, m.fill))
+    pub(super) const fn row_fill_at_key(&self) -> Option<(u16, u16)> {
+        match self.row_cur_meta {
+            Some(m) => Some((m.row, m.fill)),
+            None => match self.row_prev_meta {
+                Some(m) => Some((m.row, m.fill)),
+                None => None,
+            },
+        }
     }
 
     /// The row fill an erase delivery stamps as its baseline: the previous
     /// probe first, since receipts apply after this frame's
     /// `observe_row_with_trust` and `row_cur_meta` may already be post-erase.
     #[inline]
-    pub(super) fn row_fill_at_delivery(&self) -> Option<(u16, u16)> {
-        self.row_prev_meta
-            .or(self.row_cur_meta)
-            .map(|m| (m.row, m.fill))
+    pub(super) const fn row_fill_at_delivery(&self) -> Option<(u16, u16)> {
+        match self.row_prev_meta {
+            Some(m) => Some((m.row, m.fill)),
+            None => match self.row_cur_meta {
+                Some(m) => Some((m.row, m.fill)),
+                None => None,
+            },
+        }
     }
 
     /// [`Self::note_insert_delivered_from`] for a test that has no dispatch
@@ -1944,7 +1967,7 @@ impl CursorGlow {
     /// in-flight delivery receipt ([`PendingHop`]); Rainbow Kitty only. Shared
     /// by `spawn_judged` and `echo_anchor_pass`.
     #[inline]
-    pub(super) fn remember_refused_hop(
+    pub(super) const fn remember_refused_hop(
         &mut self,
         row: u16,
         col0: u16,
@@ -2008,9 +2031,9 @@ impl CursorGlow {
     /// the witnessed row alone: not a prompt a later Return printed, not a
     /// ⇧Tab mode line, not an untyped row.
     #[inline]
-    pub(super) fn insert_row_identity(row: u16, hop: usize, ins: InsertLicence) -> bool {
-        let own_row = ins.row == Some(row);
-        own_row || (ins.known && hop >= usize::from(ins.cells))
+    pub(super) const fn insert_row_identity(row: u16, hop: usize, ins: InsertLicence) -> bool {
+        let own_row = matches!(ins.row, Some(r) if r == row);
+        own_row || (ins.known && hop >= ins.cells as usize)
     }
 
     /// The insert's echo on the visible lane: the one predicate
@@ -2268,7 +2291,7 @@ impl CursorGlow {
     /// `trail status`'s insert rows — see [`InsertTally`].
     #[inline]
     #[must_use]
-    pub fn insert_tally(&self) -> InsertTally {
+    pub const fn insert_tally(&self) -> InsertTally {
         self.insert.tally
     }
 
@@ -2354,7 +2377,7 @@ impl CursorGlow {
     /// observability for lifecycle tests, not an admission licence.
     #[inline]
     #[must_use]
-    pub fn reflow_hint_armed(&self) -> bool {
+    pub const fn reflow_hint_armed(&self) -> bool {
         self.reflow_hint.is_some()
     }
 
@@ -2374,7 +2397,7 @@ impl CursorGlow {
     /// against 5). The two-press floor reads the raw ledger: one unechoed
     /// press is indistinguishable from a stale stamp.
     #[inline]
-    pub(super) fn share_rule(credits: usize, paid: usize, cells: usize) -> bool {
+    pub(super) const fn share_rule(credits: usize, paid: usize, cells: usize) -> bool {
         credits >= 2 && paid * 4 >= cells * 3
     }
 
@@ -2452,7 +2475,7 @@ impl CursorGlow {
     /// Raw-mode programs (Claude Code, vim, readline, `read -s -n`) echo for
     /// themselves and never come here.
     #[inline]
-    pub fn note_typed_swallowed_no_echo(&mut self) {
+    pub const fn note_typed_swallowed_no_echo(&mut self) {
         self.in_flight_tally.swallowed_no_echo += 1;
     }
 
@@ -2549,24 +2572,32 @@ impl CursorGlow {
     /// The focused pane's `(first column, width)` under the host's pane
     /// columns ([`Self::pane_columns`]), or the whole grid.
     #[inline]
-    pub(super) fn pane_span(&self, geom: Geom) -> (usize, usize) {
-        self.pane_columns.map_or((0, geom.cols), |(col0, cols)| {
-            (usize::from(col0), usize::from(cols))
-        })
+    pub(super) const fn pane_span(&self, geom: Geom) -> (usize, usize) {
+        match self.pane_columns {
+            Some((col0, cols)) => (col0 as usize, cols as usize),
+            None => (0, geom.cols),
+        }
     }
 
     /// A move's pane-local columns for the fold shapes: `(pane_cols,
     /// pc_local, cc_local, pane_contains_move)` under the host's pane columns
     /// ([`Self::pane_columns`]) or the whole grid.
     #[inline]
-    pub(super) fn pane_local(&self, pc: u16, cc: u16, geom: Geom) -> (usize, usize, usize, bool) {
+    pub(super) const fn pane_local(
+        &self,
+        pc: u16,
+        cc: u16,
+        geom: Geom,
+    ) -> (usize, usize, usize, bool) {
         let (pane_col0, pane_cols) = self.pane_span(geom);
         let pane_col1 = pane_col0.saturating_add(pane_cols);
-        let pc_window = usize::from(pc);
-        let cc_window = usize::from(cc);
+        let pc_window = pc as usize;
+        let cc_window = cc as usize;
         let pane_contains_move = pane_cols > 0
-            && (pane_col0..pane_col1).contains(&pc_window)
-            && (pane_col0..pane_col1).contains(&cc_window);
+            && pc_window >= pane_col0
+            && pc_window < pane_col1
+            && cc_window >= pane_col0
+            && cc_window < pane_col1;
         (
             pane_cols,
             pc_window.saturating_sub(pane_col0),
@@ -2732,7 +2763,7 @@ impl CursorGlow {
     /// is 0 when the pane's last cell was already paid as the pending-wrap
     /// print ([`Self::fold_origin_tail`], [`Self::wrap_paid_row`]).
     #[inline]
-    pub(super) fn fold_shape(
+    pub(super) const fn fold_shape(
         &self,
         pr: u16,
         pc: u16,
@@ -2741,14 +2772,18 @@ impl CursorGlow {
         geom: Geom,
     ) -> Option<usize> {
         let (pane_cols, pc_local, cc_local, pane_contains_move) = self.pane_local(pc, cc, geom);
-        (cr == pr.saturating_add(1)
+        if cr == pr.saturating_add(1)
             && pane_contains_move
             && cc_local <= 1
-            && pc_local.saturating_add(2) >= pane_cols)
-            .then_some(
+            && pc_local.saturating_add(2) >= pane_cols
+        {
+            Some(
                 self.fold_origin_tail(pr, pc_local, pane_cols)
                     .saturating_add(cc_local),
             )
+        } else {
+            None
+        }
     }
 
     /// The cells a fold lays on its origin row: `pc` to the pane's edge, unless
@@ -2756,8 +2791,15 @@ impl CursorGlow {
     /// that cell as the pending-wrap print ([`Self::wrap_paid_row`]). A
     /// last-column glyph arriving with the wrap prices both cells.
     #[inline]
-    pub(super) fn fold_origin_tail(&self, pr: u16, pc_local: usize, pane_cols: usize) -> usize {
-        if pc_local.saturating_add(1) == pane_cols && self.wrap_paid_row == Some(pr) {
+    pub(super) const fn fold_origin_tail(
+        &self,
+        pr: u16,
+        pc_local: usize,
+        pane_cols: usize,
+    ) -> usize {
+        if pc_local.saturating_add(1) == pane_cols
+            && matches!(self.wrap_paid_row, Some(r) if r == pr)
+        {
             0
         } else {
             pane_cols.saturating_sub(pc_local)
@@ -2888,9 +2930,11 @@ impl CursorGlow {
     /// row (a composer's next line, then Backspace back) cannot disown it. A
     /// doubt about another row stands.
     #[inline]
-    pub(super) fn hand_lands_on(&mut self, row: u16) {
+    pub(super) const fn hand_lands_on(&mut self, row: u16) {
         self.hand_row = Some(HandRow::at(row));
-        if self.unowned_caret.is_some_and(|caret| caret.row == row) {
+        if let Some(caret) = self.unowned_caret
+            && caret.row == row
+        {
             self.unowned_caret = None;
         }
     }
@@ -2943,7 +2987,7 @@ impl CursorGlow {
     /// (and ahead of `note_return` / `note_user_gesture` for Enter, Tab and
     /// ⌃V); [`Self::note_typed_glyph`] calls it before banking its stamp.
     #[inline]
-    pub fn supersede_typed_press(&mut self) {
+    pub const fn supersede_typed_press(&mut self) {
         self.user_gesture_hint = None;
         self.reflow_hint = None;
     }

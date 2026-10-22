@@ -65,8 +65,9 @@
 //! YOU: sign 3.4.0`, `Nothing left (NEEDS YOU: the grant)`). The one
 //! mention it is not: a token a `no` negates (`no NEEDS YOU, no open
 //! work`), one in quotation marks or after an article that a word naming a
-//! head follows (`the NEEDS YOU: line`), one inside a span of code that does
-//! not open it, and a tool's output (`⎿`). A none line's restatement is no
+//! head follows (`the NEEDS YOU: line`), one a line's start names (`on a
+//! line starting NEEDS YOU: and carry on`, aterm's own instruction), one
+//! inside a span of code that does not open it, and a tool's output (`⎿`). A none line's restatement is no
 //! need but is still read for open work ([`without_needs`]). Never inside a
 //! fenced code block (```` ``` ```` or `~~~`). A need is aterm's to show, so
 //! it is sanitized ([`needs_you`]): control characters dropped, whitespace
@@ -515,6 +516,62 @@ const MENTION_NOUNS: &[&str] = &[
 /// (`a NEEDS YOU: line`), with a [`MENTION_NOUNS`] word after its separator.
 const MENTION_ARTICLES: &[&str] = &["a", "an", "the", "each", "every", "any", "one", "that"];
 
+/// THE WORDS THAT NAME THE NEEDS YOU TOKEN RIGHT AFTER THEM AS A LINE'S HEAD,
+/// after a word naming a line ([`MENTION_NOUNS`]), never say it, whatever
+/// follows (`put what only a person can give on a line starting NEEDS YOU:
+/// and carry on`, `` a line starting `NEEDS YOU:` reaches the person ``,
+/// `lines beginning with NEEDS YOU:`): aterm's own instruction in every act
+/// it types and in a worker's first prompt, which a screen reads back where
+/// it cannot bound the message (agy, a reply cut above the rows read) and a
+/// worker may quote. `with` or `by` may stand between
+/// ([`HEAD_NAMING_LINKS`]). Read as a need, the words after the token (`and
+/// land the rest. Once it is all on remote main, …`) stood as one nobody
+/// said (the review of b9/spawn-residuals, F1). Only after a line's noun:
+/// `before I can start` over a `NEEDS YOU:` row is a report's own need
+/// (FAIL TOWARD A KEPT NEED).
+const HEAD_NAMING: &[&str] = &[
+    "starting",
+    "starts",
+    "beginning",
+    "begins",
+    "prefixed",
+    "headed",
+];
+
+/// The words that may stand between a [`HEAD_NAMING`] word and the token
+/// (`starting with NEEDS YOU:`, `headed by NEEDS YOU:`).
+const HEAD_NAMING_LINKS: &[&str] = &["with", "by"];
+
+/// Whether `lead`, the words before a NEEDS YOU token past its opening
+/// marks (a row, or the row above one the token opens), ends naming the
+/// token as a line's head: a [`MENTION_NOUNS`] word, a [`HEAD_NAMING`] word,
+/// and a [`HEAD_NAMING_LINKS`] word or none.
+fn names_a_head(lead: &str) -> bool {
+    let said: Vec<&str> = lead
+        .rsplit(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .take(3)
+        .collect();
+    let words: Vec<String> = said.iter().map(|w| w.to_lowercase()).collect();
+    let words: Vec<&str> = words.iter().map(String::as_str).collect();
+    let (naming, verb_at) = match words.as_slice() {
+        [link, rest @ ..] if HEAD_NAMING_LINKS.contains(link) => (rest, 1),
+        all => (all, 0),
+    };
+    match naming {
+        [verb, noun, ..] => HEAD_NAMING.contains(verb) && MENTION_NOUNS.contains(noun),
+        // The words open the text in small letters: a wrapped row whose
+        // sentence began above the rows read (`starting NEEDS YOU: and land
+        // the rest`, the top row of a reply cut there) — no report opens a
+        // need so.
+        [verb] => {
+            HEAD_NAMING.contains(verb)
+                && said[verb_at].chars().next().is_some_and(char::is_lowercase)
+        }
+        [] => false,
+    }
+}
+
 /// `t` past its list marker (`- `, `* `, `+ `, `• `, `1. `, `1) `), if it
 /// has one.
 fn past_marker(t: &str) -> Option<&str> {
@@ -798,7 +855,11 @@ fn head_from(t: &str, named: bool) -> Option<&str> {
             return None;
         }
     }
-    if named {
+    // THE BARE FORM naming the head as a thing is a mention too, wherever
+    // it stands (`Your NEEDS YOU line is on the person's screen now`, aterm's
+    // own ack, wrapped onto a row of its own as `NEEDS YOU line is on …`).
+    let bare = !separated && qualifier.is_none();
+    if named || bare {
         let first = rest
             .trim_start_matches(|c: char| !c.is_alphanumeric())
             .split(|c: char| !c.is_alphanumeric())
@@ -1266,8 +1327,10 @@ const MID_QUOTES: &[char] = &['"', '“', '‘', '\''];
 /// mention (`the primer says a NEEDS YOU: line reaches the person`). Never
 /// a token a none negates (`no NEEDS YOU, no open work`), a token inside a
 /// span of code that does not open it, nor a tool's output (a row its gutter
-/// `⎿` opens). Where the head starts in `row`, and what follows it.
-fn mid_head(row: &str) -> Option<(usize, &str)> {
+/// `⎿` opens), nor one a line's start names ([`names_a_head`], read on
+/// the row `above` too, where the row wrapped). Where the head starts in
+/// `row`, and what follows it.
+fn mid_head<'a>(row: &'a str, above: &str) -> Option<(usize, &'a str)> {
     if unquoted(row).starts_with('⎿') {
         return None;
     }
@@ -1307,6 +1370,12 @@ fn mid_head(row: &str) -> Option<(usize, &str)> {
         // The token a none negates names no need (`no NEEDS YOU, no open
         // work`).
         if matches!(before.as_str(), "no" | "zero" | "without") {
+            return None;
+        }
+        // The token a line's start names is no head said (`on a line
+        // starting NEEDS YOU: and carry on`), the row above read with this
+        // one's words before it where they are few (a wrapped row).
+        if names_a_head(&format!("{above} {lead}")) {
             return None;
         }
         let article = MENTION_ARTICLES.contains(&before.as_str());
@@ -1386,13 +1455,47 @@ fn needs_lines_by(tail: &str, by: &NoneWords<'_>) -> NeedLines {
             i += 1;
             continue;
         }
+        // A head the row above names as a line's, wrapped onto this row
+        // (`… on a line starting` over `NEEDS YOU: and carry on.`): no need
+        // said ([`names_a_head`]).
+        let above = if i > 0 { rows[i - 1] } else { "" };
+        if names_a_head(above) && need_rest(row).is_some() {
+            i += 1;
+            continue;
+        }
+        // A TEXT THAT OPENS MID-SENTENCE on the token, its words joined on
+        // by a small `and` (`NEEDS YOU: and carry on with` — the top row of
+        // a reply cut right under `… on a line starting`, aterm's own
+        // instruction): the sentence began above the rows read, and no
+        // report opens a need so.
+        if i == 0 && need_rest(row).is_some_and(|rest| rest.starts_with("and ")) {
+            i += 1;
+            continue;
+        }
         let head = i;
-        let rest = match need_rest(row) {
+        // An article ending the row above names the token this row opens
+        // with (`… a` over `NEEDS YOU: line is for credentials only`): the
+        // mention [`head_from`] drops, wrapped.
+        let named_above = above
+            .rsplit(|c: char| !c.is_alphanumeric())
+            .find(|w| !w.is_empty())
+            .is_some_and(|w| MENTION_ARTICLES.contains(&w.to_lowercase().as_str()))
+            && above.trim_end().ends_with(char::is_alphanumeric);
+        let opens = if named_above {
+            head_from(past_need_lead(unquoted(row)), true)
+        } else {
+            need_rest(row)
+        };
+        let rest = match opens {
             Some(rest) => {
                 out.lines.push(i);
                 rest
             }
-            None => match mid_head(row) {
+            None if named_above && need_rest(row).is_some() => {
+                i += 1;
+                continue;
+            }
+            None => match mid_head(row, above) {
                 Some((cut, rest)) => {
                     out.cuts.push((i, cut));
                     rest

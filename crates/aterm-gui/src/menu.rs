@@ -258,7 +258,7 @@ pub(crate) enum MenuAction {
     Paste,
     /// Select All (`App::select_all`).
     SelectAll,
-    /// Find… — enter Cmd-F find mode (`App::search_enter`).
+    /// Find… — search the active tab (`App::find_requested`).
     Find,
     /// Find Next — resume/step to the next search match.
     FindNext,
@@ -439,7 +439,8 @@ pub(crate) enum MenuAction {
     /// View ▸ Coding Agent Harness…: the one Settings tab, at Settings ▸ Harness — the harness's
     /// switches, the default Autopilot, each session's Autopilot and what the
     /// harness did. The menu and palette twin of the Autopilot menu's
-    /// `Harness settings…` (`App::open_harness_settings`). Instance-level: no session needed.
+    /// `Harness settings…` (`App::open_harness_settings`). Instance-level: no
+    /// session needed.
     HarnessSettings,
     /// Minimise the window.
     Minimize,

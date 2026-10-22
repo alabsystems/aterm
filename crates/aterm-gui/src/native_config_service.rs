@@ -226,7 +226,7 @@ impl VersionedConfigService {
     }
 
     #[cfg(any(test, feature = "bench-support"))]
-    fn new_with_themes(
+    pub(crate) fn new_with_themes(
         text: String,
         themes: Arc<crate::app_config::ThemeCatalog>,
     ) -> Result<Self, String> {
@@ -603,33 +603,14 @@ impl VersionedConfigService {
             .iter()
             .map(|edit| (edit.key.as_str(), edit.value.clone()))
             .collect::<Vec<_>>();
-        let elide =
-            crate::prefs::unset_equivalent_edits(&self.text, &borrowed, &self.assets.themes);
-        // A value that reads as what its key already holds is no edit
-        // ([`written_value`]: `14` written over the file's `14.0`): rewriting
-        // it would only re-spell the person's line (`14.0` as `14`) and
-        // report a save of nothing. A removal is left to the writer, which
-        // also takes out a retired spelling of the key.
-        let borrowed = borrowed
-            .into_iter()
-            .zip(elide)
-            .map(|((key, value), elide)| (key, if elide { None } else { value }))
-            .filter(|(key, value)| {
-                // A value the writer refuses is kept, so the writer refuses it.
-                value.as_deref().is_none_or(|value| {
-                    written_value(key, value)
-                        .is_none_or(|written| self.values.get(*key) != Some(&written))
-                })
-            })
-            .collect::<Vec<_>>();
-        if borrowed.is_empty() {
-            return ConfigPatchResult::Unchanged {
-                snapshot: self.snapshot(),
-            };
-        }
-        let next = match crate::prefs::apply_prefs_edits(&self.text, &borrowed) {
-            Ok(next) => next,
-            Err(error) => return self.rejected(error.to_string()),
+        let (borrowed, next) = match planned_write(&self.text, &borrowed, &self.assets.themes) {
+            Ok(Some(planned)) => (planned.edits, planned.text),
+            Ok(None) => {
+                return ConfigPatchResult::Unchanged {
+                    snapshot: self.snapshot(),
+                };
+            }
+            Err(message) => return self.rejected(message),
         };
         let mut keys = borrowed
             .iter()
@@ -1318,6 +1299,50 @@ fn holds(key: &str, held: Option<&String>, expected: Option<&str>) -> bool {
     }
 }
 
+/// The write a patch makes ([`planned_write`]): the edits the writer takes,
+/// and the text it makes of them.
+pub(crate) struct PlannedWrite<'a> {
+    pub(crate) edits: Vec<(&'a str, Option<String>)>,
+    pub(crate) text: String,
+}
+
+/// THE WRITE A PATCH MAKES, the one judgement every writer shares — the
+/// service, and the Settings page deciding whether a press has anything to
+/// send: `edits` with each value equal to its key's default made a removal
+/// ([`crate::prefs::unset_equivalent_edits`]) and each value its key already
+/// holds dropped ([`written_value`]: `14` over the file's `14.0` would only
+/// re-spell the person's line and report a save of nothing), and the text
+/// the writer makes of the rest. `Ok(None)` where that text is `text`: a
+/// patch that changes nothing. A removal is always the writer's to judge,
+/// even of a key the file does not hold: its document transforms (a retired
+/// spelling folded into the key that replaced it, the style Off replaced,
+/// an old Classic's colour) can change the file all the same. `Err` is the
+/// writer's refusal, in its words.
+pub(crate) fn planned_write<'a>(
+    text: &str,
+    edits: &[(&'a str, Option<String>)],
+    themes: &crate::app_config::ThemeCatalog,
+) -> Result<Option<PlannedWrite<'a>>, String> {
+    let held = parse_values(text)?;
+    let elide = crate::prefs::unset_equivalent_edits(text, edits, themes);
+    let edits = edits
+        .iter()
+        .zip(elide)
+        .map(|((key, value), elide)| (*key, if elide { None } else { value.clone() }))
+        .filter(|(key, value)| {
+            // A value the writer refuses is kept, so the writer refuses it.
+            value.as_deref().is_none_or(|value| {
+                written_value(key, value).is_none_or(|written| held.get(*key) != Some(&written))
+            })
+        })
+        .collect::<Vec<_>>();
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    let next = crate::prefs::apply_prefs_edits(text, &edits).map_err(|error| error.to_string())?;
+    Ok((next != text).then_some(PlannedWrite { edits, text: next }))
+}
+
 pub(crate) fn written_value(key: &str, raw: &str) -> Option<String> {
     crate::prefs::typed_toml_item(key, raw)
         .ok()
@@ -1415,9 +1440,9 @@ mod tests {
     /// refused without a write.
     #[test]
     fn settings_set_accepts_trail_aliases() {
+        // An alias of the default style is the default: written as a removal
+        // (`an_alias_of_the_default_style_is_written_as_a_removal`).
         for (input, written) in [
-            ("rainbow kitty", "rainbow kitty pet"),
-            ("Rainbow Kitty Tall", "rainbow kitty pet"),
             ("nyan", "rainbow kitty flying"),
             // The owner's own spelling.
             ("nyan rainbow", "rainbow kitty flying"),
@@ -2049,6 +2074,67 @@ mod tests {
                 .unwrap(),
             None,
             "Laser's own bloom size is its default"
+        );
+    }
+
+    /// AN ALIAS OF THE DEFAULT IS THE DEFAULT: the writer stores `kitty` as
+    /// `rainbow kitty pet`, so the rule that writes a default as a removal
+    /// judges the stored spelling, not the typed one. An alias of another
+    /// style is still written, as its row.
+    #[test]
+    fn an_alias_of_the_default_style_is_written_as_a_removal() {
+        let default = crate::app_config::default_cursor_trail_style();
+        let aliases: Vec<&str> = aterm_effects::cursor_glow::spellings::TRAIL_STYLE_ALIASES
+            .iter()
+            .filter(|(_, target)| *target == default)
+            .map(|(alias, _)| *alias)
+            .collect();
+        assert!(aliases.len() > 3, "{default} has aliases: {aliases:?}");
+        for alias in aliases.iter().copied().chain(["Kitty", " rainbow kitty "]) {
+            let mut service = VersionedConfigService::new(
+                "cursor_trail_style = \"comet\"\nfont_px = 14\n".into(),
+            )
+            .unwrap();
+            let base = service.snapshot().revision;
+            service.patch(edit(
+                base,
+                crate::prefs::EDIT_CURSOR_TRAIL_STYLE,
+                ExpectedValue::Any,
+                Some(alias),
+            ));
+            assert_eq!(
+                &*service.snapshot().text,
+                "font_px = 14\n",
+                "{alias:?} is the default style"
+            );
+            let mut service = VersionedConfigService::new(String::new()).unwrap();
+            let base = service.snapshot().revision;
+            let result = service.patch(edit(
+                base,
+                crate::prefs::EDIT_CURSOR_TRAIL_STYLE,
+                ExpectedValue::Any,
+                Some(alias),
+            ));
+            assert!(
+                matches!(result, ConfigPatchResult::Unchanged { .. }),
+                "{alias:?} over no style: {result:?}"
+            );
+        }
+        // Negative control: an alias of another style is that style.
+        let mut service = VersionedConfigService::new(String::new()).unwrap();
+        let base = service.snapshot().revision;
+        service.patch(edit(
+            base,
+            crate::prefs::EDIT_CURSOR_TRAIL_STYLE,
+            ExpectedValue::Any,
+            Some("nyan"),
+        ));
+        assert_eq!(
+            service
+                .value(crate::prefs::EDIT_CURSOR_TRAIL_STYLE)
+                .unwrap()
+                .as_deref(),
+            Some("rainbow kitty flying")
         );
     }
 

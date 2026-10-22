@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · `/effort workspace on` run in a session launched with `CLAUDE_CODE_DISABLE_WORKFLOWS=1` (and `editorMode: "vim"`, in INSERT), fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1): Claude refuses with `⎿  Workspace needs dynamic workflows enabled (see /config). Valid options are: low, medium, high, xhigh, max, auto`, no tag on the top rule, the transient `◐ medium · /effort` right-aligned above it; the stand-in `workspace` replaces the vendor's top effort key throughout
+
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.JhpC/proj
+
+
+❯ /effort workspace on
+  ⎿  Workspace needs dynamic workflows enabled (see /config). Valid options are: low, medium, high, xhigh, max, auto
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)

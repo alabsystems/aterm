@@ -565,6 +565,7 @@ impl Census {
 
 /// Census the cells a body `w` px wide with its left edge at `x` px covers on
 /// `row`. Bounded by the body's width in cells; allocation-free.
+#[inline]
 fn census<F>(x: i32, w: i32, row: u16, caret: (u16, u16), cols: u16, cw: i32, ink: &F) -> Census
 where
     F: Fn(u16, u16) -> Option<bool>,
@@ -697,6 +698,7 @@ impl PetOnGlass {
     /// Read off the pet's published frame; `None` when the pet is not on glass (`alpha == 0`)
     /// or the cell metrics are degenerate. The span is [`PetFrame::body_px`], the dest rect
     /// actually drawn.
+    #[inline]
     #[must_use]
     pub fn of(frame: &PetFrame, geom: Geom) -> Option<Self> {
         let cell_w = u16::try_from(geom.cw).ok()?;

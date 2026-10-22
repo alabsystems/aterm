@@ -149,6 +149,7 @@ impl TerminalFacts {
     /// Read every fact from the terminal in one pass. `scrolled` is the host's
     /// own content-scroll decision (it owns the previous snapshot); the rest is
     /// the emulator's.
+    #[inline]
     #[must_use]
     pub fn read(term: &Terminal, session: u64, scrolled: bool) -> Self {
         let display_offset = term.grid().display_offset() as i32;
@@ -209,12 +210,16 @@ impl TerminalFacts {
 /// both cases under the same lock as the caret.
 #[inline]
 #[must_use]
-pub fn motion_caret(
+pub const fn motion_caret(
     caret: Option<(u16, u16)>,
     cursor_visible: bool,
     hidden_withheld: bool,
 ) -> Option<(u16, u16)> {
-    caret.filter(|_| cursor_visible || !hidden_withheld)
+    if cursor_visible || !hidden_withheld {
+        caret
+    } else {
+        None
+    }
 }
 
 /// Whether a hidden caret on `term` is withheld from the motion engines
@@ -257,6 +262,7 @@ pub fn motion_print_anchor(term: &Terminal) -> (Option<(u16, u16, u64)>, Option<
     }
 }
 
+#[inline]
 fn cursor_row_empty(term: &Terminal) -> bool {
     let grid = term.grid();
     let row = term.cursor().row;

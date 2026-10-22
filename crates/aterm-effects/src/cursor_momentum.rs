@@ -156,6 +156,7 @@ impl TypingRate {
     /// The value at `now`: decayed over the elapsed gap on `tau`, snapped to
     /// exactly 0 once negligible. NaN/garbage in `tau` reads as 0 — inert.
     #[must_use]
+    #[inline]
     pub fn value(&self, now: Instant, tau: f32) -> f32 {
         if self.value < SNAP_ZERO {
             return 0.0;
@@ -180,6 +181,7 @@ impl TypingRate {
     }
 
     /// One printable key at `now`: decay to `now`, credit, clamp to 1, stamp.
+    #[inline]
     pub fn on_key(&mut self, now: Instant, tau: f32) {
         self.value = (self.value(now, tau) + MOMENTUM_GLOW_KEY_CREDIT).min(1.0);
         self.at = Some(now);
@@ -262,17 +264,20 @@ pub struct MomentumGlow {
 impl MomentumGlow {
     /// One printable key. The host calls this for glyph-producing keys only (never a bare
     /// modifier, never delete/kill/navigation).
+    #[inline]
     pub fn on_key(&mut self, now: Instant, tau_s: f32) {
         self.rate.on_key(now, tau_s);
     }
 
     /// The decayed value at `now` — for diagnostics and the host's cadence.
     #[must_use]
+    #[inline]
     pub fn value(&self, now: Instant, tau_s: f32) -> f32 {
         self.rate.value(now, tau_s)
     }
 
     /// Back to rest (layout/space resets only).
+    #[inline]
     pub fn reset(&mut self) {
         *self = Self::default();
     }
@@ -280,6 +285,7 @@ impl MomentumGlow {
     /// Frame cadence: the light is hot and its last two frames differed (the
     /// rainbow body's fingerprint law).
     #[must_use]
+    #[inline]
     pub fn is_active(&self) -> bool {
         self.latched >= MOMENTUM_GLOW_HOT && self.fp_last != self.fp_prev
     }
@@ -292,6 +298,7 @@ impl MomentumGlow {
     ///
     /// Disjoint from [`Self::is_active`]; their OR is "hot".
     #[must_use]
+    #[inline]
     pub fn settling(&self) -> bool {
         self.latched >= MOMENTUM_GLOW_HOT && self.fp_last == self.fp_prev
     }
@@ -300,6 +307,7 @@ impl MomentumGlow {
     /// [`MOMENTUM_GLOW_HOT`] (`stamp + τ·ln(a/floor)`): the frame that clears
     /// the halo, the tint and the blink pin. `None` once cold.
     #[must_use]
+    #[inline]
     pub fn cold_at(&self) -> Option<Instant> {
         self.decays_to(MOMENTUM_GLOW_HOT)
     }
@@ -335,6 +343,7 @@ impl MomentumGlow {
 
     /// The instant the latched amplitude decays to `level`, from the last real
     /// tick: `stamp + τ·ln(latched / level)`.
+    #[inline]
     fn decays_to(&self, level: f32) -> Option<Instant> {
         if self.latched < MOMENTUM_GLOW_HOT || level <= 0.0 {
             return None;
@@ -448,6 +457,7 @@ impl MomentumGlow {
         }
     }
 
+    #[inline]
     fn inert(&mut self) -> MomentumGlowFrame {
         self.latched = 0.0;
         self.stamp = None;
@@ -528,6 +538,7 @@ fn emit_halo(
 
 /// The halo's colour at normalised radius `rho`: the tint mixed with the ramp
 /// up to [`HALO_WARMTH`] hotter toward the core.
+#[inline]
 fn halo_colour(tint: u32, a: f32, rho: f32) -> u32 {
     let warm = (HALO_WARMTH * (1.0 - rho) / (1.0 - HALO_WARM_CORE)).clamp(0.0, HALO_WARMTH);
     mix_rgb(tint, ramp((a + warm).min(1.0), true), 0.5)
@@ -544,6 +555,7 @@ fn halo_colour(tint: u32, a: f32, rho: f32) -> u32 {
 /// body of the opposite hue a glow solved at the body law leaves the text
 /// about 4.45:1. Solved at this bar, any glow over any body keeps 5.25:1
 /// (`the_light_glow_stacked_on_a_light_body_keeps_the_light_bar`).
+#[inline]
 fn light_glow_ink(hue: u32, theme_fg: u32, theme_bg: u32) -> u32 {
     crate::cursor_glow::light_ink_over_floor(
         hue & 0x00FF_FFFF,
@@ -564,6 +576,7 @@ pub const LIGHT_GLOW_TEXT_KEEP: f32 = 0.97;
 /// The opacity `0..=255` at which the light glow's `ink` leaves the theme's
 /// text [`LIGHT_GLOW_TEXT_KEEP`] of its contrast on its paper, composited as
 /// the renderer composites a source-over quad.
+#[inline]
 fn light_glow_text_alpha(ink: u32, theme_fg: u32, theme_bg: u32) -> f32 {
     crate::cursor_glow::light_alpha_keeping(ink, theme_fg, theme_bg, LIGHT_GLOW_TEXT_KEEP)
 }

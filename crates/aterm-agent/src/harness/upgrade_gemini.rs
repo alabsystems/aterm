@@ -61,9 +61,11 @@
 //!   `137` the parent killed (its child orphaned): crashes. `41`, `42`, `44`,
 //!   `52` (and print mode's `53`-`55`) are starts the CLI REFUSED (bundle:
 //!   `FatalError` classes; `42` measured for an unknown id, another project's
-//!   and a duplicate id): never crashes. The parent ignores SIGTERM, SIGHUP
-//!   and SIGINT (measured), so `143`, `129` and any other status are no
-//!   witness.
+//!   and a duplicate id): never crashes — but for a worker's own restart
+//!   ([`restart_id`], [`ExitKind::Restarted`]): its `--session-id` met by
+//!   the CLI's own restart, which runs the same argv again, is resumed by id
+//!   with nothing typed. The parent ignores SIGTERM, SIGHUP and SIGINT
+//!   (measured), so `143`, `129` and any other status are no witness.
 //! * **The relaunch line**: `cd <the project>` and the `gemini` on the shell's
 //!   PATH (never a Cellar path: the shell's own resolution is the install a
 //!   person types), the launch's carried flags and `--resume <uuid>`
@@ -118,6 +120,14 @@ const FLAG_PROMPT_INTERACTIVE: &str = "prompt-interactive";
 
 /// The flag that starts a new session under a caller's id.
 const FLAG_SESSION_ID: &str = "session-id";
+
+/// The flag that starts a new session from a file's conversation.
+const FLAG_SESSION_FILE: &str = "session-file";
+
+/// The status a start the CLI refused for its input exits with (bundle
+/// 0.46.0: `ExitCodes.FATAL_INPUT_ERROR`): an unknown id, another project's,
+/// and a `--session-id` whose session is already written.
+pub const FATAL_INPUT_ERROR: i64 = 42;
 
 /// The words a session's user message opens with when it is the CLI's own
 /// context, never a person's turn.
@@ -1211,6 +1221,16 @@ pub enum ExitKind {
     /// `143` and `129` name nothing measured): an end no witness tells,
     /// nothing relaunched on a guess.
     Unwitnessed,
+    /// `42` where ITS OWN RESTART MET THE ID ITS FIRST START WROTE
+    /// ([`restart_id`], the start-time rule naming that id for the process):
+    /// Gemini CLI's own restart (`/settings`, IDE trust, admin settings: exit
+    /// `199`) runs the CLI again with the same argv, and a worker's
+    /// `--session-id <uuid>` (`harness::worker`) is then a session already
+    /// written (`Session ID … already exists`, exit 42, which the parent
+    /// relays). Never [`exit_kind`]'s: the status alone is a refusal.
+    /// Resumed on that session by id, nothing typed: a person's restart,
+    /// never a crash.
+    Restarted,
 }
 
 impl ExitKind {
@@ -1223,6 +1243,7 @@ impl ExitKind {
             ExitKind::Refused => "refused",
             ExitKind::Crashed => "crashed",
             ExitKind::Unwitnessed => "unwitnessed",
+            ExitKind::Restarted => "restarted",
         }
     }
 }
@@ -1281,6 +1302,31 @@ pub fn line_exit_kind(status: i64) -> ExitKind {
     }
 }
 
+/// THE SESSION ID A RESTART OF `argv` REFUSED, where `status` may be one:
+/// [`FATAL_INPUT_ERROR`] from a launch that starts a new session under its
+/// own id (`--session-id <uuid>`: a worker's, `harness::worker`), naming no
+/// session to resume (`--resume`, `-r`) or import (`--session-file`) — the
+/// one launch whose own restart is refused for the session its first start
+/// wrote. The caller holds the id to the start-time rule ([`witness`]): the
+/// session begun since the process started is that very id only where its
+/// first start ran and a later run of the same argv met it
+/// ([`ExitKind::Restarted`]); a launch whose id was written before it
+/// started was refused at its first start, as any other `42`. `None` for
+/// any other status or launch.
+#[must_use]
+pub fn restart_id(status: i64, argv: &[String]) -> Option<&str> {
+    let names_another = argv
+        .iter()
+        .skip(2)
+        .take_while(|t| t.as_str() != "--")
+        .filter_map(|t| flag_token(t))
+        .any(|(name, _)| [FLAG_RESUME, "r", FLAG_SESSION_FILE].contains(&name));
+    if status != FATAL_INPUT_ERROR || names_another {
+        return None;
+    }
+    flag_value(argv, &[FLAG_SESSION_ID]).filter(|id| is_session_uuid(id))
+}
+
 // ------------------------------------------------------------- the line
 
 /// THE ENVIRONMENT A GEMINI CLI RELAUNCH LINE MUST CARRY: its
@@ -1293,9 +1339,10 @@ pub fn line_exit_kind(status: i64) -> ExitKind {
 /// set: a worker's, without which its relaunch would stop at a folder-trust
 /// dialog its launch never drew. `get` names a variable of its exec
 /// environment. The other lanes carry the `HOME` of an agent under another
-/// one the same way. A record keeps no trusted-folders file
+/// one the same way. A record's homes keep no trusted-folders file
 /// ([`env_of_words`]): the file is the live worker's, removed with its
-/// session.
+/// session, so a relaunch carries it only while it stands
+/// ([`trusted_folders_of_words`], the lane's `plan`).
 #[must_use]
 pub fn relaunch_env<'a>(
     get: impl Fn(&str) -> Option<&'a str>,
@@ -1343,6 +1390,20 @@ pub fn env_of_words(words: &[String]) -> Vec<(String, String)> {
         .filter(|(name, _)| *name == HOME_ENV || *name == CLI_HOME_ENV)
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect()
+}
+
+/// THE WORKER'S TRUSTED-FOLDERS FILE a record's words name
+/// ([`env_words`] of [`relaunch_env`]'s pairs), where an absolute one is
+/// named: what a relaunch carries while the file stands (the worker's own,
+/// removed with its session), never a record's homes ([`env_of_words`]).
+#[must_use]
+pub fn trusted_folders_of_words(words: &[String]) -> Option<&str> {
+    words
+        .iter()
+        .filter_map(|w| w.split_once('='))
+        .find(|(name, _)| *name == TRUSTED_FOLDERS_ENV)
+        .map(|(_, value)| value)
+        .filter(|value| Path::new(value).has_root())
 }
 
 /// THE LINE A PERSON IS TOLD to resume a Gemini CLI session by hand: `cd`

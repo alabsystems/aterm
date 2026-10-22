@@ -239,6 +239,7 @@ impl TrickFlash {
             project = "conformance_trick_flash::project"
         )
     )]
+    #[inline]
     pub(crate) fn retain_panes(&mut self, keep: impl Fn(u64) -> bool) {
         let mut w = 0usize;
         for r in 0..usize::from(self.base_y_len) {
@@ -276,6 +277,7 @@ impl TrickFlash {
             project = "conformance_trick_flash::project"
         )
     )]
+    #[inline]
     pub(crate) fn found_in_a_pane(&self) -> bool {
         self.slot
             .is_some_and(|slot| slot.pane.is_some() && slot.located.is_some())
@@ -384,6 +386,7 @@ impl TrickFlash {
             project = "conformance_trick_flash::project"
         )
     )]
+    #[inline]
     pub(crate) fn revoke(&mut self, now: Instant) {
         let Some(slot) = self.slot.as_mut() else {
             return;
@@ -590,6 +593,7 @@ impl TrickFlash {
         Some(loc.since + Duration::from_millis(window))
     }
 
+    #[inline]
     fn remember_base_y(&mut self, scope: Option<u64>, base_y: Option<i64>) {
         let len = usize::from(self.base_y_len);
         let at = self.base_y[..len].iter().position(|(key, _)| *key == scope);
@@ -630,7 +634,7 @@ fn hue_seed(caret: (u16, u16), chars: &[char]) -> u64 {
 /// either side names no pane (a single-grid host, or an engine with no declared
 /// session), so there is nothing to cross; two named panes must be equal.
 #[inline]
-fn pane_matches(flash_pane: Option<u64>, scope: Option<u64>) -> bool {
+const fn pane_matches(flash_pane: Option<u64>, scope: Option<u64>) -> bool {
     match (flash_pane, scope) {
         (Some(typed_in), Some(scanning)) => typed_in == scanning,
         _ => true,
@@ -710,6 +714,7 @@ fn resolve_sat_val(bg: u32) -> (f32, f32) {
 /// grey, concealed `fg == bg`) is not tinted, and the caller ends the flash
 /// rather than arming frames that show nothing (so concealed text is never
 /// revealed).
+#[inline]
 fn legible_strength(fg: u32, bg: u32, sat: f32, val: f32) -> f32 {
     let table = crate::color_math::relative_luminance_table();
     let lum_bg = crate::color_math::relative_luminance_with(table, bg);
@@ -756,7 +761,7 @@ fn is_word_char(c: char) -> bool {
 /// presentation forms, and the SMP's RTL planes. Only decides whether the
 /// mirrored spelling is also tried, so a generous range is safe.
 #[inline]
-fn is_strong_rtl(c: char) -> bool {
+const fn is_strong_rtl(c: char) -> bool {
     matches!(c as u32,
         0x0590..=0x08FF       // Hebrew, Arabic, Syriac, Thaana, NKo, Samaritan, Mandaic, Arabic Ext
         | 0xFB1D..=0xFDFF     // Hebrew + Arabic presentation forms A
@@ -892,6 +897,7 @@ fn find_in_row(
 /// [`find_in_row`] for the typed spelling and, for an RTL word, its mirror (the
 /// GUI delivers an RTL run reversed in place, same columns, reversed scalars).
 /// Returns the hit and whether it was mirrored.
+#[inline]
 fn find_word(
     slot: &Slot,
     cells: &[RenderCell],
@@ -931,12 +937,12 @@ fn find_word(
 /// `row − (base_y_now − base_y_then)`: where a live row stands after the scroll
 /// the snapshot reports. With either side unknown the delta is zero.
 #[inline]
-fn scrolled(row: u16, then: Option<i64>, now: Option<i64>) -> (i64, i64) {
+const fn scrolled(row: u16, then: Option<i64>, now: Option<i64>) -> (i64, i64) {
     let delta = match (then, now) {
         (Some(then), Some(now)) => now.saturating_sub(then),
         _ => 0,
     };
-    (i64::from(row).saturating_sub(delta), delta)
+    ((row as i64).saturating_sub(delta), delta)
 }
 
 /// Find a pending slot's word. Only the expected row is tested; the bounded
@@ -1042,6 +1048,7 @@ fn follow(
 /// and, from the first lead cell, the background the legibility guard judges
 /// against. `false` when no tint would be legible (see [`legible_strength`]),
 /// so there is no flash.
+#[inline]
 fn capture(loc: &mut Located, n: usize, cells: &[RenderCell]) -> bool {
     let Some(first) = cells.get(usize::from(loc.cols[0])) else {
         return false;

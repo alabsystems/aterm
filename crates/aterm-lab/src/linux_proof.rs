@@ -517,6 +517,16 @@ pub fn hang_detector(secs: u32) -> Vec<String> {
 /// this spec ambiguous and the row FAIL with cargo's own message.
 pub const TESTED: [&str; 3] = ["aterm-uds", "aterm-pty", "libc"];
 
+/// The shell integration's suite (aterm-shell-integration's unit and
+/// integration tests), on real shells on a real pty: the guest's bash 5.2, zsh,
+/// apt's fish 3.7 (the fish floor lane, docs/DESIGN-init-system-2026-10-20.md
+/// §6.2) and pwsh, and GNU's bash 3.2 for the spare hold's SIGWINCH control
+/// (`linux_guest::BASH_3_2`). The lane provides every shell the suite names, so
+/// a test that ends COULD NOT RUN fails, as every failed test does, and fails
+/// the row: a fish failure no row ran once landed past every check (round 5,
+/// 2026-10-21).
+pub const SHELLS: &str = "aterm-shell-integration";
+
 /// The first-party windowing crates (LW.6): the loader, the X11 client, the
 /// Wayland client and libxkbcommon's declarations, tested with an X server
 /// and two compositors up, so their live tests (`live_x11`, `live_wayland`,
@@ -2135,6 +2145,23 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             );
             rows.push(test_verdict(
                 &format!("{tag} libc oracle conformance"),
+                &out,
+            ));
+            if let Err(s) = crate::stop::check() {
+                stopped = Some(s);
+                break 'arches;
+            }
+            println!("\n=== {tag}: {SHELLS} tests (bash, zsh, fish, pwsh) ===");
+            let mut argv = hang_detector(TEST_ROW_HANG_SECS);
+            argv.extend(cargo(
+                &env,
+                &format!("{repo}/Cargo.toml"),
+                "test",
+                &["--no-fail-fast", "--tests", "-p", SHELLS],
+            ));
+            let out = up.lima.shell_streamed(&up.home, &argv, "  | ");
+            rows.push(test_verdict(
+                &format!("{tag} tests: shell integration (bash, zsh, fish, pwsh)"),
                 &out,
             ));
             if let Err(s) = crate::stop::check() {

@@ -94,6 +94,9 @@ pub(crate) use control_input::{
 // The worker's initial command uses the same final check-and-press law.
 use control_input::INPUT_QUEUE_FULL;
 pub(crate) use control_input::{GuardedInput, InputFence, input_if_fenced_observed};
+// A footer fact's slash press guards its writes on the caret row as it read
+// it (`crate::claude_slash`).
+pub(crate) use control_input::compile_guard;
 // `input_stall`'s restart test sends `signal term` through the verb itself,
 // and the harness's restart tests drive `signal` and `restart` as the
 // dispatch runs them (`signal_verb`, `restart_verb`).
@@ -940,6 +943,7 @@ fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
                 crate::app_introspect::AuxTarget::Menu
                 | crate::app_introspect::AuxTarget::TabMenu
                 | crate::app_introspect::AuxTarget::AutopilotMenu
+                | crate::app_introspect::AuxTarget::FactMenu
                 | crate::app_introspect::AuxTarget::Update,
             ) => Some(Need::OwnerOnly),
             _ => None,
@@ -5812,28 +5816,28 @@ fn dispatch_bridge_verb(
         // The bridge's own broker link, gated to the lane's incarnation. A
         // replaced bus log (`forgot=1`) is another log's offsets to the bus
         // mirror too: its cursors start over.
-        "link" => crate::fabric::cmd_link_after_log_switch(store, rest, generation, || {
-            crate::session_log_mirror::forget_landed(store);
-        }),
+        // `link mirror unretained` (session log Phase 6 step 6E-3) is an
+        // `auto` bridge's word that the node does not mirror: the store hears
+        // it as it hears a hello ([`note_mirror_word`]).
+        "link" => {
+            let reply = crate::fabric::cmd_link_after_log_switch(store, rest, generation, || {
+                crate::session_log_mirror::forget_landed(store);
+            });
+            if reply == "OK\n" && rest.split_whitespace().next() == Some("mirror") {
+                note_mirror_word(store, generation);
+            }
+            reply
+        }
         // THE BUS MIRROR (session log phase 4), gated the same way.
         "log-take" => crate::session_log_mirror::cmd_log_take(store, rest, generation),
         "log-landed" => crate::session_log_mirror::cmd_log_landed(store, rest, generation),
         // Its lane grammar and build, gated the same way. A RECORDED hello
         // (the owning lane's, answered `OK` and not `stale=1`) says whether
-        // the node mirrors its session logs (`session_log_mirror::Shared`),
-        // read off the link before the store's read guard is taken, so the
-        // two locks never nest here.
+        // the node mirrors its session logs ([`note_mirror_word`]).
         "hello" => {
             let reply = crate::fabric::cmd_hello(rest, generation);
             if reply.starts_with("OK ") && !reply.starts_with("OK stale=1") {
-                let _ = crate::fabric::with_current_bridge(generation, || {
-                    let served = crate::fabric::bridge_mirrors_logs();
-                    store
-                        .read()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .mirror()
-                        .set_served(served);
-                });
+                note_mirror_word(store, generation);
             }
             reply
         }
@@ -5925,6 +5929,24 @@ fn dispatch_await_task(
         args.timeout_ms
             .unwrap_or(aterm_control::wire::WAIT_DEFAULT_MS),
     )
+}
+
+/// THE STORE HEARS WHETHER THE NODE MIRRORS (`session_log_mirror::Shared`)
+/// from the owning bridge's word on it (`fabric::bridge_mirror_word`): a
+/// recorded `hello`, and its `link mirror` report — an `auto` bridge's
+/// `unretained` (session log Phase 6 step 6E-3). An `auto` hello not yet
+/// judged leaves the word as it was. Read off the link before the store's
+/// read guard is taken, so the two locks never nest here.
+fn note_mirror_word(store: &Store, generation: Option<crate::fabric::BridgeGeneration>) {
+    let _ = crate::fabric::with_current_bridge(generation, || {
+        if let Some(served) = crate::fabric::bridge_mirror_word() {
+            store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .mirror()
+                .set_served(served);
+        }
+    });
 }
 
 /// The reply for a table row its access class's dispatch has no arm for: refused,
@@ -11815,6 +11837,7 @@ fn serve_session_verb(
         generation: leading.if_gen,
         fp: leading.if_fp,
         human: leading.if_human,
+        foreground: None,
         guard_at_cursor: false,
         entering_command: false,
     };

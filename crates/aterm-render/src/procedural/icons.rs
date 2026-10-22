@@ -50,6 +50,7 @@ pub struct IconMetrics {
 /// The width of an icon's raster: its own cell, or with `spill` the blank
 /// cell on each side too (the icon's own cell is then the middle third).
 #[must_use]
+#[inline]
 pub const fn band_icon_width(cell_w: usize, spill: bool) -> usize {
     if spill { cell_w * 3 } else { cell_w }
 }

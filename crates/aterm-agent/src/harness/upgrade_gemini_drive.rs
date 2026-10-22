@@ -21,7 +21,10 @@
 //! 2. **The exit** ([`look_at_exit`], [`after_exit`]): the shell's exit
 //!    status of the block it ran in, by Gemini CLI's own table
 //!    (`upgrade_gemini::exit_kind`: `0`/`130` clean, `1`/`137` a crash, `41`,
-//!    `42`, `52`… a refused start); with no word, nothing is relaunched.
+//!    `42`, `52`… a refused start); with no word, nothing is relaunched. A
+//!    worker's `42` that is ITS OWN RESTART meeting the `--session-id` its
+//!    first start wrote ([`own_restart`]) is resumed on that session as a
+//!    crash is, quietly: nothing typed after it.
 //! 3. **The relaunch** ([`relaunch`]): once the parent is gone and its shell
 //!    holds the terminal again — a parent SIGKILLed leaves its child orphaned
 //!    in the old group, reading no terminal its shell holds (its reads fail),
@@ -574,13 +577,51 @@ pub(super) fn snapshot(
 
 /// THE WORD THE EXIT OF `snap`'S GEMINI CLI LEFT: its shell's exit status of
 /// the block it ran in ([`super::super::relaunch::GeminiRun::block`]), read by
-/// its table ([`ug::exit_kind`]); `None` while no status is drawn.
-fn shell_word(opts: &Opts, snap: &super::super::relaunch::Snapshot) -> Option<ExitKind> {
+/// its table ([`ug::exit_kind`]) — but for its own restart met by its own
+/// session id ([`own_restart`]: [`ExitKind::Restarted`]); `None` while no
+/// status is drawn.
+fn shell_word(
+    opts: &Opts,
+    snap: &super::super::relaunch::Snapshot,
+    k: &dyn GeminiKernel,
+) -> Option<ExitKind> {
     let run = snap.gemini()?;
     let status = connect(opts, &snap.tab)
         .ok()
         .and_then(|mut c| exit_status(&mut c, &snap.tab, run.block))?;
-    Some(ug::exit_kind(status))
+    Some(if own_restart(snap, status, k) {
+        ExitKind::Restarted
+    } else {
+        ug::exit_kind(status)
+    })
+}
+
+/// WHETHER `status` IS `snap`'S OWN RESTART REFUSED FOR ITS OWN SESSION ID:
+/// a launch under `--session-id <uuid>` that exited `42` ([`ug::restart_id`])
+/// where the start-time rule, read now, names a session for the process
+/// ([`witness_of`]) — which is that very id: the rule names one only where
+/// the session begun since the start is the one the argv names
+/// ([`ug::argv_session`], which with no `--resume`/`-r` is the
+/// `--session-id` `restart_id` read), so no other comparison is owed. Its
+/// first start wrote it, and the `42` was a later run of the same argv:
+/// Gemini CLI's own restart (`/settings`, IDE trust, admin settings), which a
+/// worker's line meets rather than send its task twice (`harness::worker`).
+/// A launch whose id was written before it started, one whose session begun
+/// since is another than its id, or one the rule names nothing for, was
+/// refused at its start.
+fn own_restart(snap: &super::super::relaunch::Snapshot, status: i64, k: &dyn GeminiKernel) -> bool {
+    let (Some(run), Some(_)) = (snap.gemini(), ug::restart_id(status, &snap.argv)) else {
+        return false;
+    };
+    witness_of(
+        run.chats.as_deref(),
+        &snap.cwd,
+        run.started_ms,
+        &snap.argv,
+        snap.pid,
+        k,
+    )
+    .is_ok()
 }
 
 /// One look at a Gemini CLI that left its tab
@@ -599,18 +640,23 @@ pub(super) fn look_at_exit(
     let word = if running {
         None
     } else {
-        shell_word(opts, snap)
+        shell_word(opts, snap, k)
     };
     super::super::relaunch::ExitLook {
         running,
         record: None,
         agent: Agent::Gemini,
+        // Its own restart refused for its own id is owed a relaunch as a
+        // crash is ([`ExitRecord::crashed`]: the host owes it through the
+        // back-off, a handoff carries it); the attempt tells the two apart
+        // ([`after_exit_onto`]).
         crashed: match word {
-            Some(ExitKind::Crashed) => Some(true),
+            Some(ExitKind::Crashed | ExitKind::Restarted) => Some(true),
             Some(ExitKind::Clean | ExitKind::Refused) => Some(false),
             Some(ExitKind::Stopped | ExitKind::Unwitnessed) | None => None,
         },
         refused: word == Some(ExitKind::Refused),
+        restarted_itself: word == Some(ExitKind::Restarted),
     }
 }
 
@@ -726,7 +772,7 @@ pub(super) fn after_exit_onto(
             .ok()
             .and_then(|mut c| line_word(&mut c, &earlier, k));
         let stop = match line {
-            Some(ExitKind::Crashed) => None,
+            Some(ExitKind::Crashed | ExitKind::Restarted) => None,
             Some(ExitKind::Refused) => Some((
                 "refused:resume-refused",
                 "Gemini CLI refused the relaunch's resume, or the shell could not run its line: \
@@ -753,6 +799,14 @@ pub(super) fn after_exit_onto(
         typed_on = Some(earlier.thread.clone()).filter(|s| ug::is_session_uuid(s));
     }
     let word = match left {
+        // Owed as a crash is, its own restart refused for its own id too
+        // ([`look_at_exit`]): the block's word, read again, tells which.
+        ExitRecord::Crashed if !relaunched_before && cause == ExitCause::Exit => {
+            match shell_word(opts, snap, k) {
+                Some(ExitKind::Restarted) => Some(ExitKind::Restarted),
+                _ => Some(ExitKind::Crashed),
+            }
+        }
         ExitRecord::Crashed => Some(ExitKind::Crashed),
         ExitRecord::Removed => Some(ExitKind::Clean),
         ExitRecord::Refused => Some(ExitKind::Refused),
@@ -760,14 +814,18 @@ pub(super) fn after_exit_onto(
             if relaunched_before {
                 Some(ExitKind::Crashed)
             } else {
-                shell_word(opts, snap)
+                shell_word(opts, snap, k)
             }
         }
         ExitRecord::Unread | ExitRecord::Survived(_) => None,
     };
+    // ITS OWN RESTART, refused for its own session id: resumed on that
+    // session by id as a crash is, and QUIET — nothing typed after it (the
+    // person who restarted it is at the tab; nothing of a turn was cut).
+    let restarted = word == Some(ExitKind::Restarted);
     if cause == ExitCause::Exit {
         match word {
-            Some(ExitKind::Crashed) => {}
+            Some(ExitKind::Crashed | ExitKind::Restarted) => {}
             Some(ExitKind::Clean) => return said(r, "ended:graceful-exit"),
             Some(ExitKind::Refused) => return said(r, "ended:refused-start"),
             Some(ExitKind::Stopped) => return said(r, "ended:stopped"),
@@ -874,6 +932,7 @@ pub(super) fn after_exit_onto(
         salt: now,
         exited_at: now,
         phase: Phase::Exiting { at_s: now },
+        quiet: restarted,
         ..St::default()
     };
     save(opts, &session_key, &st);
@@ -885,6 +944,8 @@ pub(super) fn after_exit_onto(
             "the Gemini CLI left its tab ({}); relaunched on its session {}",
             if cause == ExitCause::HostEnded {
                 "aterm ended while it ran"
+            } else if restarted {
+                "its own restart met the session id its first start wrote (exit 42)"
             } else {
                 word.map_or(left.word(), ExitKind::word)
             },
@@ -983,7 +1044,17 @@ pub(super) fn plan(opts: &Opts, st: &St, k: &dyn GeminiKernel) -> Result<Plan, N
         what: e.to_string(),
         detail: "the launch flags cannot be carried into a relaunch".to_string(),
     })?;
-    let env = ug::env_of_words(&st.gemini_env);
+    // The homes, and a worker's own trusted-folders file while it stands:
+    // without it its relaunch would stop at a folder-trust dialog its launch
+    // never drew, which the window harness never presses on a worker
+    // (`supervise::policy::approval`). A file gone with its worker's session
+    // is named to nothing.
+    let mut env = ug::env_of_words(&st.gemini_env);
+    if let Some(file) =
+        ug::trusted_folders_of_words(&st.gemini_env).filter(|f| Path::new(f).is_file())
+    {
+        env.push((ug::TRUSTED_FOLDERS_ENV.to_string(), file.to_string()));
+    }
     let line = upgrade::relaunch_line_env(
         dialect,
         heal.as_deref(),
@@ -1170,7 +1241,9 @@ fn line_ended(opts: &Opts, r: Report, st: &mut St, kind: ExitKind) -> Report {
                  before it was adopted",
             )
         }
-        ExitKind::Crashed => {
+        // The line names no `--session-id` ([`ug::rewrite_argv`]): its own
+        // `42` is a refused resume ([`ug::line_exit_kind`]), never this.
+        ExitKind::Crashed | ExitKind::Restarted => {
             st.close_overtaken("exited-before-continuing", now);
             (
                 "failed:exited-before-continuing",
@@ -1516,6 +1589,11 @@ fn typing_fence(c: &mut Client, tab: &str) -> Result<(Option<String>, char), &'s
 /// (`composer_guard_at(<caret>, 1, …)`: its caret drawn one blank in, the
 /// supervisor's own guard for this composer) once the echo has held still
 /// (`idle=600`: an Enter within 30 ms of a key is a newline to it, bundle).
+/// A text past the composer's paste fold is guarded on the chip it is drawn
+/// as ([`aterm_phase::gemini::folded_paste`]), the row the cursor ends on: a
+/// guard on its last word matched no row, and the relaunch's 538-character
+/// continuation stood unsent in the composer, read as a person's draft
+/// (the forever lab, 2026-10-21).
 fn type_text(
     c: &mut Client,
     tab: &str,
@@ -1528,7 +1606,8 @@ fn type_text(
         .filter(|_| turn_takes_gen(c))
         .map(|g| format!("if-gen={g} yield=0.2 "))
         .unwrap_or_default();
-    let guard = composer_guard_at(caret, CARET_COLUMN, text);
+    let drawn = aterm_phase::gemini::folded_paste(text);
+    let guard = composer_guard_at(caret, CARET_COLUMN, drawn.as_deref().unwrap_or(text));
     let (head, _) = c
         .request_counted(&format!(
             "@{tab} turn {fence}submit=guarded:{guard} idle=600 {TURN_WAIT} {text}"

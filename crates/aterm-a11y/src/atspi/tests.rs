@@ -1909,15 +1909,16 @@ fn a_status_unanswered_during_the_backoff_keeps_it() {
 
 /// The desktop's join of the accessibility bus gives up on a daemon that
 /// never answers its handshake (a frozen one's listener still takes the
-/// connection into its backlog) within [`super::WRITE`], not aterm-dbus's
-/// 25 s handshake default.
+/// connection into its backlog) within its own bound ([`super::WRITE`] on the
+/// desktop, 100 ms here), not aterm-dbus's 25 s handshake default.
 #[test]
-fn the_desktop_s_join_gives_up_on_a_silent_bus_within_the_write_deadline() {
+fn the_desktop_s_join_gives_up_on_a_silent_bus_within_its_bound() {
     let path = std::env::temp_dir().join(format!("aterm-a11y-frozen-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let _frozen = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let asked = std::time::Instant::now();
-    let joined = super::SessionBuses.open(&format!("unix:path={}", path.display()));
+    let joined = super::SessionBuses::joining_within(std::time::Duration::from_millis(100))
+        .open(&format!("unix:path={}", path.display()));
     let waited = asked.elapsed();
     assert!(
         matches!(joined, Err(aterm_dbus::Error::Timeout)),
@@ -1927,7 +1928,7 @@ fn the_desktop_s_join_gives_up_on_a_silent_bus_within_the_write_deadline() {
     // The two bounds compared, not the machine's speed.
     assert!(
         waited < aterm_dbus::conn::HANDSHAKE_TIMEOUT,
-        "the join gave up after {waited:?}, the handshake default's, not WRITE's"
+        "the join gave up after {waited:?}, the handshake default's, not its own bound"
     );
     let _ = std::fs::remove_file(&path);
 }

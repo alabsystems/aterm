@@ -110,6 +110,7 @@ pub(crate) enum TexelFormat {
 
 impl TexelFormat {
     /// Bytes one texel occupies in a linear (buffer/upload) layout.
+    #[inline]
     #[cfg(target_os = "macos")]
     pub(crate) const fn bytes_per_texel(self) -> u32 {
         match self {
@@ -122,6 +123,7 @@ impl TexelFormat {
     }
 
     /// The wgpu spelling.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::TextureFormat {
         match self {
@@ -137,6 +139,7 @@ impl TexelFormat {
     /// Recover the neutral format from a wgpu format (for already-resolved
     /// formats such as `format_plan::offscreen_format`). `None` outside the six
     /// formats in use.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn from_wgpu(f: wgpu::TextureFormat) -> Option<Self> {
         match f {
@@ -151,6 +154,7 @@ impl TexelFormat {
     }
 
     /// The Metal spelling.
+    #[inline]
     #[cfg(target_os = "macos")]
     pub(crate) const fn metal(self) -> mtl::PixelFormat {
         match self {
@@ -223,6 +227,7 @@ impl TexUsage {
         copy_dst: true,
     };
 
+    #[inline]
     #[cfg(wgpu_arm)]
     const fn wgpu(self) -> wgpu::TextureUsages {
         let mut u = wgpu::TextureUsages::empty();
@@ -241,6 +246,7 @@ impl TexUsage {
         u
     }
 
+    #[inline]
     #[cfg(target_os = "macos")]
     const fn metal(self) -> usize {
         // Metal declares no copy usage: blits may read and write any texture.
@@ -363,6 +369,7 @@ impl DeviceHandle<'_> {
 
     /// Full-extent upload of level 0 (`queue.write_texture` / `replaceRegion:`).
     /// `bytes` is tightly packed at `bytes_per_row`.
+    #[inline]
     pub(crate) fn upload_texture_full(
         &self,
         tex: &LayerTexture,
@@ -377,6 +384,7 @@ impl DeviceHandle<'_> {
     /// Row-ranged upload of rows `[y0, y0 + rows)` at full width, for the
     /// atlas append: [`Self::upload_texture_region`]'s full-width case.
     /// `bytes` holds exactly the band.
+    #[inline]
     pub(crate) fn upload_texture_rows(
         &self,
         tex: &LayerTexture,
@@ -482,6 +490,7 @@ impl DeviceHandle<'_> {
     /// A per-frame instance-stream buffer (`VERTEX | COPY_DST` on wgpu, a
     /// shared-storage `MTLBuffer` on Metal). Size 0 is legal on wgpu; Metal
     /// floors at 1 byte because `newBufferWithLength:0` returns nil.
+    #[inline]
     #[cfg_attr(
         all(gl_arm, not(wgpu_arm)),
         expect(
@@ -499,6 +508,7 @@ impl DeviceHandle<'_> {
     }
 
     /// [`Self::try_create_instance_buffer`] for the wgpu arm's callers.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn create_instance_buffer(&self, label: &'static str, size: u64) -> LayerBuffer {
         self.try_create_instance_buffer(label, size)
@@ -507,6 +517,7 @@ impl DeviceHandle<'_> {
 
     /// A uniform buffer (`UNIFORM | COPY_DST` on wgpu; a shared-storage
     /// `MTLBuffer` on Metal).
+    #[inline]
     #[cfg_attr(
         all(gl_arm, not(wgpu_arm)),
         expect(
@@ -524,6 +535,7 @@ impl DeviceHandle<'_> {
     }
 
     /// [`Self::try_create_uniform_buffer`] for the wgpu arm's callers.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn create_uniform_buffer(&self, label: &'static str, size: u64) -> LayerBuffer {
         self.try_create_uniform_buffer(label, size)
@@ -533,6 +545,7 @@ impl DeviceHandle<'_> {
     /// A readback staging buffer a texture is copied into for the CPU to read
     /// (`COPY_DST | MAP_READ` on wgpu; a shared-storage `MTLBuffer` on Metal,
     /// read in place once the copy's command buffer is terminal).
+    #[inline]
     #[cfg_attr(
         all(gl_arm, not(wgpu_arm)),
         expect(
@@ -550,6 +563,7 @@ impl DeviceHandle<'_> {
     }
 
     /// [`Self::try_create_readback_buffer`] for the wgpu arm's callers.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn create_readback_buffer(&self, label: &'static str, size: u64) -> LayerBuffer {
         self.try_create_readback_buffer(label, size)
@@ -690,6 +704,7 @@ impl DeviceHandle<'_> {
     }
 
     /// [`Self::try_create_sampler`] for the wgpu arm's callers.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn create_sampler(&self, label: &'static str, kind: SamplerKind) -> LayerSampler {
         self.try_create_sampler(label, kind)
@@ -698,6 +713,7 @@ impl DeviceHandle<'_> {
 
     /// The live wgpu device, for wgpu-typed construction (layouts, bind
     /// groups, pipelines, modules). Panics by name on another arm.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn wgpu_device(&self) -> &wgpu::Device {
         match self {
@@ -712,6 +728,7 @@ impl DeviceHandle<'_> {
 
     /// The device's buffer-size ceiling, for the geometric-grow cap. Only the
     /// wgpu arm's streams grow against it (`VertexBuffer::upload_via`).
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn max_buffer_size(&self) -> u64 {
         match self {
@@ -728,6 +745,7 @@ impl DeviceHandle<'_> {
     /// The device's 2-D texture dimension ceiling, for the atlas clamps. The
     /// Metal arm's answer is [`METAL_MAX_TEXTURE_DIM`], which the renderer's
     /// framebuffer clamp reads directly.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn max_texture_dim(&self) -> u32 {
         match self {
@@ -761,6 +779,7 @@ pub(crate) enum LayerTexture {
 
 impl LayerTexture {
     /// The GL texture. Panics by name on another arm's texture.
+    #[inline]
     #[cfg(gl_arm)]
     pub(crate) fn gl(&self) -> &GlTexture {
         match self {
@@ -771,6 +790,7 @@ impl LayerTexture {
     }
 
     /// [`Self::gl`], by value.
+    #[inline]
     #[cfg(gl_arm)]
     pub(crate) fn into_gl(self) -> GlTexture {
         match self {
@@ -782,6 +802,7 @@ impl LayerTexture {
 
     /// The live wgpu texture, for the wgpu-typed seams. Panics by name on
     /// another arm's texture.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn wgpu(&self) -> &wgpu::Texture {
         match self {
@@ -795,6 +816,7 @@ impl LayerTexture {
     }
 
     /// [`Self::wgpu`], by value.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn into_wgpu(self) -> wgpu::Texture {
         match self {
@@ -809,6 +831,7 @@ impl LayerTexture {
 
     /// The sealed Metal texture, for binding. Panics by name on another arm's
     /// texture.
+    #[inline]
     #[cfg(target_os = "macos")]
     pub(crate) fn metal(&self) -> &SealedTexture {
         match self {
@@ -820,6 +843,7 @@ impl LayerTexture {
 
     /// [`Self::metal`], by value: the armed renderer keeps render targets it
     /// never uploads into as bare sealed textures.
+    #[inline]
     #[cfg(target_os = "macos")]
     pub(crate) fn into_metal(self) -> SealedTexture {
         match self {
@@ -831,6 +855,7 @@ impl LayerTexture {
 
     /// The texture's texel width (the wgpu arm's scroll-shift scratch reuse
     /// key).
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn width(&self) -> u32 {
         match self {
@@ -843,6 +868,7 @@ impl LayerTexture {
     }
 
     /// The texture's texel height.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn height(&self) -> u32 {
         match self {
@@ -869,6 +895,7 @@ pub(crate) enum LayerBuffer {
 impl LayerBuffer {
     /// The live wgpu buffer — same crossing contract as
     /// [`LayerTexture::wgpu`].
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn wgpu(&self) -> &wgpu::Buffer {
         match self {
@@ -879,6 +906,7 @@ impl LayerBuffer {
     }
 
     /// [`Self::wgpu`], by value.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn into_wgpu(self) -> wgpu::Buffer {
         match self {
@@ -889,6 +917,7 @@ impl LayerBuffer {
     }
 
     /// `wgpu::Buffer::slice`, forwarded.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn slice<S: std::ops::RangeBounds<wgpu::BufferAddress>>(
         &self,
@@ -899,6 +928,7 @@ impl LayerBuffer {
 
     /// The Metal buffer object, for binding. Panics by name on another arm's
     /// buffer.
+    #[inline]
     #[cfg(target_os = "macos")]
     pub(crate) fn metal(&self) -> &mtl::Obj {
         match self {
@@ -909,6 +939,7 @@ impl LayerBuffer {
     }
 
     /// The shared Metal buffer, by value.
+    #[inline]
     #[cfg(target_os = "macos")]
     pub(crate) fn into_metal(self) -> SharedBuffer {
         match self {
@@ -933,6 +964,7 @@ pub(crate) enum LayerSampler {
 impl LayerSampler {
     /// The live wgpu sampler, by value — same crossing contract as
     /// The GL sampler, by value. Panics by name on another arm's sampler.
+    #[inline]
     #[cfg(gl_arm)]
     pub(crate) fn into_gl(self) -> GlSampler {
         match self {
@@ -943,6 +975,7 @@ impl LayerSampler {
     }
 
     /// [`LayerTexture::wgpu`].
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn into_wgpu(self) -> wgpu::Sampler {
         match self {
@@ -954,6 +987,7 @@ impl LayerSampler {
 
     /// The `MTLSamplerState`, by value. Panics by name on another arm's
     /// sampler.
+    #[inline]
     #[cfg(target_os = "macos")]
     pub(crate) fn into_metal(self) -> mtl::Obj {
         match self {
@@ -994,6 +1028,7 @@ pub(crate) struct ClearColor4 {
 
 impl ClearColor4 {
     /// The wgpu spelling (bit-identical: four f64 fields either way).
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::Color {
         wgpu::Color {
@@ -1431,6 +1466,7 @@ pub(crate) enum FramePass<'e, 's> {
 impl FramePass<'_, '_> {
     /// `set_pipeline` — the mid-pass pipeline switch (issued on change only;
     /// the walker owns the tracker).
+    #[inline]
     pub(crate) fn set_pipeline(&mut self, pipeline: FramePipeline<'_>) {
         match (self, pipeline) {
             #[cfg(wgpu_arm)]
@@ -1447,6 +1483,7 @@ impl FramePass<'_, '_> {
     /// Bind the atlas (wgpu group 1, or the Metal texture/sampler pair at the
     /// row's slots). Issued on change only; both argument tables persist across
     /// pipeline switches.
+    #[inline]
     pub(crate) fn bind_atlas(&mut self, atlas: FrameAtlas<'_>) {
         match (self, atlas) {
             #[cfg(wgpu_arm)]
@@ -1506,6 +1543,7 @@ impl FramePass<'_, '_> {
 
     /// Bind the per-draw instance stream: wgpu vertex-buffer slot 0, or
     /// Metal `set_instance_stream` at `INSTANCE_STREAM_SLOT`.
+    #[inline]
     pub(crate) fn set_stream(&mut self, stream: FrameStream<'_>) {
         match (self, stream) {
             #[cfg(wgpu_arm)]
@@ -1525,6 +1563,7 @@ impl FramePass<'_, '_> {
 
     /// Draw `instances` quads of 6 vertices. The Metal arm can refuse (no
     /// pipeline or no stream); the wgpu arm cannot fail.
+    #[inline]
     pub(crate) fn draw_quads(&mut self, instances: u32) -> Result<(), String> {
         match self {
             #[cfg(wgpu_arm)]

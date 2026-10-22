@@ -1329,10 +1329,12 @@ pub struct Inbox {
     addressed_head: Option<u64>,
     /// The LOWEST offset ever delivered (or fetched) here — the header's
     /// `oldest_on_bus=@<off>`. Every one of THIS SESSION's records from it to
-    /// `bus_head` is on the broker's log whether or not the ring still holds it
-    /// (the broker keeps no retention yet, R4), so `inbox get @<off>` can fetch
-    /// any of them; the offsets in between are the whole fleet's, and most are
-    /// other lanes' (`ERR no such record`). `None` until the first delivery.
+    /// `bus_head` that the broker's retention still keeps is on its log
+    /// whether or not the ring still holds it, so `inbox get @<off>` can fetch
+    /// it, and one retention gave up answers `ERR retained-from=<floor>`
+    /// (astream's R4, session log Phase 6 step 6E-2); the offsets in between
+    /// are the whole fleet's, and most are other lanes' (`ERR no such
+    /// record`). `None` until the first delivery.
     oldest_on_bus: Option<u64>,
     /// Offsets already delivered, newest last, capped at [`DEDUP_CAP`].
     dedup: VecDeque<u64>,
@@ -3521,16 +3523,36 @@ struct BridgeHello {
     lane: u32,
     build: Option<String>,
     refills_broadcasts: bool,
-    /// Whether it mirrors the session logs (`log=turns`, `[fabric] log =
-    /// "turns"`, session log phase 4); acknowledged in the answer only when
-    /// the hello was recorded (ruling Q10).
-    log: bool,
+    /// What it said of the session-log mirror (`log=`, session log phase 4):
+    /// `turns` is acknowledged in the answer only when the hello was recorded
+    /// (ruling Q10).
+    log: HelloLog,
+}
+
+/// A bridge `hello`'s `log=` word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HelloLog {
+    /// No `log=`, or a word this endpoint does not read: no mirror.
+    Off,
+    /// `log=auto` (`[fabric] log = "auto"`, the default, session log Phase 6
+    /// step 6E-3): the bridge mirrors once it has attached to a broker that
+    /// retains its node's `ev` faces, and says `hello` again with `log=turns`
+    /// then; until it does it asks for nothing, and over a broker that
+    /// retains nothing it reports `link mirror unretained`.
+    Auto,
+    /// `log=turns`: it asks this endpoint to serve `log-take`/`log-landed`.
+    Turns,
 }
 
 /// The bus mirror's state as the bridge reported it: `on`, `stopped` (a
 /// definite refusal that is not the subject budget: the mirror stops for that
-/// bridge's life, its pin kept for a later one, ruling Q10) or `capped` (the
-/// node's total of mirrored bytes reached, ruling Q13), with a reason token.
+/// bridge's life, its pin kept for a later one, ruling Q10), `capped` (the
+/// node's total of mirrored bytes reached on a broker that retains nothing,
+/// ruling Q13), `budget` (the node's bytes in a retaining broker's window
+/// at their budget: the mirror waits, and goes on once the broker gives the
+/// oldest up, session log Phase 6 step 6E-2, ruling U41) or `unretained` (an
+/// `auto` bridge over a broker that retains none of its `ev` faces: the
+/// mirror does not run, step 6E-3), with a reason token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MirrorReport {
     state: &'static str,
@@ -4431,13 +4453,18 @@ pub fn cmd_hello(rest: &str, generation: Option<BridgeGeneration>) -> String {
     let mut lane: Option<u32> = None;
     let mut build: Option<String> = None;
     let mut refills_broadcasts = false;
-    let mut log = false;
+    let mut log = HelloLog::Off;
     for tok in rest.split_whitespace() {
         if let Some(v) = kv(tok, "log") {
             // THE BUS MIRROR (session log phase 4): `log=turns` asks this
-            // endpoint to serve `log-take`/`log-landed`; any other word is
-            // read past, as any other `key=value` is.
-            log = v == "turns";
+            // endpoint to serve `log-take`/`log-landed`; `log=auto` asks for
+            // nothing yet (step 6E-3); any other word is read past, as any
+            // other `key=value` is.
+            log = match v {
+                "turns" => HelloLog::Turns,
+                "auto" => HelloLog::Auto,
+                _ => HelloLog::Off,
+            };
         } else if let Some(v) = kv(tok, "refill") {
             // WHAT THE BRIDGE OFFERS AGAIN to a session a relaunch keeps, as a
             // comma list of lanes; `say` is the broadcast topics, which is all
@@ -4497,7 +4524,7 @@ pub fn cmd_hello(rest: &str, generation: Option<BridgeGeneration>) -> String {
     }
     // Only a recorded hello is told its mirror is served (ruling Q10): a ghost
     // lane's `OK stale=1` above never says it.
-    if log {
+    if log == HelloLog::Turns {
         format!("OK {answer} log=turns\n")
     } else {
         format!("OK {answer}\n")
@@ -4542,18 +4569,49 @@ pub fn bridge_mirrors_logs() -> bool {
         .unwrap_or_else(|p| p.into_inner())
         .hello
         .as_ref()
-        .is_some_and(|h| h.log)
+        .is_some_and(|h| h.log == HelloLog::Turns)
 }
 
-/// `fabric status`'s bus-mirror tail: ` bridge_log=turns mirror=<state>[:<reason>]`
-/// while the owning bridge's recorded `hello` asked for the mirror, and
-/// nothing otherwise, so a default instance's line is the bytes it was.
+/// WHETHER THE NODE MIRRORS, as the owning bridge last said it (the word the
+/// store's `session_log_mirror::Shared::served` keeps): `Some(true)` for a
+/// recorded `hello … log=turns`, `Some(false)` for one without `log=` and for
+/// an `auto` one whose bridge then reported `link mirror unretained`, and
+/// `None` for an `auto` hello not yet judged by an attach (session log Phase
+/// 6 step 6E-3), which leaves the store's word as it was: an `auto` bridge's
+/// restart is the window the word is sticky across, as a `turns` one's is.
+#[must_use]
+pub fn bridge_mirror_word() -> Option<bool> {
+    #[cfg(any(test, debug_assertions))]
+    if link_section_is_foreign() {
+        return Some(false);
+    }
+    let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
+    match link.hello.as_ref().map(|h| h.log) {
+        Some(HelloLog::Turns) => Some(true),
+        Some(HelloLog::Auto) => link
+            .mirror
+            .as_ref()
+            .is_some_and(|m| m.state == "unretained")
+            .then_some(false),
+        Some(HelloLog::Off) | None => Some(false),
+    }
+}
+
+/// `fabric status`'s bus-mirror tail: ` bridge_log=<turns|auto>
+/// mirror=<state>[:<reason>]` while the owning bridge's recorded `hello`
+/// said `log=turns` or `log=auto`, and nothing otherwise, so a bridge with
+/// `[fabric] log = "off"` leaves the line the bytes it was. An `auto` bridge
+/// over a broker that retains nothing says `bridge_log=auto
+/// mirror=unretained` (session log Phase 6 step 6E-3); over one that retains,
+/// its second `hello` makes it `turns`.
 #[must_use]
 pub fn fabric_mirror_facts() -> String {
     let link = LINK.link.lock().unwrap_or_else(|p| p.into_inner());
-    if !link.hello.as_ref().is_some_and(|h| h.log) {
-        return String::new();
-    }
+    let word = match link.hello.as_ref().map(|h| h.log) {
+        Some(HelloLog::Turns) => "turns",
+        Some(HelloLog::Auto) => "auto",
+        Some(HelloLog::Off) | None => return String::new(),
+    };
     let state = link.mirror.as_ref().map_or_else(
         || "starting".to_string(),
         |m| {
@@ -4564,11 +4622,12 @@ pub fn fabric_mirror_facts() -> String {
             }
         },
     );
-    format!(" bridge_log=turns mirror={state}")
+    format!(" bridge_log={word} mirror={state}")
 }
 
-/// `link mirror on|stopped|capped [reason=<token>]` from the lane whose
-/// generation `generation` is: what `fabric status` says of the bus mirror.
+/// `link mirror on|stopped|capped|budget|unretained [reason=<token>]` from
+/// the lane whose generation `generation` is: what `fabric status` says of
+/// the bus mirror. `budget` and `unretained` are lane 6's (`BRIDGE_LANE`).
 fn cmd_link_mirror<'a>(
     mut toks: impl Iterator<Item = &'a str>,
     generation: Option<BridgeGeneration>,
@@ -4577,6 +4636,8 @@ fn cmd_link_mirror<'a>(
         Some("on") => "on",
         Some("stopped") => "stopped",
         Some("capped") => "capped",
+        Some("budget") => "budget",
+        Some("unretained") => "unretained",
         _ => return LINK_USAGE.to_string(),
     };
     let mut reason = String::new();
@@ -4698,7 +4759,7 @@ pub fn fabric_bridge_facts() -> (Option<u32>, Option<String>, u64) {
 const LINK_USAGE: &str = "ERR usage: link up rtt=<ms> | link down reason=<token> [rtt=<ms>] | \
                           link log <identity> [continues=<off> was=<identity>] | \
                           link bye <quit|handoff> | \
-                          link mirror on|stopped|capped [reason=<token>] | \
+                          link mirror on|stopped|capped|budget|unretained [reason=<token>] | \
                           link set-aside files=<n> | \
                           link quarantine torn=<k>\n";
 
@@ -5406,12 +5467,13 @@ pub fn any_hold_refusal(store: &impl AsStore) -> Option<String> {
 /// `open` of a GATEWAY CARD under any hold: [`app_halt_refusal`]'s twin for
 /// the palette (`open menu`), a tab's menu (`open tab-menu`), the Overview
 /// (`open overview`, its old keyword `connections`) and the Autopilot menu
-/// (`open autopilot-menu`), the cards `escalated_op` classes Owner-only as
+/// (`open autopilot-menu`) and a fact's menu (`open fact-menu <fact>`), the
+/// cards `escalated_op` classes Owner-only as
 /// gateways. Each card is a row of acts behind a key: a control client that
 /// opened one while a session is held could press with `key` what `invoke`
 /// refuses — Close Window over a held background tab, a palette row the
 /// person's Take Over keeps out, the Autopilot menu's mode, timers and
-/// Harness settings. So while any session is held, opening one answers
+/// Harness settings, a fact menu's new tab. So while any session is held, opening one answers
 /// `ERR halted` as `invoke` does. Closing one (`open <target> close`) and
 /// every other target stay answerable. A card already open when the hold
 /// began is still the gesture mark's (`App::person_gesture_refused`): the
@@ -5426,7 +5488,11 @@ pub fn open_halt_refusal(store: &impl AsStore, verb: &str, rest: &str) -> Option
     if words.next() == Some("close")
         || !matches!(
             target,
-            AuxTarget::Menu | AuxTarget::TabMenu | AuxTarget::Overview | AuxTarget::AutopilotMenu
+            AuxTarget::Menu
+                | AuxTarget::TabMenu
+                | AuxTarget::Overview
+                | AuxTarget::AutopilotMenu
+                | AuxTarget::FactMenu
         )
     {
         return None;
@@ -6338,9 +6404,10 @@ const DELIVER_USAGE: &str = "ERR usage: deliver <sid> off=<n> from=<p> kind=<k> 
                              [re=<n>] [dl=<ms>] [late=1] [demoted=<k>] [via=<p,...>] \
                              [verdict=<handled|refused|deferred>] [len=<n>] [text=<pct>] \
                              | deliver <sid> landed=<post-id> off=<n> \
-                             | deliver <sid> fetched=<off> (err=<token> | from=<p> kind=<k> \
-                             trust=<t> [re=<n>] [dl=<ms>] [demoted=<k>] [via=<p,...>] \
-                             [verdict=<v>] [len=<n>] [at=<n>] [more=1] [text=<pct>]) \
+                             | deliver <sid> fetched=<off> (err=<token> [floor=<n>] \
+                             | from=<p> kind=<k> trust=<t> [re=<n>] [dl=<ms>] \
+                             [demoted=<k>] [via=<p,...>] [verdict=<v>] [len=<n>] [at=<n>] \
+                             [more=1] [text=<pct>]) \
                              | deliver <sid> receipt=<rid> off=<n|->\n";
 
 /// `deliver` — put one bus record in a session's inbox, or close an outbound post.
@@ -6477,6 +6544,7 @@ fn deliver_receipt(ctx: &dyn FabricSession, toks: &[&str]) -> String {
 fn deliver_fetched(ctx: &dyn FabricSession, toks: &[&str]) -> String {
     let mut off: Option<u64> = None;
     let mut err: Option<String> = None;
+    let mut floor: Option<u64> = None;
     let mut at: usize = 0;
     let mut more = false;
     let mut fields: Vec<&str> = Vec::with_capacity(toks.len());
@@ -6493,6 +6561,13 @@ fn deliver_fetched(ctx: &dyn FabricSession, toks: &[&str]) -> String {
                 return DELIVER_USAGE.to_string();
             }
             err = Some(v.to_string());
+        } else if let Some(v) = kv(tok, "floor") {
+            // `err=retained`'s floor: what the broker keeps of this session's
+            // lane starts there (session log Phase 6 step 6E-2).
+            match v.parse() {
+                Ok(n) => floor = Some(n),
+                Err(_) => return DELIVER_USAGE.to_string(),
+            }
         } else if let Some(v) = kv(tok, "at") {
             match v.parse() {
                 Ok(n) => at = n,
@@ -6508,7 +6583,10 @@ fn deliver_fetched(ctx: &dyn FabricSession, toks: &[&str]) -> String {
         return DELIVER_USAGE.to_string();
     };
     let slot = match err {
-        Some(why) => FetchSlot::Failed(why),
+        Some(why) => FetchSlot::Failed(match floor {
+            Some(floor) if why == "retained" => format!("retained-from={floor}"),
+            _ => why,
+        }),
         None => {
             let f = match parse_deliver_fields(&fields, usize::MAX) {
                 Ok(f) if !f.late && f.off.is_none() => f,
@@ -8103,10 +8181,15 @@ fn unfetched(inbox: &Inbox, off: u64, why: String) -> String {
 }
 
 /// The reply a failed fetch gives: `no-record` is the one answer that is the
-/// same for "another session's" and "nothing there", on purpose.
+/// same for "another session's" and "nothing there", on purpose. Below what
+/// the broker's retention keeps of this session's lane it is that floor,
+/// `ERR retained-from=<floor>` (session log Phase 6 step 6E-2): the floor is
+/// this lane's own, so it says nothing of whose record `off` was.
 fn fetch_failure(why: &str, off: u64) -> String {
     if why == "no-record" {
         format!("ERR no such record off={off}\n")
+    } else if let Some(floor) = why.strip_prefix("retained-from=") {
+        format!("ERR retained-from={floor} off={off}\n")
     } else {
         format!("ERR fetch failed reason={why} off={off}\n")
     }
@@ -10044,7 +10127,9 @@ mod inbox_hold {
     /// phase 4, ruling Q10): `log=turns` is echoed to the lane that owns the
     /// link and recorded there; a ghost lane's hello is answered `OK stale=1`
     /// without it and records nothing; `fabric status`'s tail is empty until
-    /// the owning hello asked, and `link mirror` is the owner's alone.
+    /// the owning hello asked, and `link mirror` is the owner's alone. Its
+    /// `budget` state (lane 6) is said as `mirror=budget`; NEGATIVE CONTROL,
+    /// run: an endpoint without the word answers it `ERR usage`.
     #[test]
     fn the_mirror_is_acknowledged_only_to_a_recorded_hello() {
         with_link(|| {
@@ -10059,6 +10144,10 @@ mod inbox_hold {
             assert!(on.trim_end().ends_with(" log=turns"), "{on}");
             assert!(bridge_mirrors_logs());
             assert_eq!(fabric_mirror_facts(), " bridge_log=turns mirror=starting");
+            // Lane 5: the node at its window budget on a retaining broker, a
+            // wait the next `on` ends (session log Phase 6 step 6E-2).
+            assert_eq!(cmd_link(&store, "mirror budget", Some(generation)), "OK\n");
+            assert_eq!(fabric_mirror_facts(), " bridge_log=turns mirror=budget");
             assert_eq!(
                 cmd_link(&store, "mirror stopped reason=refused", Some(generation)),
                 "OK\n"
@@ -10086,6 +10175,37 @@ mod inbox_hold {
             attach_up(&store, next);
             assert!(!bridge_mirrors_logs());
             assert_eq!(fabric_mirror_facts(), "");
+        });
+    }
+
+    /// AN `auto` HELLO ASKS FOR NOTHING AND IS SAID (session log Phase 6 step
+    /// 6E-3): `log=auto` is recorded, never acknowledged with `log=turns`, so
+    /// nothing serves `log-take` to it; `fabric status` says `bridge_log=auto`
+    /// and, once the bridge reports a broker that retains nothing,
+    /// `mirror=unretained`; the second hello an attach to a retaining broker
+    /// sends (`log=turns`) is the mirror the default runs. NEGATIVE CONTROL,
+    /// run: `auto` read as `turns` fails it.
+    #[test]
+    fn an_auto_hello_asks_for_nothing_and_says_unretained() {
+        with_link(|| {
+            let store = new_store();
+            let generation = next_bridge_generation();
+            attach_up(&store, generation);
+            let auto = cmd_hello("lane=5 build=x log=auto", Some(generation));
+            assert!(auto.starts_with("OK ") && !auto.contains("log="), "{auto}");
+            assert!(!bridge_mirrors_logs(), "auto asks for nothing yet");
+            assert_eq!(fabric_mirror_facts(), " bridge_log=auto mirror=starting");
+            assert_eq!(
+                cmd_link(&store, "mirror unretained", Some(generation)),
+                "OK\n"
+            );
+            assert_eq!(fabric_mirror_facts(), " bridge_log=auto mirror=unretained");
+            assert!(!bridge_mirrors_logs());
+            let turns = cmd_hello("lane=5 build=x log=turns", Some(generation));
+            assert!(turns.trim_end().ends_with(" log=turns"), "{turns}");
+            assert!(bridge_mirrors_logs());
+            assert_eq!(cmd_link(&store, "mirror on", Some(generation)), "OK\n");
+            assert_eq!(fabric_mirror_facts(), " bridge_log=turns mirror=on");
         });
     }
 
@@ -12953,6 +13073,26 @@ mod inbox_hold {
             assert_eq!(
                 reader.join().expect("the reader finished"),
                 "ERR no such record off=7\n"
+            );
+            // Below what the broker's retention keeps of this session's lane
+            // (session log Phase 6 step 6E-2): its floor, never `no such
+            // record`. NEGATIVE CONTROL, run: `floor=` read past.
+            let reader = {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || cmd_inbox_get(&ctx, "@8"))
+            };
+            await_fetch(8);
+            assert_eq!(
+                cmd_deliver(&store, &format!("{sid} fetched=8 err=retained floor=40")),
+                "OK\n"
+            );
+            assert_eq!(
+                reader.join().expect("the reader finished"),
+                "ERR retained-from=40 off=8\n"
+            );
+            assert_eq!(
+                cmd_deliver(&store, &format!("{sid} fetched=8 err=retained floor=x")),
+                DELIVER_USAGE
             );
             assert_eq!(cmd_inbox_get(&ctx, "@x"), INBOX_USAGE);
 

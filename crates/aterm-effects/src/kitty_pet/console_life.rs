@@ -249,7 +249,7 @@ impl VisibilityHold {
     /// Nothing further will change without new evidence: no ramp in flight,
     /// no dwell counting down, and no blind run that could still time out.
     #[inline]
-    fn settled(&self) -> bool {
+    const fn settled(&self) -> bool {
         let target = if self.shown { 1.0 } else { 0.0 };
         self.cover == target
             && self.contrary_since.is_none()
@@ -563,7 +563,7 @@ impl PetBrain {
 
     #[inline]
     #[must_use]
-    pub fn console_input_seq(&self) -> u64 {
+    pub const fn console_input_seq(&self) -> u64 {
         self.console.seq
     }
 
@@ -579,25 +579,28 @@ impl PetBrain {
 
     #[inline]
     #[must_use]
-    pub fn console_input_consumed_seq(&self) -> u64 {
+    pub const fn console_input_consumed_seq(&self) -> u64 {
         self.console.consumed
     }
 
     #[inline]
     #[must_use]
-    pub fn console_input_kind(&self) -> Option<PetInputKind> {
-        self.console.input.map(|e| e.kind)
+    pub const fn console_input_kind(&self) -> Option<PetInputKind> {
+        match self.console.input {
+            Some(e) => Some(e.kind),
+            None => None,
+        }
     }
 
     #[inline]
     #[must_use]
-    pub fn console_attention(&self) -> PetAttention {
+    pub const fn console_attention(&self) -> PetAttention {
         self.console.attention
     }
 
     #[inline]
     #[must_use]
-    pub fn console_reason(&self) -> &'static str {
+    pub const fn console_reason(&self) -> &'static str {
         if self.console.reason.is_empty() {
             "none"
         } else {
@@ -607,13 +610,16 @@ impl PetBrain {
 
     #[inline]
     #[must_use]
-    pub fn console_anchor_id(&self) -> Option<u64> {
-        self.console.anchor.map(|a| a.block_id)
+    pub const fn console_anchor_id(&self) -> Option<u64> {
+        match self.console.anchor {
+            Some(a) => Some(a.block_id),
+            None => None,
+        }
     }
 
     #[inline]
     #[must_use]
-    pub fn console_event_seq(&self) -> u64 {
+    pub const fn console_event_seq(&self) -> u64 {
         self.console.source_seq
     }
 
@@ -7153,7 +7159,7 @@ mod tests {
     /// TYPED UP TO A LABEL ON THE RULE, THE CAT WAITS ON THE LINE (lab,
     /// real Claude Code 2.1.305 with the harness off, windowed, 2026-10-20).
     /// With the harness off the host still draws its switch's label at the
-    /// right end of the composer's upper rule (`claude harness ○ off [on]`),
+    /// right end of the composer's upper rule (`alab harness ○ off [on]`),
     /// and it is the host's chrome: the stands under it are refused. The cat
     /// escorting the caret along the composer's line was sent to a seat off
     /// the line there, so it hopped up off the line at the label and down

@@ -357,17 +357,18 @@ pub(crate) fn upstream_record(upstream: &str) -> String {
     format!(r#"{{"source":"0","version":"0.164.0-dev.12+gabc","upstream":{upstream}}}"#)
 }
 
-/// The field as the packager writes it: release, commit and commit date.
+/// The field as the packager writes it: release, count, commit and commit date.
 pub(crate) fn full_upstream() -> String {
     format!(
-        r#"{{"release":"rust-v0.163.0","commit":"{UPSTREAM_SHA}","commit_date":"2026-10-15T18:02:11Z"}}"#
+        r#"{{"release":"rust-v0.163.0","commits_since_release":241,"commit":"{UPSTREAM_SHA}","commit_date":"2026-10-15T18:02:11Z"}}"#
     )
 }
 
 /// THE UPSTREAM A BUILD IS BASED ON is its record's `upstream` field, read whole or not at
-/// all: the field says `based on upstream <release>+g<12 hex>` with or without its commit
-/// date, a record from before the field says nothing, and no malformed shape says a part
-/// of it.
+/// all: the field says `based on upstream <release>+g<12 hex>` with or without its count
+/// and commit date, and its release line says the count and the day where the record
+/// holds them; a record from before the field says nothing, and no malformed shape says a
+/// part of it.
 #[test]
 fn the_upstream_is_read_off_the_record_whole_or_not_at_all() {
     let parsed = parse_upstream(&upstream_record(&full_upstream())).expect("the field");
@@ -376,18 +377,53 @@ fn the_upstream_is_read_off_the_record_whole_or_not_at_all() {
         Upstream {
             release: "rust-v0.163.0".into(),
             commit: UPSTREAM_SHA.into(),
+            since: Some(241),
+            day: Some("2026-10-15".into()),
         }
     );
     assert_eq!(
         parsed.words(),
         "based on upstream rust-v0.163.0+g0123456789ab"
     );
-    // The commit date is optional, and a sha in capitals is said in lowercase.
+    assert_eq!(
+        parsed.release_line("openai/codex"),
+        "Based on upstream openai/codex rust-v0.163.0 + 241 commits (0123456789ab, 2026-10-15)"
+    );
+    // The count and the commit date are optional, and a sha in capitals is said in
+    // lowercase.
     let bare = format!(
         r#"{{"release":"rust-v0.163.0","commit":"{}"}}"#,
         UPSTREAM_SHA.to_ascii_uppercase()
     );
-    assert_eq!(parse_upstream(&upstream_record(&bare)), Some(parsed));
+    let bare = parse_upstream(&upstream_record(&bare)).expect("release and commit alone");
+    assert_eq!(
+        bare,
+        Upstream {
+            since: None,
+            day: None,
+            ..parsed.clone()
+        }
+    );
+    assert_eq!(bare.words(), parsed.words());
+    assert_eq!(
+        bare.release_line("openai/codex"),
+        "Based on upstream openai/codex rust-v0.163.0 (0123456789ab)"
+    );
+    // The record a package built on 2026-10-21 carries: a date and no count.
+    let dated = format!(
+        r#"{{"release":"rust-v0.163.0","commit":"{UPSTREAM_SHA}","commit_date":"2026-10-20T13:50:13Z"}}"#
+    );
+    assert_eq!(
+        parse_upstream(&upstream_record(&dated)).map(|u| u.release_line("openai/codex")),
+        Some("Based on upstream openai/codex rust-v0.163.0 (0123456789ab, 2026-10-20)".into())
+    );
+    let one = format!(
+        r#"{{"release":"rust-v0.163.0","commits_since_release":1,"commit":"{UPSTREAM_SHA}"}}"#
+    );
+    assert_eq!(
+        parse_upstream(&upstream_record(&one)).map(|u| u.release_line("openai/codex")),
+        Some("Based on upstream openai/codex rust-v0.163.0 + 1 commit (0123456789ab)".into())
+    );
     // A record from before the field.
     assert_eq!(parse_upstream(r#"{"source":"0"}"#), None);
     let sha = UPSTREAM_SHA;
@@ -410,6 +446,20 @@ fn the_upstream_is_read_off_the_record_whole_or_not_at_all() {
             "g".repeat(40)
         ),
         r#"{"release":"rust-v0.163.0","commit":1}"#.to_string(),
+        // A count or a date present in another shape refuses the whole field.
+        format!(r#"{{"release":"rust-v0.163.0","commit":"{sha}","commits_since_release":"241"}}"#),
+        format!(r#"{{"release":"rust-v0.163.0","commit":"{sha}","commits_since_release":-1}}"#),
+        format!(r#"{{"release":"rust-v0.163.0","commit":"{sha}","commits_since_release":2.5}}"#),
+        format!(r#"{{"release":"rust-v0.163.0","commit":"{sha}","commits_since_release":null}}"#),
+        format!(r#"{{"release":"rust-v0.163.0","commit":"{sha}","commit_date":"2026-10-20"}}"#),
+        format!(
+            r#"{{"release":"rust-v0.163.0","commit":"{sha}","commit_date":"2026-10-20T13:50:13+07:00"}}"#
+        ),
+        format!(
+            r#"{{"release":"rust-v0.163.0","commit":"{sha}","commit_date":"2026-1O-20T13:50:13Z"}}"#
+        ),
+        format!(r#"{{"release":"rust-v0.163.0","commit":"{sha}","commit_date":20261020}}"#),
+        format!(r#"{{"release":"rust-v0.163.0","commit":"{sha}","commit_date":null}}"#),
     ] {
         assert_eq!(parse_upstream(&upstream_record(&field)), None, "{field}");
     }

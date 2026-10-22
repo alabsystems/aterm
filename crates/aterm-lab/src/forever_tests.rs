@@ -105,8 +105,176 @@ fn each_chain_is_scripted_turn_by_turn_by_the_harness_acts() {
         reply(Chain::CruiseN, &[CONTINUE_TEXT, DONE_CHECK, CONTINUE_TEXT]),
         Some(needs_reply(N4_HEAD, &[NEED_A, NEED_C]))
     );
+    // C4: a work reply; the owner's continuation, typed as the harness
+    // types it (one line), answered with a done claim; the done check after
+    // it with a clean defense
+    let owner = aterm_agent::supervise::limit::one_line(OWNER_CONTINUE);
+    assert_eq!(reply(Chain::CruiseO, &[]).as_deref(), Some(WORK));
+    assert_eq!(
+        reply(Chain::CruiseO, &[owner.as_str()]).as_deref(),
+        Some(DONE_CLAIM)
+    );
+    assert_eq!(
+        reply(Chain::CruiseO, &[owner.as_str(), DONE_CHECK]).as_deref(),
+        Some(CLEAN)
+    );
     // a conversation of no chain is left to the spec's own text
     assert_eq!(scripted_reply(&spec(&Chain::ALL), &users(&["hi"])), None);
+}
+
+/// C4'S CONTINUATION IS THE LAB'S `[harness] continue_text`, read back by
+/// the one reader of that table as the owner's two paragraphs, blank line
+/// and all, with no warning. NEGATIVE CONTROL: the line unescaped is no
+/// such text (TOML refuses a raw line break in a basic string, and the
+/// reader keeps the default).
+#[test]
+fn the_owners_continuation_is_the_labs_continue_text_blank_line_and_all() {
+    use aterm_agent::supervise::SupervisorConfig;
+    let (cfg, warnings) =
+        SupervisorConfig::from_aterm_toml(&format!("[harness]\n{}\n", owner_keys()));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(cfg.continue_text, OWNER_CONTINUE);
+    assert!(cfg.continue_text.contains("\n\n"));
+    for head in [DEFENSE_HEAD, "NEEDS YOU:"] {
+        assert!(
+            cfg.continue_text.lines().any(|l| l.starts_with(head)),
+            "{head}"
+        );
+    }
+    let raw = format!("[harness]\ncontinue_text = \"{OWNER_CONTINUE}\"\n");
+    let (cfg, _) = SupervisorConfig::from_aterm_toml(&raw);
+    assert_ne!(cfg.continue_text, OWNER_CONTINUE);
+    // only a run holding C4's chain sets it, and only cover runs it
+    assert!(Chain::COVER.contains(&Chain::CruiseO));
+    assert_eq!(Chain::CruiseO.autopilot(), "cruise");
+    assert_eq!(Chain::CruiseO.scenarios(), [Scenario::C4]);
+}
+
+/// C4 as a live run that passes it records it: the work reply, its back-off,
+/// the owner's continuation typed as one line and sent so, its reply (the
+/// done claim) read and watched 20 s more.
+fn owner_continued() -> Seen {
+    let owner = aterm_agent::supervise::limit::one_line(OWNER_CONTINUE);
+    Seen {
+        journal: vec![
+            j(5_000, &format!("EVENT idle seq=1 {WORK}")),
+            j(
+                5_100,
+                "WAITING seq=1 until=x 1 short turn(s) in a row: 2 min back-off",
+            ),
+            j(
+                125_000,
+                &format!("CONTINUED seq=1 rule=continue@v1 {owner}"),
+            ),
+            j(128_500, &format!("EVENT idle seq=2 {DONE_CLAIM}")),
+        ],
+        ledger: vec![typed(125_000, "continue@v1", &owner)],
+        status: vec![status(1_000, "open", "cruise")],
+        meta: vec![no_meta(1_000)],
+        end_ms: T0 + 150_000,
+        cover: Cover {
+            owner_texts: Some(vec![owner]),
+            ..Cover::default()
+        },
+        ..Seen::default()
+    }
+}
+
+#[test]
+fn cruise_o_passes_only_where_the_owners_continuation_is_one_line_and_never_the_reply() {
+    let c4 = |s: &Seen| one(Chain::CruiseO, s, "agy", Scenario::C4);
+    let (w, why) = c4(&owner_continued());
+    assert_eq!(w, "PASS", "{why}");
+    assert!(why.contains("1 text(s) of it reached the agent"), "{why}");
+    // NEGATIVE CONTROLS. The owner's words reached the agent in two
+    // paragraphs (a typed act that kept its blank line):
+    let mut s = owner_continued();
+    s.cover.owner_texts = Some(vec![OWNER_CONTINUE.to_string()]);
+    let (w, why) = c4(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("with a line break"), "{why}");
+    // never reached it at all:
+    let mut s = owner_continued();
+    s.cover.owner_texts = Some(Vec::new());
+    assert_eq!(c4(&s).0, "FAIL");
+    // the act's rows read back as the agent's reply, and its NEEDS YOU line
+    // raised as a need:
+    let mut s = owner_continued();
+    s.journal[3].1 = format!("EVENT idle seq=2 NEEDS YOU: {OWNER_TAIL}");
+    let (w, why) = c4(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("the act's own words read as the agent's"),
+        "{why}"
+    );
+    let mut s = owner_continued();
+    s.journal
+        .push(j(128_550, &format!("NEEDS seq=2 count=1 {OWNER_TAIL}")));
+    let (w, why) = c4(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("a need was raised"), "{why}");
+    // the owner's `Nothing left:` taken for a landing (none under Cruise):
+    let mut s = owner_continued();
+    s.journal.push(j(128_700, "DONE seq=2 rule=task-done@v1 x"));
+    assert_eq!(c4(&s).0, "FAIL");
+    // another text typed in its place (the default continuation):
+    let mut s = owner_continued();
+    s.ledger[0].command = CONTINUE_TEXT.to_string();
+    assert_eq!(c4(&s).0, "FAIL");
+    // its reply never read before the next act; no continuation at all;
+    // the dumps unread
+    let mut s = owner_continued();
+    s.journal[3] = j(
+        128_500,
+        "WAITING seq=2 until=x 1 short turn(s) in a row: 2 min back-off",
+    );
+    s.journal.push(j(
+        250_000,
+        "CONTINUED seq=2 rule=continue-done-check@v1 [aterm harness] x",
+    ));
+    s.journal
+        .push(j(253_000, &format!("EVENT idle seq=3 {DONE_CLAIM}")));
+    s.end_ms = T0 + 260_000;
+    assert_eq!(c4(&s).0, "UNOBSERVED");
+    let mut s = owner_continued();
+    s.journal.truncate(2);
+    s.ledger.clear();
+    s.end_ms = T0 + 100_000;
+    assert_eq!(c4(&s).0, "UNOBSERVED");
+    let mut s = owner_continued();
+    s.cover.owner_texts = None;
+    assert_eq!(c4(&s).0, "UNOBSERVED");
+}
+
+/// C4'S WITNESS reads the user texts of the conversation's own requests
+/// that carry the owner's words, in each API's shape, each once. NEGATIVE
+/// CONTROLS: another conversation's request, and a text without them.
+#[test]
+fn the_owners_words_are_read_from_the_conversations_requests() {
+    let token = Chain::CruiseO.token();
+    let owner = aterm_agent::supervise::limit::one_line(OWNER_CONTINUE);
+    let gemini = |texts: &[&str]| -> Vec<u8> {
+        let contents: Vec<String> = texts
+            .iter()
+            .map(|t| {
+                format!(
+                    "{{\"role\":\"user\",\"parts\":[{{\"text\":{}}}]}}",
+                    J::s(*t).py()
+                )
+            })
+            .collect();
+        format!("{{\"contents\":[{}]}}", contents.join(",")).into_bytes()
+    };
+    let prompt = Chain::CruiseO.prompt();
+    let bodies = vec![
+        gemini(&[prompt.as_str(), WORK]),
+        gemini(&[prompt.as_str(), owner.as_str()]),
+        gemini(&[prompt.as_str(), owner.as_str(), DONE_CHECK]),
+        gemini(&["FOREVERLAB-CRUISE. x", owner.as_str()]),
+    ];
+    assert_eq!(owner_texts(&bodies, &token), [owner]);
+    assert!(owner_texts(&bodies[..1], &token).is_empty());
+    assert!(owner_texts(&bodies[3..], &token).is_empty());
 }
 
 #[test]
@@ -455,6 +623,21 @@ fn the_coverage_chains_are_scripted_turn_by_turn() {
     assert_ne!(WallHid.token(), Wall.token());
 }
 
+/// A walled run's Gemini CLI runs in a zone whose offset is not the
+/// machine's, and is a half-hour one, so the reset its dialog names is placed
+/// right only by reading its zone ([`foreign_tz`]).
+#[test]
+fn a_walled_gemini_cli_runs_in_a_zone_not_the_machines() {
+    let now = crate::util::now_ms() / 1000;
+    let zone = foreign_tz(now);
+    let ist = 19_800;
+    if crate::sys::local_offset_s(now) == ist {
+        assert_eq!(zone, "America/St_Johns");
+    } else {
+        assert_eq!(zone, "Asia/Kolkata");
+    }
+}
+
 /// W2's wall resets far enough past the land act (two minutes on), its take
 /// window (half a minute) and every command the hide may enter (about four
 /// seconds each) that the notice is out of sight at least
@@ -493,7 +676,9 @@ fn the_coverage_modes_pick_their_chains() {
     use Chain::*;
     assert_eq!(
         Chain::of_mode(Mode::Cover),
-        [LandQ, LandP, LandW, WroteC, LandT, Mgr, Worker, Off]
+        [
+            LandQ, LandP, LandW, WroteC, LandT, Mgr, Worker, CruiseO, Off
+        ]
     );
     assert_eq!(Chain::of_mode(Mode::Cap), [Cap, Off]);
     // `spawn agent=<harness>` starts a worker of every harness: L15's two
@@ -531,7 +716,7 @@ fn the_coverage_modes_pick_their_chains() {
         [LandP, Cap, LandQ].map(Chain::orchestrated),
         [Some(ORCHESTRATED), Some(RESUMED), None]
     );
-    assert_eq!(Chain::every().len(), 26);
+    assert_eq!(Chain::every().len(), 29);
     assert!(
         Chain::every()
             .iter()
@@ -545,24 +730,21 @@ fn the_coverage_modes_pick_their_chains() {
     }
     assert!(Wall.lands() && !Wall.managed() && Wall.autopilot() == "land");
     assert_eq!(Wall.scenarios(), [Scenario::W1]);
-    // the remembered wall alone, where a local command takes the notice off
-    // the screen (Muse Code, agy); Claude Code and Gemini CLI name why not
+    // the remembered wall alone, on every harness: a local command on Muse
+    // Code and agy, the same once Esc has cancelled Claude Code's countdown,
+    // the dialog's Stop on Gemini CLI
     assert_eq!(Chain::of_mode(Mode::WallHid), [WallHid]);
-    for h in [Harness::Muse, Harness::Agy] {
+    for h in Harness::ALL {
         assert_eq!(Chain::of_mode_on(Mode::WallHid, h), [WallHid], "{h:?}");
         assert_eq!(wall_out_of_reach(h, Mode::WallHid), None, "{h:?}");
     }
-    for h in [Harness::Claude, Harness::Gemini] {
-        assert!(Chain::of_mode_on(Mode::WallHid, h).is_empty(), "{h:?}");
-        assert!(wall_out_of_reach(h, Mode::WallHid).is_some(), "{h:?}");
-    }
     assert_eq!(
-        Harness::ALL.map(|h| hide_of(h).map(|x| x.command)),
+        Harness::ALL.map(|h| hide_of(h).map(|x| (x.by, x.cancel))),
         [
-            Err(hide_of(Harness::Claude).unwrap_err()),
-            Err(hide_of(Harness::Gemini).unwrap_err()),
-            Ok(AGY_HIDE_COMMAND),
-            Ok(HIDE_COMMAND)
+            Ok((HideBy::Command(CLAUDE_HIDE_COMMAND), Some(CLAUDE_CANCEL))),
+            Ok((HideBy::Option(GEMINI_HIDE_OPTION), None)),
+            Ok((HideBy::Command(AGY_HIDE_COMMAND), None)),
+            Ok((HideBy::Command(HIDE_COMMAND), None))
         ]
     );
     // the claim each harness's wall is raised with, and its grace
@@ -584,10 +766,58 @@ fn the_coverage_modes_pick_their_chains() {
     }
     assert!(WallHid.lands() && !WallHid.managed() && WallHid.autopilot() == "land");
     assert_eq!(WallHid.scenarios(), [Scenario::W2]);
-    assert!(Wall.walled() && WallHid.walled() && !LandA.walled() && !Off.walled());
+    // the per-day quota's dialog alone, on Gemini CLI: the others name why
+    // not, and its wall is the key's spent day, lifted before the ladder's
+    // first rung
+    assert_eq!(Chain::of_mode(Mode::WallDay), [WallDay]);
+    assert_eq!(Chain::of_mode_on(Mode::WallDay, Harness::Gemini), [WallDay]);
+    assert_eq!(wall_out_of_reach(Harness::Gemini, Mode::WallDay), None);
+    for h in [Harness::Claude, Harness::Agy, Harness::Muse] {
+        assert!(Chain::of_mode_on(Mode::WallDay, h).is_empty(), "{h:?}");
+        assert!(wall_out_of_reach(h, Mode::WallDay).is_some(), "{h:?}");
+    }
+    assert!(WallDay.lands() && !WallDay.managed() && WallDay.autopilot() == "land");
+    assert_eq!(WallDay.scenarios(), [Scenario::W1]);
+    // the climbing quota's: the same dialog, alone on Gemini CLI, lifted past
+    // the ladder's first rung and long before its second
+    assert_eq!(Chain::of_mode(Mode::WallClimb), [WallClimb]);
     assert_eq!(
-        [Mode::Wall, Mode::WallHid, Mode::Cap, Mode::Both].map(Mode::walled),
-        [Some(Scenario::W1), Some(Scenario::W2), None, None]
+        Chain::of_mode_on(Mode::WallClimb, Harness::Gemini),
+        [WallClimb]
+    );
+    for h in [Harness::Claude, Harness::Agy, Harness::Muse] {
+        assert!(Chain::of_mode_on(Mode::WallClimb, h).is_empty(), "{h:?}");
+    }
+    assert!(WallClimb.lands() && WallClimb.walled() && WallClimb.autopilot() == "land");
+    assert_eq!(WallClimb.scenarios(), [Scenario::W1]);
+    assert_eq!(WallClimb.wall_claim_on(Harness::Gemini), "five_hour");
+    assert!(WallClimb.wall_ahead_ms() > 32 * 60_000 && WallClimb.wall_ahead_ms() < 2 * 60 * 60_000);
+    assert!(WallClimb.limit_ms() > (30 + 120 + 5) * 60_000);
+    assert_eq!(WallDay.wall_claim_on(Harness::Gemini), "five_hour");
+    assert_eq!(Wall.wall_claim_on(Harness::Gemini), "code_assist");
+    assert!(WallDay.wall_ahead_ms() < 30 * 60_000 && WallDay.wall_ahead_ms() > WALL_AHEAD_MS);
+    assert_eq!(WallDay.limit_ms(), WALL_DAY_LIMIT_MS);
+    assert!(
+        Wall.walled() && WallHid.walled() && WallDay.walled() && !LandA.walled() && !Off.walled()
+    );
+    assert_eq!(
+        [
+            Mode::Wall,
+            Mode::WallHid,
+            Mode::WallDay,
+            Mode::WallClimb,
+            Mode::Cap,
+            Mode::Both
+        ]
+        .map(Mode::walled),
+        [
+            Some(Scenario::W1),
+            Some(Scenario::W2),
+            Some(Scenario::W1),
+            Some(Scenario::W1),
+            None,
+            None
+        ]
     );
     // no other mode's chains meet the wall
     for m in [Mode::Land, Mode::Cruise, Mode::Both, Mode::Cover, Mode::Cap] {
@@ -599,6 +829,8 @@ fn the_coverage_modes_pick_their_chains() {
         ("cap", Mode::Cap),
         ("wall", Mode::Wall),
         ("wall-hid", Mode::WallHid),
+        ("wall-day", Mode::WallDay),
+        ("wall-climb", Mode::WallClimb),
     ] {
         let a = parse_args(&v(&["--harness", "claude", "--mode", w]))
             .unwrap()
@@ -4092,9 +4324,11 @@ fn a_usage_limit_dialog_reads_the_wall_and_its_escalation_fails_w1() {
 
 /// W1's records on Gemini CLI kept trying (`limit-retry@v1`): the land act
 /// met by the account's usage-limit dialog, a box read as the wall's point,
-/// waited on to the end of the minute it names and a minute's grace past the
-/// reset (+300 s), its `Keep trying` pressed then (ledgered `approved`), and
-/// the turn it sent again landing the task.
+/// its reset named in the CLI's own zone (`1:05 PM GMT+5:30`, the walled
+/// run's `TZ`), waited on to the end of the minute it names and a minute's
+/// grace past the reset (+300 s, its wait ledgered `waiting`), its `Keep
+/// trying` pressed then (ledgered `approved`), and the turn it sent again
+/// landing the task.
 fn gemini_kept_trying() -> Seen {
     let mut s = walled();
     s.journal.truncate(3);
@@ -4107,11 +4341,14 @@ fn gemini_kept_trying() -> Seen {
             140_100,
             &format!(
                 "WAITING seq=2 until={} rule=limit-retry@v1 Gemini CLI's usage limit resets at \
-                 1:05 PM: Keep trying is pressed past it",
+                 1:05 PM GMT+5:30: Keep trying is pressed past it",
                 stamp(420_000)
             ),
         ),
-        j(421_000, "APPROVED seq=2 Keep trying (reset 1:05 PM)"),
+        j(
+            421_000,
+            "APPROVED seq=2 Keep trying (reset 1:05 PM GMT+5:30)",
+        ),
         j(425_000, "EVENT idle seq=3 Nothing left: the parser"),
         j(425_000, "DONE seq=3 rule=land@v1 x"),
     ]);
@@ -4120,10 +4357,18 @@ fn gemini_kept_trying() -> Seen {
         typed(125_000, "land@v1", LAND),
         point(140_000, 2),
         row(
+            140_100,
+            "limit-retry@v1",
+            "waiting",
+            "Keep trying (reset 1:05 PM GMT+5:30)",
+            "until …: Gemini CLI's usage limit resets at 1:05 PM GMT+5:30: Keep trying is \
+             pressed past it",
+        ),
+        row(
             421_000,
             "limit-retry@v1",
             "approved",
-            "Keep trying (reset 1:05 PM)",
+            "Keep trying (reset 1:05 PM GMT+5:30)",
             "",
         ),
         point(425_000, 3),
@@ -4139,10 +4384,12 @@ fn gemini_kept_trying() -> Seen {
 
 /// GEMINI CLI KEPT TRYING PASSES W1: the usage-limit dialog takes no typing,
 /// so the harness going on past the wall is its `Keep trying` pressed past
-/// the reset (`limit-retry@v1`, ledgered `approved`), and the turn that press
-/// sent landing the task. NEGATIVE CONTROLS: the press in the wall is an act
-/// in it (FAIL); with no press ledgered, the landing is the program's own
-/// retry (UNOBSERVED, F14); a press past the deadline is persistence lost.
+/// the reset (`limit-retry@v1`, ledgered `approved`) at the due its wait
+/// named, and the turn that press sent landing the task. NEGATIVE CONTROLS:
+/// the press in the wall is an act in it (FAIL); one past the reset but
+/// before its wait's due is pressed early (FAIL); with no press ledgered,
+/// the landing is the program's own retry (UNOBSERVED, F14); a press past
+/// the deadline is persistence lost.
 #[test]
 fn a_keep_trying_pressed_past_the_reset_goes_on_past_the_wall() {
     let w1 = |s: &Seen| one(Chain::Wall, s, "gemini", Scenario::W1);
@@ -4154,8 +4401,12 @@ fn a_keep_trying_pressed_past_the_reset_goes_on_past_the_wall() {
         ),
         "{why}"
     );
+    assert!(
+        why.contains("1.0 s after the until= its wait named"),
+        "at its due: {why}"
+    );
     let mut s = gemini_kept_trying();
-    s.ledger[3].ts = T0 + 200_000;
+    s.ledger[4].ts = T0 + 200_000;
     s.journal[4].0 = T0 + 200_000;
     let (w, why) = w1(&s);
     assert_eq!(w, "FAIL", "{why}");
@@ -4163,19 +4414,313 @@ fn a_keep_trying_pressed_past_the_reset_goes_on_past_the_wall() {
         why.contains("TYPED into the wall: 0 journal act(s), 1 ledger act(s) (the first limit-retry@v1 approved at +200.0 s)"),
         "{why}"
     );
+    // past the reset but before the due its wait named (the reset's minute
+    // and the grace, in the dialog's zone): pressed before its due
     let mut s = gemini_kept_trying();
-    s.ledger.remove(3);
+    s.ledger[4].ts = T0 + 360_000;
+    s.journal[5].0 = T0 + 360_000;
+    let (w, why) = w1(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("PRESSED BEFORE ITS DUE: limit-retry@v1 at +360.0 s, 60.0 s before"),
+        "{why}"
+    );
+    let mut s = gemini_kept_trying();
+    s.ledger.remove(4);
     let (w, why) = w1(&s);
     assert_eq!(w, "UNOBSERVED", "{why}");
     assert!(why.contains("the program's own retry landed it"), "{why}");
     let mut s = gemini_kept_trying();
-    s.ledger[3].ts = T0 + 700_000;
+    s.ledger[4].ts = T0 + 700_000;
     let (w, why) = w1(&s);
     assert_eq!(w, "FAIL", "{why}");
     assert!(
         why.contains("PERSISTENCE LOST: the first press after the reset"),
         "{why}"
     );
+}
+
+/// The reason the loop raises its badge for Gemini CLI's usage-limit dialog
+/// that names no reset (`approval.rs`'s `limit_no_reset_reason`).
+const GEMINI_NO_RESET: &str = "Gemini CLI's usage limit names no reset: Keep trying is tried on a \
+     back-off ladder; /stats model says which limit";
+
+/// W1's records on Gemini CLI's per-day quota (`--mode wall-day`): the land
+/// act met by the usage-limit dialog that names no reset (+140 s), the person
+/// told at once (`ESCALATED`, its `escalated` row, `needs=ask`) beside the
+/// ladder's own wait (`WAITING … rule=limit-retry@v1 … on the back-off
+/// ladder`, ledgered `waiting`) for its first rung 30 min on; the lab's wall
+/// lifted at +25 min; `Keep trying` pressed at the rung (+1941 s), the badge
+/// cleared, the task landed.
+fn gemini_day_kept_trying() -> Seen {
+    let mut s = walled();
+    let due = 140_000 + 1_800_000;
+    let waits = "Gemini CLI's usage limit names no reset: Keep trying is pressed on the back-off \
+         ladder";
+    s.journal.truncate(3);
+    s.journal.extend([
+        j(
+            140_000,
+            "EVENT prompt seq=2 kind=usage-limit classify=- command=-",
+        ),
+        j(140_100, "ESCALATED seq=2 attention=OK"),
+        j(
+            140_200,
+            &format!(
+                "WAITING seq=2 until={} rule=limit-retry@v1 {waits}",
+                stamp(due)
+            ),
+        ),
+        j(due + 1_000, "APPROVED seq=2 Keep trying (no reset named)"),
+        j(due + 4_000, "CLEARED seq=3 box attention=OK"),
+        j(due + 5_000, "EVENT idle seq=3 Nothing left: the parser"),
+        j(due + 5_000, "DONE seq=3 rule=land@v1 x"),
+    ]);
+    s.ledger = vec![
+        point(5_000, 1),
+        typed(125_000, "land@v1", LAND),
+        point(140_000, 2),
+        row(
+            140_100,
+            "-",
+            "escalated",
+            "Keep trying (no reset named)",
+            GEMINI_NO_RESET,
+        ),
+        row(
+            140_200,
+            "limit-retry@v1",
+            "waiting",
+            "Keep trying (no reset named)",
+            &format!("until …: {waits}"),
+        ),
+        row(
+            due + 1_000,
+            "limit-retry@v1",
+            "approved",
+            "Keep trying (no reset named)",
+            "",
+        ),
+        point(due + 5_000, 3),
+        task_done(due + 5_000),
+    ];
+    s.status = vec![
+        status(1_000, "open", "land"),
+        status_of(141_000, "open", "ask", "land", "aterm-harness@1"),
+        status(due + 6_000, "landed", "land"),
+    ];
+    s.cover.wall = Some((T0 + 6_000, (T0 + 1_500_000) / 1000));
+    s.cover.lifted_ms = Some(T0 + 1_497_000);
+    s.end_ms = T0 + due + 5_000 + 545_000;
+    s
+}
+
+/// THE PER-DAY QUOTA'S DIALOG KEPT TRYING ON ITS LADDER PASSES W1
+/// (`--mode wall-day`, T5 of the review of `b9/walls-2`): the person told
+/// beside the ladder's own wait is FOREVER's NEEDS YOU, no stall, and its
+/// `needs=ask` no reply's need; the harness goes on at the ladder's first
+/// due, past the lab's lift, and the deadline counts from there. NEGATIVE
+/// CONTROLS: the same escalation with no ladder wait beside it is the stall
+/// it was (FAIL, as the 2026-10-21 `wi1gw` run's); a press five minutes
+/// past the ladder's due is persistence lost; with the ladder's due unread
+/// the deadline is the lift's, and the press at the rung lost; a reply's
+/// need (`NEEDS`) still fails.
+#[test]
+fn a_per_day_dialogs_badge_is_no_stall_and_its_ladder_goes_on() {
+    let w1 = |s: &Seen| one(Chain::WallDay, s, "gemini", Scenario::W1);
+    let (w, why) = w1(&gemini_day_kept_trying());
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains("gone on: limit-retry@v1 pressed at +1941.0 s"),
+        "{why}"
+    );
+    let mut s = gemini_day_kept_trying();
+    s.ledger.remove(4);
+    let (w, why) = w1(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("ESCALATED the wall to a person at +140.1 s"),
+        "{why}"
+    );
+    let mut s = gemini_day_kept_trying();
+    s.ledger[5].ts = T0 + 140_000 + 1_800_000 + 301_000;
+    let (w, why) = w1(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("PERSISTENCE LOST: the first press after the reset"),
+        "{why}"
+    );
+    let mut s = gemini_day_kept_trying();
+    s.journal.remove(5);
+    let (w, why) = w1(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(
+        why.contains("PERSISTENCE LOST: the first press after the reset"),
+        "{why}"
+    );
+    let mut s = gemini_day_kept_trying();
+    s.journal.push(j(150_000, "NEEDS seq=2 count=1 x"));
+    let (w, why) = w1(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("a need was raised"), "{why}");
+}
+
+/// W1's records on Gemini CLI's per-day quota standing past the ladder's
+/// first rung (`--mode wall-climb`): [`gemini_day_kept_trying`]'s dialog and
+/// badge, its first `Keep trying` at the rung (+1941 s) in the wall, the
+/// dialog drawn again (`… (drawn again after its Keep trying, try 1)`, its
+/// next due 2 h on), the badge standing (`needs=ask`); the lab's wall
+/// lifted at +45 min; the climbed try (+9142 s) got through, the badge
+/// cleared, the task landed, watched past the ladder's window after it.
+fn gemini_day_climbed() -> Seen {
+    let mut s = gemini_day_kept_trying();
+    let due = 140_000 + 1_800_000;
+    let try1 = due + 1_000;
+    let due2 = try1 + 7_200_000;
+    let waits = "Gemini CLI's usage limit names no reset: Keep trying is pressed on the back-off \
+         ladder";
+    let again = format!("{waits} (drawn again after its Keep trying, try 1)");
+    s.journal.truncate(7);
+    s.journal.extend([
+        j(
+            try1 + 2_500,
+            "EVENT prompt seq=4 kind=usage-limit classify=- command=-",
+        ),
+        j(
+            try1 + 3_000,
+            &format!(
+                "WAITING seq=4 until={} rule=limit-retry@v1 {again}",
+                stamp(due2)
+            ),
+        ),
+        j(due2 + 1_000, "APPROVED seq=4 Keep trying (no reset named)"),
+        j(due2 + 4_000, "CLEARED seq=5 box attention=OK"),
+        j(due2 + 5_000, "EVENT idle seq=5 Nothing left: the parser"),
+        j(due2 + 5_000, "DONE seq=5 rule=land@v1 x"),
+    ]);
+    s.ledger.truncate(6);
+    s.ledger.extend([
+        row(
+            try1 + 3_000,
+            "limit-retry@v1",
+            "waiting",
+            "Keep trying (no reset named)",
+            &format!("until …: {again}"),
+        ),
+        row(
+            due2 + 1_000,
+            "limit-retry@v1",
+            "approved",
+            "Keep trying (no reset named)",
+            "",
+        ),
+        point(due2 + 5_000, 5),
+        task_done(due2 + 5_000),
+    ]);
+    // as the lab records it: a status line where it changed, and every read
+    s.status = vec![
+        status(1_000, "open", "land"),
+        status_of(141_000, "open", "ask", "land", "aterm-harness@1"),
+        status(due2 + 6_000, "landed", "land"),
+    ];
+    s.status_reads = [1_000, 141_000, try1 + 6_000, try1 + 3_600_000, due2 + 6_000]
+        .map(|t| T0 + t)
+        .to_vec();
+    s.cover.wall = Some((T0 + 6_000, (T0 + 2_706_000) / 1000));
+    s.cover.lifted_ms = Some(T0 + 2_703_000);
+    s.end_ms = T0 + due2 + 5_000 + 2_100_000;
+    s
+}
+
+/// THE LADDER CLIMBED WHILE NEEDS YOU STOOD PASSES W1 (`--mode
+/// wall-climb`): the try at the first rung came in the wall — no act typed
+/// into it — and was answered by the dialog drawn again; the next due
+/// climbed (2 h after that try, past the first rung's 30 min); the badge
+/// stood (`needs=ask` at every status read, no `CLEARED`) until the climbed try got
+/// through, which took it down; the deadline counts from that climbed due.
+/// NEGATIVE CONTROLS: wall-day's records (no try in the wall) show nothing
+/// of the climb (UNOBSERVED); the return unrecorded, a next due that did not
+/// climb, the badge cleared while the quota stood, a status read without
+/// `needs=ask` in that span (the lab records a status line only where it
+/// changed: an unchanged read resolves to the line standing), no read after
+/// the try, the badge standing after the try that got through, and a try
+/// before its due (an act in the wall) each FAIL.
+#[test]
+fn the_per_day_dialogs_ladder_climbs_while_needs_you_stands() {
+    let w1 = |s: &Seen| one(Chain::WallClimb, s, "gemini", Scenario::W1);
+    let (w, why) = w1(&gemini_day_climbed());
+    assert_eq!(w, "PASS", "{why}");
+    assert!(
+        why.contains("gone on: limit-retry@v1 pressed at +9142.0 s")
+            && why.contains(
+                "the ladder climbed in the wall: try 1 drawn again, next due 7200.0 s on"
+            )
+            && why.contains("needs=ask at 2 status read(s)")
+            && why.contains("NEEDS YOU down at +9145.0 s"),
+        "{why}"
+    );
+    // wall-day's own records pass wall-day, and show no climb
+    let (w, why) = w1(&gemini_day_kept_trying());
+    assert_eq!(w, "UNOBSERVED", "{why}");
+    assert!(why.contains("the climb unobserved"), "{why}");
+    let fail = |s: &Seen, needle: &str| {
+        let (w, why) = w1(s);
+        assert_eq!(w, "FAIL", "{needle}: {why}");
+        assert!(why.contains(needle), "{needle}: {why}");
+    };
+    let try1 = 140_000 + 1_800_000 + 1_000;
+    // the return not on the record as one: the wait after the try names no
+    // return (a fresh episode's words)
+    let mut s = gemini_day_climbed();
+    for (_, l) in &mut s.journal {
+        *l = l.replace(" (drawn again after its Keep trying, try 1)", "");
+    }
+    fail(&s, "was not answered by the dialog drawn again");
+    // and with no wait after the try at all, the climbed due is unread: the
+    // press that got through is persistence lost
+    let mut s = gemini_day_climbed();
+    s.journal.retain(|(_, l)| !l.contains("drawn again"));
+    fail(&s, "PERSISTENCE LOST: the first press after the reset");
+    // the next due did not climb: 20 min after the try, under the first 30
+    let mut s = gemini_day_climbed();
+    let early = try1 + 1_200_000;
+    for (t, l) in &mut s.journal {
+        if l.contains("drawn again") {
+            *l = l.replacen(&stamp(try1 + 7_200_000), &stamp(early), 1);
+        } else if l.starts_with("APPROVED seq=4") {
+            *t = T0 + early + 1_000;
+        }
+    }
+    let at = s.ledger.len() - 3;
+    s.ledger[at].ts = T0 + early + 1_000;
+    fail(&s, "the ladder did not climb at the try at +1941.0 s");
+    // the badge cleared while the quota stood
+    let mut s = gemini_day_climbed();
+    s.journal
+        .push(j(try1 + 4_000, "CLEARED seq=4 box attention=OK"));
+    s.journal.sort_by_key(|(t, _)| *t);
+    fail(&s, "NEEDS YOU came down at +1945.0 s while the quota stood");
+    // the badge down at a status read while the quota stood (no CLEARED)
+    let mut s = gemini_day_climbed();
+    s.status.insert(2, status(try1 + 3_600_000, "open", "land"));
+    fail(
+        &s,
+        "NEEDS YOU not standing at the status read at +5541.0 s while the quota stood",
+    );
+    // no status read after the try
+    let mut s = gemini_day_climbed();
+    s.status_reads
+        .retain(|t| *t <= T0 + try1 || *t > T0 + try1 + 7_200_000);
+    fail(&s, "no status read between the last try in the wall");
+    // the badge stood after the try that got through
+    let mut s = gemini_day_climbed();
+    s.journal.retain(|(_, l)| !l.starts_with("CLEARED seq=5"));
+    s.status[2] = status_of(try1 + 7_205_000, "landed", "ask", "land", "aterm-harness@1");
+    fail(&s, "NEEDS YOU STOOD after the try that got through");
+    // a try before its due is an act in the wall
+    let mut s = gemini_day_climbed();
+    s.ledger[5].ts = T0 + try1 - 61_000;
+    fail(&s, "TYPED into the wall: 0 journal act(s), 1 ledger act(s)");
 }
 
 /// Muse Code's `/rules` output, entered once ([`HIDE_COMMAND`]; measured on
@@ -4461,6 +5006,8 @@ fn walled_hidden() -> Seen {
                 seq: Some(40),
                 commands: 10,
                 command: HIDE_COMMAND,
+                stopped: false,
+                words: &[WALL_WORDS],
             }),
             ..Cover::default()
         },
@@ -5751,4 +6298,185 @@ fn every_chain_and_scenario_of_the_pass_has_its_window_wants() {
     }
     // a coverage chain is held to none (not judged on the window in 5c)
     assert!(!wanted(Chain::LandQ, Scenario::L12));
+}
+
+// ---- W2 on Gemini CLI (its dialog's Stop) and Claude Code (Esc, then `/rename`)
+
+/// Gemini CLI's usage-limit dialog as measured (a Google account's spent
+/// quota, `Access resets at …`), its focus on `1. Keep trying`; the same
+/// answered `2. Stop`: the turn's `✕ [API Error: An unknown error occurred.]`
+/// and the composer back.
+fn gemini_dialog_and_stopped() -> (String, String) {
+    let strip = |f: &str| {
+        f.lines()
+            .skip_while(|l| l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    (
+        strip(aterm_phase::gemini::fixtures::LIMIT_DIALOG_ACCOUNT),
+        strip(aterm_phase::gemini::fixtures::LIMIT_STOPPED),
+    )
+}
+
+/// GEMINI CLI'S NOTICE IS GONE ONCE ITS DIALOG IS ANSWERED `2. Stop`
+/// ([`notice_gone`]): the composer back, no usage-limit dialog, no row of its
+/// words — though the screen draws the error the Stop leaves, a wall its
+/// reader reads. The guard of the choice ([`dialog_focus`]) reads the focused
+/// option inside the box's borders. CONTROLS: the dialog itself (its focus on
+/// either option) is the notice; a screen holding its title row is too.
+#[test]
+fn gemini_clis_notice_is_gone_once_its_dialog_is_answered_stop() {
+    let (dialog, stopped) = gemini_dialog_and_stopped();
+    assert!(notice_gone(Harness::Gemini, &stopped), "{stopped}");
+    assert!(
+        aterm_phase::gemini::wall(&stopped.lines().map(str::to_string).collect::<Vec<_>>())
+            .is_some(),
+        "PRECONDITION: the Stop's error is a wall its reader reads"
+    );
+    assert!(!notice_gone(Harness::Gemini, &dialog));
+    assert_eq!(dialog_focus(&dialog).as_deref(), Some("1. Keep trying"));
+    let moved = dialog
+        .replace("│ ● 1. Keep trying", "│   1. Keep trying")
+        .replace("│   2. Stop", "│ ● 2. Stop");
+    assert_eq!(dialog_focus(&moved).as_deref(), Some(GEMINI_HIDE_OPTION));
+    assert!(!notice_gone(Harness::Gemini, &moved));
+    assert_eq!(dialog_focus(&stopped), None);
+    let titled = stopped.replace(
+        "✕ [API Error: An unknown error occurred.]",
+        "Usage limit reached for gemini-3.5-flash.",
+    );
+    assert!(!notice_gone(Harness::Gemini, &titled), "{titled}");
+}
+
+/// Claude Code 2.1.307's screen under the stub's five-hour limit (measured,
+/// 2026-10-21, `aterm ctl text` of the lab's tab): `armed` its countdown
+/// standing (the footer's banner), `cancelled` after Esc, `scrolled` after
+/// twelve `/rename w2probe` — the rule carrying the session's name.
+fn claude_limit_screens() -> (String, String, String) {
+    let rule = "─".repeat(144);
+    let named = format!("{} w2probe ─", "─".repeat(134));
+    let head = "❯ carry on\n  ⎿  You've hit your session limit · resets 4:13pm (America/Los_Angeles)\n     /upgrade to increase your usage limit.\n\n⏺ Usage limit reached · continuing automatically at 4:13pm · esc to cancel\n\n✻ Brewed for 0s · done 3:58 PM\n";
+    let armed = format!(
+        "{head}\n{rule}\n❯\u{a0}\n{rule}\n  ⚠ Usage limit reached · limit resets 4:13pm\n    Continuing automatically at 4:13pm · esc to cancel\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n"
+    );
+    let cancel = "⏺ Automatic continue cancelled · /rate-limit-options to re-arm\n";
+    let cancelled = format!(
+        "{head}\n{cancel}\n{rule}\n❯\u{a0}\n{rule}\n  ⏵⏵ auto mode on (shift+tab to cycle)             Automatic continue cancelled · /rate-limit-options to re-arm\n"
+    );
+    let renames = "❯ /rename w2probe\n  ⎿  Session renamed to: w2probe\n\n".repeat(12);
+    let scrolled = format!(
+        "✻ Brewed for 0s · done 3:58 PM\n\n{cancel}\n{renames}{named}\n❯\u{a0}\n{rule}\n  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+    );
+    (armed, cancelled, scrolled)
+}
+
+/// CLAUDE CODE'S NOTICE IS GONE ONLY ONCE ITS COUNTDOWN IS CANCELLED AND ITS
+/// ROWS HAVE SCROLLED AWAY ([`notice_gone`]), the composer read between rules
+/// one of which carries the session's name ([`claude_composer`]); the
+/// countdown's key is pressed only where it stands armed ([`CLAUDE_CANCEL`]),
+/// and `/rename` entered only where the composer holds it with no menu row
+/// focused ([`menu_offers`]). CONTROLS: the armed footer and the cancelled
+/// turn's rows are the notice; a menu's focused row, or another draft, is no
+/// offer.
+#[test]
+fn claude_codes_notice_is_gone_once_cancelled_and_scrolled_away() {
+    let (armed, cancelled, scrolled) = claude_limit_screens();
+    assert!(notice_gone(Harness::Claude, &scrolled), "{scrolled}");
+    assert!(!notice_gone(Harness::Claude, &armed));
+    assert!(!notice_gone(Harness::Claude, &cancelled));
+    let rows = |t: &str| t.lines().map(str::to_string).collect::<Vec<_>>();
+    assert_eq!(claude_composer(&rows(&scrolled)).as_deref(), Some(""));
+    assert!(armed.contains(CLAUDE_CANCEL.armed) && !armed.contains(CLAUDE_CANCEL.cancelled));
+    assert!(cancelled.contains(CLAUDE_CANCEL.cancelled));
+    let typed = scrolled.replace("❯\u{a0}\n", &format!("❯\u{a0}{CLAUDE_HIDE_COMMAND}\n"));
+    assert!(
+        menu_offers(Harness::Claude, &typed, CLAUDE_HIDE_COMMAND),
+        "{typed}"
+    );
+    let menu = format!(
+        "{typed}  ❯ /usage (cost)               Show session cost, plan usage, and activity stats\n"
+    );
+    assert!(!menu_offers(Harness::Claude, &menu, CLAUDE_HIDE_COMMAND));
+    let other = scrolled.replace("❯\u{a0}\n", "❯\u{a0}/rename other\n");
+    assert!(!menu_offers(Harness::Claude, &other, CLAUDE_HIDE_COMMAND));
+}
+
+/// W2's records on Gemini CLI: the dialog read and waited on to its reset
+/// (`limit-retry@v1`), answered `2. Stop` at +160 s, the Stop's error read at
+/// the screen without the notice, waited on to the reset, and the resume
+/// typed past it there.
+fn gemini_stopped() -> Seen {
+    let mut s = walled_hidden();
+    s.journal[3].1 = "EVENT prompt seq=2 kind=usage-limit classify=- command=-".into();
+    s.journal[4].1 = format!(
+        "WAITING seq=2 until={} rule=limit-retry@v1 Gemini CLI's usage limit resets at 1:06 PM GMT+5:30",
+        stamp(540_000)
+    );
+    s.journal[6].1 =
+        "EVENT limited seq=30 message=[API Error: An unknown error occurred.] reset=-".into();
+    let h = s.cover.hidden.as_mut().expect("hidden");
+    h.first_ms = T0 + 160_000;
+    h.enter_ms = T0 + 160_000;
+    h.seen_ms = T0 + 163_000;
+    h.seq = Some(30);
+    h.commands = 1;
+    h.command = GEMINI_HIDE_OPTION;
+    h.stopped = true;
+    h.words = &GEMINI_WALL_WORDS;
+    s
+}
+
+/// W2 ON GEMINI CLI ([`cover::judge_wall_hidden`] under [`Hidden::stopped`]):
+/// a point read after the Stop on the error it leaves — an `EVENT limited`
+/// that names none of the dialog's words — is the screen without the notice.
+/// NEGATIVE CONTROLS: that point still naming the limit, the dialog's own
+/// point again, or a point read at a screen from before the Stop is none;
+/// the Stop's error handed to a person (what the loop decided before the
+/// fix) FAILs; and under a local command's hide (`stopped` false) an `EVENT
+/// limited` point is never one.
+#[test]
+fn the_remembered_wall_on_gemini_cli_reads_the_stops_error_as_a_screen_without_the_notice() {
+    let w2 = |s: &Seen| one(Chain::WallHid, s, "gemini", Scenario::W2);
+    let (w, why) = w2(&gemini_stopped());
+    assert_eq!(w, "PASS", "{why}");
+    assert!(why.contains("1 2. Stop from +160.0 s"), "{why}");
+    assert!(why.contains("read +168.4 s EVENT limited seq=30"), "{why}");
+    let unobserved = |edit: &dyn Fn(&mut Seen)| {
+        let mut s = gemini_stopped();
+        edit(&mut s);
+        let (w, why) = w2(&s);
+        assert_eq!(w, "UNOBSERVED", "{why}");
+        assert!(
+            why.contains("no point was read on a screen without the wall"),
+            "{why}"
+        );
+    };
+    unobserved(&|s| {
+        s.journal[6].1 =
+            "EVENT limited seq=30 message=Usage limit reached for gemini-3.5-flash. reset=-".into();
+    });
+    unobserved(&|s| {
+        s.journal[6].1 = "EVENT prompt seq=30 kind=usage-limit classify=- command=-".into();
+    });
+    unobserved(&|s| {
+        s.journal[6].1 =
+            "EVENT limited seq=20 message=[API Error: An unknown error occurred.] reset=-".into();
+    });
+    unobserved(&|s| s.cover.hidden.as_mut().expect("hidden").stopped = false);
+    // the Stop's error handed to a person, nothing typed past the reset
+    let mut s = gemini_stopped();
+    s.journal.truncate(8);
+    s.ledger.truncate(5);
+    s.ledger.push(row(
+        168_450,
+        "-",
+        "escalated",
+        "",
+        "api-error not retried (Gemini CLI retries what time answers; after its usage limit's Stop, see /stats model): [API Error: An unknown error occurred.]",
+    ));
+    s.status.truncate(1);
+    let (w, why) = w2(&s);
+    assert_eq!(w, "FAIL", "{why}");
+    assert!(why.contains("ESCALATED"), "{why}");
 }

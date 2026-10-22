@@ -34,6 +34,7 @@ struct State {
     private: BTreeSet<Slug>,
     not_visible: BTreeSet<Slug>,
     stray_drafts: BTreeMap<Slug, BTreeMap<String, usize>>,
+    notes: BTreeMap<(Slug, String), String>,
     anonymous: bool,
     calls: Vec<String>,
 }
@@ -98,6 +99,15 @@ impl FakeHost {
             .repos
             .get(slug)
             .and_then(|tags| tags.get(tag))
+            .cloned()
+    }
+
+    /// The notes release `tag` on `slug` was created with, if this host created it.
+    #[must_use]
+    pub fn notes_of(&self, slug: &Slug, tag: &str) -> Option<String> {
+        self.state()
+            .notes
+            .get(&(slug.clone(), tag.to_string()))
             .cloned()
     }
 
@@ -360,7 +370,7 @@ impl ReleaseHost for FakeHost {
         slug: &Slug,
         tag: &str,
         _title: &str,
-        _notes: &str,
+        notes: &str,
         files: &[PathBuf],
     ) -> Result<(), HostError> {
         self.log(format!("create {slug} {tag}"));
@@ -371,6 +381,9 @@ impl ReleaseHost for FakeHost {
             )));
         }
         let assets = Self::read_files(files)?.into_iter().collect();
+        self.state()
+            .notes
+            .insert((slug.clone(), tag.to_string()), notes.to_string());
         self.put(
             slug,
             tag,

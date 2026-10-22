@@ -272,7 +272,7 @@ use super::super::policy::approval::RULE_RM_BREAKER_WARN;
 use super::super::policy::approval::{
     AnswerTarget, ApprovalCtx, Choice, DeclineStep, QuestionPriority, RULE_AUTOCOMPACT_OFFER,
     RULE_LIMIT_RESET, RULE_LIMIT_RETRY, RULE_LIMIT_WAIT, RULE_TRUST_ANY, RULE_TRUST_DIALOG, decide,
-    keeps_trying_its_limit, proof_would_lift, unvoiced_tools,
+    keeps_trying_its_limit, limit_no_reset_reason, proof_would_lift, unvoiced_tools,
 };
 use super::super::policy::box_call;
 use super::super::policy::box_facts::{BoxFacts, QuestionFacts};
@@ -3027,19 +3027,90 @@ pub(super) const PRESS_BADGE_AFTER: Duration = Duration::from_secs(120);
 /// placed when this program and reset were first read, and its `Keep trying`
 /// presses since the worker last answered on another point. The occurrence
 /// stays placed across retries and a machine's sleep; re-placing the same
-/// bare clock an hour past it would turn it into tomorrow's reset. A dialog
-/// drawn again after one press waits out its own
-/// reset and, past it, the back-off ([`LIMIT_RETRY_BACKOFF_S`] doubling to
-/// [`LIMIT_RETRY_BACKOFF_MAX_S`]), so a quota that still stands at its named
-/// reset is tried again ever more slowly, never in a burst and never handed
-/// to a person for it.
+/// bare clock an hour past it would turn it into tomorrow's reset.
+///
+/// THE RESET IS PLACED IN THE ZONE THE DIALOG NAMES (`5:06 AM PDT`,
+/// [`aterm_phase::gemini::LimitReset::offset_s`]): the CLI draws it in its
+/// own process's zone, which need not be this machine's (`TZ` in its shell,
+/// an `ssh` to another host), and read in the machine's zone instead it fired
+/// hours early or most of a day late. A zone it cannot read (a spelling no
+/// en-US short name has, a row cut short) is placed in the machine's zone,
+/// where the CLI runs whenever it runs here as it was started.
+///
+/// THE FIRST TRY IS NEVER MORE THAN [`LIMIT_RETRY_RELOOK_S`] OFF: a bare
+/// clock names its next occurrence and its last alike, so a dialog the loop
+/// first reads after it has stood a while (a loop started or restarted on
+/// it) may name a reset long passed, which placed ahead is most of a day's
+/// stall. Its first `Keep trying` is pressed by then — a LOOK, which a quota
+/// still spent answers with the dialog drawn afresh, its reset now ahead of
+/// it — and the reset is then waited for. A reset whose zone the loop placed
+/// in the machine's is looked at so every [`LIMIT_RETRY_RELOOK_S`] till the
+/// reset placed, and at that reset: a right guess is tried at its reset, a
+/// wrong one at most a look late, never a day's stall. A look before the
+/// reset placed is no try past it, and climbs no back-off.
+///
+/// A dialog drawn again after a press at or past its reset waits out the
+/// back-off ([`LIMIT_RETRY_BACKOFF_S`] doubling to
+/// [`LIMIT_RETRY_BACKOFF_MAX_S`], [`ladder::doubling`]), so a quota that still
+/// stands at its named reset is tried again ever more slowly, never in a
+/// burst. EVERY RETURN CLIMBS: drawn again naming another reset (the quota's
+/// answer to the try), the new reset is placed and waited for, and the climb
+/// goes on — whichever is later — so a quota that answers each try with a
+/// reset a minute off is not tried every two minutes for ever. Only the
+/// worker answering on another point, working past a try
+/// ([`LIMIT_RETRY_ANSWER_S`], [`Session::limit_retry_busy`]), or another
+/// program, starts over.
+///
+/// THE DIALOG THAT NAMES NO RESET (a key's per-day quota, `Usage limit
+/// reached for <model>.` and `/model to switch models.`), or none the loop
+/// can place, is a model's limit with no reset, which the turn-end policy
+/// waits on the ENTITLEMENT ladder ([`TurnEndTiming::entitlement_backoff`],
+/// `policy/turn_end.rs`'s `entitlement_ladder`): its first `Keep trying`
+/// waits the ladder's first rung from the dialog's first read, each later
+/// one the next rung from the try before, the last rung for ever after —
+/// while its badge stands ([`Session::limit_retry_hold`]: NEEDS YOU, loud
+/// and never blocking), through each try's spinner too.
+///
+/// [`TurnEndTiming::entitlement_backoff`]: super::policy::turn_end::TurnEndTiming::entitlement_backoff
+/// [`ladder::doubling`]: crate::supervise::ladder::doubling
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LimitRetry {
     program: Program,
-    reset: String,
-    at_unix: i64,
+    /// The reset as drawn; `None` on the dialog that names none.
+    reset: Option<aterm_phase::gemini::LimitReset>,
+    /// When this reset (or the dialog naming none) was first read.
+    seen_unix: i64,
+    /// The reset placed; `None` where none is named, or none the loop reads.
+    at_unix: Option<i64>,
+    /// The reset was placed in the zone the dialog names, not the machine's.
+    zone_read: bool,
     tries: u32,
+    /// Of `tries`, the LOOKS: presses before the reset placed, which climb
+    /// no back-off.
+    looks: u32,
     last_unix: Option<i64>,
+    /// The box whose badge the dialog naming no reset raised
+    /// ([`Session::limit_retry_hold`]): it stands through a try's spinner.
+    badge: Option<String>,
+}
+
+#[cfg(test)]
+impl LimitRetry {
+    /// Tests: the reset placed ([`Self::at_unix`]).
+    pub(super) fn placed_unix(&self) -> Option<i64> {
+        self.at_unix
+    }
+}
+
+/// GEMINI CLI'S USAGE-LIMIT DIALOG ANSWERED `Stop` BY ANOTHER HAND while the
+/// loop waited on the reset it names ([`Session::limit_stopped`]): the turn's
+/// `✕ [API Error: An unknown error occurred.]` read as the usage limit it
+/// is, `wall`, its reset `reset_unix` placed so the turn-end policy's grace
+/// past it is when the dialog's next `Keep trying` was due.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct StoppedLimit {
+    pub(super) wall: aterm_phase::Wall,
+    pub(super) reset_unix: i64,
 }
 
 /// The first back-off after a `Keep trying` the dialog came back on
@@ -3048,6 +3119,20 @@ pub(super) const LIMIT_RETRY_BACKOFF_S: i64 = 120;
 
 /// The back-off's ceiling ([`LimitRetry`]).
 pub(super) const LIMIT_RETRY_BACKOFF_MAX_S: i64 = 1800;
+
+/// The longest a reset is waited on before its first `Keep trying`, and one
+/// placed in the machine's zone between its looks ([`LimitRetry`]): the
+/// back-off's ceiling, so such a dialog is tried no more slowly than one
+/// whose quota stands past its reset.
+pub(super) const LIMIT_RETRY_RELOOK_S: i64 = LIMIT_RETRY_BACKOFF_MAX_S;
+
+/// How long after a `Keep trying` a busy read is that try in flight
+/// ([`Session::limit_retry_busy`]): Gemini CLI answers a try its quota
+/// refuses by drawing the dialog again (measured on 0.46.0: a key's per-day
+/// 429 draws it at once, never retried under the spinner; a 503 on the way
+/// is retried there about 4, 9, 15 and 37 s apart). Busy past it, the try got
+/// through and the worker works: the episode is over.
+pub(super) const LIMIT_RETRY_ANSWER_S: i64 = 300;
 
 /// How far ahead a bare clock the dialog names may be placed: its next
 /// occurrence, unless that is this far off or more — a reset passed within
@@ -3064,13 +3149,18 @@ const LIMIT_RETRY_MINUTE_S: i64 = 60;
 /// ([`Session::limit_retry_due`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RetryDue {
-    /// No such dialog, or none the rule waits on (`limit_wait` off, no reset
-    /// named or read): the policy decides it as it stands.
+    /// No such dialog, or none the rule waits on (`limit_wait` off, its head
+    /// off the rows read): the policy decides it as it stands.
     Not,
     /// Its reset, the grace and the back-off have passed: pressed now.
     Due,
-    /// Not before `until_unix`, the reset it names being `reset`.
-    Hold { until_unix: i64, reset: String },
+    /// Not before `until_unix`, the reset it names being `reset` (as drawn,
+    /// `9:05 AM PDT`) — `None` on the ladder of a dialog that names none the
+    /// loop can place.
+    Hold {
+        until_unix: i64,
+        reset: Option<String>,
+    },
 }
 
 /// A box whose press did not land, being tried again at full power
@@ -3173,78 +3263,235 @@ impl<C: Ctl> Session<'_, C> {
 
     /// WHEN GEMINI CLI'S USAGE-LIMIT DIALOG ON `rows` IS DUE ITS `Keep
     /// trying` ([`RULE_LIMIT_RETRY`]): the reset its `Access resets at
-    /// <time>.` row names ([`aterm_phase::gemini::limit_reset`], a bare clock
-    /// in the machine's zone, placed by [`LIMIT_RETRY_AHEAD_MAX_S`]'s rule, at
-    /// the end of its minute: [`LIMIT_RETRY_MINUTE_S`]), the program's grace
-    /// after it (the turn-end policy's, which a wall's resume waits too), and
-    /// the back-off from the last press the dialog
-    /// came back on ([`LimitRetry`]). [`RetryDue::Not`] for any other screen,
-    /// a dialog naming no reset, and with `limit_wait` off.
+    /// <time>.` row names ([`aterm_phase::gemini::limit_reset`], a clock in
+    /// the zone it names, else the machine's, placed by
+    /// [`LIMIT_RETRY_AHEAD_MAX_S`]'s rule, at the end of its minute:
+    /// [`LIMIT_RETRY_MINUTE_S`]), the program's grace after it (the turn-end
+    /// policy's, which a wall's resume waits too), and the back-off from the
+    /// last press past it the dialog came back on — looked at first no later
+    /// than [`LIMIT_RETRY_RELOOK_S`] from its first read, and a reset placed
+    /// in the machine's zone so every [`LIMIT_RETRY_RELOOK_S`] till it; on a
+    /// dialog that names no reset the loop can place, the entitlement
+    /// ladder's rung ([`LimitRetry`]). [`RetryDue::Not`] for any other
+    /// screen, a dialog whose head is off the rows read, and with
+    /// `limit_wait` off.
     pub(super) fn limit_retry_due(&mut self, rows: &[String], opts: &SuperviseOpts) -> RetryDue {
         let program = self.reader(rows).program();
         if !opts.policy.limit_wait || !keeps_trying_its_limit(program) {
             self.limit_retry = None;
             return RetryDue::Not;
         }
-        let Some(reset) = aterm_phase::gemini::limit_reset(rows) else {
+        let dialog = aterm_phase::gemini::prompt(rows)
+            .is_some_and(|p| p.kind == PromptKind::UsageLimit && !p.head_off_screen);
+        if !dialog {
             self.limit_retry = None;
             return RetryDue::Not;
-        };
+        }
+        let reset = aterm_phase::gemini::limit_reset(rows);
         let now = self.now_unix();
         if self
             .limit_retry
             .as_ref()
             .is_none_or(|r| r.program != program || r.reset != reset)
         {
-            self.limit_retry = None;
-            let Some(spec) = limit::parse_reset(&reset) else {
-                return RetryDue::Not;
-            };
-            let local = self.local_offset_s();
-            let Some(at_unix) =
-                limit::reset_in_zone(&spec, now, LIMIT_RETRY_AHEAD_MAX_S, &|_| Some(local))
-            else {
-                return RetryDue::Not;
+            // Drawn again after a press with another reset, or none: the
+            // quota's answer to that try, whose climb goes on (EVERY RETURN
+            // CLIMBS, [`LimitRetry`]); the badge it raised stands with it.
+            let (tries, looks, last_unix, badge) = self
+                .limit_retry
+                .take()
+                .filter(|r| r.program == program && r.tries > 0)
+                .map_or((0, 0, None, None), |r| {
+                    (r.tries, r.looks, r.last_unix, r.badge)
+                });
+            let spec = reset
+                .as_ref()
+                .and_then(|r| Some((r.offset_s(), limit::parse_reset(&r.clock)?)));
+            let (at_unix, zone_read) = match spec {
+                Some((offset, spec)) => {
+                    let zone = offset.map(i64::from);
+                    let offset = zone.unwrap_or_else(|| self.local_offset_s());
+                    let at = limit::reset_in_zone(&spec, now, LIMIT_RETRY_AHEAD_MAX_S, &|_| {
+                        Some(offset)
+                    });
+                    (at, zone.is_some())
+                }
+                // A clock the loop cannot read is no reset it can place: the
+                // ladder's, as on the dialog that names none.
+                None => (None, false),
             };
             self.limit_retry = Some(LimitRetry {
                 program,
-                reset: reset.clone(),
+                reset,
+                seen_unix: now,
                 at_unix,
-                tries: 0,
-                last_unix: None,
+                zone_read,
+                tries,
+                looks,
+                last_unix,
+                badge,
             });
         }
         let Some(retry) = self.limit_retry.as_ref() else {
             return RetryDue::Not;
         };
-        let grace = i64::try_from(self.turn_end.timing.grace_for(Program::Gemini).as_secs())
-            .unwrap_or(i64::MAX);
-        let backed_off = retry.last_unix.map_or(i64::MIN, |last| {
-            let doubled = LIMIT_RETRY_BACKOFF_S
-                .saturating_mul(1_i64 << retry.tries.saturating_sub(1).min(16))
-                .min(LIMIT_RETRY_BACKOFF_MAX_S);
-            last.saturating_add(doubled)
-        });
-        let until_unix = retry
-            .at_unix
-            .saturating_add(LIMIT_RETRY_MINUTE_S)
-            .saturating_add(grace)
-            .max(backed_off);
+        let Some(until_unix) = self.limit_retry_until(retry) else {
+            return RetryDue::Not;
+        };
         if now >= until_unix {
             RetryDue::Due
         } else {
-            RetryDue::Hold { until_unix, reset }
+            RetryDue::Hold {
+                until_unix,
+                reset: retry
+                    .at_unix
+                    .and(retry.reset.as_ref())
+                    .map(ToString::to_string),
+            }
         }
+    }
+
+    /// When the episode `retry` is next due ([`Self::limit_retry_due`]): past
+    /// its reset placed and the program's grace, no sooner than its look or
+    /// its back-off; on the ladder's next rung where it names none. `None`
+    /// past the ladder's end.
+    fn limit_retry_until(&self, retry: &LimitRetry) -> Option<i64> {
+        let secs = |d: Duration| i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+        let until_unix = match retry.at_unix {
+            Some(at_unix) => {
+                let past_reset = self.limit_retry_past_reset(at_unix);
+                // The back-off climbs on the tries past the reset placed,
+                // never on the looks before it.
+                let climbed = retry.tries.saturating_sub(retry.looks);
+                let backed_off = match (retry.last_unix, climbed) {
+                    (Some(last), 1..) => {
+                        last.saturating_add(secs(crate::supervise::ladder::doubling(
+                            Duration::from_secs(LIMIT_RETRY_BACKOFF_S.unsigned_abs()),
+                            climbed - 1,
+                            Duration::from_secs(LIMIT_RETRY_BACKOFF_MAX_S.unsigned_abs()),
+                        )))
+                    }
+                    _ => i64::MIN,
+                };
+                // THE LOOK ([`LimitRetry`]): the first try, whatever the
+                // placement; each one, while the zone is the machine's guess.
+                let look = (retry.tries == 0 || !retry.zone_read).then(|| {
+                    retry
+                        .last_unix
+                        .unwrap_or(retry.seen_unix)
+                        .saturating_add(LIMIT_RETRY_RELOOK_S)
+                });
+                look.map_or(past_reset, |look| past_reset.min(look))
+                    .max(backed_off)
+            }
+            None => {
+                let rung = usize::try_from(retry.tries).unwrap_or(usize::MAX);
+                let pause =
+                    crate::supervise::ladder::Ladder(&self.turn_end.timing.entitlement_backoff)
+                        .at(rung)?;
+                retry
+                    .last_unix
+                    .unwrap_or(retry.seen_unix)
+                    .saturating_add(secs(pause))
+            }
+        };
+        Some(until_unix)
+    }
+
+    /// GEMINI CLI'S USAGE-LIMIT DIALOG ANSWERED `Stop` BY ANOTHER HAND (a
+    /// person at the keyboard, a script: this loop presses only `Keep
+    /// trying`) while the loop waited on the reset it names
+    /// ([`Self::limit_retry_hold`]): the turn ends on `✕ [API Error: An
+    /// unknown error occurred.]` ([`aterm_phase::gemini::stopped_error`]),
+    /// which no longer says it was the quota. The quota stands all the same,
+    /// to the reset the dialog named: that error is read as the usage limit
+    /// (`WallKind::UsageSession`), its reset placed so the program's grace
+    /// past it is when the dialog's next `Keep trying` was due — the end of
+    /// the minute it names, no sooner than the episode's look or back-off
+    /// ([`Self::limit_retry_until`]) — so the turn-end policy waits it out as
+    /// it waits out any limit whose notice left the screen and types its
+    /// resume there, a try of the episode — never into the quota, and
+    /// never handed over for good: a Stop is no Off (FOREVER LAND, the
+    /// owner's ruling of 2026-10-19), as Esc on Claude Code's countdown is
+    /// none. Measured before (`lab forever --harness gemini --mode
+    /// wall-hid`, 2026-10-21): the error escalated as `not retried … after its
+    /// usage limit's Stop`, the badge up, nothing typed past the reset, the
+    /// task never landed. `None` with no such episode standing (the error
+    /// alone does not say which dialog it answered), on a dialog that named
+    /// no reset the loop placed, and on any other screen.
+    pub(super) fn limit_stopped(&self, reading: &aterm_phase::Reading) -> Option<StoppedLimit> {
+        let retry = self.limit_retry.as_ref()?;
+        let w = reading.wall.as_ref()?;
+        if !keeps_trying_its_limit(retry.program) || !aterm_phase::gemini::stopped_error(w) {
+            return None;
+        }
+        let reset = retry.reset.as_ref()?;
+        retry.at_unix?;
+        // Due when the dialog's next `Keep trying` was (past the reset and
+        // the grace, no sooner than its look or back-off): the turn-end
+        // policy adds the same grace past the reset it is given.
+        let reset_unix = self
+            .limit_retry_until(retry)?
+            .saturating_sub(self.limit_retry_grace_s());
+        let message = format!(
+            "{} the session's model; its dialog was answered Stop. {}{reset}.",
+            aterm_phase::anchor("gemini.usage.title"),
+            aterm_phase::anchor("gemini.usage.resets"),
+        );
+        Some(StoppedLimit {
+            wall: aterm_phase::Wall {
+                kind: aterm_phase::WallKind::UsageSession,
+                message,
+                reset: Some(reset.to_string()),
+                row: w.row,
+                placement: w.placement,
+                under_call: false,
+            },
+            reset_unix,
+        })
+    }
+
+    /// The resume typed at Gemini CLI's usage limit whose dialog was answered
+    /// `Stop` ([`Self::limit_stopped`]) on `rows`: a try of the episode, as a
+    /// `Keep trying` is, so the dialog drawn again on it climbs the back-off
+    /// and its spinner is that try in flight ([`Self::limit_retry_busy`]).
+    pub(super) fn limit_resume_typed(&mut self, rows: &[String]) {
+        if aterm_phase::gemini::wall(rows).is_some_and(|w| aterm_phase::gemini::stopped_error(&w)) {
+            self.limit_retry_pressed();
+        }
+    }
+
+    /// When the reset placed at `at_unix` is past: the end of its minute
+    /// ([`LIMIT_RETRY_MINUTE_S`]) and Gemini CLI's grace.
+    fn limit_retry_past_reset(&self, at_unix: i64) -> i64 {
+        at_unix
+            .saturating_add(LIMIT_RETRY_MINUTE_S)
+            .saturating_add(self.limit_retry_grace_s())
+    }
+
+    /// Gemini CLI's grace past a reset, in seconds.
+    fn limit_retry_grace_s(&self) -> i64 {
+        i64::try_from(self.turn_end.timing.grace_for(Program::Gemini).as_secs()).unwrap_or(i64::MAX)
     }
 
     /// THE WAIT ON GEMINI CLI'S USAGE-LIMIT DIALOG `p` ON `turn` BEFORE ITS
     /// `Keep trying` ([`Self::limit_retry_due`]): not due yet, the box is
     /// held as a person's grace holds an answer ([`Self::held_for_person`]) —
-    /// neither pressed nor escalated, the point reported as it stands (its
-    /// `EVENT prompt` line), the policy's deadline set to the due, then
-    /// judged again — and `WAITING seq=<n> until=<UTC> rule=limit-retry@v1
-    /// …` said once for that due. `true`: held. A dialog due now, or none,
-    /// is decided as it stands (the rule presses it).
+    /// never pressed, the point reported as it stands (its `EVENT prompt`
+    /// line), the policy's deadline set to the due, then judged again — and
+    /// `WAITING seq=<n> until=<UTC> rule=limit-retry@v1 …` said once for that
+    /// due, with a ledger row (`waiting`) of the same words: a dialog drawn
+    /// again after a press says so and which try it answered, so every
+    /// return's climb is on the record. `true`: held. A dialog due now, or
+    /// none, is decided as it stands (the rule presses it).
+    ///
+    /// The dialog that names no reset the loop can place is a person's to
+    /// know of as well (FOREVER: NEEDS YOU is loud and never blocking): its
+    /// badge is raised once ([`Self::escalate_point`],
+    /// [`limit_no_reset_reason`]) and stands while the ladder tries it and it
+    /// comes back, each try's spinner too ([`Self::limit_retry_busy`]); the
+    /// point leaving — a try that got through, a person's own answer — takes
+    /// it down ([`Self::close_box`]).
     fn limit_retry_hold(
         &mut self,
         turn: &Turn,
@@ -3262,21 +3509,73 @@ impl<C: Ctl> Session<'_, C> {
         let now = self.now_unix();
         let wait = Duration::from_secs(u64::try_from(until_unix - now).unwrap_or(0));
         let until = self.fx.mono() + wait;
+        let tries = self.limit_retry.as_ref().map_or(0, |r| r.tries);
+        // A reset drawn whose clock the loop cannot read: on the ladder,
+        // said as what it is.
+        let unplaced = self
+            .limit_retry
+            .as_ref()
+            .and_then(|r| r.at_unix.is_none().then_some(r.reset.as_ref()).flatten())
+            .map(ToString::to_string);
+        let retry = aterm_phase::anchor("gemini.usage.retry");
+        let (why, how) = match (&reset, &unplaced) {
+            (Some(reset), _) => (
+                format!("Gemini CLI's usage limit resets at {reset}"),
+                "is pressed past it",
+            ),
+            (None, Some(drawn)) => (
+                format!(
+                    "Gemini CLI's usage limit names a reset the loop cannot place ({})",
+                    crate::harness::one_line(drawn, 24)
+                ),
+                "is pressed on the back-off ladder",
+            ),
+            (None, None) => (
+                "Gemini CLI's usage limit names no reset".to_string(),
+                "is pressed on the back-off ladder",
+            ),
+        };
         // Said once for a due: the dialog judged again under the same due
         // (a redraw, the wait's own wake) is the same wait.
-        let why = format!("Gemini CLI's usage limit resets at {reset}");
         let told = self
             .turn_end_due
             .as_ref()
             .is_some_and(|d| d.why == why && (d.unix_ms.div_euclid(1000) - until_unix).abs() <= 1);
         if !told {
+            let back = match tries {
+                0 => String::new(),
+                n => format!(" (drawn again after its {retry}, try {n})"),
+            };
+            let said = format!("{why}: {retry} {how}{back}");
+            let stamp = utc_stamp(u64::try_from(until_unix).unwrap_or(0));
+            let seq = turn.screen.seq;
             review.note(&format!(
-                "WAITING seq={} until={} rule={RULE_LIMIT_RETRY} Gemini CLI's usage limit resets at \
-                 {reset}: {} is pressed past it",
-                turn.screen.seq,
-                utc_stamp(u64::try_from(until_unix).unwrap_or(0)),
-                aterm_phase::anchor("gemini.usage.retry"),
+                "WAITING seq={seq} until={stamp} rule={RULE_LIMIT_RETRY} {said}"
             ));
+            self.ledger_row(
+                RULE_LIMIT_RETRY,
+                approvals::Outcome::Waiting,
+                &p.command,
+                &format!("until {stamp}: {said}"),
+                seq,
+            );
+        }
+        if reset.is_none() {
+            let key = self.review_key(turn);
+            if self.box_ask.as_ref().is_none_or(|b| b.key != key) {
+                let reason = limit_no_reset_reason(unplaced.as_deref());
+                self.ledger_row(
+                    "-",
+                    approvals::Outcome::Escalated,
+                    &p.command,
+                    &reason,
+                    turn.screen.seq,
+                );
+                self.escalate_point(turn, Some(&reason), review)?;
+            }
+            if let Some(retry) = self.limit_retry.as_mut() {
+                retry.badge = Some(key);
+            }
         }
         self.set_due(until, why);
         self.held = true;
@@ -3284,13 +3583,48 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// A `Keep trying` of Gemini CLI's usage-limit dialog landed: counted for
-    /// the back-off the dialog drawn again waits ([`LimitRetry`]).
-    fn limit_retry_pressed(&mut self) {
+    /// the back-off the dialog drawn again waits ([`LimitRetry`]) — a LOOK
+    /// where it came before the reset placed, which climbs none.
+    pub(super) fn limit_retry_pressed(&mut self) {
         let now = self.now_unix();
+        let early = self
+            .limit_retry
+            .as_ref()
+            .and_then(|r| r.at_unix)
+            .is_some_and(|at| now < self.limit_retry_past_reset(at));
         if let Some(retry) = self.limit_retry.as_mut() {
             retry.tries = retry.tries.saturating_add(1);
+            retry.looks = retry.looks.saturating_add(u32::from(early));
             retry.last_unix = Some(now);
         }
+    }
+
+    /// A BUSY READ while Gemini CLI's usage-limit dialog is kept trying
+    /// ([`LimitRetry`]), the worker's (never one only `writing`): within
+    /// [`LIMIT_RETRY_ANSWER_S`] of a `Keep trying` it is that try in flight
+    /// (the CLI's spinner while it sends the turn again), and the episode
+    /// stands, its climb and its badge with it — `true` where that badge is
+    /// the box this loop asked about, which this read then leaves up. Past
+    /// it (or with no press of the loop's: a person answered), the try got
+    /// through and the worker works: the episode is over, so a dialog met
+    /// later, hours into the turn, is a new limit whose climb starts over —
+    /// and `false`, the badge going with the point as any box's does.
+    pub(super) fn limit_retry_busy(&mut self) -> bool {
+        let now = self.now_unix();
+        let Some(retry) = self.limit_retry.as_ref() else {
+            return false;
+        };
+        let in_flight = retry
+            .last_unix
+            .is_some_and(|last| now.saturating_sub(last) < LIMIT_RETRY_ANSWER_S);
+        if !in_flight {
+            self.limit_retry = None;
+            return false;
+        }
+        retry
+            .badge
+            .as_ref()
+            .is_some_and(|k| self.box_ask.as_ref().is_some_and(|b| b.key == *k))
     }
 
     /// The press back-off, for a box nobody else is there to answer (a press

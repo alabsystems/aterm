@@ -659,7 +659,7 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  step=done:landing past the waits and busy:another-sweep). A hold or Land the live
                                  instance's journal never carries on the tab within 30 s fails the run before aterm ends
                                  (1); a tab under Land before --land or --land-open sets it cannot run (3).
-  forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]   FOREVER LAND and FOREVER
+  forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]   FOREVER LAND and FOREVER
                                  CRUISE live on a supervised harness: the real TUI on a lab of its own (all: one after
                                  another, <tag>-<harness>), a tab per scenario chain, each in a scratch git repository
                                  pushed to a local bare origin and left as the chain says, its Autopilot set, the stub
@@ -703,10 +703,18 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                  drawing its own usage wall, Claude Code on its subscriber path; ~6-12 min): W1 the stub's
                                  usage wall met by the land act, nothing typed into it, gone on past its reset (nothing
                                  typed on top of Claude Code's own continuation), landed.
-                                 --mode wall-hid (Muse Code, agy; ~15 min): W2 the remembered wall, W1's wall whose notice a
-                                 local command's output (Muse Code /rules, agy /title) scrolls out of sight while the wait
-                                 stands: a screen without the wall read, nothing typed into it, the resume typed there past
-                                 the reset, landed.
+                                 --mode wall-hid (every harness; ~15 min): W2 the remembered wall, W1's wall whose notice
+                                 leaves the screen while the wait stands — a local command's output (Muse Code /rules, agy
+                                 /title, Claude Code /rename after Esc cancels its countdown) scrolls it out of sight, or
+                                 Gemini CLI's dialog is answered 2. Stop: a screen without the wall read, nothing typed into
+                                 it, the resume typed there past the reset, landed. Gemini CLI's walled runs run it in a zone
+                                 not the machine's (TZ).
+                                 --mode wall-day (Gemini CLI; ~40 min): W1 on the usage-limit dialog of a key's spent
+                                 per-day quota, which names no reset: the person told (the ladder's badge, no stall),
+                                 Keep trying pressed at the ladder's first rung (30 min) past the stub's lift, landed.
+                                 --mode wall-climb (Gemini CLI; ~2 h 45 min): that dialog, its quota standing past the first
+                                 rung: the try there drawn again, NEEDS YOU standing, the next try at the climbed rung (2 h)
+                                 getting through, NEEDS YOU down, landed.
                                  --window (a run with land-p): OPENS A WINDOW: the lab's instance windowed, in the same
                                  jail (no Launch Services: never the active app, `hwkey` key=0), and L13's person types
                                  land-p's first prompt key by key through `hwkey` (a real NSEvent in the window's own

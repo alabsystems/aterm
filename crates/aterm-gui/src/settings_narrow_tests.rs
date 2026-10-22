@@ -1233,16 +1233,19 @@ fn the_fleet_fields_words_keep_it_a_field() {
     });
 }
 
-/// THE MUSIC STATUS LINE IS WHOLE IN THE NARROW HOST'S COLUMN, whatever
-/// silences the voices: a host with no audio output paints its line on every
-/// Home and Sound screen, and the round-7 Linux lane found "Audio
-/// unavailable" elided there at 1.5× and 2× text (135.9 and 181.3 pt of the
-/// 126-pt column a 178-pt window leaves it). Every reason is laid out here,
-/// not only the one this host's audio gives.
+/// THE MUSIC STATUS LINE SAYS WHY, WHOLE, IN THE ROOM IT HAS: whatever
+/// silences the voices, at every width from the narrow host's 126-pt column
+/// to a wide page and at 1x, 1.5x and 2x text, the painted status keeps its
+/// words whole and names its cause in the setting's own words (Reduce
+/// motion, System Reduce Motion, Heavy load, the cursor trail, Sound volume,
+/// the audio output); where the full sentence fits on two lines, the full
+/// sentence is what paints. One fixed "Some off" named neither the cause nor
+/// the voices, under a switch that read On.
 #[test]
-fn every_music_status_line_is_whole_in_the_narrow_column() {
+fn every_music_status_line_is_whole_and_names_its_cause() {
     at_each_text_scale(&[1.0, 1.5, 2.0], "music status", |scale| {
         crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
         for status in [
             MusicStatus::NoOutput { saved_on: true },
             MusicStatus::NoOutput { saved_on: false },
@@ -1252,11 +1255,43 @@ fn every_music_status_line_is_whole_in_the_narrow_column() {
             MusicStatus::MotionPaused(MotionReduction::System),
             MusicStatus::MotionPaused(MotionReduction::HeavyLoad),
         ] {
-            let compiled = crate::native_ui::UiTree::new(top_music_suppression_node(status))
-                .compile(LogicalRect::new(0.0, 0.0, 126.0, page_subtitle_height()))
-                .expect("the status compiles");
-            let cut = cut_words(&compiled, &["settings/top/music-effects/suppression"]);
-            assert!(cut.is_empty(), "{scale}\u{d7} {status:?}: {cut:#?}");
+            let cause = match status {
+                MusicStatus::NoOutput { .. } => "audio output".to_string(),
+                MusicStatus::VolumeZero => "sound volume".to_string(),
+                MusicStatus::TypingNotesOff => "trail".to_string(),
+                MusicStatus::MotionPaused(reduction) => reduction.cause().to_lowercase(),
+            };
+            for width in [126.0, 160.0, 220.0, 320.0, 528.0, 682.0] {
+                let (node, height) = top_music_suppression_node(status, width);
+                let compiled = crate::native_ui::UiTree::new(node)
+                    .compile(LogicalRect::new(0.0, 0.0, width, height))
+                    .expect("the status compiles");
+                let context = format!("{scale}\u{d7} {width}pt {status:?}");
+                let cut = cut_words(&compiled, &["settings/top/music-effects/suppression"]);
+                assert!(cut.is_empty(), "{context}: {cut:#?}");
+                let painted = compiled
+                    .paint
+                    .iter()
+                    .filter(|node| {
+                        node.key
+                            .as_str()
+                            .starts_with("settings/top/music-effects/suppression/visual")
+                    })
+                    .filter_map(|node| match &node.content {
+                        UiContent::Text(text) => Some(text.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(
+                    painted.to_lowercase().contains(&cause),
+                    "{context}: {painted:?} names no {cause}"
+                );
+                let full = &status.forms()[0];
+                if wrapped_copy_lines(full, px, width).len() <= 2 {
+                    assert_eq!(&painted, full, "{context}: the whole sentence fits");
+                }
+            }
         }
     });
 }
@@ -1595,7 +1630,13 @@ fn the_retired_packages_note_keeps_its_words_in_a_narrow_column() {
             }
             assert!(!lines.is_empty(), "{context}: the note is drawn");
             let said = lines.into_values().collect::<Vec<_>>().join("\n");
-            assert_eq!(painted_words(&said), note, "{context}: every word paints");
+            // Each break joined as the note writes its halves: `auto_update`
+            // breaks before its `_` with no mark, an identifier's own joint.
+            assert_eq!(
+                crate::native_ui::joined_as_named(&said, &note),
+                note,
+                "{context}: every word paints"
+            );
         }
     });
 }
@@ -1780,7 +1821,13 @@ fn every_control_and_word_of_a_system_page_is_on_some_screen() {
                         if said.iter().any(|line| line.ends_with('\u{2026}')) {
                             continue;
                         }
-                        let (want, have) = (words(label), words(&said.join("\n")));
+                        // Each break joined as the label writes its
+                        // halves: an identifier breaks at its own joints
+                        // with no mark (`alab` / `.systems`).
+                        let (want, have) = (
+                            words(label),
+                            words(&crate::native_ui::joined_as_named(&said.join("\n"), label)),
+                        );
                         if have.first() != want.first() {
                             continue;
                         }
@@ -1971,8 +2018,12 @@ fn cut_inside_a_word(painted: &str, whole: &str) -> bool {
 /// them, `whole`) or a button's label line that ends where its next line
 /// goes on in the same word — "Messages" then "." alone, where a word wider
 /// than its box is broken with a hyphen ([`wrap_to_box`]). A line ending in
-/// a hyphen, or a path's `/`, and East Asian text, which breaks between its
-/// characters, are not breaks inside a word.
+/// a hyphen, a path broken at a folder's `/` (before it, or after it where
+/// its words are prose), a break inside an identifier (a path, a host, a
+/// version, a hash: [`aterm_grapheme::TokenKind::Identifier`], which never
+/// takes a mark, a hyphen would read as one of its characters) and East
+/// Asian text, which breaks between its characters, are not breaks inside a
+/// word.
 fn broken_inside_a_word(
     screen: &crate::native_ui::CompiledUi,
     whole: &std::collections::HashMap<String, String>,
@@ -1990,6 +2041,7 @@ fn broken_inside_a_word(
             return false;
         };
         if matches!(end, '-' | '/' | '\\' | '\u{2026}')
+            || matches!(start, '/' | '\\')
             || crate::tray_raster::is_east_asian(end)
             || crate::tray_raster::is_east_asian(start)
         {
@@ -1999,7 +2051,9 @@ fn broken_inside_a_word(
         let first = after.split(char::is_whitespace).next().unwrap_or(after);
         let joined = format!("{last}{first}");
         let spaced = format!("{last} {first}");
-        whole.contains(&joined) && !whole.contains(&spaced)
+        whole.contains(&joined)
+            && !whole.contains(&spaced)
+            && aterm_grapheme::token_kind(&joined) == aterm_grapheme::TokenKind::Word
     };
     for node in screen.paint.iter().filter(|node| !node.peek) {
         let key = node.key.as_str();
@@ -2300,10 +2354,11 @@ fn the_macos_access_block_keeps_its_words_at_phone_width() {
 }
 
 /// A WORD OF COPY WIDER THAN ITS BOX BREAKS AS A LABEL'S DOES
-/// ([`copy_paragraph_lines`]): with a hyphen, its last line never a lone
-/// letter or mark, every line inside the box. The copy walk breaks only at
-/// white space, and broke such a word wherever the box ended: a setting's note
-/// at 2× in a 22-column card painted "Messages" and then "." alone.
+/// ([`copy_paragraph_lines`]): at its syllable, with a hyphen ("Mes-" /
+/// "sages."), every line inside the box. The copy walk breaks only at white
+/// space, and broke such a word wherever the box ended: a setting's note at
+/// 2× in a 22-column card painted "Messages" and then "." alone, and the
+/// label's rule then broke it "Messag-" / "es.".
 /// CONTROLS: copy whose every word fits wraps at its spaces, as the walk wraps
 /// it, with no hyphen; East Asian text breaks between its characters, with
 /// none.
@@ -2336,7 +2391,12 @@ fn a_word_of_copy_wider_than_its_box_breaks_with_a_hyphen() {
         text
     });
     assert_eq!(rejoined, text, "{lines:?}");
-    assert!(lines.iter().any(|line| line.ends_with('-')), "{lines:?}");
+    assert!(
+        lines
+            .windows(2)
+            .any(|pair| pair[0].ends_with("Mes-") && pair[1] == "sages."),
+        "broken at its syllable: {lines:?}"
+    );
     // CONTROL: every word fits — the walk's lines.
     let wide = measure("Messages.") + 1.0;
     let walked: Vec<String> = crate::tray_raster::ui_text_wrap_ranges(text, px, wide)
@@ -2349,6 +2409,431 @@ fn a_word_of_copy_wider_than_its_box_breaks_with_a_hyphen() {
     let lines = wrapped_copy_lines(cjk, px, measure("設定ファイ"));
     assert!(lines.len() > 1, "{lines:?}");
     assert!(lines.iter().all(|line| !line.ends_with('-')), "{lines:?}");
+}
+
+/// NO LINE OF COPY OR OF A LABEL IS ONE LETTER ALONE where a syllable of the
+/// word after it fits beside it ([`copy_paragraph_lines`], [`wrap_to_box`]):
+/// the Security note at 2× text in a 22-column card, in every box "A
+/// program's" is too wide for and "A pro-" is not, reads "A pro-" /
+/// "gram's …", every line inside the box, the words all there. CONTROL: an
+/// identifier is never broken for it ("A aterm.toml" leaves "A" alone).
+/// NEGATIVE CONTROL: the copy walk painted "A" alone, then "program's".
+#[test]
+fn no_line_is_a_lone_letter_a_syllable_after_it_could_fill() {
+    let px = 26.0;
+    let measure = |text: &str| crate::tray_raster::ui_text_width(text, px);
+    let text = "A program's colors last for its session and are never saved; off refuses them.";
+    let least = measure("A pro-").max(measure("program's")).ceil();
+    let most = measure("A program's");
+    assert!(least < most, "premise: a box leaves \"A\" alone");
+    let mut width = least;
+    while width < most {
+        let context = format!("{width}pt");
+        for lines in [
+            wrapped_copy_lines(text, px, width),
+            wrap_to_box(text, width, &measure),
+        ] {
+            assert!(
+                lines.iter().all(|line| line.trim() != "A"),
+                "{context}: {lines:?}"
+            );
+            assert_eq!(
+                lines.first().map(String::as_str),
+                Some("A pro-"),
+                "{context}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| measure(line) <= width + crate::native_ui::TEXT_FIT_SLACK),
+                "{context}: {lines:?}"
+            );
+            let rejoined = lines.join(" ").replace("- ", "");
+            assert_eq!(rejoined, text, "{context}: {lines:?}");
+        }
+        width += 2.0;
+    }
+    // CONTROL: an identifier keeps its characters together.
+    let code = "A aterm.toml key";
+    let lines = wrap_to_box(code, measure("aterm.toml") + 1.0, &measure);
+    assert_eq!(lines.first().map(String::as_str), Some("A"), "{lines:?}");
+}
+
+/// A SPACED SLASH ENDS ITS LINE, NEVER STARTS ONE (UAX #14 LB13,
+/// [`aterm_grapheme::never_starts_a_line`]): Tabs' computers heading and a
+/// window note, wrapped as a label ([`wrap_to_box`]) and as copy
+/// ([`wrapped_copy_lines`]) in every box from the widest word with its
+/// slash to the whole text, keep each " /" with the word before it, every
+/// word whole and in order. NEGATIVE CONTROL: the heading painted "(CPU /
+/// GPU" / "/ RAM /" at 2× text in a 22-column window.
+#[test]
+fn a_spaced_slash_never_starts_a_line() {
+    let px = 26.0;
+    let measure = |text: &str| crate::tray_raster::ui_text_width(text, px);
+    for text in [
+        "LIVE SYSTEM VITALS (CPU / GPU / RAM / DISK / UPTIME / RTT)",
+        "Removes eligible inactive files toward a 64 MiB / 2,048-file cap.",
+    ] {
+        let least = text
+            .split_whitespace()
+            .map(|word| measure(&format!("{word} /")))
+            .fold(0.0_f32, f32::max)
+            .ceil();
+        let mut width = least;
+        while width < measure(text) {
+            let context = format!("{width}pt {text:?}");
+            for lines in [
+                wrap_to_box(text, width, &measure),
+                wrapped_copy_lines(text, px, width),
+            ] {
+                assert!(
+                    lines.iter().all(|line| !line.starts_with('/')),
+                    "{context}: {lines:?}"
+                );
+                assert_eq!(lines.join(" "), text, "{context}");
+            }
+            width += 3.0;
+        }
+    }
+}
+
+/// A WORD WIDER THAN ITS BOX BREAKS AT A SYLLABLE, as a typesetter breaks
+/// it ([`wrap_to_box`], [`aterm_grapheme::break_inside`]): the words the
+/// 178pt window at 2× and 1.5× text broke, in a label's, a caption's and a
+/// button's type, at every box from as narrow as the word's widest syllable
+/// (and its hyphen) to as wide as the word — each line it breaks ends in a
+/// hyphen at one of the word's syllable breaks, no line paints past the
+/// box, the lines rejoined are the word, and a separator glued to a word
+/// ("COMPUTER ·") never leaves a lone letter. NEGATIVE CONTROL: broken
+/// wherever the box ended, Settings painted "Brightn-" / "ess", "AUTOMA-" /
+/// "TIC", "NOTIFICATI-" / "ONS", "Foregro-" / "und", "COMPUTE-" / "R ·".
+#[test]
+fn a_word_wider_than_its_box_breaks_at_a_syllable() {
+    let words = [
+        "Brightness",
+        "AUTOMATIC",
+        "NOTIFICATIONS",
+        "MAINTENANCE",
+        "Foreground",
+        "Background",
+        "SUPERVISION",
+        "COMPUTERS",
+        "CONTINUED",
+        "ACCESSIBLE",
+        "PERMISSIONS",
+        "SPREADSHEET",
+        "Messages.",
+        "appearance",
+        "translucent",
+        "Lightning",
+        "underline",
+        "Problems",
+        "Antigravity",
+        "introspectable.",
+        "automatically",
+        "registration",
+    ];
+    at_each_text_scale(&[1.5, 2.0], "syllable breaks", |scale| {
+        let faces = [
+            crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary),
+            crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Quiet),
+            crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet),
+        ];
+        for (px, face) in faces {
+            let measure = |line: &str| crate::tray_raster::ui_text_width_for(face, line, px);
+            for word in words {
+                let points = aterm_grapheme::hyphen_points(word);
+                assert!(!points.is_empty(), "premise: {word:?} has syllables");
+                // The widest run between two of its breaks, its hyphen on.
+                let narrowest = std::iter::once(0)
+                    .chain(points.iter().copied())
+                    .zip(points.iter().copied().chain(std::iter::once(word.len())))
+                    .map(|(from, to)| measure(&format!("{}-", &word[from..to])))
+                    .fold(0.0_f32, f32::max);
+                let mut width = narrowest.ceil();
+                while width < measure(word) {
+                    let context = format!("{scale}\u{d7} {px}px {width}pt {word:?}");
+                    let lines = wrap_to_box(word, width, &measure);
+                    let mut at = 0;
+                    for line in &lines[..lines.len() - 1] {
+                        let stem = line.strip_suffix('-').unwrap_or_else(|| {
+                            panic!("{context}: a broken line ends in a hyphen: {lines:?}")
+                        });
+                        at += stem.len();
+                        assert!(
+                            points.contains(&at),
+                            "{context}: broken off a syllable: {lines:?}"
+                        );
+                    }
+                    for line in &lines {
+                        assert!(
+                            measure(line) <= width + crate::native_ui::TEXT_FIT_SLACK,
+                            "{context}: {line:?} is wider than its box"
+                        );
+                    }
+                    let rejoined: String = lines
+                        .iter()
+                        .map(|line| line.strip_suffix('-').unwrap_or(line))
+                        .collect();
+                    assert_eq!(rejoined, word, "{context}");
+                    width += 3.0;
+                }
+            }
+            // A separator glued to the word is no letter of it: the word's
+            // last syllables go with it, never a lone letter, in every box
+            // that holds a last syllable with its separator.
+            let heading = "HARDWARE \u{b7} OS & COMPUTER \u{b7} STATUS";
+            let least = measure("PUTER \u{b7}").max(measure("WARE \u{b7}")).ceil();
+            for width in (0..8).map(|step| least + 6.0 * step as f32) {
+                for line in wrap_to_box(heading, width, &measure) {
+                    let letters = line
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .trim_end_matches('-');
+                    assert!(
+                        letters.chars().count() != 1 || letters == "&",
+                        "{width}pt: a lone letter {line:?}"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// AN IDENTIFIER NO LINE HOLDS BREAKS WITH NO MARK IN IT — a path, a host, a
+/// version, a hash or a file's name, which a hyphen would change
+/// ([`aterm_grapheme::break_inside`]): About's values at the 22- and
+/// 30-column value columns at 2× text, and Settings' file names, wrap so
+/// that their lines rejoined are the value, character for character, each
+/// line inside its column, and none ends in a hyphen; a host breaks before
+/// its dot, a version before its build, and a path before its own hyphen
+/// ("/aterm" / "-final"). CONTROL: a prose fact name still takes its hyphen at a
+/// syllable ("Archi-" / "tecture"). NEGATIVE CONTROL: broken as a word,
+/// About painted "0.11.0+g205-" / "65c325", "ec73ab1c-" / "007d90ca",
+/// "alab.syst-" / "ems" and "Applicatio-" / "ns/", and Modified "ATERM.T-" /
+/// "OML"; broken after a path's hyphen, "/aterm-" / "final" read as a word
+/// broken.
+#[test]
+fn an_identifier_no_line_holds_breaks_with_no_mark_in_it() {
+    at_each_text_scale(&[2.0], "identifiers", |_| {
+        let facts = [
+            (
+                "compiler",
+                "Trust 0.11.0+g20565c325 \u{b7} release \u{b7} trust_verify",
+            ),
+            ("signature", "ec73ab1c007d90ca"),
+            ("site", "alab.systems"),
+            ("running", "/Users//someone/aterm-final/target/debug/aterm"),
+            ("another copy", "/Applications/aterm.app (0.109.0)"),
+        ];
+        let px = 13.0 * crate::native_appearance::text_scale();
+        for width in [126.0_f32, 182.0] {
+            for (label, value) in facts {
+                let context = format!("{width}pt {label}");
+                let lines = metadata_value_lines(label, value, width);
+                let bare = |text: &str| text.replace(FACT_SEPARATOR, "").replace(' ', "");
+                assert_eq!(
+                    bare(&lines.concat()),
+                    bare(value),
+                    "{context}: nothing is put in it: {lines:?}"
+                );
+                for line in &lines {
+                    assert!(
+                        metadata_value_text_width(line, px, false)
+                            <= width + crate::native_ui::TEXT_FIT_SLACK,
+                        "{context}: {line:?} is wider than its column"
+                    );
+                    // A path's own hyphen starts its next line, never ends
+                    // one, where it reads as a hyphen the break put in.
+                    assert!(
+                        !line.ends_with('-'),
+                        "{context}: {line:?} ends in a hyphen: {lines:?}"
+                    );
+                }
+            }
+        }
+        let measure = |line: &str| metadata_value_text_width(line, px, false);
+        let narrow = measure("alab.syst");
+        assert_eq!(
+            wrap_to_box("alab.systems", narrow, &measure),
+            ["alab", ".systems"]
+        );
+        let version = wrap_to_box("0.11.0+g20565c325", measure("0.11.0+g2056"), &measure);
+        assert_eq!(version, ["0.11.0", "+g20565c325"]);
+        let (heading_px, heading_face) =
+            crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Quiet);
+        let heading =
+            |line: &str| crate::tray_raster::ui_text_width_for(heading_face, line, heading_px);
+        let caps = wrap_to_box("ONLY IN ATERM.TOML", heading("ATERM.TO"), &heading);
+        assert!(
+            caps.iter().all(|line| !line.ends_with('-')) && caps.contains(&".TOML".to_string()),
+            "{caps:?}"
+        );
+        // CONTROL: a prose name still takes its hyphen, at a syllable.
+        let name = wrap_to_box(
+            "Architecture",
+            fact_name_width("Architec"),
+            &fact_name_width,
+        );
+        assert_eq!(name, ["Archi-", "tecture"]);
+    });
+}
+
+/// A SHORT WORD IS NEVER BROKEN IN A CONTROL OR A TITLE that has room for
+/// it, in a 22-column window at 2× text: a colour row's Choose… paints
+/// "Choose" (its trailing "…" given up, [`button_words_in`]) where
+/// "Choose…" is wider than the button and "Choose" is not; a colour field
+/// whose words cannot be whole beside its chip shows the chip alone
+/// ([`fit_row_field_placeholder`]); and a stacked Messages head's title runs
+/// past its chevron, which stands on the head's first row
+/// ([`messages_stacked_width`]), so "Antigravity" is whole and the title is
+/// not cut. NEGATIVE CONTROL: Appearance painted "Choo-" / "se…" and "The-"
+/// / "me…", Messages "Antigrav-" / "ity CLI is" / "not…".
+#[test]
+fn a_short_word_is_never_broken_in_a_control_with_room_for_it() {
+    at_each_text_scale(&[2.0], "short words", |_| {
+        // Choose…, on its own line in a 122pt column.
+        let spec = ButtonSpec::new("Choose the foreground color").visual_label("Choose\u{2026}");
+        let room = crate::native_ui::text_button_label_room(&spec, 122.0);
+        assert!(
+            crate::native_ui::native_button_label_width("Choose\u{2026}") > room
+                && crate::native_ui::native_button_label_width("Choose") <= room,
+            "premise: only the ellipsis does not fit"
+        );
+        assert_eq!(
+            button_words_in(&spec, "Choose\u{2026}", &[], 122.0),
+            ("Choose".to_string(), 1)
+        );
+        // The colour fields, on every screen of Appearance.
+        let (mut runtime, instance, view) = setup();
+        go_to_route(&mut runtime, instance, view, SettingsRoute::Appearance);
+        let mut fields = 0;
+        each_screen(
+            &mut runtime,
+            instance,
+            view,
+            &view_cx_at(178.0, 488.0),
+            |screen, top| {
+                for node in screen.paint.iter().filter(|node| !node.peek) {
+                    let UiContent::TextField(field) = &node.content else {
+                        continue;
+                    };
+                    if field.spec.swatch.is_none() {
+                        continue;
+                    }
+                    let Some(painted) = painted_text(node) else {
+                        continue;
+                    };
+                    fields += 1;
+                    assert!(
+                        painted
+                            .lines()
+                            .all(|line| !line.ends_with('-') && !line.ends_with('\u{2026}')),
+                        "screen {top}: {} paints {painted:?}",
+                        node.key.as_str()
+                    );
+                }
+            },
+        );
+        assert!(fields > 0, "premise: a colour field is drawn");
+        // A stacked Messages head, in a window as tall as the report's.
+        let title = "Antigravity CLI is not installed";
+        let (mut runtime, instance, view) = super::setup_with_messages();
+        let mut messages = super::sample_messages();
+        for entry in &mut messages.entries {
+            if entry.id == 40 {
+                entry.title = title.to_string();
+            }
+        }
+        assert!(runtime.replace_settings_messages(messages, 8));
+        let mut seen = false;
+        super::scroll_messages_through(
+            &mut runtime,
+            instance,
+            view,
+            &view_cx_at(178.0, 488.0),
+            1,
+            |screen, k| {
+                let mut lines: Vec<(String, String)> = screen
+                    .paint
+                    .iter()
+                    .filter(|node| {
+                        !node.peek
+                            && node
+                                .key
+                                .as_str()
+                                .starts_with("settings/messages/row/40/label")
+                    })
+                    .filter_map(|node| match &node.content {
+                        UiContent::Text(text) => {
+                            Some((node.key.as_str().to_string(), text.text.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    return;
+                }
+                seen = true;
+                lines.sort();
+                let lines: Vec<String> = lines.into_iter().map(|(_, line)| line).collect();
+                assert_eq!(lines.join(" "), title, "screen {k}: {lines:?}");
+            },
+        );
+        assert!(seen, "premise: the head is drawn");
+    });
+}
+
+/// A PATH IN A STATUS BREAKS BEFORE ITS FOLDERS' SLASHES, so no line of it
+/// ends in a separator ([`status_word_lines`], [`aterm_grapheme::line_breaks`]):
+/// the save failure of the Security page under a long lab path, at every
+/// width an 80- to 150-column window at 1× and 2× text gives the status bar,
+/// keeps the path's leading `/` with its first folder, starts each line the
+/// path goes on with a `/` of it, ends no line in a `/` or in a hyphen of
+/// the path, and keeps `lab-42` and `75d5bccd-9c38` whole. NEGATIVE
+/// CONTROL: broken after each `/` and `-`, line 1 ended "was not saved: /"
+/// and line 2 "lab-42/-Users-someone-aterm/75d5bccd-".
+#[test]
+fn a_path_in_a_status_breaks_before_its_folders_slashes() {
+    let path = "/private/tmp/lab-42/-Users-someone-aterm/75d5bccd-9c38-431b-99e5-ef81935c6fbd/scratchpad/labs/fv-sk105-l80/cfg/aterm";
+    let text = format!(
+        "Allow programs to read the clipboard was not saved: {path} isn't writable \u{b7} check its permissions"
+    );
+    at_each_text_scale(&[1.0, 2.0], "status path", |scale| {
+        // From the widest folder (no narrower line holds it whole) to a
+        // 150-column window's bar.
+        let widest = path
+            .split('/')
+            .map(|folder| status_words_width(&format!("/{folder}")))
+            .fold(0.0_f32, f32::max);
+        let from = widest.ceil() as usize;
+        for width in (from..=1100.max(from))
+            .step_by(17)
+            .map(|width| width as f32)
+        {
+            let context = format!("{scale}\u{d7} {width}pt");
+            let lines = status_word_lines(&text, width);
+            let mut in_path = false;
+            for line in &lines {
+                if in_path {
+                    assert!(line.starts_with('/'), "{context}: {lines:#?}");
+                }
+                assert!(
+                    !line.ends_with('/') && !line.ends_with('-'),
+                    "{context}: a line ends in a separator: {lines:#?}"
+                );
+                let last = line.split_whitespace().last().unwrap_or_default();
+                in_path = path.contains(last) && !path.ends_with(last);
+            }
+            for whole in ["lab-42", "75d5bccd-9c38"] {
+                assert!(
+                    lines.iter().any(|line| line.contains(whole)),
+                    "{context}: {whole} broken: {lines:#?}"
+                );
+            }
+        }
+    });
 }
 
 /// A CURSOR STYLE SAYS ITS WHOLE NAME AND DESCRIPTION (#71): at 80×24,
@@ -2634,18 +3119,17 @@ fn a_path_field_keeps_its_file_name() {
                         seen = true;
                         whole |= node.clip.height >= node.rect.height - 0.5;
                         // A form of the path ending in its file's name, whole
-                        // or on lines (a word wider than the field broken
-                        // with a hyphen), on two lines at most where a form
-                        // with a folder is shown.
+                        // or on lines (a path breaks at its folders and its
+                        // own joints, never with a mark: its lines join with
+                        // nothing between), on two lines at most where a
+                        // form with a folder is shown.
                         let painted = painted_text(node).unwrap_or_default();
                         assert!(
-                            painted_words(&painted)
-                                .replace('-', "")
-                                .ends_with("aifleet.toml"),
+                            painted.replace('\n', "").ends_with("ai-fleet.toml"),
                             "{context}: {painted:?}"
                         );
                         assert!(
-                            painted.lines().count() <= 2 || painted.starts_with("\u{2026}/ai-"),
+                            painted.lines().count() <= 2 || painted.starts_with("\u{2026}/ai"),
                             "{context}: {painted:?}"
                         );
                         let value = screen.semantic(&key).map(|node| node.value.clone());
@@ -3114,7 +3598,13 @@ fn harness_lists_a_tall_session_row_by_the_one_splitter() {
 /// CJK took the shared line breaks (taken from that code, 2026-10-21); the
 /// walk's lines re-taken once a space past the box ended its line, the word
 /// before it kept (a note wrapped a word early, #79), with no empty line
-/// after a text's trailing space.
+/// after a text's trailing space; the pieces and the box's lines re-taken
+/// once a path broke before its slashes and an identifier nowhere else, and
+/// a piece wider than its box where a typesetter breaks it
+/// ([`aterm_grapheme::break_inside`]: "archi-" / "tec-" / "ture", not
+/// "archi-" / "tectu-" / "re"; "/aterm" / ".toml", not "aterm-" / ".tom-" /
+/// "l"); and once a path's own hyphen started the next line, never ended
+/// one ("/aterm-lab" / "-instance-runner", not "/aterm-lab-" / "instance-").
 fn latin_wraps() -> String {
     let corpus = [
         "Cursor blink",
@@ -3146,13 +3636,13 @@ fn latin_wraps() -> String {
     out
 }
 
-/// LATIN SETTINGS COPY WRAPS WHERE IT ALWAYS DID: breaking between CJK
-/// characters (the shared line breaks, [`aterm_grapheme::line_breaks`])
-/// moved no piece and no line of a Latin name, note or path (the golden
-/// record, taken from the code that broke only at spaces, hyphens and
-/// slashes).
+/// LATIN SETTINGS COPY WRAPS AS RECORDED: breaking between CJK characters
+/// (the shared line breaks, [`aterm_grapheme::line_breaks`]) moved no piece
+/// and no line of a Latin name, note or path, and neither does anything
+/// else unseen (the golden record: a change that moves a wrap re-takes it,
+/// and the diff shows every line it moved).
 #[test]
-fn latin_settings_copy_wraps_where_it_always_did() {
+fn latin_settings_copy_wraps_as_recorded() {
     let golden = include_str!("../tests/fixtures/latin-wraps.txt");
     let now = latin_wraps();
     let moved: Vec<(&str, &str)> = golden

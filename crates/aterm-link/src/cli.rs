@@ -97,11 +97,14 @@ so it is never presented to a --broker you named). A flag given on the command l
                          releases their `post --wait-ack`. `--no-receipts` turns
                          it off for one run, `[fabric] receipts = false` for good;
                          off, a sender's `post --wait-ack` waits out its deadline.
-  --log <off|turns>      `serve` only, off by default: `turns` mirrors each
+  --log <auto|off|turns> `serve` only, `auto` by default: mirror each
                          session log's turns, runs, needs and the steps they
                          rise from onto its session's `ev` face, deduplicated
-                         by readers (`aterm fabric brief` folds them). Without
-                         the flag, `[fabric] log` in aterm.toml.
+                         by readers (`aterm fabric brief` folds them), while
+                         the broker retains them (`fabric status` says
+                         `mirror=unretained` where it does not); `turns`
+                         mirrors over any broker, `off` never. Without the
+                         flag, `[fabric] log` in aterm.toml.
   --attention            `ls` only: keep only rows carrying an `attention=`
 
 `ls` prints one line per node and per session: <node> <host> <sid> state= inc=
@@ -410,8 +413,9 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         // On, matching `receipts_from_config`'s absent-key answer and what `aterm fabric on`
         // writes.
         receipts: true,
-        // OFF, matching `log_from_config`'s absent-key answer (D4 is open).
-        log: crate::mirror::LogMode::Off,
+        // AUTO, matching `log_from_config`'s absent-key answer (D4, session
+        // log Phase 6 step 6E-3): on over a broker that retains it.
+        log: crate::mirror::LogMode::Auto,
     };
     let mut token_file: Option<String> = None;
     let mut it = args.iter();
@@ -448,7 +452,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
             "--log" => {
                 let v = value()?;
                 cfg.log = crate::mirror::LogMode::parse(&v)
-                    .ok_or_else(|| format!("--log {v}: `off` or `turns`"))?;
+                    .ok_or_else(|| format!("--log {v}: `auto`, `off` or `turns`"))?;
                 log_given = true;
             }
             "--sock" => cfg.sock = Some(value()?),
@@ -572,6 +576,10 @@ pub(crate) fn default_state_dir() -> String {
 /// reopens the log, moving its generation when astream recorded the run
 /// lossy. A broker no `aterm fabric on` job runs exits the same, and its line
 /// names the command that restarts it.
+///
+/// It retains its log by aterm's default rules ([`crate::broker_rules`],
+/// session log Phase 6 step 6E-2), set at every open before anything is
+/// served, so its first `Hello` advertises them.
 fn broker(args: &[String]) -> ExitCode {
     // Capture the running image and invocation before opening the broker or
     // announcing readiness. An update during startup must remain observable.
@@ -658,6 +666,15 @@ once when the log is poisoned, and a last time when it stops cleanly: when it
 exits on its own, or, at any durability but strict, on SIGTERM, SIGINT or SIGHUP
 (a strict broker keeps their default action, so its last snapshot is the last
 periodic one); `aterm fabric` and `aterm fabric doctor` read it.
+
+It keeps its log within bounds: the `ev` records for at most 7 days within
+256 MiB, and the log is cut from its oldest end as they go. Below the cut it
+keeps the latest presence, unread mail for up to 7 days within 64 MiB of its own
+(read mail goes with the cut), and everything else for 7 days within 32 MiB.
+The trimming runs beside the log (<log>.held keeps what is held) and survives a
+crash. A read below what is kept answers `retained-from=` (`inbox get @<off>`
+says it). Unread mail given up past its limit is logged here, one line naming
+its subject and count; the recipient's inbox reads on past it.
 ";
     let parsed = match crate::broker_args::BrokerArgs::parse(args) {
         Ok(parsed) => parsed,
@@ -807,6 +824,27 @@ periodic one); `aterm fabric` and `aterm fabric doctor` read it.
         }
     };
     seam.arm(&broker, std::path::Path::new(&log));
+    // THE DEFAULT RETENTION (session log Phase 6 step 6E-2, ruling U24):
+    // astream retains, and its `Hello` advertises, only the rules set since
+    // this open, so they are set at every open, before anything is served.
+    // A broker whose rules cannot be set (a poisoned log, a held store that
+    // cannot be written) still serves, unretained, and says so: its log grows
+    // as a broker before R4's did, and no bridge's mirror defaults on over it
+    // (it advertises no rule). Exiting instead would take the whole fabric
+    // down over its bound.
+    let retained = match crate::broker_rules::retain(&broker) {
+        Ok(()) => format!(
+            "retained by aterm's default rules ({})",
+            crate::broker_rules::summary()
+        ),
+        Err(e) => {
+            eprintln!(
+                "aterm link broker: {log}: its retention rules could not be set ({e}); it serves \
+                 unretained, and no bridge mirrors the session logs onto it by default"
+            );
+            "unretained".to_string()
+        }
+    };
     let handle = match broker.serve(&endpoint) {
         Ok(h) => h,
         Err(e) => {
@@ -864,7 +902,8 @@ periodic one); `aterm fabric` and `aterm fabric doctor` read it.
         // order, and the line then says "served strict" and why.
         let _ = writeln!(
             std::io::stderr(),
-            "aterm link broker: unix socket on {endpoint}{guard_note}, durability {}: {}; log {}",
+            "aterm link broker: unix socket on {endpoint}{guard_note}, durability {}: {}; \
+             {retained}; log {}",
             durability.name(),
             crate::durability::describe_served(
                 durability,
@@ -1085,10 +1124,14 @@ pub const NEWER_LOG_REMEDY: &str = "the log was written by a newer aterm and is 
 /// line naming `log` — `None` for a refusal with no remedy of aterm's own (a
 /// lock held, a permission), whose astream words say enough.
 ///
-/// By kind, never by astream's wording. In aterm's build (no anti-rollback,
-/// and retention compiled but never run, so no `.base`/`.state` sidecar
-/// exists) `InvalidData` from an open is the corrupt-record refusal, and
-/// `Unsupported` a record format newer than this build reads.
+/// By kind, never by astream's wording. In aterm's build (no anti-rollback)
+/// `InvalidData` from an open is the corrupt-record refusal, and
+/// `Unsupported` a record format newer than this build reads. Since the
+/// default retention (session log Phase 6 step 6E-2) the log also has the
+/// retention's sidecars (`<log>.held`, `.state`, `.base`), and one that does
+/// not read is refused `InvalidData` too, astream's words naming the file: the
+/// repair named here then opens the log the same way and touches nothing, so
+/// the remedy costs nothing where it does not apply.
 #[must_use]
 pub fn log_refusal_remedy(kind: std::io::ErrorKind, log: &str) -> Option<String> {
     match kind {

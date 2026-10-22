@@ -95,6 +95,7 @@ fn selected_subscription_repaints_without_old_account_data_or_extra_rows() {
             email: Some(email.into()),
             plan: Some(plan.into()),
             weekly: weekly.map(str::to_owned),
+            weekly_reset: None,
         }),
         ..facts()
     };
@@ -137,6 +138,7 @@ fn unicode_subscription_text_survives_the_native_splice_and_rests_without_alloca
                 email: Some(email.into()),
                 plan: Some("Pro".into()),
                 weekly: Some("weekly 29% left".into()),
+                weekly_reset: None,
             }),
             ..FooterFacts::default()
         };
@@ -323,11 +325,11 @@ fn a_frame_at_rest_costs_the_footer_nothing() {
 }
 
 /// A HOVERED CHIP COSTS A FRAME NOTHING (design §9.2.1: the title is built
-/// when a hover starts, never per frame): with the pointer resting on the
-/// Autopilot chip, a frame whose screen and facts did not move lays the
-/// chip's title from what the reading built — whole and short, built once
-/// when the hover began (`App::claude_lights_block`) — and does nothing
-/// else the footer counts: no allocation, no
+/// when a hover starts, never per frame): with the pointer resting on a
+/// harness chip, a frame whose screen and facts did not move lays the
+/// chip's title from what the reading built — Autopilot's, whole and short,
+/// built once when the hover began (`App::claude_lights_block`) — and does
+/// nothing else the footer counts: no allocation, no
 /// reading, no fit, no composition (the rule's cells are the last frame's).
 /// At this pane's width, beside these facts, Autopilot's is a LEANER form
 /// (`claude_lights::lean_titles`, §9.2.1), laid from slices of the whole
@@ -380,11 +382,7 @@ fn a_hovered_chip_costs_its_title_alone() {
         "CONTROL: a leaner form is the one laid: {hovered:?}"
     );
     for i in 0..12 {
-        assert_eq!(
-            cost(&mut app, wid),
-            Cost::default(),
-            "Autopilot hovered, frame {i}"
-        );
+        assert_eq!(cost(&mut app, wid), Cost::default(), "hovered, frame {i}");
     }
     app.hover_claude_chip(wid, None);
     for _ in 0..2 {
@@ -395,6 +393,189 @@ fn a_hovered_chip_costs_its_title_alone() {
         Cost::default(),
         "CONTROL: the pointer gone"
     );
+}
+
+/// THE FACTS AS TARGETS COST NOTHING AT REST: every frame records where
+/// each fact landed (`claude_lights::FactHit`, in a list that keeps its
+/// buffer), and a frame at rest still allocates, reads and composes
+/// nothing — the targets the same frame after frame.
+///
+/// NEGATIVE CONTROL: a fact hidden by a click (`App::set_fact_mask`) moves
+/// the repaint key and composes the rule once, its stub then a target; then
+/// the rule rests at nothing again.
+#[test]
+fn a_frame_at_rest_with_fact_targets_costs_nothing() {
+    use crate::claude_lights::Fact;
+    let (mut app, wid, session) = probe_glass();
+    let targets = |app: &App| app.windows[&wid].claude_lights.fact_hits.clone();
+    let at_rest = targets(&app);
+    let kinds: Vec<Fact> = at_rest.iter().map(|h| h.fact).collect();
+    assert_eq!(
+        kinds,
+        [
+            Fact::Model,
+            Fact::Effort,
+            Fact::Path,
+            Fact::Branch,
+            Fact::Usage
+        ],
+        "CONTROL: every fact is a target"
+    );
+    for i in 0..30 {
+        assert_eq!(cost(&mut app, wid), Cost::default(), "frame {i}");
+        assert_eq!(targets(&app), at_rest, "frame {i}: the same targets");
+    }
+    let key = pass(&mut app, wid);
+    app.set_fact_mask(session, FactMask::default().with(FactKind::Branch, true));
+    assert_ne!(pass_key(&app, wid), key, "CONTROL: the repaint key moved");
+    let hidden = cost(&mut app, wid);
+    assert_eq!(hidden.composed, 1, "CONTROL: composed once ({hidden:?})");
+    let rule = AT_REST.bottom();
+    assert!(
+        glass_row(&app, wid, rule).contains("\u{2387} main off"),
+        "CONTROL: the stub on the glass: {:?}",
+        glass_row(&app, wid, rule)
+    );
+    let stub = targets(&app);
+    assert!(
+        stub.iter()
+            .any(|h| h.fact == Fact::Branch && h.restores.has(FactKind::Branch)),
+        "CONTROL: the stub is the target: {stub:?}"
+    );
+    for i in 0..12 {
+        assert_eq!(cost(&mut app, wid), Cost::default(), "hidden, frame {i}");
+    }
+}
+
+/// `screen(&AT_REST)` with Claude Code's context indicator, `<left>% until
+/// auto-compact`, parked right-aligned above the composer, two columns
+/// short of its rules (`aterm_phase::phase::context_left_shown`).
+fn context_screen(left: u8) -> Vec<String> {
+    let mut rows = screen(&AT_REST);
+    let top = rows
+        .iter()
+        .position(|r| r.starts_with('\u{2500}'))
+        .expect("the composer's top rule");
+    let text = format!("{left}% until auto-compact");
+    rows[top - 1] = format!("{}{text}", " ".repeat(usize::from(COLS) - 2 - text.len()));
+    rows
+}
+
+/// THE CONTEXT FACT AT REST COSTS NOTHING (main's `◐ ctx` fact, a reading
+/// or nothing, read off the glass once per rebuild of the rows): a Claude
+/// Code pane published with no context fact whose indicator reads `12%
+/// until auto-compact` shows `◐ ctx 12% left` on its rule, and a frame
+/// whose screen did not move compares that reading with the fact shown and
+/// allocates nothing, composes nothing, frame after frame.
+///
+/// NEGATIVE CONTROL: the indicator moving to 11% publishes the fact anew —
+/// it allocates its words and composes the rule once, `◐ ctx 11% left` on
+/// the glass — then rests at nothing again.
+#[test]
+fn a_context_reading_at_rest_costs_nothing() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let session = app.focused_session_id(wid).expect("the front session");
+    assert!(app.apply_term_resize(wid, ROWS, COLS));
+    feed(&app, session, &context_screen(12));
+    publish(&app, session, facts());
+    {
+        // A Claude Code pane: only its rule follows the indicator.
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(timeline.set_program(4242, Some("claude".into())));
+    }
+    for _ in 0..3 {
+        refill(&mut app, wid);
+        let _ = pass(&mut app, wid);
+    }
+    let rule = AT_REST.bottom();
+    let at_rest = glass_row(&app, wid, rule);
+    assert!(
+        at_rest.contains("\u{25D0} ctx 12% left"),
+        "the reading is on the rule: {at_rest:?}"
+    );
+    for i in 0..30 {
+        assert_eq!(cost(&mut app, wid), Cost::default(), "frame {i}");
+        assert_eq!(glass_row(&app, wid, rule), at_rest, "frame {i}");
+    }
+    // CONTROL: the indicator moves.
+    feed(&app, session, &context_screen(11));
+    refill(&mut app, wid);
+    let moved = cost(&mut app, wid);
+    assert!(
+        moved.allocations > 0,
+        "CONTROL: the new reading's words allocate ({moved:?})"
+    );
+    refill(&mut app, wid);
+    let _ = pass(&mut app, wid);
+    let now = glass_row(&app, wid, rule);
+    assert!(
+        now.contains("\u{25D0} ctx 11% left"),
+        "CONTROL: the new reading is on the rule: {now:?}"
+    );
+    for i in 0..12 {
+        assert_eq!(cost(&mut app, wid), Cost::default(), "moved, frame {i}");
+    }
+}
+
+/// THE HOVER OF A FACT COMPOSES ONCE, THEN RESTS: the frame a fact is first
+/// hovered composes the rule with it lit; every frame under the pointer
+/// after it costs nothing; the pointer leaving composes it once more, and
+/// it rests again. With a harness host the fact's title stands in the
+/// block's title slot, laid once.
+#[test]
+fn a_hover_change_composes_once_then_rests() {
+    use crate::claude_lights::Fact;
+    let (mut app, wid, session) = probe_glass();
+    assert_eq!(cost(&mut app, wid), Cost::default(), "CONTROL: at rest");
+    app.hover_claude_fact(wid, Some((session, Fact::Branch)));
+    let first = cost(&mut app, wid);
+    assert_eq!(first.composed, 1, "the hover composes once ({first:?})");
+    assert_eq!(first.reads, 0, "and reads no pane ({first:?})");
+    for i in 0..12 {
+        assert_eq!(cost(&mut app, wid), Cost::default(), "hovered, frame {i}");
+    }
+    app.hover_claude_fact(wid, None);
+    let left = cost(&mut app, wid);
+    assert_eq!(
+        left.composed, 1,
+        "the pointer leaving composes once more ({left:?})"
+    );
+    for i in 0..12 {
+        assert_eq!(cost(&mut app, wid), Cost::default(), "left, frame {i}");
+    }
+    // With a host: the title in the block's slot, laid once.
+    let _host = hosted(&mut app);
+    for _ in 0..2 {
+        let _ = pass(&mut app, wid);
+    }
+    assert_eq!(
+        cost(&mut app, wid),
+        Cost::default(),
+        "CONTROL: chips at rest"
+    );
+    app.hover_claude_fact(wid, Some((session, Fact::Branch)));
+    let titled = cost(&mut app, wid);
+    assert!(
+        titled.composed == 1 && titled.fits == 1,
+        "the title laid once ({titled:?})"
+    );
+    let rule = AT_REST.bottom();
+    assert!(
+        glass_row(&app, wid, rule).contains("\u{2387} main \u{b7} click: hide"),
+        "the fact's title: {:?}",
+        glass_row(&app, wid, rule)
+    );
+    for i in 0..12 {
+        assert_eq!(cost(&mut app, wid), Cost::default(), "titled, frame {i}");
+    }
+}
+
+/// The footer's repaint key for `wid`'s visible plan, the pass not run.
+fn pass_key(app: &App, wid: WindowId) -> u64 {
+    let (plan, _) = app.active_visible_frame_layout(wid).expect("a layout");
+    app.claude_footer_fp(wid, &plan)
 }
 
 /// Session `session`'s own Autopilot word, written as `meta set autopilot`
@@ -879,7 +1060,7 @@ fn read_rows(app: &App, wid: WindowId) -> Vec<String> {
 }
 
 /// A 1×1 image, as a placement on a cell carries it.
-fn image() -> aterm_core::grid::extra::ImageRef {
+pub(super) fn image() -> aterm_core::grid::extra::ImageRef {
     use aterm_core::grid::extra::{ImageData, ImageFormat, ImageRef, ImageScaling};
     ImageRef {
         image: std::sync::Arc::new(ImageData {

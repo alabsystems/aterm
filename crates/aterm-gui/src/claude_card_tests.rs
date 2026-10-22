@@ -14,7 +14,8 @@ use aterm_agent::harness::footer::FooterFacts;
 use aterm_agent::supervise::Autopilot;
 use aterm_core::render::{FxInk, FxItem, FxLayer, FxRamps, FxRect, FxSlot, FxSpace, PxRect};
 use aterm_core::terminal::{CutKind, HolderCut};
-use aterm_effects::harness_card::{EPISODE_MS, KITTY_W};
+use aterm_effects::harness_card::{EPISODE_MS, FLOW_SLACK_MS, KITTY_W};
+use aterm_effects::ripple::{FLOW_STEP_MS, GLINT_PERIOD_MS};
 
 /// The build the screens' card names, and the process the facts are for.
 const VERSION: &str = "2.1.283";
@@ -267,20 +268,42 @@ fn painted(app: &App, wid: WindowId) -> &CardPainted {
     &app.windows[&wid].claude_card.painted
 }
 
-/// The card's layer of `slot` as the last splice put it on the frame.
-fn card_layer(app: &App, wid: WindowId, slot: FxSlot) -> Option<FxLayer> {
+/// Whether the card drew anything — a light, a slab, a halo, ink or a word
+/// decoration — the front session's top-line mark left out: that layer
+/// shares the card's record so every strip takes it back
+/// (`WindowCards::paint_layer`), but it is the lockup's icon, drawn in every
+/// harness state, not the card's light.
+fn card_drew(app: &App, wid: WindowId) -> bool {
+    let p = painted(app, wid);
+    card_only(app, wid).next().is_some()
+        || !p.under.is_empty()
+        || !p.halo.is_empty()
+        || !p.ink.is_empty()
+        || !p.decos.is_empty()
+}
+
+/// The card's own layers in its record, the front session's top-line mark
+/// left out ([`card_drew`]).
+fn card_only(app: &App, wid: WindowId) -> impl Iterator<Item = &FxLayer> {
+    let mark = app
+        .focused_session_id(wid)
+        .map(crate::claude_footer::top_mark_id);
     painted(app, wid)
         .layers
         .iter()
-        .find(|l| l.slot == slot)
-        .cloned()
+        .filter(move |l| Some(l.id) != mark)
+}
+
+/// The card's layer of `slot` as the last splice put it on the frame.
+fn card_layer(app: &App, wid: WindowId, slot: FxSlot) -> Option<FxLayer> {
+    card_only(app, wid).find(|l| l.slot == slot).cloned()
 }
 
 /// The card's layers as the last splice put them on the frame: compared as
 /// layers are, by IDENTITY (the same content `Arc`s at the same place: a
 /// replayed frame), never by their bytes ([`card_pic`] for those).
 fn card_layers(app: &App, wid: WindowId) -> Vec<FxLayer> {
-    painted(app, wid).layers.clone()
+    card_only(app, wid).cloned().collect()
 }
 
 /// The grid's origin in `wid`'s window pixels: the padding and the head,
@@ -318,7 +341,7 @@ impl Mark {
 fn marks(app: &App, wid: WindowId, slot: FxSlot) -> Vec<Mark> {
     let grid = grid_origin(app, wid);
     let mut out = Vec::new();
-    for layer in painted(app, wid).layers.iter().filter(|l| l.slot == slot) {
+    for layer in card_only(app, wid).filter(|l| l.slot == slot) {
         let shift = match layer.space {
             FxSpace::Window => (0, 0),
             FxSpace::Grid => grid,
@@ -455,7 +478,7 @@ fn layer_pic(layer: &FxLayer) -> LayerPic {
 /// The card's layers by value ([`LayerPic`]), in the order the splice put
 /// them on.
 fn card_pic(app: &App, wid: WindowId) -> Vec<LayerPic> {
-    painted(app, wid).layers.iter().map(layer_pic).collect()
+    card_only(app, wid).map(layer_pic).collect()
 }
 
 /// The card's layers as the CPU renderer paints them over a black window
@@ -476,7 +499,8 @@ fn card_pixels(app: &App, wid: WindowId, occluded: bool) -> (Vec<u32>, usize) {
     };
     let mut px = vec![0u32; fx.w * fx.h];
     let occluders: &[PxRect] = if occluded { &scratch.fx_occluders } else { &[] };
-    aterm_render::fx::paint_layers(&mut px, &fx, &painted(app, wid).layers, occluders);
+    let layers: Vec<FxLayer> = card_only(app, wid).cloned().collect();
+    aterm_render::fx::paint_layers(&mut px, &fx, &layers, occluders);
     (px, fx.w)
 }
 
@@ -599,6 +623,20 @@ fn the_wrapped_card_wears_its_border_kitty_stars_and_line() {
         crate::claude_footer::value_fg(GRAY, blank.fg),
         "the footer's value colour under the ink"
     );
+    // ATERM STANDS OUT: its five cells bold, and no other letter.
+    let hero = start + 12..start + 17;
+    let word: String = scratch.cells[line_row][hero.clone()]
+        .iter()
+        .map(|c| c.ch)
+        .collect();
+    assert_eq!(word, HERO_WORD, "the hero word's cells");
+    for col in start..start + want.chars().count() {
+        assert_eq!(
+            scratch.cells[line_row][col].bold,
+            hero.contains(&col),
+            "col {col}: bold on the hero word alone"
+        );
+    }
     let inked: Vec<u16> = scratch
         .ink
         .iter()
@@ -1033,10 +1071,31 @@ fn a_landing_is_said_on_the_cards_line_under_land_alone() {
             std::ptr::eq(texts, line_texts(AutopilotView::Land, end)),
             "made once"
         );
+        let versioned = |texts: &[String]| -> Vec<String> {
+            texts[1..]
+                .iter()
+                .filter(|t| t.starts_with("enhanced by "))
+                .cloned()
+                .collect()
+        };
         assert_eq!(
-            texts[1..],
-            line_texts(AutopilotView::Land, LineEnd::Mode)[1..],
-            "the narrower rungs"
+            versioned(texts),
+            versioned(line_texts(AutopilotView::Land, LineEnd::Mode)),
+            "the narrower versioned rungs"
+        );
+        let glyph = tail.split(' ').next().expect("a glyph");
+        let short: Vec<&String> = texts
+            .iter()
+            .filter(|t| !t.starts_with("enhanced by "))
+            .collect();
+        assert_eq!(
+            short,
+            [
+                &format!("{HERO_WORD} harness \u{b7} {tail}"),
+                &format!("{HERO_WORD} \u{b7} {tail}"),
+                &format!("{HERO_WORD} {glyph}"),
+            ],
+            "the short rungs say the end too"
         );
         let cruise = line_texts(AutopilotView::Cruise, end);
         assert!(
@@ -1081,7 +1140,7 @@ fn a_landing_is_said_on_the_cards_line_under_land_alone() {
         t += Duration::from_millis(EPISODE_MS + 1000);
         set_now(Some(t));
         frame(&mut app, wid);
-        assert_eq!(app.claude_card_deadline(t), None, "settled");
+        assert!(intro_over(&app, wid), "the intro over");
         let strip = strip_rows(&app, wid);
         for (face, end) in [
             (Some(TaskFace::Landed), LineEnd::Landed),
@@ -1101,10 +1160,14 @@ fn a_landing_is_said_on_the_cards_line_under_land_alone() {
                 want,
                 "{word:?}: {face:?}"
             );
-            assert_eq!(
-                app.claude_card_deadline(t),
-                None,
+            assert!(
+                intro_over(&app, wid),
                 "{word:?}: {face:?}: a face's move arms no episode"
+            );
+            assert_ne!(
+                app.claude_card_deadline(t),
+                Some(t + Duration::from_millis(FRAME_MS)),
+                "{word:?}: {face:?}: no intro frame wanted"
             );
         }
         set_now(None);
@@ -1228,7 +1291,8 @@ fn the_cards_line_follows_an_armed_timer() {
     }
 }
 
-/// THE TIMER ON THE GLASS: a settled Cruise card whose session arms a timer
+/// THE TIMER ON THE GLASS: a settled Cruise card (held: its window unfocused)
+/// whose session arms a timer
 /// for 18:00 says `⤓18:00` at the end of its line on the next frame — laid
 /// out once, no episode armed — and every frame after it replays the
 /// settled frame and its line as they are, laying out nothing and inking
@@ -1245,6 +1309,7 @@ fn a_cruise_cards_line_says_its_armed_timer() {
     t += Duration::from_millis(EPISODE_MS + 1000);
     set_now(Some(t));
     frame(&mut app, wid);
+    hold(&mut app, wid);
     assert_eq!(app.claude_card_deadline(t), None, "settled");
     let line_row = strip_rows(&app, wid) + 4;
     let start = 11 + LINE_LEAD;
@@ -1321,15 +1386,17 @@ fn a_cruise_cards_line_says_its_armed_timer() {
 /// app and session.
 type NegativeCase = (&'static str, fn(&mut App, u64));
 
-/// NOTHING is drawn — no light, no line — for Off, a session this host does
+/// NOTHING is drawn — no light, no line — for a Cruise session this host does
 /// not hold, `[claude_footer] card = false`, a card of another build than the
-/// process in front, a scrolled-back frame, no host and the master switch
-/// off. CONTROL: the wrapped card on the same screen draws.
+/// process in front, a scrolled-back frame, no host, the master switch off,
+/// and an agent's own switch off with the session's word Off (Off's white
+/// card is for a harness that runs: `off_wears_the_white_card_without_a_claim`).
+/// CONTROL: the wrapped card on the same screen draws.
 #[test]
-fn off_unsupervised_switched_off_another_build_or_scrolled_back_draw_nothing() {
+fn unsupervised_switched_off_another_build_scrolled_back_no_host_or_master_off_draw_nothing() {
     let bare = |app: &App, wid: WindowId| {
         let strip = strip_rows(app, wid);
-        painted(app, wid).is_empty()
+        !card_drew(app, wid)
             && !glass_text(app, wid, strip + 4, 0..120).contains("aterm harness")
             && !app.windows[&wid]
                 .claude_card
@@ -1338,13 +1405,6 @@ fn off_unsupervised_switched_off_another_build_or_scrolled_back_draw_nothing() {
                 .any(|e| e.shown)
     };
     let cases: [NegativeCase; 7] = [
-        ("off", |app, session| {
-            assert!(app.set_session_autopilot(
-                session,
-                Some(Autopilot::Off),
-                crate::autopilot::Surface::Chip
-            ));
-        }),
         ("unsupervised", |app, session| {
             let ctx = app.pool.get(session).unwrap().ctx.clone();
             crate::session_timeline::release_supervisor(
@@ -1379,6 +1439,7 @@ fn off_unsupervised_switched_off_another_build_or_scrolled_back_draw_nothing() {
                 crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
             );
         }),
+        ("agent switch off, word Off", agent_switch_off),
     ];
     for (what, case) in cases {
         let (mut app, wid, session) = glass(120);
@@ -1388,6 +1449,112 @@ fn off_unsupervised_switched_off_another_build_or_scrolled_back_draw_nothing() {
         case(&mut app, session);
         frame(&mut app, wid);
         assert!(bare(&app, wid), "{what}: the vendor's card bare");
+        host.shutdown_and_join();
+    }
+}
+
+/// Claude Code's own switch off under the master switch on
+/// (`[harness.claude] enabled = false`), the session's word Off and its
+/// claim still held: the view is the agent's switch (`AgentOff`), which no
+/// word lifts — no harness runs to be white.
+fn agent_switch_off(app: &mut App, session: u64) {
+    {
+        let entry = app.pool.get(session).expect("session");
+        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        timeline.set_program(PGID, Some("claude".into()));
+    }
+    app.harness_policy =
+        crate::harness_policy_cell::HarnessPolicyCell::new(crate::app_config::HarnessPolicy::read(
+            "[harness]\nheadless = true\n[harness.claude]\nenabled = false\n",
+        ));
+    app.set_session_autopilot(
+        session,
+        Some(Autopilot::Off),
+        crate::autopilot::Surface::Chip,
+    );
+    let (word, view, supervised) = app.session_autopilot(session);
+    assert_eq!(word, Some(Autopilot::Off));
+    assert!(supervised, "the claim is still held");
+    assert_eq!(
+        view,
+        AutopilotView::AgentOff(aterm_phase::Program::Claude),
+        "the agent's own switch"
+    );
+}
+
+/// OFF WEARS THE WHITE CARD WITHOUT A CLAIM (owner, 2026-10-19: "I want a
+/// white themed for 'off'"): a session switched Off, its worker stopped and
+/// its claim given back, keeps the whole card — the border, the trail, the
+/// kitty and the stars — in the moonbow (`CardPalette::Off`), and the line
+/// `✦ enhanced by aterm harness <version> · autopilot ○ off`. NEGATIVE
+/// CONTROLS: the same session under the master switch off, and under
+/// Claude Code's own switch off, is bare.
+#[test]
+fn off_wears_the_white_card_without_a_claim() {
+    // Off, as the host runs it: the word, then the worker's claim given back.
+    let lit = |app: &mut App, wid: WindowId, session: u64| {
+        let ctx = app.pool.get(session).unwrap().ctx.clone();
+        app.set_session_autopilot(
+            session,
+            Some(Autopilot::Off),
+            crate::autopilot::Surface::Chip,
+        );
+        assert_eq!(app.session_autopilot(session).0, Some(Autopilot::Off));
+        crate::session_timeline::release_supervisor(
+            &ctx,
+            None,
+            crate::metrics::now_us(),
+            aterm_slog::Actor::Ctl,
+        );
+        assert!(!app.session_autopilot(session).2, "the claim is given back");
+        frame(app, wid);
+    };
+    let (mut app, wid, session) = glass(120);
+    let host = supervise(&mut app, session);
+    lit(&mut app, wid, session);
+    let (under, over) = card_marks(&app, wid);
+    assert!(!under.is_empty(), "the moonbow border and trail");
+    assert!(!over.is_empty(), "the kitty and the stars");
+    let strip = strip_rows(&app, wid);
+    let line = glass_text(&app, wid, strip + 4, 0..120);
+    assert!(
+        line.contains("enhanced by aterm harness") && line.contains("autopilot \u{25cb} off"),
+        "the line says Off: {line:?}"
+    );
+    let entry = app.windows[&wid]
+        .claude_card
+        .entries
+        .iter()
+        .find(|e| e.shown)
+        .expect("the card on show");
+    assert_eq!(entry.view, AutopilotView::Off);
+    let (_, (_, scene)) = entry
+        .laid
+        .as_ref()
+        .and_then(|(key, laid)| Some((key, laid.as_ref()?)))
+        .expect("laid");
+    assert_eq!(scene.palette, aterm_effects::harness_card::CardPalette::Off);
+    host.shutdown_and_join();
+    // The negative controls: no harness runs to wear it.
+    let cases: [NegativeCase; 2] = [
+        ("master switch off", |app, _| {
+            app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+                crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+            );
+        }),
+        ("agent switch off", agent_switch_off),
+    ];
+    for (what, case) in cases {
+        let (mut app, wid, session) = glass(120);
+        let host = supervise(&mut app, session);
+        case(&mut app, session);
+        lit(&mut app, wid, session);
+        let strip = strip_rows(&app, wid);
+        assert!(!card_drew(&app, wid), "{what}: no light");
+        assert!(
+            !glass_text(&app, wid, strip + 4, 0..120).contains("aterm harness"),
+            "{what}: no line"
+        );
         host.shutdown_and_join();
     }
 }
@@ -1424,7 +1591,7 @@ fn the_grid_and_the_vendors_frame_are_untouched() {
     };
     let host = supervise(&mut app, session);
     frame(&mut app, wid);
-    assert!(!painted(&app, wid).is_empty());
+    assert!(card_drew(&app, wid));
     assert_ne!(app.windows[&wid].input_scratch.cells, vendor, "the line");
     assert_eq!(engine_text(&app, session), before, "the terminal's text");
     let ws = app.windows.get_mut(&wid).unwrap();
@@ -1482,7 +1649,7 @@ fn capture_resplice(tab_strip: u16) {
     };
     frame(&mut app, wid);
     let once = lens(&app);
-    assert!(!painted(&app, wid).is_empty());
+    assert!(card_drew(&app, wid));
     let (plan, route) = app.active_visible_frame_layout(wid).unwrap();
     for _ in 0..3 {
         app.splice_claude_footer(wid, &plan, route);
@@ -1522,16 +1689,22 @@ fn capture_resplice(tab_strip: u16) {
     host.shutdown_and_join();
 }
 
-/// EPISODES, THEN STILLNESS (§3): a card first decorated plays its episode — a
-/// frame ahead each step, the repaint key moving every frame — then asks once
-/// for its settled frame, and from there its key is constant and no wake is
-/// armed, over a thousand idle frames. Focus regained plays it again, the
-/// kitty in the seat the glass showed and the trail whole (`harness_card`'s
-/// `Ride`, review of slice 5b): no snap back to the trail's start.
-/// NEGATIVE CONTROL: the first episode's first frame rides (the kitty left of
+/// AN INTRO, THEN THE FLOW; HELD, A CONSTANT KEY (§3; owner, 2026-10-19:
+/// "Make the rainbow at the banner continue to shimmer and flow
+/// continuously"): a card first decorated plays its intro — a frame ahead
+/// each step, the repaint key moving every frame — then asks once for the
+/// flow's first frame and flows on, over two whole ripple cycles: one new
+/// frame a step of Claude's ripple, due at the step's start plus the slack,
+/// the key moving once a step and holding inside one, where a wake finds
+/// nothing due. Held (the window unfocused), its key is constant and no wake
+/// is armed, over a thousand idle frames. Focus regained plays the intro
+/// again, the kitty in the seat the glass showed and the trail whole
+/// (`harness_card`'s `Ride`, review of slice 5b): no snap back to the
+/// trail's start.
+/// NEGATIVE CONTROL: the first intro's first frame rides (the kitty left of
 /// its seat, no trail yet).
 #[test]
-fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
+fn the_card_flows_a_frame_a_step_and_held_keys_constant() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
     app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
@@ -1552,21 +1725,18 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
         set_now(at(t));
         assert_eq!(app.claude_cards_due(at(t)), vec![wid], "{t} ms");
         let fp = app.claude_footer_fp(wid, &plan);
-        assert_ne!(
-            fp, last_fp,
-            "the key moves while the episode plays ({t} ms)"
-        );
+        assert_ne!(fp, last_fp, "the key moves while the intro plays ({t} ms)");
         frame(&mut app, wid);
         last_fp = app.claude_footer_fp(wid, &plan);
     }
-    // The episode runs out: one ask for the settled frame, once.
+    // The intro runs out: one ask for the flow's first frame, once.
     let end = at(EPISODE_MS + 1);
     set_now(end);
     assert_eq!(app.claude_card_deadline(end), Some(end));
     assert_ne!(
         app.claude_footer_fp(wid, &plan),
         last_fp,
-        "the settled frame is owed"
+        "the flow's first frame is owed"
     );
     assert_eq!(app.claude_cards_due(end), vec![wid]);
     assert_eq!(
@@ -1575,12 +1745,59 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
         "asked once: no wake spins on a frame that never comes"
     );
     frame(&mut app, wid);
+    assert!(intro_over(&app, wid), "the intro let go");
+    // THE FLOW: a frame a step, on the ripple's grid from the first arm.
+    let step = |k: u64| at(k * FLOW_STEP_MS);
+    let slack = Duration::from_millis(FLOW_SLACK_MS);
+    let mut k = (EPISODE_MS + 1) / FLOW_STEP_MS;
+    let mut key = app.claude_footer_fp(wid, &plan);
+    let mut drawn = card_marks(&app, wid);
+    for _ in 0..2 * GLINT_PERIOD_MS / FLOW_STEP_MS {
+        let due = step(k + 1) + slack;
+        let inside = step(k + 1) - Duration::from_millis(1);
+        set_now(inside);
+        assert_eq!(
+            app.claude_card_deadline(inside),
+            Some(due),
+            "step {k}: the next step's instant"
+        );
+        assert!(
+            app.claude_cards_due(inside).is_empty(),
+            "step {k}: nothing due inside it"
+        );
+        assert_eq!(
+            app.claude_footer_fp(wid, &plan),
+            key,
+            "step {k}: the key holds inside it"
+        );
+        k += 1;
+        set_now(due);
+        assert_eq!(app.claude_cards_due(due), vec![wid], "step {k}: due");
+        assert_ne!(
+            app.claude_footer_fp(wid, &plan),
+            key,
+            "step {k}: the key moves"
+        );
+        frame(&mut app, wid);
+        let glass = card_marks(&app, wid);
+        assert_ne!(glass, drawn, "step {k}: a new frame");
+        (key, drawn) = (app.claude_footer_fp(wid, &plan), glass);
+    }
+    // HELD: the window loses focus, and its next frame is the settled one.
+    let now = step(k) + slack;
+    app.windows.get_mut(&wid).unwrap().focused = false;
+    assert_ne!(
+        app.claude_footer_fp(wid, &plan),
+        key,
+        "a gate closing moves the key"
+    );
+    frame(&mut app, wid);
     let settled = app.claude_footer_fp(wid, &plan);
     let layers = card_layers(&app, wid);
     let settled_pic = card_pic(&app, wid);
     let at_rest = card_marks(&app, wid);
     for i in 0..1000u64 {
-        let t = end + Duration::from_millis(1 + i * 7);
+        let t = now + Duration::from_millis(1 + i * 7);
         set_now(t);
         assert_eq!(app.claude_footer_fp(wid, &plan), settled, "idle frame {i}");
         assert_eq!(app.claude_card_deadline(t), None, "idle frame {i}");
@@ -1595,10 +1812,11 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
         );
         assert_eq!(app.claude_footer_fp(wid, &plan), settled);
     }
-    // Focus regained: the episode again, its first frame wanted at once
-    // (the last frame drawn is long past).
-    let back = end + Duration::from_secs(60);
+    // Focus regained: the intro again, its first frame wanted at once (the
+    // last frame drawn is long past).
+    let back = now + Duration::from_secs(60);
     set_now(back);
+    app.windows.get_mut(&wid).unwrap().focused = true;
     app.rearm_claude_cards(wid, || back);
     assert!(app.claude_card_deadline(back).is_some_and(|d| d <= back));
     assert_ne!(app.claude_footer_fp(wid, &plan), settled);
@@ -1621,10 +1839,10 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
         "the trail whole"
     );
     assert!(kitty_x(&at_rest).is_some() && trail_span(&at_rest).is_some());
-    // CONTROL: the first episode rode in.
+    // CONTROL: the first intro rode in.
     assert!(
         kitty_x(&riding) < kitty_x(&at_rest),
-        "the first episode rides"
+        "the first intro rides"
     );
     assert_ne!(trail_span(&riding), trail_span(&at_rest));
     // NEGATIVE CONTROL: an unfocused window draws the settled frame and arms
@@ -1637,15 +1855,166 @@ fn the_card_settles_to_a_constant_key_and_arms_no_wake() {
     host.shutdown_and_join();
 }
 
+/// Claude repainting from `from` to `until`, as the steps' lock holds it on
+/// a real window: one repaint 20 ms into each step of the card's ripple, each
+/// a present — and, where the card's own wake comes before Claude's next
+/// repaint, that wake's frame first. Returns how many of the card's own
+/// wakes came first, and leaves the clock at `until`.
+fn own_wakes(app: &mut App, wid: WindowId, from: Instant, until: Instant) -> usize {
+    let g0 = app.windows[&wid]
+        .claude_card
+        .entries
+        .iter()
+        .find_map(|e| e.card.ripple_origin())
+        .expect("the card's ripple");
+    let step = Duration::from_millis(FLOW_STEP_MS);
+    let into = Duration::from_millis(20);
+    let mut repaint = g0 + into;
+    while repaint <= from {
+        repaint += step;
+    }
+    let (mut t, mut own) = (from, 0);
+    while repaint <= until {
+        while let Some(due) = app.claude_card_deadline(t).filter(|&due| due < repaint) {
+            let at = due.max(t);
+            set_now(Some(at));
+            assert_eq!(app.claude_cards_due(at), vec![wid], "the wake's frame");
+            frame(app, wid);
+            own += 1;
+            t = at;
+            assert!(own < 10_000, "the card's wakes spin");
+        }
+        set_now(Some(repaint));
+        frame(app, wid);
+        t = repaint;
+        repaint += step;
+    }
+    set_now(Some(until));
+    own
+}
+
+/// A FOCUS BLIP IS NO RETURN ([`RETURN_MS`]). MEASURED on a real window
+/// (2026-10-21): the window server takes a window's focus for 18 to 65 ms as
+/// another process starts (a new test binary's first run, a lab's instance), and
+/// each such blip replayed the card's intro — about 140 of its own wakes in
+/// a 30 s sample, 6 s of frames a `FRAME_MS` apart — where the flow before
+/// it paid none, its steps drawn by Claude's repaints. A card flows, Claude
+/// repainting 20 ms into each step: over 3 s its own wake never comes first.
+/// The window loses focus through the OS focus seam 50 ms into a step, draws
+/// a frame, and has it back 20 ms later: the frame drawn away is the step's
+/// flow frame, not the settled one, and so is the one drawn back — the flow
+/// ran on through the blip, its colours and glints where they were (a
+/// settled frame there snapped the border to the settled colours and the
+/// flow restarted from them, its glints faded out) — no intro is armed, and
+/// over the next 3 s Claude's repaints still draw every step and the card's
+/// own wake comes first on none of them. NEGATIVE CONTROL: away 2 s, the
+/// card settles on its first step past `RETURN_MS`, wakes for nothing while
+/// held, and the gain is a person's return — the intro plays again, and its
+/// frames come ahead of Claude's repaints, the card's own wakes, dozens of
+/// them in 3 s.
+#[test]
+fn a_focus_blip_replays_no_intro_and_the_card_rides_on() {
+    let (mut app, wid, session) = glass(120);
+    let host = supervise(&mut app, session);
+    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    set_now(Some(t0));
+    frame(&mut app, wid);
+    // The intro plays out on its own frames, then the card flows.
+    let _ = own_wakes(&mut app, wid, t0, at(EPISODE_MS + 1000));
+    assert!(intro_over(&app, wid), "CONTROL: the intro let go");
+    let flowing = |app: &App| {
+        app.windows[&wid]
+            .claude_card
+            .entries
+            .iter()
+            .any(|e| e.card.flowing(card_now()))
+    };
+    assert!(flowing(&app), "CONTROL: the card flows");
+    let steady = own_wakes(&mut app, wid, at(EPISODE_MS + 1000), at(EPISODE_MS + 4000));
+    assert_eq!(steady, 0, "CONTROL: the flow rides Claude's repaints");
+    // THE BLIP: 50 ms into a step, 20 ms away, one present in between.
+    let g0 = app.windows[&wid]
+        .claude_card
+        .entries
+        .iter()
+        .find_map(|e| e.card.ripple_origin())
+        .expect("the card's ripple");
+    let mut lost = g0 + Duration::from_millis(50);
+    while lost <= at(EPISODE_MS + 4000) {
+        lost += Duration::from_millis(FLOW_STEP_MS);
+    }
+    set_now(Some(lost));
+    frame(&mut app, wid);
+    let step_pic = card_pic(&app, wid);
+    app.window_focus_event(wid, false);
+    assert!(!app.windows[&wid].focused, "CONTROL: the window lost focus");
+    frame(&mut app, wid);
+    assert_eq!(
+        card_pic(&app, wid),
+        step_pic,
+        "a loss within the bound draws the step's flow frame, not the settled one"
+    );
+    let back = lost + Duration::from_millis(20);
+    set_now(Some(back));
+    app.window_focus_event(wid, true);
+    assert!(app.windows[&wid].focused, "CONTROL: the window has it back");
+    assert!(intro_over(&app, wid), "a blip arms no intro");
+    frame(&mut app, wid);
+    assert_eq!(
+        card_pic(&app, wid),
+        step_pic,
+        "the flow ran on through the blip: the same step, the same colours and glints"
+    );
+    let after = own_wakes(&mut app, wid, back, back + Duration::from_secs(3));
+    assert!(flowing(&app), "the flow resumed");
+    assert_eq!(
+        after, 0,
+        "after a blip Claude's repaints still carry every step"
+    );
+    // NEGATIVE CONTROL: away 2 s — a return, and the intro plays again.
+    let away = back + Duration::from_secs(3) + Duration::from_millis(50);
+    set_now(Some(away));
+    app.window_focus_event(wid, false);
+    frame(&mut app, wid);
+    let settle = away + Duration::from_millis(RETURN_MS + 2 * FLOW_STEP_MS);
+    let mut held = own_wakes(&mut app, wid, away, settle);
+    assert!(
+        !flowing(&app),
+        "away past the bound, the card settles on its next step"
+    );
+    assert_eq!(app.claude_card_deadline(settle), None, "and arms nothing");
+    held += own_wakes(&mut app, wid, settle, away + Duration::from_secs(2));
+    assert_eq!(held, 0, "CONTROL: a held card wakes for nothing");
+    let returned = away + Duration::from_secs(2);
+    set_now(Some(returned));
+    app.window_focus_event(wid, true);
+    assert!(
+        !intro_over(&app, wid),
+        "NEGATIVE CONTROL: a return plays the intro"
+    );
+    let intro = own_wakes(&mut app, wid, returned, returned + Duration::from_secs(3));
+    assert!(
+        intro > 30,
+        "NEGATIVE CONTROL: the intro's frames come ahead of Claude's repaints ({intro})"
+    );
+    set_now(None);
+    host.shutdown_and_join();
+}
+
 /// LIGHT THEMES (§3: "additive light is invisible on white"). A LIGHT
-/// THEME'S CARD IS INK, ITS LINE TEXT ON ITS OWN GROUND: on white and on a
-/// cream ground (Gruvbox Light's), every quad of the card is source-over ink,
-/// the line's `✦` is opaque ink (on light it was a see-through tint that
-/// fell under AA), every letter reads at 4.5:1 or more against the pane's
-/// ground, and no letter is solved on its own — the scene's ground and the
-/// line's are both the pane's, so the line's inks are the ones the card's
-/// tick kept (`harness_card::take_line_ink_solves`). On cream, letters
-/// solved for white fall under AA.
+/// THEME'S CARD IS INK, ITS LINE TEXT ON ITS OWN GROUND, in every palette it
+/// wears (Cruise's print rainbow, Land's sunset, Off's silver): on white and
+/// on a cream ground (Gruvbox Light's), in the intro and in the flow, every
+/// mark of the card is source-over ink, the line's `✦` is opaque ink (on light it
+/// was a see-through tint that fell under AA), every letter reads at 4.5:1
+/// or more against the pane's ground, and no letter is solved on its own —
+/// the scene's ground and the line's are both the pane's, so the line's
+/// inks are the ones the card's tick kept
+/// (`harness_card::take_line_ink_solves`); and the line's hero word is bold
+/// and inked on light as on dark. On cream, letters solved for white fall
+/// under AA.
 #[test]
 fn a_light_theme_card_is_ink() {
     use aterm_effects::color_math::relative_luminance;
@@ -1653,48 +2022,102 @@ fn a_light_theme_card_is_ink() {
         let (la, lb) = (relative_luminance(a), relative_luminance(b));
         (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
     };
-    for (osc, bg) in [("ff/ff/ff", 0x00FF_FFFF), ("fb/f1/c7", 0x00FB_F1C7)] {
+    let modes = [
+        (Autopilot::Cruise, "\u{221e} cruise"),
+        (Autopilot::Land, "\u{2913} land"),
+        (Autopilot::Off, "\u{25cb} off"),
+    ];
+    let grounds = [("ff/ff/ff", 0x00FF_FFFF), ("fb/f1/c7", 0x00FB_F1C7)];
+    for ((mode, word), (rgb, bg)) in modes.into_iter().flat_map(|m| grounds.map(|g| (m, g))) {
+        // Every message names the palette and the ground.
+        let osc = &format!("{mode:?} {rgb}");
         let (mut app, wid, session) = glass(120);
         {
             let term = app.pool.get(session).unwrap().term.clone();
             crate::term_lock(&term)
-                .process(format!("\x1b]11;rgb:{osc}\x1b\\\x1b]10;rgb:20/20/20\x1b\\").as_bytes());
+                .process(format!("\x1b]11;rgb:{rgb}\x1b\\\x1b]10;rgb:20/20/20\x1b\\").as_bytes());
         }
         let host = supervise(&mut app, session);
+        if mode != Autopilot::Cruise {
+            assert!(app.set_session_autopilot(
+                session,
+                Some(mode),
+                crate::autopilot::Surface::Chip
+            ));
+        }
         let _ = aterm_effects::harness_card::take_line_ink_solves();
-        frame(&mut app, wid);
-        let (under, over) = card_marks(&app, wid);
-        assert!(!under.is_empty() && !over.is_empty(), "{osc}");
-        assert!(
-            under
-                .iter()
-                .chain(&over)
-                .all(|m| m.inks.iter().all(|i| i.alpha > 0)),
-            "{osc}: ink, never light"
-        );
-        let p = painted(&app, wid);
-        assert!(
-            !p.decos.is_empty()
-                && p.decos
-                    .iter()
-                    .all(|d| d.blend == DecoBlend::Over && d.alpha == u8::MAX),
-            "{osc}: {:?}",
-            p.decos
-        );
-        assert!(p.ink.len() > 20, "{osc}: the line, {} letters", p.ink.len());
-        for c in &p.ink {
-            let rgb = pack(c.color);
+        let t0 = Instant::now();
+        for t in [0, EPISODE_MS + 1, EPISODE_MS + 1 + 5 * FLOW_STEP_MS] {
+            set_now(Some(t0 + Duration::from_millis(t)));
+            frame(&mut app, wid);
+            let (under, over) = card_marks(&app, wid);
+            assert!(!under.is_empty() && !over.is_empty(), "{osc} {t} ms");
+            let p = painted(&app, wid);
             assert!(
-                contrast(rgb, bg) >= 4.5,
-                "{osc}: {rgb:06x} at {:.2}:1",
-                contrast(rgb, bg)
+                under
+                    .iter()
+                    .chain(&over)
+                    .all(|m| m.inks.iter().all(|i| i.alpha > 0)),
+                "{osc} {t} ms: ink, never light"
             );
+            assert!(
+                !p.decos.is_empty()
+                    && p.decos
+                        .iter()
+                        .all(|d| d.blend == DecoBlend::Over && d.alpha == u8::MAX),
+                "{osc} {t} ms: {:?}",
+                p.decos
+            );
+            assert!(
+                p.ink.len() > 20,
+                "{osc} {t} ms: the line, {} letters",
+                p.ink.len()
+            );
+            for c in &p.ink {
+                let rgb = pack(c.color);
+                assert!(
+                    contrast(rgb, bg) >= 4.5,
+                    "{osc} {t} ms: {rgb:06x} at {:.2}:1",
+                    contrast(rgb, bg)
+                );
+            }
         }
         assert_eq!(
             aterm_effects::harness_card::take_line_ink_solves(),
             0,
             "{osc}: letters solved on their own"
         );
+        assert!(
+            intro_over(&app, wid),
+            "{osc}: CONTROL: the last frame is the flow's"
+        );
+        // The hero word, on the line under the card at its text column.
+        let line_row = strip_rows(&app, wid) + 4;
+        assert!(
+            glass_text(&app, wid, line_row, 0..120)
+                .trim_end()
+                .ends_with(&format!("autopilot {word}")),
+            "{osc}: CONTROL: the card wears {mode:?}"
+        );
+        let start = 11 + LINE_LEAD;
+        let scratch = &app.windows[&wid].input_scratch;
+        let hero = start + 12..start + 17;
+        assert!(
+            scratch.cells[line_row][hero.clone()].iter().all(|c| c.bold),
+            "{osc}: bold on light"
+        );
+        assert!(
+            !scratch.cells[line_row][start].bold,
+            "{osc}: the line's own letters not"
+        );
+        assert!(
+            hero.clone().all(|col| scratch
+                .ink
+                .iter()
+                .any(|i| usize::from(i.row) == line_row && usize::from(i.col) == col)),
+            "{osc}: the hero word inked"
+        );
+        set_now(None);
         host.shutdown_and_join();
     }
 }
@@ -2570,6 +2993,23 @@ fn set_now(t: Option<Instant>) {
     TEST_NOW.with(|now| now.set(t));
 }
 
+/// Close the flow's focus gate on `wid` — the window loses focus — and frame
+/// it: its cards draw their settled frame and hold there.
+fn hold(app: &mut App, wid: WindowId) {
+    app.windows.get_mut(&wid).expect("the window").focused = false;
+    frame(app, wid);
+}
+
+/// Whether no intro is armed or playing on `wid`'s cards: each flows on or is
+/// held (`HarnessCard::intro_live`).
+fn intro_over(app: &App, wid: WindowId) -> bool {
+    app.windows[&wid]
+        .claude_card
+        .entries
+        .iter()
+        .all(|e| !e.card.intro_live())
+}
+
 /// The clock [`set_now`] holds, else the wall clock: what a measured pass's
 /// capture drives its cursor effects with, so a harness window and its bare
 /// twin are extracted at one instant, the card's, however long the machine
@@ -2726,12 +3166,13 @@ fn other_wakes_never_push_an_episode_frame_on() {
     host.shutdown_and_join();
 }
 
-/// AN EPISODE PACES ITSELF, whatever else wakes the loop: under a stream of
+/// AN INTRO PACES ITSELF, whatever else wakes the loop: under a stream of
 /// wakes faster than its frame (a 120 Hz display's, the pointer's, another
 /// pane's output), the window draws at most one card frame a [`FRAME_MS`] —
-/// never one a wake — and the frame that settles the card is the last it
-/// draws. The repaint gate is the loop's: the key is read BEFORE the splice
-/// ticks the card, and a wake that finds it unmoved draws nothing.
+/// never one a wake — and past the intro one a flow step
+/// ([`FLOW_STEP_MS`]: `a_flowing_card_draws_once_a_step_whatever_else_wakes`),
+/// the intro let go. The repaint gate is the loop's: the key is read BEFORE
+/// the splice ticks the card, and a wake that finds it unmoved draws nothing.
 /// CONTROL: the episode still plays (a frame every couple of frame times),
 /// and a key that folded the frame just drawn — the card's fingerprint, as
 /// it once did — draws on every wake (mutation-checked).
@@ -2757,9 +3198,10 @@ fn an_episode_draws_a_frame_a_frame_time_whatever_else_wakes() {
             if key != drawn {
                 drawn = key;
                 frame(&mut app, wid);
-                frames += 1;
-                if t > EPISODE_MS + 100 {
+                if t > EPISODE_MS {
                     late += 1;
+                } else {
+                    frames += 1;
                 }
             }
         }
@@ -2772,10 +3214,25 @@ fn an_episode_draws_a_frame_a_frame_time_whatever_else_wakes() {
             frames >= EPISODE_MS / (2 * FRAME_MS),
             "wakes every {wake_ms} ms: the episode played ({frames} frames)"
         );
-        assert_eq!(late, 0, "wakes every {wake_ms} ms: settled, nothing more");
-        assert_eq!(
-            app.claude_card_deadline(t0 + Duration::from_millis(t)),
-            None
+        // Past the intro, the flow: a frame a step, never one a wake.
+        let steps = 1000 / FLOW_STEP_MS + 2;
+        assert!(
+            late <= steps,
+            "wakes every {wake_ms} ms: {late} flow frames, at most {steps}"
+        );
+        assert!(
+            late >= 1000 / (2 * FLOW_STEP_MS),
+            "wakes every {wake_ms} ms: CONTROL, the card flows ({late} frames)"
+        );
+        let end = t0 + Duration::from_millis(t);
+        assert!(
+            intro_over(&app, wid),
+            "wakes every {wake_ms} ms: the intro let go"
+        );
+        assert_ne!(
+            app.claude_card_deadline(end),
+            Some(end + Duration::from_millis(FRAME_MS)),
+            "wakes every {wake_ms} ms: no intro frame wanted"
         );
         set_now(None);
         host.shutdown_and_join();
@@ -2874,6 +3331,7 @@ fn serious_mode_moves_a_settled_cards_key() {
     frame(&mut app, wid);
     set_now(Some(t0 + Duration::from_millis(EPISODE_MS + 1000)));
     frame(&mut app, wid);
+    hold(&mut app, wid);
     let key = app.claude_footer_fp(wid, &plan);
     assert_eq!(app.claude_footer_fp(wid, &plan), key, "settled: constant");
     app.serious_mode = true;
@@ -2888,9 +3346,10 @@ fn serious_mode_moves_a_settled_cards_key() {
     host.shutdown_and_join();
 }
 
-/// AN AUTOPILOT CHANGE ARMS AN EPISODE (§3): a settled card plays again when
-/// its Autopilot moves from Cruise to Land, and when it comes back from Off
-/// (the bare card) to Cruise; a frame with no change arms nothing.
+/// AN AUTOPILOT CHANGE ARMS AN EPISODE (§3): a card past its intro (flowing)
+/// plays its intro again when its Autopilot moves from Cruise to Land, from
+/// Cruise into Off (the white card), and when it comes back from Off to
+/// Cruise; a frame with no change arms nothing.
 #[test]
 fn an_autopilot_change_arms_an_episode() {
     let (mut app, wid, session) = glass(120);
@@ -2903,9 +3362,9 @@ fn an_autopilot_change_arms_an_episode() {
         t += Duration::from_millis(EPISODE_MS + 1000);
         set_now(Some(t));
         frame(app, wid);
-        assert_eq!(app.claude_card_deadline(t), None, "settled");
+        assert!(intro_over(app, wid), "the intro over");
         frame(app, wid);
-        assert_eq!(app.claude_card_deadline(t), None, "no change, no episode");
+        assert!(intro_over(app, wid), "no change, no episode");
         t
     };
     let playing = |app: &App, now: Instant| {
@@ -2919,6 +3378,12 @@ fn an_autopilot_change_arms_an_episode() {
     ));
     frame(&mut app, wid);
     assert!(playing(&app, now), "Cruise to Land plays");
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Cruise),
+        crate::autopilot::Surface::Chip
+    ));
+    frame(&mut app, wid);
     let now = settle(&mut app);
     assert!(app.set_session_autopilot(
         session,
@@ -2926,7 +3391,9 @@ fn an_autopilot_change_arms_an_episode() {
         crate::autopilot::Surface::Chip
     ));
     frame(&mut app, wid);
-    assert!(painted(&app, wid).is_empty(), "Off: bare");
+    assert!(card_drew(&app, wid), "Off: the white card");
+    assert!(playing(&app, now), "Cruise to Off plays");
+    let now = settle(&mut app);
     assert!(app.set_session_autopilot(
         session,
         Some(Autopilot::Cruise),
@@ -2939,13 +3406,14 @@ fn an_autopilot_change_arms_an_episode() {
 }
 
 /// OFF TO CRUISE PLAYS THROUGH THE CLAIM'S GAP, as the real host runs it: Off
-/// stops the session's worker and gives back its claim, and the word goes
-/// back to Cruise tens of milliseconds before the new worker claims again —
-/// a frame drawn in that gap shows the card bare under Cruise. The decorated
-/// frame after the claim still plays the episode. CONTROL: Cruise to Land
-/// under a held claim plays (the arm itself works), and a frame drawn bare
-/// under Cruise with no Off before it (a gap with nothing changed) arms
-/// nothing once the claim is back.
+/// stops the session's worker and gives back its claim — the card wears
+/// white with no claim — and the word goes back to Cruise tens of
+/// milliseconds before the new worker claims again: a frame drawn in that
+/// gap shows the card bare under Cruise. The decorated frame after the claim
+/// still plays the episode. CONTROL: Cruise to Land under a held claim plays
+/// (the arm itself works), and a frame drawn bare under Cruise with no Off
+/// before it (a gap with nothing changed) arms nothing once the claim is
+/// back.
 #[test]
 fn off_to_cruise_plays_though_the_claim_lands_a_frame_later() {
     let (mut app, wid, session) = glass(120);
@@ -2978,7 +3446,7 @@ fn off_to_cruise_plays_though_the_claim_lands_a_frame_later() {
         set_now(Some(t));
         frame(app, wid);
         frame(app, wid);
-        assert_eq!(app.claude_card_deadline(t), None, "settled");
+        assert!(intro_over(app, wid), "the intro over");
         t
     };
     let playing = |app: &App, now: Instant| {
@@ -3008,7 +3476,13 @@ fn off_to_cruise_plays_though_the_claim_lands_a_frame_later() {
     ));
     release();
     frame(&mut app, wid);
-    assert!(painted(&app, wid).is_empty(), "Off: bare");
+    assert!(card_drew(&app, wid), "Off, claim released: the white card");
+    assert!(
+        playing(&app, now),
+        "Cruise to Off plays, the claim released"
+    );
+    // Its own episode played out, so the next is Off to Cruise's alone.
+    let now = settle(&mut app);
     // Back to Cruise: a frame in the gap before the new worker's claim.
     assert!(app.set_session_autopilot(
         session,
@@ -3016,13 +3490,10 @@ fn off_to_cruise_plays_though_the_claim_lands_a_frame_later() {
         crate::autopilot::Surface::Chip
     ));
     frame(&mut app, wid);
-    assert!(
-        painted(&app, wid).is_empty(),
-        "the gap: Cruise, unclaimed, bare"
-    );
+    assert!(!card_drew(&app, wid), "the gap: Cruise, unclaimed, bare");
     reclaim();
     frame(&mut app, wid);
-    assert!(!painted(&app, wid).is_empty(), "claimed: decorated");
+    assert!(card_drew(&app, wid), "claimed: decorated");
     assert!(
         playing(&app, now),
         "Off to Cruise plays though the claim came late"
@@ -3031,15 +3502,12 @@ fn off_to_cruise_plays_though_the_claim_lands_a_frame_later() {
     let now = settle(&mut app);
     release();
     frame(&mut app, wid);
-    assert!(painted(&app, wid).is_empty(), "unclaimed: bare");
+    assert!(!card_drew(&app, wid), "unclaimed: bare");
     reclaim();
     frame(&mut app, wid);
-    assert!(!painted(&app, wid).is_empty(), "claimed again: decorated");
-    assert_eq!(
-        app.claude_card_deadline(now),
-        None,
-        "the same mode back: no episode"
-    );
+    assert!(card_drew(&app, wid), "claimed again: decorated");
+    assert!(intro_over(&app, wid), "the same mode back: no episode");
+    assert!(!playing(&app, now), "the same mode back: no intro frame");
     set_now(None);
     host.shutdown_and_join();
 }
@@ -3058,7 +3526,7 @@ fn tab_status_off_hides_every_card() {
     assert!(app.claude_card_deadline(t0).is_some(), "CONTROL");
     app.config.tab_status = Some(false);
     frame(&mut app, wid);
-    assert!(painted(&app, wid).is_empty());
+    assert!(!card_drew(&app, wid));
     assert!(!app.windows[&wid].claude_card.any_shown());
     assert_eq!(app.claude_card_deadline(t0), None);
     let strip = strip_rows(&app, wid);
@@ -3343,8 +3811,11 @@ struct PassCost {
     reads: usize,
     /// Sessions' Autopilot reads (one metadata lock each).
     autopilot_reads: usize,
-    /// Card lines whose ink was laid (not kept).
+    /// Card lines and banners whose ink was laid (not kept).
     line_inks: usize,
+    /// Update notices scanned for under a card (not kept from the last
+    /// rebuild of the pane's text).
+    notice_reads: usize,
     /// Session timeline locks the splice took.
     timeline_locks: usize,
     /// Session timeline locks the dev card probe took (its rows: one a pane
@@ -3384,6 +3855,7 @@ fn pass_cost(app: &mut App, wid: WindowId) -> PassCost {
         crate::work_counts::take_card_reads(),
         crate::work_counts::take_autopilot_reads(),
         crate::work_counts::take_card_line_inks(),
+        crate::work_counts::take_card_notice_reads(),
         crate::work_counts::take_footer_timeline_locks(),
         crate::work_counts::take_card_probe_locks(),
         crate::work_counts::take_pane_text_rebuilds(),
@@ -3407,6 +3879,7 @@ fn pass_cost(app: &mut App, wid: WindowId) -> PassCost {
         reads: crate::work_counts::take_card_reads(),
         autopilot_reads: crate::work_counts::take_autopilot_reads(),
         line_inks: crate::work_counts::take_card_line_inks(),
+        notice_reads: crate::work_counts::take_card_notice_reads(),
         timeline_locks: crate::work_counts::take_footer_timeline_locks(),
         probe_locks: crate::work_counts::take_card_probe_locks(),
         text_rebuilds: crate::work_counts::take_pane_text_rebuilds(),
@@ -3430,7 +3903,9 @@ fn keystroke(app: &mut App, wid: WindowId, session: u64, key: u8) {
 }
 
 /// The card fixture played out to its SETTLED frame on the test clock:
-/// decorated at `t0`, its episode drawn, then the frame it owes.
+/// decorated at `t0`, its intro drawn, then the flow's first frame, then —
+/// the window losing focus, which closes the flow's gate — the settled frame
+/// it holds at.
 fn settled_glass(cols: u16, t0: Instant) -> (App, WindowId, u64, crate::harness_host::HostHandle) {
     let (mut app, wid, session) = glass(cols);
     let host = supervise(&mut app, session);
@@ -3440,6 +3915,7 @@ fn settled_glass(cols: u16, t0: Instant) -> (App, WindowId, u64, crate::harness_
     frame(&mut app, wid);
     set_now(Some(t0 + Duration::from_millis(EPISODE_MS + 1)));
     frame(&mut app, wid);
+    hold(&mut app, wid);
     let ws = &app.windows[&wid];
     assert!(ws.claude_card.any_shown(), "the card is on show");
     assert!(
@@ -3450,11 +3926,12 @@ fn settled_glass(cols: u16, t0: Instant) -> (App, WindowId, u64, crate::harness_
 }
 
 /// The same screen with no harness host: no chip drawn, no card wrapped —
-/// the footer's own cost, which the harness's is measured against.
+/// the footer's own cost, which the harness's is measured against — its
+/// window unfocused as [`settled_glass`]'s is.
 fn bare_glass(cols: u16) -> (App, WindowId, u64) {
     let (mut app, wid, session) = glass(cols);
     frame(&mut app, wid);
-    frame(&mut app, wid);
+    hold(&mut app, wid);
     assert!(
         !app.windows[&wid].claude_card.any_shown(),
         "no card wrapped"
@@ -3515,6 +3992,7 @@ fn a_settled_card_at_rest_costs_the_frame_nothing() {
     // NEGATIVE CONTROL: focus regained, the episode is drawn on the clock.
     let back = t0 + Duration::from_secs(60);
     set_now(Some(back));
+    app.windows.get_mut(&wid).expect("the window").focused = true;
     app.rearm_claude_cards(wid, || back);
     let replayed = pass_cost(&mut app, wid);
     assert_eq!(replayed.ticks, 1, "CONTROL: an episode frame is drawn");
@@ -3550,8 +4028,8 @@ fn a_settled_card_at_rest_costs_the_frame_nothing() {
 }
 
 /// AN INLINE SCROLL OF A SETTLED CARD DRAWS NOTHING (card engine §4.8):
-/// while Claude's inline output scrolls a card at rest up the screen a row
-/// a frame, the card is read and laid out anew at its new place — and
+/// while Claude's inline output scrolls a HELD card (its window out of
+/// focus: the settled frame) up the screen a row a frame, the card is read and laid out anew at its new place — and
 /// REPLAYED there: the same two contents (`Arc::ptr_eq`) at an origin a row
 /// up, every mark exactly a row up, and the pass draws no frame, seals or
 /// copies no fx content, builds no art and reads no clock for the card.
@@ -3576,6 +4054,7 @@ fn an_inline_scroll_replays_the_settled_card_at_its_new_place() {
         set_now(Some(t0 + Duration::from_millis(t)));
         frame(&mut app, wid);
     }
+    hold(&mut app, wid);
     assert!(
         app.windows[&wid].claude_card.entries[0].card.at_rest(),
         "settled"
@@ -3765,17 +4244,20 @@ fn a_published_drawer_queues_the_cards_arts() {
 /// THE PINNED CONSTELLATION (`card seed=`, a debug build's
 /// `crate::card_verb`): two cards of different processes — each card's
 /// stars seeded by its session and its process — draw the very same settled
-/// frame once pinned to one seed, and a pin re-arms the card on show, whose
+/// frame (held, the window out of focus, after the intro) once pinned to
+/// one seed, and a pin re-arms the card on show, whose
 /// episode settles on the same frame again. CONTROLS: unpinned, the two
 /// cards' stars differ; pinned to two seeds, one card's differ.
 #[test]
 fn a_pinned_seed_gives_every_card_the_same_stars() {
     use crate::card_verb::{Asked, line};
     let settled = |app: &mut App, wid: WindowId, t0: Instant| {
+        app.windows.get_mut(&wid).expect("the window").focused = true;
         for t in [0, FRAME_MS, EPISODE_MS + 1] {
             set_now(Some(t0 + Duration::from_millis(t)));
             frame(app, wid);
         }
+        hold(app, wid);
         assert!(
             app.windows[&wid]
                 .claude_card
@@ -3956,6 +4438,10 @@ fn costs_the_floor(
         // pass's allocation count sees it only when the stream outgrows its
         // capacity.
         assert_eq!(
+            app.0.windows[&wid].input_scratch.fx_layers, layers,
+            "{what} {i}: the card's two layers on the frame, none left behind"
+        );
+        assert_eq!(
             app.0.windows[&wid].input_scratch.fx_layers.len(),
             stream,
             "{what} {i}: the card's light once, no copy of the last frame's"
@@ -3999,6 +4485,8 @@ fn a_keystroke_under_a_settled_card_costs_the_frame_nothing() {
     let (mut app, wid, session, host) = settled_glass(120, t0);
     let back = t0 + Duration::from_secs(60);
     set_now(Some(back));
+    // Focus regained.
+    app.windows.get_mut(&wid).expect("the window").focused = true;
     app.rearm_claude_cards(wid, || back);
     keystroke(&mut app, wid, session, b'!');
     let playing = pass_cost(&mut app, wid);
@@ -4074,6 +4562,9 @@ fn a_split_composed_every_frame_costs_the_card_nothing() {
         frame(&mut app, wid);
         frame(&mut bare, bare_wid);
     }
+    // Held: both windows unfocused, the card at its settled frame.
+    hold(&mut app, wid);
+    hold(&mut bare, bare_wid);
     assert!(
         !marks(&app, wid, FxSlot::Under).is_empty(),
         "the card is on the glass"
@@ -4397,6 +4888,8 @@ struct CardGlass {
     ink: Vec<InkCell>,
     decos: Vec<WordDecoration>,
     lines: Vec<(usize, usize, Vec<RenderCell>)>,
+    /// The banner's rows over Claude's update notice.
+    notices: Vec<(usize, usize, Vec<RenderCell>)>,
 }
 
 fn card_glass(app: &App, wid: WindowId) -> CardGlass {
@@ -4410,11 +4903,17 @@ fn card_glass(app: &App, wid: WindowId) -> CardGlass {
             .lines()
             .map(|l| (l.frame_row, l.col, l.cells.clone()))
             .collect(),
+        notices: app.windows[&wid]
+            .claude_card
+            .notice_edits()
+            .map(|(row, col, cells, _)| (row, col, cells.to_vec()))
+            .collect(),
     }
 }
 
-/// The card a FRESH window `cols` wide draws, settled, over the screen
-/// `paint` draws: what a card kept across frames must be, bit for bit.
+/// The card a FRESH window `cols` wide draws, settled (held, as
+/// [`settled_glass`]'s), over the screen `paint` draws: what a card kept
+/// across frames must be, bit for bit.
 fn fresh_card(cols: u16, paint: &dyn Fn(&App, u64)) -> CardGlass {
     let (mut app, wid, session) = glass(cols);
     paint(&app, session);
@@ -4424,6 +4923,7 @@ fn fresh_card(cols: u16, paint: &dyn Fn(&App, u64)) -> CardGlass {
         set_now(Some(t0 + Duration::from_millis(t)));
         frame(&mut app, wid);
     }
+    hold(&mut app, wid);
     let glass = card_glass(&app, wid);
     host.shutdown_and_join();
     glass
@@ -4444,7 +4944,10 @@ fn fresh_card(cols: u16, paint: &dyn Fn(&App, u64)) -> CardGlass {
 /// glyph turns wide or narrow again with as many chars (the same place: only
 /// the glyph's spacer cell says the row is a cell longer) is laid anew; a
 /// newer card printed below, the card scrolled, its own words edited and a
-/// resize read it anew; and the pass after each keeps what it made. An
+/// resize read it anew; Claude's update notice under the box lays the card
+/// anew (its air) and wears the banner a fresh window wears, and the notice
+/// with other counts is scanned again and laid out not; and the pass after
+/// each keeps what it made. An
 /// anchor right of where the line goes, or right of the box over it, is past
 /// what the layout reads, and costs nothing.
 /// CONTROL: the comparisons are not vacuous — the line leaves the row under
@@ -4484,6 +4987,14 @@ fn a_change_the_card_reads_lays_it_as_a_fresh_window_would() {
     composer[base.len() - 3] = "\u{276F} keep going".into();
     let mut output = base.clone();
     output[9] = "\u{23FA} Here is what changed in the footer.".into();
+    // Claude's update notice under the card (the measured rows), and the
+    // same with other counts: the scan reads it again, the layout's cells
+    // (the air's, up to the summary's first letter) are the same, and so is
+    // the banner.
+    let update_notice = notice_screen(24, 120, &notice_rows()[1]);
+    let mut recounted = update_notice.clone();
+    recounted[NOTICE_TOP] = recounted[NOTICE_TOP].replace("Got 66", "Got 67");
+    assert_ne!(recounted, update_notice, "recounted");
     // Each step: what it is, the screen's rows, bytes painted over them, the
     // readings and layouts its frame costs, and whether the card moved from
     // the settled one.
@@ -4532,6 +5043,28 @@ fn a_change_the_card_reads_lays_it_as_a_fresh_window_would() {
             edit(5, "  Get to finished work sooner".into()),
             String::new(),
             (0, 1),
+            true,
+        ),
+        ("back", base.clone(), String::new(), (0, 1), false),
+        (
+            "Claude's update notice under the box",
+            update_notice.clone(),
+            String::new(),
+            (0, 1),
+            true,
+        ),
+        (
+            "its summary reworded past the box's air",
+            recounted,
+            String::new(),
+            (0, 0),
+            true,
+        ),
+        (
+            "the update notice again",
+            update_notice,
+            String::new(),
+            (0, 0),
             true,
         ),
         ("back", base.clone(), String::new(), (0, 1), false),
@@ -4743,6 +5276,7 @@ fn a_change_in_a_split_lays_the_card_as_a_fresh_split_would() {
             set_now(Some(t0 + Duration::from_millis(t)));
             frame(&mut app, wid);
         }
+        hold(&mut app, wid);
         let glass = card_glass(&app, wid);
         host.shutdown_and_join();
         glass
@@ -4754,6 +5288,7 @@ fn a_change_in_a_split_lays_the_card_as_a_fresh_split_would() {
         set_now(Some(t0 + Duration::from_millis(t)));
         frame(&mut app, wid);
     }
+    hold(&mut app, wid);
     let settled = card_glass(&app, wid);
     assert!(
         settled.layers.len() == 2 && settled.layers.iter().all(|l| !l.items.is_empty()),
@@ -4858,8 +5393,8 @@ fn a_change_in_a_split_lays_the_card_as_a_fresh_split_would() {
 /// the window may come back. Past the episode and its settle grace the card
 /// wants no frame at any later instant until a splice ticks it, and the
 /// first wake that finds so lets it go: every wake after costs no clock read
-/// and asks the window server nothing. Shown again, its frame settles the
-/// card; focus regained plays it again.
+/// and asks the window server nothing. Shown again, its frame lets the intro
+/// go and the card flows on; focus regained plays the intro again.
 /// CONTROLS: mid-episode the hidden window's frame is wanted and the judges
 /// ask (two clock reads a wake); one shown again mid-episode is due at once;
 /// and without the let-go every later wake reads the clock twice, for good
@@ -4917,19 +5452,24 @@ fn a_window_hidden_mid_episode_costs_the_wakes_nothing() {
         );
     }
     assert!(app.windows[&wid].claude_card.any_shown(), "still on show");
-    // Shown again: its frame draws the card settled, and it stays at rest.
+    // Shown again: its frame lets the intro go, and the card flows on.
     hide(&mut app, false);
     set_now(Some(at(past + 1000)));
     frame(&mut app, wid);
+    assert!(intro_over(&app, wid), "the intro let go");
     assert!(
         app.windows[&wid]
             .claude_card
             .entries
             .iter()
-            .all(|e| e.card.at_rest()),
-        "settled"
+            .all(|e| e.card.flowing(at(past + 1000))),
+        "flowing"
     );
-    assert_eq!(wake(&mut app, at(past + 1100)), ((vec![], None), 0, 0));
+    assert_ne!(
+        app.claude_card_deadline(at(past + 1000)),
+        Some(at(past + 1000 + FRAME_MS)),
+        "no intro frame wanted"
+    );
     // Focus regained: the episode again.
     let back = at(past + 2000);
     app.rearm_claude_cards(wid, || back);
@@ -5048,6 +5588,1940 @@ fn a_timer_weekday_change_moves_the_footer_key_with_its_card_words() {
         before_key,
         "TIMER_WEEKDAY_DISPLAY_MUST_MOVE_FOOTER_KEY"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The flow (owner, 2026-10-19: "Make the rainbow at the banner continue to
+// shimmer and flow continuously, which is also aligned with how the claude
+// alien shimmers. emphasize aterm in the banner.")
+// ---------------------------------------------------------------------------
+
+/// A card on `glass(120)` past its intro on the test clock: decorated at
+/// `t0`, its first flow frame drawn at `t0 + at_ms`.
+fn flowing_glass(t0: Instant, at_ms: u64) -> (App, WindowId, u64, crate::harness_host::HostHandle) {
+    let (mut app, wid, session) = glass(120);
+    let host = supervise(&mut app, session);
+    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    for t in [0, at_ms] {
+        set_now(Some(t0 + Duration::from_millis(t)));
+        frame(&mut app, wid);
+    }
+    assert!(
+        app.windows[&wid]
+            .claude_card
+            .entries
+            .iter()
+            .all(|e| e.card.flowing(t0 + Duration::from_millis(at_ms))),
+        "flowing"
+    );
+    (app, wid, session, host)
+}
+
+/// THE FLOW PACES ITSELF, whatever else wakes the loop: under a stream of
+/// wakes faster than its step (a 120 Hz display's, the pointer's, another
+/// pane's output), over two whole ripple cycles, a flowing card draws at most
+/// one frame a step ([`FLOW_STEP_MS`]) — never one a wake — and the repaint
+/// key moves at most once a step. CONTROL: it flows, a frame a step or near
+/// it.
+#[test]
+fn a_flowing_card_draws_once_a_step_whatever_else_wakes() {
+    for wake_ms in [4u64, 8, 20] {
+        let t0 = Instant::now();
+        let from = EPISODE_MS + 1;
+        let (mut app, wid, _, host) = flowing_glass(t0, from);
+        let plan = app.active_visible_leaf_plan(wid).unwrap();
+        let mut drawn = app.claude_footer_fp(wid, &plan);
+        let _ = crate::work_counts::take_card_ticks();
+        let span = 2 * GLINT_PERIOD_MS;
+        let (mut frames, mut t) = (0u64, from);
+        while t < from + span {
+            t += wake_ms;
+            let now = t0 + Duration::from_millis(t);
+            set_now(Some(now));
+            let _ = app.claude_cards_due(now);
+            let key = app.claude_footer_fp(wid, &plan);
+            if key != drawn {
+                drawn = key;
+                frame(&mut app, wid);
+                frames += 1;
+            }
+        }
+        let ticks = crate::work_counts::take_card_ticks() as u64;
+        let steps = span / FLOW_STEP_MS + 1;
+        assert!(
+            frames <= steps && ticks <= steps,
+            "wakes every {wake_ms} ms: {frames} frames, {ticks} drawn, at most {steps}"
+        );
+        assert!(
+            ticks >= steps - 2,
+            "wakes every {wake_ms} ms: CONTROL, it flows ({ticks} drawn)"
+        );
+        set_now(None);
+        host.shutdown_and_join();
+    }
+}
+
+/// STEADY STATE 6 — A FLOWING CARD BETWEEN TWO STEPS (a keystroke's present,
+/// streamed output's, a 120 Hz display's): the splice reads the clock ONCE,
+/// to find the step, and puts the kept step's frame on the glass — the same
+/// two content `Arc`s: no frame drawn, no line inked, no layout, no reading,
+/// no fx content sealed and not one allocation over the bare footer's pass,
+/// frame after frame; the key and the two wake judges read the clock once
+/// each (the card is not at rest). NEGATIVE CONTROL: at the next step's
+/// start the pass draws the step — a frame, its line, its two contents
+/// sealed — on the clock.
+#[test]
+fn a_flowing_card_costs_one_clock_read_and_a_copy_between_steps() {
+    let t0 = Instant::now();
+    // Drawn just inside a step, so the passes after it share it.
+    let k = EPISODE_MS / FLOW_STEP_MS + 1;
+    let (mut app, wid, _, host) = flowing_glass(t0, k * FLOW_STEP_MS + 1);
+    let (mut bare, bare_wid, _) = bare_glass(120);
+    bare.windows.get_mut(&bare_wid).unwrap().focused = true;
+    let layers = card_layers(&app, wid);
+    let pic = card_pic(&app, wid);
+    let line = glass_text(&app, wid, strip_rows(&app, wid) + 4, 0..120);
+    for warm in [3, 5] {
+        set_now(Some(t0 + Duration::from_millis(k * FLOW_STEP_MS + warm)));
+        let _ = pass_cost(&mut app, wid);
+        let _ = pass_cost(&mut bare, bare_wid);
+    }
+    for i in 0..10u64 {
+        let now = t0 + Duration::from_millis(k * FLOW_STEP_MS + 10 + 11 * i);
+        set_now(Some(now));
+        let floor = pass_cost(&mut bare, bare_wid);
+        let cost = pass_cost(&mut app, wid);
+        assert_eq!(
+            (
+                cost.ticks,
+                cost.line_inks,
+                cost.layouts,
+                cost.reads,
+                cost.fx_builds
+            ),
+            (0, 0, 0, 0, 0),
+            "pass {i}: replayed ({cost:?})"
+        );
+        assert_eq!(
+            cost.allocations, floor.allocations,
+            "pass {i}: no allocation"
+        );
+        assert_eq!(
+            cost.clock_reads, 4,
+            "pass {i}: the key, the splice and the two judges, one read each"
+        );
+        assert_eq!(
+            card_layers(&app, wid),
+            layers,
+            "pass {i}: the step's kept contents"
+        );
+        assert_eq!(
+            glass_text(&app, wid, strip_rows(&app, wid) + 4, 0..120),
+            line,
+            "pass {i}: its line"
+        );
+    }
+    // The splice alone: one clock read.
+    let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
+    let _ = crate::work_counts::take_harness_clock_reads();
+    app.splice_claude_footer(wid, &plan, route);
+    assert_eq!(
+        crate::work_counts::take_harness_clock_reads(),
+        1,
+        "the splice reads the clock once"
+    );
+    // NEGATIVE CONTROL: the next step is drawn.
+    set_now(Some(t0 + Duration::from_millis((k + 1) * FLOW_STEP_MS + 1)));
+    let next = pass_cost(&mut app, wid);
+    assert_eq!(
+        (next.ticks, next.line_inks),
+        (1, 1),
+        "CONTROL: the next step drawn, its line inked ({next:?})"
+    );
+    assert_eq!(next.fx_builds, 2, "CONTROL: its two contents sealed");
+    assert_eq!(
+        next.art_builds, 0,
+        "a step is a new palette on the arts its height registered: no art built"
+    );
+    assert_ne!(card_pic(&app, wid), pic, "CONTROL: a new step's glass");
+    set_now(None);
+    host.shutdown_and_join();
+}
+
+/// A GATE REOPENING RESUMES THE FLOW ON THE NEXT WAKE (the resume gap): a
+/// flowing card held by Reduce Motion, or by the load-shed latch, keys
+/// constant and arms no wake; the gate reopening moves the repaint key — the
+/// motion verdict is in the card's term — so the redraw the reopening asks
+/// for is not gated out, and its frame flows again: its next step wanted on
+/// the ripple's grid. CONTROL: held, the key holds over a second of
+/// instants. Mutation-checked: a card term without the motion verdict
+/// leaves the key unmoved on the reopening, and fails here.
+#[test]
+fn a_gate_reopening_moves_the_key_and_the_card_flows() {
+    for gate in ["reduce motion", "load shed"] {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let (mut app, wid, _, host) = flowing_glass(t0, EPISODE_MS + 1);
+        let plan = app.active_visible_leaf_plan(wid).unwrap();
+        let shut = |app: &mut App, shut: bool| match gate {
+            "reduce motion" => app.system_reduce_motion = shut,
+            _ => app.perf_reduced = shut,
+        };
+        shut(&mut app, true);
+        set_now(Some(at(EPISODE_MS + 100)));
+        frame(&mut app, wid);
+        assert!(
+            app.windows[&wid]
+                .claude_card
+                .entries
+                .iter()
+                .all(|e| e.card.at_rest()),
+            "{gate}: held"
+        );
+        let held = app.claude_footer_fp(wid, &plan);
+        for i in 0..100u64 {
+            let t = at(EPISODE_MS + 100 + 10 * i);
+            set_now(Some(t));
+            assert_eq!(
+                app.claude_footer_fp(wid, &plan),
+                held,
+                "{gate}: CONTROL {i}"
+            );
+            assert_eq!(app.claude_card_deadline(t), None, "{gate}: no wake {i}");
+        }
+        shut(&mut app, false);
+        let back_ms = EPISODE_MS + 1500;
+        set_now(Some(at(back_ms)));
+        assert_ne!(
+            app.claude_footer_fp(wid, &plan),
+            held,
+            "{gate}: reopened, the key moves"
+        );
+        frame(&mut app, wid);
+        let k = back_ms / FLOW_STEP_MS;
+        assert!(
+            app.windows[&wid]
+                .claude_card
+                .entries
+                .iter()
+                .all(|e| e.card.flowing(at(back_ms))),
+            "{gate}: it flows again"
+        );
+        assert_eq!(
+            app.claude_card_deadline(at(back_ms)),
+            Some(at((k + 1) * FLOW_STEP_MS + FLOW_SLACK_MS)),
+            "{gate}: the next step wanted"
+        );
+        set_now(None);
+        host.shutdown_and_join();
+    }
+}
+
+/// The measured workspace card (Claude Code 2.1.302, 120 columns): the
+/// mascot's wand `✦` at pane cell (10, 0), the card's text at column 13.
+fn workspace_glass() -> (App, WindowId, u64, crate::harness_host::HostHandle) {
+    let text =
+        include_str!("../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-120col.txt");
+    let screen: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let session = app.focused_session_id(wid).expect("the front session");
+    assert!(app.apply_term_resize(wid, 24, 120));
+    publish(&app, session, "2.1.302");
+    feed(&app, session, &screen);
+    let host = supervise(&mut app, session);
+    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    (app, wid, session, host)
+}
+
+/// `ch` in `rgb` at pane cell `(col, row)` of `session`, the cursor kept.
+fn paint_cell(app: &App, session: u64, (col, row): (usize, usize), ch: char, rgb: [u8; 3]) {
+    let bytes = format!(
+        "\x1b7\x1b[{};{}H\x1b[38;2;{};{};{}m{ch}\x1b[0m\x1b8",
+        row + 1,
+        col + 1,
+        rgb[0],
+        rgb[1],
+        rgb[2]
+    );
+    let term = app.pool.get(session).expect("session").term.clone();
+    crate::term_lock(&term).process(bytes.as_bytes());
+}
+
+/// THE PHASE LOCK ON THE GLASS (lab M1–M3): the card's ripple runs on
+/// Claude's own where Claude flares its wand, and only its fullscreen
+/// renderer's key-on mascot does. The wand's `✦` flaring in either of
+/// Claude's inks, on a dark ground and on a light one (Claude picks its ink
+/// by its own theme, not the ground), seen on a frame that reads the clock
+/// anyway, locks the ring train: a ring's birth, a step's start, is put
+/// `FLARE_STEP_LEAD_MS` before the frame that saw it. Inside the intro,
+/// before the glints rise, the grid takes that whole. Held lit, the flare
+/// locks nothing more (an edge, not a level). Flowing, lit again 20 ms
+/// after the card's next ring birth, the grid slews a quarter of that (5
+/// ms), and a second off, one step. Then the wand at rest (Claude blurred,
+/// or its key off) locks nothing, and the grid free-runs where the lock
+/// left it. Claude's other repaints here come on the card's beat (a step's
+/// start plus the lead), so the step lock they also drive
+/// (`the_shimmer_locks_the_flows_steps`) moves nothing. CONTROLS:
+/// free-running from the first arm, the wand in its measured resting
+/// `#ffcc68` or its orange flicker locks nothing, and neither does the
+/// flare's colour on the plain card's wand cell, which holds no `✦`.
+/// Mutation-checked: a splice that sees the flare and locks nothing fails
+/// here.
+#[test]
+fn the_wand_flare_locks_the_ring_train() {
+    use aterm_effects::harness_card::FLARE_STEP_LEAD_MS;
+    let wand = (10, 0);
+    let rest = [255, 204, 104];
+    let flicker = [240, 128, 72];
+    let next =
+        |grid: u64, t: u64| grid + ((t - grid) / FLOW_STEP_MS + 1) * FLOW_STEP_MS + FLOW_SLACK_MS;
+    let lag = FLARE_STEP_LEAD_MS;
+    // The first instant at or after `t` on the beat of `grid`: a step's
+    // start plus the lead, where a repaint's step lock finds no error.
+    let beat = |grid: u64, t: u64| {
+        let from = grid + lag;
+        from + (t.saturating_sub(from)).div_ceil(FLOW_STEP_MS) * FLOW_STEP_MS
+    };
+    for light in [false, true] {
+        for flare in [aterm_phase::WAND_FLARE_DARK, aterm_phase::WAND_FLARE_LIGHT] {
+            let case = format!(
+                "{flare:?} on a {} ground",
+                if light { "light" } else { "dark" }
+            );
+            let (mut app, wid, session, host) = workspace_glass();
+            if light {
+                let term = app.pool.get(session).unwrap().term.clone();
+                crate::term_lock(&term)
+                    .process(b"\x1b]11;rgb:f8/fa/fd\x1b\\\x1b]10;rgb:20/20/20\x1b\\");
+            }
+            let t0 = Instant::now();
+            let at = |ms: u64| t0 + Duration::from_millis(ms);
+            let step = |app: &mut App, t: u64, ink: Option<[u8; 3]>| {
+                if let Some(ink) = ink {
+                    paint_cell(app, session, wand, '\u{2726}', ink);
+                }
+                set_now(Some(at(t)));
+                frame(app, wid);
+            };
+            step(&mut app, 0, Some(rest));
+            // In the intro, its glints not up: a step's start the lead
+            // before it, whole.
+            step(&mut app, 1000, Some(flare));
+            let grid = 1000 - lag;
+            step(&mut app, 1050, None);
+            step(&mut app, beat(grid, 1100), Some(rest));
+            step(&mut app, EPISODE_MS + 50, None);
+            assert_eq!(
+                app.claude_card_deadline(at(EPISODE_MS + 50)),
+                Some(at(next(grid, EPISODE_MS + 50))),
+                "{case}: adopted in the intro, the flow on the flare's grid"
+            );
+            // Flowing: 20 ms after the second ring birth on, a quarter.
+            let seen = grid + 2 * GLINT_PERIOD_MS + 20 + lag;
+            step(&mut app, seen, Some(flare));
+            let grid = grid + 5;
+            assert_eq!(
+                app.claude_card_deadline(at(seen)),
+                Some(at(next(grid, seen))),
+                "{case}: slewed by 5 ms"
+            );
+            step(&mut app, seen + 50, None);
+            assert_eq!(
+                app.claude_card_deadline(at(seen + 50)),
+                Some(at(next(grid, seen + 50))),
+                "{case}: held lit, the same grid"
+            );
+            step(&mut app, beat(grid, seen + 300), Some(rest));
+            // A second off: one step.
+            let seen = grid + 3 * GLINT_PERIOD_MS + 1000 + lag;
+            step(&mut app, seen, Some(flare));
+            let grid = grid + FLOW_STEP_MS;
+            assert_eq!(
+                app.claude_card_deadline(at(seen)),
+                Some(at(next(grid, seen))),
+                "{case}: a step toward it"
+            );
+            // The wand at rest from here: the grid free-runs.
+            step(&mut app, beat(grid, seen + 300), Some(rest));
+            let later = beat(grid, seen + 5 * GLINT_PERIOD_MS + 77);
+            step(&mut app, later, Some(flicker));
+            assert_eq!(
+                app.claude_card_deadline(at(later)),
+                Some(at(next(grid, later))),
+                "{case}: free-running where the lock left it"
+            );
+            set_now(None);
+            host.shutdown_and_join();
+        }
+    }
+    // CONTROL: the wand at rest, or in its flicker, locks nothing.
+    for ink in [rest, flicker] {
+        let (mut app, wid, session, host) = workspace_glass();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        for t in [0, 1000, EPISODE_MS + 50] {
+            paint_cell(&app, session, wand, '\u{2726}', ink);
+            set_now(Some(at(t)));
+            frame(&mut app, wid);
+        }
+        paint_cell(&app, session, wand, '\u{2726}', ink);
+        set_now(Some(at(7100)));
+        frame(&mut app, wid);
+        assert_eq!(
+            app.claude_card_deadline(at(7100)),
+            Some(at(next(0, 7100))),
+            "CONTROL: {ink:?}, free-running on the first arm's grid"
+        );
+        set_now(None);
+        host.shutdown_and_join();
+    }
+    // CONTROL: the flare's colour on the plain card's wand cell (no `✦`
+    // there: a space past the banner row's blocks) and on its last block,
+    // painted on the beat.
+    let t0 = Instant::now();
+    let (mut app, wid, session, host) = flowing_glass(t0, EPISODE_MS + 50);
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let place = decorated(&app, wid).expect("the plain card");
+    let cell = place.wand().expect("its wand cell");
+    paint_cell(&app, session, cell, ' ', aterm_phase::WAND_FLARE_DARK);
+    paint_cell(
+        &app,
+        session,
+        (cell.0 - 1, cell.1),
+        '\u{2588}',
+        aterm_phase::WAND_FLARE_DARK,
+    );
+    let t = beat(0, 7100);
+    set_now(Some(at(t)));
+    frame(&mut app, wid);
+    assert!(decorated(&app, wid).is_some(), "CONTROL: still decorated");
+    assert_eq!(
+        app.claude_card_deadline(at(t)),
+        Some(at(next(0, t))),
+        "CONTROL: no wand, free-running"
+    );
+    set_now(None);
+    host.shutdown_and_join();
+}
+
+/// THE SHIMMER LOCKS THE FLOW'S STEPS (design §10.6.11): on the workspace
+/// card, flowing on its first arm's grid, each repaint of Claude's mascot
+/// that is no flare (its ink changed under the same wand) puts a step's
+/// start `FLARE_STEP_LEAD_MS` before the frame that saw it, a quarter of
+/// the error at a time: a repaint 60 ms into a step moves the grid +10, the
+/// next a step later +7 (the 30 ms left, a quarter), so the card's own wake comes
+/// later each time and Claude's next repaint draws the step first. A frame
+/// that repainted nothing locks nothing. NEGATIVE CONTROL: a frame that
+/// changed a cell under the card, and no cell of the mascot, locks nothing.
+#[test]
+fn the_shimmer_locks_the_flows_steps() {
+    use aterm_effects::harness_card::FLARE_STEP_LEAD_MS;
+    let next =
+        |grid: u64, t: u64| grid + ((t - grid) / FLOW_STEP_MS + 1) * FLOW_STEP_MS + FLOW_SLACK_MS;
+    let (mut app, wid, session, host) = workspace_glass();
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let inks = [[240, 128, 72], [255, 204, 104], [250, 160, 90]];
+    let body = (3, 1);
+    let beat = |t: u64| {
+        let from = FLARE_STEP_LEAD_MS;
+        from + (t.saturating_sub(from)).div_ceil(FLOW_STEP_MS) * FLOW_STEP_MS
+    };
+    for (i, t) in [0, beat(1000), beat(EPISODE_MS + 50)]
+        .into_iter()
+        .enumerate()
+    {
+        paint_cell(&app, session, body, '\u{2588}', inks[i % 2]);
+        set_now(Some(at(t)));
+        frame(&mut app, wid);
+    }
+    let t = beat(EPISODE_MS + 50);
+    assert_eq!(
+        app.claude_card_deadline(at(t)),
+        Some(at(next(0, t))),
+        "CONTROL: the repaints came on the beat"
+    );
+    // Flowing: a repaint 60 ms into step 60 — the lead plus 40 late.
+    let seen = 60 * FLOW_STEP_MS + FLARE_STEP_LEAD_MS + 40;
+    paint_cell(&app, session, body, '\u{2588}', inks[2]);
+    set_now(Some(at(seen)));
+    frame(&mut app, wid);
+    assert_eq!(
+        app.claude_card_deadline(at(seen)),
+        Some(at(next(10, seen))),
+        "a quarter of 40: +10"
+    );
+    set_now(Some(at(seen + 20)));
+    frame(&mut app, wid);
+    assert_eq!(
+        app.claude_card_deadline(at(seen + 20)),
+        Some(at(next(10, seen + 20))),
+        "a frame that repainted nothing locks nothing"
+    );
+    let seen = seen + FLOW_STEP_MS;
+    paint_cell(&app, session, body, '\u{2588}', inks[0]);
+    set_now(Some(at(seen)));
+    frame(&mut app, wid);
+    assert_eq!(
+        app.claude_card_deadline(at(seen)),
+        Some(at(next(17, seen))),
+        "the 30 ms left, a quarter: +7"
+    );
+    paint_cell(&app, session, (20, 4), 'x', inks[1]);
+    let seen = seen + FLOW_STEP_MS;
+    set_now(Some(at(seen)));
+    frame(&mut app, wid);
+    assert_eq!(
+        app.claude_card_deadline(at(seen)),
+        Some(at(next(17, seen))),
+        "NEGATIVE CONTROL: no mascot cell changed"
+    );
+    set_now(None);
+    host.shutdown_and_join();
+}
+
+/// EVERY RUNG OF THE LINE NAMES ATERM (owner, 2026-10-19: "emphasize aterm in
+/// the banner"): under every Autopilot, every end (a task's, an armed
+/// timer's, on its day and another) and for Claude, agy and muse, every
+/// rung's words hold the hero word as a whole word at the same cells
+/// ([`hero_cells`]: `enhanced by ` before it on a versioned rung, nothing on
+/// a short one), and the short rungs (`aterm harness · ∞ cruise`, `aterm ·
+/// ∞ cruise`, `aterm ∞`) are its last three, narrowest last. NEGATIVE
+/// CONTROLS: a word that only contains it, or none, has no hero; a wide
+/// glyph before it counts two cells.
+#[test]
+fn every_rung_of_the_line_names_aterm() {
+    let ends = [
+        LineEnd::Mode,
+        LineEnd::Landed,
+        LineEnd::CruiseUntil(six_pm(false)),
+        LineEnd::CruiseUntil(six_pm(true)),
+    ];
+    let mut rungs = 0;
+    for view in AutopilotView::ALL {
+        for end in ends {
+            for rows_kind in [3, 4, 1] {
+                let texts = line_texts_for(rows_kind, view, end);
+                for (i, text) in texts.iter().enumerate() {
+                    let short = i + 3 >= texts.len();
+                    assert_eq!(!text.starts_with("enhanced by "), short, "{text:?}");
+                    let at = if short { 0 } else { 12 };
+                    assert_eq!(hero_cells(text), Some(at..at + 5), "{text:?}");
+                    let word: String = text.chars().skip(usize::from(at)).take(5).collect();
+                    assert_eq!(word, HERO_WORD, "{text:?}");
+                    rungs += 1;
+                }
+                let widths: Vec<usize> = texts.iter().map(|t| text_cells(t)).collect();
+                assert!(
+                    widths.windows(2).all(|w| w[0] > w[1]),
+                    "widest first: {texts:?}"
+                );
+            }
+        }
+    }
+    assert!(rungs > 100, "CONTROL: the rungs were walked ({rungs})");
+    assert_eq!(
+        hero_cells("enhanced by materm harness"),
+        None,
+        "NEGATIVE CONTROL"
+    );
+    assert_eq!(
+        hero_cells("enhanced by aterms harness"),
+        None,
+        "NEGATIVE CONTROL"
+    );
+    assert_eq!(hero_cells("no word"), None, "NEGATIVE CONTROL");
+    assert_eq!(
+        hero_cells("\u{4E2D} aterm"),
+        Some(3..8),
+        "a wide glyph, two cells"
+    );
+}
+
+/// One of the lab's MEASURED update-notice captures — Claude Code 2.1.304
+/// in a private headless aterm, `lastReleaseNotesSeen` seeded older
+/// (`aterm-phase/src/fixtures/claude-2.1.304-update-notice-*`) — and the
+/// notice's geometry the lab measured on it.
+#[derive(Clone, Copy, Debug)]
+struct NoticeCapture {
+    name: &'static str,
+    /// The fixture's text: its provenance line, then its rows.
+    text: &'static str,
+    /// The pane it was taken in: rows, columns.
+    rows: usize,
+    cols: usize,
+    /// The card's first row: 1 under the fullscreen renderer's row of top
+    /// air, 0 inline.
+    card: usize,
+    /// The card's rows: 3 wide, 4 narrow (the banner alone on its row).
+    card_rows: usize,
+    /// The summary's first row, its rows, and the details row's after it.
+    top: usize,
+    summary: usize,
+    details: usize,
+    /// Just past the notice's widest row.
+    end: usize,
+}
+
+impl NoticeCapture {
+    /// The capture's rows.
+    fn screen(&self) -> Vec<String> {
+        self.text.lines().skip(1).map(str::to_owned).collect()
+    }
+
+    /// The notice's rows: the summary's, then the details row's.
+    fn notice(&self) -> std::ops::Range<usize> {
+        self.top..self.top + self.summary + self.details
+    }
+}
+
+/// The build the captures' card names.
+const CAPTURED: &str = "2.1.304";
+
+/// The five update-notice captures: fullscreen at 120 columns (the summary
+/// and the details row one row each), at 50 (the summary wrapped onto two)
+/// and at 44 (the details row wrapped too: `…changelog for` / `details`);
+/// inline under the workspace card at 120 and the plain card at 50.
+const NOTICE_CAPTURES: [NoticeCapture; 5] = [
+    NoticeCapture {
+        name: "fullscreen-120col",
+        text: include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-fullscreen-120col.txt"
+        ),
+        rows: 40,
+        cols: 120,
+        card: 1,
+        card_rows: 3,
+        top: 5,
+        summary: 1,
+        details: 1,
+        end: 74,
+    },
+    NoticeCapture {
+        name: "fullscreen-50col",
+        text: include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-fullscreen-50col.txt"
+        ),
+        rows: 40,
+        cols: 50,
+        card: 1,
+        card_rows: 3,
+        top: 5,
+        summary: 2,
+        details: 1,
+        end: 47,
+    },
+    NoticeCapture {
+        name: "fullscreen-44col",
+        text: include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-fullscreen-44col.txt"
+        ),
+        rows: 40,
+        cols: 44,
+        card: 1,
+        card_rows: 3,
+        top: 5,
+        summary: 2,
+        details: 2,
+        end: 41,
+    },
+    NoticeCapture {
+        name: "inline-workspace-120col",
+        text: include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-inline-workspace-120col.txt"
+        ),
+        rows: 40,
+        cols: 120,
+        card: 0,
+        card_rows: 3,
+        top: 4,
+        summary: 1,
+        details: 1,
+        end: 74,
+    },
+    NoticeCapture {
+        name: "inline-50col",
+        text: include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-inline-50col.txt"
+        ),
+        rows: 40,
+        cols: 50,
+        card: 0,
+        card_rows: 3,
+        top: 4,
+        summary: 2,
+        details: 1,
+        end: 47,
+    },
+];
+
+/// The fullscreen capture at 120 columns, the one the single-screen banner
+/// tests run on.
+const WIDE: NoticeCapture = NOTICE_CAPTURES[0];
+
+/// The seven NARROW update-notice captures the lab MEASURED (2.1.304, the
+/// workspace stand-in for the vendor's top effort key, or `xhigh` without
+/// it): Claude's four-row card — the banner alone on its row, the mascot
+/// beside the model, the billing and the working directory — at 50 columns
+/// fullscreen and inline, and at the narrowest widths the card keeps four
+/// rows (33 with the wand, 31 without), where the summary wraps onto three
+/// rows and the details link breaks hard at the pane's edge (34 and 33
+/// columns: `…changelo`/`g for details`).
+const NARROW_CAPTURES: [NoticeCapture; 7] = [
+    NoticeCapture {
+        name: "narrow-workspace-fullscreen-50col",
+        text: include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-workspace-fullscreen-50col.txt"
+        ),
+        rows: 40,
+        cols: 50,
+        card: 1,
+        card_rows: 4,
+        top: 6,
+        summary: 2,
+        details: 1,
+        end: 47,
+    },
+    NoticeCapture {
+        name: "narrow-workspace-fullscreen-34col",
+        text: include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-workspace-fullscreen-34col.txt"
+        ),
+        rows: 40,
+        cols: 34,
+        card: 1,
+        card_rows: 4,
+        top: 6,
+        summary: 3,
+        details: 2,
+        end: 34,
+    },
+    NoticeCapture {
+        name: "narrow-workspace-fullscreen-33col",
+        text: include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-workspace-fullscreen-33col.txt"
+        ),
+        rows: 40,
+        cols: 33,
+        card: 1,
+        card_rows: 4,
+        top: 6,
+        summary: 3,
+        details: 2,
+        end: 33,
+    },
+    NoticeCapture {
+        name: "narrow-workspace-inline-50col",
+        text: include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-workspace-inline-50col.txt"
+        ),
+        rows: 40,
+        cols: 50,
+        card: 0,
+        card_rows: 4,
+        top: 5,
+        summary: 2,
+        details: 1,
+        end: 47,
+    },
+    NoticeCapture {
+        name: "narrow-workspace-inline-33col",
+        text: include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-workspace-inline-33col.txt"
+        ),
+        rows: 40,
+        cols: 33,
+        card: 0,
+        card_rows: 4,
+        top: 5,
+        summary: 3,
+        details: 2,
+        end: 33,
+    },
+    NoticeCapture {
+        name: "narrow-xhigh-fullscreen-50col",
+        text: include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-xhigh-fullscreen-50col.txt"
+        ),
+        rows: 40,
+        cols: 50,
+        card: 1,
+        card_rows: 4,
+        top: 6,
+        summary: 2,
+        details: 1,
+        end: 47,
+    },
+    NoticeCapture {
+        name: "narrow-xhigh-fullscreen-31col",
+        text: include_str!(
+            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-xhigh-fullscreen-31col.txt"
+        ),
+        rows: 40,
+        cols: 31,
+        card: 1,
+        card_rows: 4,
+        top: 6,
+        summary: 3,
+        details: 2,
+        end: 31,
+    },
+];
+
+/// The measured notice's two rows at 120 columns ([`WIDE`]'s): the summary
+/// (anchor `notice.updated`, then the build's changes) and the details row
+/// (anchor `notice.updated_details`).
+fn notice_rows() -> [String; 2] {
+    let screen = WIDE.screen();
+    let rows = [screen[WIDE.top].clone(), screen[WIDE.top + 1].clone()];
+    assert!(rows[0].starts_with(&format!("  {}", aterm_phase::anchor_text("notice.updated"))));
+    assert_eq!(
+        rows[1],
+        format!("  {}", aterm_phase::anchor_text("notice.updated_details"))
+    );
+    rows
+}
+
+/// The pane row the notice's summary takes on [`notice_screen`] and
+/// [`WIDE`]: under the card's blank margin row (4, where the line goes), as
+/// the fullscreen renderer draws it (`WIDE.top`).
+const NOTICE_TOP: usize = 5;
+
+/// [`card_screen`] `rows` × `cols` (its card where [`WIDE`]'s is) with the
+/// measured notice's rows under the card at [`NOTICE_TOP`], its details row
+/// `details` (the vendor's: [`notice_rows`]).
+fn notice_screen(rows: usize, cols: usize, details: &str) -> Vec<String> {
+    let mut screen = card_screen(rows, cols, MODEL, VERSION);
+    let [summary, _] = notice_rows();
+    screen[NOTICE_TOP] = summary;
+    screen[NOTICE_TOP + 1] = details.to_string();
+    screen
+}
+
+/// [`WIDE`] refit to a pane `rows` × `cols` at least as wide as its notice:
+/// its rows down to the notice's, then blank rows, then its composer and
+/// mode row pinned to the pane's bottom (as the fullscreen renderer pins
+/// them), each rule drawn `cols` wide; its details row `details`. Only the
+/// split-pane press tests use it, and they are unix's.
+#[cfg(unix)]
+fn capture_at(rows: usize, cols: usize, details: &str) -> Vec<String> {
+    assert!(cols >= WIDE.end && rows >= 12, "the notice fits the pane");
+    let screen = WIDE.screen();
+    let fit = |row: &String| {
+        if !row.is_empty() && row.chars().all(|c| c == '\u{2500}') {
+            "\u{2500}".repeat(cols)
+        } else {
+            row.clone()
+        }
+    };
+    let mut out: Vec<String> = screen[..WIDE.notice().end].iter().map(fit).collect();
+    out[WIDE.top + WIDE.summary] = details.to_string();
+    let foot = &screen[screen.len() - 4..];
+    out.resize(rows - foot.len(), String::new());
+    out.extend(foot.iter().map(fit));
+    out
+}
+
+/// Paint the capture `c`'s rows `rows` into `session`'s terminal with the
+/// attributes the lab measured: the card's working directory in [`GRAY`],
+/// the summary bold, the details row #999999, the rest in the default ink;
+/// the caret on the composer.
+fn feed_capture(app: &App, session: u64, c: &NoticeCapture, rows: &[String]) {
+    let mut out = String::from("\x1b[2J");
+    for (i, row) in rows.iter().enumerate() {
+        let sgr = if (c.card + 2..c.card + c.card_rows).contains(&i) {
+            format!("\x1b[38;2;{};{};{}m", GRAY[0], GRAY[1], GRAY[2])
+        } else if (c.top..c.top + c.summary).contains(&i) {
+            "\x1b[1m".to_string()
+        } else if c.notice().contains(&i) {
+            "\x1b[38;2;153;153;153m".to_string()
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("\x1b[{};1H{sgr}{row}\x1b[0m", i + 1));
+    }
+    let caret = rows
+        .iter()
+        .rposition(|r| r.starts_with('\u{276F}'))
+        .unwrap_or(0);
+    out.push_str(&format!("\x1b[{};3H", caret + 1));
+    let term = app.pool.get(session).expect("session").term.clone();
+    crate::term_lock(&term).process(out.as_bytes());
+}
+
+/// A headless window the size of the capture `c`'s pane: the facts of its
+/// build published, its drawer in front, then its rows painted — by the
+/// drawer, after it took the front (card engine §3.8's fence).
+fn capture_glass(c: &NoticeCapture) -> (App, WindowId, u64) {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let session = app.focused_session_id(wid).expect("the front session");
+    assert!(app.apply_term_resize(wid, u16_of(c.rows), u16_of(c.cols)));
+    publish(&app, session, CAPTURED);
+    feed_capture(&app, session, c, &c.screen());
+    (app, wid, session)
+}
+
+/// The terminal's own text at its own size, as `text`/`screen` read it.
+fn engine_rows(app: &App, session: u64) -> Vec<String> {
+    let mut fresh = RenderInput::empty();
+    let term = app.pool.get(session).unwrap().term.clone();
+    let mut term = crate::term_lock(&term);
+    let (rows, cols) = (usize::from(term.rows()), usize::from(term.cols()));
+    term.cell_frame_into(&mut fresh, rows, cols);
+    fresh
+        .cells
+        .iter()
+        .map(|row| row.iter().map(|c| c.ch).collect::<String>())
+        .collect()
+}
+
+/// Whether `wid`'s frame shows the capture `c`'s notice bare: each of its
+/// rows where Claude drew it.
+fn capture_bare(app: &App, wid: WindowId, c: &NoticeCapture) -> bool {
+    let strip = strip_rows(app, wid);
+    let screen = c.screen();
+    c.notice()
+        .all(|r| glass_text(app, wid, strip + r, 0..text_cells(&screen[r])) == screen[r])
+}
+
+/// Whether `wid`'s frame shows the banner over the capture `c`'s notice:
+/// [`NOTICE`]'s words after the `✦`'s two cells on the summary's first row,
+/// and every row of the notice — the summary's wrap, the details row and its
+/// wrap — blank to the notice's end.
+fn capture_banner(app: &App, wid: WindowId, c: &NoticeCapture) -> bool {
+    let strip = strip_rows(app, wid);
+    let words = text_cells(NOTICE.text);
+    let at = 2 + LINE_LEAD;
+    let blank = |r: usize, from: usize| {
+        glass_text(app, wid, strip + r, from..c.end) == " ".repeat(c.end - from)
+    };
+    glass_text(app, wid, strip + c.top, 0..at) == " ".repeat(at)
+        && glass_text(app, wid, strip + c.top, at..at + words) == NOTICE.text
+        && blank(c.top, at + words)
+        && c.notice().skip(1).all(|r| blank(r, 0))
+}
+
+/// Whether `wid`'s frame shows [`WIDE`]'s notice bare at [`NOTICE_TOP`]:
+/// its summary and its details row where Claude drew them.
+fn notice_bare(app: &App, wid: WindowId) -> bool {
+    capture_bare(app, wid, &WIDE)
+}
+
+/// Whether `wid`'s frame shows the banner over [`WIDE`]'s notice at
+/// [`NOTICE_TOP`] ([`capture_banner`]).
+fn banner_shown(app: &App, wid: WindowId) -> bool {
+    capture_banner(app, wid, &WIDE)
+}
+
+/// THE HARNESS BANNER (owner, 2026-10-19: "just remove ' Updated to latest.
+/// Got 4 features, 43 bugfixes, and 16 other changes.' and replace it
+/// alab.systems URL"), on each of the lab's twelve MEASURED captures
+/// ([`NOTICE_CAPTURES`]: fullscreen at 120, 50 and 44 columns, inline under
+/// the workspace card and the plain one; [`NARROW_CAPTURES`]: the four-row
+/// card at 50 columns and at its narrowest): under the card, the summary's
+/// first row shows `✦ alab.systems` at the notice's column — the words in
+/// the line's value colour, every letter inked, a drawn `Star4` in the first
+/// letter's colour at column 2 — and every other row of the notice (the
+/// summary's wrap, the details row with its code.claude.com link, and its
+/// own wrap at 44 columns) is blank to the notice's end; the banner's hits
+/// name [`NOTICE`]'s link on the `✦` and the words, none on the rest. GLASS
+/// ONLY: the terminal's text keeps the vendor's notice, and the frame's undo
+/// and strip leave the scratch exactly the vendor's frame. CONTROL: with no
+/// host the vendor's notice shows bare.
+#[test]
+fn the_update_notice_wears_the_harness_notice_on_the_glass_only() {
+    for c in NOTICE_CAPTURES.iter().chain(&NARROW_CAPTURES) {
+        let name = c.name;
+        let (mut app, wid, session) = capture_glass(c);
+        let before = engine_rows(&app, session);
+        let screen = c.screen();
+        for r in c.notice() {
+            assert!(
+                before[r].starts_with(&screen[r]),
+                "{name}: CONTROL: the vendor's notice is in the terminal"
+            );
+        }
+        frame(&mut app, wid);
+        assert!(
+            capture_bare(&app, wid, c),
+            "{name}: CONTROL: no host, the vendor's notice"
+        );
+        let vendor = {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            assert!(crate::claude_footer::undo(
+                &mut ws.claude_footer_undo,
+                &mut ws.input_scratch
+            ));
+            ws.input_scratch.cells.clone()
+        };
+        let host = supervise(&mut app, session);
+        frame(&mut app, wid);
+        assert!(
+            capture_banner(&app, wid, c),
+            "{name}: the banner over the notice"
+        );
+        assert_eq!(
+            decorated(&app, wid).map(|p| (p.top, p.rows)),
+            Some((c.card, c.card_rows)),
+            "{name}: the card on the glass"
+        );
+        let chrome = strip_rows(&app, wid);
+        // The card's line stays on its row under the card, naming aterm at
+        // every width: a versioned rung at 120 columns, a short one
+        // (`aterm harness · ∞ cruise`, `aterm · ∞ cruise`) narrower.
+        let line = glass_text(&app, wid, chrome + c.card + c.card_rows, 0..c.cols);
+        let words = line.trim_start().trim_start_matches('\u{2726}').trim();
+        let short = !words.starts_with("enhanced by ");
+        assert!(
+            words.starts_with(HERO_WORD) == short && line.contains(HERO_WORD),
+            "{name}: the card's line: {line:?}"
+        );
+        assert_eq!(short, c.cols < 120, "{name}: the rung: {line:?}");
+        let hero = line[..line.find(HERO_WORD).expect("the hero")]
+            .chars()
+            .count();
+        let line_row = &app.windows[&wid].input_scratch.cells[chrome + c.card + c.card_rows];
+        assert!(
+            line_row
+                .iter()
+                .take(c.cols)
+                .enumerate()
+                .all(|(col, cell)| cell.bold == (hero..hero + HERO_WORD.len()).contains(&col)),
+            "{name}: bold on the hero word alone, on every rung"
+        );
+        let (row, at, words) = (chrome + c.top, 2 + LINE_LEAD, text_cells(NOTICE.text));
+        let scratch = &app.windows[&wid].input_scratch;
+        let blank = scratch.implicit_blank;
+        assert_eq!(
+            scratch.cells[row][at].fg,
+            crate::claude_footer::value_fg(GRAY, blank.fg),
+            "{name}: the line's value colour under the ink"
+        );
+        let inked: Vec<u16> = scratch
+            .ink
+            .iter()
+            .filter(|c| usize::from(c.row) == row)
+            .map(|c| c.col)
+            .collect();
+        assert_eq!(
+            inked,
+            (at..at + words).map(|c| c as u16).collect::<Vec<_>>(),
+            "{name}: every letter inked, and nothing else on the row"
+        );
+        let hidden: Vec<usize> = c.notice().skip(1).map(|r| chrome + r).collect();
+        assert!(
+            scratch
+                .ink
+                .iter()
+                .all(|i| !hidden.contains(&usize::from(i.row))),
+            "{name}: nothing inked on the blanked rows"
+        );
+        let star = scratch
+            .word_decorations
+            .iter()
+            .find(|d| usize::from(d.row) == row)
+            .expect("the banner's star");
+        let first = scratch
+            .ink
+            .iter()
+            .find(|c| (usize::from(c.row), usize::from(c.col)) == (row, at))
+            .expect("the first letter's ink");
+        assert_eq!(
+            (usize::from(star.col), star.glyph, star.blend, star.color),
+            (2, DecoGlyph::Star4, DecoBlend::Add, pack(first.color)),
+            "{name}: the star leads the words in the first letter's colour"
+        );
+        let hits = &app.windows[&wid].claude_card.notice_hits;
+        let mut want = vec![
+            (session, row, 2..at + words, Some(NOTICE.url)),
+            (session, row, 2..c.end, None),
+        ];
+        want.extend(hidden.iter().map(|&r| (session, r, 2..c.end, None)));
+        assert_eq!(
+            hits.iter()
+                .map(|h| (h.session, h.frame_row, h.cols.clone(), h.url))
+                .collect::<Vec<_>>(),
+            want,
+            "{name}: the link on the star and its words, nothing on the rest"
+        );
+        assert_eq!(
+            engine_rows(&app, session),
+            before,
+            "{name}: the terminal's text"
+        );
+        let ws = app.windows.get_mut(&wid).unwrap();
+        assert!(crate::claude_footer::undo(
+            &mut ws.claude_footer_undo,
+            &mut ws.input_scratch
+        ));
+        strip(&mut ws.claude_card, &mut ws.input_scratch);
+        assert_eq!(
+            ws.input_scratch.cells, vendor,
+            "{name}: every cell the vendor's"
+        );
+        assert!(
+            ws.input_scratch
+                .word_decorations
+                .iter()
+                .all(|d| usize::from(d.row) != row),
+            "{name}: the banner's star taken back"
+        );
+        host.shutdown_and_join();
+    }
+    assert_eq!(NOTICE.url, "https://alab.systems");
+}
+
+/// THE BOX STROKES NO GLYPH IN THE PANE'S LAST COLUMN (the Track 1c review:
+/// at 33 and 31 columns Claude's version and model rows end in the pane's
+/// last column, and the box's right side was drawn in it, over their `4`
+/// and `…`): on each MEASURED narrow capture ([`NARROW_CAPTURES`]) the card
+/// is boxed, and on every boxed row whose last column holds a glyph no
+/// border quad covers any pixel of that column at the row's mid-height —
+/// the right side stands one column past the pane, where the clip cuts it
+/// away, the box open at the pane's edge. NEGATIVE CONTROL: where the rows
+/// end one column short of the pane's edge (34 columns) the right side is
+/// drawn in that blank last column, at every boxed row's mid-height.
+#[test]
+fn the_box_strokes_no_glyph_in_the_panes_last_column() {
+    let mut open = 0;
+    let mut closed = 0;
+    for c in &NARROW_CAPTURES {
+        let name = c.name;
+        let (mut app, wid, session) = capture_glass(c);
+        let host = supervise(&mut app, session);
+        frame(&mut app, wid);
+        assert_eq!(
+            decorated(&app, wid).map(|p| (p.top, p.rows)),
+            Some((c.card, c.card_rows)),
+            "{name}: the card is boxed"
+        );
+        let (cw, ch) = app.win_cell_size(wid);
+        let (pad, grid_top) = (app.win_pad(wid), app.win_pad_top(wid) + app.win_head(wid));
+        let chrome = strip_rows(&app, wid);
+        let screen = c.screen();
+        let last = c.cols - 1;
+        let column = pad + last * cw..pad + (last + 1) * cw;
+        // Whether a border quad covers a pixel of the last column at frame
+        // row `row`'s mid-height.
+        let stroked = |row: usize| {
+            let y = grid_top + row * ch + ch / 2;
+            card_marks(&app, wid).0.iter().any(|m| {
+                let y = pixel(y);
+                (m.at.y0..m.at.y1).contains(&y)
+                    && m.at.x0 < pixel(column.end)
+                    && m.at.x1 > pixel(column.start)
+            })
+        };
+        let full = |r: usize| screen[r].chars().nth(last).is_some_and(|ch| ch != ' ');
+        let boxed = c.card..c.card + c.card_rows;
+        if boxed.clone().any(full) {
+            for r in boxed.filter(|&r| full(r)) {
+                assert!(
+                    !stroked(chrome + r),
+                    "{name}: row {r}'s last glyph under the border"
+                );
+            }
+            open += 1;
+        } else if screen[c.card].chars().count() == last {
+            for r in boxed {
+                assert!(stroked(chrome + r), "{name}: CONTROL: the side at row {r}");
+            }
+            closed += 1;
+        }
+        host.shutdown_and_join();
+    }
+    assert_eq!(
+        (open, closed),
+        (3, 1),
+        "CONTROL: the captures hold both edges"
+    );
+}
+
+/// One case of [`the_vendors_notice_stays_bare_where_the_banner_may_not_go`]:
+/// what it is, whether the card keeps its line, and the change it makes.
+type NoticeCase = (&'static str, bool, fn(&mut App, u64));
+
+/// THE BANNER TAKES THE CARD'S GATE, and shows nothing it cannot show
+/// whole, on the measured capture ([`WIDE`]): the vendor's notice stays
+/// bare for a Cruise session this host
+/// does not hold, `[claude_footer] card = false`, the master switch off, a
+/// details row the reader does not know (reworded — the card still wears
+/// its line), and while a find bar is up (its matches lie in the text the
+/// banner would hide — the card still wears its line). Off's white card
+/// wears the banner too. CONTROL: each case's screen shows the banner first.
+#[test]
+fn the_vendors_notice_stays_bare_where_the_banner_may_not_go() {
+    let cases: [NoticeCase; 5] = [
+        ("unsupervised", false, |app, session| {
+            let ctx = app.pool.get(session).unwrap().ctx.clone();
+            crate::session_timeline::release_supervisor(
+                &ctx,
+                None,
+                crate::metrics::now_us(),
+                aterm_slog::Actor::Ctl,
+            );
+        }),
+        ("switched off", false, |app, _| {
+            app.config.claude_footer = Some(crate::app_config::ClaudeFooterConfig {
+                card: Some(false),
+                ..Default::default()
+            });
+        }),
+        ("master switch off", false, |app, _| {
+            app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+                crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+            );
+        }),
+        ("reworded", true, |app, session| {
+            let mut rows = WIDE.screen();
+            rows[WIDE.top + 1] = format!(
+                "  see {}",
+                aterm_phase::anchor_text("notice.updated_details")
+            );
+            feed_capture(app, session, &WIDE, &rows);
+        }),
+        ("find bar up", true, |app, _| app.search_enter()),
+    ];
+    for (what, line, case) in cases {
+        let (mut app, wid, session) = capture_glass(&WIDE);
+        let host = supervise(&mut app, session);
+        frame(&mut app, wid);
+        assert!(banner_shown(&app, wid), "{what}: CONTROL, the banner");
+        case(&mut app, session);
+        frame(&mut app, wid);
+        let strip = strip_rows(&app, wid);
+        assert!(
+            what == "reworded" || notice_bare(&app, wid),
+            "{what}: the vendor's notice bare"
+        );
+        assert!(!banner_shown(&app, wid), "{what}: no banner");
+        assert!(
+            app.windows[&wid].claude_card.notice_hits.is_empty(),
+            "{what}: nothing to press"
+        );
+        assert_eq!(
+            glass_text(&app, wid, strip + WIDE.card + 3, 0..120).contains("aterm harness"),
+            line,
+            "{what}: the card's line"
+        );
+        host.shutdown_and_join();
+    }
+    // Off: the white card, and the banner on it.
+    let (mut app, wid, session) = capture_glass(&WIDE);
+    let host = supervise(&mut app, session);
+    let ctx = app.pool.get(session).unwrap().ctx.clone();
+    app.set_session_autopilot(
+        session,
+        Some(Autopilot::Off),
+        crate::autopilot::Surface::Chip,
+    );
+    crate::session_timeline::release_supervisor(
+        &ctx,
+        None,
+        crate::metrics::now_us(),
+        aterm_slog::Actor::Ctl,
+    );
+    assert!(!app.session_autopilot(session).2, "the claim is given back");
+    frame(&mut app, wid);
+    assert!(banner_shown(&app, wid), "Off's white card wears the banner");
+    host.shutdown_and_join();
+}
+
+/// Window pixel at the centre of frame cell `(row, col)` of `wid`: the
+/// inverse of `App::frame_cell_at`, checked against it.
+#[cfg(unix)]
+fn cell_px(app: &App, wid: WindowId, (row, col): (usize, usize)) -> (f64, f64) {
+    let (cw, ch) = app.win_cell_size(wid);
+    let (ox, oy) = app.frame_origin(wid);
+    let x = ox as f64 + (app.win_pad(wid) + col * cw + cw / 2) as f64;
+    let y = oy as f64 + (app.win_pad_top(wid) + app.win_head(wid) + row * ch + ch / 2) as f64;
+    assert_eq!(
+        app.frame_cell_at(wid, x, y),
+        Some((row, col)),
+        "the pixel names the cell"
+    );
+    (x, y)
+}
+
+/// The "open link" modifier: Cmd on macOS, Ctrl elsewhere.
+#[cfg(unix)]
+fn link_modifier() -> aterm_window::keyboard::ModifiersState {
+    #[cfg(target_os = "macos")]
+    {
+        aterm_window::keyboard::ModifiersState::SUPER
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        aterm_window::keyboard::ModifiersState::CONTROL
+    }
+}
+
+/// A left press and release at frame cell `at` of `wid`, the pointer moved
+/// there first and `mods` held, through the real mouse path.
+#[cfg(unix)]
+fn click(
+    app: &mut App,
+    wid: WindowId,
+    at: (usize, usize),
+    mods: aterm_window::keyboard::ModifiersState,
+) {
+    use aterm_window::event::{ElementState, MouseButton};
+    let (x, y) = cell_px(app, wid, at);
+    app.windows.get_mut(&wid).expect("window").mods = mods;
+    app.on_cursor_moved(wid, x, y);
+    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+    app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+    app.windows.get_mut(&wid).expect("window").mods =
+        aterm_window::keyboard::ModifiersState::empty();
+}
+
+/// What the session's PTY received through the private observer: up to a
+/// minute for `want` bytes (a hang detector), and every byte already
+/// written. The app writes a press on the calling thread, so one that
+/// should NOT have come is in the socket by now.
+#[cfg(unix)]
+fn pty(reader: &mut std::os::unix::net::UnixStream, want: usize) -> Vec<u8> {
+    use std::io::{ErrorKind, Read};
+    let mut got = Vec::new();
+    let mut buf = [0u8; 256];
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if got.len() >= want || Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => panic!("reading the PTY observer: {e}"),
+        }
+    }
+    got
+}
+
+/// A PRESS ON THE BANNER NEVER REACHES THE VENDOR'S LINK, on the measured
+/// capture ([`WIDE`]). As measured, the details row carries no OSC 8 link
+/// and no scheme, so bare the grid's link reader names nothing on it; the
+/// test then lays an OSC 8 link to the changelog over the row's link text —
+/// the link a later build may add, the strongest case — so the hidden row's
+/// checks are not vacuous (CONTROL: bare, the grid's link reader names it).
+/// Under the banner the link readers see the
+/// banner: its words name [`NOTICE`]'s link, the hidden details row none,
+/// and no citation either; a link-modifier press on the words opens exactly
+/// [`NOTICE`]'s link (recorded, a test opens nothing), one on the hidden row
+/// nothing; the hand shows on the words only with the modifier held. Under
+/// mouse tracking (DECSET 1000 + 1006) a plain press on the banner or the
+/// hidden row is swallowed — no report reaches the PTY, so Claude opens
+/// nothing it no longer shows — while a press on a row the banner does not
+/// cover is reported (CONTROL: the observer sees reports); with tracking
+/// off, a plain press is the grid's, as on any row.
+#[cfg(unix)]
+#[test]
+fn a_press_on_the_notice_never_reaches_the_vendors_link() {
+    use aterm_session::sink::SinkWriter;
+    let changelog = aterm_phase::anchor_text("notice.changelog");
+    let vendor_url = format!("https://{changelog}");
+    let tail = aterm_phase::anchor_text("notice.updated_details")
+        .strip_prefix(changelog)
+        .expect("the details row opens with the changelog link");
+    let details = format!("  \x1b]8;;{vendor_url}\x1b\\{changelog}\x1b]8;;\x1b\\{tail}");
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("PTY observer");
+    reader.set_nonblocking(true).expect("nonblocking observer");
+    let mut reader = reader;
+    let mut app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new_owned(writer.into())));
+    let wid = WindowId(0);
+    let session = app.focused_session_id(wid).expect("the front session");
+    assert!(app.apply_term_resize(wid, u16_of(WIDE.rows), u16_of(WIDE.cols)));
+    publish(&app, session, CAPTURED);
+    feed_capture(&app, session, &WIDE, &WIDE.screen());
+    frame(&mut app, wid);
+    let strip = strip_rows(&app, wid);
+    let (words, hidden) = ((strip + NOTICE_TOP, 6), (strip + NOTICE_TOP + 1, 10));
+    // As measured: no link on the details row.
+    let (x, y) = cell_px(&app, wid, hidden);
+    app.on_cursor_moved(wid, x, y);
+    assert_eq!(
+        app.link_under_pointer(wid),
+        None,
+        "the measured row: no link"
+    );
+    // The row again, an OSC 8 link laid over its link text.
+    let mut rows = WIDE.screen();
+    rows[NOTICE_TOP + 1] = details;
+    feed_capture(&app, session, &WIDE, &rows);
+    frame(&mut app, wid);
+    assert!(notice_bare(&app, wid), "CONTROL: the same text");
+    // CONTROL: bare, the grid's link reader names the vendor's link.
+    app.on_cursor_moved(wid, x, y);
+    assert_eq!(
+        app.link_under_pointer(wid).as_deref(),
+        Some(vendor_url.as_str()),
+        "CONTROL: the vendor's link on its row"
+    );
+    let host = supervise(&mut app, session);
+    frame(&mut app, wid);
+    assert!(banner_shown(&app, wid), "the banner over the notice");
+    // The link readers see the banner.
+    app.on_cursor_moved(wid, x, y);
+    assert_eq!(app.link_under_pointer(wid), None, "the hidden row's link");
+    assert!(app.path_link_under_pointer(wid).is_none());
+    let (wx, wy) = cell_px(&app, wid, words);
+    app.on_cursor_moved(wid, wx, wy);
+    assert_eq!(
+        app.link_under_pointer(wid).as_deref(),
+        Some(NOTICE.url),
+        "the banner's link"
+    );
+    assert!(app.path_link_under_pointer(wid).is_none());
+    // The hand only with the modifier held.
+    let probe = |app: &mut App, mods| {
+        app.windows.get_mut(&wid).unwrap().mods = mods;
+        app.update_hover_cursor(wid);
+        let ws = &app.windows[&wid];
+        (
+            ws.hover_pointer,
+            ws.native_text_cursor,
+            ws.link_hover.is_some(),
+        )
+    };
+    assert_eq!(
+        probe(&mut app, link_modifier()),
+        (true, false, false),
+        "the hand, and no caption of the hidden link"
+    );
+    assert_eq!(
+        probe(&mut app, aterm_window::keyboard::ModifiersState::empty()),
+        (false, true, false),
+        "the I-beam without the modifier"
+    );
+    app.on_cursor_moved(wid, x, y);
+    assert_eq!(
+        probe(&mut app, link_modifier()),
+        (false, true, false),
+        "no hand on the hidden row, and no caption of its link"
+    );
+    app.windows.get_mut(&wid).unwrap().mods = aterm_window::keyboard::ModifiersState::empty();
+    let _ = crate::platform::take_opened_urls();
+    // The link modifier: the banner's link, and nothing on the hidden row.
+    click(&mut app, wid, words, link_modifier());
+    assert_eq!(
+        crate::platform::take_opened_urls(),
+        vec![NOTICE.url.to_string()],
+        "a modifier press on the words opens the banner's link"
+    );
+    click(&mut app, wid, hidden, link_modifier());
+    assert!(
+        crate::platform::take_opened_urls().is_empty(),
+        "a modifier press on the hidden row opens nothing"
+    );
+    let _ = pty(&mut reader, 0);
+    // Tracking off: a plain press is the grid's (a selection may start) and
+    // reports nothing.
+    click(
+        &mut app,
+        wid,
+        hidden,
+        aterm_window::keyboard::ModifiersState::empty(),
+    );
+    assert!(pty(&mut reader, 0).is_empty(), "nothing tracks the mouse");
+    // Tracking on.
+    {
+        let term = app.pool.get(session).unwrap().term.clone();
+        crate::term_lock(&term).process(b"\x1b[?1000h\x1b[?1006h");
+    }
+    assert!(
+        app.pool
+            .get(session)
+            .unwrap()
+            .ctx
+            .modes
+            .mouse_tracking_enabled()
+    );
+    frame(&mut app, wid);
+    assert!(banner_shown(&app, wid), "the banner stays");
+    let _ = pty(&mut reader, 0);
+    for at in [words, hidden] {
+        click(
+            &mut app,
+            wid,
+            at,
+            aterm_window::keyboard::ModifiersState::empty(),
+        );
+        assert!(
+            pty(&mut reader, 0).is_empty(),
+            "{at:?}: a plain press on the banner reaches no PTY"
+        );
+        click(&mut app, wid, at, link_modifier());
+        assert!(
+            pty(&mut reader, 0).is_empty(),
+            "{at:?}: nor does a modifier press"
+        );
+    }
+    let _ = crate::platform::take_opened_urls();
+    // CONTROL: a press on a row the banner does not cover is reported.
+    click(
+        &mut app,
+        wid,
+        (strip + 10, 40),
+        aterm_window::keyboard::ModifiersState::empty(),
+    );
+    let report = pty(&mut reader, 6);
+    assert!(
+        report.starts_with(b"\x1b[<0;"),
+        "CONTROL: the press reported: {report:?}"
+    );
+    host.shutdown_and_join();
+}
+
+/// THE MIXED TAB'S PRESS (`on_mouse_input`'s heterogeneous router, the other
+/// call site of `App::press_claude_light`): in a tab whose Claude Code pane
+/// — the measured capture refit to it ([`capture_at`]), an OSC 8 link laid
+/// over its details row's link text — sits under a native one (Settings), a
+/// link-modifier press on the banner
+/// opens exactly [`NOTICE`]'s link and
+/// one on the hidden details row — Claude's OSC 8 changelog link under it —
+/// nothing; under mouse tracking a plain press on either reaches no PTY,
+/// while one on a row the banner does not cover is reported (CONTROL).
+#[cfg(unix)]
+#[test]
+fn a_press_on_the_notice_in_a_mixed_tab_is_the_banners() {
+    use aterm_session::sink::SinkWriter;
+    use aterm_window::keyboard::ModifiersState;
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    assert!(app.apply_term_resize(wid, 30, 240));
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("PTY observer");
+    reader.set_nonblocking(true).expect("nonblocking observer");
+    let mut reader = reader;
+    let (session, _) = app.split_active_with_stub_terminal_with_sink(
+        wid,
+        crate::tab_model::SplitAxis::Vertical,
+        Arc::new(SinkWriter::new_owned(writer.into())),
+    );
+    let (rows, cols) = {
+        let term = crate::term_lock(&app.pool.get(session).unwrap().term);
+        (usize::from(term.rows()), usize::from(term.cols()))
+    };
+    assert!(cols >= 100, "the pane holds the notice whole ({cols})");
+    let changelog = aterm_phase::anchor_text("notice.changelog");
+    let tail = aterm_phase::anchor_text("notice.updated_details")
+        .strip_prefix(changelog)
+        .expect("the details row opens with the changelog link");
+    let details = format!("  \x1b]8;;https://{changelog}\x1b\\{changelog}\x1b]8;;\x1b\\{tail}");
+    publish(&app, session, CAPTURED);
+    feed(&app, session, &capture_at(rows, cols, &details));
+    let host = supervise(&mut app, session);
+    let mixed_frame = |app: &mut App| {
+        let Some((plan, crate::VisibleContentRoute::Heterogeneous)) =
+            app.active_visible_frame_layout(wid)
+        else {
+            panic!("a mixed tab");
+        };
+        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
+        app.splice_claude_footer(wid, &plan, crate::VisibleContentRoute::Heterogeneous);
+    };
+    mixed_frame(&mut app);
+    let hits = app.windows[&wid].claude_card.notice_hits.clone();
+    let words = hits
+        .iter()
+        .find(|h| h.url.is_some())
+        .map(|h| (h.frame_row, h.cols.end - 1))
+        .expect("the banner on the mixed tab's glass");
+    let hidden = hits
+        .iter()
+        .find(|h| h.frame_row == words.0 + 1)
+        .map(|h| (h.frame_row, h.cols.start + 8))
+        .expect("the hidden details row");
+    let _ = crate::platform::take_opened_urls();
+    click(&mut app, wid, words, link_modifier());
+    assert_eq!(
+        crate::platform::take_opened_urls(),
+        vec![NOTICE.url.to_string()],
+        "the banner's link"
+    );
+    mixed_frame(&mut app);
+    click(&mut app, wid, hidden, link_modifier());
+    assert!(
+        crate::platform::take_opened_urls().is_empty(),
+        "nothing from the hidden row"
+    );
+    // Under mouse tracking.
+    {
+        let term = app.pool.get(session).unwrap().term.clone();
+        crate::term_lock(&term).process(b"\x1b[?1000h\x1b[?1006h");
+    }
+    mixed_frame(&mut app);
+    let _ = pty(&mut reader, 0);
+    for at in [words, hidden] {
+        click(&mut app, wid, at, ModifiersState::empty());
+        assert!(
+            pty(&mut reader, 0).is_empty(),
+            "{at:?}: a plain press on the banner reaches no PTY"
+        );
+    }
+    // CONTROL: a press on a row the banner does not cover is reported.
+    click(
+        &mut app,
+        wid,
+        (words.0 + 6, words.1),
+        ModifiersState::empty(),
+    );
+    let report = pty(&mut reader, 6);
+    assert!(
+        report.starts_with(b"\x1b[<0;"),
+        "CONTROL: the press reported: {report:?}"
+    );
+    host.shutdown_and_join();
+}
+
+/// A PRESS ON THE BANNER OF AN UNFOCUSED PANE IS ITS FOCUS CLICK: in a split
+/// whose Claude Code pane (the measured capture refit to it, [`capture_at`])
+/// is not the focused one, a plain press on the
+/// banner under mouse tracking focuses that pane — a focusing press stops
+/// there and reports nothing, so there is nothing to keep from Claude — and
+/// reaches no PTY; once the pane is focused, a plain press there is
+/// swallowed (the vendor's hidden link) while one on a row the banner does
+/// not cover is reported (CONTROL).
+#[cfg(unix)]
+#[test]
+fn a_press_on_an_unfocused_panes_banner_focuses_the_pane() {
+    use aterm_session::sink::SinkWriter;
+    use aterm_window::keyboard::ModifiersState;
+    let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("PTY observer");
+    reader.set_nonblocking(true).expect("nonblocking observer");
+    let mut reader = reader;
+    let mut app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new_owned(writer.into())));
+    let wid = WindowId(0);
+    let session = app.focused_session_id(wid).expect("the front session");
+    assert!(app.apply_term_resize(wid, 24, 160));
+    let other = app.split_active_stub_tab(wid);
+    assert_eq!(
+        app.focused_session_id(wid),
+        Some(other),
+        "CONTROL: the new pane has the focus"
+    );
+    let (rows, cols) = {
+        let term = crate::term_lock(&app.pool.get(session).unwrap().term);
+        (usize::from(term.rows()), usize::from(term.cols()))
+    };
+    let [_, details] = notice_rows();
+    publish(&app, session, CAPTURED);
+    feed(&app, session, &capture_at(rows, cols, &details));
+    let host = supervise(&mut app, session);
+    {
+        let term = app.pool.get(session).unwrap().term.clone();
+        crate::term_lock(&term).process(b"\x1b[?1000h\x1b[?1006h");
+    }
+    frame(&mut app, wid);
+    let words = app.windows[&wid]
+        .claude_card
+        .notice_hits
+        .iter()
+        .find(|h| h.url.is_some())
+        .map(|h| (h.frame_row, h.cols.end - 1))
+        .expect("the banner on the unfocused pane");
+    let _ = pty(&mut reader, 0);
+    click(&mut app, wid, words, ModifiersState::empty());
+    assert_eq!(
+        app.focused_session_id(wid),
+        Some(session),
+        "the press on the banner focuses its pane"
+    );
+    assert!(
+        pty(&mut reader, 0).is_empty(),
+        "the focus click reports nothing"
+    );
+    frame(&mut app, wid);
+    click(&mut app, wid, words, ModifiersState::empty());
+    assert!(
+        pty(&mut reader, 0).is_empty(),
+        "focused, a plain press on the banner reaches no PTY"
+    );
+    assert_eq!(app.focused_session_id(wid), Some(session));
+    // CONTROL: focused, a press on a row the banner does not cover is
+    // reported.
+    click(
+        &mut app,
+        wid,
+        (words.0 + 6, words.1),
+        ModifiersState::empty(),
+    );
+    let report = pty(&mut reader, 6);
+    assert!(
+        report.starts_with(b"\x1b[<0;"),
+        "CONTROL: the press reported: {report:?}"
+    );
+    host.shutdown_and_join();
+}
+
+/// STEADY STATE — A SETTLED CARD WITH THE BANNER costs the frame nothing
+/// over the bare footer's pass: the notice is scanned once, when it comes,
+/// and kept through Claude's streamed output and the spinner under it (the
+/// rows the scan read unchanged), the banner's cells, ink and star kept.
+/// NEGATIVE CONTROLS: a change to the notice's own rows is scanned again —
+/// once (`notice_reads`) — and a reworded details row takes the banner off
+/// the glass.
+#[test]
+fn a_settled_notice_at_rest_costs_the_frame_nothing() {
+    let [summary, details] = notice_rows();
+    let notice = format!(
+        "\x1b7\x1b[{};1H{summary}\x1b[{};1H{details}\x1b8",
+        NOTICE_TOP + 1,
+        NOTICE_TOP + 2
+    );
+    costs_the_floor("notice", 12, |i, app, bare| {
+        if i == 0 {
+            feed_both(app, bare, notice.as_bytes());
+            return;
+        }
+        assert!(banner_shown(&app.0, app.1), "pass {i}: the banner");
+        let spinner = ['\u{2722}', '\u{2733}', '\u{2736}', '\u{273B}'][i % 4];
+        let bytes = format!(
+            "\x1b7\x1b[9;1H\u{23FA} streamed line {i}\x1b[K\
+             \x1b[12;1H{spinner} Thinking\u{2026} ({i}s)\x1b[K\x1b8"
+        );
+        feed_both(app, bare, bytes.as_bytes());
+    });
+    // NEGATIVE CONTROLS: the notice's own rows.
+    let t0 = Instant::now();
+    let (mut app, wid, session, host) = settled_glass(120, t0);
+    let term = app.pool.get(session).unwrap().term.clone();
+    let step = |app: &mut App, bytes: &[u8]| {
+        crate::term_lock(&term).process(bytes);
+        app.capture_words(wid, Instant::now());
+        app.splice_tab_strip(wid);
+        pass_cost(app, wid)
+    };
+    assert_eq!(
+        step(&mut app, notice.as_bytes()).notice_reads,
+        1,
+        "it comes"
+    );
+    assert!(banner_shown(&app, wid));
+    assert_eq!(step(&mut app, b"x").notice_reads, 0, "kept");
+    let reworded = format!(
+        "\x1b7\x1b[{};1H  see {}\x1b8",
+        NOTICE_TOP + 2,
+        aterm_phase::anchor_text("notice.updated_details")
+    );
+    assert_eq!(
+        step(&mut app, reworded.as_bytes()).notice_reads,
+        1,
+        "CONTROL: a change to its rows is scanned again"
+    );
+    assert!(!banner_shown(&app, wid), "CONTROL: and the banner goes");
+    set_now(None);
+    host.shutdown_and_join();
+}
+
+/// The MEASURED capture where the conversation scrolled the card's top off
+/// a 29-row pane: the card's model and working-directory rows at rows 0
+/// and 1, the blank row, the whole notice.
+const SCROLLED_29: &str = include_str!(
+    "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-scrolled-29rows-fullscreen-120col.txt"
+);
+
+/// THE BANNER STAYS WHILE THE CARD SCROLLS OFF (fullscreen: the transcript
+/// grows under a 30-row pane and its top leaves the screen a row at a
+/// time). The card is DERIVED whole over the 29-row capture (its banner row
+/// put back, as one row more of pane shows it), and the screen then scrolls
+/// by one, two and three rows: while any of the card's rows stands at the
+/// screen's top — its model and working directory, then its working
+/// directory alone — the notice under them still wears the banner (the
+/// card itself leaves the glass: no box is drawn around a cut card); with
+/// none left the vendor's notice shows bare. Scrolled BACK a row at a time
+/// (two rows off, one, none) the banner stays too, known by the whole
+/// card's rows and not only the last frame's (mutation-checked: a scrolled
+/// card kept by its shown rows alone goes bare scrolling back). A mode
+/// moved while the card is scrolled, and a find bar opened and closed over
+/// the whole card before it scrolled, keep the banner too. GLASS ONLY:
+/// the terminal's text is the vendor's on every frame. NEGATIVE CONTROLS,
+/// each bare: the scrolled screen on a fresh window (no card was ever whole
+/// on it), a row of another card's scrolled back, and a reply of Claude's
+/// quoting the notice where the card's rows were.
+#[test]
+fn the_banner_stays_while_the_card_scrolls_off() {
+    let cut: Vec<String> = SCROLLED_29.lines().skip(1).map(str::to_owned).collect();
+    let mut whole = vec![format!(
+        " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259B}\u{2588}   {}{CAPTURED}",
+        banner()
+    )];
+    whole.extend(cut.iter().cloned());
+    assert_eq!(whole.len(), 30, "CONTROL: the derived whole screen");
+    let scrolled = |k: usize| -> Vec<String> {
+        let mut rows = whole[k..].to_vec();
+        rows.resize(whole.len(), String::new());
+        rows
+    };
+    let paint = |app: &App, session: u64, rows: &[String]| {
+        let mut out = String::from("\x1b[2J");
+        for (i, row) in rows.iter().enumerate() {
+            let sgr = if row.ends_with("/proj") {
+                format!("\x1b[38;2;{};{};{}m", GRAY[0], GRAY[1], GRAY[2])
+            } else if row.starts_with(&format!("  {}", aterm_phase::anchor_text("notice.updated")))
+            {
+                "\x1b[1m".to_string()
+            } else if row.contains(aterm_phase::anchor_text("notice.updated_details")) {
+                "\x1b[38;2;153;153;153m".to_string()
+            } else {
+                String::new()
+            };
+            out.push_str(&format!("\x1b[{};1H{sgr}{row}\x1b[0m", i + 1));
+        }
+        let term = app.pool.get(session).expect("session").term.clone();
+        crate::term_lock(&term).process(out.as_bytes());
+    };
+    let words = text_cells(NOTICE.text);
+    let at = 2 + LINE_LEAD;
+    // The banner on the notice whose summary is row `top`; its details row
+    // blank under it.
+    let banner_on = |app: &App, wid: WindowId, top: usize| {
+        let strip = strip_rows(app, wid);
+        glass_text(app, wid, strip + top, at..at + words) == NOTICE.text
+            && glass_text(app, wid, strip + top + 1, 0..74)
+                .trim()
+                .is_empty()
+    };
+    // The vendor's notice bare at `top` on `rows`.
+    let bare_on = |app: &App, wid: WindowId, rows: &[String], top: usize| {
+        let strip = strip_rows(app, wid);
+        (top..top + 2).all(|r| glass_text(app, wid, strip + r, 0..text_cells(&rows[r])) == rows[r])
+    };
+    let window = || {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let session = app.focused_session_id(wid).expect("the front session");
+        assert!(app.apply_term_resize(wid, 30, 120));
+        publish(&app, session, CAPTURED);
+        let host = supervise(&mut app, session);
+        (app, wid, session, host)
+    };
+    let (mut app, wid, session, host) = window();
+    for k in 0..=3 {
+        let rows = scrolled(k);
+        paint(&app, session, &rows);
+        frame(&mut app, wid);
+        let top = 4 - k;
+        assert!(
+            rows[top].starts_with(&format!("  {}", aterm_phase::anchor_text("notice.updated"))),
+            "CONTROL: the notice at row {top}: {rows:#?}"
+        );
+        assert_eq!(
+            banner_on(&app, wid, top),
+            k < 3,
+            "scrolled {k}: the banner while a row of the card stands"
+        );
+        assert_eq!(bare_on(&app, wid, &rows, top), k == 3, "scrolled {k}");
+        assert_eq!(
+            decorated(&app, wid).map(|p| p.top),
+            (k == 0).then_some(0),
+            "scrolled {k}: the box only round the whole card"
+        );
+        assert!(
+            engine_rows(&app, session)
+                .iter()
+                .zip(&rows)
+                .all(|(drawn, fed)| drawn.starts_with(fed.as_str())),
+            "scrolled {k}: GLASS ONLY"
+        );
+        frame(&mut app, wid);
+        assert_eq!(banner_on(&app, wid, top), k < 3, "scrolled {k}: kept");
+    }
+    host.shutdown_and_join();
+    // SCROLLED BACK (a menu under the composer closing, the composer
+    // shrinking): the card's rows come back down a row at a time and the
+    // banner stays with them, the box back once the card is whole.
+    let (mut app, wid, session, host) = window();
+    for k in [0, 2, 1, 0] {
+        paint(&app, session, &scrolled(k));
+        frame(&mut app, wid);
+        assert!(
+            banner_on(&app, wid, 4 - k),
+            "scrolled back to {k}: the banner"
+        );
+    }
+    assert_eq!(
+        decorated(&app, wid).map(|p| p.top),
+        Some(0),
+        "whole again: the box"
+    );
+    // NEGATIVE CONTROL: the row that comes back is not the card's.
+    paint(&app, session, &scrolled(2));
+    frame(&mut app, wid);
+    let mut other = scrolled(1);
+    other[0] = other[0].replace("API Usage Billing", "Claude Max");
+    paint(&app, session, &other);
+    frame(&mut app, wid);
+    assert!(
+        bare_on(&app, wid, &other, 3) && !banner_on(&app, wid, 3),
+        "NEGATIVE CONTROL: another card's row scrolled back"
+    );
+    host.shutdown_and_join();
+    let (mut app, wid, session, host) = window();
+    let rows = scrolled(1);
+    paint(&app, session, &rows);
+    frame(&mut app, wid);
+    assert!(
+        bare_on(&app, wid, &rows, 3) && !banner_on(&app, wid, 3),
+        "NEGATIVE CONTROL: no card was whole on this window"
+    );
+    host.shutdown_and_join();
+    let (mut app, wid, session, host) = window();
+    paint(&app, session, &whole);
+    frame(&mut app, wid);
+    assert!(banner_on(&app, wid, 4), "CONTROL: the whole card's banner");
+    let mut quoted = scrolled(1);
+    quoted[0] = "\u{23FA} The notice read:".into();
+    quoted[1] = String::new();
+    paint(&app, session, &quoted);
+    frame(&mut app, wid);
+    assert!(
+        bare_on(&app, wid, &quoted, 3) && !banner_on(&app, wid, 3),
+        "NEGATIVE CONTROL: a reply quoting the notice is never hidden"
+    );
+    host.shutdown_and_join();
+    // THE MODE MOVES WHILE THE CARD IS SCROLLED (the cross-track review of
+    // 2026-10-19): Cruise to Land with the card's top off the screen keeps
+    // the banner on the notice — the card was whole for this process.
+    let (mut app, wid, session, host) = window();
+    paint(&app, session, &whole);
+    frame(&mut app, wid);
+    assert!(banner_on(&app, wid, 4), "CONTROL: the whole card's banner");
+    let rows = scrolled(1);
+    paint(&app, session, &rows);
+    frame(&mut app, wid);
+    assert!(banner_on(&app, wid, 3), "CONTROL: scrolled, the banner");
+    assert!(app.set_session_autopilot(
+        session,
+        Some(Autopilot::Land),
+        crate::autopilot::Surface::Chip
+    ));
+    frame(&mut app, wid);
+    assert!(
+        banner_on(&app, wid, 3),
+        "the mode moved while the card is scrolled: the banner stays"
+    );
+    host.shutdown_and_join();
+    // A FIND BAR over the whole card, closed before it scrolls, keeps no
+    // layout — and the banner stays all the same.
+    let (mut app, wid, session, host) = window();
+    paint(&app, session, &whole);
+    frame(&mut app, wid);
+    app.windows.get_mut(&wid).unwrap().search = Some(Default::default());
+    frame(&mut app, wid);
+    app.windows.get_mut(&wid).unwrap().search = None;
+    paint(&app, session, &rows);
+    frame(&mut app, wid);
+    assert!(
+        banner_on(&app, wid, 3),
+        "a find bar opened and closed over the whole card: the banner"
+    );
+    host.shutdown_and_join();
 }
 
 /// DRIFT IS A FACT FOR LATER, NEVER A GATE (card engine §3.10, §3.8). The
@@ -5174,7 +7648,7 @@ fn a_card_layer_survives_a_menu_cut_and_is_withdrawn_once() {
         w: 2,
         h: 1,
     };
-    cut_out(&mut cards, &mut input, menu);
+    cut_out(&mut cards, &mut input, menu, 1, 0);
     crate::app_render::scrub_overlay_card(&mut input, menu, (1, 2), (0, 0));
     let mut after = vec![0x010203; 48];
     aterm_render::fx::paint_layers(&mut after, &f, &input.fx_layers, &input.fx_occluders);
@@ -5210,6 +7684,10 @@ fn a_card_layer_survives_a_menu_cut_and_is_withdrawn_once() {
         "a consumed record removes nothing again"
     );
 }
+
+#[cfg(a11y_tree)]
+#[path = "claude_card_a11y_tests.rs"]
+mod a11y_tests;
 
 /// The gate switch's laws (card engine §7 "A, the gate"), on this module's
 /// fixtures.

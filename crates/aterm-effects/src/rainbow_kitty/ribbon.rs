@@ -1007,6 +1007,7 @@ impl Cohort {
     /// ([`Ribbon::settle_revoked_parts`]), so this frame's content read can
     /// still lift a part whose glyphs are back. A part released at `at` or
     /// later is not revoked.
+    #[inline]
     fn revoke_releases(&mut self, at: Instant) {
         self.release_clock = None;
         self.parts_revoked_at = Some(self.parts_revoked_at.map_or(at, |t| t.max(at)));
@@ -1014,6 +1015,7 @@ impl Cohort {
 
     /// Hold a partial release in custody; with every slot taken, the
     /// oldest part is let go.
+    #[inline]
     fn hold_part(&mut self, part: ReleasePart) {
         let slot = self
             .release_parts
@@ -1391,6 +1393,7 @@ struct FieldLane {
 
 impl FieldLane {
     /// Clear only what the last frame wrote — the O(marks) reset §18 asks for.
+    #[inline]
     fn clear(&mut self) {
         for &col in &self.touched {
             if let Some(slot) = self.t.get_mut(usize::from(col)) {
@@ -1401,6 +1404,7 @@ impl FieldLane {
     }
 
     /// Size the lane to `cols`, filling with the "no field here" sentinel.
+    #[inline]
     fn resize(&mut self, cols: u16) {
         self.t.clear();
         self.t.resize(usize::from(cols), f32::NAN);
@@ -1448,6 +1452,7 @@ impl FieldIndex {
     /// The prune keeps lookups linear in live rows rather than in every row
     /// ever typed on. A grid resize drops every lane, live and spare, since
     /// none is the right width any more.
+    #[inline]
     fn begin(&mut self, cols: u16) {
         if self.cols != cols {
             self.cols = cols;
@@ -1472,6 +1477,7 @@ impl FieldIndex {
     /// The lane for `row`, from the spare pool if the row is newly lit and
     /// minted only when the pool is empty: paid once per "most rows ever live
     /// at once", never per frame.
+    #[inline]
     fn lane_mut(&mut self, row: u16) -> &mut FieldLane {
         if let Some(i) = self.lanes.iter().position(|l| l.row == row) {
             return &mut self.lanes[i];
@@ -1486,6 +1492,7 @@ impl FieldIndex {
     }
 
     /// Drop every lane, live and spare.
+    #[inline]
     fn reset(&mut self) {
         self.lanes.clear();
         self.spare.clear();
@@ -1495,6 +1502,7 @@ impl FieldIndex {
     /// grid retires into the spare pool, cleared over its `touched` list; the
     /// rest keep their columns and take the new row, so [`FieldIndex::at`]
     /// answers for the moved cell between the scroll and the next plan.
+    #[inline]
     fn translate(&mut self, rows: u16) {
         let mut i = 0;
         while i < self.lanes.len() {
@@ -1515,6 +1523,7 @@ impl FieldIndex {
     /// [`FieldIndex::at`] answers for the moved cell until the next plan (the
     /// law [`crate::cursor_glow::band_row`] states; the edge row is a real cell
     /// that does not own this light).
+    #[inline]
     fn translate_band(&mut self, top: u16, bottom: u16, delta: i16) {
         let mut i = 0;
         while i < self.lanes.len() {
@@ -1532,6 +1541,7 @@ impl FieldIndex {
     /// Write one cell's field. First writer wins, and the plan feeds this
     /// newest-first: the newest cell at a column owns it, and an older cell it
     /// shadows is never seen.
+    #[inline]
     fn set(&mut self, row: u16, col: u16, t: f32) {
         let lane = self.lane_mut(row);
         let Some(slot) = lane.t.get_mut(usize::from(col)) else {
@@ -1591,6 +1601,7 @@ fn toward_white(rgb: u32, w: f32) -> u32 {
 /// answer is `family(lo)`, the last parameter whose bytes measured under the
 /// target (never the midpoint, which can round over); `Y(family(lo)) <
 /// target` holds throughout.
+#[inline]
 fn solve_for_luma(family: impl Fn(f32) -> u32, target: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
@@ -1614,6 +1625,7 @@ fn solve_for_luma(family: impl Fn(f32) -> u32, target: f32) -> u32 {
 /// light from value, not chroma (indigo `#4B0082` at `Y 0.097` is `(127, 0,
 /// 219)`). Blue alone is under the bar at full value (`Y 0.072`) and takes some
 /// white; a stop brighter than the target scales down.
+#[inline]
 fn onto_luma(rgb: u32, target: f32) -> u32 {
     let mx = ((rgb >> 16) & 0xff).max((rgb >> 8) & 0xff).max(rgb & 0xff);
     if mx == 0 {
@@ -1634,6 +1646,7 @@ fn onto_luma(rgb: u32, target: f32) -> u32 {
 /// one is lifted through its own hue to full value and only then toward white). Every stop
 /// therefore composites at one weight, so one coverage ceiling holds for the whole arc; on the
 /// default theme a warm stop at that weight composites at `(80, 80, 3)`.
+#[inline]
 #[must_use]
 pub fn bed_ink(rgb: u32, budget: f32) -> u32 {
     onto_luma(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR), budget)
@@ -1718,6 +1731,7 @@ pub(crate) fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 {
 /// brightest. The stop at full value (yellow bent through [`PAPER_HUE_BEND`]), darkened
 /// with its hue intact only as far as [`PAPER_CARET_CONTRAST`] against `bg` needs; red,
 /// blue, indigo and violet already clear it and stay pure.
+#[inline]
 #[must_use]
 pub fn paper_caret_ink(rgb: u32, bg: u32) -> u32 {
     paper_vivid_ink(rgb, bg, PAPER_CARET_CONTRAST)
@@ -1728,6 +1742,7 @@ pub fn paper_caret_ink(rgb: u32, bg: u32) -> u32 {
 /// page on a light one ([`paper_caret_ink`]). The one spelling both the live
 /// head ([`Ribbon::head_rgb`]) and a seated stop
 /// (`CursorGlow::v2_caret_stop_rgb`) read, so the two agree to the byte.
+#[inline]
 #[must_use]
 pub(crate) fn caret_ink(arc: u32, cfg: &Config) -> u32 {
     if cfg.dark_theme {
@@ -1740,6 +1755,7 @@ pub(crate) fn caret_ink(arc: u32, cfg: &Config) -> u32 {
 /// A point mark's ink on paper: [`paper_caret_ink`]'s law at [`PAPER_MARK_CONTRAST`], so a
 /// star or spark keeps its stop's hue (a yellow one gold, never olive) and a letter it
 /// crosses stays readable through it.
+#[inline]
 #[must_use]
 pub fn paper_mark_ink(rgb: u32, bg: u32) -> u32 {
     paper_vivid_ink(rgb, bg, PAPER_MARK_CONTRAST)
@@ -1788,6 +1804,7 @@ fn paper_vivid_ink(rgb: u32, bg: u32, bar: f32) -> u32 {
 /// a whole-colour test cannot tell its stops apart: at one luminance violet is
 /// `#0019FD` and a warm stop `#585000`. The hue-carrying channel is what the
 /// eye picks out of the ground and what the census measures.
+#[inline]
 fn channel_contrast(linear: &[f32; 256], a: u8, b: u8) -> f32 {
     let (a, b) = (linear[usize::from(a)], linear[usize::from(b)]);
     let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
@@ -1798,6 +1815,7 @@ fn channel_contrast(linear: &[f32; 256], a: u8, b: u8) -> f32 {
 /// ground in its furthest channel ([`channel_contrast`]) and [`SEEN_SPREAD`]
 /// bytes of channel spread. Contrast alone passes a grey smudge; spread alone
 /// passes a tinted ground. Both halves are ground-independent.
+#[inline]
 #[must_use]
 pub(crate) fn seen(rgb: u32, bg: u32) -> bool {
     let ch = |c: u32, sh: u32| ((c >> sh) & 0xff) as u8;
@@ -1822,6 +1840,7 @@ pub(crate) fn seen(rgb: u32, bg: u32) -> bool {
 /// at several times a cool one's coverage): the arithmetic behind the ember's per-stop floor.
 /// Solved once per theme into [`BedInkLut`] by a scan down from full alpha with the renderer's
 /// own compositor, answering one over the highest alpha that fails.
+#[inline]
 #[must_use]
 fn seen_floor(ink: u32, bg: u32) -> f32 {
     (1..=255u16)
@@ -1854,6 +1873,7 @@ pub fn edge_cells(surge: f32, heat: f32) -> f32 {
 /// too. Additive, so not under the bed's bar: 1 px on the top edge, priced by
 /// [`HOT_EDGE_COV_MAX`] inside the transient cap, ledger-held over the row
 /// above's descenders (§4.1).
+#[inline]
 #[must_use]
 pub fn hot_edge_ink(rgb: u32) -> u32 {
     let rgb = spectrum_with_min_saturation(rgb, BED_SAT_FLOOR);
@@ -1872,6 +1892,7 @@ pub fn hot_edge_ink(rgb: u32) -> u32 {
 /// `(255, 0, 0)`, blue `(103, 103, 255)`. The green→blue crossing, authored under full value,
 /// is scaled up through its hue first and takes [`BED_SAT_FLOOR`]. Solved once per theme
 /// into [`BedInkLut`]'s rail table.
+#[inline]
 #[must_use]
 pub fn rail_ink(rgb: u32) -> u32 {
     let rgb = spectrum_with_min_saturation(rgb, BED_SAT_FLOOR);
@@ -3185,6 +3206,7 @@ impl Ribbon {
     /// Arm the new line's gate ([`Ribbon::fresh_line`]) at `at`, with the row
     /// the hand left when a cross-row move armed it. An armed gate keeps its
     /// earlier instant and first recorded row ([`FreshLine`]).
+    #[inline]
     fn arm_fresh_line(&mut self, at: Instant, left_row: Option<u16>) {
         // A line the hand started is not the input continued: no seam.
         self.seam = None;
@@ -3291,6 +3313,7 @@ impl Ribbon {
     /// cannot move it. The newest cohort the hand typed into (`!wake`, newest
     /// [`Cohort::alive_at`]), else the newest cohort; `col1` is exclusive, so it
     /// is the column the caret stood in after the last lay.
+    #[inline]
     fn curtain_hand(&self) -> Option<(u16, u16)> {
         let newest = |wake_ok: bool| {
             freshest(self.cohorts.iter().filter(|c| wake_ok || !c.wake)).map(|c| (c.row, c.col1))
@@ -3330,6 +3353,7 @@ impl Ribbon {
     /// rest against [`Ribbon::rest_s`] at the previous tempo
     /// ([`super::timing::phrase_rest_reached`]'s law), advance the tempo by the melody's law,
     /// and open a new phrase if the last one is closed. Once per `Typed` event.
+    #[inline]
     fn note_key(&mut self, at: Instant) {
         let gap_ms = self
             .last_key_at
@@ -3440,6 +3464,7 @@ impl Ribbon {
     /// flowing joins the open phrase `open`, and the row is held ([`Ribbon::hold`]) at the
     /// arrival. The erase alone cannot guarantee this: where it is replayed depends on when its
     /// echo lands, and a run begun after the rest mints its phrase on the row below.
+    #[inline]
     fn take_row_back(&mut self, open: u32, row: u16, at: Instant) {
         for coh in &mut self.cohorts {
             if !coh.abandoned && coh.row == row && coh.flow.is_some() {
@@ -3523,6 +3548,7 @@ impl Ribbon {
     ///
     /// The suffix, not the erased cell with the rest slid left: a slide stacks a slid live
     /// cell on the retracting one for the retract's length.
+    #[inline]
     fn erase(&mut self, caret: (u16, u16), cells: u16, span_s: f32, at: Instant) {
         // In a shell line the suffix is the one erased cell; in a wrapped
         // composer the caret sits inside the text, and the band follows its
@@ -3564,6 +3590,7 @@ impl Ribbon {
     /// `cell` is the cell the held key will lay, or `None` for a caret the engine never
     /// learned; a held Space is remembered there, since the composer's word move measures from
     /// the Space's own cell and the echo's sweep cannot correct it later.
+    #[inline]
     pub(super) fn hold_typed(
         &mut self,
         ev: &super::Event,
@@ -3610,6 +3637,7 @@ impl Ribbon {
     /// full. A burned-out focus loss has nothing to rearm (the pool was
     /// cleared by [`Ribbon::retire`]). The stamp is the common fade, which
     /// [`ember_level`] maps to each cell's own level.
+    #[inline]
     fn regain_focus(&mut self, at: Instant) {
         if let Some(ember) = self.ember_at.take() {
             let r = at.saturating_duration_since(ember).as_secs_f32() / FOCUS_EMBER_S;
@@ -3675,6 +3703,7 @@ impl Ribbon {
     /// The life one cell earns, priced at birth (§4's chain law, verbatim)
     /// — and spent from the cohort's clock ([`live_since`]): it is how long
     /// the cell outlives the last key of its run.
+    #[inline]
     fn cell_life(&self, at: Instant, ctx: &Ctx<'_>) -> f32 {
         let full = ctx.cfg.duration.as_secs_f32().max(0.001);
         let base = (full * LIFE_DURATION_GAIN).clamp(LIFE_BASE_MIN, LIFE_BASE_MAX);
@@ -3721,6 +3750,7 @@ impl Ribbon {
     /// ends. When the shift pass read an insert on that row this tick and the
     /// lay would fall on the tail it pushed right, the landing is the insert's
     /// end, `lo + dc`. Otherwise `landing` is returned as it came.
+    #[inline]
     #[must_use]
     fn insert_landing(&self, landing: (u16, u16), cells: u16) -> (u16, u16) {
         if cells == 0 {
@@ -3941,6 +3971,7 @@ impl Ribbon {
     /// at `at`. A cohort past its grace stays on its swoosh (restarting from
     /// full would brighten it); an abandoned cohort keeps its rewound clock; a
     /// wake expires on its own life.
+    #[inline]
     fn flow_row(&mut self, row: u16, at: Instant) {
         for coh in &mut self.cohorts {
             if coh.row == row {
@@ -3952,6 +3983,7 @@ impl Ribbon {
     /// [`Ribbon::flow_row`]'s law on one cohort: a typed cohort still in
     /// its laying or grace, not abandoned and not already flowing, starts
     /// its flow at `at`.
+    #[inline]
     fn flow_cohort(coh: &mut Cohort, at: Instant) {
         if coh.abandoned || coh.wake || coh.flow.is_some() {
             return;
@@ -3980,6 +4012,7 @@ impl Ribbon {
     /// When no cell owns that column any more, the walk is read off the copy
     /// the follow pass carried away ([`SplitOff`]). `None` when neither
     /// exists; the relay then joins or mints as usual.
+    #[inline]
     #[must_use]
     fn relay_origin(&self, from: (u16, u16), w: u16) -> Option<WalkPos> {
         if w == 0 {
@@ -4070,6 +4103,7 @@ impl Ribbon {
 
     /// The content witness says the text this typed rewrap relays starts at
     /// `start` on its landing row. Only the matching move consumes it.
+    #[inline]
     pub(super) fn note_rewrap_start(
         &mut self,
         from: (u16, u16),
@@ -4287,6 +4321,7 @@ impl Ribbon {
     /// line wraps mid-word: the app moved nothing). An arrival inside the hand's own live typed
     /// run (an arrow back over the word, a typo fix) reaches back over that run, still bounded
     /// by the Space; an arrival into unlit program text stands (`tests/wrap_code_reflow.rs`).
+    #[inline]
     pub(crate) fn moved_word_len(&self, from: (u16, u16), at: Instant) -> u16 {
         let after_space = match self.word_space(from) {
             Some((row, s)) if row == from.0 && s < from.1 => Some(s + 1),
@@ -4317,6 +4352,7 @@ impl Ribbon {
     /// Resident typed suffix immediately before `from`, for a content proof
     /// whose preceding Space was program text rather than a typed event.
     /// This measures existing light; it grants no relocation by itself.
+    #[inline]
     pub(crate) fn typed_suffix_len(&self, from: (u16, u16), at: Instant) -> u16 {
         (0..from.1)
             .rev()
@@ -4566,6 +4602,7 @@ impl Ribbon {
     /// its light dims to [`RETURN_PRINTED_SHARE`] while the swoosh keeps its
     /// clock, nothing stamped as leaving. A cohort already printed keeps its
     /// clock.
+    #[inline]
     fn print_row(&mut self, row: u16, at: Instant) {
         for coh in &mut self.cohorts {
             if coh.row == row && coh.printed.is_none() {
@@ -4945,6 +4982,7 @@ impl Ribbon {
     /// or a [`Cell::leaving`] one); and whether that cell's band is leaving
     /// ([`Cohort::leaving_at`]). One reading for [`Ribbon::wake`]'s reach and
     /// lay, so the two cannot disagree about a column.
+    #[inline]
     fn corridor_column(
         &self,
         ctx: &Ctx<'_>,
@@ -5056,6 +5094,7 @@ impl Ribbon {
     /// anywhere is continued from one past its rightmost column (its colour only), anchored at
     /// `landing` at distance zero ([`WalkPos::restarted`], as `meteor::landing_field` walks
     /// there); red when nothing is laid.
+    #[inline]
     fn wake_origin(&self, row: u16, landing: u16, at: Instant) -> (u16, WalkPos) {
         let fresh =
             |c: &&Cohort| at.saturating_duration_since(c.alive_at).as_secs_f32() <= CHAIN_GAP_MAX;
@@ -5072,6 +5111,7 @@ impl Ribbon {
     /// `col` (a held arrow's trail, or a jump's wake it runs into). Otherwise
     /// a new wake cohort on the row's origin `(anchor_col, walk)`. Never a
     /// typed cohort: the hop leaves the word's clock and bounds alone.
+    #[inline]
     fn join_wake_cohort(
         &mut self,
         row: u16,
@@ -5096,6 +5136,7 @@ impl Ribbon {
     /// Push a new cohort covering `col` on `row` with the walk origin
     /// `anchor_col` on `walk` (its `t0` and odometer `d0`), born and alive at
     /// `at`; returns its index.
+    #[inline]
     fn mint_cohort(
         &mut self,
         row: u16,
@@ -5245,6 +5286,7 @@ impl Ribbon {
     /// ([`Cell::leaving`]) is marked, so no key rejoins it while it drains
     /// ([`Ribbon::stands`]). A cohort with a cell still standing (a `^K`
     /// from mid-line) keeps its band.
+    #[inline]
     fn mark_line_killed(&mut self, row: u16) {
         for k in 0..self.cohorts.len() {
             let coh = self.cohorts[k];
@@ -5362,6 +5404,7 @@ impl Ribbon {
     /// [`Ribbon::retract_suffix`]'s bounded twin, for a re-wrap's moved word
     /// ([`Ribbon::leave_row`]): `w + 1` cells off the old row's end and
     /// nothing else. The erase is still the suffix ([`Ribbon::erase`]).
+    #[inline]
     fn retract_span(&mut self, row: u16, col: u16, min_cells: u16, at: Instant, span_s: f32) {
         let last = col.saturating_add(min_cells.max(1) - 1);
         let n = f32::from(last - col + 1);
@@ -5672,6 +5715,7 @@ impl Ribbon {
     /// ([`Ribbon::restore_releases`]) stops waiting for them and the other
     /// released cells can still be restored. A pruned cell (its retract ran
     /// out) is not replaced and still refuses.
+    #[inline]
     fn custody_replaced(&mut self, idx: usize, stamp: Option<Instant>, n: usize) {
         let Some(stamp) = stamp else {
             return;
@@ -5691,6 +5735,7 @@ impl Ribbon {
     /// cells, each part keeping its stamp and count. Otherwise a torn read's
     /// released cells could never be lifted. A whole release is never
     /// folded: both folds take only un-abandoned cohorts.
+    #[inline]
     fn carry_release(&mut self, from: u32, into: u32) {
         let Some((parts, revoked)) = self
             .cohorts
@@ -5716,6 +5761,7 @@ impl Ribbon {
     /// ([`Cohort::revoke_releases`]); a part released at it or after stays in
     /// custody. Run at the top of the engine's tick, so a revocation gets
     /// exactly one content read in which a part's glyphs could come back.
+    #[inline]
     pub(super) fn settle_revoked_parts(&mut self) {
         for coh in &mut self.cohorts {
             let Some(t) = coh.parts_revoked_at.take() else {
@@ -6154,6 +6200,7 @@ impl Ribbon {
     /// per vertex pair, so the cost is `cells × slabs × rows` and `slabs` is
     /// the term that gives. Sized on the total so two hot rows fit the same
     /// budget as one.
+    #[inline]
     fn slabs_for(ctx: &Ctx<'_>, cells: usize) -> usize {
         let prof = Self::body_profile(ctx.cfg);
         let ch = ctx.geom.ch as f32;
@@ -6324,6 +6371,7 @@ impl Ribbon {
 
     /// [`Ribbon::env_of`] with `cell`'s cohort already looked up — the form
     /// the plan reads, which has it once per run.
+    #[inline]
     fn env_with(&self, ctx: &Ctx<'_>, cell: &Cell, coh: Option<&Cohort>) -> f32 {
         let now = ctx.now;
         // A wake cell laid ahead of its birth (the flight clock) is dark until it is born:
@@ -6488,6 +6536,7 @@ impl Ribbon {
     /// multiplies it into the slab. The floor is never gated, so the echo frame shows the
     /// colour (T2). Exactly `1.0` past the wipe, for a wake cell, before the attack, for the
     /// flat spelling and under reduced motion (§6.11).
+    #[inline]
     fn wipe_of(&self, ctx: &Ctx<'_>, cell: &Cell, dist: f32) -> f32 {
         // Typed cells only: a wake's cells share one birth instant, so
         // wiping each from its own edge would print a comb; its lay sweep is
@@ -6522,6 +6571,7 @@ impl Ribbon {
     /// the retract began under ([`Cohort::retract_col`]) on `suck-in`, so the mark shortens
     /// into the hand (T5) and a later jump does not lurch it. Per cohort, never per row; static
     /// under reduced motion (§6.11).
+    #[inline]
     fn retract_x(&self, ctx: &Ctx<'_>, coh: Option<&Cohort>, x: f32) -> f32 {
         if ctx.cfg.reduced_motion {
             return x;
@@ -6586,6 +6636,7 @@ impl Ribbon {
     ///
     /// `at caret` is the emit-order key (the run the hand is on goes first): the caret is in or
     /// beside the run. `coh` is the run's cohort.
+    #[inline]
     fn head_col(
         &self,
         ctx: &Ctx<'_>,
@@ -7264,6 +7315,7 @@ impl Ribbon {
     /// past the band's ends too: what the landing's jets (`meteor::LandingWalk`) wear. On a
     /// jump's tick the owner may be the corridor's unborn `Over` cell where the field index
     /// reads the `Base` beneath; both agree because a row holds one walk (§45).
+    #[inline]
     #[must_use]
     pub fn walk_origin_at(&self, row: u16, col: u16) -> Option<(f32, f32)> {
         let owner = self
@@ -7279,6 +7331,7 @@ impl Ribbon {
     /// light, else the newest typed cell on the caret's row, then on any row; red when nothing
     /// is laid. The meteor phase-locks its arc to it (§6.4's `t_land`), so the station under
     /// the caret is the caret's own stop.
+    #[inline]
     #[must_use]
     pub fn field_at_caret(&self) -> f32 {
         if let Some(t) = self.caret.and_then(|(row, col)| self.field_at(row, col)) {
@@ -7316,6 +7369,7 @@ impl Ribbon {
     /// The body's vertical extent at a cell, or `None` where no cell is laid (§4.2, §5.4, D16);
     /// valid after [`Ribbon::plan`]. Stardust's sky band is measured from its `top`, since the
     /// tall body covers the whole cell.
+    #[inline]
     #[must_use]
     pub fn band(&self, row: u16, col: u16) -> Option<Band> {
         let run = self
@@ -7392,6 +7446,7 @@ impl Ribbon {
     /// focus rearm inside its 18 ms `edge-in`, T3; a cohort retracting into the caret, §4's
     /// 0.40 s; a falling curtain; a live seam). Grace, reach beats and fades are tails. Under
     /// reduced motion nothing moves (§6.11); the attack still ramps.
+    #[inline]
     #[must_use]
     pub fn brisk(&self, now: Instant) -> bool {
         let ramping = |at: Instant| now.saturating_duration_since(at).as_secs_f32() < EDGE_IN_S;
@@ -7414,6 +7469,7 @@ impl Ribbon {
     /// (amplitude `WAVE_AMP_CELLS·ch·disp`, `PHASE_RATE·disp` cycles/s) at its
     /// crest velocity; one pixel over their sum. `None` with nothing laid or
     /// the spine at rest.
+    #[inline]
     #[must_use]
     pub fn settle_step_s(&self, disp: f32) -> Option<f32> {
         if self.cells.is_empty() || !disp.is_finite() || disp <= 0.0 {
@@ -8037,6 +8093,7 @@ impl Ribbon {
     }
 
     /// Drop everything — style switch, layout change, `Engine::reset`.
+    #[inline]
     pub fn reset(&mut self) {
         self.cells.clear();
         self.cohorts.clear();
@@ -8062,6 +8119,7 @@ impl Ribbon {
     /// Clear transient pen, carry, re-anchor, and follow state belonging to
     /// the ending coordinate space (shared by [`Ribbon::curtain`] and
     /// [`Ribbon::reset`]).
+    #[inline]
     fn clear_space_transient_state(&mut self) {
         self.pending_erase = 0;
         self.pen = None;

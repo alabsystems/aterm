@@ -189,7 +189,7 @@ pub enum Provider {
     },
     /// A release host's own (`ship provision` acquires and audits it).
     ReleaseHost,
-    /// The Linux guest's apt list (`verify linux`): another OS's tool.
+    /// The Linux guest's provisioning (`verify linux`): another OS's tool.
     Guest,
     /// Nobody, yet: aterm provides no copy, and `because` says what removes the need or
     /// whose dependency it is. A §6.1 IN-HOUSE, DROP or OUTSIDE verdict whose slice has not
@@ -391,7 +391,7 @@ impl Tool {
                 "a release host carries it (`targo --unverified ship provision` audits one)".into()
             }
             Provider::Guest => {
-                "the Linux guest's apt list provides it: `targo --unverified verify linux` runs this there"
+                "the Linux guest provides it: `targo --unverified verify linux` runs this there"
                     .into()
             }
             Provider::Unprovided { because } => format!("aterm provides none: {because}"),

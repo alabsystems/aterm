@@ -86,7 +86,8 @@ impl CaptureEncoding {
         })
     }
 
-    fn format_label(self, format: crate::device_layer::TexelFormat) -> &'static str {
+    #[inline]
+    const fn format_label(self, format: crate::device_layer::TexelFormat) -> &'static str {
         match (format, self.color_space) {
             (crate::device_layer::TexelFormat::Bgra8Unorm, CaptureColorSpace::Srgb) => "bgra8",
             (crate::device_layer::TexelFormat::Rgba8Unorm, CaptureColorSpace::Srgb) => "rgba8",
@@ -324,6 +325,7 @@ pub struct VideoSlotDecision {
     )
 )]
 #[must_use]
+#[inline]
 pub const fn video_slot_transition(
     phase: VideoSlotPhase,
     event: VideoSlotEvent,
@@ -372,6 +374,7 @@ pub enum VideoPresentDecision {
     )
 )]
 #[must_use]
+#[inline]
 pub const fn video_present_decision(
     fps_accepted: bool,
     metadata_valid: bool,
@@ -401,6 +404,7 @@ enum SlotState {
 }
 
 impl SlotState {
+    #[inline]
     const fn phase(&self) -> VideoSlotPhase {
         match self {
             Self::Free => VideoSlotPhase::Free,
@@ -439,8 +443,9 @@ enum SlotBuf {
 impl SlotBuf {
     /// Whether this slot stages through the wgpu arm (always false on the
     /// wgpu-free build).
+    #[inline]
     #[cfg(target_os = "macos")]
-    fn is_wgpu(&self) -> bool {
+    const fn is_wgpu(&self) -> bool {
         #[cfg(wgpu_arm)]
         {
             matches!(self, Self::Wgpu(_))
@@ -452,6 +457,7 @@ impl SlotBuf {
     }
 
     /// The wgpu buffer, for the map/harvest paths only WGPU slots reach.
+    #[inline]
     #[cfg(wgpu_arm)]
     fn wgpu(&self) -> &wgpu::Buffer {
         match self {
@@ -466,8 +472,9 @@ impl SlotBuf {
     }
 
     /// Whether this slot stages through the GL arm.
+    #[inline]
     #[cfg(gl_arm)]
-    fn is_gl(&self) -> bool {
+    const fn is_gl(&self) -> bool {
         matches!(self, Self::Gl(_))
     }
 }
@@ -610,6 +617,7 @@ fn spawn_convert_worker(
 
 /// Bytes per source pixel for every destination format the taps support.
 /// Device-free, so the decode contract is testable without an adapter.
+#[inline]
 fn capture_bpp(format: crate::device_layer::TexelFormat) -> Result<u32, String> {
     match format {
         crate::device_layer::TexelFormat::Bgra8Unorm
@@ -619,8 +627,9 @@ fn capture_bpp(format: crate::device_layer::TexelFormat) -> Result<u32, String> 
     }
 }
 
-fn padded_row_bytes(width: u32, bpp: u32) -> u64 {
-    (u64::from(width) * u64::from(bpp)).div_ceil(256) * 256
+#[inline]
+const fn padded_row_bytes(width: u32, bpp: u32) -> u64 {
+    (width as u64 * bpp as u64).div_ceil(256) * 256
 }
 
 /// How one mapped texel becomes straight, non-linear sRGB RGBA8: the
@@ -884,10 +893,12 @@ impl VideoTap {
         })
     }
 
-    fn padded_row(&self) -> u64 {
+    #[inline]
+    const fn padded_row(&self) -> u64 {
         padded_row_bytes(self.src_w, self.bpp)
     }
 
+    #[inline]
     fn note_capture_encoding(&mut self, capture_encoding: CaptureEncoding) {
         match self.first_capture_encoding {
             Some(first) if first != capture_encoding => self.mixed_capture_encoding = true,
@@ -1378,6 +1389,7 @@ impl VideoTap {
     }
 
     /// Whether this ring stages through the GL arm.
+    #[inline]
     #[cfg(gl_arm)]
     pub(crate) fn ring_is_gl(&self) -> bool {
         self.slots.first().is_some_and(|s| s.buffer.is_gl())
@@ -1688,6 +1700,7 @@ impl VideoTap {
 
     /// Whether this ring stages through the armed (Metal) arm; the renderer
     /// wrapper's dispatch key (a ring is homogeneous; see `SlotBuf`).
+    #[inline]
     #[cfg(target_os = "macos")]
     pub(crate) fn ring_is_metal(&self) -> bool {
         self.slots.first().is_some_and(|s| !s.buffer.is_wgpu())
@@ -1856,6 +1869,7 @@ impl VideoTap {
 
     /// [`ordered_capture_store_push`] into this tap's store; evictions count in `evicted`
     /// (head truncation), not `dropped`.
+    #[inline]
     fn push_frame(&mut self, f: CapturedFrame) {
         self.evicted += ordered_capture_store_push(
             &mut self.store,
@@ -1867,13 +1881,15 @@ impl VideoTap {
 
     /// Whether a mid-capture resize already finalized the recording.
     #[must_use]
-    pub fn resized(&self) -> bool {
+    #[inline]
+    pub const fn resized(&self) -> bool {
         self.resized_early_stop
     }
 
     /// Frames harvested so far (`video status`), including frames dispatched
     /// to the worker and not yet adopted.
     #[must_use]
+    #[inline]
     pub fn frames_so_far(&self) -> usize {
         #[cfg(not(target_arch = "wasm32"))]
         let dispatched = self.worker.as_ref().map_or(0, |worker| worker.pending);
@@ -2111,6 +2127,7 @@ pub struct PresentedFrameDecision {
     )
 )]
 #[must_use]
+#[inline]
 pub const fn presented_frame_transition(
     phase: PresentedFramePhase,
     event: PresentedFrameEvent,
@@ -2150,6 +2167,7 @@ enum PresentedFrameState {
 }
 
 impl PresentedFrameState {
+    #[inline]
     const fn phase(self) -> PresentedFramePhase {
         match self {
             Self::Armed => PresentedFramePhase::Armed,
@@ -2252,17 +2270,20 @@ impl RawCapture {
     }
 
     #[must_use]
-    pub fn width(&self) -> u32 {
+    #[inline]
+    pub const fn width(&self) -> u32 {
         self.width
     }
 
     #[must_use]
-    pub fn height(&self) -> u32 {
+    #[inline]
+    pub const fn height(&self) -> u32 {
         self.height
     }
 
     /// The bytes this capture holds: its mapped copy's allocation.
     #[must_use]
+    #[inline]
     pub fn allocation(&self) -> usize {
         self.bytes.capacity()
     }
@@ -2383,7 +2404,8 @@ impl PresentedFrameTap {
         })
     }
 
-    fn padded_row(&self) -> u64 {
+    #[inline]
+    const fn padded_row(&self) -> u64 {
         padded_row_bytes(self.src_w, self.bpp)
     }
 
@@ -2622,8 +2644,9 @@ impl PresentedFrameTap {
     }
 
     /// Whether this one-shot stages through the GL arm.
+    #[inline]
     #[cfg(gl_arm)]
-    pub(crate) fn tap_is_gl(&self) -> bool {
+    pub(crate) const fn tap_is_gl(&self) -> bool {
         self.buffer.is_gl()
     }
 

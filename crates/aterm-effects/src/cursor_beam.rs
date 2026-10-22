@@ -163,6 +163,7 @@ impl CursorBeamRod {
     /// Whether the host must keep arming the animation tick: only while the
     /// beam is charged (typing or a jump flare cooling).
     #[must_use]
+    #[inline]
     pub fn is_active(&self) -> bool {
         self.blaze > SETTLED_BLAZE
     }

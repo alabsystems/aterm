@@ -390,19 +390,23 @@ const CARRIED: Busy = Busy {
 /// turns it started itself since (their pending work was the same), so that
 /// row still says what the session waits on.
 fn carried_wait(rows: &[String], top: usize) -> bool {
+    carried_row(rows, top).is_some()
+}
+
+/// The waiting row [`carried_wait`] reads, its first row as drawn: where the
+/// live zone starts when no status row is drawn ([`busy_zone_start`]).
+fn carried_row(rows: &[String], top: usize) -> Option<usize> {
     const WAITING: [&str; 3] = [
         "waiting for a dynamic workflow",
         "waiting for a background agent",
         "waiting for background work",
     ];
     let width = crate::question::screen_width(rows);
-    glyph_above(rows, top)
-        .map(|i| {
-            let end = status_line_end(rows, i, top, width).unwrap_or(i);
-            status_text(&rows[i..=end])
-        })
-        .and_then(|line| status_busy(&line))
+    let i = glyph_above(rows, top)?;
+    let end = status_line_end(rows, i, top, width).unwrap_or(i);
+    status_busy(&status_text(&rows[i..=end]))
         .is_some_and(|rule| WAITING.contains(&rule))
+        .then_some(i)
 }
 
 /// THE SCREEN READS BUSY BY NOTHING BUT THE WAIT CLAUDE CODE CARRIES: no
@@ -814,11 +818,25 @@ fn footer_count(row: &str, noun: &str) -> bool {
     })
 }
 
-/// A workflow's progress line under the footer (`◯ <name>  <description…>
-/// 1/4 agents done · 20m 59s · ↓ 428.2k tokens`).
+/// A workflow's progress line under the footer: an older build's `◯ <name>
+/// <description…> 1/4 agents done · 20m 59s · ↓ 428.2k tokens`, or 2.1.304's
+/// workflow row (`◯ <name>  ▰▰▰▰▰▱▱▱  3/4 · 4h10m · ↓ 1.0m tokens`,
+/// [`crate::agents_panel`]), which no longer says `agents done` — no store
+/// build of 2.1.301 to 2.1.304 holds the words, so on those builds this rule
+/// read nothing until the panel's reader took the row. A PAUSED workflow
+/// (`⏸ <name>  …`) runs nothing, as the old rule's `◯` already said — and
+/// the paused bullet is manual and plan mode's pill glyph, so their footer
+/// row (`  ⏸ manual mode on · ? for shortcuts`) reads as a paused workflow
+/// too: leaving `⏸` out is what keeps every idle manual-mode footer idle.
 fn is_workflow_progress(row: &str) -> bool {
-    crate::text::trim_start(row).starts_with('◯')
-        && (row.contains("agents done") || row.contains("agent done"))
+    use crate::agents_panel::{Bullet, PROGRESS_OLD, RowKind, one_cell, parse_row};
+    (crate::text::trim_start(row).starts_with('◯')
+        && PROGRESS_OLD
+            .iter()
+            .any(|words| row.contains(crate::text::trim_start(words))))
+        || parse_row(row, one_cell).is_some_and(|r| {
+            r.kind == RowKind::Workflow && r.bullet.is_some_and(|(_, b)| b != Bullet::Paused)
+        })
 }
 
 /// `^\s*<glyph>\s+\S+…` — a spinner glyph ([`is_spinner_glyph`], never the
@@ -1756,9 +1774,13 @@ pub fn status_line(rows: &[String]) -> Option<Cow<'_, str>> {
 
 /// The first row of the LIVE ZONE, by position: every row a running turn
 /// draws its busy signal on is at or under it. With the composer frame it is
-/// where [`busy_signal`] starts reading — the status row, else the row under
-/// the transcript row, launch card or other composer rule the walk up from
-/// the top rule stopped at — and a box up with it starts it no lower than
+/// where [`busy_signal`] starts reading — the status row, else the waiting
+/// row of the wait Claude Code carries ([`carried_wait`]: above its own
+/// wakes' `⏺` rows; measured on 2.1.304, `✻ Waiting for 1 background agent
+/// to finish` over `⏺ Agent "bg probe" finished · 3m 20s` and its turn's
+/// reply, fixture `claude-2.1.304-agents-panel-long-bash-4m57s-120col.txt`),
+/// else the row under the transcript row, launch card or other composer rule
+/// the walk up from the top rule stopped at — and a box up with it starts it no lower than
 /// the box's own first row; with a box and no frame, the box's first row
 /// ([`crate::prompt::prompt_box_first_row`]: the box replaces the frame, and
 /// the turn it blocks draws its footer again where the box was); with
@@ -1782,7 +1804,10 @@ pub fn busy_zone_start(rows: &[String]) -> usize {
     let start = match composer_frame(rows) {
         Some(frame) => {
             let block = status_block(rows, frame.top);
-            let start = block.status.unwrap_or(block.from);
+            let start = block
+                .status
+                .or_else(|| carried_row(rows, frame.top))
+                .unwrap_or(block.from);
             boxed.map_or(start, |b| b.min(start))
         }
         None => boxed.unwrap_or(0),
@@ -1800,7 +1825,8 @@ pub fn busy_zone_start(rows: &[String]) -> usize {
 /// composer rule: a draft that starts with a number (`❯ 1. Keep the harness`,
 /// an answer to a numbered question typed but not sent) is still the composer.
 /// Nor is it an entry of the list Claude Code opens under the composer
-/// ([`is_list_entry`]).
+/// ([`is_list_entry`]), which a column-0 `❯` with no rule over it, as the
+/// agents panel's pointed row under the footer, is.
 pub fn composer_index(rows: &[String]) -> Option<usize> {
     // A plain loop: every reading finds the composer many times over, and a
     // debug build's iterator adapters cost more than the test of a row.
@@ -5041,6 +5067,55 @@ mod tests {
             assert_eq!(reach.rules(), Some((2, 4)), "{r:?}");
             assert_eq!(reach.rules(), composer_rules(&r));
         }
+        // Negative control: a draft that reads like a panel row, typed at the
+        // caret right under its top rule, is still the caret, with the
+        // panel's pointed row under the footer or not.
+        let agent = "◯ salvage-merge  ▱▱▱▱  0/5   12m43s · ↓ 943.7k tokens";
+        for under in [format!("  {agent}"), format!("❯ {agent}")] {
+            let r = rows(&[
+                "⏺ Done.",
+                "",
+                &rule,
+                &format!("❯ {agent}"),
+                &rule,
+                "  ⏵⏵ bypass permissions on · 2 shells · ↓ to manage",
+                "",
+                "  ⏺ main",
+                &under,
+            ]);
+            assert_eq!(composer_index(&r), Some(3), "{r:?}");
+        }
+    }
+
+    /// MEASURED on 2.1.304 (the lab, 2026-10-19): one background agent under
+    /// the footer, the panel at rest, its main row selected and its agent row
+    /// selected (`↓` once and twice from the empty composer). On every one
+    /// the caret is the composer's empty `❯` row under its top rule, the
+    /// frame stands, and the turn reads busy from its status row (`Waiting
+    /// for 1 background agent to finish`). The selected screens are the
+    /// defect's: the caret search took the `❯ ⏺ main` row before.
+    #[test]
+    fn the_measured_selected_panel_rows_are_no_caret() {
+        for text in [
+            include_str!("fixtures/claude-2.1.304-agents-panel.txt"),
+            include_str!("fixtures/claude-2.1.304-agents-panel-later.txt"),
+            include_str!("fixtures/claude-2.1.304-agents-panel-main-selected.txt"),
+            include_str!("fixtures/claude-2.1.304-agents-panel-agent-selected.txt"),
+        ] {
+            let r: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
+            let caret = r
+                .iter()
+                .position(|row| row == "❯")
+                .expect("the empty caret");
+            assert_eq!(composer_index(&r), Some(caret), "{text}");
+            let frame = composer_frame(&r).expect("the frame stands");
+            assert_eq!((frame.top, frame.bottom), (caret - 1, caret + 1));
+            assert_eq!(worker_phase(&r), Phase::Busy);
+            assert_eq!(
+                signal(&r).as_deref(),
+                Some("status row: waiting for a background agent")
+            );
+        }
     }
 
     /// Each footer rule, on an otherwise idle frame; the footers an idle worker
@@ -5079,6 +5154,18 @@ mod tests {
                 "footer: a workflow running",
                 false,
             ),
+            // 2.1.304's workflow row: its pill bar, `done/total` with no
+            // `agents done`, the bar's own elapsed (read in the bundle).
+            (
+                "  ◯ nightly-sweep  ▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  1/4 · 3m02s · ↓ 12.4k tokens",
+                "footer: a workflow running",
+                false,
+            ),
+            (
+                "  ◯ nightly-sweep  ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱  16/21 · 4h42m · ↓ 1.2m tokens · ⚠ Large workflow · /workflows to stop",
+                "footer: a workflow running",
+                false,
+            ),
             ("  Still working (12s)", "footer: Still working", false),
             (
                 "  esc to interrupt · ctrl+b to run in background",
@@ -5096,6 +5183,10 @@ mod tests {
             "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents                /rc active",
             "  paste again to expand",
             "  ⏵⏵ auto mode on · shells are fine · 10 files changed",
+            // A PAUSED 2.1.304 workflow runs nothing; a panel AGENT row is
+            // not a workflow (the background-agent rules read those).
+            "  ⏸ nightly-sweep  ▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  1/4 · 3m02s · ↓ 12.4k tokens",
+            "  ◯ general-purpose  Searching the report's consumers in tests      4m 28s · ↓ 115.4k tokens",
         ] {
             let r = screen(&body, footer);
             assert_eq!(signal(&r), None, "{footer}");
@@ -5846,6 +5937,12 @@ mod tests {
         assert_eq!(status_row(&r), None);
         assert!(!status_unseen(&r), "a glyph row is on the screen");
         assert!(carried_wait_alone(&r));
+        // The live zone keeps the waiting row the reading reads.
+        let waiting = r
+            .iter()
+            .position(|row| row.starts_with("\u{273B} Waiting for"))
+            .expect("the waiting row");
+        assert_eq!(busy_zone_start(&r), waiting);
         // A pane 16 columns wide: Ink wrapped the waiting row right after
         // `Waiting for`, and the wait is read on its LINE (module docs).
         let narrow = pane(
@@ -5883,6 +5980,12 @@ mod tests {
         assert_eq!(worker_phase(&r), Phase::Idle);
         assert_eq!(busy_signal(&r), None);
         assert!(status_unseen(&r), "the walk stops at the prompt");
+        // ...and the live zone starts under the reply, the waiting row out.
+        let reply = r
+            .iter()
+            .position(|row| row.starts_with("\u{23FA} No change"))
+            .expect("the reply");
+        assert_eq!(busy_zone_start(&r), reply + 1);
         // (b) The work finished: the completion turn drew its done row.
         let r = collapsed(&[
             "⏺ Dynamic workflow \"Second review pass\" completed · 5s",

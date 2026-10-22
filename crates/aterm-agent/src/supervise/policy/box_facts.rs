@@ -65,8 +65,8 @@ pub struct BoxFacts {
     /// A limit reset was passed over at this dialog's mount.
     pub limit_reset_passed: bool,
     /// Gemini CLI's usage-limit dialog is due its `Keep trying`: its named
-    /// reset, the grace and the loop's back-off have passed
-    /// ([`ApprovalCtx::limit_retry`]).
+    /// reset, the grace and the loop's back-off have passed, or, naming none,
+    /// its ladder's rung ([`ApprovalCtx::limit_retry`]).
     pub limit_retry: bool,
     /// The worker, where it was read (a box that may run git, a Bash box, a
     /// box an ask rule may have sent), or why it could not be; `None`: not

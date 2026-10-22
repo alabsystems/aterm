@@ -31,6 +31,19 @@ static SETTINGS_FONT_FAMILIES: std::sync::Mutex<(
     Option<std::sync::Arc<aterm_render::font_catalog::MonospaceFamilies>>,
 )> = std::sync::Mutex::new((None, None));
 
+/// The installed fonts the Settings font pickers were last given
+/// ([`SETTINGS_FONT_FAMILIES`]), for words that name the automatic font as
+/// a font row does (`aterm ctl settings unset font_family`); `None` before
+/// any Settings view listed them.
+pub(crate) fn settings_font_families()
+-> Option<std::sync::Arc<aterm_render::font_catalog::MonospaceFamilies>> {
+    SETTINGS_FONT_FAMILIES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .1
+        .clone()
+}
+
 impl App {
     /// Every live Settings presentation in `wid`, focused or not: a split or restore may
     /// put Settings beside a terminal or another app, so focus is not identity.
@@ -1456,7 +1469,10 @@ impl App {
     /// (design §9.2.1, §9.3.3). Every input is read from state the frame already
     /// computed (the presented `input_scratch`, the hits and the rect the last paint
     /// recorded), so a reader is told the frame on the glass and no layout work is
-    /// added. `None` for an unknown window.
+    /// added — but the grid's TEXT under the harness's glass is the program's, as copy
+    /// and `text`/`screen` keep it (`claude_footer::ProgramCells`, review G3): the
+    /// chips, the mode light, the badge, the title slot, the facts and the key the glass
+    /// adds are their own nodes. `None` for an unknown window.
     #[cfg(a11y_tree)]
     pub(crate) fn grid_a11y_tree(
         &self,
@@ -1667,8 +1683,13 @@ impl App {
                             .then_some((crow - row_off, ccol - col_off))
                     })
                     .flatten();
+                // The program's words under the harness's glass, as the whole
+                // grid's (`App::grid_snapshot`).
                 let snap = crate::accessibility::AccessibleSnapshot::from_cells_in(
-                    &ws.input_scratch.cells,
+                    &crate::claude_footer::ProgramCells::of(
+                        &ws.input_scratch,
+                        &ws.claude_footer_undo,
+                    ),
                     strip + row_off..strip + row_off + rows,
                     col_off..col_off + cols,
                     cursor,
@@ -2189,6 +2210,15 @@ impl App {
                     crate::a11y_tree::chip_for(req.target_node)
             {
                 self.open_autopilot_menu_for_reader(wid, session);
+                return;
+            }
+            // A fact's menu, asked for (`crate::fact_menu`: what its right-click does),
+            // opened as from the keyboard while the fact is on the glass.
+            if req.action == aterm_a11y::model::Action::ShowContextMenu
+                && let Some((session, chip)) = crate::a11y_tree::chip_for(req.target_node)
+                && let Some(fact) = chip.fact()
+            {
+                self.open_fact_menu_for_reader(wid, session, fact);
                 return;
             }
             // A harness chip the reader clicked: what a click on its cells does, while

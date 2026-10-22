@@ -416,6 +416,79 @@ fn a_session_sums_its_subagent_transcripts_and_nothing_else() {
     assert_eq!(total.assistant_rows, 4);
 }
 
+/// THE TRAFFIC VIEW is the whole session's: the transcript's and every
+/// subagent's stamped rows in one series, the unstamped ones counted beside
+/// it, the totals every file's; the main chain's working spans in whole
+/// seconds, rounded outward, and its working time. The generation holds
+/// while nothing was appended and moves with a row in any file.
+#[test]
+fn the_traffic_view_is_the_whole_sessions() {
+    let dir = TestDir::new("traffic");
+    let main = dir.join("abc-123.jsonl");
+    let stamped =
+        |text: String, at: &str| text.replacen('{', &format!("{{\"timestamp\":\"{at}\","), 1);
+    append(
+        &main,
+        &stamped(
+            row("m1", "claude-opus-5-5", 10, 100),
+            "2026-10-19T12:00:05Z",
+        ),
+    );
+    append(&main, &row("m2", "claude-opus-5-5", 1, 1));
+    append(
+        &main,
+        "{\"isSidechain\":false,\"type\":\"system\",\"subtype\":\"turn_duration\",\"durationMs\":61500,\"timestamp\":\"2026-10-19T12:01:10.250Z\"}\n",
+    );
+    let subs = dir.join("abc-123").join("subagents");
+    fs::create_dir_all(&subs).expect("dirs");
+    append(
+        &subs.join("agent-a1.jsonl"),
+        &stamped(row("s1", "claude-haiku-4-5", 5, 40), "2026-10-19T12:02:30Z"),
+    );
+    let mut session = SessionUsage::new(&main);
+    assert!(session.refresh(BIG).caught_up);
+    let view = session.traffic();
+    let minute = i64::try_from(
+        crate::harness::upgrade_models::parse_utc("2026-10-19T12:00:00Z").expect("a stamp"),
+    )
+    .expect("fits");
+    assert_eq!((view.start_s, view.width_s), (minute, 60));
+    // Each prompt is its input and 1010 cache tokens.
+    assert_eq!(&*view.buckets, &[(1_020, 100), (0, 0), (1_015, 40)]);
+    assert_eq!(view.totals, (1_020 + 1_011 + 1_015, 141));
+    assert_eq!(view.unread, 1, "m2 has no stamp");
+    // The turn 12:00:08.750–12:01:10.250, outward to whole seconds.
+    assert_eq!(&*view.busy, &[(minute + 8, minute + 71)]);
+    assert_eq!(view.runtime_s, Some(61));
+    let generation = session.traffic_generation();
+    session.refresh(BIG);
+    assert_eq!(session.traffic_generation(), generation, "nothing appended");
+    assert_eq!(session.traffic(), view);
+    append(
+        &subs.join("agent-a1.jsonl"),
+        &stamped(row("s2", "claude-haiku-4-5", 5, 2), "2026-10-19T12:02:40Z"),
+    );
+    session.refresh(BIG);
+    assert_ne!(session.traffic_generation(), generation, "a subagent's row");
+}
+
+/// A FOLD THAT STARTS OVER never takes back an old generation: a reader
+/// keyed on it rebuilds. CONTROL by construction: the old fold and the new
+/// one each summed one row, so a fresh count would read the same.
+#[test]
+fn a_fold_that_starts_over_moves_its_generation() {
+    let dir = TestDir::new("generation");
+    let path = dir.join("s.jsonl");
+    append(&path, &row("m1", "claude-opus-5-5", 1, 100));
+    let mut cursor = TranscriptCursor::new(&path);
+    cursor.advance(BIG).expect("reads");
+    let before = cursor.fold().generation();
+    fs::write(&path, row("m9", "claude-haiku-4-5", 1, 7)).expect("truncate and rewrite");
+    assert!(cursor.advance(BIG).expect("reads").restarted);
+    assert_eq!(output_of(cursor.fold(), "claude-haiku-4-5"), 7);
+    assert_ne!(cursor.fold().generation(), before);
+}
+
 /// A subagent still behind is a prefix: the session is not caught up while the transcript is, and
 /// it is once the subagent is read to its end.
 #[test]
@@ -1626,4 +1699,209 @@ fn unread_is_said_with_no_tokens_shown() {
         UsageFacts::of((Vec::new(), More::default()), None, Some(&whole)),
         None
     );
+}
+
+// ---------------------------------------------------------------------------
+// Its subagents' calls in flight (`super::super::flight`)
+// ---------------------------------------------------------------------------
+
+/// The measured rows of `testdata/flight/<name>`, the header left out, each
+/// with its newline.
+fn measured(name: &str) -> Vec<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/harness/testdata/flight")
+        .join(name);
+    fs::read_to_string(path)
+        .expect("test data")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+fn testdata(name: &str) -> String {
+    fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/harness/testdata/flight")
+            .join(name),
+    )
+    .expect("test data")
+}
+
+/// THE ONE FOLD: a subagent's calls in flight are read off the same appended
+/// bytes as its tokens, and its meta once. MEASURED rows: `long probe`'s
+/// call is in flight after its row, the model's after its result; the table
+/// names it as its meta does and starts it at its first row. A refresh with
+/// nothing new reads no byte and no meta, and moves no generation.
+#[test]
+fn a_subagents_calls_in_flight_ride_the_usage_fold() {
+    let dir = TestDir::new("flight");
+    let main = dir.join("abc-123.jsonl");
+    append(&main, &row("m1", "claude-opus-5-5", 10, 100));
+    let subs = dir.join("abc-123").join("subagents");
+    fs::create_dir_all(&subs).expect("dirs");
+    let file = subs.join("agent-a372f0f51e1893105.jsonl");
+    fs::write(
+        subs.join("agent-a372f0f51e1893105.meta.json"),
+        testdata("claude-2.1.304-long-bash.meta.json"),
+    )
+    .expect("meta");
+    let rows = measured("claude-2.1.304-long-bash.jsonl");
+    for r in &rows[..2] {
+        append(&file, r);
+    }
+    let mut session = SessionUsage::new(&main);
+    assert!(session.refresh(BIG).complete());
+    let table = session.flights();
+    let [flyer] = table.flyers.as_slice() else {
+        panic!("one agent: {table:?}");
+    };
+    assert_eq!(
+        *flyer,
+        crate::harness::flight::Flyer {
+            start_ms: crate::harness::codex_rollout::stamp_ms("2026-10-20T15:58:20.682Z").unwrap(),
+            flight: flyer.flight,
+            ..crate::harness::flight::Flyer::agent(
+                "general-purpose",
+                Some("long probe"),
+                0,
+                FileFlight::Unknown
+            )
+        }
+    );
+    assert!(matches!(flyer.flight, FileFlight::Tool(c) if c.budget_ms == 400_000));
+    assert_eq!(session.meta_reads(), 1);
+    // At rest: nothing read, nothing moved.
+    let (bytes, generation) = (session.bytes_read(), session.flight_generation());
+    assert!(!session.moved());
+    session.refresh(BIG);
+    assert_eq!(session.bytes_read(), bytes);
+    assert_eq!(session.meta_reads(), 1);
+    assert_eq!(session.flight_generation(), generation);
+    // The result appended: the model's, and the generation moved.
+    append(&file, &rows[2]);
+    session.refresh(BIG);
+    assert_eq!(session.bytes_read() - bytes, rows[2].len() as u64 + 1);
+    assert_eq!(session.flights().flyers[0].flight, FileFlight::Model);
+    assert_ne!(session.flight_generation(), generation);
+    assert_eq!(session.meta_reads(), 1, "the meta is read once");
+    // The main transcript has no flight of its own.
+    assert_eq!(session.main().file_flight(), FileFlight::Unknown);
+}
+
+/// A RUN IS LOOKED FOR ONCE A REFRESH, however many of its agents' files
+/// are followed: a run of five agents whose script is missing spends one of
+/// its [`META_TRIES`] a refresh, so it is looked for on that many refreshes,
+/// then no more. Each file spent one before, so a run of four agents or more
+/// spent every try on its first refresh, before its script was written.
+#[test]
+fn a_run_is_looked_for_once_a_refresh_whatever_its_agents() {
+    let dir = TestDir::new("flight-run-tries");
+    let main = dir.join("abc-123.jsonl");
+    append(&main, &row("m1", "claude-opus-5-5", 10, 100));
+    let run = dir
+        .join("abc-123")
+        .join("subagents")
+        .join("workflows")
+        .join("wf_stallrun-f56");
+    fs::create_dir_all(&run).expect("dirs");
+    let wf = measured("claude-2.1.304-workflow-long.jsonl");
+    let agents: Vec<_> = (0..5)
+        .map(|i| run.join(format!("agent-a{i}.jsonl")))
+        .collect();
+    let mut session = SessionUsage::new(&main);
+    for k in 1..=u64::from(META_TRIES) + 2 {
+        for agent in &agents {
+            append(agent, &wf[0]);
+        }
+        session.refresh(BIG);
+        assert_eq!(
+            session.meta_reads(),
+            k.min(u64::from(META_TRIES)),
+            "refresh {k}: one look a refresh, bounded"
+        );
+    }
+}
+
+/// An agent with no meta is in no table (its row cannot map), looked for at
+/// most `META_TRIES` times; one written later is found while tries are left.
+/// A workflow run's agents make one entry, named by its script.
+#[test]
+fn metas_and_scripts_are_looked_for_a_bounded_number_of_times() {
+    let dir = TestDir::new("flight-meta");
+    let main = dir.join("abc-123.jsonl");
+    append(&main, &row("m1", "claude-opus-5-5", 10, 100));
+    let subs = dir.join("abc-123").join("subagents");
+    let run = subs.join("workflows").join("wf_stallrun-f56");
+    fs::create_dir_all(&run).expect("dirs");
+    let file = subs.join("agent-a1.jsonl");
+    let rows = measured("claude-2.1.304-long-bash.jsonl");
+    append(&file, &rows[0]);
+    let mut session = SessionUsage::new(&main);
+    session.refresh(BIG);
+    assert!(session.flights().flyers.is_empty(), "no meta, no entry");
+    // Found on a later try.
+    fs::write(
+        subs.join("agent-a1.meta.json"),
+        testdata("claude-2.1.304-long-bash.meta.json"),
+    )
+    .expect("meta");
+    append(&file, &rows[1]);
+    session.refresh(BIG);
+    assert_eq!(session.flights().flyers.len(), 1);
+    assert_eq!(session.meta_reads(), 2);
+    // A run whose script is missing: looked for at each refresh that finds
+    // its agents, at most `META_TRIES` times, then no more.
+    let wf = measured("claude-2.1.304-workflow-long.jsonl");
+    let agent = run.join("agent-aa69f18335229ca32.jsonl");
+    for (k, r) in wf.iter().enumerate() {
+        append(&agent, r);
+        session.refresh(BIG);
+        if k == 0 {
+            assert_eq!(session.meta_reads(), 3, "the run's first look");
+        }
+    }
+    assert_eq!(session.meta_reads(), 2 + u64::from(META_TRIES), "bounded");
+    assert_eq!(session.flights().flyers.len(), 1, "no script, no run");
+    // Control: with its script there from the start, the run is one entry.
+    let dir = TestDir::new("flight-run");
+    let main = dir.join("abc-123.jsonl");
+    append(&main, &row("m1", "claude-opus-5-5", 10, 100));
+    let session_dir = dir.join("abc-123");
+    let run = session_dir
+        .join("subagents")
+        .join("workflows")
+        .join("wf_stallrun-f56");
+    let scripts = session_dir.join("workflows").join("scripts");
+    fs::create_dir_all(&run).expect("dirs");
+    fs::create_dir_all(&scripts).expect("dirs");
+    fs::write(
+        scripts.join("stall-probe-wf_stallrun-f56.js"),
+        "// stand-in\n",
+    )
+    .expect("script");
+    for (name, rows) in [
+        ("agent-aa69f18335229ca32.jsonl", &wf[..3]),
+        (
+            "agent-a20aa78f1612099f1.jsonl",
+            &measured("claude-2.1.304-workflow-quick.jsonl")[..],
+        ),
+    ] {
+        for r in rows {
+            append(&run.join(name), r);
+        }
+    }
+    let mut session = SessionUsage::new(&main);
+    session.refresh(BIG);
+    let table = session.flights();
+    let [flyer] = table.flyers.as_slice() else {
+        panic!("one run: {table:?}");
+    };
+    assert_eq!(flyer.kind, aterm_phase::agents_panel::RowKind::Workflow);
+    assert_eq!(
+        flyer.name_hash,
+        aterm_phase::agents_panel::text_hash("stall-probe")
+    );
+    assert!(matches!(flyer.flight, FileFlight::Tool(c) if c.budget_ms == 300_000));
+    assert_eq!(session.meta_reads(), 1, "one listing for the run");
 }

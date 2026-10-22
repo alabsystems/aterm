@@ -318,12 +318,16 @@ mod chrome_label;
 /// The harness card on Claude Code's launch card
 /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §3).
 mod claude_card;
+mod claude_facts;
 mod claude_footer;
 mod claude_lights;
+mod claude_panel;
 /// The registry rows the footer's resolver awaits, watched by push
 /// (`docs/DESIGN-card-engine-2026-10-19.md` §3.10).
 mod claude_registry;
+mod claude_slash;
 mod cli;
+pub use cli::initial_setup_window_args;
 /// The window's own frame where the window system draws none: the chrome band as
 /// the Wayland client-side header (LW.5). Only Linux draws one; elsewhere its
 /// geometry compiles for the strip's layout and the tests, so parts go unused.
@@ -434,10 +438,10 @@ mod system_state_host;
 mod workstation_setup;
 #[cfg(target_os = "macos")]
 pub use devtools_helper_drive::run_devtools_helper_drive;
-pub use system_state::{InitialSetupPermissionPolicy, SetupStatus, SetupStatusRow};
+pub use system_state::{InitialSetupPermissionPolicy, SetupCheck, SetupStatus, SetupStatusRow};
 pub use system_state_host::{
-    InitialSetupApplyReceipt, InitialSetupHandlers, publish_initial_setup_status,
-    set_initial_setup_handlers,
+    InitialSetupApplyReceipt, InitialSetupCancelReceipt, InitialSetupHandlers,
+    publish_initial_setup_status, set_initial_setup_handlers,
 };
 pub use workstation_setup::{
     SetupAnswer, WorkstationSetupDecision, await_initial_setup_countdown_while,
@@ -765,6 +769,8 @@ mod fabric;
 /// The `[fabric] command` bridge launcher: a child inheriting two socketpairs at fds 3 and 4.
 #[cfg(unix)]
 mod fabric_launch;
+/// The composer rule's facts' menus (`crate::autopilot_menu`'s card, owned by a fact).
+mod fact_menu;
 mod find_bar;
 /// The fleet glance: one bounded `aterm ctl survey --fleet --json` child at a
 /// time, read into a shared snapshot the status item's Fleet rows show.
@@ -985,7 +991,8 @@ mod session_log;
 /// 6, with `[session_log] journal = false` the opt-out): the
 /// `aterm-session-log` writer thread, its files and its reader.
 mod session_log_journal;
-/// THE SESSION LOG's bus mirror, GUI half (phase 4, off by default): the
+/// THE SESSION LOG's bus mirror, GUI half (phase 4; `[fabric] log = "auto"`
+/// by default since Phase 6, on over a broker that retains it): the
 /// bridge-only `log-take`/`log-landed`, closed sessions' tails and tombstones.
 mod session_log_mirror;
 /// THE INSTANCE'S NODE LOG (session log 5J): node `n`'s start, fabric link
@@ -3908,8 +3915,6 @@ pub(crate) struct PausePlan {
 enum Wake {
     /// A worker asks for the first-launch countdown on the next visible window.
     WorkstationSetup(workstation_setup::Request),
-    #[cfg(target_os = "macos")]
-    OpenSystemState,
     InitialSetupStatus {
         generation: Option<u64>,
         status: system_state::SetupStatus,
@@ -4740,10 +4745,12 @@ enum Wake {
         text: String,
         source: Source,
     },
-    /// The same X11 hand-off for a paste into the open find bar (`App::search_paste_in`).
+    /// The same X11 hand-off for a paste into the open find bar (`App::search_paste_in`),
+    /// tied to that field's lifetime rather than a later find in the same window.
     #[cfg(target_os = "linux")]
     FindPasteReady {
         wid: WindowId,
+        owner: Arc<()>,
         text: String,
     },
     /// A document open's blocking half finished (resolve, bounded read, UTF-8);
@@ -5065,6 +5072,13 @@ enum Wake {
     /// cross-session callers skip the hop.
     FrontControlSurface {
         reply: std::sync::mpsc::Sender<control::FrontControlSurface>,
+    },
+    /// `open fact-menu <fact>`: the front window's focused session's menu of
+    /// that fact (`crate::fact_menu`), or, `None`, `open fact-menu close`. The
+    /// main thread replies `Ok(())` or `Err(msg)`.
+    OpenFactMenu {
+        fact: Option<claude_lights::Fact>,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
     /// Open an auxiliary target for inspection: Settings aliases resolve to tab routes, Menu to
     /// the palette.
@@ -7755,6 +7769,11 @@ struct PooledSession {
     /// [`App::install_session_colors`] compares against, so an unchanged
     /// reload costs a pinned session no `apply_config`.
     own_colors: Option<Arc<aterm_core::config::TerminalConfig>>,
+    /// The program's DEC 1004 enable count (`ModeMirror::focus_arms`) as of the last
+    /// focus report written to this session, or as of its adoption: an enable past it is
+    /// one the session has not been told the focus state for yet
+    /// ([`App::report_focus_arm`]).
+    focus_arms_told: u32,
 }
 
 impl SessionPool {
@@ -7764,6 +7783,9 @@ impl SessionPool {
         // See `insert_epoch`: this is the one way an id nobody has classified
         // yet can enter the live set.
         self.insert_epoch = self.insert_epoch.wrapping_add(1);
+        // An enable made before the pool held the session (an adopted one's) was the
+        // predecessor's to answer.
+        let focus_arms_told = session.ctx.modes.focus_arms();
         self.sessions.insert(
             id,
             PooledSession {
@@ -7772,9 +7794,22 @@ impl SessionPool {
                 rain_override: None,
                 theme: None,
                 own_colors: None,
+                focus_arms_told,
             },
         );
         id
+    }
+    /// The DEC 1004 enable count the session was last told the focus state at
+    /// ([`PooledSession::focus_arms_told`]); `None` for an unknown id.
+    fn focus_arms_told(&self, id: u64) -> Option<u32> {
+        self.sessions.get(&id).map(|p| p.focus_arms_told)
+    }
+    /// Record that the session has been told the focus state as of `arms` enables. No-op
+    /// for an unknown id.
+    fn set_focus_arms_told(&mut self, id: u64, arms: u32) {
+        if let Some(p) = self.sessions.get_mut(&id) {
+            p.focus_arms_told = arms;
+        }
     }
     /// The per-session matrix-rain override; `None` (unknown session or none set) follows the
     /// config.
@@ -12375,7 +12410,6 @@ fn update_handoff_wake_class(ev: &Wake) -> UpdateHandoffEventClass {
         | Wake::WorkerLaunch { .. } => UpdateHandoffEventClass::Revoking,
         #[cfg(target_os = "macos")]
         Wake::StatusAction { .. }
-        | Wake::OpenSystemState
         | Wake::Askpass(_)
         | Wake::AskpassAnswered { .. }
         | Wake::AskpassWithdraw { .. } => UpdateHandoffEventClass::Revoking,
@@ -14838,6 +14872,14 @@ struct App {
     /// The open Autopilot menu (`crate::autopilot_menu`): one at a time, in
     /// one window; `None` at rest.
     autopilot_menu: Option<autopilot_menu::AutopilotMenu>,
+    /// The card a menu choice just closed, in its window, and when
+    /// (`App::spends_menu_follow_up`): the double-click's second press there
+    /// is spent, not passed to what the card covered.
+    autopilot_menu_spent: Option<(WindowId, tab_menu::MenuRect, Instant)>,
+    /// Each session's clickable footer facts (`crate::claude_facts`): what
+    /// the person hid there by a click, for every window that shows it; an
+    /// entry goes with its session (`retire_session_registration`).
+    claude_facts: std::collections::HashMap<u64, claude_facts::SessionFacts>,
     /// Monotonic user/output activity identity. A handoff captures it after
     /// parking; any later input/window activity invalidates final Commit and
     /// signals the worker to kill/reap the child before readers resume.
@@ -19624,8 +19666,10 @@ impl App {
 
     /// The DEC 1004 delta: `ESC[O` to the session that lost the keyboard, `ESC[I` to the one
     /// that gained it, nothing if [`Self::focus_report_holder`] did not move. Recomputes the
-    /// whole account, so any window's sync converges it; `WindowEvent::Focused` and the `focus`
-    /// verb keep their own egress ([`Self::on_focus`]) and only record into it.
+    /// whole account, so any window's sync converges it, and every focus change reaches the
+    /// program through it: a tab switch, a pane move, a split, a close, and the window edge
+    /// (`WindowEvent::Focused` and the `focus` verb, [`Self::on_focus`]), so each change is
+    /// reported once, whichever of them sees it first.
     fn recompute_focus_reports(&mut self) {
         let want = self.focus_report_holder();
         if self.focus_reported == want {
@@ -19639,6 +19683,33 @@ impl App {
         }
         if let Some(next) = want {
             self.write_focus_report(next, true);
+        }
+    }
+
+    /// A program that turns DEC 1004 on is told at once when its session does not hold the
+    /// keyboard: `ESC[O`, since every program that enables focus reports (vim, neovim, tmux,
+    /// a crossterm TUI such as codex) starts out believing it is focused, and one born in a
+    /// background tab would otherwise keep believing it, animating for nobody, until a focus
+    /// change it may never get. In the session the account names ([`Self::focus_reported`])
+    /// that belief is right and nothing is written, as xterm writes nothing at the enable: an
+    /// `ESC[I` there would only fire a FocusGained hook at every program start. Run from the
+    /// session's output wake, which follows the batch that carried the enable; an enable a
+    /// focus report already answered ([`Self::write_focus_report`]) is not answered again.
+    fn report_focus_arm(&mut self, session: u64) {
+        let Some(arms) = self
+            .pool
+            .get(session)
+            .map(|live| live.ctx.modes.focus_arms())
+        else {
+            return;
+        };
+        if self.pool.focus_arms_told(session) == Some(arms) {
+            return;
+        }
+        if self.focus_reported == Some(session) {
+            self.pool.set_focus_arms_told(session, arms);
+        } else {
+            self.write_focus_report(session, false);
         }
     }
 
@@ -20415,6 +20486,8 @@ impl App {
             autopilot_timers: autopilot_timers::AutopilotTimers::default(),
             autopilot_recorded: std::collections::HashMap::new(),
             autopilot_menu: None,
+            autopilot_menu_spent: None,
+            claude_facts: std::collections::HashMap::new(),
             update_handoff_activity_epoch: 0,
             last_update_activity_at: Instant::now(),
             last_keystroke_at: None,
@@ -20939,8 +21012,9 @@ impl App {
     fn on_output_wake(&mut self, session: u64, now: Instant) {
         // A spare booking waiting for this session's first prompt (`spare`).
         self.spares.note_output(session, now);
-        // Output may be a job starting: the stuck engine looks (job demand).
-        self.vitals.note_output();
+        // Output may be a job starting: the stuck engine looks (job demand),
+        // in this wake when the edge is due now.
+        self.vitals_output_edge(now);
         // Clear the session's coalescing flag before any work, so output processed from
         // here on posts a fresh wake — or, for a streaming session, hold it for the
         // cadence, so that output marks the hold dirty and its release runs the next
@@ -20987,6 +21061,8 @@ impl App {
         self.observe_title_drift(session, now);
         // Kitty animations: the bytes may have started, stopped or fed one.
         self.tick_kitty_animations(session, now);
+        // The bytes may have turned DEC 1004 on: a session without the keyboard is told so.
+        self.report_focus_arm(session);
     }
 
     /// Release every output hold due at `now` (`spawn::release_output_hold`): a
@@ -21131,10 +21207,6 @@ impl App {
     /// window; both edges go through [`Self::on_focus`]. winit's macOS backend queues a
     /// `Focused(false)` for each new window after attach.
     fn window_focus_event(&mut self, wid: WindowId, focused: bool) {
-        // The Autopilot menu closes with its window's focus (design §9.3.3).
-        if !focused && self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid) {
-            self.close_autopilot_menu();
-        }
         if focused {
             if cfg!(target_os = "macos") && !self.headless {
                 self.consent.invalidate();
@@ -21172,8 +21244,11 @@ impl App {
             // A window coming to the front is a person arriving: the warm spare
             // may be promoted again (`spare`).
             self.spares.note_person(Instant::now());
-            // The harness cards on show play an episode again (design §3).
-            self.rearm_claude_cards(wid, claude_card::card_now);
+            // A person back at the window: the harness cards on show play an
+            // episode again (design §3), and the agents panels' stuck dots
+            // breathe their course again — unless the window was away for
+            // only a blip (`claude_card::RETURN_MS`).
+            self.claude_glass_focus(wid, true);
             // Re-point control/notify at the new front window only when the frontmost
             // actually changes: `sync_active_session` clears find/selection, which a
             // same-window focus gain must keep.
@@ -21196,6 +21271,9 @@ impl App {
             // The loss clears this window's modifiers ahead of input held for a tab
             // in flight to it, so that input's replay ends with a repair.
             self.tab_spawns.note_focus_loss(wid);
+            // When the window went away, so a gain after a mere blip plays no
+            // card's intro again (`claude_card::RETURN_MS`).
+            self.claude_glass_focus(wid, false);
         }
         self.on_focus(wid, focused);
         // A carried full screen waits for aterm to come to the front, which `on_focus` has
@@ -21235,6 +21313,11 @@ impl App {
             self.close_tab_menu(wid);
             // Any stats lens closes on focus loss (§12.2).
             self.close_stats_lens(wid);
+            // The Autopilot menu closes with its window's focus (design §9.3.3), the
+            // controller's `focus out` as well as the OS edge.
+            if self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid) {
+                self.close_autopilot_menu();
+            }
         }
         let reorders_pre_commit_queue = !focused && self.pre_commit_focus_loss_reorders_queue(wid);
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -21305,20 +21388,24 @@ impl App {
         // This window's active tab joins or leaves the muted and focus-boost sets.
         self.recompute_notify_suppress();
         self.recompute_focus_boost();
-        // The DEC 1004 egress goes through the seam, so a controller `focus` verb satisfies a
-        // focus-tracking app too.
-        self.input(wid, InputEvent::Focus(focused), Source::Human);
-        // Record the egress into [`Self::focus_reported`] so the two lanes do not double-report.
-        // Focus-out clears only if it names the session just blurred, since the new window's
-        // `Focused(true)` may arrive first.
-        let told = self.focused_session_id(wid);
-        if focused {
-            self.focus_reported = told;
-            if let Some(session) = told {
-                self.note_session_seen(wid, session);
-            }
-        } else if self.focus_reported == told {
-            self.focus_reported = None;
+        // What the edge did at the input seam besides its report: tolerated activity for
+        // the automatic update's quiet clock (`input_event_handoff_class`), a recovery
+        // stimulus for a parked present, the control fences this window owes, and the
+        // typed licence a focus change closes whether or not the program reads a report.
+        self.note_update_handoff_tolerated_activity();
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.rearm_present(false);
+        }
+        self.reconcile_licence(wid);
+        self.clear_move_license(wid);
+        // The DEC 1004 report goes through the account, not the seam: macOS hands the key
+        // window over in either order (the new window's `Focused(true)` may come first, and
+        // a window born focused has already been given the keyboard by its sync), so a
+        // report written per edge told one session twice. The delta tells each change once,
+        // to the session the keyboard left and the one it reached, whichever edge sees it.
+        self.recompute_focus_reports();
+        if focused && let Some(session) = self.focused_session_id(wid) {
+            self.note_session_seen(wid, session);
         }
         // `redraw_window` re-applies the hollow-cursor override per window.
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -21496,20 +21583,24 @@ impl App {
     /// Build the accessibility snapshot of window `id`'s grid from the just-rendered
     /// `input_scratch`, dropping the top [`Self::chrome_rows`] and re-basing the cursor
     /// row. Shared by the native publishers. Speculative
-    /// predictive-echo glyphs are included, matching the frame. `None` for an unknown
-    /// window.
+    /// predictive-echo glyphs are included, matching the frame. Under the harness's
+    /// glass a reader gets the PROGRAM's words, as copy and `text`/`screen` do
+    /// (review G3, owner decision 2026-10-20): every cell the footer's last write put
+    /// on the glass reads as the cell it covered (`claude_footer::ProgramCells`).
+    /// `None` for an unknown window.
     #[cfg(a11y_tree)]
     fn grid_snapshot(&self, id: WindowId) -> Option<accessibility::AccessibleSnapshot> {
         let ws = self.windows.get(&id)?;
         let strip = usize::from(self.chrome_rows(id));
-        let cells = ws.input_scratch.cells.get(strip..).unwrap_or(&[]);
+        let rows = strip.min(ws.input_scratch.cells.len())..ws.input_scratch.cells.len();
         let cursor = ws.input_scratch.cursor_visible.then_some((
             ws.input_scratch.cursor_row.saturating_sub(strip),
             ws.input_scratch.cursor_col,
         ));
-        Some(accessibility::AccessibleSnapshot::from_cells(
-            cells,
-            ws.cols as usize,
+        Some(accessibility::AccessibleSnapshot::from_cells_in(
+            &claude_footer::ProgramCells::of(&ws.input_scratch, &ws.claude_footer_undo),
+            rows,
+            0..ws.cols as usize,
             cursor,
         ))
     }
@@ -23010,6 +23101,14 @@ impl ApplicationHandler<Wake> for App {
                 window.request_redraw();
             }
         }
+        // The agents panels' frames the same way: a bar's crest step, a stuck
+        // dot's breath, a dot's next turn (`claude_panels_due`); none running,
+        // breathing or due, and no clock is read (`claude_panel_redraws`).
+        for wid in self.claude_panel_redraws() {
+            if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                window.request_redraw();
+            }
+        }
         // Glide/bounce ticks are levels judged every wake; a `WaitCancelled` turn past
         // the slot must consume it, or `about_to_wait` would arm a past instant.
         // After the lock-free judges, before the borrow loop.
@@ -23862,6 +23961,16 @@ impl ApplicationHandler<Wake> for App {
                 &mut deadline_owner,
                 d,
                 metrics::DeadlineOwner::ClaudeCard,
+            );
+        }
+        // The agents panels' next frames (`App::claude_panel_wake`): nothing
+        // running, breathing or due arms nothing and reads no clock.
+        if let Some(d) = self.claude_panel_wake() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                d,
+                metrics::DeadlineOwner::AgentsPanel,
             );
         }
         // The harness's glass: the end of an act's label on the Autopilot
@@ -25092,10 +25201,6 @@ impl App {
             // park), a configured Mac's read, the sheet's answer, a join's end.
             Wake::SecretsVault(wake) => self.on_secrets_vault(wake),
             Wake::WorkstationSetup(request) => self.offer_workstation_setup(request),
-            #[cfg(target_os = "macos")]
-            Wake::OpenSystemState => {
-                self.open_system_state_tab();
-            }
             Wake::InitialSetupStatus { generation, status } => {
                 self.receive_system_state_status(generation, status)
             }
@@ -25324,6 +25429,17 @@ impl App {
             // immediate input consumer).
             Wake::FrontControlSurface { reply } => {
                 let _ = reply.send(self.front_control_surface());
+            }
+            // A fact's menu, opened (or closed) as `open fact-menu` asks.
+            Wake::OpenFactMenu { fact, reply } => {
+                let result = match fact {
+                    Some(fact) => self.open_front_fact_menu(fact),
+                    None => {
+                        self.close_fact_menu();
+                        Ok(())
+                    }
+                };
+                let _ = reply.send(result);
             }
             // Bring an auxiliary surface up so a driver can then inspect it.
             Wake::OpenAuxWindow {
@@ -26273,9 +26389,10 @@ impl App {
                     // A controller `focus <in|out>` drives the whole focus seam through
                     // `on_focus` (a driven window gets no `WindowEvent::Focused`, so the
                     // cursor's focus look is reachable only there; it writes the DEC 1004
-                    // report itself). A pinned focus takes this route only while `wid` still
-                    // shows that session; otherwise `input_to_session` routes it, so the
-                    // report never reaches a tab that became front after authorization.
+                    // report itself, through the account). A pinned focus takes this route
+                    // only while `wid` still shows that session; otherwise
+                    // `input_to_session` routes it, so the report never reaches a tab that
+                    // became front after authorization.
                     if let (InputEvent::Focus(f), Source::Controller) = (&ev, &src)
                         && session.is_none_or(|target| {
                             self.front_terminal(wid)
@@ -26323,11 +26440,11 @@ impl App {
                 text,
                 source,
             } => self.deliver_paste(wid, session, text, source),
-            // The worker's find-field hand-off: insert at the caret; a find closed meanwhile
-            // makes `search_edit_in` a no-op.
+            // A closed/replaced find drops the worker's reply; focus moving to another
+            // window does not replace the field that requested it.
             #[cfg(target_os = "linux")]
-            Wake::FindPasteReady { wid, text } => {
-                self.search_edit_in(wid, crate::app_search::SearchEdit::Insert(text));
+            Wake::FindPasteReady { wid, owner, text } => {
+                self.complete_search_paste_in(wid, owner, text);
             }
             // A document admission worker reported: failures get the stderr line and a
             // user-facing notice; completions for closed windows or superseded tickets
@@ -35598,6 +35715,8 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         autopilot_timers: autopilot_timers::AutopilotTimers::default(),
         autopilot_recorded: std::collections::HashMap::new(),
         autopilot_menu: None,
+        autopilot_menu_spent: None,
+        claude_facts: std::collections::HashMap::new(),
         update_handoff_activity_epoch: 0,
         last_update_activity_at: Instant::now(),
         last_keystroke_at: None,
@@ -35774,10 +35893,15 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
     // `EXIT_WINDOW_SYSTEM_GONE` and its line; any other error is said as
     // itself and exits `EXIT_EVENT_LOOP_FAILED` (`system_quit::failed_loop_end`).
     // Nothing after this asks a window anything (`App::event_loop_failed`).
-    let failed_status = event_loop
+    let mut failed_status = event_loop
         .run_app(&mut app)
         .err()
         .map(|error| event_loop_failed(&mut app, &error));
+    crate::watchdog::beat(crate::watchdog::Breadcrumb::ShutdownWait);
+    if let Err(error) = app.finish_system_state_shutdown() {
+        aterm_log::error!("{error}");
+        failed_status.get_or_insert(1);
+    }
     // A completion still queued in winit owns no pool entry. Cancel those
     // results and join the one spawner before waiting for reaps or telling the
     // keeper BYE: no late spawn can escape either ownership barrier.

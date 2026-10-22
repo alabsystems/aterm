@@ -110,8 +110,9 @@ verify_island! {
 /// configured `font_features` (a single cell can substitute — `zero` on a lone `0`,
 /// `ss01` on one char), else 2 (a single cell cannot ligate). PURE; keeps the two
 /// `min_run` derivation sites (planner gate + run gate) from drifting.
+#[inline]
 #[must_use]
-pub fn shaping_min_run(has_user_features: bool) -> usize {
+pub const fn shaping_min_run(has_user_features: bool) -> usize {
     if has_user_features { 1 } else { 2 }
 }
 
@@ -160,8 +161,9 @@ pub enum ShapeVerdict {
 /// (`accept iff n_out == n_in`), so the no-flag path stays byte-identical. The
 /// `Collapsed` branch is the ONLY
 /// behaviour the flag adds, and it admits EXACTLY the `N:1` (`N >= 2`) case.
+#[inline]
 #[must_use]
-pub fn classify_shape(n_in: usize, n_out: usize, admit_collapsed: bool) -> ShapeVerdict {
+pub const fn classify_shape(n_in: usize, n_out: usize, admit_collapsed: bool) -> ShapeVerdict {
     if n_in >= 1 && n_out == n_in {
         ShapeVerdict::OneToOne
     } else if admit_collapsed && n_out == 1 && n_in >= 2 {
@@ -245,6 +247,7 @@ pub fn extract_cell_slice(
 /// control, not emoji/text-presentation, not in a shaped emoji cluster, not image-covered.
 /// Spaces break runs, so `a => b` shapes only `=>`. The caller also breaks runs on a
 /// style change and at the cursor and selection columns.
+#[inline]
 #[must_use]
 pub fn cell_is_shapeable(cell: &RenderCell, has_cluster: bool, image_covered: bool) -> bool {
     !cell.wide
@@ -255,7 +258,7 @@ pub fn cell_is_shapeable(cell: &RenderCell, has_cluster: bool, image_covered: bo
         && !has_cluster
         && !image_covered
         // A script cell (aterm's own chrome) is drawn glyph by glyph, small.
-        && cell.script == aterm_core::terminal::Script::Normal
+        && matches!(cell.script, aterm_core::terminal::Script::Normal)
 }
 
 /// One row's fixed font instance and feature list. The renderer already parses

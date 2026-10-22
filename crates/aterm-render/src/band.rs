@@ -27,8 +27,9 @@ use crate::{
 };
 
 /// Build one render cell for compact chrome.
+#[inline]
 #[must_use]
-pub fn cell(ch: char, fg: [u8; 3], bg: [u8; 3], bold: bool, seam: bool) -> RenderCell {
+pub const fn cell(ch: char, fg: [u8; 3], bg: [u8; 3], bold: bool, seam: bool) -> RenderCell {
     RenderCell {
         ch,
         fg,
@@ -51,12 +52,14 @@ pub fn cell(ch: char, fg: [u8; 3], bg: [u8; 3], bold: bool, seam: bool) -> Rende
 }
 
 /// A `cols`-wide row of blank chrome cells in `fg` on `bg` (with a top seam when `seam`).
+#[inline]
 #[must_use]
 pub fn blank_row(cols: usize, fg: [u8; 3], bg: [u8; 3], seam: bool) -> Vec<RenderCell> {
     vec![cell(' ', fg, bg, false, seam); cols]
 }
 
 /// One empty band row in a painted row's colours: [`compose_band`] pads with it.
+#[inline]
 #[must_use]
 pub fn blank_band_row(cols: usize, inks: &BandInks) -> Vec<RenderCell> {
     blank_row(cols, inks.label, inks.bar_bg, false)
@@ -65,6 +68,7 @@ pub fn blank_band_row(cols: usize, inks: &BandInks) -> Vec<RenderCell> {
 /// The renderer's drawn icon for the engine's ([`Icon`] and [`BandIcon`] are one set in two
 /// tables, held together by `band_icon_ids_match_the_renderers`). A `const fn`, not a
 /// `From`: the orphan rule forbids an impl between two foreign types here.
+#[inline]
 #[must_use]
 pub const fn band_icon(icon: Icon) -> BandIcon {
     use BandIcon as B;
@@ -88,9 +92,11 @@ pub const fn band_icon(icon: Icon) -> BandIcon {
 /// The rail band's height on a `cell_h`-pixel row: about an eighth of it, never under two
 /// pixels, in the row's lowest pixels, where a bar's glint sits under its words'
 /// descenders (ruling 242).
+#[inline]
 #[must_use]
-fn rail_px(cell_h: usize) -> usize {
-    ((cell_h + 4) / 8).max(2)
+const fn rail_px(cell_h: usize) -> usize {
+    let r = (cell_h + 4) / 8;
+    if r > 2 { r } else { 2 }
 }
 
 /// Row raster `r` on a frame whose column 0 starts `lo` window pixels in from
@@ -305,9 +311,14 @@ pub const RAIL_SEAM_MIN_CELL_H: usize = 18;
 /// default 17 px's 23 px cell is `(2, 2)`. Without the measure their descenders end on the
 /// rail's own row. JetBrains Mono has at least a pixel each of head and foot room at 12 to
 /// 40 px.
+#[inline]
 #[must_use]
-pub fn seam_can_rail(cell_h: usize, room: Option<(usize, usize)>) -> bool {
-    cell_h >= RAIL_SEAM_MIN_CELL_H && room.is_none_or(|(head, foot)| head + foot >= 2)
+pub const fn seam_can_rail(cell_h: usize, room: Option<(usize, usize)>) -> bool {
+    cell_h >= RAIL_SEAM_MIN_CELL_H
+        && match room {
+            Some((head, foot)) => head.saturating_add(foot) >= 2,
+            None => true,
+        }
 }
 
 /// Whether a native host measures the face's room ([`BandFrame::room`]): Windows only, as

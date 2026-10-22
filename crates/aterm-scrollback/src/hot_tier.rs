@@ -21,7 +21,8 @@ pub(crate) struct HotTier {
 impl HotTier {
     /// Create a new hot tier.
     #[must_use]
-    pub(crate) fn new() -> Self {
+    #[inline]
+    pub(crate) const fn new() -> Self {
         Self {
             lines: VecDeque::new(),
             bytes_used: std::mem::size_of::<Self>(),
@@ -53,6 +54,7 @@ impl HotTier {
     // Skip: the ring index read — VecDeque::get navigates the ring's head/len
     // arithmetic the verifier cannot chain. Total by the `Option` return.
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     pub(crate) fn get(&self, idx: usize) -> Option<&Line> {
         self.lines.get(idx)
     }
@@ -118,14 +120,15 @@ impl HotTier {
 
     /// Calculate memory used (diagnostic: includes struct overhead).
     #[must_use]
-    pub(crate) fn memory_used(&self) -> usize {
+    #[inline]
+    pub(crate) const fn memory_used(&self) -> usize {
         self.bytes_used
     }
 
     /// Reclaimable line storage bytes (budget enforcement only).
     #[must_use]
     #[inline]
-    pub(crate) fn budgeted_bytes(&self) -> usize {
+    pub(crate) const fn budgeted_bytes(&self) -> usize {
         self.budgeted_bytes
     }
 

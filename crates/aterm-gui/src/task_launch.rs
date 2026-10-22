@@ -158,7 +158,7 @@ pub(crate) struct TaskOrder {
     /// carries where the starter runs one. `None`: `from=ctl`.
     pub(crate) caller: Option<SessionId>,
     /// The `cwd=` named, canonical: the one folder the window harness's
-    /// folder-trust rule trusts for this worker (`SessionMeta::trusted_cwd`).
+    /// folder-trust rule trusts for this worker (`TaskRecord::trusted_cwd`).
     /// `None` when none was named, or its canonical form could not be read
     /// in time ([`crate::spawn_folder::canonical_folder`]): the harness then
     /// asks rather than trusts.
@@ -273,7 +273,8 @@ pub(crate) fn task_text(
     autopilot: Autopilot,
     agent: aterm_phase::Program,
 ) -> Vec<u8> {
-    let blank_lines = aterm_agent::harness::worker::worker_cli(agent).is_none_or(|w| w.blank_lines);
+    let blank_lines =
+        aterm_agent::harness::worker::worker_cli(agent).is_none_or(|w| w.blank_lines());
     let mut text = if blank_lines {
         task.to_vec()
     } else {
@@ -292,14 +293,36 @@ pub(crate) fn task_text(
     text
 }
 
-/// `task` with every blank line (empty, or ASCII white space alone) left
-/// out, each other line as given.
+/// `task` with every line that draws as a blank row left out (one of white
+/// space alone, Unicode's as agy's reader reads a blank row — `U+00A0`,
+/// `U+3000`, `U+2000`..`U+200A` and the rest — or of characters that draw
+/// nothing: controls and the zero-width ones, [`draws_nothing`]), each other
+/// line as given. A line of a no-break space alone, common in text pasted
+/// from a web page or a chat, kept as a line, was a blank row on agy's
+/// screen and the fact line under it read as agy's reply (the review of
+/// b9/spawn-residuals, F3). Text that is not UTF-8 is read lossily: its
+/// replacement character draws, so such a line is kept.
 fn without_blank_lines(task: &[u8]) -> Vec<u8> {
     task.split_inclusive(|&b| b == b'\n')
-        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .filter(|line| !String::from_utf8_lossy(line).chars().all(draws_nothing))
         .flatten()
         .copied()
         .collect()
+}
+
+/// Whether `c` draws nothing a reader of the row could tell from a blank
+/// cell: white space (Unicode's `White_Space`, what `aterm_phase`'s readers
+/// trim), a control character, or a zero-width format character (the soft
+/// hyphen, the zero-width space, joiners and marks `U+200B`..`U+200F`, the
+/// word joiner and invisible operators `U+2060`..`U+2064`, the byte-order
+/// mark).
+fn draws_nothing(c: char) -> bool {
+    c.is_whitespace()
+        || c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FEFF}'
+        )
 }
 
 /// A worker's task file, ready to be written once the newborn's sid is known

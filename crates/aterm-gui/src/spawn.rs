@@ -1779,6 +1779,8 @@ pub(crate) fn seed_adopted_end(
 /// the cast header's `aterm_handoff`, `temporal status`'s tail, and the session
 /// log's `gap why=handoff epoch=<ep+1>` (`gap why=crash` for a shell the PTY
 /// keeper held, `keeper`). Called before any other row reaches the timeline.
+/// Anonymous account cards on carried glass are unowned here, regardless of
+/// what account provenance the predecessor could observe.
 ///
 /// Timeline ids continue above `timeline_id`, the last one the outgoing process
 /// issued, so every row is above any `timeline since=` anchor taken before; the
@@ -1797,6 +1799,7 @@ pub(crate) fn mark_handoff_gap(
     let gap = crate::session_timeline::HandoffGap { from_build };
     {
         let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+        tl.note_carried_glass();
         tl.continue_ids(timeline_id);
         tl.record("handoff", gap.payload());
         let at = tl.slog().now();
@@ -3266,6 +3269,10 @@ mod adoption_wiring_tests {
         use std::sync::Mutex as StdMutex;
         let fresh_cast = crate::cast::CastRecorder::new(80, 24).to_asciicast();
         let fresh_temporal = crate::temporal::TemporalRecorder::new().status_tail();
+        assert!(
+            !crate::session_timeline::SessionTimeline::default().muse_cards_need_account(),
+            "a fresh terminal can bootstrap its first anonymous usage card"
+        );
         for (from_build, word, json) in [
             (Some(812_u64), "812", "\"from_build\": 812"),
             (None, "-", "\"from_build\": null"),
@@ -3281,6 +3288,10 @@ mod adoption_wiring_tests {
                 0,
                 Default::default(),
                 false,
+            );
+            assert!(
+                timeline.lock().unwrap().muse_cards_need_account(),
+                "a successor cannot attribute the predecessor's anonymous cards"
             );
             // …and a row recorded after it (the fabric seed, the registration).
             timeline

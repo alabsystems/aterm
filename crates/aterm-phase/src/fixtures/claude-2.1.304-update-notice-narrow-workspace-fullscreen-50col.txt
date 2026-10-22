@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (50x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the update notice under the NARROW workspace launch card at 50 columns (`--effort workspace`, launched at 50 columns, `lastReleaseNotesSeen` seeded to 2.1.290), fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1): one row of top air, then the card's four rows — the banner ALONE on its row at column 13 (`Claude Code v2.1.304`, nothing after it), the wand-raised mascot from column 0 beside the model (`Opus 5.5 with xhigh effort`), the billing and the working directory, each at column 13 — a blank row, the bold summary wrapped onto two rows at column 2 and the dim details row whole (47 cells); the stand-in `workspace` replaces the vendor's top effort key throughout
+
+             Claude Code v2.1.304
+ ▐▛███▛█▄╱✦  Opus 5.5 with xhigh effort
+▝▜██████▘    API Usage Billing
+ ▝▝   ▝▝     /private/tmp/at.r3cj/proj
+
+  Updated to latest. Got 66 features, 424
+  bugfixes, and 126 other changes.
+  code.claude.com/docs/en/changelog for details
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────── workspace ─
+❯
+──────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

@@ -407,12 +407,14 @@ pub struct PetBakeKey {
 impl PetBakeKey {
     /// Resolve this key's ramp indices and local palette into bake fills (floats appear only
     /// past this point).
+    #[inline]
     #[must_use]
     pub fn fills(&self) -> ResolvedFills {
         ResolvedFills::from_context(self.coat, self.iris, self.colors)
     }
 
     /// Bake the tile this key describes (the cache-miss path).
+    #[inline]
     #[must_use]
     pub fn bake(&self) -> Tile {
         bake_pose(
@@ -424,16 +426,17 @@ impl PetBakeKey {
     }
 
     /// The stable `host_id` for [`CatBaker::host_tile`](crate::cat_baker::CatBaker::host_tile).
+    #[inline]
     #[must_use]
-    pub fn host_id(&self) -> u64 {
+    pub const fn host_id(&self) -> u64 {
         host_tile_id(&[
             self.pose as u64,
-            u64::from(self.coat),
-            u64::from(self.iris),
-            u64::from(self.colors.accent),
-            u64::from(self.colors.background),
-            u64::from(self.w),
-            u64::from(self.h),
+            self.coat as u64,
+            self.iris as u64,
+            self.colors.accent as u64,
+            self.colors.background as u64,
+            self.w as u64,
+            self.h as u64,
         ])
     }
 }
@@ -442,10 +445,12 @@ impl PetBakeKey {
 /// across std releases, unlike `DefaultHasher`) with the high bit set, so it never collides
 /// with a small hand-assigned host id. Non-pet rosters lead `words` with a namespace salt.
 #[inline]
-pub(crate) fn host_tile_id(words: &[u64]) -> u64 {
+pub(crate) const fn host_tile_id(words: &[u64]) -> u64 {
     let mut h = aterm_hash::FNV64_OFFSET;
-    for &word in words {
-        h = aterm_hash::fnv_mix_u64(h, word);
+    let mut i = 0;
+    while i < words.len() {
+        h = aterm_hash::fnv_mix_u64(h, words[i]);
+        i += 1;
     }
     h | (1 << 63)
 }
@@ -461,6 +466,7 @@ pub(crate) fn host_tile_id(words: &[u64]) -> u64 {
 /// Below [`FACE_DETAIL_MIN_H`] the face LOD culls whisker, blush, pattern, iris, catch-light
 /// and pupil layers and refills each `Eye` subpath as one grown dot ([`paint_eye_dots`]);
 /// below [`MOUTH_DETAIL_MIN_H`] the mouth goes too.
+#[inline]
 #[must_use]
 pub fn bake_pose(pose: PetGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Tile {
     bake_pose_with_reflections(pose, fills, w, h, true)
@@ -521,10 +527,12 @@ pub trait ExactTileKey: Copy + PartialEq {
 }
 
 impl ExactTileKey for PetBakeKey {
+    #[inline]
     fn size(&self) -> (u16, u16) {
         (self.w, self.h)
     }
 
+    #[inline]
     fn bake_tile(&self) -> Tile {
         self.bake()
     }
@@ -561,6 +569,7 @@ pub struct ExactTileBaker<K> {
 }
 
 impl<K> Default for ExactTileBaker<K> {
+    #[inline]
     fn default() -> Self {
         Self {
             slots: Vec::new(),
@@ -581,6 +590,7 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
     /// Per-frame prologue: advance the LRU clock, reset the cold-bake budget, and clear on a
     /// cell-metric change. Call once per presented frame, not per pane, or the
     /// [`MAX_BAKES_PER_FRAME`] cap multiplies by the pane count.
+    #[inline]
     pub fn begin_frame(&mut self, cell_w: u16, cell_h: u16) {
         self.clock = self.clock.wrapping_add(1);
         self.bakes_left = MAX_BAKES_PER_FRAME;
@@ -593,6 +603,7 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
 
     /// Drop every resident tile and bump the version. A no-op when already empty, so a
     /// per-frame "effect is off" reset cannot make a quiescent host look dirty.
+    #[inline]
     pub fn clear(&mut self) {
         if self.slots.is_empty() {
             return;
@@ -604,7 +615,8 @@ impl<K: ExactTileKey> ExactTileBaker<K> {
 
     /// Monotonic bake/clear counter, for the frame fingerprint.
     #[inline]
-    pub fn version(&self) -> u64 {
+    #[must_use]
+    pub const fn version(&self) -> u64 {
         self.version
     }
 
@@ -691,8 +703,9 @@ impl PetBaker {
     /// destination box from it. Clamped away from zero so a degenerate asset cannot make a NaN.
     #[inline]
     #[must_use]
-    pub fn aspect(pose: PetGlyphId) -> f32 {
-        (f32::from(PET_GLYPHS[pose as usize].aspect_x1000) / 1000.0).max(0.001)
+    pub const fn aspect(pose: PetGlyphId) -> f32 {
+        let a = (PET_GLYPHS[pose as usize].aspect_x1000 as f32) / 1000.0;
+        if a > 0.001 { a } else { 0.001 }
     }
 }
 

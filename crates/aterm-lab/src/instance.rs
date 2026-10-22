@@ -302,6 +302,52 @@ impl Reply {
     }
 }
 
+/// A terminal's explicit selector from the instance-local roster. Native tabs
+/// can own the front while their underlying shell remains in this registry.
+/// An exited command remains readable and can still answer `ready` or `image`.
+fn terminal_selector(roster: &str) -> Option<String> {
+    roster
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            words.next()?.parse::<u64>().ok()?;
+            let sid = words.next()?;
+            if crate::stub::first_sid(sid) != Some(sid) {
+                return None;
+            }
+            words.next()?; // parent
+            let live = match words.next()? {
+                "alive" | "spawning" => true,
+                "exited" => false,
+                _ => return None,
+            };
+            words.next()?; // title, which can itself look like a placement field
+            let focused = words.clone().any(|word| word == "wfocus=1");
+            let active = words.any(|word| word == "active=1");
+            Some(((live, focused, active), sid))
+        })
+        .max_by_key(|(rank, _)| *rank)
+        .map(|(_, sid)| format!("@{sid}"))
+}
+
+fn terminal_request(mut ctl: impl FnMut(&[&str]) -> Reply, args: &[&str]) -> Reply {
+    let roster = ctl(&["sessions"]);
+    if roster.code != 0 {
+        return roster;
+    }
+    let Some(selector) = terminal_selector(&roster.stdout) else {
+        return Reply {
+            code: 1,
+            stderr: "instance: no terminal in its session registry".into(),
+            ..Reply::default()
+        };
+    };
+    let mut selected = Vec::with_capacity(args.len() + 1);
+    selected.push(selector.as_str());
+    selected.extend_from_slice(args);
+    ctl(&selected)
+}
+
 impl Instance {
     /// Start `l` in `world`, its output in `<world>/aterm.log`.
     ///
@@ -744,7 +790,7 @@ pub fn cmd_instance(args: &[String]) -> Res {
         band,
     )?;
     inst.await_socket(BOOT)?;
-    let ready = inst.ctl(&["ready"]);
+    let ready = terminal_request(|args| inst.ctl(args), &["ready"]);
     if ready.code != 0 {
         return Err(Fail::die(format!("instance: not ready: {}", ready.first())));
     }
@@ -754,7 +800,10 @@ pub fn cmd_instance(args: &[String]) -> Res {
         // reveal's grace — and then the screen (half a second without
         // output) before the frame is taken.
         await_band(&inst)?;
-        let _ = inst.ctl(&["await", "idle", "500", "timeout=60000"]);
+        let _ = terminal_request(
+            |args| inst.ctl(args),
+            &["await", "idle", "500", "timeout=60000"],
+        );
         let shot = inst.ctl(&["image", "frame.png"]);
         let path = shot
             .stdout
@@ -1231,6 +1280,81 @@ mod cold_copy_tests {
         assert!(meta.is_file(), "a file, not a link: {meta:?}");
         assert!(copy.exe.starts_with(&world.dir), "{}", copy.exe.display());
         assert_eq!(std::fs::read(&copy.exe).expect("read"), script);
+    }
+}
+
+#[cfg(test)]
+mod terminal_selection_tests {
+    use super::{Reply, terminal_request, terminal_selector};
+
+    #[test]
+    fn terminal_waits_name_the_registry_session_when_a_native_tab_is_front() {
+        for wait in [
+            &["ready"][..],
+            &["await", "idle", "500", "timeout=60000"][..],
+        ] {
+            let mut calls = Vec::new();
+            let reply = terminal_request(
+                |args| {
+                    calls.push(args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>());
+                    match args {
+                        ["sessions"] => Reply {
+                            stdout: "OK 2\n0 s-aa - exited previous active=0 wfocus=1\n7 s-bb - alive shell active=0 wfocus=1\n".into(),
+                            ..Reply::default()
+                        },
+                        ["@s-bb", rest @ ..] if rest == wait => Reply::default(),
+                        _ => Reply {
+                            code: 1,
+                            stderr: "ERR no active terminal".into(),
+                            ..Reply::default()
+                        },
+                    }
+                },
+                wait,
+            );
+            assert_eq!(reply.code, 0);
+            assert_eq!(calls.len(), 2, "discovery and one selected request");
+            assert_eq!(calls[1][0], "@s-bb");
+            assert_eq!(&calls[1][1..], wait);
+        }
+    }
+
+    #[test]
+    fn terminal_selection_tracks_the_focused_session_and_keeps_exited_commands_readable() {
+        let roster = "OK 3\n0 s-aa - alive active=1 active=0 wfocus=1\n1 s-bb - spawning shell active=1 wfocus=1\n2 s-cc - alive shell active=1 wfocus=0\n";
+        assert_eq!(terminal_selector(roster).as_deref(), Some("@s-bb"));
+        assert_eq!(
+            terminal_selector("0 s-aa - exited finished active=1 wfocus=1\n").as_deref(),
+            Some("@s-aa")
+        );
+        assert_eq!(terminal_selector("OK 0\n"), None);
+        assert_eq!(terminal_selector("0 native - native SystemState\n"), None);
+    }
+
+    #[test]
+    fn terminal_wait_errors_propagate_without_retrying_or_following_the_front() {
+        let mut calls = 0;
+        let reply = terminal_request(
+            |args| {
+                calls += 1;
+                if args == ["sessions"] {
+                    Reply {
+                        stdout: "0 s-aa - exited finished active=1 wfocus=1\n".into(),
+                        ..Reply::default()
+                    }
+                } else {
+                    assert_eq!(args, ["@s-aa", "ready"]);
+                    Reply {
+                        code: 3,
+                        stderr: "ERR selected session unavailable".into(),
+                        ..Reply::default()
+                    }
+                }
+            },
+            &["ready"],
+        );
+        assert_eq!(reply.code, 3);
+        assert_eq!(calls, 2);
     }
 }
 

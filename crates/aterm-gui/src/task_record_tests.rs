@@ -31,6 +31,11 @@ fn tasks() -> PathBuf {
     PathBuf::from(native("/state/aterm/tasks"))
 }
 
+/// The absolute folder `/<rest>`, as this platform spells it.
+fn folder(rest: &str) -> String {
+    native(&format!("/{rest}"))
+}
+
 fn parse(args: &str) -> Result<TaskMark, String> {
     TaskMark::parse(args, Some(&tasks()))
 }
@@ -273,19 +278,20 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         since: t0,
         entered: 7,
         agent: Some(aterm_phase::Program::Agy),
+        trusted_cwd: Some(folder("w/my proj")),
     };
     let row = record.carry_row();
-    // The path rides in this platform's own spelling, pct-encoded.
-    let wire = if cfg!(windows) {
-        r"C:\state\aterm\tasks\r%201.txt"
+    // The paths ride in this platform's own spelling, pct-encoded.
+    let (wire, trusted) = if cfg!(windows) {
+        (r"C:\state\aterm\tasks\r%201.txt", r"C:\w\my%20proj")
     } else {
-        "/state/aterm/tasks/r%201.txt"
+        ("/state/aterm/tasks/r%201.txt", "/w/my%20proj")
     };
     assert_eq!(
         row,
         format!(
             "rev=7 state=exited from={SID} since=10000 result_bytes=9 attention=1 why=exit \
-             exit=-2 result_path={wire} agent=agy"
+             exit=-2 result_path={wire} agent=agy trusted_cwd={trusted}"
         )
     );
     // Read back five seconds of wall clock later: the same record, and its
@@ -301,6 +307,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         result_path: None,
         attention: false,
         agent: None,
+        trusted_cwd: None,
         ..record.clone()
     };
     let back = TaskRecord::from_carry_row(&bare.carry_row(), Some(&tasks()), t0, 10_000).unwrap();
@@ -341,6 +348,25 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
             },
             bare,
             "{agent:?}"
+        );
+    }
+    // THE FOLDER ITS SPAWN TRUSTED CROSSES, and one this build cannot vouch
+    // for (relative, climbing, a second spelling, a control character) costs
+    // the folder alone, never the record: no folder is trusted on it.
+    let with = TaskRecord {
+        trusted_cwd: Some(folder("w/proj")),
+        ..bare.clone()
+    };
+    assert_eq!(
+        TaskRecord::from_carry_row(&with.carry_row(), Some(&tasks()), t0, 10_000),
+        Some(with.clone())
+    );
+    for bad in ["w/proj", "/w/../etc", "/w/proj/", "/w/a%0Ab", "/w//proj"] {
+        let row = format!("{} trusted_cwd={bad}", bare.carry_row());
+        assert_eq!(
+            TaskRecord::from_carry_row(&row, Some(&tasks()), t0, 10_000),
+            Some(bare.clone()),
+            "{bad}"
         );
     }
     let unknown = format!("{} agent=a-later-cli", bare.carry_row());
@@ -384,6 +410,7 @@ fn the_reply_event_and_status_spellings() {
         since: Instant::now(),
         entered: 3,
         agent: Some(aterm_phase::Program::Gemini),
+        trusted_cwd: Some(folder("w")),
     };
     let fields = record.wire_fields();
     assert!(

@@ -1,0 +1,30 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (120x29, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · fullscreen renderer, the plain card and the update notice, then three turns of the stub's (`hi`), the pane resized to 29 rows (`ctl resize 29 120`) so the transcript's top is cut by the screen's edge: the top air and the card's banner row are gone, its model and working-directory rows stand at rows 0 and 1, then the blank row and the whole notice (at 30 rows the card is whole at row 0; the renderer keeps the transcript's foot on the composer, so each row taken off the pane cuts one more off its top)
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.r3cj/proj
+
+  Updated to latest. Got 66 features, 424 bugfixes, and 126 other changes.
+  code.claude.com/docs/en/changelog for details
+
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 2)
+
+✻ Cooked for 0s · done 12:10 AM
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 3)
+
+✻ Baked for 0s · done 12:10 AM
+
+❯ hi
+
+⏺ Hi! I am the local lab stub, not a model. (reply 4)
+
+✻ Cooked for 0s · done 12:10 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

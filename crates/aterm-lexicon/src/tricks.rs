@@ -133,8 +133,9 @@ impl Trick {
 
     /// The stable lowercase id: the `id` key in `data/tricks.toml`, the
     /// `trick=` field of [`row_line`], and the spelling config and docs use.
+    #[inline]
     #[must_use]
-    pub fn code(self) -> &'static str {
+    pub const fn code(self) -> &'static str {
         match self {
             Trick::Sit => "sit",
             Trick::Down => "down",
@@ -158,6 +159,7 @@ impl Trick {
 
     /// The inverse of [`code`](Self::code), walking [`ALL`](Self::ALL) so `code` stays the one
     /// spelling table. Exact match: ids are data keys, not typed words.
+    #[inline]
     #[must_use]
     pub fn from_code(code: &str) -> Option<Trick> {
         Trick::ALL.into_iter().find(|trick| trick.code() == code)
@@ -167,8 +169,9 @@ impl Trick {
     /// words and spaces only: [`row_line`] spells the spaces as `_` so the
     /// clause stays one field, which an authored `_` or `=` would corrupt
     /// (pinned by `every_listing_line_of_the_embedded_file_is_one_line_of_key_value_fields`).
+    #[inline]
     #[must_use]
-    pub fn blurb(self) -> &'static str {
+    pub const fn blurb(self) -> &'static str {
         match self {
             Trick::Sit => "sits up and looks at you for a few seconds",
             Trick::Down => "lies down in a loaf",
@@ -371,7 +374,8 @@ struct TrickEntry {
 
 /// The role a lookup reports: the authored role with the lone-ideograph law applied. The lookup
 /// and the load-time double-claim check share it, so "same role" means one thing.
-fn effective_role(entry: &TrickEntry) -> TrickRole {
+#[inline]
+const fn effective_role(entry: &TrickEntry) -> TrickRole {
     match entry.role {
         TrickRole::Trick {
             trick,
@@ -459,6 +463,7 @@ impl TrickLexicon {
     /// is retried with every such run collapsed to two (`goooood` → `good`, `pssssst` → `psst`),
     /// then to one (`nooo` → `no`, `staaay` → `stay`); the first hit wins. A run of two is never
     /// touched, so `sitt` stays a miss: the fold answers a held key, not a typo.
+    #[inline]
     #[must_use]
     pub fn classify(&self, token: &str, scratch: &mut String) -> Option<TrickRole> {
         self.lookup(token, scratch).map(effective_role)
@@ -467,6 +472,7 @@ impl TrickLexicon {
     /// [`classify`](Self::classify) for one HALF of a run read as a name glued
     /// to a command (module docs): the same lookup, and `None` as well for a
     /// surface its row lists as `unglued`.
+    #[inline]
     #[must_use]
     pub fn classify_glued_half(&self, token: &str, scratch: &mut String) -> Option<TrickRole> {
         self.lookup(token, scratch)
@@ -475,6 +481,7 @@ impl TrickLexicon {
     }
 
     /// The entry behind one isolated token, the marks-required gate applied.
+    #[inline]
     fn lookup(&self, token: &str, scratch: &mut String) -> Option<&TrickEntry> {
         let entry = if is_no_space_surface(token) {
             self.table.get(token)?
@@ -527,13 +534,15 @@ impl TrickLexicon {
     /// Data problems found at load (unknown trick id, a surface that is not
     /// one token or is too long, a surface claimed under two roles, a gated
     /// English row). Empty for well-formed data.
+    #[inline]
     #[must_use]
-    pub fn conflicts(&self) -> &[String] {
-        &self.conflicts
+    pub const fn conflicts(&self) -> &[String] {
+        self.conflicts.as_slice()
     }
 
     /// Number of distinct compiled keys (validator surface: lets a test prove
     /// a configuration is not vacuous).
+    #[inline]
     #[must_use]
     pub fn surface_count(&self) -> usize {
         self.table.len()
@@ -564,6 +573,7 @@ const ELONGATED_RUN: usize = 3;
 const ELONGATION_WINDOW: usize = TrickLexicon::MAX_SURFACE_CHARS * 2;
 
 /// Length of the run of identical characters that starts at `at`.
+#[inline]
 fn run_len(chars: &[char], at: usize) -> usize {
     let Some(first) = chars.get(at) else {
         return 0;
@@ -577,6 +587,7 @@ fn run_len(chars: &[char], at: usize) -> usize {
 
 /// Whether any run of identical characters reaches [`ELONGATED_RUN`] — the
 /// gate that keeps the retry off every ordinary miss.
+#[inline]
 fn has_elongated_run(chars: &[char]) -> bool {
     let mut at = 0usize;
     while at < chars.len() {

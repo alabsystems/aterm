@@ -166,6 +166,60 @@ fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
     );
 }
 
+/// A LINE THAT DRAWS AS A BLANK ROW IS A BLANK LINE OF AN AGY WORKER'S TASK
+/// ([`without_blank_lines`]; the review of b9/spawn-residuals, F3): agy's
+/// reader reads a row of Unicode white space alone as blank (a no-break
+/// space, an ideographic space, an em space), and a zero-width or control
+/// character draws nothing beside it — so such a line ends agy's message as
+/// an empty one does, the fact line under it read as agy's reply, its
+/// `NEEDS YOU:` with it. Each is dropped. The reader's side is measured:
+/// agy's screen with a no-break-space row between the task and the fact
+/// reads the fact as the reply. NEGATIVE CONTROLS: a line with a word beside
+/// its no-break space is kept, and every other worker keeps the task as
+/// given.
+#[test]
+fn a_line_that_draws_as_a_blank_row_is_dropped_from_an_agy_task() {
+    use aterm_phase::agy::fixtures::lab::WORKER_FIRST_PROMPT;
+    use aterm_phase::agy::said_tail;
+    let task = "First paragraph.\n\u{a0}\n\u{3000}\u{2003}\t\n\u{200b}\n\u{feff}\u{7}\n\
+                \u{a0}keep me\nSecond paragraph.\n";
+    let text = |agent| {
+        String::from_utf8(task_text(task.as_bytes(), None, Autopilot::Land, agent)).expect("utf-8")
+    };
+    assert_eq!(
+        text(Program::Agy),
+        "First paragraph.\n\u{a0}keep me\nSecond paragraph.\n"
+    );
+    for agent in [Program::Claude, Program::Gemini, Program::Muse] {
+        assert_eq!(
+            text(agent),
+            task,
+            "CONTROL: {agent:?} keeps the task as given"
+        );
+    }
+    // agy's reader: the measured first turn with its blank row a no-break
+    // space reads the fact under it as the reply, as the empty row does.
+    let rows = aterm_phase::prompt::fixtures::screen(WORKER_FIRST_PROMPT);
+    let act = rows
+        .iter()
+        .position(|r| r.starts_with("> [aterm harness]"))
+        .expect("the Land act");
+    let caret = rows.iter().rposition(|r| r == ">").expect("the composer");
+    let mut first = rows[..act - 1].to_vec();
+    first.extend(rows[caret - 1..].iter().cloned());
+    let user = first
+        .iter()
+        .position(|r| r.starts_with("> FOREVERLAB-WORKER"))
+        .expect("the first prompt");
+    assert!(first[user + 1].is_empty(), "the measured blank row");
+    first[user + 1] = "  \u{a0}".to_string();
+    assert!(
+        said_tail(&first).is_some_and(|s| s.starts_with("(Started by `s-146719f2750f4a8f6909`")),
+        "{:?}",
+        said_tail(&first)
+    );
+}
+
 /// AN AGY WORKER'S FIRST PROMPT HOLDS NO BLANK LINE ([`task_text`],
 /// `WorkerCli::blank_lines`). agy draws a message's blank line as a blank
 /// row, the rows under it two columns in as its reply's
@@ -176,7 +230,8 @@ fn the_task_file_is_the_task_a_blank_line_and_the_fact() {
 /// task's blank lines and puts the fact on the line under it: the same
 /// message drawn with no blank row is one message, and the reply under it
 /// is read alone, with no need. NEGATIVE CONTROLS: the measured screen reads
-/// the fact as the reply and the need in it; every other worker's task file
+/// the fact as the reply (its need, raised in `l15a`, now read as the line's
+/// mention); every other worker's task file
 /// keeps the task as given and the blank line before the fact (their screens
 /// mark a reply's head: Claude Code's `⏺`, Gemini CLI's `✦`, Muse Code's
 /// `◆`).
@@ -219,13 +274,17 @@ fn an_agy_workers_first_prompt_holds_no_blank_line() {
         .position(|r| r.starts_with("> FOREVERLAB-WORKER"))
         .expect("the first prompt");
     let reply = "Implemented the parser module and its unit tests in this turn.";
-    // NEGATIVE CONTROL: as measured, the fact line read as the reply.
+    // NEGATIVE CONTROL: as measured, the fact line read as the reply. Its
+    // `NEEDS YOU:` raised the need in `l15a`; the needs reader now reads a
+    // token `a line starting` names as the line's mention
+    // (`needs::names_a_head`, the review of b9/spawn-residuals), so the fact
+    // read as the reply names none — the misread itself stands.
     let misread = said_tail(&first).expect("words");
     assert!(
         misread.starts_with("(Started by `s-146719f2750f4a8f6909`") && misread.ends_with(reply),
         "{misread}"
     );
-    assert_eq!(needs_you(&misread).len(), 1, "{misread}");
+    assert!(needs_you(&misread).is_empty(), "{misread}");
     // That message is the old task file drawn: the task, a blank row, the
     // fact's rows.
     let task = b"FOREVERLAB-WORKER. write the parser for this repository and land it";

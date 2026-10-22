@@ -8,14 +8,14 @@
 
 use crate::center::MessageCenter;
 use crate::exceptions::{Entry, Family};
-use crate::log::{MessageLog, Retired};
+use crate::log::{LogLine, MessageLog, Retired};
 use crate::model::{ActionIndex, Intent, MessageId, Severity, WallStamp, tags};
 use crate::need::{DIGEST_CAP, Reason, Then, Why};
 use crate::wire::{
     Applied, DETAIL_LONG, KEY_REFUSAL, LATER_USAGE, LaterRequest, NoticeRequest, OWN_TAG_REFUSAL,
     Paint, REASON_LONG, STEP_LONG, URL_REFUSAL, WireGate, apply,
 };
-use crate::{Instant, WIRE_LATER_CAP, WIRE_MINTS_PER_WINDOW};
+use crate::{Instant, LOG_CAP, WIRE_LATER_CAP, WIRE_MINTS_PER_WINDOW};
 
 const DAY_MS: u64 = 86_400_000;
 const T0_MS: u64 = 1_790_000_000_000;
@@ -326,6 +326,39 @@ fn the_owners_dismissal_of_a_later_entry_holds() {
     assert_eq!(later_reply(&q).1, "quiet");
 }
 
+/// The dismissal outlasts the wire's own churn: once the log ring is full and the wire
+/// holds its share, every new record evicts the oldest retired wire record, and the
+/// dismissal of a tool's entry is one. A script's ordinary records after it (a build's
+/// `notice post`, many times a ring) must not take it, or the nag is back the next
+/// launch of the tool. Negative control: an entry the tool ended (`done`, no filing)
+/// keeps nothing quiet whatever the churn.
+#[test]
+fn a_flood_of_wire_records_never_evicts_the_owners_dismissal() {
+    let now = Instant::now();
+    let (mut c, mut g) = fresh(now);
+    let (id, _) = later_reply(&notice(&mut c, &mut g, SETUP, 0, now));
+    notice(&mut c, &mut g, &format!("dismiss {id}"), DAY_MS, now);
+    let other = line("other", "Renew it");
+    notice(&mut c, &mut g, &other, DAY_MS, now);
+    notice(&mut c, &mut g, "done other", DAY_MS, now);
+    for i in 0..2 * LOG_CAP {
+        // A fresh gate per line: the budget is the wire's pacing, not this test's subject.
+        let rec = notice(
+            &mut c,
+            &mut WireGate::default(),
+            &format!("post script Built step {i}"),
+            DAY_MS + 1,
+            now,
+        );
+        assert!(rec.reply.starts_with("OK recorded"), "{}", rec.reply);
+    }
+    assert_eq!(c.log().records().count(), LOG_CAP, "the ring is full");
+    let q = notice(&mut c, &mut g, SETUP, 2 * DAY_MS, now);
+    assert_eq!(later_reply(&q), (id, "quiet".into()), "the dismissal holds");
+    let back = notice(&mut c, &mut g, &other, 2 * DAY_MS, now);
+    assert_eq!(later_reply(&back).1, "new", "an end keeps nothing quiet");
+}
+
 /// The tool says the fact ended: `done` ends the entry (no row holds the key), its
 /// record keeps the words the tool finished with, and the next post is news, since an
 /// end is not the owner's dismissal.
@@ -368,6 +401,81 @@ fn notice_done_ends_a_later_entry() {
         now,
     );
     assert_eq!(gone.reply, "OK done=- how=gone");
+    assert!(!gone.note, "an already resolved record is unchanged");
+
+    // Filing is not proof that the cause ended. Without done it stays quiet, but a
+    // confirmed end after either kind of filing allows a genuinely new occurrence.
+    for (answered, progress) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (mut c, mut g) = fresh(now);
+        let (id, _) = later_reply(&notice(&mut c, &mut g, SETUP, 0, now));
+        if answered {
+            assert!(matches!(
+                c.act_digest(id, ActionIndex(0), wall(DAY_MS), now),
+                Some(Intent::OpenLink { .. })
+            ));
+        } else {
+            notice(&mut c, &mut g, &format!("dismiss {id}"), DAY_MS, now);
+        }
+        let other_line = line("other", "Renew it");
+        let (other, _) = later_reply(&notice(&mut c, &mut g, &other_line, DAY_MS, now));
+        notice(&mut c, &mut g, &format!("dismiss {other}"), DAY_MS, now);
+        let other_before = c.log().get(other).unwrap().clone();
+        let quiet = notice(&mut c, &mut g, SETUP, 2 * DAY_MS, now);
+        assert_eq!(later_reply(&quiet), (id, "quiet".into()));
+        let live = progress.then(|| {
+            let posted = notice(
+                &mut c,
+                &mut g,
+                "progress codex.security-setup.0123abcd busy Securing the Codex account",
+                2 * DAY_MS,
+                now,
+            );
+            let live = c
+                .live_by_key("wire.codex.security-setup.0123abcd")
+                .unwrap()
+                .id;
+            assert_ne!(live, id);
+            assert_eq!(posted.reply, format!("OK message={live}"));
+            let quiet = notice(&mut c, &mut g, SETUP, 2 * DAY_MS, now);
+            assert_eq!(later_reply(&quiet), (id, "quiet".into()));
+            live
+        });
+        let revision = c.projection_revision();
+        let done = notice(
+            &mut c,
+            &mut g,
+            "done codex.security-setup.0123abcd ok Codex account secured",
+            3 * DAY_MS,
+            now,
+        );
+        if let Some(live) = live {
+            assert_eq!(done.reply, format!("OK done={live} how=resolved-ok"));
+            assert_eq!((done.paint, done.note), (Paint::Now, true));
+            assert!(
+                c.live_by_key("wire.codex.security-setup.0123abcd")
+                    .is_none()
+            );
+        } else {
+            assert_eq!(done.reply, "OK done=- how=gone");
+            assert_eq!((done.paint, done.note), (Paint::None, true));
+        }
+        assert_ne!(
+            c.projection_revision(),
+            revision,
+            "the retired outcome is observable"
+        );
+        assert!(matches!(
+            c.log().get(id).unwrap().retired(),
+            Some(Retired::Resolved(crate::center::Outcome::Ok))
+        ));
+        let back = notice(&mut c, &mut g, SETUP, 4 * DAY_MS, now);
+        let (next, how) = later_reply(&back);
+        assert_eq!(how, "new");
+        assert_ne!(next, id);
+        assert_eq!(c.log().get(other).unwrap(), &other_before);
+        let other_quiet = notice(&mut c, &mut g, &other_line, 4 * DAY_MS, now);
+        assert_eq!(later_reply(&other_quiet), (other, "quiet".into()));
+    }
 }
 
 /// At most four wire entries are open, and none is filed into a full digest, so a flood
@@ -475,4 +583,45 @@ fn a_press_of_open_in_browser_files_the_entry_answered() {
     };
     assert_eq!(rec.actions, c.log().get(id).unwrap().actions);
     assert!(rec.later);
+}
+
+/// Across a restart or an update the entry is adopted from the log, and the tool may
+/// not say it again for days: its `Open in browser` is still the entry's own button, so
+/// the owner's press answers it and the answer holds against the tool's next post.
+/// Negative control: an entry with no link keeps its one step in words, no button.
+#[test]
+fn a_press_after_a_restart_still_answers_a_later_entry() {
+    let now = Instant::now();
+    let (mut c, mut g) = fresh(now);
+    let (id, _) = later_reply(&notice(&mut c, &mut g, SETUP, 0, now));
+    let bare = later_reply(&notice(&mut c, &mut g, &line("bare", "Renew it"), 0, now)).0;
+    let lines: Vec<String> = c
+        .drain_new_for_persist()
+        .iter()
+        .map(LogLine::encode)
+        .collect();
+    let mut log = MessageLog::empty();
+    log.replay_all(lines.iter().filter_map(|l| LogLine::decode(l).ok()));
+    let mut next = MessageCenter::new(log, now);
+    assert_eq!(next.adopt_digest(wall(DAY_MS), now), 2);
+    let intent = next.act_digest(id, ActionIndex(0), wall(DAY_MS), now);
+    assert!(
+        matches!(intent, Some(Intent::OpenLink { .. })),
+        "{intent:?}"
+    );
+    assert_eq!(
+        next.log().get(id).unwrap().retired(),
+        Some(&Retired::Answered {
+            label: "Open in browser".into()
+        }),
+        "the press answered the adopted entry"
+    );
+    let q = notice(&mut next, &mut WireGate::default(), SETUP, 2 * DAY_MS, now);
+    assert_eq!(later_reply(&q), (id, "quiet".into()));
+    let open = next.digest();
+    assert_eq!(open.len(), 1);
+    assert_eq!(
+        (open.entries[0].id, open.entries[0].actions.len()),
+        (bare, 0)
+    );
 }

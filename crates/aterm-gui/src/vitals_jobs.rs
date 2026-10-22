@@ -19,10 +19,13 @@
 //! mirror the probe's readings (`examples/stuck_live.rs` in aterm-sysprobe
 //! is the same hand-off, run live).
 //!
-//! What the host does not yet hand the engine: OSC 133 blocks, the tty's
-//! mode, the unread-input gate and PTY output times (the loop owns those).
-//! Without them the engine reads each tab's jobs from kernel facts alone,
-//! as the design's no-shell-integration case does.
+//! The host hands the engine each tab's terminal mode word
+//! (`vitals_host::TtyWord`, design §6.6), while it is current, so a program
+//! waiting for the person at its prompt reads `tty-raw` or `tty-password`
+//! and arms no job demand (§6.1). What it does not yet hand: OSC 133
+//! blocks, the unread-input gate's word and PTY output times (the loop owns
+//! those), so the engine reads each tab's jobs from kernel facts and that
+//! word, as the design's no-shell-integration case does.
 //!
 //! THE JOBS BOARD ([`JobsBoard`], the process's [`BOARD`]): the view the loop
 //! last adopted, posted with each tab's session id, for the harness workers'
@@ -48,7 +51,7 @@ use aterm_sysprobe::procs::ProcessReading;
 use aterm_vitals::jobs::{
     Class, Consumer, Demand, Fd, FdKind, JobCounters, JobKind, JobProc, JobRow, JobTab, JobTick,
     Jobs, JobsView, Knote, KnoteFilter, LanesSeen, Machine, ProcState, Standing, SweepProc,
-    TcpState, ThreadState,
+    TcpState, ThreadState, TtyMode,
 };
 use aterm_vitals::model::TabRoot;
 
@@ -77,26 +80,32 @@ impl JobsPass {
         }
     }
 
-    /// One reading's pass: run the engine when it is due, and return the
-    /// view to publish (the last one when it is not due). `None` before the
-    /// first pass and without a sweep.
+    /// One reading's pass: run the engine when it is due, or whenever `now`
+    /// (a reading an edge asked: the loop paces those itself, on its own
+    /// clock, and one that lands a little inside this pass's cadence must
+    /// still look, or the job it was asked for goes unseen until the next
+    /// edge), and return the view to publish (the last one when it is not
+    /// due). `None` before the first pass and without a sweep.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn tick(
         &mut self,
         at_ms: u64,
         sweep: Option<&[ProcessReading]>,
         tabs: &[TabRoot],
+        ttys: &[(u64, TtyMode)],
         self_pid: u32,
         thrashing: bool,
+        now: bool,
     ) -> Option<Arc<JobsView>> {
         let Some(sweep) = sweep else {
             return self.view.clone();
         };
-        if self.next_ms.is_some_and(|due| at_ms < due) {
+        if !now && self.next_ms.is_some_and(|due| at_ms < due) {
             return self.view.clone();
         }
         let self_uid = sweep.iter().find(|p| p.pid == self_pid).and_then(|p| p.uid);
         let sweep: Vec<SweepProc> = sweep.iter().map(sweep_proc).collect();
-        let tabs = job_tabs(tabs);
+        let tabs = job_tabs(tabs, ttys);
         let reqs: Vec<ReadReq> = self
             .jobs
             .plan(&sweep, &tabs)
@@ -142,6 +151,19 @@ impl JobsPass {
 /// matter. Older than this, the reader stopped (no harness host to look,
 /// the probe thread gone), and the view says nothing of now.
 pub(crate) const JOBS_FRESH: Duration = Duration::from_secs(60);
+
+/// WHETHER A JOBS VIEW `age` OLD SPEAKS FOR NOW: one at most [`JOBS_FRESH`]
+/// old does; so does a PARKED one (its demand idle: every live job waits only
+/// for the person, or none is live) of any age while its reader runs
+/// (`reader`), because a parked engine is read again only on an edge (output,
+/// a session's fork, `exec` or exit, the disk watch's look; design §6.1), so
+/// no reading since says nothing changed. An idle Claude Code, vim, less or a
+/// password prompt keeps its `job=` and its brief line for as long as it
+/// waits. A view that is not parked, or whose reader stopped, says nothing of
+/// now past the minute.
+pub(crate) fn speaks_for_now(view: &JobsView, age: Duration, reader: bool) -> bool {
+    age <= JOBS_FRESH || (reader && view.demand == Demand::Idle)
+}
 
 /// The view last posted, its tabs' session ids, and when it was first posted.
 struct Posted {
@@ -272,8 +294,9 @@ pub(crate) fn windowless_after(view: &JobsView) -> Option<Duration> {
 }
 
 /// The engine's tabs from the host's request: its session key, the number
-/// the person sees (`Tab 2` is 2) and its shell.
-fn job_tabs(tabs: &[TabRoot]) -> Vec<JobTab> {
+/// the person sees (`Tab 2` is 2), its shell, and its terminal mode word
+/// where `ttys` holds a current one.
+fn job_tabs(tabs: &[TabRoot], ttys: &[(u64, TtyMode)]) -> Vec<JobTab> {
     tabs.iter()
         .map(|t| JobTab {
             key: t.key,
@@ -284,6 +307,7 @@ fn job_tabs(tabs: &[TabRoot]) -> Vec<JobTab> {
                 .and_then(|n| n.parse().ok())
                 .unwrap_or(0),
             shell_pid: t.shell_pid,
+            tty: ttys.iter().find(|(key, _)| *key == t.key).map(|(_, m)| *m),
             ..JobTab::default()
         })
         .collect()
@@ -601,18 +625,28 @@ pub(crate) mod tests {
         );
     }
 
+    /// Each tab keeps its key, number and shell, and takes the terminal word
+    /// handed for its key. NEGATIVE CONTROL: a tab with no word handed gets
+    /// none (its wait is named from kernel facts alone).
     #[test]
-    fn a_tab_keeps_its_session_key_shell_and_number() {
-        let tabs = job_tabs(&[TabRoot {
-            key: 41,
-            shell_pid: 900,
-            label: "Tab 3".into(),
+    fn a_tab_keeps_its_session_key_shell_and_number_and_its_own_terminal_word() {
+        let root = |key, label: &str| TabRoot {
+            key,
+            shell_pid: 900 + u32::try_from(key).expect("small"),
+            label: label.into(),
             program: String::new(),
-        }]);
+        };
+        let raw = TtyMode {
+            canonical: false,
+            echo: false,
+            stamped_ms: 7,
+        };
+        let tabs = job_tabs(&[root(41, "Tab 3"), root(42, "Tab 4")], &[(41, raw)]);
         assert_eq!(
-            (tabs[0].key, tabs[0].number, tabs[0].shell_pid),
-            (41, 3, 900)
+            (tabs[0].key, tabs[0].number, tabs[0].shell_pid, tabs[0].tty),
+            (41, 3, 941, Some(raw))
         );
+        assert_eq!((tabs[1].key, tabs[1].tty), (42, None));
     }
 
     /// The pass on this host's real process table: this test process stands
@@ -632,18 +666,69 @@ pub(crate) mod tests {
         }];
         let mut pass = JobsPass::new();
         let first = pass
-            .tick(10_000, Some(&sweep.procs), &tabs, me, false)
+            .tick(10_000, Some(&sweep.procs), &tabs, &[], me, false, false)
             .expect("a view");
         let again = pass
-            .tick(10_500, Some(&sweep.procs), &tabs, me, false)
+            .tick(10_500, Some(&sweep.procs), &tabs, &[], me, false, false)
             .expect("the same view");
         assert!(
             Arc::ptr_eq(&first, &again),
             "inside the cadence nothing is re-read"
         );
         assert!(
-            pass.tick(10_600, None, &tabs, me, false).is_some(),
+            pass.tick(10_600, None, &tabs, &[], me, false, true)
+                .is_some(),
             "a reading without a sweep keeps the last view"
         );
+    }
+
+    /// AN EDGE'S READING LOOKS (the loop paces edges on its own clock): one
+    /// asked inside the pass's cadence runs the engine anyway, so the job it
+    /// was asked for is seen now. NEGATIVE CONTROL: the same reading at the
+    /// same instant, not an edge's, keeps the last view (the engine's cadence,
+    /// which skipped a job typed 1 s after quitting `less`).
+    #[test]
+    fn an_edges_reading_inside_the_cadence_runs_the_engine() {
+        let Some(sweep) = aterm_sysprobe::processes() else {
+            return; // A host without a process sweep publishes no jobs.
+        };
+        let me = std::process::id();
+        let tabs = [TabRoot {
+            key: 1,
+            shell_pid: me,
+            label: "Tab 1".into(),
+            program: String::new(),
+        }];
+        let mut pass = JobsPass::new();
+        let first = pass
+            .tick(10_000, Some(&sweep.procs), &tabs, &[], me, false, false)
+            .expect("a view");
+        let paced = pass
+            .tick(11_900, Some(&sweep.procs), &tabs, &[], me, false, false)
+            .expect("the last view");
+        assert!(Arc::ptr_eq(&first, &paced), "paced: the engine waits");
+        let edge = pass
+            .tick(11_900, Some(&sweep.procs), &tabs, &[], me, false, true)
+            .expect("a new view");
+        assert!(!Arc::ptr_eq(&first, &edge), "an edge's reading looks");
+    }
+
+    /// A view speaks for now for a minute; a PARKED one (demand idle) for as
+    /// long as its reader runs. NEGATIVE CONTROLS: a view that is not parked
+    /// says nothing past the minute, and neither does a parked one whose
+    /// reader stopped.
+    #[test]
+    fn a_parked_view_speaks_for_now_while_its_reader_runs() {
+        let parked = JobsView::default();
+        assert_eq!(parked.demand, Demand::Idle);
+        let watched = JobsView {
+            demand: Demand::Fast,
+            ..JobsView::default()
+        };
+        let late = JOBS_FRESH + Duration::from_secs(1);
+        assert!(speaks_for_now(&watched, JOBS_FRESH, false));
+        assert!(speaks_for_now(&parked, late, true), "parked, read on edges");
+        assert!(!speaks_for_now(&watched, late, true), "due long ago");
+        assert!(!speaks_for_now(&parked, late, false), "no reader");
     }
 }

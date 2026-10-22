@@ -797,6 +797,7 @@ impl Rule {
     /// This rule's bit in the predictor's disabled set. Sixty-four rules fit,
     /// and the assertion below refuses to build a sixty-fifth.
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     const fn bit(self) -> u64 {
         1 << self as u32
     }
@@ -938,7 +939,8 @@ impl Learned {
     ];
 
     /// The learned key `key` is, if it is one.
-    fn of(key: EditKey) -> Option<Self> {
+    #[inline]
+    const fn of(key: EditKey) -> Option<Self> {
         match key {
             EditKey::Home => Some(Self::Home),
             EditKey::End => Some(Self::End),
@@ -952,7 +954,8 @@ impl Learned {
     /// The edit key this is. Its one reader is the test seam
     /// [`Prediction::edit_key_for_test`], so it is built where that is.
     #[cfg(any(test, debug_assertions))]
-    fn key(self) -> EditKey {
+    #[inline]
+    const fn key(self) -> EditKey {
         match self {
             Self::Home => EditKey::Home,
             Self::End => EditKey::End,
@@ -963,13 +966,15 @@ impl Learned {
     }
 
     /// Its slot in `EditorBindings::keys`.
+    #[inline]
     fn index(self) -> usize {
         Self::ALL.iter().position(|&k| k == self).unwrap_or(0)
     }
 
     /// The op its canonical binding is: beginning-of-line, end-of-line or
     /// delete-char.
-    fn op(self) -> Op {
+    #[inline]
+    const fn op(self) -> Op {
         match self {
             Self::Home | Self::CtrlA => Op::LineStart(self),
             Self::End | Self::CtrlE => Op::LineEnd(self),
@@ -980,7 +985,8 @@ impl Learned {
     /// A control chord, which a keyboard mode that escapes chords sends as
     /// another key: `CSI 97;5u` under a Kitty mode that reports functional
     /// keys, `CSI 27;5;97~` under modifyOtherKeys level 2 (R-KITTY).
-    fn chord(self) -> bool {
+    #[inline]
+    const fn chord(self) -> bool {
         matches!(self, Self::CtrlA | Self::CtrlE)
     }
 }
@@ -1015,14 +1021,17 @@ struct EditorBindings {
 }
 
 impl EditorBindings {
+    #[inline]
     fn get(&self, key: Learned) -> Binding {
         self.keys.get(key.index()).copied().unwrap_or_default()
     }
 
+    #[inline]
     fn learned(&self, key: Learned) -> bool {
         self.get(key).seen >= BINDING_LEARNED
     }
 
+    #[inline]
     fn banned(&self, key: Learned) -> bool {
         self.get(key).contradictions >= BINDING_BANNED
     }
@@ -1034,7 +1043,8 @@ impl LinkEstimate {
     /// custody, not a measurement.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn has_sample(&self) -> bool {
+    #[inline]
+    pub const fn has_sample(&self) -> bool {
         self.srtt.is_some() || self.slow_samples > 0 || self.fast_samples > 0
     }
 }
@@ -1153,7 +1163,8 @@ enum Op {
 
 impl Op {
     /// The learned key this op was armed for, if it is one's.
-    fn learned(self) -> Option<Learned> {
+    #[inline]
+    const fn learned(self) -> Option<Learned> {
         match self {
             Self::LineStart(k) | Self::LineEnd(k) => Some(k),
             Self::Delete => Some(Learned::Delete),
@@ -1164,7 +1175,8 @@ impl Op {
     /// An op that erases a glyph and vacates the cell the text's end leaves
     /// (a Backspace, Delete): the cells past the end must read blank
     /// ([`Rule::VacateRefusal`]).
-    fn erases(self) -> bool {
+    #[inline]
+    const fn erases(self) -> bool {
         matches!(self, Self::Erase | Self::Delete)
     }
 }
@@ -1198,6 +1210,7 @@ impl OpClass {
     /// This class's bit in `Predictor::proven` (none for the glyph class, which
     /// the glyph proof alone admits, nor for the learned classes, which their
     /// bindings admit).
+    #[inline]
     const fn proven_bit(self) -> u8 {
         match self {
             Self::Glyph | Self::LineEdge | Self::DeleteFwd => 0,
@@ -1258,7 +1271,8 @@ impl Prediction {
     /// What this cell of a state chain's overlay shows ([`GhostCell`]):
     /// `Typed` for every guess of the glyph lane.
     #[must_use]
-    pub fn ghost(&self) -> GhostCell {
+    #[inline]
+    pub const fn ghost(&self) -> GhostCell {
         self.ghost
     }
 
@@ -1266,7 +1280,8 @@ impl Prediction {
     /// [`Predictor::take_credited_for_test`] names it by. A read-only test seam.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn seq_for_test(&self) -> u64 {
+    #[inline]
+    pub const fn seq_for_test(&self) -> u64 {
         self.seq
     }
 
@@ -1274,7 +1289,8 @@ impl Prediction {
     /// A read-only test seam: the safety theorem follows each op back to its key.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn edit_key_for_test(&self) -> Option<EditKey> {
+    #[inline]
+    pub const fn edit_key_for_test(&self) -> Option<EditKey> {
         match self.op {
             Op::Insert => None,
             Op::Left => Some(EditKey::Left),
@@ -1289,7 +1305,8 @@ impl Prediction {
     /// binding is not learned yet: never displayed). A read-only test seam.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn probe_for_test(&self) -> bool {
+    #[inline]
+    pub const fn probe_for_test(&self) -> bool {
         self.probe
     }
 }
@@ -1319,8 +1336,9 @@ impl Seen {
     /// The cell holding `ch` (`' '` for an empty cell), opaque or not, as a host
     /// projects it: a space is [`Seen::Blank`].
     #[must_use]
-    pub fn of_cell(ch: char, opaque: bool) -> Self {
-        let legacy = (ch != ' ').then_some(ch);
+    #[inline]
+    pub const fn of_cell(ch: char, opaque: bool) -> Self {
+        let legacy = if ch != ' ' { Some(ch) } else { None };
         match legacy {
             _ if opaque => Self::Opaque(legacy),
             Some(ch) => Self::Glyph(ch),
@@ -1331,7 +1349,8 @@ impl Seen {
     /// What a plain glyph observe answered at this cell: its glyph, or `None` for
     /// a blank. The glyph lane reads every cell through this.
     #[must_use]
-    pub fn legacy(self) -> Option<char> {
+    #[inline]
+    pub const fn legacy(self) -> Option<char> {
         match self {
             Self::Blank => None,
             Self::Glyph(ch) => Some(ch),
@@ -1525,6 +1544,7 @@ struct EditLine {
 
 impl EditLine {
     /// One past the last cell of the text.
+    #[inline]
     fn hi(&self) -> u16 {
         self.lo
             .saturating_add(u16::try_from(self.text.len()).unwrap_or(u16::MAX))
@@ -1563,7 +1583,8 @@ struct Worlds {
 /// Whether `seen` is the cell a state shows holding `ch` (a typed space reads
 /// blank: the cursor tells it from an empty cell). An opaque cell is never a
 /// state's cell.
-fn cell_holds(seen: Seen, ch: char) -> bool {
+#[inline]
+const fn cell_holds(seen: Seen, ch: char) -> bool {
     match seen {
         Seen::Blank => ch == ' ',
         Seen::Glyph(g) => g == ch,
@@ -1574,12 +1595,14 @@ fn cell_holds(seen: Seen, ch: char) -> bool {
 /// Whether `ch` makes a row the engine's UAX #9 reorder draws in another order
 /// (a right-to-left letter, an Arabic digit, an embedding or isolate), by the
 /// engine's own classification ([`Rule::RightToLeftRows`]).
+#[inline]
 fn reorders(ch: char) -> bool {
     aterm_bidi::has_bidi(&[ch])
 }
 
 /// Whether a row read as `cells` holds a character that makes it reorder, by
 /// each cell's plain answer (an opaque cell's included).
+#[inline]
 fn row_reorders(cells: &[Seen]) -> bool {
     cells.iter().any(|s| s.legacy().is_some_and(reorders))
 }
@@ -1777,6 +1800,7 @@ const SRTT_ALPHA: f32 = 0.3;
 /// - RTT target: `3 * srtt_ms` when `srtt_us` is present
 /// - clamped to `[floor_ms, 2000 ms]`.
 #[must_use]
+#[inline]
 pub const fn compute_glitch_window_ms(srtt_us: Option<u32>, expiry_backoff: u8) -> u64 {
     let shift = if expiry_backoff > EXPIRY_BACKOFF_MAX {
         EXPIRY_BACKOFF_MAX
@@ -1805,6 +1829,7 @@ pub const fn compute_glitch_window_ms(srtt_us: Option<u32>, expiry_backoff: u8) 
 /// Fixed-point EWMA SRTT step in microseconds (`alpha = 3/10`, matching
 /// `SRTT_ALPHA = 0.3`): `0.7 * prev_srtt_us + 0.3 * sample_us`.
 #[must_use]
+#[inline]
 pub const fn ewma_srtt_step_us(prev_srtt_us: Option<u32>, sample_us: u32) -> u32 {
     match prev_srtt_us {
         None => sample_us,
@@ -1825,6 +1850,7 @@ pub const fn ewma_srtt_step_us(prev_srtt_us: Option<u32>, sample_us: u32) -> u32
 /// Encode a predicted overlay ghost cell `(row, col, ch, epoch)` into a
 /// 16-byte little-endian wire record (`row: u16, col: u16, ch: u32, epoch: u64`).
 #[must_use]
+#[inline]
 pub const fn encode_predicted_ghost_wire_le(row: u16, col: u16, ch: char, epoch: u64) -> [u8; 16] {
     let r = row.to_le_bytes();
     let c = col.to_le_bytes();
@@ -1839,6 +1865,7 @@ pub const fn encode_predicted_ghost_wire_le(row: u16, col: u16, ch: char, epoch:
 /// Decode a 16-byte little-endian predicted ghost cell wire record produced by
 /// [`encode_predicted_ghost_wire_le`], rejecting invalid Unicode scalar values.
 #[must_use]
+#[inline]
 pub const fn decode_predicted_ghost_wire_le(wire: &[u8; 16]) -> Option<(u16, u16, char, u64)> {
     let row = u16::from_le_bytes([wire[0], wire[1]]);
     let col = u16::from_le_bytes([wire[2], wire[3]]);
@@ -1859,6 +1886,7 @@ pub const fn decode_predicted_ghost_wire_le(wire: &[u8; 16]) -> Option<(u16, u16
 /// rather than the key (a remapped key sequence, controller input); any other
 /// byte-writing input is [`Predictor::note_unmodelled_input`].
 #[must_use]
+#[inline]
 pub fn is_line_submit(bytes: &[u8]) -> bool {
     let is_terminator = |c: char| matches!(c, '\r' | '\n');
     std::str::from_utf8(bytes).is_ok_and(|text| {
@@ -2328,6 +2356,7 @@ pub struct Predictor {
 
 impl Predictor {
     /// A predictor starting in `mode` (a default-constructed one starts `Off`).
+    #[inline]
     pub fn new(mode: PredictMode) -> Self {
         Self {
             mode,
@@ -2339,6 +2368,7 @@ impl Predictor {
     /// [`Rule`]). Debug builds only; the switch survives every reset, because it
     /// describes the predictor under test, not its state.
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     pub fn disable_rule_for_test(&mut self, rule: Rule) {
         self.disabled |= rule.bit();
     }
@@ -2347,7 +2377,8 @@ impl Predictor {
     /// read-only test seam for the safety theorem's non-vacuity floors.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn events_for_test(&self) -> PredictEvents {
+    #[inline]
+    pub const fn events_for_test(&self) -> PredictEvents {
         self.events
     }
 
@@ -2361,6 +2392,7 @@ impl Predictor {
     }
 
     /// Count `event` for [`PredictEvents`]; nothing in a release build.
+    #[inline]
     fn count(&mut self, event: Event) {
         #[cfg(any(test, debug_assertions))]
         {
@@ -2408,6 +2440,7 @@ impl Predictor {
     /// Count `n` ops through THE FOLD for [`PredictEvents::ops_folded`];
     /// nothing in a release build. Called once per loop that folds, after it,
     /// since the loop borrows the ops it folds.
+    #[inline]
     fn folded(&mut self, n: usize) {
         #[cfg(any(test, debug_assertions))]
         {
@@ -2421,7 +2454,8 @@ impl Predictor {
     }
 
     /// Whether `rule` is in force: always, outside a negative control.
-    fn rule(&self, rule: Rule) -> bool {
+    #[inline]
+    const fn rule(&self, rule: Rule) -> bool {
         #[cfg(any(test, debug_assertions))]
         {
             self.disabled & rule.bit() == 0
@@ -2440,6 +2474,7 @@ impl Predictor {
     /// given up on.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
+    #[inline]
     pub fn glitch_window_for_test(&self) -> Duration {
         self.glitch_window()
     }
@@ -2447,7 +2482,8 @@ impl Predictor {
     /// The display mode in force: a host that keeps no mode of its own asks it
     /// before paying for a row read the predictor would not use (`Off`).
     #[must_use]
-    pub fn mode(&self) -> PredictMode {
+    #[inline]
+    pub const fn mode(&self) -> PredictMode {
         self.mode
     }
 
@@ -2475,6 +2511,7 @@ impl Predictor {
 
     /// The cells the terminal writes `ch` with, under the ambiguous-width policy
     /// in force ([`set_ambiguous_width_double`](Self::set_ambiguous_width_double)).
+    #[inline]
     fn cells_of(&self, ch: char) -> usize {
         if self.ambiguous_width_double {
             aterm_grapheme::char_width_cjk(ch)
@@ -2488,6 +2525,7 @@ impl Predictor {
     /// [`predict_char_in_grid`](Self::predict_char_in_grid) with no wrap lane: a guess
     /// that would cross the right margin is declined. Prefer the grid-aware entry
     /// point: long command lines are where type-ahead matters most.
+    #[inline]
     pub fn predict_char(
         &mut self,
         ch: char,
@@ -2551,6 +2589,7 @@ impl Predictor {
     /// predict in a mode other than `Off`, and a host that keeps no mode of its
     /// own asks [`mode`](Self::mode).
     #[must_use]
+    #[inline]
     pub fn wants_key_row(&self) -> bool {
         self.preds.is_empty()
     }
@@ -2561,6 +2600,7 @@ impl Predictor {
     /// the live cursor also takes the cursor row right of it as its tail (see
     /// `tail`), so an echo that leaves a right prompt in place still proves the
     /// line. Returns `true` if a guess was added.
+    #[inline]
     pub fn predict_glyph(&mut self, ch: char, sample: &KeySample<'_>, now: Instant) -> bool {
         self.arm_glyph(ch, sample, now)
     }
@@ -2792,6 +2832,7 @@ impl Predictor {
     /// text, which the far end's insert of `ch` moves right of it, or text an
     /// owed echo is still to erase. A guess on its own glyph or on a blank is
     /// over none.
+    #[inline]
     fn text_under(&self, row: u16, col: u16, ch: char) -> Option<char> {
         if self.tail_line_end || !self.rule(Rule::DarkOverText) {
             return None;
@@ -2804,6 +2845,7 @@ impl Predictor {
     /// The index of the run's first pending guess typed over text
     /// (`text_under`): the one DARK OVER TEXT decides on, and with it every
     /// guess typed after it ([`Rule::DarkOverText`]).
+    #[inline]
     fn first_over_text(&self) -> Option<usize> {
         self.preds
             .iter()
@@ -2812,6 +2854,7 @@ impl Predictor {
 
     /// Whether a pending guess holds itself and what was typed after it off
     /// the glass over the line's text (`text_wait`, [`Rule::DarkOverText`]).
+    #[inline]
     fn text_held(&self) -> bool {
         self.text_wait
             .is_some_and(|s| self.preds.iter().any(|p| p.seq == s))
@@ -2819,6 +2862,7 @@ impl Predictor {
 
     /// Arm one op at `(row, col)`: the newest pending key, owing nothing of its
     /// own yet, and owed every keystroke owed so far (each was typed before it).
+    #[inline]
     fn push_op(&mut self, row: u16, col: u16, ch: char, op: Op, class: OpClass, now: Instant) {
         self.preds.push_back(Prediction {
             row,
@@ -3243,6 +3287,7 @@ impl Predictor {
     /// (`prompt_gate`), which it shuts. Every key entry point asks it once,
     /// before anything else, so a key refused, declined or not modelled
     /// shuts it as surely as one armed.
+    #[inline]
     fn first_key(&mut self) -> PromptGate {
         std::mem::take(&mut self.prompt_gate)
     }
@@ -3258,6 +3303,7 @@ impl Predictor {
     /// typed and stepped back over with a key this crate does not model), or
     /// stand at a `B` the shell left behind when it redrew the prompt (zsh's
     /// `reset-prompt` sends no new one).
+    #[inline]
     fn witness_of(
         &self,
         start: Option<InputStart>,
@@ -3491,6 +3537,7 @@ impl Predictor {
     }
 
     /// A state chain is in flight (see `chain`).
+    #[inline]
     fn engaged(&self) -> bool {
         self.chain && !self.preds.is_empty()
     }
@@ -3812,6 +3859,7 @@ impl Predictor {
     }
 
     /// One past the last cell of a state's text starting at `lo`.
+    #[inline]
     fn text_end<T>(lo: u16, text: &[T]) -> u16 {
         lo.saturating_add(u16::try_from(text.len()).unwrap_or(u16::MAX))
     }
@@ -4504,6 +4552,7 @@ impl Predictor {
 
     /// The shift kinds proven for ops of `epoch`: this epoch's (`proven`), or
     /// the carried epoch's as it ended (`carried_proven`), else none.
+    #[inline]
     fn proven_for(&self, epoch: u64) -> u8 {
         if epoch == self.epoch {
             self.proven
@@ -4515,6 +4564,7 @@ impl Predictor {
     }
 
     /// The op classes proven for op `p`'s epoch (`proven_for`).
+    #[inline]
     fn class_proven(&self, p: &Prediction) -> u8 {
         self.proven_for(p.epoch) & p.class.proven_bit()
     }
@@ -4880,7 +4930,8 @@ impl Predictor {
     /// safety theorem's PROVENANCE oracle takes its base. A read-only test seam.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn chain_matched_for_test(&self) -> bool {
+    #[inline]
+    pub const fn chain_matched_for_test(&self) -> bool {
         self.chain_matched
     }
 
@@ -4888,6 +4939,7 @@ impl Predictor {
     /// rather than the glyph lane's guesses. A read-only test seam.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
+    #[inline]
     pub fn engaged_for_test(&self) -> bool {
         self.engaged()
     }
@@ -4895,6 +4947,7 @@ impl Predictor {
     /// How many leading pending ops pass the display gate. A read-only test seam.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
+    #[inline]
     pub fn visible_ops_for_test(&self) -> usize {
         self.visible_count()
     }
@@ -4925,6 +4978,7 @@ impl Predictor {
     /// stays shut (`prompt_gate`): no line at the prompt that follows is
     /// witnessed. A host that knows it calls
     /// [`note_line_submit_at`](Self::note_line_submit_at).
+    #[inline]
     pub fn note_line_submit(&mut self, now: Instant) {
         self.note_line_submit_at(None, now);
     }
@@ -5114,6 +5168,7 @@ impl Predictor {
     /// Whether the terminal is PARKED in the deferred-wrap slot at a press: the
     /// engine's own flag where the host hands it ([`Rule::EngineWrapFlag`]),
     /// else the last reconcile's reading (`deferred_wrap`).
+    #[inline]
     fn parked(&self, flag: Option<bool>) -> bool {
         match flag {
             Some(pending) if self.rule(Rule::EngineWrapFlag) => pending,
@@ -5165,19 +5220,22 @@ impl Predictor {
 
     /// The guess typed at `born` echoed somewhere other than an append: its tail
     /// redraw may still be on its way (`moved_tail_at`).
+    #[inline]
     fn moved_tail(&mut self, born: Instant) {
         self.moved_tail_at = Some(self.moved_tail_at.map_or(born, |t| t.max(born)));
     }
 
     /// The cell after `p`, where an echo of `p` leaves the cursor: the next
     /// column, or `p`'s own in the last column, where the terminal parks.
-    fn cell_after(&self, p: &Prediction) -> (u16, u16) {
+    #[inline]
+    const fn cell_after(&self, p: &Prediction) -> (u16, u16) {
         self.after(p.row, p.col)
     }
 
     /// The cell after `(row, col)` as an echo written there leaves the cursor
     /// (`cell_after`).
-    fn after(&self, row: u16, col: u16) -> (u16, u16) {
+    #[inline]
+    const fn after(&self, row: u16, col: u16) -> (u16, u16) {
         let next = col.saturating_add(1);
         let parked = self.grid_cols > 0 && next >= self.grid_cols;
         (row, if parked { col } else { next })
@@ -5185,6 +5243,7 @@ impl Predictor {
 
     /// What the tail snapshot says stood at `(row, col)` when the run started, if
     /// it covers that cell (see `tail`).
+    #[inline]
     fn tail_at(&self, row: u16, col: u16) -> Option<Seen> {
         let (_, from) = self.tail.filter(|&(r, from)| r == row && from <= col)?;
         Some(
@@ -5303,6 +5362,7 @@ impl Predictor {
     /// typed narrow glyph makes by itself. A row that becomes right-to-left
     /// under the run reads opaque too, and proves only from the next run's
     /// press, which sees it opaque: display deferred, never a wrong cell.
+    #[inline]
     fn echo_unmarked(&self, p: &Prediction, seen: Seen) -> bool {
         !self.rule(Rule::MarkedEcho)
             || !matches!(seen, Seen::Opaque(_))
@@ -5323,6 +5383,7 @@ impl Predictor {
     /// pending space's cell, the redraw's trailing space credited it, and the
     /// proof `i` had earned, its `i` now a `$`, carried on to paint the secret
     /// typed next.
+    #[inline]
     fn holds_its_glyph(p: &Prediction, seen: Seen) -> bool {
         seen.legacy() == Seen::of_cell(p.ch, false).legacy()
     }
@@ -5881,7 +5942,8 @@ impl Predictor {
     /// counts it as a displayed prediction (so the frame after it is retired
     /// erases it) even when it painted no cell.
     #[must_use]
-    pub fn overlay_cursor(&self) -> Option<(u16, u16)> {
+    #[inline]
+    pub const fn overlay_cursor(&self) -> Option<(u16, u16)> {
         self.ghost_cursor
     }
 
@@ -5893,6 +5955,7 @@ impl Predictor {
     /// would leave a PAST deadline that the event loop re-folds at turn rate. After
     /// this call `next_deadline()` is `None` or in the future. A dropped guess that
     /// was on glass still needs its erase frame, so the host repaints on `true`.
+    #[inline]
     pub fn expire_due(&mut self, now: Instant) -> bool {
         let before = self.preds.len();
         self.expire(now);
@@ -6003,6 +6066,7 @@ impl Predictor {
     /// consecutive timeout walks it 250 → 500 → 1000 → 2000 ms until an echo fits;
     /// any confirmation resets it (see [`Self::record_rtt`]). It is bounded, and
     /// unlike feeding timeouts into `srtt` it cannot diverge or vote on the regime.
+    #[inline]
     fn glitch_window(&self) -> Duration {
         let probe = (GLITCH_FLOOR_MS << self.expiry_backoff.min(EXPIRY_BACKOFF_MAX)) as f32;
         let floor = probe.min(GLITCH_CEILING_MS as f32);
@@ -6062,6 +6126,7 @@ impl Predictor {
     /// shift of its kind has echoed exactly, moving a glyph: overwrite mode
     /// never moves one, so it never shows one. A learned key shows only once
     /// its binding is learned (`Prediction::probe` clear, [`Rule::LearnedBindings`]).
+    #[inline]
     fn op_visible(&self, p: &Prediction) -> bool {
         let class_ok = |proven: u8| {
             let rule = match p.class {
@@ -6082,6 +6147,7 @@ impl Predictor {
     /// its whole predict block, so an idle predictor costs nothing per frame.
     /// Every flush leaves `preds` empty, so the guard cannot strand a deadline or
     /// an unpainted erase.
+    #[inline]
     pub fn idle(&self) -> bool {
         self.preds.is_empty()
     }
@@ -6124,6 +6190,7 @@ impl Predictor {
     ///
     /// [`shown_through`]: Self::shown_through
     #[must_use]
+    #[inline]
     pub fn newest_op(&self) -> Option<u64> {
         self.preds.back().map(|p| p.seq)
     }
@@ -6133,6 +6200,7 @@ impl Predictor {
     /// (the press cancelled a guess, flushed, or was input the predictor does
     /// not model).
     #[must_use]
+    #[inline]
     pub fn armed_since(&self, before: Option<u64>) -> Option<u64> {
         self.newest_op()
             .filter(|op| before.is_none_or(|before| *op > before))
@@ -6143,6 +6211,7 @@ impl Predictor {
     /// a Backspace may have cancelled an older op below `shown_through`, so
     /// numeric press order alone does not say that key is still shown.
     #[must_use]
+    #[inline]
     pub fn op_is_pending(&self, op: u64) -> bool {
         self.preds.iter().any(|pending| pending.seq == op)
     }
@@ -6154,6 +6223,7 @@ impl Predictor {
     /// op is still pending, before its echo. `None` when nothing would be
     /// displayed. `&self`, read after the frame's `overlay`.
     #[must_use]
+    #[inline]
     pub fn shown_through(&self) -> Option<u64> {
         self.visible_count()
             .checked_sub(1)
@@ -6170,6 +6240,7 @@ impl Predictor {
     /// leave only from the front (echo, expiry), the back (a Backspace popping our
     /// own) or all at once (a flush), which is what lets a caller keep that map.
     #[cfg(any(test, debug_assertions))]
+    #[inline]
     pub fn pending(&self) -> impl ExactSizeIterator<Item = &Prediction> + '_ {
         self.preds.iter()
     }
@@ -6179,6 +6250,7 @@ impl Predictor {
     /// keystroke. Returns true while the oldest guess is past its expiry window so
     /// [`overlay`](Self::overlay)'s flush still gets one cleanup frame (an erase only
     /// if that guess passed the display gate; hidden Adaptive state changes no pixels).
+    #[inline]
     pub fn is_displaying(&self, now: Instant) -> bool {
         match self.preds.front() {
             None => false,
@@ -6196,6 +6268,7 @@ impl Predictor {
     /// arms a `WaitUntil` on this so a stale prediction is cleaned up (and, if it was
     /// visible, repainted away) via [`overlay`](Self::overlay)'s expiry flush even when
     /// no further input or output arrives.
+    #[inline]
     pub fn next_deadline(&self) -> Option<Instant> {
         let window = self.glitch_window();
         self.preds.front().map(|p| p.born + window)
@@ -6343,6 +6416,7 @@ impl Predictor {
 
     /// A keystroke typed at `at` is no longer tracked by any guess: its echo is
     /// owed (see `owed_at`).
+    #[inline]
     fn owe(&mut self, at: Instant) {
         self.owed_at = Some(self.owed_at.map_or(at, |t| t.max(at)));
     }
@@ -6704,6 +6778,7 @@ impl Predictor {
     }
 
     /// Fold a confirmed echo latency into the smoothed RTT estimate.
+    #[inline]
     fn record_rtt(&mut self, rtt: Duration) {
         let ms = rtt.as_secs_f32() * 1000.0;
         self.srtt = Some(match self.srtt {

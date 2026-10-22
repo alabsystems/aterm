@@ -70,6 +70,7 @@ impl PresentTag {
     /// (nobody could see it); then whether it registered within one refresh of
     /// the previous registration, and under which pace floor.
     #[must_use]
+    #[inline]
     pub const fn for_pacing(burst: bool, input_hot: bool, occluded: bool) -> Self {
         match (occluded, burst, input_hot) {
             (true, _, _) => Self::Occluded,
@@ -88,6 +89,7 @@ impl PresentTag {
 
     /// The stable wire label.
     #[must_use]
+    #[inline]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Spaced => "spaced",
@@ -100,6 +102,7 @@ impl PresentTag {
     /// The tag a stored discriminant names; anything else is `Spaced`, the
     /// arm that claims nothing about pacing.
     #[must_use]
+    #[inline]
     #[cfg(any(target_os = "macos", test))]
     const fn from_u8(raw: u8) -> Self {
         match raw {
@@ -130,7 +133,8 @@ impl GlassReport {
     /// visible one whose successor registered within a refresh is charged to the
     /// lane that replaced it; one nothing replaced was dropped by the compositor.
     #[must_use]
-    pub fn skip_attribution(self) -> PresentTag {
+    #[inline]
+    pub const fn skip_attribution(self) -> PresentTag {
         match (self.tag, self.successor) {
             (PresentTag::Occluded, _) => PresentTag::Occluded,
             (_, PresentTag::HotBurst) => PresentTag::HotBurst,
@@ -209,6 +213,7 @@ pub fn install_sink(sink: GlassSink) -> bool {
 }
 
 /// Whether a sink is installed — the swapchain registers a handler only then.
+#[inline]
 #[cfg(target_os = "macos")]
 pub(crate) fn sink_installed() -> bool {
     SINK.get().is_some()
@@ -216,6 +221,7 @@ pub(crate) fn sink_installed() -> bool {
 
 /// Presented handlers delivered since process start, both kinds.
 #[must_use]
+#[inline]
 pub fn delivered() -> u64 {
     DELIVERED.load(Ordering::Relaxed)
 }
@@ -224,6 +230,7 @@ pub fn delivered() -> u64 {
 /// presenting thread immediately before the present that registers the handler.
 /// A present that never registers (refused, non-Metal path) leaves the facts
 /// for the next one, which overwrites them.
+#[inline]
 pub fn arm_present(armed: ArmedPresent) {
     let mut flags = 0;
     if armed.input_hot {
@@ -241,6 +248,7 @@ pub fn arm_present(armed: ArmedPresent) {
 }
 
 /// `CACurrentMediaTime` seconds → nanoseconds, saturating.
+#[inline]
 #[cfg(any(target_os = "macos", test))]
 fn secs_to_ns(secs: f64) -> u64 {
     if secs.is_finite() && secs > 0.0 {
@@ -274,6 +282,7 @@ pub(crate) fn registration_begin(registered_s: f64) -> (u64, PresentTag) {
 /// The most recent registration, once. The presenting thread takes it right
 /// after its present returns; `None` when nothing registered since the last take
 /// (a refused present, or a path with no handler).
+#[inline]
 pub fn take_registration() -> Option<Registration> {
     match TAKEABLE_SERIAL.swap(0, Ordering::Relaxed) {
         0 => None,
@@ -284,6 +293,7 @@ pub fn take_registration() -> Option<Registration> {
     }
 }
 
+#[inline]
 #[cfg(any(target_os = "macos", test))]
 fn ring_slot(serial: u64) -> usize {
     usize::try_from(serial % TAG_RING as u64).unwrap_or(0)
@@ -312,6 +322,7 @@ pub(crate) fn deliver_report(serial: u64, tag: PresentTag, sample: GlassSample) 
 /// `CACurrentMediaTime` seconds: `registered_s` read just before
 /// `presentDrawable:`, `presented_s` the drawable's `presentedTime`.
 #[must_use]
+#[inline]
 pub fn classify(registered_s: f64, presented_s: f64) -> GlassSample {
     if presented_s.is_nan() || presented_s <= 0.0 {
         return GlassSample::Skipped;

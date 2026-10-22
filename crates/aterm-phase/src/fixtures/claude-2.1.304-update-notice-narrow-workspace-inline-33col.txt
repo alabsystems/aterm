@@ -1,0 +1,18 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (33x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the narrow workspace card and its notice on the inline renderer launched at 33 columns: the card's four rows from row 0, the summary on three rows, the details row's link broken at the pane's edge (`…/changel` / `og for details`); the stand-in `workspace` replaces the vendor's top effort key throughout
+             Claude Code v2.1.304
+ ▐▛███▛█▄╱✦  Opus 5.5 with xhigh…
+▝▜██████▘    API Usage Billing
+ ▝▝   ▝▝     /…/tmp/at.r3cj/proj
+
+  Updated to latest. Got 66
+  features, 424 bugfixes, and 126
+  other changes.
+  code.claude.com/docs/en/changel
+  og for details
+
+
+───────────────────── workspace ─
+❯
+─────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to
+  ◉ xhigh · workspace · /effort

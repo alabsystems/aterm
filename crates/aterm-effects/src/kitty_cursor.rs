@@ -310,6 +310,7 @@ impl CatPose {
 }
 
 impl Default for CatPose {
+    #[inline]
     fn default() -> Self {
         Self::STILL
     }
@@ -576,6 +577,7 @@ pub struct CursorCat {
 }
 
 impl Default for CursorCat {
+    #[inline]
     fn default() -> Self {
         Self {
             momentum: TypingMomentum::default(),
@@ -634,6 +636,7 @@ impl CursorCat {
     /// left alone. An earned flight is positioned from the live caret, so
     /// letting it survive the fence would make the sprite jump to an unrelated
     /// cell.
+    #[inline]
     pub fn retire_unowned_cursor_motion(&mut self) {
         if self.collection_hello || self.sing > 0.0 || matches!(self.state, State::Hidden) {
             return;
@@ -665,6 +668,7 @@ impl CursorCat {
         self.on_motion_pulse_with_owner(pulse, false);
     }
 
+    #[inline]
     fn on_motion_pulse_with_owner(
         &mut self,
         pulse: crate::cursor_glow::CursorCatMotionPulse,
@@ -742,6 +746,7 @@ impl CursorCat {
         self.on_key_with_owner(now, forward, true);
     }
 
+    #[inline]
     fn on_key_with_owner(&mut self, now: Instant, forward: bool, ordinary_flight_owned: bool) {
         let dt = self
             .last
@@ -807,6 +812,7 @@ impl CursorCat {
     /// The Hidden → FadeIn summon shared by [`Self::on_key`] and [`Self::set_singing`] (each
     /// keeps its own gate); a latched look lands here. The FadeOut revive is the same
     /// appearance and keeps the latched look.
+    #[inline]
     fn summon(&mut self, now: Instant) {
         self.sustain = 0.0;
         self.run_keys = 0;
@@ -823,6 +829,7 @@ impl CursorCat {
     /// Fire (or sustain) the delete oops on a live companion: every delete extends the hold
     /// to [`OOPS_HOLD`] past it; the flinch and recoil kick only on a burst's first delete
     /// ([`OOPS_REARM`]).
+    #[inline]
     fn note_oops(&mut self, now: Instant) {
         if !self.is_active() {
             return;
@@ -845,6 +852,7 @@ impl CursorCat {
     /// Wince at complete profanity cues on a live companion; never summons, touches momentum
     /// or extends the flight. Cues within one phrase chain (to `MAX_WINCE_CHAIN`) to scale
     /// the re-kicked recoil. Returns whether a live companion accepted it.
+    #[inline]
     pub fn on_curse(&mut self, now: Instant, hits: u8) -> bool {
         if hits == 0 || !self.is_active() {
             return false;
@@ -869,6 +877,7 @@ impl CursorCat {
     /// [`Flight::disp_floor`] past the `DISP_TAU` follower, the whip springs from
     /// `FLYING_LEAD_0`, the eyes squint through the flight, and the landing squash is booked
     /// for [`Flight::land_at`]. `frame` predates the impulse, so its pose is re-resolved.
+    #[inline]
     pub fn on_meteor(&mut self, flight: Flight, now: Instant, frame: &mut CatFrame) {
         if !self.is_active() {
             return;
@@ -884,6 +893,7 @@ impl CursorCat {
     /// Refresh an animated [`CatFrame`] that predates an in-frame reaction
     /// impulse (such as Rainbow Kitty v2's `Delight` in `route_flying_head`),
     /// so frame 0 of the reaction carries the new [`CatReaction`] and eyes.
+    #[inline]
     pub(crate) fn refresh_reaction_frame(&mut self, now: Instant, frame: &mut CatFrame) {
         if !self.is_active() {
             return;
@@ -912,6 +922,7 @@ impl CursorCat {
     /// [`Self::on_curse`] with happy eyes and a leap. Never summons, touches
     /// momentum or the flight, or changes `look`; returns whether a live
     /// companion accepted it.
+    #[inline]
     pub fn on_delight(&mut self, now: Instant, hits: u8) -> bool {
         if hits == 0 || !self.is_active() {
             return false;
@@ -936,6 +947,7 @@ impl CursorCat {
     /// Stamp one kill chord (Ctrl-K/U/W, Alt-D, forward Delete, word backspace): drains
     /// momentum at twice the single-delete rate and fires the oops on a live companion.
     /// Never summons.
+    #[inline]
     pub fn on_kill(&mut self, now: Instant) {
         self.sustain = 0.0;
         self.run_keys = 0;
@@ -946,6 +958,7 @@ impl CursorCat {
 
     /// Celebrate a committed command without summoning an otherwise-hidden
     /// companion. The reaction is a bounded pose swap on an already-live cat.
+    #[inline]
     pub fn on_enter(&mut self, now: Instant) {
         if self.is_active() {
             self.reaction = CatReaction::Celebrate;
@@ -959,6 +972,7 @@ impl CursorCat {
     /// [`Self::frame`]/[`Self::static_frame`]. While armed (`drive == 1`) the metric is pinned
     /// to 1.0, since holding a key at repeat cadence is the celebration's premise; an armed
     /// celebration skips the dwell but still owes [`MIN_RUN_KEYS`].
+    #[inline]
     pub fn set_singing(&mut self, now: Instant, sync: SingSync) {
         self.sing = if sync.drive.is_finite() {
             sync.drive.clamp(0.0, 1.0)
@@ -984,6 +998,7 @@ impl CursorCat {
     /// else the tenured program cat, else the launch kitty) without changing the lifecycle.
     /// While on screen it parks until the next appearance (a mid-fade revive is the same
     /// appearance); while hidden it applies at once. [`Self::on_collect`] replaces it at once.
+    #[inline]
     pub fn set_look(&mut self, look: KittyLook) {
         let look = look.normalized();
         if self.is_active() || self.collection_hello {
@@ -1385,6 +1400,7 @@ impl CursorCat {
 
     /// Settle a finished flight or collection hello back to `State::Hidden`,
     /// applying any parked look and clearing per-appearance state.
+    #[inline]
     fn settle_hidden(&mut self) {
         self.state = State::Hidden;
         self.flight = None;
@@ -1512,6 +1528,7 @@ impl CursorCat {
     /// the erase deadline, or the earlier oops-decay instant (the swap back has
     /// no key to ride). An expired deadline is never returned: rearming a past
     /// instant could spin if an occluded compositor withholds the redraw.
+    #[inline]
     #[must_use]
     pub fn static_deadline(&self, now: Instant) -> Option<Instant> {
         if !self.collection_hello || self.collection_paused_at.is_some() {
@@ -1653,6 +1670,7 @@ impl CursorCat {
     /// non-discovery flight begins its fade-out — a collection hello's
     /// goodbye starts at the promised hold deadline, an earned flight at the
     /// analytic [`LOW`] crossing.
+    #[inline]
     fn grounded_exit(&mut self, discovery_until: Option<Instant>, now: Instant) -> CatFrame {
         let started = if self.collection_hello {
             discovery_until.unwrap_or(now)
@@ -1671,6 +1689,7 @@ impl CursorCat {
         self.momentum.low_crossing(LOW).unwrap_or(now)
     }
 
+    #[inline]
     fn begin_fade_out_at(&mut self, started: Instant, now: Instant) -> CatFrame {
         // A discovery goodbye keeps showing the exact unlocked art. Ordinary
         // earned flights retain the occasional authored wink/meow flourish.

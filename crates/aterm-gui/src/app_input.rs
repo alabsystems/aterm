@@ -1048,6 +1048,7 @@ fn native_settings_route_for_aux(
         | AuxTarget::Menu
         | AuxTarget::TabMenu
         | AuxTarget::AutopilotMenu
+        | AuxTarget::FactMenu
         | AuxTarget::Overview => None,
     }
 }
@@ -4318,20 +4319,27 @@ impl InputRefusal {
 
 impl App {
     /// Writes one DEC 1004 report to `session` ([`Self::recompute_focus_reports`]'s
-    /// delta) by the one report route ([`paste_order::report_ordered_or_inline`]), so
-    /// a tab switch away from a frozen program never parks the UI thread; a report
-    /// with no room is counted silently. Addressed by session id because `App::input`
-    /// routes by window, and the session losing the keyboard is no longer front.
-    pub(super) fn write_focus_report(&self, session: u64, focused: bool) {
+    /// delta, [`Self::report_focus_arm`]'s answer) by the one report route
+    /// ([`paste_order::report_ordered_or_inline`]), so a tab switch away from a frozen
+    /// program never parks the UI thread; a report with no room is counted silently.
+    /// Addressed by session id because `App::input` routes by window, and the session
+    /// losing the keyboard is no longer front.
+    ///
+    /// The report answers every enable published before it, so the enable count is read
+    /// first and recorded as told: a delta that blurred a session which had just turned
+    /// 1004 on is its answer, and the arm's own answer does not repeat it.
+    pub(super) fn write_focus_report(&mut self, session: u64, focused: bool) {
         let Some(live) = self.pool.get(session) else {
             return;
         };
+        let arms = live.ctx.modes.focus_arms();
         write_ui_report(
             &live.term,
             &live.ctx.modes,
             &live.ctx.sink,
             &InputEvent::Focus(focused),
         );
+        self.pool.set_focus_arms_told(session, arms);
     }
 
     /// A key or paste refused for `session` (the ordered queue could not admit it,
@@ -5055,7 +5063,7 @@ impl App {
     /// [`Source::Human`]). The seam's only use of `src` besides audit. Read only by the
     /// `status` and `text --json` verbs and a controller's own `key|send if-human=<n>`,
     /// which can hold back only that controller's write.
-    fn note_person_input(&self, session: u64, ev: &InputEvent, src: Source) {
+    pub(crate) fn note_person_input(&self, session: u64, ev: &InputEvent, src: Source) {
         if matches!(src, Source::Human) && crate::human_input::is_person_gesture(ev) {
             // A person is present: the warm spare may exist (`spare`).
             self.spares.note_person(std::time::Instant::now());
@@ -8741,7 +8749,7 @@ impl App {
             && let Key::Character(character) = &ev.logical_key
         {
             if character.eq_ignore_ascii_case("f") {
-                self.find_requested();
+                self.find_requested_in(wid);
                 self.note_consumed_press(wid, ev);
                 return true;
             }
@@ -9318,7 +9326,7 @@ impl App {
             && let Key::Character(s) = &ev.logical_key
             && s.eq_ignore_ascii_case("f")
         {
-            self.search_enter();
+            self.find_requested_in(wid);
             self.note_consumed_press(wid, &ev);
             return;
         }
@@ -10416,7 +10424,7 @@ impl App {
                 #[cfg(not(target_os = "linux"))]
                 self.paste_clipboard();
             }
-            Action::Find => self.find_requested(),
+            Action::Find => self.find_requested_in(wid),
             Action::FontIncrease => self.set_font_size(self.font_size + FONT_ZOOM_STEP),
             Action::FontDecrease => self.set_font_size(self.font_size - FONT_ZOOM_STEP),
             Action::FontReset => self.set_font_size(self.default_font_size),
@@ -10501,10 +10509,10 @@ impl App {
             }
             // The `MenuAction::FindNext` reducer; a key path has no refusal surface.
             Action::FindNext => {
-                let _ = self.search_find_again(true);
+                let _ = self.search_find_again_in(wid, true);
             }
             Action::FindPrev => {
-                let _ = self.search_find_again(false);
+                let _ = self.search_find_again_in(wid, false);
             }
             // The ledger key: the same method the hardcoded ⇧⌘L calls.
             Action::OpenLedger => self.open_session_ledger(wid),
@@ -11366,8 +11374,9 @@ impl App {
                 self.open_settings_tab(crate::native_settings::SettingsRoute::Messages);
             }
             // …and at the Harness route — the bar and palette path to the
-            // coding agent harness's page (the Autopilot menu opens it in the
-            // window it was opened in: `App::open_harness_settings`).
+            // coding agent harness's page (the Autopilot menu's `Harness
+            // settings…` opens it in the window it was chosen in:
+            // `App::open_harness_settings`).
             MenuAction::HarnessSettings => {
                 if let Some(wid) = self.frontmost_window {
                     self.open_harness_settings(wid, crate::harness_screen::HarnessFocus::Top);
@@ -11696,6 +11705,13 @@ impl App {
             // chip, as `↓` on the selected chip opens it; `controls
             // autopilot-menu` / `image` then read it.
             AuxTarget::AutopilotMenu => self.open_front_autopilot_menu(),
+            // A fact's menu names its fact: `cmd_open` posts its own wake
+            // (`Wake::OpenFactMenu`), so the bare target reaches here only
+            // without one.
+            AuxTarget::FactMenu => Err(
+                "open fact-menu names its fact: model | effort | path | branch | context | usage"
+                    .to_string(),
+            ),
             AuxTarget::Front => {
                 Err("the front terminal window is already open (use window/chrome)".to_string())
             }
@@ -11728,6 +11744,10 @@ impl App {
             }
             AuxTarget::AutopilotMenu => {
                 self.close_autopilot_menu();
+                Ok(())
+            }
+            AuxTarget::FactMenu => {
+                self.close_fact_menu();
                 Ok(())
             }
             AuxTarget::Overview => {

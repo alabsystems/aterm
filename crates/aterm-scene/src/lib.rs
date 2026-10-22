@@ -20,21 +20,24 @@ pub use vector::{PathCmd, PathSeg, PathTransform, fill_path, fill_path_fixed, pa
 
 /// Clamp `v` into `[lo, hi]`. `lo <= hi` is the caller's contract; if violated the
 /// result is `lo` (we clamp high first, then low), which is still finite and bounded.
+#[inline]
 #[must_use]
-pub(crate) fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
+pub(crate) const fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
     let v = if v > hi { hi } else { v };
     if v < lo { lo } else { v }
 }
 
 /// Smoothstep easing of `t ∈ [0,1]` (the classic `3t² − 2t³`).
+#[inline]
 #[must_use]
-pub fn smoothstep(t: f32) -> f32 {
+pub const fn smoothstep(t: f32) -> f32 {
     let t = clampf(t, 0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
 /// Per-channel linear blend of two packed `0x00RRGGBB` colours by `t ∈ [0,1]` (the
 /// shared gradient/daylight helper for every scene). `t` is clamped.
+#[inline]
 #[must_use]
 pub fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
     let t = clampf(t, 0.0, 1.0);
@@ -50,12 +53,14 @@ pub fn mix_rgb(a: u32, b: u32, t: f32) -> u32 {
 }
 
 /// Pack `(r, g, b)` channels into `0x00RRGGBB`.
+#[inline]
 #[must_use]
 pub const fn pack_rgb24(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
 /// Unpack a `0x00RRGGBB` color into `(r, g, b)`.
+#[inline]
 #[must_use]
 pub const fn unpack_rgb24(rgb: u32) -> (u8, u8, u8) {
     (
@@ -66,6 +71,7 @@ pub const fn unpack_rgb24(rgb: u32) -> (u8, u8, u8) {
 }
 
 /// Integer linear blend of two 8-bit channels by `alpha ∈ 0..=255`.
+#[inline]
 #[must_use]
 pub const fn blend_channel_u8(a: u8, b: u8, alpha: u8) -> u8 {
     let inv = 255u32.saturating_sub(alpha as u32);
@@ -77,6 +83,7 @@ pub const fn blend_channel_u8(a: u8, b: u8, alpha: u8) -> u8 {
 }
 
 /// Integer linear blend of two `0x00RRGGBB` colors by `alpha ∈ 0..=255`.
+#[inline]
 #[must_use]
 pub const fn blend_rgb24_u8(a: u32, b: u32, alpha: u8) -> u32 {
     let (ar, ag, ab) = unpack_rgb24(a);
@@ -89,6 +96,7 @@ pub const fn blend_rgb24_u8(a: u32, b: u32, alpha: u8) -> u32 {
 }
 
 /// Encode a 4-word tile rectangle `(x, y, w, h)` into 16 little-endian bytes.
+#[inline]
 #[must_use]
 pub const fn encode_tile_rect_le(x: u32, y: u32, w: u32, h: u32) -> [u8; 16] {
     [
@@ -112,6 +120,7 @@ pub const fn encode_tile_rect_le(x: u32, y: u32, w: u32, h: u32) -> [u8; 16] {
 }
 
 /// Decode 16 little-endian bytes into a 4-word tile rectangle `(x, y, w, h)`.
+#[inline]
 #[must_use]
 pub const fn decode_tile_rect_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
     let x = (bytes[0] as u32)

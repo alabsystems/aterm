@@ -49,7 +49,8 @@ impl ImageSpan {
     /// Create a span covering `[start_col, end_col)` with footprint row
     /// `image_row`, whose first cell paints footprint column `first_cell_col`.
     #[must_use]
-    pub fn new(
+    #[inline]
+    pub const fn new(
         start_col: u16,
         end_col: u16,
         image_row: u16,
@@ -81,7 +82,7 @@ impl ImageSpan {
     /// recovered from the span without storing a ref per cell.
     #[inline]
     #[must_use]
-    pub fn tile_at(&self, col: u16) -> Option<(u16, u16)> {
+    pub const fn tile_at(&self, col: u16) -> Option<(u16, u16)> {
         if !self.contains(col) {
             return None;
         }
@@ -100,6 +101,7 @@ impl ImageSpan {
     /// would hide images from the budget. The per-row shares sum to the payload once.
     /// Over-counts only when an overwrite split one footprint row into several spans.
     #[must_use]
+    #[inline]
     pub fn memory_used(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(self.image.per_row_bytes())
     }

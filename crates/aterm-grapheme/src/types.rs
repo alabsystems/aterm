@@ -43,24 +43,28 @@ pub struct GraphemeInfo {
 impl Grapheme<'_> {
     /// Byte length of this grapheme cluster slice.
     #[must_use]
+    #[inline]
     pub const fn byte_len(&self) -> usize {
         self.text.len()
     }
 
     /// Return `true` iff this grapheme occupies 0 terminal cells.
     #[must_use]
+    #[inline]
     pub const fn is_zero_width(&self) -> bool {
         self.width == 0
     }
 
     /// Return `true` iff this grapheme occupies 2 terminal cells.
     #[must_use]
+    #[inline]
     pub const fn is_wide(&self) -> bool {
         self.width == 2
     }
 
     /// Return `true` iff this grapheme consists of a single Unicode codepoint.
     #[must_use]
+    #[inline]
     pub const fn is_single_codepoint(&self) -> bool {
         self.codepoint_count == 1
     }
@@ -69,12 +73,14 @@ impl Grapheme<'_> {
 impl GraphemeInfo {
     /// Return `true` iff the analyzed string contains 0 bytes.
     #[must_use]
+    #[inline]
     pub const fn is_empty(&self) -> bool {
         self.byte_count == 0
     }
 
     /// Return `true` iff every byte is a single-width ASCII grapheme (`byte_count == grapheme_count == display_width`).
     #[must_use]
+    #[inline]
     pub const fn is_ascii_single_width(&self) -> bool {
         self.byte_count == self.grapheme_count
             && self.grapheme_count == self.display_width
@@ -86,6 +92,7 @@ impl GraphemeInfo {
 
     /// Encode the 4 primary 32-bit counts `(grapheme_count, display_width, codepoint_count, byte_count)` into 16 little-endian bytes.
     #[must_use]
+    #[inline]
     pub const fn encode_counts_le(&self) -> [u8; 16] {
         let g = self.grapheme_count as u32;
         let w = self.display_width as u32;
@@ -113,6 +120,7 @@ impl GraphemeInfo {
 
     /// Decode 16 little-endian bytes into `(grapheme_count, display_width, codepoint_count, byte_count)`.
     #[must_use]
+    #[inline]
     pub const fn decode_counts_le(bytes: [u8; 16]) -> (u32, u32, u32, u32) {
         let g = (bytes[0] as u32)
             | ((bytes[1] as u32) << 8)

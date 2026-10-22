@@ -105,6 +105,7 @@ impl<T> Clone for Offset<T> {
 impl<T> Offset<T> {
     /// Create an offset.
     #[must_use]
+    #[inline]
     pub const fn new(byte_offset: u32) -> Self {
         Self {
             byte_offset,
@@ -115,6 +116,7 @@ impl<T> Offset<T> {
     /// Get the byte offset.
     #[cfg(test)]
     #[must_use]
+    #[inline]
     pub const fn byte_offset(self) -> u32 {
         self.byte_offset
     }
@@ -139,6 +141,7 @@ impl<T> PageSlice<T> {
     /// Length of the slice (u16).
     #[cfg(test)]
     #[must_use]
+    #[inline]
     pub const fn len_u16(&self) -> u16 {
         self.len
     }
@@ -146,6 +149,7 @@ impl<T> PageSlice<T> {
     /// Page ID for this slice.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
+    #[inline]
     pub const fn page_id(&self) -> PageId {
         self.page_id
     }
@@ -153,6 +157,7 @@ impl<T> PageSlice<T> {
     /// Offset within the page.
     #[cfg(test)]
     #[must_use]
+    #[inline]
     pub const fn offset(&self) -> Offset<T> {
         self.offset
     }
@@ -160,7 +165,7 @@ impl<T> PageSlice<T> {
     /// View the slice as a shared reference.
     #[must_use]
     #[inline]
-    pub fn as_slice(&self) -> &[T] {
+    pub const fn as_slice(&self) -> &[T] {
         let len = self.len as usize;
         // SAFETY: ptr/len are validated at allocation time.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), len) }
@@ -169,7 +174,7 @@ impl<T> PageSlice<T> {
     /// View the slice as a mutable reference.
     #[must_use]
     #[inline]
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
+    pub const fn as_mut_slice(&mut self) -> &mut [T] {
         let len = self.len as usize;
         // SAFETY: ptr/len are validated at allocation time and uniquely owned.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), len) }
@@ -179,12 +184,14 @@ impl<T> PageSlice<T> {
 impl<T> Deref for PageSlice<T> {
     type Target = [T];
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         self.as_slice()
     }
 }
 
 impl<T> DerefMut for PageSlice<T> {
+    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut_slice()
     }

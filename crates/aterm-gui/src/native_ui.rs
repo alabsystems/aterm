@@ -637,6 +637,12 @@ pub(crate) struct ButtonSpec {
     /// ([`TextFieldSpec::swatch`]), painted at the button's end ahead of its
     /// trailing icon. Paint only: the control's value names the colour.
     pub(crate) chip: Option<[u8; 3]>,
+    /// A DISCLOSURE HEAD TALLER THAN ONE ROW (a stacked Messages head: its
+    /// mark and time on a first row, its title on lines under them) centres
+    /// its chevron on that first row, this many points tall, beside the few
+    /// words there, so the lines under it run to the head's end. `None`:
+    /// centred in the head. Paint only.
+    pub(crate) chevron_row: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -701,6 +707,7 @@ impl ButtonSpec {
             badge: false,
             swatches: Vec::new(),
             chip: None,
+            chevron_row: None,
         }
     }
 
@@ -6329,9 +6336,6 @@ fn paint_compiled_node(
                     sky,
                     rim,
                 );
-                if spec.value.as_deref() == Some("system-state-kitty") {
-                    crate::system_state::paint_brand_kitty(prims, rect);
-                }
                 return;
             }
             if spec.audit_id == WORDMARK_AUDIT {
@@ -8316,7 +8320,11 @@ fn paint_disclosure_button(
         }
     }
     let ink = rgba(readable_secondary(roles), 235);
-    let (cx, cy) = (rect.right() - 16.0, rect.y + rect.height / 2.0);
+    let chevron_band = control
+        .spec
+        .chevron_row
+        .map_or(rect.height, |row| f32::from(row).min(rect.height));
+    let (cx, cy) = (rect.right() - 16.0, rect.y + chevron_band / 2.0);
     let segment = |x1: f32, y1: f32, x2: f32, y2: f32| DrawPrim::Line {
         x1,
         y1,
@@ -8868,6 +8876,44 @@ pub(crate) enum CompileError {
     VisibleLabelNotInName(UiKey),
 }
 
+/// `visual`'s lines joined as `name` writes each break's two halves: with
+/// nothing between where the name has them as one word (an identifier
+/// broken at its own joints, `aterm` / `.toml`), the break's hyphen dropped
+/// where the name has the word without it (`Infor-` / `mation`), else with
+/// a space.
+pub(crate) fn joined_as_named(visual: &str, name: &str) -> String {
+    let name = name.to_lowercase();
+    let mut out = String::new();
+    for line in visual.split('\n') {
+        if out.is_empty() {
+            out.push_str(line);
+            continue;
+        }
+        let last = out
+            .rsplit(char::is_whitespace)
+            .next()
+            .unwrap_or_default()
+            .to_lowercase();
+        let first = line
+            .split(char::is_whitespace)
+            .next()
+            .unwrap_or_default()
+            .to_lowercase();
+        let unhyphenated = last
+            .strip_suffix('-')
+            .is_some_and(|stem| name.contains(&format!("{stem}{first}")));
+        if unhyphenated {
+            out.pop();
+        } else if !name.contains(&format!("{last}{first}"))
+            || name.contains(&format!("{last} {first}"))
+        {
+            out.push(' ');
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// THE WORDS A CONTROL PAINTS ARE IN ITS NAME (WCAG 2.5.3, Label in Name):
 /// a speech user says what they see, so a button's painted words
 /// (`visual_label`) must be one phrase of its accessible name (`label`),
@@ -8881,8 +8927,11 @@ pub(crate) fn visible_label_in_name(visual: &str, name: &str) -> bool {
     // A label painted on lines ([`native_button_label_lines`]) is its words
     // with spaces between; one broken inside a word ends its line in a `-` or
     // after a `/`, which joins the word again — a hyphen the break added, or
-    // one the word has; and a code identifier broken with no mark (an
-    // aterm.toml key) is its lines joined as they are.
+    // one the word has; a code identifier broken with no mark (an
+    // aterm.toml key) is its lines joined as they are; and a label that has
+    // both (words wrapped, and an identifier among them broken at its own
+    // joints with no mark: "Open" / "aterm" / ".toml") joins each break as
+    // the name writes the two halves ([`joined_as_named`]).
     if visual.contains('\n') {
         let joined = |hyphen: &str| {
             visual
@@ -8890,9 +8939,14 @@ pub(crate) fn visible_label_in_name(visual: &str, name: &str) -> bool {
                 .replace("/\n", "/")
                 .replace('\n', " ")
         };
-        return [joined(""), joined("-"), visual.replace('\n', "")]
-            .iter()
-            .any(|visual| visible_label_in_name(visual, name));
+        return [
+            joined(""),
+            joined("-"),
+            visual.replace('\n', ""),
+            joined_as_named(visual, name),
+        ]
+        .iter()
+        .any(|visual| visible_label_in_name(visual, name));
     }
     let words = |text: &str| {
         text.split_whitespace()

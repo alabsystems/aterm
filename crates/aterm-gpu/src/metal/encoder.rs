@@ -158,6 +158,7 @@ impl EncodeSession {
 
     /// The session's latch, for wiring cross-checks (present compares it to
     /// the swapchain's by pointer).
+    #[inline]
     pub(crate) const fn latch(&self) -> &Arc<loss::LossLatch> {
         &self.latch
     }
@@ -165,6 +166,7 @@ impl EncodeSession {
     /// Lend the queue to a blocking one-shot helper ([`super::ffi::
     /// draw_and_read`], `dispatch_compute`). Sound because those helpers wait
     /// for completion before returning, and no second queue is constructed.
+    #[inline]
     pub(crate) const fn one_shot_queue(&self) -> &Obj {
         &self.queue
     }
@@ -591,6 +593,7 @@ fn report_gpu_span(cb: Id, token: crate::gpu_time::FrameToken<'static>) {
 
 /// Whether a blit between these two raw `MTLPixelFormat`s moves bytes 1:1:
 /// identical formats or the Unorm/sRGB pair.
+#[inline]
 const fn formats_copy_compatible(a: usize, b: usize) -> bool {
     if a == b {
         return true;
@@ -621,6 +624,7 @@ pub(crate) struct PassEncoder<'cb, 's> {
 
 impl PassEncoder<'_, '_> {
     /// `-setRenderPipelineState:` — the mid-pass pipeline switch.
+    #[inline]
     pub(crate) fn set_pipeline(&self, pso: &Obj) {
         self.pipeline_set.set(true);
         // SAFETY: plain object-argument message on the live encoder.
@@ -631,6 +635,7 @@ impl PassEncoder<'_, '_> {
     }
 
     /// Fragment texture at `index` (the mid-pass atlas switch).
+    #[inline]
     pub(crate) fn set_fragment_texture(&self, tex: &Obj, index: usize) {
         // SAFETY: plain message on the live encoder; the encoder retains what
         // it needs for the pass.
@@ -646,6 +651,7 @@ impl PassEncoder<'_, '_> {
     }
 
     /// Fragment sampler at `index`.
+    #[inline]
     pub(crate) fn set_fragment_sampler(&self, sampler: &Obj, index: usize) {
         // SAFETY: as `set_fragment_texture`.
         unsafe {
@@ -660,6 +666,7 @@ impl PassEncoder<'_, '_> {
     }
 
     /// Fragment buffer at `index`, offset 0 (every uniform writes from 0).
+    #[inline]
     pub(crate) fn set_fragment_buffer(&self, buf: &Obj, index: usize) {
         // SAFETY: as `set_fragment_texture`.
         unsafe {
@@ -677,6 +684,7 @@ impl PassEncoder<'_, '_> {
     /// Vertex-stage buffer at `index`, the uniform slot (`cell.metal` and
     /// `hdr_glow.metal` at 0, `tray.metal` at 2). Not for the instance stream,
     /// which binds through [`Self::set_instance_stream`]; this refuses that slot.
+    #[inline]
     pub(crate) fn set_vertex_buffer(&self, buf: &Obj, index: usize) -> Result<(), String> {
         if index == super::ffi::INSTANCE_STREAM_SLOT {
             return Err(format!(
@@ -700,6 +708,7 @@ impl PassEncoder<'_, '_> {
 
     /// Bind the per-instance stream at [`super::ffi::INSTANCE_STREAM_SLOT`], the
     /// slot no MSL uniform block uses. Any other index lands on the uniforms.
+    #[inline]
     pub(crate) fn set_instance_stream(&self, stream: &Obj) {
         self.set_instance_stream_at(stream, 0);
     }
@@ -707,6 +716,7 @@ impl PassEncoder<'_, '_> {
     /// [`Self::set_instance_stream`] at a byte offset, for the bloom extract's
     /// `extract_first..` sub-stream. The offset must be a multiple of the
     /// instance stride and inside the buffer.
+    #[inline]
     pub(crate) fn set_instance_stream_at(&self, stream: &Obj, byte_offset: usize) {
         self.stream_set.set(true);
         // SAFETY: as `set_fragment_buffer`.
@@ -723,6 +733,7 @@ impl PassEncoder<'_, '_> {
     }
 
     /// `-setScissorRect:` mid-pass, for re-scissoring between draw groups.
+    #[inline]
     pub(crate) fn set_scissor(&self, sc: MtlScissorRect) {
         // SAFETY: `MTLScissorRect` travels indirectly per its ffi doc; plain
         // message on the live encoder.
@@ -733,6 +744,7 @@ impl PassEncoder<'_, '_> {
     }
 
     /// `-setViewport:` (the present's blit pass states the full destination).
+    #[inline]
     pub(crate) fn set_viewport(&self, vp: MtlViewport) {
         // SAFETY: `MTLViewport` travels indirectly per its ffi doc.
         unsafe {
@@ -744,6 +756,7 @@ impl PassEncoder<'_, '_> {
     /// Instanced draw from vertex 0: `(Triangle, 6, n)` for quads, alongside
     /// [`Self::draw_fullscreen_triangle`] and [`Self::draw_strip_quad`]. A zero
     /// instance or vertex count encodes as Metal's legal no-op (an empty group).
+    #[inline]
     pub(crate) fn draw_instanced(
         &self,
         primitive: PrimitiveType,
@@ -766,16 +779,19 @@ impl PassEncoder<'_, '_> {
 
     /// The 3-vertex fullscreen triangle (`vs_blit`/`vs_fs` synthesize their
     /// positions from `[[vertex_id]]`; no stream is bound or needed).
+    #[inline]
     pub(crate) fn draw_fullscreen_triangle(&self) -> Result<(), String> {
         self.raw_draw(PrimitiveType::Triangle, 3, 1)
     }
 
     /// The tray's 4-vertex strip quad.
+    #[inline]
     pub(crate) fn draw_strip_quad(&self) -> Result<(), String> {
         self.raw_draw(PrimitiveType::TriangleStrip, 4, 1)
     }
 
     /// Every draw funnels here; the pipeline check cannot be skipped.
+    #[inline]
     fn raw_draw(
         &self,
         primitive: PrimitiveType,
@@ -826,6 +842,7 @@ pub(crate) struct CbProbe {
 
 impl CbProbe {
     /// A +1 probe onto `sub`'s command buffer.
+    #[inline]
     pub(crate) fn of(sub: &Submitted) -> Self {
         Self {
             cb: sub.cb.clone_retained(),
@@ -834,6 +851,7 @@ impl CbProbe {
 
     /// `None` while the command buffer is still in flight, `Some(outcome)`
     /// once terminal. Feeds nothing (see the type doc).
+    #[inline]
     pub(crate) fn try_terminal(&self) -> Option<loss::CbOutcome> {
         match loss::outcome_of(self.cb.id()) {
             loss::CbOutcome::Unfinished { .. } => None,
@@ -891,6 +909,7 @@ impl Submitted {
     /// Poll: `None` while in flight, `Some(outcome)` once terminal. The first
     /// terminal answer feeds the latch like [`Self::wait_outcome`]; later calls
     /// answer from the cache and feed nothing.
+    #[inline]
     pub(crate) fn try_outcome(&self) -> Option<loss::CbOutcome> {
         if let Some(done) = self.settled.get() {
             return Some(done);
@@ -902,6 +921,7 @@ impl Submitted {
     }
 
     /// Record the one terminal outcome: feed the latch, fill the cache.
+    #[inline]
     fn settle_terminal(&self, outcome: loss::CbOutcome) -> loss::CbOutcome {
         self.settled.set(Some(outcome));
         self.settle(outcome)
@@ -909,6 +929,7 @@ impl Submitted {
 
     /// Record one classified outcome on the process latch and return it; the
     /// injection seam, like `PresentTicket::settle`. Uncached.
+    #[inline]
     pub(crate) fn settle(&self, outcome: loss::CbOutcome) -> loss::CbOutcome {
         self.latch.record(&outcome);
         outcome

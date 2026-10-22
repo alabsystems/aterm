@@ -84,8 +84,11 @@ fn control_serious_mode_intent(key: &str, value: Option<&str>) -> Option<bool> {
 /// The `settings` verb's answer, from what the write did: `written` is the
 /// value `key` holds once it lands (`None` where the key is absent — an
 /// `unset`, or a value equal to its default, which the service writes as a
-/// removal), and `now` what a removed key reads as (the words its Settings
-/// row shows). An applied write says `saved: k = v` or `removed: k; now w`; a
+/// removal), and `now` what a removed key reads as, in the words its Settings
+/// row's control says and where it comes from
+/// ([`crate::native_settings::effective_value_words`]: "Auto (default)",
+/// "Off (default)", "1.5 (from theme Studio)"). An applied write says
+/// `saved: k = v` or `removed: k; now w`; a
 /// write that changed nothing says so, never "saved" with an empty value.
 /// Whether the save still needs reconciling comes last, after what it did.
 fn control_settings_completion_reply(
@@ -2823,6 +2826,65 @@ impl App {
         window.last_present = None;
     }
 
+    fn repaint_native_view(
+        &mut self,
+        wid: WindowId,
+        view: crate::tab_model::ViewId,
+        damage: DamageRegion,
+    ) {
+        self.invalidate_native_view_cache(wid, view, damage);
+        if let Some(window) = self.windows.get_mut(&wid) {
+            // The full-page raster is retained independently of its leaf scene.
+            window.settings_card = None;
+            if let Some(window) = window.os_window.as_ref() {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn repaint_native_instance(
+        &mut self,
+        instance: crate::tab_model::AppInstanceId,
+        damage: DamageRegion,
+    ) {
+        // ViewStore owns the instance links. A shared-model publication must
+        // advance every linked frame's stamp without changing view-local state.
+        let views = self
+            .view_store
+            .iter()
+            .filter_map(|(view, link)| {
+                matches!(link, crate::tab_model::View::Native(native) if native.instance == instance)
+                    .then_some(view)
+            })
+            .collect::<Vec<_>>();
+        for view in views {
+            self.native_runtime.change_view_state(view, |state| {
+                let common = state.common_mut();
+                common.presentation_revision = common.presentation_revision.wrapping_add(1);
+                true
+            });
+            if let Ok((wid, _)) = self.locate_native_view(view) {
+                self.repaint_native_view(wid, view, damage);
+            }
+        }
+    }
+
+    /// Retire queued actions for every view of one shared review without
+    /// changing its fields, caret, focus, or visual frame identity.
+    pub(crate) fn retire_native_review(&mut self, instance: crate::tab_model::AppInstanceId) {
+        let views = self
+            .view_store
+            .iter()
+            .filter_map(|(view, link)| {
+                matches!(link, crate::tab_model::View::Native(native) if native.instance == instance)
+                    .then_some(view)
+            })
+            .collect::<Vec<_>>();
+        for view in views {
+            self.native_runtime.retire_native_review(view);
+        }
+    }
+
     /// Compile the active native app's one semantic tree for inspection or hit
     /// testing. Paint uses this exact compiler in `redraw_native_window`.
     pub(crate) fn compiled_native_ui(
@@ -3431,11 +3493,12 @@ impl App {
             .map_err(|error| format!("native dispatch failed: {error:?}"))?;
         // A reducer that mutates without asking for repaint still fails safe,
         // but only its own leaf is widened to full damage.
-        if !outcome
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, AppEffect::RepaintSelf(_)))
-        {
+        if !outcome.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                AppEffect::RepaintSelf(_) | AppEffect::RepaintInstance(_)
+            )
+        }) {
             self.invalidate_native_view_cache(wid, view, DamageRegion::All);
         }
         for effect in outcome.effects {
@@ -4793,18 +4856,12 @@ impl App {
                 self.refresh_native_presentation(wid, instance, view);
             }
             AppEffect::RepaintSelf(damage) => {
-                self.invalidate_native_view_cache(wid, view, damage);
-                if let Some(ws) = self.windows.get_mut(&wid) {
-                    ws.last_present = None;
-                    // The native tray is a retained full-page raster; dropping it
-                    // keeps a control capture or the next present from reusing
-                    // the previous route's pixels under the new semantic tree.
-                    ws.settings_card = None;
-                }
-                if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-                    window.request_redraw();
-                }
+                self.repaint_native_view(wid, view, damage);
             }
+            AppEffect::RepaintInstance(damage) => {
+                self.repaint_native_instance(instance, damage);
+            }
+            AppEffect::RetireReview => self.retire_native_review(instance),
         }
         Ok(())
     }
@@ -4838,10 +4895,9 @@ impl App {
         reply: std::sync::mpsc::Sender<Result<String, String>>,
         request_id: u64,
     ) -> Option<u64> {
-        let Some(canonical_key) = crate::prefs::editable_fields(&self.config)
+        let Some(field) = crate::prefs::editable_fields(&self.config)
             .into_iter()
             .find(|field| field.key == key)
-            .map(|field| field.key.to_string())
         else {
             // A key the file still loads but nothing reads (retired, or kept for
             // compatibility) gets the band's and Manual's own story, never
@@ -4853,6 +4909,16 @@ impl App {
             let _ = reply.send(Err(message));
             return None;
         };
+        let canonical_key = field.key.to_string();
+        // A choice no option takes is refused at once, with every option and
+        // the words its row says for it.
+        if let Some(Err(refusal)) = value
+            .as_deref()
+            .map(|value| crate::native_settings::control_input_value(&field, value))
+        {
+            let _ = reply.send(Err(format!("save failed: {refusal}")));
+            return None;
+        }
         if self.proxy.is_none() {
             let _ = reply.send(Err(
                 "save failed: config persistence needs an event-loop proxy".to_string(),
@@ -4909,6 +4975,15 @@ impl App {
         reply: std::sync::mpsc::Sender<Result<String, String>>,
         request_id: u64,
     ) {
+        // A value in the words its Settings row shows ("Reduce", "Match
+        // macOS", "On") is the option it names.
+        let value = value.map(|value| {
+            crate::prefs::editable_fields(&self.config)
+                .iter()
+                .find(|field| field.key == canonical_key)
+                .and_then(|field| crate::native_settings::control_input_value(field, &value).ok())
+                .unwrap_or(value)
+        });
         let serious_mode_intent = control_serious_mode_intent(&canonical_key, value.as_deref());
         self.native_config_pending.push_back(NativeConfigRequest {
             origin: NativeConfigOrigin::Control {
@@ -6251,11 +6326,17 @@ impl App {
                     || value.clone(),
                     |snapshot| snapshot.semantic_values.get(&key).cloned(),
                 );
+                let system_dark = self.os_appearance == aterm_types::Appearance::Dark;
                 let now = landed
                     .as_ref()
                     .filter(|_| written.is_none())
                     .and_then(|snapshot| {
-                        crate::prefs::effective_value_label(&snapshot.config, &key)
+                        crate::native_settings::effective_value_words(
+                            snapshot,
+                            &key,
+                            system_dark,
+                            crate::app_settings::settings_font_families(),
+                        )
                     });
                 let mut response = control_settings_completion_reply(
                     &key,
@@ -11538,6 +11619,12 @@ impl App {
         )
     )]
     fn native_update_close_preflight(&self) -> (ClosePreflight, Option<NativeUpdateSafetyToken>) {
+        if self.system_state_cancel_pending() {
+            return (
+                ClosePreflight::Blocked(vec!["Cancel has not been saved".into()]),
+                None,
+            );
+        }
         let documents = self
             .view_store
             .iter()

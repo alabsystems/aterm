@@ -308,7 +308,7 @@ impl Scrollback {
     /// Get the total number of lines across all tiers.
     #[must_use]
     #[inline]
-    pub fn line_count(&self) -> usize {
+    pub const fn line_count(&self) -> usize {
         self.line_count
     }
 
@@ -323,14 +323,14 @@ impl Scrollback {
     /// Get the number of lines in warm tier.
     #[must_use]
     #[inline]
-    pub fn warm_line_count(&self) -> usize {
+    pub const fn warm_line_count(&self) -> usize {
         self.warm.line_count()
     }
 
     /// Get the number of lines in cold tier.
     #[must_use]
     #[inline]
-    pub fn cold_line_count(&self) -> usize {
+    pub const fn cold_line_count(&self) -> usize {
         self.cold.line_count()
     }
 
@@ -338,7 +338,8 @@ impl Scrollback {
     /// [`cold_memory_used`](Self::cold_memory_used) and
     /// [`total_memory_used`](Self::total_memory_used).
     #[must_use]
-    pub fn memory_used(&self) -> usize {
+    #[inline]
+    pub const fn memory_used(&self) -> usize {
         // Saturating: both are bytes this process holds, so the sum fits.
         self.hot
             .memory_used()
@@ -350,14 +351,16 @@ impl Scrollback {
     /// For [`Scrollback`], cold tier is in-memory and participates in budget
     /// enforcement via FIFO eviction of the oldest cold pages.
     #[must_use]
-    pub fn cold_memory_used(&self) -> usize {
+    #[inline]
+    pub const fn cold_memory_used(&self) -> usize {
         self.cold.compressed_size()
     }
 
     /// Get total memory usage across all tiers (bytes), including cache and
     /// overhead.
     #[must_use]
-    pub fn total_memory_used(&self) -> usize {
+    #[inline]
+    pub const fn total_memory_used(&self) -> usize {
         self.bytes_used
     }
 
@@ -366,7 +369,7 @@ impl Scrollback {
     /// metadata. [`over_budget`](Self::over_budget) and the watermark compare it.
     #[must_use]
     #[inline]
-    pub fn budgeted_memory_used(&self) -> usize {
+    pub const fn budgeted_memory_used(&self) -> usize {
         self.budgeted_bytes
     }
 
@@ -374,21 +377,21 @@ impl Scrollback {
     /// not `total_memory_used()`, so read-only cache fills do not perturb it.
     #[must_use]
     #[inline]
-    pub fn over_budget(&self) -> bool {
+    pub const fn over_budget(&self) -> bool {
         self.budgeted_bytes > self.memory_budget
     }
 
     /// Get the hot tier limit.
     #[must_use]
     #[inline]
-    pub fn hot_limit(&self) -> usize {
+    pub const fn hot_limit(&self) -> usize {
         self.hot_limit
     }
 
     /// Get the warm tier limit.
     #[must_use]
     #[inline]
-    pub fn warm_limit(&self) -> usize {
+    pub const fn warm_limit(&self) -> usize {
         self.warm_limit
     }
 
@@ -397,14 +400,14 @@ impl Scrollback {
     #[cfg(test)]
     #[must_use]
     #[inline]
-    pub(crate) fn block_size(&self) -> usize {
+    pub(crate) const fn block_size(&self) -> usize {
         self.block_size
     }
 
     /// Get the memory budget.
     #[must_use]
     #[inline]
-    pub fn memory_budget(&self) -> usize {
+    pub const fn memory_budget(&self) -> usize {
         self.memory_budget
     }
 
@@ -413,7 +416,7 @@ impl Scrollback {
     /// Returns `None` if no limit is set.
     #[must_use]
     #[inline]
-    pub fn line_limit(&self) -> Option<usize> {
+    pub const fn line_limit(&self) -> Option<usize> {
         self.line_limit
     }
 
@@ -421,7 +424,7 @@ impl Scrollback {
     /// accounting sync).
     #[must_use]
     #[inline]
-    pub fn watermark_level(&self) -> WatermarkLevel {
+    pub const fn watermark_level(&self) -> WatermarkLevel {
         self.watermark_level
     }
 }

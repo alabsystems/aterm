@@ -15,7 +15,8 @@
 //! 2. else the staging copy, downloaded (retried) and checked ([`check_staged`]); a public
 //!    manifest that exists must be byte-identical to staging's (a public pack is
 //!    immutable);
-//! 3. publish: create the release, or upload exactly what is missing (never replacing); a
+//! 3. publish: create the release ([`public_notes`]: for an ALab package, the upstream base
+//!    its staged archive records), or upload exactly what is missing (never replacing); a
 //!    public release that serves no manifest (an orphaned draft) is refused;
 //! 4. confirm every asset answers on the download host ([`super::probe_served`]).
 //!
@@ -28,7 +29,7 @@ use std::path::{Path, PathBuf};
 use atpkg::net::MANIFEST_CAP;
 
 use super::{Log, download_retried, flag_value, host_error, probe_served};
-use crate::artifact::{pkgdoc, upload};
+use crate::artifact::{package, pkgdoc, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::host::{HostError, Probe, Replace};
@@ -92,7 +93,7 @@ fn bind(pkg: &atpkg::PkgManifest, program: &str, build: u64, which: &str, tag: &
 
 /// The staging release in `dir`, verified: the signed manifest pair under the client's
 /// rule, the program/build bind, every release asset's sha256, and exactly the signed set.
-/// Returns the expected file names, manifest pair first.
+/// Returns the expected file names, manifest pair first, and the verified manifest.
 ///
 /// # Errors
 ///
@@ -103,7 +104,7 @@ pub fn check_staged(
     staged: &[String],
     program: &str,
     build: u64,
-) -> Result<Vec<String>> {
+) -> Result<(Vec<String>, atpkg::PkgManifest)> {
     let tag = upload::tag(program, build);
     let mf = pkgdoc::manifest_name(program, build);
     let sig = pkgdoc::sig_name(program, build);
@@ -143,7 +144,30 @@ pub fn check_staged(
              republish it"
         )));
     }
-    Ok(expected)
+    Ok((expected, pkg))
+}
+
+/// What every public pack release says about its authenticity.
+pub const PUBLIC_NOTES: &str = "Signed atpkg package, published byte-identical from the \
+     staging registry by atpkg-publish. Authenticity is the Ed25519 signature chain from the \
+     paper master, through the machine roster published beside the index — the host is never \
+     an authenticity input.";
+
+/// The notes the public release of `program`'s verified staging pack `pkg` (its files in
+/// `dir`) is created with: [`PUBLIC_NOTES`], then, for an ALab package whose record names
+/// one, its upstream base (`Based on upstream openai/codex …`), read off the archive as a
+/// client stages it ([`package::staged_upstream`]) and never off the staging release's
+/// text, which nothing signs.
+///
+/// # Errors
+///
+/// A refusal when an ALab package's archive does not stage.
+pub fn public_notes(program: &str, pkg: &atpkg::PkgManifest, dir: &Path) -> Result<String> {
+    let upstream = package::staged_upstream(program, pkg, dir)?;
+    Ok(match package::upstream_line(program, upstream.as_ref()) {
+        Some(line) => format!("{PUBLIC_NOTES}\n\n{line}"),
+        None => PUBLIC_NOTES.to_string(),
+    })
 }
 
 /// Make every pack `quad` pins public on the channel owner.
@@ -312,7 +336,7 @@ fn one(
         )),
         e => host_error(format!("download {staging}@{tag}"), &e),
     })?;
-    let expected = check_staged(quad, &dir, &staged_release.assets, program, build)?;
+    let (expected, staged_pkg) = check_staged(quad, &dir, &staged_release.assets, program, build)?;
     if public_mf {
         let same = |name: &str| {
             std::fs::read(pub_dir.join(name)).ok() == std::fs::read(dir.join(name)).ok()
@@ -384,15 +408,13 @@ fn one(
             return Ok(());
         }
         let files: Vec<PathBuf> = expected.iter().map(|n| dir.join(n)).collect();
+        let notes = public_notes(program, &staged_pkg, &dir)?;
         channel
             .create(
                 &public,
                 &tag,
                 &format!("atpkg {program} build {build}"),
-                "Signed atpkg package, published byte-identical from the staging registry by \
-                 atpkg-publish. Authenticity is the Ed25519 signature chain from the paper \
-                 master, through the machine roster published beside the index — the host is \
-                 never an authenticity input.",
+                &notes,
                 &files,
             )
             .map_err(|e| host_error(format!("create {public}@{tag}"), &e))?;

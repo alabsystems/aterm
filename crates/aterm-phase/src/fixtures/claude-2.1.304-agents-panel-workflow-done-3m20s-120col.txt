@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab), bypass mode (`--dangerously-skip-permissions`), fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1) · the same workflow at its end: `2/2 · 3m20s · ↓ 12.9k tokens`, the bar full and its clock stopped; `<session>/workflows/wf_stallrun-f56.json` (the run's record) is written now
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.19iX/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ Workflow(Long tool call inside a workflow)
+  ⎿  ✔ Completed in 3m 20s · 2 agents · 12.9k tokens
+
+⏺ Tool call done.
+
+✻ Waiting for 1 dynamic workflow to finish
+
+⏺ Dynamic workflow "Long tool call inside a workflow" completed · 3m 20s
+
+⏺ Tool call done.
+
+✻ Brewed for 3m 20s · done 9:08 AM
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+
+  ◯ stall-probe  ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰  2/2 · 3m20s · ↓ 12.9k tokens
+
+
+
+
+
+
+
+
+
+
+
+

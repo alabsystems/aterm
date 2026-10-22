@@ -86,8 +86,16 @@ pub use terminal_style::{CurrentStyle, SavedCursorState};
 /// Convert usize row index to u16 (saturating at `u16::MAX`).
 #[must_use]
 #[inline]
-pub fn row_u16(idx: usize) -> u16 {
-    idx.try_into().unwrap_or(u16::MAX)
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "guarded by idx <= u16::MAX as usize before cast"
+)]
+pub const fn row_u16(idx: usize) -> u16 {
+    if idx > u16::MAX as usize {
+        u16::MAX
+    } else {
+        idx as u16
+    }
 }
 
 /// Maximum visible rows a [`Grid`] will hold. Constructors and

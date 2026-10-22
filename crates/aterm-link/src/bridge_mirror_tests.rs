@@ -39,6 +39,8 @@ fn limits() -> Limits {
 struct World {
     bridge: Bridge,
     _server: astream_broker::BrokerHandle,
+    /// The broker, kept to cut its log ([`World::retaining`]).
+    broker: astream_broker::Broker,
     lane: FakeVerbLane,
     model: aterm_spec::derive::Model,
     expect: State,
@@ -57,7 +59,17 @@ impl World {
     /// A session whose log holds its open (`ms` 1, the model's first
     /// `Append`), mirrored one slot a batch.
     fn new() -> World {
-        let (lane, mut bridge, server) = rig_with_broker(&[]);
+        World::with_broker(false)
+    }
+
+    /// [`World::new`] over a broker that retains its log by aterm's default
+    /// rules, its `Hello` read and judged (session log Phase 6 step 6E-2).
+    fn retaining() -> World {
+        World::with_broker(true)
+    }
+
+    fn with_broker(retained: bool) -> World {
+        let (lane, mut bridge, server, broker) = rig_with_kept_broker(&[], retained);
         bridge.mirror = Some(MirrorRun::acked_for_tests(&bridge.state, 1));
         let mut log = Log::with_limits(1, limits());
         log.open_session(
@@ -79,6 +91,7 @@ impl World {
         let mut w = World {
             bridge,
             _server: server,
+            broker,
             lane,
             model,
             expect,
@@ -124,7 +137,9 @@ impl World {
     fn view(&mut self) -> ([i64; 3], [i64; 3]) {
         let face = subject::session_face("f", &self.bridge.node, SID, "ev");
         let (mut conn, _) = self.bridge.connect().expect("a read connection");
-        let (rows, _) = conn.fetch(0, &face, 1000).expect("the face");
+        // From what a retaining broker keeps ([`crate::transport::fetch_kept`]).
+        let ((rows, _), _) =
+            crate::transport::fetch_kept(&mut conn, 0, &face, 1000).expect("the face");
         let mut recs: BTreeMap<u64, BTreeSet<(u32, u64)>> = BTreeMap::new();
         let mut cov = [0i64; 3];
         for (_, _, bytes) in rows {
@@ -871,6 +886,7 @@ fn a_mirror_with_its_copies_and_no_pin_writes_one_at_its_hello() {
             inc: 1,
             total: 7000,
             key: Some(key),
+            win: Vec::new(),
             slots: vec![crate::mirror::PinSlot {
                 pseq: 9,
                 sid: SID.to_string(),
@@ -1282,6 +1298,13 @@ fn a_busy_landing_waits_and_a_definite_refusal_stops_the_mirror() {
 #[test]
 fn the_nodes_total_rides_the_pin_and_the_cap_stops_the_mirror() {
     let mut w = World::new();
+    w.bridge.read_log_identity().unwrap();
+    w.bridge.note_broker_retention();
+    assert_eq!(
+        w.bridge.broker_retains,
+        Some(false),
+        "PRECONDITION: a broker that retains nothing"
+    );
     w.take();
     w.publish();
     w.settle();
@@ -1312,6 +1335,385 @@ fn the_nodes_total_rides_the_pin_and_the_cap_stops_the_mirror() {
         .unwrap()
         .iter()
         .any(|l| l == "link mirror capped reason=total"));
+}
+
+/// Publish `n` records of another writer on this node's `ev` faces: what the
+/// broker's window holds below the mirror's own. Their offsets.
+fn fill(w: &World, n: u64) -> Vec<u64> {
+    let face = subject::session_face("f", &w.bridge.node, "s-old", "ev");
+    let (mut god, _) = w.bridge.connect().unwrap();
+    (1..=n)
+        .map(|seq| god.publish(93, seq, &face, b"v=1 t=1 ev=old").unwrap().0)
+        .collect()
+}
+
+/// THE WINDOW BUDGET REPLACES THE LIFETIME CAP ON A RETAINING BROKER (session
+/// log Phase 6 step 6E-2, ruling U41). The node's pin says it mirrored past
+/// [`crate::mirror::TOTAL_MAX_BYTES`], a whole window's budget of it in a
+/// batch the broker's cut has since passed: the mirror reads `oldest=` again,
+/// forgets that batch, and goes on taking, landing and counting, never
+/// `capped`. NEGATIVE CONTROL, run: the lifetime gate on every broker stops it
+/// with `mirror=capped`.
+#[test]
+fn a_retaining_brokers_window_lets_a_total_past_the_cap_mirror_on() {
+    let mut w = World::retaining();
+    assert_eq!(w.bridge.broker_retains, Some(true), "PRECONDITION");
+    let old = fill(&w, 2);
+    {
+        let m = w.bridge.mirror.as_deref_mut().unwrap();
+        m.set_total_for_tests(crate::mirror::TOTAL_MAX_BYTES + 1);
+        m.note_window_for_tests(old[0], crate::mirror::NODE_WINDOW_BYTES);
+    }
+    w.broker.retain_before(old[1]).expect("the broker's cut");
+    w.take();
+    w.publish();
+    w.settle();
+    let m = w.bridge.mirror.as_deref().unwrap();
+    assert_eq!(m.stopped(), None, "never capped");
+    assert!(!m.waiting(), "the window has room");
+    assert!(m.total() > crate::mirror::TOTAL_MAX_BYTES, "counted on");
+    let (win, oldest) = m.window();
+    assert_eq!(oldest, old[1], "the oldest= the broker said");
+    assert_eq!(
+        win.len(),
+        1,
+        "the passed batch forgotten, this one noted: {win:?}"
+    );
+    assert!(win[0].0 > old[1], "{win:?}");
+    let links = w.lane.links.lock().unwrap().clone();
+    assert!(
+        !links.iter().any(|l| l.starts_with("link mirror capped")),
+        "{links:?}"
+    );
+    assert_eq!(w.view().0[0], 1, "the session's open is on the bus");
+}
+
+/// A NODE AT ITS WINDOW BUDGET WAITS, AND GOES ON WHEN THE BROKER GIVES ITS
+/// OLDEST UP (session log Phase 6 step 6E-2, ruling U41). A landed batch at
+/// the window's top holds the whole budget: the take asks `oldest=` again,
+/// still finds it in the window, takes nothing, says `link mirror budget`
+/// once to a lane-6 endpoint (`fabric status mirror=budget`) and waits
+/// [`super::super::DEADLINE_RETRY`]; it never stops. Once the broker's cut passes that
+/// batch the next take says `link mirror on` and lands the session's record.
+/// NEGATIVE CONTROL, run: a budget that never asks `oldest=` again waits
+/// for ever.
+#[test]
+fn a_node_at_its_window_budget_waits_and_goes_on_when_the_broker_gives_its_oldest_up() {
+    let mut w = World::retaining();
+    w.bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
+    let old = fill(&w, 2);
+    w.bridge
+        .mirror
+        .as_deref_mut()
+        .unwrap()
+        .note_window_for_tests(old[1], crate::mirror::NODE_WINDOW_BYTES);
+    w.take();
+    {
+        let m = w.bridge.mirror.as_deref().unwrap();
+        assert!(m.waiting(), "at the budget");
+        assert!(m.batch().0.is_empty(), "nothing taken");
+        assert_eq!(m.stopped(), None, "a wait, never a stop");
+        assert!(m.retry_at().is_some(), "asked again at the retry cadence");
+    }
+    w.take();
+    let budget = |w: &World| {
+        w.lane
+            .links
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| *l == "link mirror budget")
+            .count()
+    };
+    assert_eq!(budget(&w), 1, "said once");
+
+    w.broker
+        .retain_before(old[1] + 1)
+        .expect("the broker's cut");
+    w.take();
+    assert!(!w.bridge.mirror.as_deref().unwrap().waiting(), "room again");
+    let links = w.lane.links.lock().unwrap().clone();
+    assert_eq!(
+        links.last().map(String::as_str),
+        Some("link mirror on"),
+        "{links:?}"
+    );
+    w.publish();
+    w.settle();
+    assert_eq!(w.view().0[0], 1, "the session's open is on the bus");
+}
+
+/// A BUDGET FILLED IN MANY SMALL BATCHES GOES ON ONCE THE CUT PASSES HALF OF
+/// THEM (session log Phase 6 step 6E-2, ruling U41): a busy node's window
+/// filled in 1024 batches, sixteen times what the ledger keeps entries, waits
+/// at its budget, and the broker's cut past the older half of them gives the
+/// room back at the next take. NEGATIVE CONTROL, run: the ledger merging its
+/// two oldest entries counts the whole window still, and the mirror waits.
+#[test]
+fn a_budget_filled_in_many_small_batches_goes_on_once_the_cut_passes_half() {
+    const N: usize = 1024;
+    let mut w = World::retaining();
+    w.bridge.endpoint_lane = aterm_types::control_verbs::BRIDGE_LANE;
+    let old = fill(&w, N as u64);
+    {
+        let m = w.bridge.mirror.as_deref_mut().unwrap();
+        for off in &old {
+            m.note_window_for_tests(*off, crate::mirror::NODE_WINDOW_BYTES / N as u64);
+        }
+    }
+    w.take();
+    assert!(
+        w.bridge.mirror.as_deref().unwrap().waiting(),
+        "at the budget"
+    );
+    w.broker
+        .retain_before(old[N / 2])
+        .expect("the broker's cut");
+    w.take();
+    let m = w.bridge.mirror.as_deref().unwrap();
+    assert!(
+        !m.waiting(),
+        "half the window given up, room again: {:?}",
+        m.window()
+    );
+    let links = w.lane.links.lock().unwrap().clone();
+    assert_eq!(
+        links.last().map(String::as_str),
+        Some("link mirror on"),
+        "{links:?}"
+    );
+}
+
+/// AN `auto` MIRROR RUNS ONLY OVER A BROKER THAT RETAINS IT (session log
+/// Phase 6 step 6E-3, owner decision D4). The start's `hello`, before any
+/// attach, says `log=auto` and asks for nothing, whatever the endpoint
+/// answers. An attach to a broker whose `Hello` advertises the default rules
+/// says the `hello` again with `log=turns`, and its answer engages the mirror
+/// and says `link mirror on`; a later attach asks nothing more. Over a broker
+/// that advertises none the mirror is never asked for: no second `hello`,
+/// nothing engaged, and `link mirror unretained` said once to a lane-6
+/// endpoint across two attaches. NEGATIVE CONTROL, run: an attach that does
+/// not follow the broker (no `mirror_attached`) fails the retaining half.
+#[test]
+fn an_auto_mirror_runs_only_over_a_broker_that_retains_it() {
+    let lane_now = aterm_types::control_verbs::BRIDGE_LANE;
+    for retained in [true, false] {
+        let (lane, mut bridge, _server, _broker) = rig_with_kept_broker(&[], retained);
+        bridge.mirror = MirrorRun::new(
+            crate::mirror::LogMode::Auto,
+            &bridge.state,
+            Instant::now(),
+            crate::mirror::mint_alias_key,
+        );
+        bridge.broker_retains = None;
+        lane.answer_hello_with(&format!("OK lane={lane_now} build=x log=turns\n"));
+        bridge.introduce();
+        assert!(
+            lane.hellos()[0].ends_with(" log=auto"),
+            "{:?}",
+            lane.hellos()
+        );
+        assert!(!bridge.mirror_engaged(), "an auto hello asks for nothing");
+        let said = |lane: &FakeVerbLane, line: &str| {
+            lane.links
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|l| *l == line)
+                .count()
+        };
+        for _ in 0..2 {
+            assert!(bridge.attach_broker(), "attached ({retained})");
+            assert_eq!(bridge.broker_retains, Some(retained));
+        }
+        let hellos = lane.hellos();
+        if retained {
+            assert_eq!(hellos.len(), 2, "asked once: {hellos:?}");
+            assert!(hellos[1].ends_with(" log=turns"), "{hellos:?}");
+            assert!(bridge.mirror_engaged(), "the default mirrors turns");
+            assert_eq!(said(&lane, "link mirror on"), 1);
+            assert_eq!(said(&lane, "link mirror unretained"), 0);
+        } else {
+            assert_eq!(hellos.len(), 1, "never asked: {hellos:?}");
+            assert!(!bridge.mirror_engaged(), "nothing mirrors unretained");
+            assert_eq!(said(&lane, "link mirror unretained"), 1, "said once");
+            assert_eq!(said(&lane, "link mirror on"), 0);
+        }
+    }
+}
+
+/// AN `auto` MIRROR A BROKER STOPS RETAINING IS WITHDRAWN BEFORE IT SAYS SO
+/// (session log Phase 6 step 6E-3). Asked for and acknowledged over a
+/// retaining broker, the mirror reattaches to one that retains nothing: it
+/// says the `hello` again with `log=auto` (so the endpoint's recorded hello
+/// reads `bridge_log=auto`, and stops engaging its sessions), then `link
+/// mirror unretained`; back on the retaining broker it asks again with
+/// `log=turns` and its answer says `link mirror on`. NEGATIVE CONTROL, run: no
+/// withdrawal leaves the endpoint's last recorded hello `log=turns`.
+#[test]
+fn an_auto_mirror_a_broker_stops_retaining_is_withdrawn_before_it_says_so() {
+    let lane_now = aterm_types::control_verbs::BRIDGE_LANE;
+    let (lane, mut bridge, _server, _broker) = rig_with_kept_broker(&[], true);
+    bridge.mirror = MirrorRun::new(
+        crate::mirror::LogMode::Auto,
+        &bridge.state,
+        Instant::now(),
+        crate::mirror::mint_alias_key,
+    );
+    bridge.broker_retains = None;
+    lane.answer_hello_with(&format!("OK lane={lane_now} build=x log=turns\n"));
+    bridge.introduce();
+    let retaining = bridge.cfg.broker.clone();
+    assert!(bridge.attach_broker(), "attached, retaining");
+    assert!(
+        bridge.mirror_engaged(),
+        "PRECONDITION: asked and acknowledged"
+    );
+    assert!(
+        lane.hellos()[1].ends_with(" log=turns"),
+        "{:?}",
+        lane.hellos()
+    );
+
+    let socket = lane.dir.path().join("unretaining.sock");
+    let unretaining = crate::test_broker(lane.dir.path().join("unretaining.log")).unwrap();
+    let _unretaining_server = unretaining.serve(&socket).unwrap();
+    bridge.cfg.broker = socket.to_string_lossy().into_owned();
+    assert!(bridge.attach_broker(), "attached, unretaining");
+    assert_eq!(bridge.broker_retains, Some(false));
+    let hellos = lane.hellos();
+    assert_eq!(hellos.len(), 3, "withdrawn once: {hellos:?}");
+    assert!(hellos[2].ends_with(" log=auto"), "{hellos:?}");
+    assert!(!bridge.mirror_engaged(), "nothing mirrors unretained");
+    let said = |line: &str| {
+        lane.links
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| *l == line)
+            .count()
+    };
+    assert_eq!(said("link mirror unretained"), 1);
+
+    bridge.cfg.broker = retaining;
+    assert!(bridge.attach_broker(), "attached, retaining again");
+    let hellos = lane.hellos();
+    assert_eq!(hellos.len(), 4, "asked again: {hellos:?}");
+    assert!(hellos[3].ends_with(" log=turns"), "{hellos:?}");
+    assert!(bridge.mirror_engaged(), "the mirror runs again");
+    assert_eq!(
+        said("link mirror on"),
+        2,
+        "{:?}",
+        lane.links.lock().unwrap()
+    );
+}
+
+/// WHO SPAWNED WHOM STAYS LOCAL (session log Phase 6 step 6E-4, D4's
+/// "senders stay local"): a spawned session's open names its parent
+/// (`parent=<sid>`) and the turn an edge opened restates its opener on its
+/// close (`op_by=<sid>`, 6C-2), both HOST. The bridge mirrors the open, the
+/// run and the turn onto the session's `ev` face, and no `v=2` body there
+/// holds either key or either raw sid, while the open's `prev=` (the node's
+/// own earlier session, ruling U23(c)) still crosses and a reader still
+/// folds the run and the turn. NEGATIVE CONTROL, run: `parent=` marked W
+/// fails it.
+#[test]
+fn no_parent_sid_and_no_opener_reach_a_mirrored_body() {
+    use aterm_slog::{Actor, Close, Fields, Key, Open, Out, ShortId, Tier, TurnOut};
+    let mut w = World::new();
+    let (parent, prev) = ("s-parentqzp6", "s-prevqzp6");
+    let edge = ShortId::new("s-edgeqzp6").expect("a sid");
+    let mut log = Log::with_limits(1, limits());
+    let f = Fields::new()
+        .id(Key::Parent, parent)
+        .and_then(|f| f.id(Key::Prev, prev))
+        .expect("fields");
+    log.open_session(
+        Kind::Spawn,
+        Src::Aterm,
+        Conf::Exact,
+        Actor::Aterm,
+        f,
+        Stamp::new(1, 1),
+    )
+    .expect("opens");
+    let run = log
+        .open(
+            Open::new(Kind::Agent, Src::Status, Conf::Strong),
+            Stamp::new(2, 2),
+        )
+        .expect("the run");
+    let turn = log
+        .open(
+            Open::new(Kind::Turn, Src::Screen, Conf::Strong)
+                .under(run)
+                .by(Actor::sid(edge)),
+            Stamp::new(3, 3),
+        )
+        .expect("the edge's turn");
+    log.close(
+        turn,
+        Close::new(Out::Turn(TurnOut::Done), Src::Screen, Conf::Strong).by(Actor::Ctl),
+        Stamp::new(4, 4),
+    )
+    .expect("ctl closes it");
+    let host: Vec<String> = log
+        .window()
+        .filter_map(|r| aterm_slog::encode(r, Tier::Host).ok())
+        .collect();
+    assert!(
+        host.iter()
+            .any(|l| l.contains(&format!(" parent={parent} ")))
+            && host.iter().any(|l| l.contains(" op_by=s-edgeqzp6 ")),
+        "PRECONDITION: the log holds both locally: {host:#?}"
+    );
+    let head = log.ms_head();
+    w.lane
+        .mirror
+        .lock()
+        .unwrap()
+        .logs
+        .insert(SID.to_string(), log);
+    w.bridge.mirror = Some(MirrorRun::acked_for_tests(&w.bridge.state, 32));
+    let landed = |w: &World| {
+        w.lane.mirror.lock().unwrap().logs[SID]
+            .mirror_landed()
+            .map(|c| c.ms)
+    };
+    for _ in 0..8 {
+        if landed(&w) == Some(head) {
+            break;
+        }
+        w.take();
+        w.publish();
+        w.settle();
+    }
+    assert_eq!(landed(&w), Some(head), "the whole log landed");
+    let face = subject::session_face("f", &w.bridge.node, SID, "ev");
+    let (mut conn, _) = w.bridge.connect().expect("a read connection");
+    let ((rows, _), _) = crate::transport::fetch_kept(&mut conn, 0, &face, 1000).expect("the face");
+    let bodies: Vec<String> = rows
+        .iter()
+        .map(|(_, _, b)| String::from_utf8_lossy(b).into_owned())
+        .filter(|b| b.starts_with("v=2 "))
+        .collect();
+    for b in &bodies {
+        for leak in ["parent=", parent, "op_by=", "s-edgeqzp6"] {
+            assert!(!b.contains(leak), "{leak} crossed: {b}");
+        }
+    }
+    assert!(
+        bodies.iter().any(|b| b.contains(&format!(" prev={prev} "))),
+        "prev= crosses: {bodies:#?}"
+    );
+    let mut space = aterm_slog::bus::BusSpace::new(1);
+    for b in &bodies {
+        space.offer(aterm_slog::decode_bus(b).expect("a v=2 body"));
+    }
+    let (fold, _) = space.fold();
+    assert!(fold.state().run().is_some(), "the run folds: {bodies:#?}");
+    assert_eq!(fold.state().totals.done, 1, "and the turn: {bodies:#?}");
 }
 
 /// RULING Q3, IN ORDER: a foreign record at the pinned seq of a batch's

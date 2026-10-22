@@ -33,14 +33,16 @@ struct Affine {
 }
 
 impl Affine {
-    fn apply(self, x: f32, y: f32) -> (f32, f32) {
+    #[inline]
+    const fn apply(self, x: f32, y: f32) -> (f32, f32) {
         (
             self.a * x + self.c * y + self.e,
             self.b * x + self.d * y + self.f,
         )
     }
     /// `self ∘ t` — apply `t` first, then `self`.
-    fn then(self, t: Affine) -> Affine {
+    #[inline]
+    const fn then(self, t: Affine) -> Affine {
         Affine {
             a: self.a * t.a + self.c * t.b,
             b: self.b * t.a + self.d * t.b,
@@ -51,7 +53,8 @@ impl Affine {
         }
     }
     /// The inverse transform, or `None` when (near-)singular.
-    fn invert(self) -> Option<Affine> {
+    #[inline]
+    const fn invert(self) -> Option<Affine> {
         let det = self.a * self.d - self.b * self.c;
         if !det.is_finite() || det.abs() < 1e-12 {
             return None;
@@ -145,12 +148,14 @@ impl aterm_font::OutlineSink for OutlineCollector {
 }
 
 /// Component-wise color equality.
-fn rgba_eq(a: RgbaColor, b: RgbaColor) -> bool {
-    (a.red, a.green, a.blue, a.alpha) == (b.red, b.green, b.blue, b.alpha)
+#[inline]
+const fn rgba_eq(a: RgbaColor, b: RgbaColor) -> bool {
+    a.red == b.red && a.green == b.green && a.blue == b.blue && a.alpha == b.alpha
 }
 
 /// Premultiplied-alpha lerp between two straight-alpha colors, returned straight. The
 /// COLRv1 spec prescribes it; it avoids gray fringes toward transparent stops.
+#[inline]
 fn lerp_premul(c0: RgbaColor, c1: RgbaColor, u: f32) -> RgbaColor {
     let (a0, a1) = (f32::from(c0.alpha) / 255.0, f32::from(c1.alpha) / 255.0);
     let a = a0 + (a1 - a0) * u;
@@ -184,7 +189,8 @@ fn collect_stops(iter: impl Iterator<Item = ColorStop>) -> Vec<(f32, RgbaColor)>
 /// with `t(p) = (p − p0)·q / (q·q)`: lines of constant color run parallel to
 /// p0→p2, and `t(p1) = 1`. `None` when the geometry is ill-formed per the spec
 /// (p2 = p0, or p1 on the p0→p2 line — including p1 = p0).
-fn linear_projection(dx: f32, dy: f32, rx: f32, ry: f32) -> Option<(f32, f32)> {
+#[inline]
+const fn linear_projection(dx: f32, dy: f32, rx: f32, ry: f32) -> Option<(f32, f32)> {
     let r2 = rx * rx + ry * ry;
     if r2 <= 0.0 || !r2.is_finite() {
         return None;
@@ -627,13 +633,16 @@ struct UnitBox {
 }
 
 impl UnitBox {
-    fn width(self) -> f32 {
+    #[inline]
+    const fn width(self) -> f32 {
         self.x_max - self.x_min
     }
-    fn height(self) -> f32 {
+    #[inline]
+    const fn height(self) -> f32 {
         self.y_max - self.y_min
     }
-    fn shifted(self, x: f32, y: f32) -> UnitBox {
+    #[inline]
+    const fn shifted(self, x: f32, y: f32) -> UnitBox {
         UnitBox {
             x_min: self.x_min + x,
             y_min: self.y_min + y,
@@ -641,7 +650,8 @@ impl UnitBox {
             y_max: self.y_max + y,
         }
     }
-    fn union(self, o: UnitBox) -> UnitBox {
+    #[inline]
+    const fn union(self, o: UnitBox) -> UnitBox {
         UnitBox {
             x_min: self.x_min.min(o.x_min),
             y_min: self.y_min.min(o.y_min),
@@ -649,7 +659,8 @@ impl UnitBox {
             y_max: self.y_max.max(o.y_max),
         }
     }
-    fn is_proper(self) -> bool {
+    #[inline]
+    const fn is_proper(self) -> bool {
         self.width() > 0.0
             && self.height() > 0.0
             && self.width().is_finite()

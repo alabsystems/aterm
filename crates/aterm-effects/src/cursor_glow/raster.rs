@@ -162,7 +162,7 @@ pub(crate) const LIGHT_BODY_ALPHA_CAP: f32 = 255.0;
 /// Rec. 709 luma of a `0x00RRGGBB` colour, 0..255. The one luminance the light
 /// arms measure with.
 #[inline]
-pub(super) fn luma709(rgb: u32) -> f32 {
+pub(super) const fn luma709(rgb: u32) -> f32 {
     0.2126 * ((rgb >> 16) & 0xff) as f32
         + 0.7152 * ((rgb >> 8) & 0xff) as f32
         + 0.0722 * (rgb & 0xff) as f32
@@ -198,8 +198,9 @@ pub(super) fn luma709(rgb: u32) -> f32 {
 // kitty is; on dark they are added light, which keeps any letter under it
 // readable. Its line is text: its letters take the paper law's point-mark
 // ink (`rainbow_kitty::ribbon`'s `paper_mark_ink`, WCAG AA against the page)
-// rather than this rule, as does the composer rule's wordmark under the card
-// (`claude_footer.rs`'s `brand_letter_fg`). Every other mark keeps the rule.
+// rather than this rule, as do the composer rule's switch letters under the
+// card (`claude_footer.rs`'s `brand_letter_fg`). Every other mark keeps the
+// rule.
 
 /// Leading-only ink ([`light_ink_bold`]): one ink weight for every hue, so a
 /// sweep does not pulse light and dark, at the most saturation that weight
@@ -302,7 +303,7 @@ impl InkRole {
 
     /// This role's per-pixel centre over-alpha ceiling.
     #[inline]
-    pub(crate) fn alpha_cap(self) -> f32 {
+    pub(crate) const fn alpha_cap(self) -> f32 {
         match self {
             Self::Leading => RAINBOW_LIGHT_RAIL_ALPHA_CAP,
             Self::OverText => LIGHT_INK_ALPHA_CAP,
@@ -631,30 +632,53 @@ pub(super) fn wcag_ratio(a: u32, b: u32) -> f32 {
 /// Per-channel max / min of two colours, repacked: the corners of the box the
 /// whole tint path lives in (see [`glyph_ink_bound`]).
 #[inline]
-pub(super) fn chan_max(a: u32, b: u32) -> u32 {
-    let m = |sh: u32| ((a >> sh) & 0xff).max((b >> sh) & 0xff);
-    (m(16) << 16) | (m(8) << 8) | m(0)
+pub(super) const fn chan_max(a: u32, b: u32) -> u32 {
+    let ar = (a >> 16) & 0xff;
+    let br = (b >> 16) & 0xff;
+    let ag = (a >> 8) & 0xff;
+    let bg = (b >> 8) & 0xff;
+    let ab = a & 0xff;
+    let bb = b & 0xff;
+    let r = if ar > br { ar } else { br };
+    let g = if ag > bg { ag } else { bg };
+    let bl = if ab > bb { ab } else { bb };
+    (r << 16) | (g << 8) | bl
 }
 #[inline]
-pub(super) fn chan_min(a: u32, b: u32) -> u32 {
-    let m = |sh: u32| ((a >> sh) & 0xff).min((b >> sh) & 0xff);
-    (m(16) << 16) | (m(8) << 8) | m(0)
+pub(super) const fn chan_min(a: u32, b: u32) -> u32 {
+    let ar = (a >> 16) & 0xff;
+    let br = (b >> 16) & 0xff;
+    let ag = (a >> 8) & 0xff;
+    let bg = (b >> 8) & 0xff;
+    let ab = a & 0xff;
+    let bb = b & 0xff;
+    let r = if ar < br { ar } else { br };
+    let g = if ag < bg { ag } else { bg };
+    let bl = if ab < bb { ab } else { bb };
+    (r << 16) | (g << 8) | bl
 }
 /// Chroma presence: how far apart this colour's extreme channels are.
 #[inline]
-pub(super) fn chan_spread(c: u32) -> i32 {
+pub(super) const fn chan_spread(c: u32) -> i32 {
     let (r, g, b) = (
         ((c >> 16) & 0xff) as i32,
         ((c >> 8) & 0xff) as i32,
         (c & 0xff) as i32,
     );
-    r.max(g).max(b) - r.min(g).min(b)
+    let hi_rg = if r > g { r } else { g };
+    let hi = if hi_rg > b { hi_rg } else { b };
+    let lo_rg = if r < g { r } else { g };
+    let lo = if lo_rg < b { lo_rg } else { b };
+    hi - lo
 }
 /// Largest per-channel difference — "is this visibly a different colour".
 #[inline]
-pub(super) fn chan_dist(a: u32, b: u32) -> i32 {
-    let d = |sh: u32| (((a >> sh) & 0xff) as i32 - ((b >> sh) & 0xff) as i32).abs();
-    d(16).max(d(8)).max(d(0))
+pub(super) const fn chan_dist(a: u32, b: u32) -> i32 {
+    let dr = (((a >> 16) & 0xff) as i32 - ((b >> 16) & 0xff) as i32).abs();
+    let dg = (((a >> 8) & 0xff) as i32 - ((b >> 8) & 0xff) as i32).abs();
+    let db = ((a & 0xff) as i32 - (b & 0xff) as i32).abs();
+    let hi_rg = if dr > dg { dr } else { dg };
+    if hi_rg > db { hi_rg } else { db }
 }
 
 /// Which side of the ground the theme's own ink sits on.

@@ -8,6 +8,7 @@
 
 /// Rotate a `0x00RRGGBB` color's hue by the §4.2 nudge code (`0..=15` →
 /// `-18°..=+18°`), preserving saturation and value.
+#[inline]
 pub fn hue_nudge(rgb: u32, code: u8) -> u32 {
     let (h, s, v) = rgb2hsv(rgb);
     hsv2rgb(h + (-18.0 + f32::from(code) * 2.4), s, v)
@@ -25,6 +26,7 @@ pub const LIGHT_MUDDY_HUES: (f32, f32) = (36.0 / 360.0, 96.0 / 360.0);
 /// into green), every other hue kept in order. A dark page shows the whole
 /// wheel; only the light arms call this.
 #[must_use]
+#[inline]
 pub fn light_spectrum_hue(hue: f32) -> f32 {
     let (b0, b1) = LIGHT_MUDDY_HUES;
     let h = if hue.is_finite() {
@@ -36,6 +38,7 @@ pub fn light_spectrum_hue(hue: f32) -> f32 {
 }
 
 /// `0x00RRGGBB` → HSV (`h` degrees, `s`/`v` in `0..=1`); the inverse of [`hsv2rgb`].
+#[inline]
 pub fn rgb2hsv(rgb: u32) -> (f32, f32, f32) {
     let r = ((rgb >> 16) & 0xff) as f32 / 255.0;
     let g = ((rgb >> 8) & 0xff) as f32 / 255.0;
@@ -97,6 +100,7 @@ pub(crate) fn relative_luminance_with(table: &RelativeLuminanceTable, rgb: u32) 
 
 /// WCAG relative luminance of a `0x00RRGGBB` colour. Same definition the
 /// renderer floors with, so the host can check final ink before rendering.
+#[inline]
 pub fn relative_luminance(rgb: u32) -> f32 {
     relative_luminance_with(relative_luminance_table(), rgb)
 }
@@ -104,6 +108,7 @@ pub fn relative_luminance(rgb: u32) -> f32 {
 /// WCAG contrast ratio (`>= 1`) between two `0x00RRGGBB` colours, on
 /// [`relative_luminance`].
 #[must_use]
+#[inline]
 pub fn contrast_ratio(a: u32, b: u32) -> f32 {
     let table = relative_luminance_table();
     let (la, lb) = (
@@ -213,6 +218,7 @@ const LIGHT_DEPTH_MAX: f32 = 0.40;
 /// to mud when the page floor later lowers its value. A near-grey keeps its
 /// saturation.
 #[must_use]
+#[inline]
 pub fn light_body_fill(rgb: u32, heat: f32) -> u32 {
     let heat = if heat.is_finite() {
         heat.clamp(0.0, 1.0)
@@ -236,6 +242,7 @@ pub fn light_body_fill(rgb: u32, heat: f32) -> u32 {
 /// and orange mix to grey, pink and orange to brown). A near-grey keeps its
 /// saturation.
 #[must_use]
+#[inline]
 pub fn light_charge_in_hue(rgb: u32, k: f32) -> u32 {
     let k = if k.is_finite() {
         k.clamp(0.0, 1.0)
@@ -266,6 +273,7 @@ pub fn light_charge_in_hue(rgb: u32, k: f32) -> u32 {
 /// to the byte, and the move toward `styled` starts from it continuously. A
 /// non-finite charge reads as rest.
 #[must_use]
+#[inline]
 pub fn wear_pinned(pinned: u32, styled: u32, charge: f32, settled: f32) -> u32 {
     let k = if charge.is_finite() && settled < 1.0 {
         ((charge - settled) / (1.0 - settled)).clamp(0.0, 1.0)
@@ -287,6 +295,7 @@ pub fn wear_pinned(pinned: u32, styled: u32, charge: f32, settled: f32) -> u32 {
 
 /// OKLab `[L, a, b]` of a `0x00RRGGBB` colour (Björn Ottosson's matrices), the
 /// uniform space a tint's distance from its page is weighed in.
+#[inline]
 pub(crate) fn oklab(rgb: u32) -> [f32; 3] {
     let linear = &relative_luminance_table().linear;
     let r = linear[((rgb >> 16) & 0xff) as usize];
@@ -302,7 +311,32 @@ pub(crate) fn oklab(rgb: u32) -> [f32; 3] {
     ]
 }
 
+/// [`oklab`]'s inverse: the `0x00RRGGBB` colour of OKLab `[L, a, b]`, each
+/// linear channel clamped to `0..=1` (a colour past the sRGB gamut lands on
+/// its edge) before the sRGB transfer and the byte's rounding.
+#[inline]
+pub(crate) fn oklab_to_rgb([l, a, b]: [f32; 3]) -> u32 {
+    let l_ = l + 0.396_337_78 * a + 0.215_803_76 * b;
+    let m_ = l - 0.105_561_346 * a - 0.063_854_17 * b;
+    let s_ = l - 0.089_484_18 * a - 1.291_485_5 * b;
+    let (l3, m3, s3) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
+    let byte = |c: f32| {
+        let c = c.clamp(0.0, 1.0);
+        let n = if c <= 0.003_130_8 {
+            12.92 * c
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        };
+        (n * 255.0).round().clamp(0.0, 255.0) as u32
+    };
+    let r = byte(4.076_741_7 * l3 - 3.307_711_6 * m3 + 0.230_969_94 * s3);
+    let g = byte(-1.268_438 * l3 + 2.609_757_4 * m3 - 0.341_319_38 * s3);
+    let bl = byte(-0.004_196_086_3 * l3 - 0.703_418_6 * m3 + 1.707_614_7 * s3);
+    (r << 16) | (g << 8) | bl
+}
+
 /// The Euclidean OKLab distance between two `0x00RRGGBB` colours.
+#[inline]
 pub(crate) fn oklab_distance(a: u32, b: u32) -> f32 {
     let (x, y) = (oklab(a), oklab(b));
     let (dl, da, db) = (x[0] - y[0], x[1] - y[1], x[2] - y[2]);
@@ -310,6 +344,7 @@ pub(crate) fn oklab_distance(a: u32, b: u32) -> f32 {
 }
 
 /// HSV (`h` degrees, `s`/`v` in `0..=1`) → `0x00RRGGBB`.
+#[inline]
 pub fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
     let c = v * s;
     let hp = (h.rem_euclid(360.0)) / 60.0;

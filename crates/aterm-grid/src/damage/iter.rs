@@ -41,6 +41,7 @@ impl Iterator for DamagedRowIterator<'_> {
         }
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             DamagedRowIterator::Full { current, max } => {
@@ -106,6 +107,7 @@ impl Iterator for BitsetRowIterator<'_> {
         }
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         // Upper bound: the set bits left; `.get()` because an exhausted iterator's
         // word_idx is past the end.
@@ -131,7 +133,12 @@ pub struct DamageBoundsIterator<'a> {
 
 impl<'a> DamageBoundsIterator<'a> {
     /// Create a new bounds iterator.
-    pub(crate) fn new(damage: &'a Damage, row_iter: DamagedRowIterator<'a>, cols: u16) -> Self {
+    #[inline]
+    pub(crate) const fn new(
+        damage: &'a Damage,
+        row_iter: DamagedRowIterator<'a>,
+        cols: u16,
+    ) -> Self {
         Self {
             damage,
             row_iter,

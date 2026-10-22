@@ -220,6 +220,18 @@ pub(crate) struct TaskRecord {
     /// agent (`meta`'s `worker=`). A mark keeps it; a seamless update
     /// carries it ([`Self::carry_row`]). Not on the wire.
     pub(crate) agent: Option<aterm_phase::Program>,
+    /// THE ONE FOLDER A WORKER'S STARTER TRUSTED FOR IT: the canonical `cwd=`
+    /// an Owner's `spawn agent=<word>` named (`App::start_worker`), which the
+    /// window harness's folder-trust rule trusts for this session alone
+    /// (`meta`'s `trusted_cwd=`; `[harness] trust_roots` is not widened).
+    /// Written by the spawn alone, never by a mark or `meta set`: no driver
+    /// can name a folder trusted. A mark keeps it, and a seamless update
+    /// carries it with the record ([`Self::carry_row`]): a worker adopted
+    /// across one keeps the trust its spawn gave it, and its agent's
+    /// folder-trust dialog — met again on a relaunch there — is answered in
+    /// that folder as before. `None` for a record a `task mark` made. Not on
+    /// the wire.
+    pub(crate) trusted_cwd: Option<String>,
 }
 
 impl TaskRecord {
@@ -290,8 +302,9 @@ impl TaskRecord {
 
     /// The row a seamless update carries ([`crate::session_store::SessionRecord::task`]):
     /// `rev= state= from= since=<unix ms> result_bytes= attention=<0|1>`, then
-    /// `why=`, `exit=` and `result_path=` when set, and `agent=` a worker's
-    /// ([`Self::agent`]). [`Self::from_carry_row`] reads it back.
+    /// `why=`, `exit=` and `result_path=` when set, and `agent=` and
+    /// `trusted_cwd=` (pct-encoded) a worker's ([`Self::agent`],
+    /// [`Self::trusted_cwd`]). [`Self::from_carry_row`] reads it back.
     #[must_use]
     #[cfg(any(unix, test))]
     pub(crate) fn carry_row(&self) -> String {
@@ -309,6 +322,10 @@ impl TaskRecord {
             out.push_str(" agent=");
             out.push_str(agent.name());
         }
+        if let Some(folder) = &self.trusted_cwd {
+            out.push_str(" trusted_cwd=");
+            out.push_str(&crate::control::pct_encode(folder));
+        }
         out
     }
 
@@ -319,7 +336,10 @@ impl TaskRecord {
     /// A key this build does not know is skipped: the row a NEWER build wrote
     /// still reads here after a rollback, as the manifest it rides does — and
     /// so is an `agent=` word it does not know (an agent a newer build
-    /// added): the record crosses, read as a `task mark`'s.
+    /// added): the record crosses, read as a `task mark`'s. A `trusted_cwd=`
+    /// that is no absolute folder spelled as its own parts ([`trusted_folder`])
+    /// crosses as none: the record keeps its facts, and no folder is trusted
+    /// on a word this build cannot vouch for.
     /// `now`/`now_unix_ms` re-anchor the monotonic `since` so `since_ms=`
     /// keeps counting from when the state was entered.
     #[must_use]
@@ -370,8 +390,26 @@ impl TaskRecord {
             // own entry into it is the one a turn here can find.
             entered: rev,
             agent: field("agent").and_then(worker_agent),
+            trusted_cwd: field("trusted_cwd").and_then(trusted_folder),
         })
     }
+}
+
+/// The folder a carried `trusted_cwd=` names: pct-decoded, absolute, spelled
+/// as its own parts ([`spelled_as_its_parts`]: no `.`, `..`, doubled or
+/// trailing separator), no control character, at most [`RESULT_PATH_MAX`]
+/// bytes — the canonical form the spawn stored. Anything else is none.
+fn trusted_folder(value: &str) -> Option<String> {
+    let decoded = aterm_codec::pct::decode(value);
+    let path = Path::new(&decoded);
+    (decoded.len() <= RESULT_PATH_MAX
+        && !decoded.chars().any(char::is_control)
+        && path.has_root()
+        && path
+            .components()
+            .all(|c| !matches!(c, Component::ParentDir | Component::CurDir))
+        && spelled_as_its_parts(path))
+    .then(|| decoded.clone())
 }
 
 /// The agent a worker's `agent=` word names: one a spawn can start
@@ -470,7 +508,7 @@ impl TaskMark {
     /// now. Returns the record after it and whether it moved: a new record is
     /// rev 1, no worker's ([`TaskRecord::agent`]); a change bumps the rev, and
     /// a change of state restarts `since`; the same state with the same facts
-    /// changes nothing. The record's agent is kept.
+    /// changes nothing. The record's agent and trusted folder are kept.
     #[must_use]
     pub(crate) fn apply(
         &self,
@@ -498,6 +536,7 @@ impl TaskMark {
                 since: now,
                 entered: 1,
                 agent: None,
+                trusted_cwd: None,
             };
             return (record, true);
         };

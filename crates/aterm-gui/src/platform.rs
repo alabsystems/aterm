@@ -2307,15 +2307,25 @@ thread_local! {
     static OPENED_URLS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The URLs this thread's [`AppRt::open_url`] calls named, drained
-/// (test-only).
+/// The URLs this thread's [`AppRt::open_url`] and
+/// `app_mouse::open_url_external` calls named, drained (test-only).
 #[cfg(test)]
 #[cfg_attr(
-    not(target_os = "macos"),
-    expect(dead_code, reason = "the menu-bar status item is macOS's")
+    not(unix),
+    expect(
+        dead_code,
+        reason = "its readers, the status item's and the harness banner's press tests, are unix's"
+    )
 )]
 pub(crate) fn take_opened_urls() -> Vec<String> {
     OPENED_URLS.with(|urls| std::mem::take(&mut *urls.borrow_mut()))
+}
+
+/// Note `url` as opened on this thread ([`take_opened_urls`]): what
+/// `app_mouse::open_url_external` does in a test build, which opens none.
+#[cfg(test)]
+pub(crate) fn record_opened_url(url: &str) {
+    OPENED_URLS.with(|urls| urls.borrow_mut().push(url.to_string()));
 }
 
 /// The runtime handed to a headless test or benchmark fixture. Its native

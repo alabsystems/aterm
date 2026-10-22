@@ -40,7 +40,7 @@ pub const PROMPT: &str =
 /// The prompt that asks for the vault's join password (hidden): an admin Mac shows it with
 /// `aterm secrets password`, and its subscriber lets this Mac in within seconds. `none` or
 /// `skip` skips the step, as at [`PROMPT`]: on the ALab LAN this is the step's only question.
-pub const PASSWORD_PROMPT: &str = "Vault join password (an admin Mac shows it: aterm secrets password; Enter to be approved by code instead, none skips): ";
+pub const PASSWORD_PROMPT: &str = "Vault join password (an admin Mac shows it: aterm secrets password; Enter joins without one: an open vault lets this Mac in, another approves it by code; none skips): ";
 
 /// What a step skipped at a prompt says: nothing was changed.
 const SKIPPED: &str = "skipped at the prompt; aterm secrets join <url> joins a vault later";
@@ -63,6 +63,9 @@ const UNCONFIGURED: &str =
 /// What an apply puts in place on a Mac whose vault is configured but whose subscriber does
 /// not run.
 const SUBSCRIBED: &str = "subscriber running (aterm secrets watch keeps ~/.secrets in sync)";
+
+/// What a Mac whose vault files are not all written is changed to.
+const WRITTEN: &str = "every vault file written (aterm secrets sync)";
 
 /// The vault, as `aterm init` sees it.
 pub trait SecretsOps: Send + Sync {
@@ -119,6 +122,20 @@ pub trait SecretsOps: Send + Sync {
     /// # Errors
     /// The job could not be installed or started.
     fn install_subscriber(&self) -> aterm_secrets::Result<String>;
+
+    /// Whether this Mac's last sync wrote every file and each still holds what it wrote
+    /// (`aterm_secrets::client::materialization_ready`): local files only, never the network.
+    ///
+    /// # Errors
+    /// The state cannot be read.
+    fn synced(&self) -> aterm_secrets::Result<bool>;
+
+    /// Fetch and apply the vault once (`aterm_secrets::client::sync`, no long-poll), writing
+    /// again a file that failed, was deleted or was changed.
+    ///
+    /// # Errors
+    /// The vault could not be fetched or applied; the error names no value.
+    fn sync(&self) -> aterm_secrets::Result<()>;
 }
 
 /// The live vault of one user: `aterm_secrets::client` over `<home>/.config/aterm/secrets`
@@ -280,6 +297,14 @@ impl SecretsOps for LiveSecrets {
             &program,
             &["secrets".to_owned(), "watch".to_owned()],
         )
+    }
+
+    fn synced(&self) -> aterm_secrets::Result<bool> {
+        aterm_secrets::client::materialization_ready(&self.paths())
+    }
+
+    fn sync(&self) -> aterm_secrets::Result<()> {
+        aterm_secrets::client::sync(&self.paths(), None).map(drop)
     }
 }
 
@@ -649,8 +674,10 @@ fn idle(state: &State) -> Option<&'static str> {
 
 /// What this Mac's vault state means for the item reading `source`. `unsynced`: why the
 /// subscriber keeps nothing in sync, `None` while it runs ([`idle`]; read only for a Mac that
-/// is in, reading a plain file, or waiting for an admin).
-fn judge(status: &Status, source: &str, unsynced: Option<&str>) -> Probe {
+/// is in, reading a plain file, or waiting for an admin). `synced`: whether its last sync
+/// wrote every file and each still holds what it wrote ([`SecretsOps::synced`]); a Mac whose
+/// files do not is a change, whose apply syncs again.
+fn judge(status: &Status, source: &str, unsynced: Option<&str>, synced: bool) -> Probe {
     let name = status
         .config
         .as_ref()
@@ -671,7 +698,17 @@ fn judge(status: &Status, source: &str, unsynced: Option<&str>) -> Probe {
         to: SUBSCRIBED.into(),
     };
     let watched = unsynced.is_none();
+    let unwritten = |now: String| Probe::Change {
+        from: format!("{now}, but a file it wrote failed, is missing or was changed"),
+        to: WRITTEN.into(),
+    };
     match &status.membership {
+        Membership::In { seq, .. } if watched && !synced => {
+            unwritten(format!("in vault {name} (seq {seq})"))
+        }
+        Membership::Plain if watched && !synced => {
+            unwritten(format!("reading the plain text file {}", shown(source)))
+        }
         Membership::In { seq, .. } if watched => Probe::Ok {
             now: format!("in vault {name} (seq {seq}): {held}, kept in sync by the subscriber"),
         },
@@ -741,11 +778,22 @@ impl Item for Vault {
             }
             Membership::Unconfigured | Membership::Revoked { .. } => None,
         };
-        judge(&status, &self.source, unsynced)
+        let synced = match status.membership {
+            Membership::In { .. } | Membership::Plain => match self.ops.synced() {
+                Ok(synced) => synced,
+                Err(why) => {
+                    return Probe::Unusable {
+                        why: format!("cannot read whether the vault files are written: {why}"),
+                    };
+                }
+            },
+            _ => true,
+        };
+        judge(&status, &self.source, unsynced, synced)
     }
 
     /// Join, then install the subscriber; on a Mac whose vault is configured, only install
-    /// (and so start) it. A join that waits for an admin is not a failure: the apply stands
+    /// (and so start) it, and sync once when a file it wrote is not as written. A join that waits for an admin is not a failure: the apply stands
     /// aside saying what the admin runs, and the subscriber, installed as soon as the join
     /// request is queued (so a Ctrl-C during the wait leaves a Mac that joins by itself),
     /// finishes the join once it is approved. The subscriber is installed once per apply.
@@ -753,10 +801,23 @@ impl Item for Vault {
         self.set_aside(None);
         if self.origin == Origin::Configured {
             self.install()?;
-            if let Ok(status) = self.ops.status()
-                && status.membership == Membership::Pending
-            {
-                self.wait_for_admin(status.machine.as_ref().map(|(_, code)| code.as_str()));
+            let Ok(status) = self.ops.status() else {
+                return Ok(());
+            };
+            match status.membership {
+                Membership::Pending => {
+                    self.wait_for_admin(status.machine.as_ref().map(|(_, code)| code.as_str()));
+                }
+                // A file it wrote failed, is missing or was changed: written again now, not
+                // at the subscriber's next pass.
+                Membership::In { .. } | Membership::Plain
+                    if !self.ops.synced().unwrap_or(false) =>
+                {
+                    self.ops
+                        .sync()
+                        .map_err(|why| format!("writing the vault's files: {why}"))?;
+                }
+                _ => {}
             }
             return Ok(());
         }
@@ -875,6 +936,9 @@ mod tests {
         /// How many installs had happened when each join ended.
         installed_by_join: Mutex<Vec<u32>>,
         installs: Mutex<u32>,
+        /// What `synced` answers until a sync makes it true.
+        unwritten: Mutex<bool>,
+        syncs: Mutex<u32>,
     }
 
     impl Scripted {
@@ -1004,6 +1068,16 @@ mod tests {
                 *self.subscriber.lock().unwrap() = None;
             }
             installed
+        }
+
+        fn synced(&self) -> aterm_secrets::Result<bool> {
+            Ok(!*self.unwritten.lock().unwrap())
+        }
+
+        fn sync(&self) -> aterm_secrets::Result<()> {
+            *self.syncs.lock().unwrap() += 1;
+            *self.unwritten.lock().unwrap() = false;
+            Ok(())
         }
     }
 
@@ -1145,6 +1219,35 @@ mod tests {
             assert_eq!(ops.probes(), 0);
             assert!(ops.joins().is_empty());
             assert_eq!(ops.installs(), 0);
+        }
+    }
+
+    #[test]
+    fn a_mac_in_the_vault_whose_files_are_not_all_written_is_a_change_that_syncs() {
+        for mode in [Mode::Plan, Mode::Apply] {
+            let sys = fake();
+            let ops = Scripted::new(vec![Ok(configured(Membership::In {
+                seq: 7,
+                heard: 1_800_000_000,
+            }))]);
+            ops.subscribed(Ok(installed_state()));
+            *ops.unwritten.lock().unwrap() = true;
+            let rows = run(&sys, &ops, mode);
+            let want = if mode == Mode::Plan {
+                Outcome::Planned
+            } else {
+                Outcome::Changed
+            };
+            assert_eq!(rows[0].outcome, want, "{rows:?}");
+            assert_eq!(
+                rows[0].from.as_deref(),
+                Some(
+                    "in vault alab (seq 7), but a file it wrote failed, is missing or was changed"
+                )
+            );
+            assert_eq!(rows[0].to.as_deref(), Some(WRITTEN));
+            assert_eq!(*ops.syncs.lock().unwrap(), u32::from(mode == Mode::Apply));
+            assert!(ops.joins().is_empty(), "nothing is joined again");
         }
     }
 

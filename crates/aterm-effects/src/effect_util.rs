@@ -86,6 +86,7 @@ pub(crate) fn push_grid_quad(
 /// per-cell-row [`GlowQuad`]s with origin-anchored row damage tags. Callers
 /// pass window px (`geom.origin_*` applied); grid-relative emitters use
 /// [`push_grid_quad`].
+#[inline]
 pub(crate) fn push_fx_rect(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -110,6 +111,7 @@ pub(crate) fn push_fx_rect(
     clippy::too_many_arguments,
     reason = "the rect + blend mode IS the call, as in `push_grid_quad`"
 )]
+#[inline]
 pub(crate) fn push_fx_quad(
     out: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -674,6 +676,7 @@ impl StarPart {
     /// The part's paint id, `0..STAR_PAINTS`: the body `0`, the nucleus `1`,
     /// point span `k` `2 + k`, a glint the last.
     #[must_use]
+    #[inline]
     pub(crate) const fn id(self) -> u8 {
         match self {
             Self::Body => 0,
@@ -709,6 +712,7 @@ pub(crate) struct StarPieces {
 impl std::ops::Deref for StarPieces {
     type Target = [StarPiece];
 
+    #[inline]
     fn deref(&self) -> &[StarPiece] {
         &self.pieces[..self.n]
     }

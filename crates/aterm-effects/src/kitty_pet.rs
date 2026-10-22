@@ -670,8 +670,8 @@ const QUIET_PANE_PER_SEC: f32 = 0.74;
 /// The quiet pace in cells/s on a `cols`-wide pane — see
 /// [`QUIET_PANE_PER_SEC`].
 #[inline]
-fn quiet_speed_max(cols: u16) -> f32 {
-    (QUIET_PANE_PER_SEC * f32::from(cols)).clamp(HOP_SPEED_MAX, BIG_HOP_SPEED_MAX)
+const fn quiet_speed_max(cols: u16) -> f32 {
+    (QUIET_PANE_PER_SEC * (cols as f32)).clamp(HOP_SPEED_MAX, BIG_HOP_SPEED_MAX)
 }
 
 // ── the stream watch ────────────────────────────────────────────────────────
@@ -700,8 +700,8 @@ const STREAM_LAPSE: f32 = 0.8;
 /// A same-row caret jump counts as a line event from this size on: a quarter
 /// of the pane, never under the pounce gap, so a held word-jump is typing.
 #[inline]
-fn stream_jump(cols: u16) -> f32 {
-    POUNCE_GAP.max(0.25 * f32::from(cols))
+const fn stream_jump(cols: u16) -> f32 {
+    POUNCE_GAP.max(0.25 * (cols as f32))
 }
 
 // ── the reactive states ─────────────────────────────────────────────────────
@@ -1260,11 +1260,11 @@ pub const ART_ASPECT: f32 = 244.0 / 148.0;
 /// (in cell heights) divided by the cell aspect, about 5.6 columns at 1:2.
 #[must_use]
 #[inline]
-pub fn art_cols(cell_w: u16, cell_h: u16) -> f32 {
+pub const fn art_cols(cell_w: u16, cell_h: u16) -> f32 {
     if cell_w == 0 || cell_h == 0 {
         return 3.0;
     }
-    ART_ROWS * ART_ASPECT * f32::from(cell_h) / f32::from(cell_w)
+    ART_ROWS * ART_ASPECT * (cell_h as f32) / (cell_w as f32)
 }
 
 /// Cap on live pet motes; landing dust, the wake's pop, sleep z's and purr
@@ -1340,7 +1340,7 @@ impl Mote {
     /// Age as a fraction of life at brain clock `clock` — `resolve_motes`'s
     /// `u`, alive on `0..1`.
     #[inline]
-    fn age(&self, clock: f64) -> f32 {
+    const fn age(&self, clock: f64) -> f32 {
         ((clock - self.born) as f32) / self.life.max(0.01)
     }
 
@@ -1363,7 +1363,7 @@ impl Mote {
 
     /// The per-axis speed bound of [`Self::drift`], cells per unit of age.
     #[inline]
-    fn drift_slope(&self) -> (f32, f32) {
+    const fn drift_slope(&self) -> (f32, f32) {
         match self.kind {
             PetMoteKind::Zee => ZEE_DRIFT_SLOPE,
             _ => NOTE_DRIFT_SLOPE,
@@ -1372,7 +1372,7 @@ impl Mote {
 
     /// How many held looks this mote wears in a life ([`look_slice`]).
     #[inline]
-    fn look_steps(&self) -> f32 {
+    const fn look_steps(&self) -> f32 {
         match self.kind {
             PetMoteKind::Zee => ZEE_STEPS,
             _ => PURR_MOTE_STEPS,
@@ -1414,7 +1414,7 @@ fn look_slice(u: f32, steps: f32) -> f32 {
 }
 
 #[inline]
-fn look_slice_age(slice: f32, steps: f32) -> f32 {
+const fn look_slice_age(slice: f32, steps: f32) -> f32 {
     (slice + 0.5) / steps
 }
 
@@ -1608,7 +1608,7 @@ impl Stance {
 
     /// The stance `frame` drew its body at.
     #[inline]
-    fn of(frame: &PetFrame) -> Self {
+    const fn of(frame: &PetFrame) -> Self {
         Self {
             scale_x: frame.scale_x,
             scale_y: frame.scale_y,
@@ -1619,13 +1619,13 @@ impl Stance {
     /// `self` moved toward `to` by `t`, `0..=1`: exactly `self` at 0 and
     /// exactly `to` at 1.
     #[inline]
-    fn toward(self, to: Self, t: f32) -> Self {
+    const fn toward(self, to: Self, t: f32) -> Self {
         let t = t.clamp(0.0, 1.0);
-        let mix = |a: f32, b: f32| a * (1.0 - t) + b * t;
+        let one_minus_t = 1.0 - t;
         Self {
-            scale_x: mix(self.scale_x, to.scale_x),
-            scale_y: mix(self.scale_y, to.scale_y),
-            lift: mix(self.lift, to.lift),
+            scale_x: self.scale_x * one_minus_t + to.scale_x * t,
+            scale_y: self.scale_y * one_minus_t + to.scale_y * t,
+            lift: self.lift * one_minus_t + to.lift * t,
         }
     }
 }
@@ -1773,7 +1773,7 @@ impl Departure {
     /// Seconds this visit lasts: the run to the edge plus the fade, capped at
     /// [`DEPART_MAX`] so it is always finite.
     #[inline]
-    fn life(&self) -> f32 {
+    const fn life(&self) -> f32 {
         ((self.edge - self.from_col).abs() / self.speed + EDGE_FADE).min(DEPART_MAX)
     }
 
@@ -1782,7 +1782,7 @@ impl Departure {
     /// to exactly zero at the end of its [`Self::life`]. A still ghost's whole
     /// life is that fade.
     #[inline]
-    fn envelope(&self, t: f32) -> f32 {
+    const fn envelope(&self, t: f32) -> f32 {
         let life = self.life();
         let fade_start = life - EDGE_FADE;
         let fade = if t <= fade_start {
@@ -1809,7 +1809,12 @@ impl Departure {
         }
         let stride = self.stride0 + run / RUN_STRIDE_CELLS;
         let cycle = PetBrain::CYCLE_RUN;
-        let frame = ((stride.rem_euclid(1.0) * cycle.len() as f32) as usize).min(cycle.len() - 1);
+        let idx = (stride.rem_euclid(1.0) * cycle.len() as f32) as usize;
+        let frame = if idx < cycle.len() - 1 {
+            idx
+        } else {
+            cycle.len() - 1
+        };
         (col, cycle[frame], dir < 0.0, Stance::NEUTRAL)
     }
 
@@ -1907,7 +1912,7 @@ impl PetAction {
     /// True while the pet is settled — the states a caret move interrupts.
     #[must_use]
     #[inline]
-    pub fn settled(self) -> bool {
+    pub const fn settled(self) -> bool {
         matches!(
             self,
             Self::Sleep
@@ -1923,7 +1928,7 @@ impl PetAction {
     /// True while the pet is off the ground.
     #[must_use]
     #[inline]
-    pub fn airborne(self) -> bool {
+    pub const fn airborne(self) -> bool {
         matches!(self, Self::Leap)
     }
 }
@@ -2311,7 +2316,7 @@ impl PetSpecies {
     /// verified at compile time in [`DOG_SKIN`]; dog frames map to themselves.
     #[must_use]
     #[inline]
-    pub fn skin(self, pose: PetGlyphId) -> PetGlyphId {
+    pub const fn skin(self, pose: PetGlyphId) -> PetGlyphId {
         match self {
             Self::Cat => pose,
             Self::Dog => DOG_SKIN[pose as usize],
@@ -3237,7 +3242,7 @@ impl PetBrain {
     /// left.
     #[must_use]
     #[inline]
-    pub fn station(caret_col: u16, cols: u16, width: f32) -> f32 {
+    pub const fn station(caret_col: u16, cols: u16, width: f32) -> f32 {
         Self::station_with(caret_col, cols, width, 0.0)
     }
 
@@ -3246,9 +3251,9 @@ impl PetBrain {
     /// is decided for the actual stand. Lead-free, so the chase and the console
     /// resident agree.
     #[inline]
-    fn station_with(caret_col: u16, cols: u16, width: f32, extra: f32) -> f32 {
-        let right = f32::from(caret_col) + STATION_LEAD + extra;
-        let limit = f32::from(cols) - width;
+    const fn station_with(caret_col: u16, cols: u16, width: f32, extra: f32) -> f32 {
+        let right = caret_col as f32 + STATION_LEAD + extra;
+        let limit = cols as f32 - width;
         if limit <= 0.0 {
             return 0.0;
         }
@@ -3256,13 +3261,13 @@ impl PetBrain {
             return right;
         }
         // The wall: stand on the other side of the caret, one clear cell back.
-        (f32::from(caret_col) - width - STATION_LEAD - extra).max(0.0)
+        (caret_col as f32 - width - STATION_LEAD - extra).max(0.0)
     }
 
     /// The rhythm gate is open: a real same-direction typing run is under way,
     /// so the flight-aim prediction may bet on v̂.
     #[inline]
-    pub(super) fn rhythm_open(&self) -> bool {
+    pub(super) const fn rhythm_open(&self) -> bool {
         self.run_count >= RHYTHM_MOVES
     }
 
@@ -3302,7 +3307,7 @@ impl PetBrain {
     /// already held ([`Self::held_lead`]) where that is more. Through a
     /// carried rhythm the carry sets out from it.
     #[inline]
-    fn stand(&self) -> f32 {
+    const fn stand(&self) -> f32 {
         self.keep_ahead().max(self.held_lead)
     }
 
@@ -3312,7 +3317,7 @@ impl PetBrain {
     /// the next, not the EMA's sawtooth, whose decay between keys would take
     /// back what the carry gives.
     #[inline]
-    fn keep_ahead(&self) -> f32 {
+    const fn keep_ahead(&self) -> f32 {
         if self.carrying_run() {
             // The carry's room is kept clear under the cap ([`CARRY_ROOM`]):
             // a keep-ahead at the cap would leave the carry no cell to walk,
@@ -3385,12 +3390,12 @@ impl PetBrain {
     /// the body every few keys, and the cat froze mid-stride for a frame or
     /// three (a hand typing 60–120 ms apart).
     #[inline]
-    fn carry_legs(&self) -> (f32, f32) {
+    const fn carry_legs(&self) -> (f32, f32) {
         Self::carry_legs_from(self.stand())
     }
 
     #[inline]
-    fn carry_legs_from(stand: f32) -> (f32, f32) {
+    const fn carry_legs_from(stand: f32) -> (f32, f32) {
         let room = (LEAD_MAX - stand).max(0.0);
         let walk = (room - CARRY_COAST).clamp(0.0, 1.0);
         (walk, (room - walk).min(CARRY_COAST))
@@ -3402,7 +3407,7 @@ impl PetBrain {
     /// first room grant ([`LEAD_STEP`]) already steps the station on: the two
     /// together put a pecked caret's cat into a trot.
     #[inline]
-    fn carrying_run(&self) -> bool {
+    const fn carrying_run(&self) -> bool {
         self.run_count > RHYTHM_MOVES && self.run_dir > 0 && self.key_pace > 0.0
     }
 
@@ -3446,7 +3451,7 @@ impl PetBrain {
     /// fast run is lifted, and the lead still waits for the room the rhythm
     /// earns ([`LEAD_STEP`]).
     #[inline]
-    fn pace(&self) -> f32 {
+    const fn pace(&self) -> f32 {
         self.vhat.max(self.vrun).clamp(0.0, VEL_MAX)
     }
 
@@ -3518,7 +3523,7 @@ impl PetBrain {
 
     /// [`LEASE_STANDOFF`] while a controller lease is held, else zero.
     #[inline]
-    fn standoff(&self) -> f32 {
+    const fn standoff(&self) -> f32 {
         if self.room_lease { LEASE_STANDOFF } else { 0.0 }
     }
 
@@ -3526,14 +3531,14 @@ impl PetBrain {
     /// withheld and the vigil crouch follows. Without an armed vigil a silent
     /// job is slept through.
     #[inline]
-    fn waiting_up(&self) -> bool {
+    const fn waiting_up(&self) -> bool {
         self.room_quiet && self.vigil_armed && self.exec_since.is_some()
     }
 
     /// Under `Quiet` with no burst this tick the watch heat holds still; it is
     /// not motion and pins no lane.
     #[inline]
-    fn heat_frozen(&self) -> bool {
+    const fn heat_frozen(&self) -> bool {
         self.room_quiet && !self.last_burst
     }
 
@@ -3542,14 +3547,14 @@ impl PetBrain {
     /// Safe every frame: the skin is applied at `emit`, so the switch shows on
     /// the next frame with position, gait, mood and sleep kept.
     #[inline]
-    pub fn set_species(&mut self, species: PetSpecies) {
+    pub const fn set_species(&mut self, species: PetSpecies) {
         self.species = species;
     }
 
     /// The animal currently being drawn.
     #[must_use]
     #[inline]
-    pub fn species(&self) -> PetSpecies {
+    pub const fn species(&self) -> PetSpecies {
         self.species
     }
 
@@ -3879,7 +3884,8 @@ impl PetBrain {
     }
 
     /// Drop a pending re-sighting ghost: the host knows its pixels are gone.
-    pub fn forget_resight(&mut self) {
+    #[inline]
+    pub const fn forget_resight(&mut self) {
         self.resight = None;
     }
 
@@ -4314,7 +4320,7 @@ impl PetBrain {
     /// Whether an eviction is a re-anchor (a hop) rather than a step aside (a
     /// glide): a column move past [`INK_EVICT_MAX`] or any row change.
     #[inline]
-    fn is_re_anchor(from_col: f32, to_col: f32, from_row: f32, to_row: f32) -> bool {
+    const fn is_re_anchor(from_col: f32, to_col: f32, from_row: f32, to_row: f32) -> bool {
         (to_col - from_col).abs() > INK_EVICT_MAX || (to_row - from_row).abs() >= 0.5
     }
 
@@ -4322,7 +4328,7 @@ impl PetBrain {
     /// [`INK_EVICT_SPEED`] cells per second, never overshooting. Longer trips
     /// are re-anchors ([`Self::is_re_anchor`]).
     #[inline]
-    fn evict_toward(from: f32, to: f32, dt: f32) -> f32 {
+    const fn evict_toward(from: f32, to: f32, dt: f32) -> f32 {
         let delta = to - from;
         let step = INK_EVICT_SPEED * dt.max(0.0);
         if delta.abs() <= step {
@@ -4403,8 +4409,11 @@ impl PetBrain {
     /// The live output edge as a row coordinate — `None` until the host
     /// feeds the ink map, which keeps the watch's hug inert without it.
     #[inline]
-    fn ink_live_row(&self) -> Option<f32> {
-        self.ink_live.map(f32::from)
+    const fn ink_live_row(&self) -> Option<f32> {
+        match self.ink_live {
+            Some(r) => Some(r as f32),
+            None => None,
+        }
     }
 
     /// How visible a z-mote may be at `(col, row)`: 1 in clear sky, easing to
@@ -4452,7 +4461,7 @@ impl PetBrain {
     /// [`BELL_LATCH_TTL`]: a sleeper wakes with the startled z, a settled pet
     /// flinches toward the caret, and a bell that expires mid-flight is dropped.
     #[inline]
-    pub fn note_bell(&mut self, now: Instant) {
+    pub const fn note_bell(&mut self, now: Instant) {
         self.pending_bell = Some(now);
     }
 
@@ -4547,7 +4556,7 @@ impl PetBrain {
     /// partial write, so the letter veil ([`Self::veil_over_letters`]) holds
     /// its level through it.
     #[inline]
-    pub fn note_repainting(&mut self, repainting: bool) {
+    pub const fn note_repainting(&mut self, repainting: bool) {
         self.repainting = repainting;
     }
 
@@ -4557,7 +4566,7 @@ impl PetBrain {
     /// (`Departure::surface`), so an arriver that adopts the ghost knows
     /// whether the ghost's palette was sampled on its own ground.
     #[inline]
-    pub fn note_surface(&mut self, surface: (u64, bool)) {
+    pub const fn note_surface(&mut self, surface: (u64, bool)) {
         self.surface = Some(surface);
     }
 
@@ -4569,7 +4578,8 @@ impl PetBrain {
     /// screen, so the heat cannot come back) and stands an armed vigil down. The
     /// live-edge hug does not arm either: a TUI's bottom-most inked row is its
     /// footer, not its newest output.
-    pub fn note_full_screen(&mut self, full_screen: bool) {
+    #[inline]
+    pub const fn note_full_screen(&mut self, full_screen: bool) {
         if full_screen && !self.full_screen {
             self.watch_heat = 0.0;
             self.watch_t = 0.0;
@@ -4584,8 +4594,13 @@ impl PetBrain {
     /// [`PET_LATCH_TTL`] from the last click, so a pet mid-flight waits for the
     /// ground.
     #[inline]
-    pub fn note_petted(&mut self, now: Instant) {
-        self.pending_pet = self.pending_pet.saturating_add(1).min(PET_LATCH_MAX);
+    pub const fn note_petted(&mut self, now: Instant) {
+        let next = self.pending_pet.saturating_add(1);
+        self.pending_pet = if next < PET_LATCH_MAX {
+            next
+        } else {
+            PET_LATCH_MAX
+        };
         self.pet_at = Some(now);
     }
 
@@ -4649,7 +4664,7 @@ impl PetBrain {
     /// fast failure within [`TRICK_SUBMIT_FORGIVEN`]. Spent by the next
     /// completion.
     #[inline]
-    pub fn note_trick_submit(&mut self, now: Instant) {
+    pub const fn note_trick_submit(&mut self, now: Instant) {
         self.trick_submit_at = Some(now);
     }
 
@@ -4657,8 +4672,11 @@ impl PetBrain {
     /// opening beat has begun, and after a drop, a revoke or the TTL.
     #[must_use]
     #[inline]
-    pub fn pending_trick(&self) -> Option<Trick> {
-        self.pending_trick.map(|p| p.trick)
+    pub const fn pending_trick(&self) -> Option<Trick> {
+        match self.pending_trick {
+            Some(p) => Some(p.trick),
+            None => None,
+        }
     }
 
     /// The hand entered flow (`rainbow_kitty::spine::FLOW_ENTRY_KEYS` fast keys
@@ -4669,7 +4687,7 @@ impl PetBrain {
     /// Latches only. Spawns no motes and never wakes a sleeper, so it adds no
     /// frame; expires unconsumed at [`FLOW_LATCH_TTL`].
     #[inline]
-    pub fn note_flow(&mut self, now: Instant) {
+    pub const fn note_flow(&mut self, now: Instant) {
         self.pending_flow = Some(now);
     }
 
@@ -4722,7 +4740,8 @@ impl PetBrain {
 
     /// The v2 offer's latches, `(perk, catch)`, for host tests.
     #[must_use]
-    pub fn pending_v2_offer(&self) -> (bool, bool) {
+    #[inline]
+    pub const fn pending_v2_offer(&self) -> (bool, bool) {
         (self.pending_perk.is_some(), self.pending_catch.is_some())
     }
 
@@ -4732,7 +4751,7 @@ impl PetBrain {
     /// and sit are worn as the perk; at release the chase walks the cat home.
     /// No pose, clock or wake here.
     #[inline]
-    pub fn note_room_lease(&mut self, held: bool) {
+    pub const fn note_room_lease(&mut self, held: bool) {
         self.room_lease = held;
     }
 
@@ -4742,7 +4761,7 @@ impl PetBrain {
     /// and a cat with an armed vigil is not put to sleep at [`SLEEP_AFTER`].
     /// The cap and vigil entry are named to the coarse offer.
     #[inline]
-    pub fn note_room_quiet(&mut self, quiet: bool) {
+    pub const fn note_room_quiet(&mut self, quiet: bool) {
         self.room_quiet = quiet;
     }
 
@@ -4750,7 +4769,8 @@ impl PetBrain {
     /// restated every frame; the brain diffs the id. `settled` moves the ledger
     /// now by [`CHEER_FAST_CONTENT`] and latches the notice; `timeout` latches
     /// the ear-flat beat. Both retire at [`ROOM_CUE_TTL`].
-    pub fn note_room_turn(&mut self, now: Instant, id: u64, settled: bool) {
+    #[inline]
+    pub const fn note_room_turn(&mut self, now: Instant, id: u64, settled: bool) {
         // A fresh brain's first note only seeds the watermark.
         let seeded = core::mem::replace(&mut self.room_turn_seeded, true);
         if id == self.room_turn || !seeded {
@@ -4785,7 +4805,8 @@ impl PetBrain {
     /// to keep (the companion hands the end back as
     /// [`crate::companion::PetTick::landed_seen`], and the glass marks it
     /// cheered); the brain latches every call.
-    pub fn note_room_landed(&mut self) {
+    #[inline]
+    pub const fn note_room_landed(&mut self) {
         self.content = (self.content + CHEER_CONTENT).min(1.0);
         self.pending_cheer = Some(true);
         self.room_cheer = true;
@@ -4797,7 +4818,8 @@ impl PetBrain {
 
     /// The landing's cheer is over or wiped: nothing of it is owed, and a
     /// cat leaving the glass after it stays where the fade left it.
-    fn drop_room_cheer(&mut self) {
+    #[inline]
+    const fn drop_room_cheer(&mut self) {
         self.room_cheer = false;
         self.room_cheer_air = None;
         self.room_cheer_leaving = false;
@@ -4846,7 +4868,8 @@ impl PetBrain {
     /// host's tests, which see the brain from another crate.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn cheer_owed(&self) -> bool {
+    #[inline]
+    pub const fn cheer_owed(&self) -> bool {
         self.pending_cheer.is_some()
     }
 
@@ -4867,7 +4890,8 @@ impl PetBrain {
     /// handled watermark latches mail (perk, one ear, one ♪); the overdue
     /// flag's rising edge latches the ear-flat beat; `hold` is a level (the cat
     /// sits tight). A fresh brain's first note only seeds.
-    pub fn note_room_inbox(&mut self, now: Instant, inbox: RoomInbox) {
+    #[inline]
+    pub const fn note_room_inbox(&mut self, now: Instant, inbox: RoomInbox) {
         self.room_hold = inbox.hold;
         let seeded = core::mem::replace(&mut self.room_inbox_seeded, true);
         let mail = inbox.unseen > self.room_unseen;
@@ -4889,7 +4913,8 @@ impl PetBrain {
     /// Queued, not-yet-consumed pets — host observability (the click seam's
     /// unit tests assert the latch moved without driving a full frame).
     #[must_use]
-    pub fn pending_pets(&self) -> u8 {
+    #[inline]
+    pub const fn pending_pets(&self) -> u8 {
         self.pending_pet
     }
 
@@ -8080,8 +8105,8 @@ impl PetBrain {
     /// purrs whatever the ledger says now: `enter_settled` admitted it on
     /// `content + owed`.
     #[inline]
-    fn purring(&self) -> bool {
-        self.action == PetAction::Purr
+    const fn purring(&self) -> bool {
+        matches!(self.action, PetAction::Purr)
             || (matches!(self.action, PetAction::Sit | PetAction::Loaf)
                 && self.content >= PURR_GATE)
     }
@@ -8089,20 +8114,20 @@ impl PetBrain {
     /// The dealt loaf onset: [`LOAF_AFTER`] plus 0.8 s per `seed % 3` —
     /// 2.8 / 3.6 / 4.4 s of quiet, every hand under the long-dwell bar.
     #[inline]
-    fn loaf_after(&self) -> f32 {
-        LOAF_AFTER + 0.8 * f32::from(self.settle_seed % 3)
+    const fn loaf_after(&self) -> f32 {
+        LOAF_AFTER + 0.8 * (self.settle_seed % 3) as f32
     }
 
     /// The dealt groom onset inside the sit: [`GROOM_AFTER`] minus 0.45 s per
     /// `(seed / 3) % 3` (6.5 / 6.05 / 5.6 s).
     #[inline]
-    fn groom_after(&self) -> f32 {
-        GROOM_AFTER - 0.45 * f32::from((self.settle_seed / 3) % 3)
+    const fn groom_after(&self) -> f32 {
+        GROOM_AFTER - 0.45 * ((self.settle_seed / 3) % 3) as f32
     }
 
     /// One hand in four skips the second wash of a settle.
     #[inline]
-    fn groom_skip(&self) -> bool {
+    const fn groom_skip(&self) -> bool {
         self.settle_seed % 4 == 3
     }
 
@@ -8136,8 +8161,8 @@ impl PetBrain {
 
     /// The hand this beat was dealt, `0..n`.
     #[inline]
-    fn beat_deal(&self, beat: i64, n: i64) -> i64 {
-        (beat + i64::from(self.settle_seed)).rem_euclid(n)
+    const fn beat_deal(&self, beat: i64, n: i64) -> i64 {
+        (beat + self.settle_seed as i64).rem_euclid(n)
     }
 
     /// The seat's dealt tail. Four hands per beat, with the beat index dealt
@@ -8186,7 +8211,7 @@ impl PetBrain {
     /// The authored length of the tail's dealt `hand`, internal silences
     /// included, so a door can check the gesture fits. Hand 3 has none.
     #[inline]
-    fn tail_hand_len(hand: i64) -> f32 {
+    const fn tail_hand_len(hand: i64) -> f32 {
         match hand {
             0 => TAIL_FLICK,
             1 => 2.0 * TAIL_TAP + TAIL_GAP,
@@ -8198,12 +8223,12 @@ impl PetBrain {
     /// The tail's beat: its period and window phase. Face-on it rides the
     /// glance's clock ([`Self::sit_tail`]).
     #[inline]
-    fn tail_clock(&self) -> (f32, f32) {
+    const fn tail_clock(&self) -> (f32, f32) {
         if self.sit_front {
             (self.glance_period(), GLANCE_AT)
         } else {
             (
-                TAIL_PERIOD + TAIL_PERIOD_STEP * f32::from(self.settle_seed % 3),
+                TAIL_PERIOD + TAIL_PERIOD_STEP * (self.settle_seed % 3) as f32,
                 TAIL_AT,
             )
         }
@@ -8225,8 +8250,8 @@ impl PetBrain {
 
     /// The dealt glance's period — 2.6 / 3.3 / 4.0 s, one hand each.
     #[inline]
-    fn glance_period(&self) -> f32 {
-        GLANCE_PERIOD + GLANCE_PERIOD_STEP * f32::from(self.settle_seed % 3)
+    const fn glance_period(&self) -> f32 {
+        GLANCE_PERIOD + GLANCE_PERIOD_STEP * (self.settle_seed % 3) as f32
     }
 
     /// The dealt look's length: [`LOOK_DUR`], or [`LOOK_DUR_LONG`] on a seat
@@ -8234,7 +8259,7 @@ impl PetBrain {
     /// (`GLANCE_AT + LOOK_DUR_LONG + LOOK_RETURN_MIN` = 2.05 s against
     /// `loaf_after() - SIT_AFTER` of 1.4 / 2.2 / 3.0).
     #[inline]
-    fn look_dur(&self) -> f32 {
+    const fn look_dur(&self) -> f32 {
         if self.loaf_after() - SIT_AFTER >= GLANCE_AT + LOOK_DUR_LONG + LOOK_RETURN_MIN {
             LOOK_DUR_LONG
         } else {
@@ -8270,7 +8295,7 @@ impl PetBrain {
     /// Half the hands yawn the seat into its loaf: the last [`YAWN_DUR`] of
     /// the sit, handing straight into the melt.
     #[inline]
-    fn sit_yawn(&self) -> bool {
+    const fn sit_yawn(&self) -> bool {
         !self.room_hold
             && self.settle_seed.is_multiple_of(2)
             && self.quiet >= self.loaf_after() - YAWN_DUR
@@ -8329,7 +8354,7 @@ impl PetBrain {
     /// The scaled coil for a pounce winding up `span` columns:
     /// `(CROUCH_DUR + span·COIL_PER_CELL).clamp(CROUCH_DUR, COIL_MAX)`.
     #[inline]
-    fn coil_dur(span: f32) -> f32 {
+    const fn coil_dur(span: f32) -> f32 {
         (CROUCH_DUR + span * COIL_PER_CELL).clamp(CROUCH_DUR, COIL_MAX)
     }
 
@@ -8344,7 +8369,7 @@ impl PetBrain {
     ///   along the motion, `1 − 0.6·LAUNCH_STRETCH` across), so the
     ///   crouch-to-launch cut has no pop.
     #[inline]
-    fn coil_envelope(t: f32, dur: f32) -> (f32, f32) {
+    const fn coil_envelope(t: f32, dur: f32) -> (f32, f32) {
         let q_full = COIL_SQUASH * (dur / COIL_MAX).min(1.0);
         let release0 = (dur - COIL_RELEASE).max(f32::EPSILON);
         if t < release0 {
@@ -8381,7 +8406,7 @@ impl PetBrain {
     /// one shared factor when the hero would fall under [`MIN_HERO`]; under
     /// `3·MIN_HERO` the caller splits two poses at the apex.
     #[inline]
-    fn pose_schedule(dur: f32) -> (f32, f32) {
+    const fn pose_schedule(dur: f32) -> (f32, f32) {
         let (rise, desc) = (LEAP_RISE_T, LEAP_DESC_T);
         if rise + desc + MIN_HERO > dur {
             let k = (dur - MIN_HERO) / (rise + desc);
@@ -8401,7 +8426,8 @@ impl PetBrain {
     ///    or two poses split at the apex for a very short flight.
     /// 4. The apex, big bounds only: a hero window of at least `4·MIN_HERO`
     ///    splits at its midpoint and the top gets `PetApex`.
-    fn flight_pose(f: &Flight) -> PetGlyphId {
+    #[inline]
+    const fn flight_pose(f: &Flight) -> PetGlyphId {
         // The schedule reads the flight's own clock, clamped to its own
         // length exactly as the `u` the arc is drawn from is.
         let t = f.t.clamp(0.0, f.dur);
@@ -8457,7 +8483,7 @@ impl PetBrain {
     /// ([`Self::leave_ground`]) flies a bound, and within it this curve stays
     /// under [`HOP_SPEED_MAX`].
     #[inline]
-    fn flight_shape(span: f32, vertical: bool) -> (f32, f32) {
+    const fn flight_shape(span: f32, vertical: bool) -> (f32, f32) {
         if vertical {
             (
                 (HOP_DUR + span * FLIGHT_PER_CELL * 0.5).clamp(HOP_DUR, FLIGHT_MAX),
@@ -8526,8 +8552,9 @@ impl PetBrain {
     /// A cat at rest: a settled pose that is not a stand caught between two
     /// keystrokes ([`STAND_REST`]). The double-take is only for a cat at rest.
     #[inline]
-    fn at_rest(&self) -> bool {
-        self.action.settled() && !(self.action == PetAction::Stand && self.action_t < STAND_REST)
+    const fn at_rest(&self) -> bool {
+        self.action.settled()
+            && !(matches!(self.action, PetAction::Stand) && self.action_t < STAND_REST)
     }
 
     /// The notice rule: a cat at rest looks up before a bound, from any door.
@@ -8692,7 +8719,7 @@ impl PetBrain {
     /// Duration and arc for one screen-crossing bound of `span` columns —
     /// before the viewport clamp in [`Self::begin_big_arc`].
     #[inline]
-    fn big_shape(span: f32) -> (f32, f32) {
+    const fn big_shape(span: f32) -> (f32, f32) {
         (
             (BIG_FLIGHT_BASE + span * BIG_FLIGHT_PER_CELL).clamp(BIG_FLIGHT_BASE, BIG_FLIGHT_MAX),
             (BIG_ARC_BASE + span * BIG_ARC_PER_CELL).clamp(BIG_ARC_BASE, BIG_ARC_MAX),
@@ -8934,7 +8961,7 @@ impl PetBrain {
     /// The sleeping head in fractional cells, the z's anchor: on the facing
     /// side, offset off the cell lattice.
     #[inline]
-    fn head_anchor(&self, width: f32) -> (f32, f32) {
+    const fn head_anchor(&self, width: f32) -> (f32, f32) {
         let x = if self.facing_left { 0.28 } else { 0.72 };
         (self.col + width * x + 0.19, self.row - 0.61)
     }
@@ -9099,7 +9126,7 @@ impl PetBrain {
     /// A kitty command's settle gate: [`TRICK_SETTLE`] when final,
     /// [`TRICK_SETTLE_TENTATIVE`] while the line may still become prose.
     #[inline]
-    fn trick_settle_after(confirmed: bool) -> f32 {
+    const fn trick_settle_after(confirmed: bool) -> f32 {
         if confirmed {
             TRICK_SETTLE
         } else {
@@ -9129,7 +9156,7 @@ impl PetBrain {
     /// Stand the commanded seat down: the level and its ending quiet value
     /// together (the no-caret fast path relies on that).
     #[inline]
-    fn clear_trick_settle(&mut self) {
+    const fn clear_trick_settle(&mut self) {
         self.trick_settle = None;
         self.hold_end_q = 0.0;
     }
@@ -9138,7 +9165,7 @@ impl PetBrain {
     /// that a tentative word was answered, so a following confirmation still
     /// finds the trick owed. A performed verb has already emptied `trick_go`.
     #[inline]
-    fn drop_trick_go(&mut self) {
+    const fn drop_trick_go(&mut self) {
         if self.trick_go.take().is_some() {
             self.trick_heard = None;
         }
@@ -9148,7 +9175,7 @@ impl PetBrain {
     /// flag, commanded seat, answered-word memory). Shared by the no-caret arm
     /// and the console resident's clear list.
     #[inline]
-    fn drop_tricks(&mut self) {
+    const fn drop_tricks(&mut self) {
         self.pending_trick = None;
         self.trick_go = None;
         self.trick_heard = None;
@@ -9167,7 +9194,7 @@ impl PetBrain {
     /// a held seat is engaged and parked.
     #[inline]
     #[must_use]
-    pub fn trick_engaged(&self) -> bool {
+    pub const fn trick_engaged(&self) -> bool {
         self.pending_trick.is_some()
             || self.trick_go.is_some()
             || self.trick_act
@@ -9198,9 +9225,9 @@ impl PetBrain {
     /// A one-shot trick has finished: the cat is back in a settled, non-notice
     /// pose with no verb hold live and no pose owed back.
     #[inline]
-    fn trick_act_over(&self) -> bool {
+    const fn trick_act_over(&self) -> bool {
         self.action.settled()
-            && self.action != PetAction::Perk
+            && !matches!(self.action, PetAction::Perk)
             && self.wriggle_t <= 0.0
             && self.pet_hold_t <= 0.0
             && self.song_left == 0
@@ -9470,7 +9497,8 @@ impl PetBrain {
     /// goes too, or it closes the vigil's own re-entry gate. The ledger is
     /// untouched: the verdict's contentment moved at note time
     /// ([`Self::note_command_done`]).
-    fn drop_verdict_latches(&mut self) {
+    #[inline]
+    const fn drop_verdict_latches(&mut self) {
         self.pending_vigil_pounce = false;
         self.vigil_cheer = None;
         self.vigil = false;
@@ -9563,6 +9591,7 @@ impl PetBrain {
                 .any(|m| m.kind == PetMoteKind::Note)
     }
 
+    #[inline]
     pub(super) fn drop_room_cue(&mut self) {
         self.room_cue_act = false;
         self.pending_room = None;
@@ -9795,7 +9824,7 @@ impl PetBrain {
     /// The live droop's hold: the sulk's [`DROOP_HOLD`], or the ear-flat
     /// beat's [`EAR_FLAT_HOLD`].
     #[inline]
-    fn droop_hold(&self) -> f32 {
+    const fn droop_hold(&self) -> f32 {
         if self.droop_brief {
             EAR_FLAT_HOLD
         } else {
@@ -9855,6 +9884,7 @@ impl PetBrain {
 
     /// The swipe's contact puff: one neutral Dust mote at the peek cell,
     /// kicked the way the swipe travels.
+    #[inline]
     fn spawn_bat_dust(&mut self, col: f32, row: f32) {
         // Fractional offsets by law: no grain sits on the cell lattice.
         self.spawn_dealt(PetMoteKind::Dust, 0.5, (col + 0.23, row + 0.12));
@@ -9967,7 +9997,7 @@ impl PetBrain {
     /// The chest anchor a ♪/♥ rises from, cells: the chest on the side the
     /// cat faces, just under its head.
     #[inline]
-    fn chest_anchor(&self, width: f32) -> (f32, f32) {
+    const fn chest_anchor(&self, width: f32) -> (f32, f32) {
         let chest_x = if self.facing_left { 0.38 } else { 0.62 };
         (self.col + width * chest_x + 0.23, self.row - 0.27)
     }
@@ -9975,6 +10005,7 @@ impl PetBrain {
     /// One ♪/♥ off the chest anchor, born into the first lane clear of every
     /// ♪/♥ already up ([`Self::note_lane_birth`]). `None` alternates by
     /// serial: ♪ on even, ♥ on odd.
+    #[inline]
     fn spawn_chest_mote(&mut self, kind: Option<PetMoteKind>, width: f32) {
         let kind = kind.unwrap_or_else(|| self.next_note_kind());
         let at = self.note_lane_birth(kind, self.chest_anchor(width));
@@ -9983,7 +10014,7 @@ impl PetBrain {
 
     /// The next ♪/♥ by mote-serial parity: ♪ on even, ♥ on odd.
     #[inline]
-    fn next_note_kind(&self) -> PetMoteKind {
+    const fn next_note_kind(&self) -> PetMoteKind {
         if self.mote_serial.is_multiple_of(2) {
             PetMoteKind::Note
         } else {
@@ -10246,6 +10277,7 @@ impl PetBrain {
     }
 
     /// A fresh [`Departure::id`].
+    #[inline]
     fn next_departure_id(&mut self) -> u32 {
         self.departure_serial = self.departure_serial.wrapping_add(1);
         self.departure_serial
@@ -11091,7 +11123,7 @@ impl PetBrain {
     /// function of elapsed time.
     /// The gaits in order of speed: 0 the amble, 1 the walk, 2 the run.
     #[inline]
-    fn gait_rank(running: bool, lateral: bool) -> u8 {
+    const fn gait_rank(running: bool, lateral: bool) -> u8 {
         if running {
             2
         } else if lateral {
@@ -11104,7 +11136,7 @@ impl PetBrain {
     /// The body's own speed over the last tick that had time in it (cells/s,
     /// unsigned), as drawn: [`Self::col_at_tick`] to here.
     #[inline]
-    fn leg_speed(&self) -> f32 {
+    const fn leg_speed(&self) -> f32 {
         if self.tick_dt > 0.0 {
             (self.col - self.col_at_tick).abs() / self.tick_dt
         } else {
@@ -11171,7 +11203,7 @@ impl PetBrain {
     /// The current action (for hosts that gate sound or other effects on it).
     #[inline]
     #[must_use]
-    pub fn action(&self) -> PetAction {
+    pub const fn action(&self) -> PetAction {
         self.action
     }
 
@@ -11179,7 +11211,7 @@ impl PetBrain {
     /// Not the frame-cadence signal — see [`Self::needs_frames`].
     #[inline]
     #[must_use]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.alpha > 0.0
     }
 
@@ -11213,6 +11245,7 @@ impl PetBrain {
     /// rewinds: [`Departure::id`] stays unique for the pet's life, so the
     /// emitter never pairs a ghost born after a retire or a drain with a
     /// tile it still holds for one before it (`PetDepartureSprite::id`).
+    #[inline]
     #[must_use]
     pub(crate) fn reborn(&self) -> Self {
         Self {
@@ -11268,7 +11301,7 @@ impl PetBrain {
     /// bookkeeping to it.
     #[inline]
     #[must_use]
-    pub fn worn_pair(&self) -> Option<(u8, u8)> {
+    pub const fn worn_pair(&self) -> Option<(u8, u8)> {
         self.worn
     }
 
@@ -11283,7 +11316,7 @@ impl PetBrain {
     /// Return the palette already frozen for this resident appearance.
     #[inline]
     #[must_use]
-    pub fn appearance_colors(&self) -> Option<CatColorKey> {
+    pub const fn appearance_colors(&self) -> Option<CatColorKey> {
         self.colors
     }
 
@@ -11936,7 +11969,7 @@ impl PetBrain {
     /// The stand's `(scale_x, scale_y)` at `quiet` — `emit`'s arithmetic:
     /// the gather down over the last [`SIT_FOLD`] before the sit.
     #[inline]
-    fn stand_scale(quiet: f32) -> (f32, f32) {
+    const fn stand_scale(quiet: f32) -> (f32, f32) {
         let pre = ((quiet - (SIT_AFTER - SIT_FOLD)) / SIT_FOLD).clamp(0.0, 1.0);
         (1.0 + 0.03 * pre, 1.0 - 0.05 * pre)
     }
@@ -11983,7 +12016,7 @@ impl PetBrain {
     /// Earned contentment 0..=1.
     #[inline]
     #[must_use]
-    pub fn content(&self) -> f32 {
+    pub const fn content(&self) -> f32 {
         self.content
     }
 }

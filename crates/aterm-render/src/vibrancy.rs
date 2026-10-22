@@ -19,7 +19,7 @@
 /// Multiplied into the bg-quad stream only.
 #[must_use]
 #[inline]
-pub fn bg_quad_alpha(opacity: f32) -> u8 {
+pub const fn bg_quad_alpha(opacity: f32) -> u8 {
     if !opacity.is_finite() || opacity >= 1.0 {
         return 255;
     }
@@ -36,7 +36,7 @@ pub fn bg_quad_alpha(opacity: f32) -> u8 {
 /// Non-finite is treated as solid.
 #[must_use]
 #[inline]
-pub fn is_translucent(opacity: f32) -> bool {
+pub const fn is_translucent(opacity: f32) -> bool {
     opacity.is_finite() && opacity < 1.0
 }
 
@@ -51,7 +51,7 @@ pub const CONTRAST_FLOOR: f32 = 4.5;
 /// already passes the effective value changes nothing.
 #[must_use]
 #[inline]
-pub fn effective_minimum_contrast(configured: f32, opacity: f32) -> f32 {
+pub const fn effective_minimum_contrast(configured: f32, opacity: f32) -> f32 {
     if is_translucent(opacity) {
         configured.max(CONTRAST_FLOOR)
     } else {

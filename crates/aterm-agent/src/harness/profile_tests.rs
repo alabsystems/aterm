@@ -1588,10 +1588,12 @@ fn a_login_answers_to_its_rows_address_alone() {
 
 /// [`muse_subscription_for`]: Muse Code's login store under the config
 /// home its environment names, the `meta` provider's `user_email` alone
-/// (MEASURED on 1.4.11-R6667.1). NEGATIVE CONTROLS: an API key in the
-/// environment, a store with no address, a non-oauth mechanism and no
-/// store at all name no account; a key another mechanism keeps in the
-/// store is never read out as one.
+/// (MEASURED on 1.4.11-R6667.1), and only for a process on that
+/// provider. NEGATIVE CONTROLS: another provider named on its command
+/// line or in its settings, an API key in the environment, a store with
+/// no address, a non-oauth mechanism and no store at all name no
+/// account; a prompt's `--provider` after `--` names none; a key
+/// another mechanism keeps in the store is never read out as one.
 #[test]
 fn a_muse_login_store_names_its_account_alone() {
     let tmp = tmp_dir("muse-auth");
@@ -1605,13 +1607,57 @@ fn a_muse_login_store_names_its_account_alone() {
         r#"{"schema_version":2,"providers":{"meta":{"mechanism":"oauth","storage":"keychain","user_email":"owner@example.com","api_key":"[REDACTED]"}}}"#,
     )
     .expect("auth");
-    let shown = muse_subscription_for(&env, &home).expect("the account");
+    let args = |words: &[&str]| {
+        words
+            .iter()
+            .map(|word| (*word).to_owned())
+            .collect::<Vec<_>>()
+    };
+    let shown = muse_subscription_for(&args(&["muse"]), &env, &home).expect("the account");
     assert_eq!(shown.email.as_deref(), Some("owner@example.com"));
     assert_eq!((shown.plan, shown.weekly), (None, None));
-    // NEGATIVE CONTROLS.
+    // NEGATIVE CONTROLS: a process on another provider is not this
+    // login's, however its command line spells the choice.
+    for words in [
+        vec!["muse", "--provider", "echo"],
+        vec!["muse", "--provider=local"],
+        vec!["muse", "-c", "provider=\"echo\""],
+        vec!["muse", "-cprovider=echo"],
+        vec!["muse", "--config=provider=local"],
+    ] {
+        assert_eq!(
+            muse_subscription_for(&args(&words), &env, &home),
+            None,
+            "{words:?}"
+        );
+    }
+    assert!(
+        muse_subscription_for(&args(&["muse", "--", "--provider", "echo"]), &env, &home).is_some(),
+        "a prompt's words are not its flags"
+    );
+    let settings = store.join("settings.json");
+    std::fs::write(&settings, r#"{"provider":"echo"}"#).expect("settings");
+    assert_eq!(
+        muse_subscription_for(&args(&["muse"]), &env, &home),
+        None,
+        "its settings' provider"
+    );
+    assert!(
+        muse_subscription_for(&args(&["muse", "--provider", "meta"]), &env, &home).is_some(),
+        "its command line outranks its settings"
+    );
+    assert!(
+        muse_subscription_for(&args(&["muse", "-cprovider=meta"]), &env, &home).is_some(),
+        "an attached config value outranks its settings too"
+    );
+    std::fs::remove_file(&settings).expect("settings gone");
     let mut keyed = env.clone();
     keyed.push("META_API_KEY=[REDACTED]".to_owned());
-    assert_eq!(muse_subscription_for(&keyed, &home), None, "an API key");
+    assert_eq!(
+        muse_subscription_for(&args(&["muse"]), &keyed, &home),
+        None,
+        "an API key"
+    );
     for text in [
         r#"{"providers":{"meta":{"mechanism":"api_key","user_email":"owner@example.com"}}}"#,
         r#"{"providers":{"meta":{"mechanism":"oauth","storage":"keychain"}}}"#,
@@ -1619,10 +1665,14 @@ fn a_muse_login_store_names_its_account_alone() {
         "not JSON",
     ] {
         std::fs::write(&auth, text).expect("auth");
-        assert_eq!(muse_subscription_for(&env, &home), None, "{text}");
+        assert_eq!(
+            muse_subscription_for(&args(&["muse"]), &env, &home),
+            None,
+            "{text}"
+        );
     }
     std::fs::remove_file(&auth).expect("gone");
-    assert_eq!(muse_subscription_for(&env, &home), None);
+    assert_eq!(muse_subscription_for(&args(&["muse"]), &env, &home), None);
     // An XDG config home of its own: its own store, never the home's.
     let xdg = tmp.path().join("xdg");
     std::fs::create_dir_all(xdg.join("muse")).expect("xdg store");
@@ -1634,7 +1684,7 @@ fn a_muse_login_store_names_its_account_alone() {
     let mut in_xdg = env.clone();
     in_xdg.push(format!("XDG_CONFIG_HOME={}", xdg.display()));
     assert_eq!(
-        muse_subscription_for(&in_xdg, &home).and_then(|s| s.email),
+        muse_subscription_for(&args(&["muse"]), &in_xdg, &home).and_then(|s| s.email),
         Some("xdg@example.com".to_owned())
     );
 }

@@ -847,15 +847,24 @@ fn the_jobs_line_lands_before_the_trailer_and_the_header_counts_it() {
     assert_eq!(splice_brief_line(one, "jobs 1 job", 5), one);
 }
 
-/// A jobs view speaks for now only while it is at most a minute old.
+/// A jobs view that is not parked speaks for now only while it is at most a
+/// minute old; a parked one (demand idle) for as long as its reader runs.
+/// NEGATIVE CONTROL: the parked view with its reader stopped says nothing
+/// past the minute.
 #[test]
-fn a_jobs_view_older_than_a_minute_says_nothing_of_now() {
-    let view = Arc::new(aterm_vitals::jobs::JobsView::default());
+fn a_jobs_view_older_than_a_minute_says_nothing_of_now_unless_parked() {
+    let view = Arc::new(aterm_vitals::jobs::JobsView {
+        demand: aterm_vitals::jobs::Demand::Fast,
+        ..aterm_vitals::jobs::JobsView::default()
+    });
     let now = Instant::now();
-    assert!(fresh_jobs(Some((Arc::clone(&view), now)), now).is_some());
+    assert!(fresh_jobs(Some((Arc::clone(&view), now)), now, true).is_some());
     let old = now
         .checked_sub(crate::vitals_jobs::JOBS_FRESH + Duration::from_secs(1))
         .expect("a clock past a minute");
-    assert!(fresh_jobs(Some((view, old)), now).is_none());
-    assert!(fresh_jobs(None, now).is_none());
+    assert!(fresh_jobs(Some((view, old)), now, true).is_none());
+    assert!(fresh_jobs(None, now, true).is_none());
+    let parked = Arc::new(aterm_vitals::jobs::JobsView::default());
+    assert!(fresh_jobs(Some((Arc::clone(&parked), old)), now, true).is_some());
+    assert!(fresh_jobs(Some((parked, old)), now, false).is_none());
 }

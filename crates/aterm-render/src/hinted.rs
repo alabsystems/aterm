@@ -108,12 +108,14 @@ impl HintMode {
     /// byte-stable portable path the golden/parity tests use ([`crate::portable_raster_forced`]).
     /// It forces `Off` at construction and wins over the `font_hinting` setter, so those tests
     /// keep their exact bytes.
+    #[inline]
     pub(crate) fn portable_forced() -> bool {
         crate::portable_raster_forced()
     }
 
     /// The mode a renderer is built with: [`HintMode::Full`], or `Off` under
     /// [`Self::portable_forced`].
+    #[inline]
     pub(crate) fn initial() -> Self {
         if Self::portable_forced() {
             Self::Off
@@ -125,7 +127,8 @@ impl HintMode {
     /// The hinter target this mode stands for; `None` = hinting disabled. Horizontal fitting
     /// inside the cell is wanted (that is the crispness); advances reported upstream stay linear
     /// regardless (module doc).
-    fn options(self) -> Option<Target> {
+    #[inline]
+    const fn options(self) -> Option<Target> {
         match self {
             Self::Full => Some(Target::Normal),
             Self::Light => Some(Target::Light),
@@ -294,10 +297,12 @@ pub(crate) struct PathPen {
 }
 
 impl PathPen {
+    #[inline]
     pub(crate) fn is_blank(&self) -> bool {
         self.cmds.is_empty() || !self.min_x.is_finite()
     }
 
+    #[inline]
     fn see(&mut self, x: f32, y: f32) {
         if self.cmds.is_empty() {
             (self.min_x, self.max_x) = (x, x);
@@ -367,25 +372,30 @@ impl PathPen {
 /// The recording half (pixels, y up), as plain methods so both the `OutlineSink` impl below
 /// and the subpixel raster's unhinted outline can feed it.
 impl PathPen {
+    #[inline]
     pub(crate) fn move_to(&mut self, x: f32, y: f32) {
         self.see(x, y);
         self.cmds.push(Cmd::Move(x, y));
     }
+    #[inline]
     pub(crate) fn line_to(&mut self, x: f32, y: f32) {
         self.see(x, y);
         self.cmds.push(Cmd::Line(x, y));
     }
+    #[inline]
     pub(crate) fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
         self.see(cx, cy);
         self.see(x, y);
         self.cmds.push(Cmd::Quad(cx, cy, x, y));
     }
+    #[inline]
     pub(crate) fn curve_to(&mut self, c0x: f32, c0y: f32, c1x: f32, c1y: f32, x: f32, y: f32) {
         self.see(c0x, c0y);
         self.see(c1x, c1y);
         self.see(x, y);
         self.cmds.push(Cmd::Curve(c0x, c0y, c1x, c1y, x, y));
     }
+    #[inline]
     pub(crate) fn close(&mut self) {
         self.cmds.push(Cmd::Close);
     }

@@ -1,0 +1,22 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (144x50, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · 2.1.304, the same background agent later (its Bash still sleeping), the panel released with Escape
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.h0kd/proj
+
+
+❯ toolstart
+
+⏺ Agent(bling probe)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Tool call done.
+
+✻ Waiting for 1 background agent to finish
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ↓ to manage
+
+  ⏺ main
+  ◯ general-purpose  bling probe                                                                                           52s · ↓ 6.2k tokens

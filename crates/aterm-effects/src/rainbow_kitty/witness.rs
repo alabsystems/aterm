@@ -352,6 +352,7 @@ pub(super) const FOLLOW_DRS: [i16; 4] = [-1, 1, -2, 2];
 
 /// The sampled rows at every follow offset from `row`, in [`FOLLOW_DRS`]
 /// order, `None` where not sampled this frame.
+#[inline]
 fn neighbours_of<'a>(rows: &[RowSample<'a>], row: u16) -> [Option<&'a [char]>; 4] {
     let mut out = [None; 4];
     for (slot, dr) in out.iter_mut().zip(FOLLOW_DRS) {
@@ -366,6 +367,7 @@ fn neighbours_of<'a>(rows: &[RowSample<'a>], row: u16) -> [Option<&'a [char]>; 4
 /// The follow offsets whose evidence survives a row-band move
 /// ([`Witness::translate_band`]) for a record carried from `old` to `new`: those
 /// whose neighbour moved with it (`old + dr` is now at `new + dr`).
+#[inline]
 fn band_keeps(old: u16, new: u16, top: u16, bottom: u16, delta: i16) -> u8 {
     let mut keep = 0u8;
     for (k, dr) in FOLLOW_DRS.into_iter().enumerate() {
@@ -385,6 +387,7 @@ impl Seen {
     /// [`Seen::pending`]; the same unit sets [`Seen::twin`] at once when
     /// arming, otherwise once it has stood [`TWIN_MIN`]. An unsampled row
     /// changes nothing; a blank record testifies nothing.
+    #[inline]
     fn observe(&mut self, nb: &[Option<&[char]>; 4], at_arm: bool, now: Instant) {
         if self.unit.is_blank() {
             return;
@@ -677,6 +680,7 @@ impl Witness {
     /// An empty witness with capacity reserved once ([`WITNESS_CAP`]) for the
     /// records and the deferral's scratch (at most one entry per record), so a
     /// frame with a withheld row never allocates.
+    #[inline]
     #[must_use]
     pub fn new() -> Self {
         Self {

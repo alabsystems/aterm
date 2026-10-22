@@ -21,6 +21,7 @@ mod bridge_recovery;
 mod bridge_wake;
 mod broadcast;
 mod broker_poison;
+mod broker_retention;
 mod doctor_retire;
 mod exactly_once;
 mod fabric_cli;

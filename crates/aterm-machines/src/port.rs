@@ -3,11 +3,12 @@
 
 //! The one port between this crate and the operating system.
 //!
-//! Every tool an item runs, every file it reads or writes, goes through [`System`]. The
-//! live arm ([`Live`]) runs absolute programs built by `aterm_uds::spawnfd::command`, each
-//! bounded by a deadline, with a fixed environment. The test arm (`Fake`, test builds only)
-//! answers from a script and records the argv, so no test touches the real `defaults`,
-//! `pmset`, `scutil` or `launchctl` of the machine running it.
+//! Every tool an item runs, every file it reads or writes, and the converge journal its
+//! changes are recorded in go through [`System`]. The live arm ([`Live`]) runs absolute
+//! programs built by `aterm_uds::spawnfd::command`, each bounded by a deadline, with a fixed
+//! environment. The test arm (`Fake`, test builds only) answers from a script and records
+//! the argv, so no test touches the real `defaults`, `pmset`, `scutil` or `launchctl` of
+//! the machine running it, nor its account's journal.
 
 use std::ffi::OsString;
 use std::io;
@@ -758,6 +759,19 @@ pub trait System: Sync {
     /// This Mac's own `IOPlatformUUID` on the live system; `None` in tests.
     fn own_uuid(&self) -> Option<String> {
         None
+    }
+
+    /// The converge journal of the account this system acts as, which records each change
+    /// before it is made (docs/DESIGN-init-system-2026-10-20.md §3.3): an item's journal
+    /// goes where its account is, so it comes from the same port the items act through.
+    /// [`Live`] keeps it under the account's state root; the test arm keeps it in its own
+    /// files, so a run over it can never write the journal of the account running the
+    /// test. The default keeps none, and every change is refused on it.
+    ///
+    /// # Errors
+    /// No journal can be kept (the account has no state root; this system keeps none).
+    fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
+        Err("this system keeps no converge journal".into())
     }
 }
 
@@ -1511,6 +1525,19 @@ impl System for Live {
             .ok()?;
         crate::agent::platform::ioreg_value(&ran.out(), "IOPlatformUUID")
     }
+
+    /// `<state_dir>/converge/journal.ndjson` under [`aterm_types::dirs::account_state_dir`]:
+    /// the state root the process's items act on (a private state root as it is, else
+    /// `$HOME`'s), and for root its own account record's home, since `sudo aterm machines
+    /// here apply` may keep the invoking person's `$HOME`.
+    fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
+        aterm_types::dirs::account_state_dir()
+            .map(|root| {
+                Box::new(aterm_converge::FileJournal::under(&root))
+                    as Box<dyn aterm_converge::Journal>
+            })
+            .ok_or_else(|| "this account has no state directory to journal changes in".into())
+    }
 }
 
 /// [`Live::exclusive`]'s guard: released by `LOCK_UN` when dropped, before the close
@@ -1690,6 +1717,31 @@ mod fake {
         Stat(PathBuf, Stat),
     }
 
+    /// [`Fake`]'s converge journal: each line appended to [`Fake::JOURNAL`] in its files.
+    struct Journaled<'a>(&'a Fake);
+
+    impl aterm_converge::Journal for Journaled<'_> {
+        fn before_change(
+            &mut self,
+            id: &str,
+            from: &str,
+            to: &str,
+            revert: Option<&str>,
+        ) -> Result<(), String> {
+            let line = aterm_json::json!({
+                "time": self.0.now, "id": id, "from": from, "to": to, "revert": revert,
+            });
+            let mut line = aterm_json::to_string(&line).map_err(|e| e.to_string())?;
+            line.push('\n');
+            let mut files = self.0.files.lock().unwrap();
+            let (bytes, _) = files
+                .entry(PathBuf::from(Fake::JOURNAL))
+                .or_insert_with(|| (Vec::new(), 0o600));
+            bytes.extend_from_slice(line.as_bytes());
+            Ok(())
+        }
+    }
+
     struct FakeDirectory<'s> {
         sys: &'s Fake,
         path: Option<PathBuf>,
@@ -1846,6 +1898,11 @@ mod fake {
             *self.scroll_set_readback.lock().unwrap() = Some(natural);
             self
         }
+
+        /// The fake account's converge journal ([`System::journal`]), a file of the fake's
+        /// own: each change's line is appended there, read back with [`Fake::written`].
+        pub const JOURNAL: &'static str =
+            "/var/root/Library/Application Support/aterm/converge/journal.ndjson";
 
         /// A fake running as root at a fixed time.
         #[must_use]
@@ -2576,6 +2633,10 @@ mod fake {
 
         fn now(&self) -> u64 {
             self.now
+        }
+
+        fn journal(&self) -> Result<Box<dyn aterm_converge::Journal + '_>, String> {
+            Ok(Box::new(Journaled(self)))
         }
 
         fn create_new(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {

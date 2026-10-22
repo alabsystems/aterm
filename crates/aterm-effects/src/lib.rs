@@ -45,6 +45,10 @@ mod cat_glyphs_codegen;
 pub mod cat_glyphs_gen {
     include!("cat_glyphs_gen.rs");
 }
+/// The top line's marks: one drawn icon and one brand colour per agent CLI
+/// (the lockup every agent CLI's top line opens with), their fit law, their
+/// inks floored to their grounds, and the fx payload that draws them.
+pub mod cli_marks;
 pub mod color_math;
 /// The pet driver: `CompanionOwner` owns a resident [`kitty_pet`] brain per
 /// surface and senses for it, dresses it, decides custody and draws it, for
@@ -96,6 +100,10 @@ pub mod genome;
 /// launch card wears while the harness has it on Autopilot; a pure emitter,
 /// one episode then stillness.
 pub mod harness_card;
+/// The agents panel's glass (the harness theme's rainbow on Claude Code's
+/// agents panel, and its dots' light: hue = which agent, brightness and glow
+/// = work, saturation = freshness); a pure emitter, the host places it.
+pub mod harness_panel;
 /// The host contract (`docs/DESIGN-host-boundary-2026-08-30.md` §3): the plain
 /// data a host hands the effects driver for one frame (`HostFrameInput`,
 /// `TerminalFacts`) and gets back (`PressOutcome`). Uses `aterm_time::Instant` only.
@@ -144,6 +152,10 @@ pub mod pipeline;
 /// design (`docs/design/RAINBOW-KITTY-V2.md`). [`rainbow_kitty::Engine`] is what
 /// `CursorGlow` delegates to at its seam points; other styles are unaffected.
 pub mod rainbow_kitty;
+/// Claude Code's mascot ripple (2.1.304), decoded: the glint wave the
+/// harness's glass shimmers in step with — Claude's own per-cycle field and
+/// the ring train that carries it past the mascot. Pure: time comes in.
+pub mod ripple;
 /// Sound-cue policy: the gain laws (focus, music master, volume, per-cue
 /// switches) and the drains that turn engine cues into synth events. The sink
 /// is the host's.

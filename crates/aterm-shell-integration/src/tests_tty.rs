@@ -104,31 +104,75 @@ impl LiveShell {
             .len()
     }
 
-    /// Type `line` and Enter (a CR, as a terminal sends it), then wait for the
-    /// command's `133;D;<status>` and the next prompt's `133;A`. Returns the
-    /// offset past that prompt mark.
+    /// Type `line` and Enter (a CR, as a terminal sends it) at the prompt
+    /// ([`Self::type_at_prompt`]), then wait for the command's
+    /// `133;D;<status>` and the next prompt's `133;A`. Returns the offset past
+    /// that prompt mark.
     fn run_line(&mut self, line: &str, status: &str) -> usize {
-        let from = self.len();
-        self.send_bytes(format!("{line}\r").as_bytes());
+        let from = self.type_at_prompt(format!("{line}\r").as_bytes());
         let done = self.wait_for_after(&format!("\x1b]133;D;{status}"), from);
         self.wait_for_after("\x1b]133;A", done)
     }
 
-    /// Wait until zsh's line editor owns the tty for the prompt whose `133;A`
-    /// ends at `at`: the `\e[?2004h` (bracketed paste on) zle writes after its
-    /// first refresh, the refresh that puts the tty in zle's raw, no-echo mode
-    /// (`zrefresh` → `zsetterm`). A line typed before that lands in a tty that
-    /// still echoes, so the kernel echoes it ahead of the prompt as well as zle
-    /// drawing it on the line; `133;A` comes from precmd, well before. Returns
-    /// the offset past the mark.
-    fn wait_for_zle(&mut self, at: usize) -> usize {
-        self.wait_for_after("\x1b[?2004h", at)
+    /// Type `bytes` at the prompt the shell stands at, once its line editor
+    /// reads the tty ([`Self::wait_for_line_editor`]). Returns the offset they
+    /// were typed at.
+    fn type_at_prompt(&mut self, bytes: &[u8]) -> usize {
+        self.wait_for_line_editor();
+        let from = self.len();
+        self.send_bytes(bytes);
+        from
+    }
+
+    /// Wait until the line editor reads the tty at the prompt the shell stands
+    /// at (the last `133;A` it wrote, which the caller has waited for), and
+    /// return the offset past its word for it.
+    ///
+    /// The prompt's `133;A` comes before the editor puts the tty in its raw,
+    /// no-echo mode, and a line typed in between is echoed by the kernel as
+    /// well as drawn by the editor, onto whatever the shell writes meanwhile:
+    /// bash runs the user's PROMPT_COMMAND after aterm's `133;A`, and under
+    /// XTRACE its `+__aterm_body_prompt_command> eval '…'` took the typed
+    /// line's echo on its own line (Linux lane, aarch64 guest, bash 5.2.21: 2
+    /// of 14 suite runs, 5 of 200 of that test run 8 at a time); in zsh, precmd
+    /// and zle's setup come after it too, and the echo lands ahead of the
+    /// prompt. Each editor writes two words only once it owns the tty:
+    ///
+    /// - `\e[?2004h`, bracketed paste on: readline (bash 5.1+) writes it in
+    ///   `rl_prep_terminal`, after setting the tty; zle after zle-line-init,
+    ///   which follows the refresh that sets zle's mode (`zrefresh` →
+    ///   `zsetterm`);
+    /// - aterm's `133;B`: readline draws it with the rest of PS1, after
+    ///   `rl_prep_terminal`, in every bash; zle-line-init writes zsh's.
+    ///
+    /// Whichever comes first: bash 3.2 (macOS's /bin/bash) writes no
+    /// `\e[?2004h`, and a zsh body from before the lead writes no `133;B` under
+    /// an rc that replaced zle-line-init.
+    fn wait_for_line_editor(&mut self) -> usize {
+        const PROMPT: &[u8] = b"\x1b]133;A";
+        const OWNS_THE_TTY: [&[u8]; 2] = [b"\x1b[?2004h", b"\x1b]133;B"];
+        let prompt = {
+            let out = self
+                .stdout
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            out.windows(PROMPT.len())
+                .rposition(|w| w == PROMPT)
+                .map_or(0, |at| at + PROMPT.len())
+        };
+        let pipe = std::sync::Arc::clone(&self.stdout);
+        self.wait_on(&pipe, "the line editor's \\e[?2004h or 133;B", |out| {
+            let after = &out[prompt.min(out.len())..];
+            OWNS_THE_TTY
+                .iter()
+                .filter_map(|word| find_bytes(after, word).map(|at| prompt + at + word.len()))
+                .min()
+        })
     }
 
     /// The flags `FLAGS_LINE` printed, e.g. `isig=on icanon=on … ixon=off`.
     fn flags(&mut self) -> String {
-        let from = self.len();
-        self.send_bytes(format!("{FLAGS_LINE}\r").as_bytes());
+        let from = self.type_at_prompt(format!("{FLAGS_LINE}\r").as_bytes());
         let at = self.wait_for_after("FLAGS42", from);
         let text = stdout_between(self, from, at);
         let start = text
@@ -170,8 +214,7 @@ impl LiveShell {
     /// reads; the newline is then an empty line at the prompt, which marks no
     /// command.
     fn ctrl_c_status(&mut self, runner: &str) -> String {
-        let from = self.len();
-        self.send_bytes(
+        let from = self.type_at_prompt(
             format!("{runner}sh -c 'echo WAIT$((40+2)); exec head -c 1 >/dev/null'\r").as_bytes(),
         );
         let running = self.wait_for_after("WAIT42", from);
@@ -196,8 +239,7 @@ impl LiveShell {
     /// empty line for the prompt, which marks no command), with `hello\r` when
     /// the tty passed the CR through as a byte.
     fn cr_ends_read(&mut self) -> bool {
-        let from = self.len();
-        self.send_bytes(b"read -r x; echo \"GOT=[$x]\"\r");
+        let from = self.type_at_prompt(b"read -r x; echo \"GOT=[$x]\"\r");
         let started = self.wait_for_after("\x1b]133;C", from);
         self.send_bytes(b"hello\r\n");
         let got = self.wait_for_after("GOT=[", started);
@@ -209,8 +251,7 @@ impl LiveShell {
 
     /// A raw-mode child ends as `end` says, and the shell returns to a prompt.
     fn kill_raw_child(&mut self, end: RawEnd) {
-        let from = self.len();
-        self.send_bytes(format!("{}\r", end.line()).as_bytes());
+        let from = self.type_at_prompt(format!("{}\r", end.line()).as_bytes());
         let raw = self.wait_for_after("RAW42", from);
         let done = self.wait_for_after(&format!("\x1b]133;D;{}", end.status()), raw);
         self.wait_for_after("\x1b]133;A", done);
@@ -218,8 +259,7 @@ impl LiveShell {
 
     /// The shell's own report of its tty freeze (zsh `ttyctl`).
     fn zsh_frozen(&mut self) -> bool {
-        let from = self.len();
-        self.send_bytes(b"ttyctl; echo TTYCTL$((40+2))\r");
+        let from = self.type_at_prompt(b"ttyctl; echo TTYCTL$((40+2))\r");
         let at = self.wait_for_after("TTYCTL42", from);
         let text = stdout_between(self, from, at);
         self.wait_for_after("\x1b]133;A", at);
@@ -380,21 +420,8 @@ fn spawn_pty_shell_unwaited(
         argv.extend(over.into_iter().skip(1));
     }
     argv.push("-i".to_owned());
-    let mut cmd = Command::new("script");
-    if cfg!(target_os = "macos") {
-        cmd.args(["-q", "/dev/null"]).args(&argv);
-    } else {
-        let quoted: Vec<String> = argv
-            .iter()
-            .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
-            .collect();
-        // util-linux runs `-c`'s line through `$SHELL -c`: /bin/sh here, never a
-        // bash that reads `~/.bashrc` on the way (Debian's does for a `-c` run
-        // over ssh, `SSH_CLIENT` set), which ran the rig's startup file before
-        // the shell under test began.
-        cmd.args(["-q", "-c", &quoted.join(" "), "/dev/null"])
-            .env("SHELL", "/bin/sh");
-    }
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let mut cmd = pty_script(&argv);
     // The hermetic environment of `shell_command`, applied to `script` (the
     // shell inherits it), then the fixture's home and the injection.
     let hermetic = shell_command(program);
@@ -559,7 +586,7 @@ fn an_integrated_zsh_whose_rc_left_the_tty_raw_takes_ctrl_c_at_its_first_prompt(
     ] {
         std::fs::write(fx.home.join(".zshrc"), &rc).expect(".zshrc");
         let mut sh = spawn_pty_shell(ShellType::Zsh, zsh, &fx, dir, &[]);
-        let at = sh.wait_for_zle(0);
+        let at = sh.wait_for_line_editor();
         if fixed {
             // The prompt drawn again, on the repaired tty.
             sh.wait_for_after("@@P@@", at);
@@ -583,8 +610,8 @@ fn an_integrated_zsh_whose_rc_left_the_tty_raw_takes_ctrl_c_at_its_first_prompt(
         if fixed {
             // An interrupt flushes the tty's input: type on only at the next
             // prompt. The control's ^C is a byte, and there is none.
-            let next = sh.wait_for_after("\x1b]133;A", from);
-            sh.wait_for_zle(next);
+            sh.wait_for_after("\x1b]133;A", from);
+            sh.wait_for_line_editor();
         }
         let from = sh.len();
         sh.send_bytes(b"echo KEPT$((40+2)) $?\r");
@@ -1006,16 +1033,15 @@ fn an_integrated_zsh_marks_every_prompt_whatever_its_rc_does_to_zle_line_init() 
     // `n` prompts, each from its 133;A to the next one's: its line-init, then a
     // command, whose status cycles through 3, 1 and 0 (each form of the event: a
     // prompt after a 3 is checked in every phase), and whether zsh reports that
-    // status (`zsh: exit <status>`, PRINT_EXIT_VALUE). Each line is typed once
-    // zle owns the tty, so its only echo is VERBOSE's: typed at the bare 133;A,
-    // a loaded machine lets the tty echo it ahead of the prompt too
+    // status (`zsh: exit <status>`, PRINT_EXIT_VALUE). `run_line` types each
+    // line once zle owns the tty, so its only echo is VERBOSE's: typed at the
+    // bare 133;A, a loaded machine lets the tty echo it ahead of the prompt too
     // (`\n(exit 3)\r\n` twice in one prompt).
     let lines = [("(exit 3)", "3"), ("false", "1"), ("true", "0")];
     let prompts = |sh: &mut LiveShell, at: &mut usize, n: usize| -> Vec<(String, usize, &str)> {
         (0..n)
             .map(|i| {
                 let (line, status) = lines[i % lines.len()];
-                sh.wait_for_zle(*at);
                 let next = sh.run_line(line, status);
                 let prompt = stdout_between(sh, *at, next);
                 *at = next;
@@ -1392,7 +1418,7 @@ fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bas
     sh.run_line("echo alive$((40+2))", "0");
     let from = sh.run_line("set -o functrace", "0");
     // An empty line: a prompt with no command before it.
-    sh.send_bytes(b"\r");
+    sh.type_at_prompt(b"\r");
     sh.wait_for_after("\x1b]133;A", from);
     sh.run_line("f() { echo in-f; }; f", "0");
     sh.run_line("echo hi", "0");
@@ -1417,7 +1443,7 @@ fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bas
         r#"w() { local a=$1; eval -- "$T"; : "$a"; }; eval "T=($(trap -p DEBUG))"; T=("${T[2]}"); trap 'w "$_"' DEBUG"#,
         "0",
     );
-    sh.send_bytes(b"echo wrapped$((40+2))\r");
+    sh.type_at_prompt(b"echo wrapped$((40+2))\r");
     let at = sh.wait_for_after("wrapped42", from);
     let end = sh.wait_for_after("\x1b]133;A", at);
     assert_eq!(
@@ -1482,8 +1508,7 @@ fn an_integrated_bash_chains_the_debug_trap_its_rc_set() {
             &[]
         };
         let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
-        let from = sh.len();
-        sh.send_bytes(b" echo typed$((6*7))\r");
+        let from = sh.type_at_prompt(b" echo typed$((6*7))\r");
         let ran = sh.wait_for_after("typed42", from);
         let done = sh.wait_for_after("\x1b]133;A", ran);
         let text = stdout_between(&sh, from, done);
@@ -1570,8 +1595,7 @@ fn an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks() {
             &[]
         };
         let mut sh = spawn_pty_shell(ShellType::Bash, bash, &fx, dir, extra);
-        let from = sh.len();
-        sh.send_bytes(b" echo typed$((6*7))\r");
+        let from = sh.type_at_prompt(b" echo typed$((6*7))\r");
         let ran = sh.wait_for_after("typed42", from);
         let done = sh.wait_for_after("\x1b]133;A", ran);
         let marked = stdout_between(&sh, from, done).contains("\x1b]133;C");
@@ -1612,8 +1636,7 @@ fn an_integrated_bash_whose_rc_set_errexit_and_an_err_trap_loads_quietly() {
         &dir,
         &[(REKEY_PATH_VAR, rekey.to_str().expect("UTF-8"))],
     );
-    let loaded = sh.len();
-    sh.send_bytes(b"echo typed$((6*7))\r");
+    let loaded = sh.type_at_prompt(b"echo typed$((6*7))\r");
     let ran = sh.wait_for_after("typed42", loaded);
     sh.wait_for_after("\x1b]133;A", ran);
     let load = stdout_between(&sh, 0, loaded);
@@ -1731,8 +1754,7 @@ fn an_integrated_bash_with_an_array_prompt_command_reports_only_typed_lines() {
             .expect("append to the history file");
     };
     let enter = |sh: &mut LiveShell| {
-        let at = sh.len();
-        sh.send_bytes(b"\r");
+        let at = sh.type_at_prompt(b"\r");
         sh.wait_for_after("\x1b]133;A", at)
     };
     let from = sh.len();

@@ -26,8 +26,7 @@ use crate::harness_glass::{Arrival, on_act, on_act_at};
 /// A switch a test flips (`true`: the label withheld), by name.
 type Switch = (&'static str, fn(&mut App, bool));
 
-/// The chips at rest in a hosted Cruise session: Autopilot's `∞` alone (no
-/// settings button beside it, owner 2026-10-20).
+/// The chips at rest in a hosted Cruise session: Autopilot's `∞` alone.
 const CHIPS: &str = "\u{221e}";
 
 /// `app` hosted, its session drawing Claude Code in bypass under the
@@ -226,9 +225,9 @@ const SPLIT_PATH: &str = "/private/tmp/claude-502/-Users-person-aterm/\
 ///
 /// RED before the fix: the label and the title were paired with the WHOLE
 /// facts only, so neither was drawn and a hover only underlined the chip.
-/// NEGATIVE CONTROL: at 58 columns, where the cut facts leave no room for
-/// it, the label is not drawn and leaves no lone glyph; the facts stand.
-/// (60 columns before the `⚙` chip's two cells went, 2026-10-20.)
+/// NEGATIVE CONTROL: at 58 columns, the widest where the cut facts leave no
+/// room for it, the label is not drawn and leaves no lone glyph; the facts
+/// stand.
 #[test]
 fn a_split_panes_cut_path_leaves_the_label_and_the_hovered_title_room() {
     let t0 = Instant::now();
@@ -574,13 +573,11 @@ fn a_pause_told_under_a_hover_is_in_the_title_on_the_next_frame() {
 }
 
 /// THE CHIPS ARE BUTTONS A SCREEN READER CAN PRESS (§9.2.1): the tree's
-/// chips are the frame's — Autopilot alone, over the cells the painter
-/// recorded, named in words (`Autopilot: cruise.`), the newest act its
-/// description (none once it is a day old, as the title leaves it out) —
-/// and a reader's click on it steps its word, as a click on its cells does.
-/// No `Harness settings` button is published: the rule draws none (owner,
-/// 2026-10-20), and the tree is the frame's (RED on the tree before the
-/// removal, which published two).
+/// chips are the frame's — Autopilot (then the facts), over the cells the
+/// painter recorded, named in words (`Autopilot: cruise.`), the newest act
+/// its description (none once it is a day old, as the title leaves it out)
+/// — and a reader's click on Autopilot steps its word, as a click on its
+/// cells does.
 ///
 /// NEGATIVE CONTROL: a click on a chip the glass does not show (a pane too
 /// narrow for it) does nothing.
@@ -597,7 +594,18 @@ fn the_chips_are_buttons_a_screen_reader_can_press() {
     on_act_at(&mut app, session, Act::Approved, now);
     frame(&mut app, wid);
     let chips = app.claude_chips_a11y(wid);
-    assert_eq!(chips.len(), 1, "Autopilot alone: {chips:?}");
+    // Autopilot first, every other a fact the rule shows (the facts' own
+    // buttons are `claude_facts_gesture_tests`'), the top rule's harness
+    // switch or the title slot (the act's label).
+    assert!(
+        chips.len() > 1
+            && chips[1..].iter().all(|c| c.chip.fact().is_some()
+                || matches!(
+                    c.chip,
+                    HarnessChip::Switch | HarnessChip::SwitchOn | HarnessChip::Title
+                )),
+        "{chips:?}"
+    );
     let strip = usize::from(app.chrome_rows(wid));
     let (row, col) = hit(&app, wid, Chip::Autopilot);
     assert_eq!(
@@ -608,10 +616,6 @@ fn the_chips_are_buttons_a_screen_reader_can_press() {
     assert_eq!(
         chips[0].description,
         Some(format!("Last: approved at {clock}."))
-    );
-    assert!(
-        chips.iter().all(|c| !c.label.contains("settings")),
-        "no settings button: {chips:?}"
     );
     // A day and a minute old, the act is told no more.
     let (mut old, _) = arrival_now(t0, 20_000);
@@ -701,6 +705,132 @@ fn a_reader_cannot_press_a_chip_under_painted_chrome() {
     );
 }
 
+/// EVERYTHING ATERM DRAWS IN THE RULES IS IN THE TREE (review G1): the
+/// grid's text there is Claude's own `─`, so the permission-mode light, the
+/// top rule's harness switch and the title slot are nodes of their own.
+/// The light, drawn in plan mode, is a button over its cells named by its
+/// title and its mode, with what a click does as its description, and a
+/// reader's click on it presses Claude's own shift+tab. The switch is a
+/// switch over its own cells named by the words it paints and told on, and
+/// a reader's click on it turns the harness off, after which it is told off
+/// with its `on` button beside it. A hover on the light
+/// writes its title into the slot, which the tree publishes as its words.
+///
+/// NEGATIVE CONTROL: at rest in bypass, an expected mode, no light is drawn
+/// and none is published, and a reader's click on it types nothing.
+#[cfg(a11y_tree)]
+#[test]
+fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
+    use super::gesture_tests::{MODE, PGID, PLAN, autopilot, pty, px_of};
+    use crate::a11y_tree::{GridChip, HarnessChip};
+    use crate::autopilot::AutopilotView;
+    use aterm_agent::harness::lights::{Mode, SHIFT_TAB};
+    use aterm_agent::supervise::Autopilot;
+    let of = |chips: &[GridChip], chip| chips.iter().find(|c| c.chip == chip).cloned();
+    let (mut app, wid, session, (_hosted, mut reader)) = ticker_app(120);
+    // Claude Code's session, its claim this window's host's: the harness's
+    // glass is worn, so the top rule wears the lit switch.
+    {
+        let ctx = app.pool.get(session).expect("session").ctx.clone();
+        {
+            let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline.note_foreground_group(PGID);
+            timeline.set_program(PGID, Some("claude".into()));
+        }
+        crate::session_timeline::claim_supervisor(
+            &ctx,
+            &crate::harness_host::holder(),
+            None,
+            None,
+            crate::metrics::now_us(),
+        )
+        .expect("the claim");
+    }
+    draw_claude(&app, session, BYPASS);
+    frame(&mut app, wid);
+    let strip = usize::from(app.chrome_rows(wid));
+    // NEGATIVE CONTROL: bypass draws no light, so the tree has none.
+    assert_eq!(of(&app.claude_chips_a11y(wid), HarnessChip::Mode), None);
+    app.press_claude_chip_for_reader(wid, session, HarnessChip::Mode);
+    assert!(pty(&mut reader, 0).is_empty(), "no light, nothing typed");
+    // The light, in plan mode.
+    draw_claude(&app, session, PLAN);
+    frame(&mut app, wid);
+    let chips = app.claude_chips_a11y(wid);
+    let light = of(&chips, HarnessChip::Mode).unwrap_or_else(|| panic!("{chips:?}"));
+    let (row, col) = hit(&app, wid, MODE);
+    assert_eq!((light.row, light.col), (row - strip, col));
+    assert_eq!(light.label, "Permission mode: plan.");
+    let relabelled = app.windows[&wid].claude_lights.sessions[&session].relabelled;
+    assert_eq!(
+        light.description,
+        Some(format!(
+            "Click for {} or auto.",
+            Mode::Bypass.word_on_glass(relabelled)
+        ))
+    );
+    // The harness switch, on the top rule: a switch told it is on.
+    let switch = of(&chips, HarnessChip::Switch).unwrap_or_else(|| panic!("{chips:?}"));
+    assert_eq!(switch.label, "alab harness on: Claude Code");
+    assert_eq!(switch.toggled, Some(aterm_a11y::model::Toggled::True));
+    assert!(switch.description.is_some(), "{switch:?}");
+    let drawn = app.windows[&wid]
+        .claude_lights
+        .border_toggles
+        .iter()
+        .find(|b| b.session == session)
+        .cloned()
+        .expect("the switch is drawn");
+    assert_eq!(
+        (switch.row, switch.col, switch.width),
+        (
+            drawn.frame_row - strip,
+            drawn.switch.start,
+            drawn.switch.len()
+        )
+    );
+    assert!(
+        row_text(&app, wid, drawn.frame_row)[..].contains("alab harness \u{25cf} on"),
+        "the glass says what the node says"
+    );
+    // No title at rest.
+    assert_eq!(of(&chips, HarnessChip::Title), None, "{chips:?}");
+    // A hover on the light: its title in the slot, and in the tree.
+    let (x, y) = px_of(&app, wid, (row, col));
+    app.on_cursor_moved(wid, x, y);
+    frame(&mut app, wid);
+    let title = of(&app.claude_chips_a11y(wid), HarnessChip::Title).expect("the title slot");
+    assert_eq!(title.row, row - strip);
+    assert!(
+        title.label.starts_with("Permission mode: "),
+        "{:?}",
+        title.label
+    );
+    assert!(
+        rule(&app, wid).contains(&title.label),
+        "the slot's words as drawn: {:?} in {:?}",
+        title.label,
+        rule(&app, wid)
+    );
+    // A reader's click on the light presses Claude's own shift+tab.
+    app.press_claude_chip_for_reader(wid, session, HarnessChip::Mode);
+    assert_eq!(pty(&mut reader, SHIFT_TAB.len()), SHIFT_TAB);
+    // A reader's click on the switch turns the harness off: the switch is
+    // told off, and the `on` button stands beside it.
+    app.press_claude_chip_for_reader(wid, session, HarnessChip::Switch);
+    assert_eq!(
+        autopilot(&app, session),
+        (Some(Autopilot::Off), AutopilotView::Off)
+    );
+    frame(&mut app, wid);
+    let chips = app.claude_chips_a11y(wid);
+    let switch = of(&chips, HarnessChip::Switch).expect("the off switch");
+    assert_eq!(switch.label, "alab harness off: Claude Code");
+    assert_eq!(switch.toggled, Some(aterm_a11y::model::Toggled::False));
+    let on = of(&chips, HarnessChip::SwitchOn).expect("the on button");
+    assert_eq!(on.label, "on: turn the Claude Code harness on");
+}
+
 #[cfg(a11y_tree)]
 #[test]
 fn a_reader_chip_click_commits_an_open_in_grid_rename() {
@@ -743,6 +873,7 @@ fn a_reader_chip_click_commits_an_open_in_grid_rename() {
     app.end_session_rename_editor(wid);
     assert_eq!(pinned(&app), None);
     app.switch_tab_in(wid, 0);
+    frame(&mut app, wid);
     // The master switch off: the reader's click on `⊘ off` turns it on and
     // raises nothing (owner, 2026-10-20: "remove the harness settings button
     // in the UX").

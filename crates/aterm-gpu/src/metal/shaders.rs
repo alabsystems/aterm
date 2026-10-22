@@ -62,6 +62,7 @@ pub(crate) const BLOOM: &str = include_str!("../../shaders/bloom.metal");
 pub(crate) const SHIMMER: &str = include_str!("../../shaders/shimmer.metal");
 
 /// The MSL source for one [`ShaderLibrary`].
+#[inline]
 pub(crate) const fn source(library: ShaderLibrary) -> &'static str {
     match library {
         ShaderLibrary::Cell => CELL,

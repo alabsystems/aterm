@@ -1075,15 +1075,20 @@ impl MessageLog {
     /// wire holds its share, else the oldest retired record, else the oldest. A filed
     /// exception outlives the ordinary FIFO for `FILED_KEEP` after its filing: the
     /// dismissal is the fact's memory (`MessageCenter::quiet_record`), and the ring is
-    /// counted in records, not days.
+    /// counted in records, not days. Inside the wire's share too (a tool's `notice later`
+    /// entry the owner dismissed): a script's ordinary records take each other first, and
+    /// a filing goes only when the share holds nothing else retired, so the share stays
+    /// bounded.
     fn evict_one(&mut self, at_ms: u64) {
         let wire_full = self.wire_records >= WIRE_LOG_SHARE;
+        let keep_since = at_ms.saturating_sub(crate::need::FILED_KEEP_MS);
         let wire_victim = || {
+            let retired_wire = |r: &LogRecord| r.wire_owned() && !r.is_live();
             self.ring
                 .iter()
-                .position(|r| r.wire_owned() && !r.is_live())
+                .position(|r| retired_wire(r) && !r.kept_as_filing(keep_since))
+                .or_else(|| self.ring.iter().position(retired_wire))
         };
-        let keep_since = at_ms.saturating_sub(crate::need::FILED_KEEP_MS);
         let victim = wire_full
             .then(wire_victim)
             .flatten()
@@ -2135,6 +2140,73 @@ pub(crate) mod tests {
             ..posted(1)
         };
         assert!(!hosted.wire_owned());
+    }
+
+    /// A tool's exception the owner filed (`notice later`, then Dismiss) is the wire's
+    /// record and the fact's memory: inside the wire's share, the script's ordinary
+    /// records go before it. A share made only of filings still turns over within itself,
+    /// so the wire never takes more than its share of a ring of aterm's own.
+    #[test]
+    fn a_wire_filing_outlives_the_wires_own_churn_inside_its_share() {
+        let file = |log: &mut MessageLog, rec: LogRecord, how: Retired| {
+            let id = rec.id;
+            let at = rec.stamp.unix_ms;
+            log.record_posted(rec);
+            log.record_retired(
+                id,
+                how,
+                at,
+                Instant::now(),
+                FinalWords {
+                    title: "t",
+                    detail: &[],
+                    repeats: 1,
+                    mark: None,
+                },
+            );
+            id
+        };
+        let next = |log: &mut MessageLog, origin: Origin, later: bool| {
+            let id = log.mint();
+            LogRecord {
+                id,
+                origin,
+                key: later.then(|| format!("wire.k{}", id.raw())),
+                later,
+                ..posted(id.raw())
+            }
+        };
+        let fill_with_host = |log: &mut MessageLog| {
+            for _ in 0..LOG_CAP {
+                let rec = next(log, Origin::Host, false);
+                file(log, rec, Retired::Recorded);
+            }
+        };
+        let mut log = MessageLog::empty();
+        fill_with_host(&mut log);
+        let rec = next(&mut log, Origin::Wire, true);
+        let dismissed = file(&mut log, rec, Retired::Dismissed);
+        for _ in 0..600 {
+            let rec = next(&mut log, Origin::Wire, false);
+            file(&mut log, rec, Retired::Recorded);
+        }
+        assert!(log.get(dismissed).is_some(), "the owner's dismissal stays");
+        let wire_n = log.records().filter(|r| r.wire_owned()).count();
+        assert_eq!(wire_n, WIRE_LOG_SHARE, "the share holds");
+        assert_eq!(log.wire_records, wire_n);
+        // The control: filings alone past the share turn over among themselves.
+        let mut log = MessageLog::empty();
+        fill_with_host(&mut log);
+        for _ in 0..600 {
+            let rec = next(&mut log, Origin::Wire, true);
+            file(&mut log, rec, Retired::Dismissed);
+        }
+        let wire_n = log.records().filter(|r| r.wire_owned()).count();
+        assert_eq!(
+            wire_n, WIRE_LOG_SHARE,
+            "filings never take aterm's own place"
+        );
+        assert_eq!(log.len() - wire_n, LOG_CAP - WIRE_LOG_SHARE);
     }
 
     /// A message at the crate's own caps reads back from its own line. The caps are in

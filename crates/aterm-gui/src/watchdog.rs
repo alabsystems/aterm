@@ -225,6 +225,9 @@ label_enum! {
         /// Entered through [`enter_about_to_wait`], whose guard hands the thread
         /// to [`Breadcrumb::AboutToWait`] as the handler returns.
         AboutToWaitWork => "about_to_wait",
+        /// The event loop has ended and teardown is waiting for accepted work
+        /// to become durable. Waiting is expected; a CPU spin is still a stall.
+        ShutdownWait => "shutdown_wait",
     }
 }
 
@@ -247,8 +250,8 @@ impl Breadcrumb {
         )
     }
 
-    /// A root where a frozen heartbeat is expected (startup, idle, a modal dialog, the
-    /// update handoff), so the sampler does not report a stall while parked here.
+    /// A root where a frozen heartbeat is expected, so the sampler does not
+    /// report a stall while parked here.
     fn is_park_point(self) -> bool {
         matches!(
             self,
@@ -256,6 +259,7 @@ impl Breadcrumb {
                 | Breadcrumb::AboutToWait
                 | Breadcrumb::UpdateHandoff
                 | Breadcrumb::Modal
+                | Breadcrumb::ShutdownWait
         )
     }
 }
@@ -2166,6 +2170,7 @@ mod tests {
             (Breadcrumb::Modal, ten_min, RELEASE_STALL_THRESHOLD, false),
             (Breadcrumb::UpdateHandoff, ten_min, RELEASE_STALL_THRESHOLD, false),
             (Breadcrumb::AboutToWaitWork, STALL_THRESHOLD, STALL_THRESHOLD, true),
+            (Breadcrumb::ShutdownWait, ten_min, STALL_THRESHOLD, false),
         ];
         for (bc, frozen, bar, stall) in table {
             assert_eq!(
@@ -2558,19 +2563,26 @@ mod tests {
             }
             hits
         };
-        let spun = run(Breadcrumb::AboutToWait, true);
-        assert_eq!(spun.len(), 1, "one report per contiguous spin: {spun:?}");
-        let (tick, hit) = spun[0];
-        assert!(hit.busy && hit.root == Breadcrumb::AboutToWait);
-        assert!(hit.frozen >= STALL_THRESHOLD, "{hit:?}");
-        assert_eq!(
-            tick, 3,
-            "busy from the first interval, the bar crossed at the third sample"
-        );
-        assert!(
-            run(Breadcrumb::AboutToWait, false).is_empty(),
-            "idle is not a stall"
-        );
+        for park in [Breadcrumb::AboutToWait, Breadcrumb::ShutdownWait] {
+            let spun = run(park, true);
+            assert_eq!(spun.len(), 1, "one report per contiguous spin: {spun:?}");
+            let (tick, hit) = spun[0];
+            assert!(hit.busy && hit.root == park);
+            assert!(hit.frozen >= STALL_THRESHOLD, "{hit:?}");
+            assert_eq!(
+                tick, 3,
+                "busy from the first interval, the bar crossed at the third sample"
+            );
+            assert!(
+                run(park, false).is_empty(),
+                "a quiet {park:?} is not a stall"
+            );
+            // A machine without CPU readings still permits a deliberate wait.
+            let mut s = Sampler::with_threshold(t0, 3, STALL_THRESHOLD);
+            for tick in 1..=12u32 {
+                assert!(s.poll_with(t0 + step * tick, 3, park, None).is_none());
+            }
+        }
         for designed in [
             Breadcrumb::Startup,
             Breadcrumb::Modal,
@@ -2579,14 +2591,6 @@ mod tests {
             assert!(
                 run(designed, true).is_empty(),
                 "{designed:?} does real work by design"
-            );
-        }
-        // With no CPU reading at all, the park point keeps its exemption.
-        let mut s = Sampler::with_threshold(t0, 3, STALL_THRESHOLD);
-        for tick in 1..=12u32 {
-            assert!(
-                s.poll_with(t0 + step * tick, 3, Breadcrumb::AboutToWait, None)
-                    .is_none()
             );
         }
     }

@@ -1769,17 +1769,7 @@ fn spawn_live_fish_from(
     extra: &[(&str, &str)],
 ) -> LiveShell {
     std::fs::create_dir_all(fx.home.join("config").join("fish")).expect("config dir");
-    let mut cmd = Command::new("script");
-    if cfg!(target_os = "macos") {
-        cmd.args(["-q", "/dev/null", fish, "-i"]);
-    } else {
-        // util-linux runs `-c`'s line through `$SHELL -c`: /bin/sh here, never a
-        // bash that reads `~/.bashrc` on the way (Debian's does for a `-c` run
-        // over ssh, `SSH_CLIENT` set), which ran the rig's startup file before
-        // the shell under test began.
-        cmd.args(["-q", "-c", &format!("{fish} -i"), "/dev/null"])
-            .env("SHELL", "/bin/sh");
-    }
+    let mut cmd = pty_script(&[fish, "-i"]);
     let hermetic = shell_command(fish);
     for (key, value) in hermetic.get_envs() {
         match value {
@@ -2027,8 +2017,7 @@ fn a_live_zsh_with_a_line_init_hook_is_upgraded_without_a_widget_loop() {
     )
     .expect(".zshrc");
     let InjectionEnv { env_add, .. } = injection_for(ShellType::Zsh, &old).expect("zsh");
-    let mut cmd = Command::new("script");
-    cmd.args(["-q", "/dev/null", zsh, "-i"]);
+    let mut cmd = pty_script(&[zsh, "-i"]);
     let hermetic = shell_command(zsh);
     for (key, value) in hermetic.get_envs() {
         match value {

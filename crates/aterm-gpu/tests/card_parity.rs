@@ -46,6 +46,9 @@ const CARD: u64 = 7;
 /// detector, never a budget: more frames than any episode has.
 const FRAMES_MAX: usize = 400;
 
+/// Flow steps compared after the intro: the card flows on while it may animate.
+const FLOW_STEPS: usize = 3;
+
 /// A hidden-cursor terminal whose every cell is the ground `bg` (an SGR
 /// background, `None`: the theme's): background fills only, byte-equal on
 /// both renderers, so any delta is the card's.
@@ -91,6 +94,7 @@ fn scene(cpu: &Renderer, top: u16, dark: bool, ground: u32) -> CardScene {
         serious: false,
         coat: 0x00E8_A060,
         eye: 0x0040_C080,
+        wand: None,
     }
 }
 
@@ -156,8 +160,10 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
             let t0 = Instant::now();
             card.arm(t0, 0x5eed_ca4d);
             let mut now = t0;
-            let mut drawn = 0;
-            // The episode, frame by frame, then the settled frame.
+            let (mut drawn, mut flowed) = (0, 0);
+            // The intro, frame by frame, then the flow's first steps (the card
+            // flows on while it may animate, f9b86bc658), then the settled
+            // frame a held card draws.
             loop {
                 let frame = card.draw(now, &at, true, &mut frames);
                 let input = input_with(&mut t, layers(&frame, &at, &cpu), Vec::new());
@@ -179,14 +185,21 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
                     );
                 }
                 drawn += 1;
-                assert!(drawn < FRAMES_MAX, "{what}: the episode never ended");
+                assert!(drawn < FRAMES_MAX, "{what}: the intro never ended");
+                if card.flowing(now) {
+                    flowed += 1;
+                    if flowed == FLOW_STEPS {
+                        break;
+                    }
+                }
                 match card.deadline(now) {
                     Some(next) => now = next.max(now + Duration::from_millis(FRAME_MS)),
                     None => break,
                 }
             }
             assert!(drawn > 10, "{what}: an episode of {drawn} frames");
-            let settled = card.draw(now, &at, true, &mut frames);
+            assert_eq!(flowed, FLOW_STEPS, "{what}: the card flows after its intro");
+            let settled = card.draw(now, &at, false, &mut frames);
             let settled_layers = layers(&settled, &at, &cpu);
             let input = input_with(&mut t, settled_layers.clone(), Vec::new());
             let (c, g) = (
@@ -201,7 +214,7 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
             );
             // Replayed: the same contents, nothing uploaded.
             let replayed = card
-                .replay(&at, true, &frames)
+                .replay(&at, false, &frames)
                 .expect("a settled card replays");
             assert!(Arc::ptr_eq(&replayed.under, &settled.under));
             let input = input_with(&mut t, layers(&replayed, &at, &cpu), Vec::new());
@@ -223,7 +236,7 @@ fn the_cards_layers_are_byte_exact_on_the_gpu() {
             // An inline scroll: the settled frame a row up, replayed.
             let up = scene(&cpu, top - 1, dark, ground);
             let moved = card
-                .replay(&up, true, &frames)
+                .replay(&up, false, &frames)
                 .expect("a scrolled card replays");
             assert!(
                 Arc::ptr_eq(&moved.over, &settled.over),

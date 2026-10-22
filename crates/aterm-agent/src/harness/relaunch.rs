@@ -4963,6 +4963,13 @@ pub struct ExitLook {
     /// ([`ExitRecord::Refused`]), with `crashed` `Some(false)`. `false` for
     /// every other look and agent.
     pub refused: bool,
+    /// A GEMINI CLI'S OWN RESTART REFUSED FOR ITS OWN SESSION ID, with
+    /// `crashed` `Some(true)` (`upgrade_gemini::ExitKind::Restarted`): its
+    /// `/settings`, IDE trust or admin settings restart ran a worker's argv
+    /// again and met the `--session-id` its first start wrote (`42`). A
+    /// person's keystroke before it asked for that restart, never the exit
+    /// ([`restarted_itself`]). `false` for every other look and agent.
+    pub restarted_itself: bool,
 }
 
 /// How long after the first look an exit may still be removing its own record:
@@ -4996,6 +5003,7 @@ pub fn look_at_exit(home: &Path, snap: &Snapshot) -> ExitLook {
         agent: upgrade::Agent::Claude,
         crashed: None,
         refused: false,
+        restarted_itself: false,
     }
 }
 
@@ -5037,6 +5045,38 @@ pub fn look_at_agy_exit(opts: &Opts, snap: &Snapshot) -> ExitLook {
 #[must_use]
 pub fn look_at_gemini_exit(opts: &Opts, snap: &Snapshot) -> ExitLook {
     super::upgrade_drive::gemini_look_at_exit(opts, snap)
+}
+
+/// WHETHER THE EXIT IS A GEMINI CLI'S OWN RESTART REFUSED FOR ITS OWN
+/// SESSION ID ([`ExitLook::restarted_itself`]), read as the exit is seen,
+/// before whose exit it is decided: looked at every [`EXIT_LOOK`] until the
+/// shell's word is drawn (`crashed` told), at most [`EXIT_GONE`]. `look` and
+/// `wait` are [`exit_record`]'s. `false` for an unreadable look, a process
+/// still running, a word not told within the wait, and any other end.
+///
+/// A person's `/settings` or IDE trust restart comes seconds after their own
+/// keys, inside `[harness] human_grace_s`: read after the person's grace
+/// ([`on_exit`]'s [`OnExit::PersonAsked`]), the worker the restart was for
+/// was left at its shell, `Session ID … already exists` (the review of
+/// b9/spawn-residuals, F2).
+pub fn restarted_itself(
+    mut look: impl FnMut() -> Option<ExitLook>,
+    mut wait: impl FnMut(Duration) -> bool,
+) -> bool {
+    let mut waited = Duration::ZERO;
+    loop {
+        match look() {
+            None => return false,
+            Some(now) if !now.running && now.crashed.is_some() => {
+                return now.crashed == Some(true) && now.restarted_itself;
+            }
+            Some(_) => {}
+        }
+        if waited >= EXIT_GONE || !wait(EXIT_LOOK) {
+            return false;
+        }
+        waited += EXIT_LOOK;
+    }
 }
 
 /// Read what the exit left, once, as it is seen, independent of the back-off.
@@ -6822,6 +6862,19 @@ pub fn driver_hand(status: &str) -> bool {
 #[must_use]
 pub fn person_present(status: &str, grace_s: u32) -> bool {
     HumanInput::of_status(status).within(grace_s) == Some(true)
+}
+
+/// THE PERSON'S GRACE STILL TO RUN by one `status` reply (`human_ms=`):
+/// how long until their last input is `grace_s` old, which a relaunch line
+/// typed for them waits out (`upgrade_drive::held_by_status`, a counted wait
+/// at each try). Zero with no input within it, none ever, or no stamp read.
+#[must_use]
+pub fn grace_left(status: &str, grace_s: u32) -> Duration {
+    HumanInput::of_status(status)
+        .ago()
+        .map_or(Duration::ZERO, |age| {
+            Duration::from_secs(u64::from(grace_s)).saturating_sub(age)
+        })
 }
 
 /// The pauses before consecutive relaunches of a crash: a repeating crash is

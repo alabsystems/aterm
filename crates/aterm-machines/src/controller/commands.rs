@@ -4210,7 +4210,9 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
             return ExitCode::FAILURE;
         }
     };
-    let mut journal = match crate::engine::account_journal() {
+    // The journal of the account `sys` acts as: the items' own port, never one this
+    // process resolves beside it.
+    let mut journal = match sys.journal() {
         Ok(journal) => journal,
         Err(why) => {
             errln!("aterm machines here: {why}");
@@ -4228,7 +4230,7 @@ pub fn here(sys: &dyn System, mode: Mode, baseline_path: &Path, json: bool) -> E
         sys,
         &ctx,
         &remedy,
-        &mut journal,
+        journal.as_mut(),
         &mut |_| {},
     ) {
         Ok(rows) => rows,
@@ -6733,21 +6735,21 @@ __NVGPU__ NVIDIA GB10, 12, 45, 3.40\n";
         );
     }
 
+    /// `here` journals each change where the account its items act on is: the system it
+    /// runs against, here the fake, whose files hold the line. Negative control: a run
+    /// that changes nothing writes none. The journal this process would resolve for
+    /// itself (`aterm_types::dirs::account_state_dir`, where `here` journaled before) is
+    /// never asked: a mutant that asks it leaves the fake's journal empty and fails here.
     #[test]
-    fn here_journals_each_change_under_the_accounts_state_and_nothing_when_all_is_right() {
-        // A test binary's private state root is the account's state here
-        // (`engine::account_journal`); no other test of this binary journals into it. The
-        // lines already there (a development build's own `ATERM_STATE_HOME`) are kept.
-        let state = aterm_types::dirs::state_dir().expect("a test binary's state root");
-        let journal = aterm_converge::FileJournal::under(&state);
-        let journaled = || -> Vec<aterm_json::Value> {
-            std::fs::read_to_string(journal.path())
+    fn here_journals_each_change_in_the_journal_of_the_system_it_runs_on() {
+        let journaled = |sys: &Fake| -> Vec<aterm_json::Value> {
+            sys.written(Fake::JOURNAL)
+                .map(|bytes| String::from_utf8(bytes).unwrap())
                 .unwrap_or_default()
                 .lines()
                 .map(|l| aterm_json::from_str(l).unwrap())
                 .collect()
         };
-        let before = journaled().len();
         let baseline = "/b/baseline.toml";
         let text: &[u8] = b"schema = 1\n[names]\nhost_name = \"lab-07.lab.example\"\n";
         // A Mac at the login window (root owns the console), so the run has no users.
@@ -6777,10 +6779,9 @@ __NVGPU__ NVIDIA GB10, 12, 45, 3.40\n";
             ExitCode::SUCCESS
         );
         assert_eq!(
-            journaled().len(),
-            before,
-            "{}: a line for a run that changed nothing",
-            journal.path().display()
+            journaled(&sys),
+            Vec::<aterm_json::Value>::new(),
+            "a line for a run that changed nothing"
         );
         // A change: its line, then scutil's set and the read-back.
         let sys = mac();
@@ -6800,9 +6801,9 @@ __NVGPU__ NVIDIA GB10, 12, 45, 3.40\n";
             here(&sys, Mode::Apply, Path::new(baseline), true),
             ExitCode::SUCCESS
         );
-        let lines = journaled();
-        assert_eq!(lines.len(), before + 1, "{lines:?}");
-        let line = &lines[before];
+        let lines = journaled(&sys);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
         assert_eq!(line["id"].as_str(), Some("names.host-name"));
         assert_eq!(line["from"].as_str(), Some("not set"));
         assert_eq!(line["to"].as_str(), Some("\"lab-07.lab.example\""));

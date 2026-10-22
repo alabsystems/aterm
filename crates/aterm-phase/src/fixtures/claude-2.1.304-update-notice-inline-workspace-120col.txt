@@ -1,0 +1,13 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the update notice under the workspace launch card (`--effort workspace` on the command line), inline renderer, `lastReleaseNotesSeen` seeded to 2.1.290: the card at row 0 (no top air), one blank row, the bold summary and the dim details row at column 2, then the composer with the ` workspace ` tag on its top rule; the stand-in `workspace` replaces the vendor's top effort key throughout
+ ▐▛███▛█▄╱✦  Claude Code v2.1.304
+▝▜██████▘    Opus 5.5 with xhigh effort · API Usage Billing
+ ▝▝   ▝▝     /private/tmp/at.IbLp/proj
+
+  Updated to latest. Got 66 features, 424 bugfixes, and 126 other changes.
+  code.claude.com/docs/en/changelog for details
+
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── workspace ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

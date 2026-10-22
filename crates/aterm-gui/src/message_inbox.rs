@@ -60,6 +60,14 @@ static EXCEPTIONS_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// One word the exceptions lane carries ([`EXCEPTIONS`]).
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    not(any(unix, test)),
+    expect(
+        dead_code,
+        reason = "its producers, queue_exception and queue_exception_clear, are built where \
+                  fabric_bind's reports are (unix and tests)"
+    )
+)]
 pub(crate) enum ExceptionWord {
     /// The fact holds: `App::except` (a later raise restates it).
     Raise(Box<aterm_messages::exceptions::Entry>),
@@ -68,6 +76,7 @@ pub(crate) enum ExceptionWord {
     Clear(String),
 }
 
+#[cfg(any(unix, test))]
 impl ExceptionWord {
     /// The key of the fact it is about.
     fn key(&self) -> String {

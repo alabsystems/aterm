@@ -54,7 +54,8 @@ pub use icons::{IconMetrics, band_icon_coverage, band_icon_width};
 /// resolution chain ([`crate::font_chain::Tier::Synthetic`]) after every real face
 /// missed, so it replaces only `.notdef` tofu. (`⎿` must join a `│` above it, so it is
 /// in [`covers`] instead.)
-pub fn covers_symbol(ch: char) -> bool {
+#[inline]
+pub const fn covers_symbol(ch: char) -> bool {
     symbols::covers(ch)
 }
 
@@ -64,7 +65,8 @@ pub fn covers_symbol(ch: char) -> bool {
 /// soft, below `bundled::SPINNER_STARS_CRISP_PX`
 /// (`Renderer::spinner_star_preempts`). From that size up the faces draw
 /// them, their weights evened across the cycle (`Renderer::even_spinner_frame`).
-pub fn is_spinner_star(ch: char) -> bool {
+#[inline]
+pub const fn is_spinner_star(ch: char) -> bool {
     symbols::is_spinner_star(ch)
 }
 
@@ -81,6 +83,7 @@ pub const SPINNER_REST: char = '\u{273B}';
 /// to `1..=2`; a wide emoji-presentation symbol is centred across both cells),
 /// 8-bit anti-aliased coverage. `None` outside the symbol set or for a
 /// degenerate cell.
+#[inline]
 pub fn symbol_coverage(ch: char, cell_w: usize, cell_h: usize, span: usize) -> Option<Vec<u8>> {
     symbols::coverage(ch, cell_w, cell_h, span)
 }
@@ -90,9 +93,10 @@ pub fn symbol_coverage(ch: char, cell_w: usize, cell_h: usize, span: usize) -> O
 /// U+1FB00–1FB8B, Unicode 16 octants U+1CD00–1CDE5, Powerline separators U+E0B0–E0BF,
 /// and the `⎿` connector U+23BF, a box-drawing stroke in all but block name that must
 /// tile with `│`.
-pub fn covers(ch: char) -> bool {
+#[inline]
+pub const fn covers(ch: char) -> bool {
     matches!(
-        u32::from(ch),
+        ch as u32,
         0x23BF
             | 0x2500..=0x259F
             | 0x2800..=0x28FF
@@ -106,9 +110,10 @@ pub fn covers(ch: char) -> bool {
 /// U+256D–2570, diagonals U+2571–2573, legacy wedges U+1FB3C–1FB6F, Powerline
 /// U+E0B0–E0BF. Their interior may take any coverage, their cell-edge texels are hard
 /// 0/255; everything else [`covers`] accepts is hard 0/255 throughout.
-pub fn antialiased(ch: char) -> bool {
+#[inline]
+pub const fn antialiased(ch: char) -> bool {
     matches!(
-        u32::from(ch),
+        ch as u32,
         0x256D..=0x2573 | 0x1FB3C..=0x1FB6F | 0xE0B0..=0xE0BF
     )
 }
@@ -382,14 +387,16 @@ impl Canvas {
 
 /// A centred stroke of thickness `t` across extent `e`: the half-open span
 /// `[(e - t) / 2, (e - t) / 2 + t)`, the module's placement rule.
-fn span(e: usize, t: usize) -> (usize, usize) {
-    let t = t.min(e);
+#[inline]
+const fn span(e: usize, t: usize) -> (usize, usize) {
+    let t = if t < e { t } else { e };
     let s = (e - t) / 2;
     (s, s + t)
 }
 
 /// `round(k * e / 8)` — the block-element eighth boundary (round half up).
-fn eighth(k: u32, e: usize) -> usize {
+#[inline]
+const fn eighth(k: u32, e: usize) -> usize {
     (k as usize * e + 4) / 8
 }
 
@@ -416,10 +423,14 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn new(w: usize, h: usize) -> Metrics {
-        let base = w.min(h);
-        let light = ((base + 4) / 8).max(1);
-        let heavy = (3 * light).min(base.max(1));
+    #[inline]
+    const fn new(w: usize, h: usize) -> Metrics {
+        let base = if w < h { w } else { h };
+        let l0 = (base + 4) / 8;
+        let light = if l0 > 1 { l0 } else { 1 };
+        let b1 = if base > 1 { base } else { 1 };
+        let h0 = 3 * light;
+        let heavy = if h0 < b1 { h0 } else { b1 };
         let (vl0, vl1) = span(w, light);
         let (hl0, hl1) = span(h, light);
         let (vh0, vh1) = span(w, heavy);
@@ -450,7 +461,8 @@ enum Arm {
 }
 
 impl Arm {
-    fn thickness(self, m: &Metrics) -> Option<usize> {
+    #[inline]
+    const fn thickness(self, m: &Metrics) -> Option<usize> {
         match self {
             Arm::None => None,
             Arm::Light => Some(m.light),
@@ -467,7 +479,8 @@ const H: Arm = Arm::Heavy;
 /// U+2500–254B (the dashed slots 2504–250B hold their solid equivalents;
 /// `draw_box` intercepts those before this table is consulted) and the half
 /// lines / weight transitions U+2574–257F.
-fn arms(cp: u32) -> [Arm; 4] {
+#[inline]
+const fn arms(cp: u32) -> [Arm; 4] {
     #[rustfmt::skip]
     const TABLE: [[Arm; 4]; 0x4C] = [
         [N, N, L, L], // 2500 ─

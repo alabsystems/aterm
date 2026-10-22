@@ -24,6 +24,7 @@ use crate::pipeline_table::{
 };
 
 /// The GL spelling of one [`Factor`].
+#[inline]
 const fn gl_factor(f: Factor) -> GLenum {
     match f {
         Factor::Zero => ffi::GL_ZERO,
@@ -35,6 +36,7 @@ const fn gl_factor(f: Factor) -> GLenum {
 }
 
 /// The GL spelling of one [`BlendOp`].
+#[inline]
 const fn gl_op(op: BlendOp) -> GLenum {
     match op {
         BlendOp::Add => ffi::GL_FUNC_ADD,
@@ -42,6 +44,7 @@ const fn gl_op(op: BlendOp) -> GLenum {
 }
 
 /// The GL primitive mode of a row's [`Topology`].
+#[inline]
 const fn gl_mode(t: Topology) -> GLenum {
     match t {
         Topology::TriangleList => ffi::GL_TRIANGLES,
@@ -51,8 +54,11 @@ const fn gl_mode(t: Topology) -> GLenum {
 
 /// The blend state a row sets: `None` disables blending (no blend, or
 /// REPLACE), else `(src_rgb, dst_rgb, src_a, dst_a, op_rgb, op_a)`.
-pub(crate) fn gl_blend(blend: Option<Blend>) -> Option<[GLenum; 6]> {
-    let b = blend?;
+#[inline]
+pub(crate) const fn gl_blend(blend: Option<Blend>) -> Option<[GLenum; 6]> {
+    let Some(b) = blend else {
+        return None;
+    };
     if b.is_replace() {
         return None;
     }

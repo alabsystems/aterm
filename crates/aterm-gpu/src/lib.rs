@@ -37,12 +37,14 @@ pub(crate) use stderr_line;
 static VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Record the host's `--verbose` flag (a launch flag, never an environment read).
+#[inline]
 pub fn set_verbose(on: bool) {
     VERBOSE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Whether the host asked for `--verbose` (read by the wgpu and GL arms'
 /// window surface notes).
+#[inline]
 #[cfg(any(wgpu_arm, all(gl_arm, not(target_arch = "wasm32"))))]
 pub(crate) fn verbose() -> bool {
     VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
@@ -169,6 +171,7 @@ static VISUAL_SWAPCHAIN_ACTIVE: std::sync::atomic::AtomicBool =
 /// Request that the next [`GpuContext::new`] build its Windows instance on the
 /// visual swapchain path. Call before the context exists; loss recovery
 /// re-reads the latch. Ignored by a backend without a composition swapchain.
+#[inline]
 #[cfg(windows)]
 pub fn request_visual_swapchain() {
     VISUAL_SWAPCHAIN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -184,6 +187,7 @@ pub fn request_visual_swapchain() {
 ///
 /// Records the withdrawal ([`visual_swapchain_withdrawn`]) when a request
 /// was standing; otherwise a no-op.
+#[inline]
 #[cfg(windows)]
 pub fn withdraw_visual_swapchain() {
     if VISUAL_SWAPCHAIN_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -193,6 +197,7 @@ pub fn withdraw_visual_swapchain() {
 
 /// Whether a visual-swapchain request was made and then withdrawn this run.
 /// Diagnostics only.
+#[inline]
 #[cfg(windows)]
 pub fn visual_swapchain_withdrawn() -> bool {
     VISUAL_SWAPCHAIN_WITHDRAWN.load(std::sync::atomic::Ordering::Relaxed)
@@ -217,7 +222,8 @@ pub enum SurfaceAttachFallback {
 /// context is visual (`visual_swapchain_active`) and no other window presents
 /// on it (`other_gpu_windows`).
 #[must_use]
-pub fn surface_attach_fallback(
+#[inline]
+pub const fn surface_attach_fallback(
     visual_swapchain_active: bool,
     other_gpu_windows: bool,
 ) -> SurfaceAttachFallback {
@@ -233,6 +239,7 @@ pub fn surface_attach_fallback(
 /// Whether the visual swapchain has been requested. Window creation keys
 /// `with_no_redirection_bitmap` off this, since
 /// [`visual_swapchain_active`] is known only after GPU init.
+#[inline]
 #[cfg(windows)]
 pub fn visual_swapchain_requested() -> bool {
     VISUAL_SWAPCHAIN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
@@ -240,6 +247,7 @@ pub fn visual_swapchain_requested() -> bool {
 
 /// Whether the live [`GpuContext`] was actually built on the DirectComposition
 /// visual path (ground truth for `aterm ctl chrome`'s `client=` field).
+#[inline]
 #[cfg(windows)]
 pub fn visual_swapchain_active() -> bool {
     VISUAL_SWAPCHAIN_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
@@ -309,7 +317,8 @@ const _: () = assert!(ALIGN == wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize);
 /// multiples of 256, so every `Frame` readback stages through padded rows. The
 /// Metal readback (`device_layer::metal_try_read_back`) uses the same stride so
 /// the staging shape is identical on both backends.
-pub(crate) fn padded_bytes_per_row(width: usize) -> usize {
+#[inline]
+pub(crate) const fn padded_bytes_per_row(width: usize) -> usize {
     let unpadded = width * 4;
     unpadded.div_ceil(ALIGN) * ALIGN
 }
@@ -393,6 +402,7 @@ pub(crate) fn instance_descriptor(backends: wgpu::Backends) -> wgpu::InstanceDes
 /// instance's `vkEnumeratePhysicalDevices` unloads the ICDs it does not use
 /// (measured as above). Only a debug build sets `DEBUG`, and only a process with
 /// two instances meets the race: parallel tests, never a window.
+#[inline]
 #[cfg(all(wgpu_arm, unix, not(target_vendor = "apple")))]
 fn vulkan_instance_flags(flags: wgpu::InstanceFlags) -> wgpu::InstanceFlags {
     flags - wgpu::InstanceFlags::DEBUG
@@ -411,8 +421,9 @@ fn vulkan_instance_flags(flags: wgpu::InstanceFlags) -> wgpu::InstanceFlags {
 /// the test oracle; wgpu's DX12 on Windows, its Vulkan elsewhere). A driver
 /// that cannot render falls to the CPU present path; `gpu = false` in
 /// aterm.toml chooses it outright.
+#[inline]
 #[cfg(wgpu_arm)]
-fn default_backends() -> wgpu::Backends {
+const fn default_backends() -> wgpu::Backends {
     #[cfg(windows)]
     let backends = wgpu::Backends::DX12;
     #[cfg(not(windows))]
@@ -426,6 +437,7 @@ fn default_backends() -> wgpu::Backends {
 /// armed-path site reads as this decision.
 #[cfg(target_os = "macos")]
 #[must_use]
+#[inline]
 pub const fn metal_backend_selected() -> bool {
     true
 }
@@ -436,6 +448,7 @@ pub const fn metal_backend_selected() -> bool {
 /// that starts before the worker does still waits for it. `None` once claimed.
 #[cfg(target_os = "macos")]
 #[must_use]
+#[inline]
 pub fn begin_first_frame_warm() -> Option<FirstFrameWarm> {
     metal::warm::FIRST_FRAME.begin()
 }
@@ -444,6 +457,7 @@ pub fn begin_first_frame_warm() -> Option<FirstFrameWarm> {
 /// ([`begin_first_frame_warm`]); a headless launch never does.
 #[cfg(target_os = "macos")]
 #[must_use]
+#[inline]
 pub fn first_frame_warm_began() -> bool {
     metal::warm::FIRST_FRAME.began()
 }
@@ -481,8 +495,9 @@ const MEMBLOCK_CEILING_MIB: u64 = 128;
 
 /// Build a `MemoryHints::Manual` from a `(min, max)` device block size in MiB.
 /// Host block sizes are half the device ones.
+#[inline]
 #[cfg(wgpu_arm)]
-fn memblock_hints(min_mib: u64, max_mib: u64) -> wgpu::MemoryHints {
+const fn memblock_hints(min_mib: u64, max_mib: u64) -> wgpu::MemoryHints {
     const MIB: u64 = 1024 * 1024;
     wgpu::MemoryHints::Manual {
         suballocated_device_memory_block_size: (min_mib * MIB)..(max_mib * MIB),
@@ -498,8 +513,9 @@ fn memblock_hints(min_mib: u64, max_mib: u64) -> wgpu::MemoryHints {
 /// anyway). A 16 MiB device floor keeps the reservation at 24 MiB; smaller
 /// floors cost more heap creations for little gain.
 #[must_use]
+#[inline]
 #[cfg(wgpu_arm)]
-pub(crate) fn terminal_memory_hints() -> wgpu::MemoryHints {
+pub(crate) const fn terminal_memory_hints() -> wgpu::MemoryHints {
     memblock_hints(MEMBLOCK_FLOOR_MIB, MEMBLOCK_CEILING_MIB)
 }
 
@@ -534,6 +550,7 @@ const TERMINAL_VIEW_DESCRIPTORS: u32 = 16_384;
 /// timestamp queries when offered (the `gpu_time` clock, idle unless a sink
 /// listens), nothing else. Asking for a feature the adapter lacks would fail
 /// the device request, so the grant is never assumed.
+#[inline]
 #[cfg(wgpu_arm)]
 fn terminal_device_features(available: wgpu::Features) -> wgpu::Features {
     available & wgpu::Features::TIMESTAMP_QUERY
@@ -543,6 +560,7 @@ fn terminal_device_features(available: wgpu::Features) -> wgpu::Features {
 /// with a DX12 view-descriptor heap sized for a terminal
 /// ([`TERMINAL_VIEW_DESCRIPTORS`]). DX12 compiles only into the Windows build,
 /// so every other build asks for wgpu's defaults, as before.
+#[inline]
 #[cfg(wgpu_arm)]
 fn terminal_device_limits(backend: wgpu::Backend) -> wgpu::Limits {
     match backend {
@@ -574,6 +592,7 @@ fn terminal_device_limits(backend: wgpu::Backend) -> wgpu::Limits {
 /// `request_device` there answers "Parent device is lost"; without it the
 /// device comes up, and its frames match the GL arm's byte for byte
 /// (measured 2026-10-20).
+#[inline]
 #[cfg(wgpu_arm)]
 fn terminal_instance_flags(
     flags: wgpu::InstanceFlags,
@@ -814,6 +833,7 @@ impl GpuContext {
     /// poll ([`Self::device_lost`]) then downgrades to the CPU renderer, as for
     /// a lost device, where a surface it presents to was refused (its window
     /// system gone, a lost swapchain). Sticky like a device loss.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn latch_surface_loss(&self, why: String) {
         let _ = self.device_loss_msg.set(why);
@@ -826,6 +846,7 @@ impl GpuContext {
     /// message the wgpu device-lost callback stored (its reason when the message
     /// is empty). `None` when neither has one.
     #[must_use]
+    #[inline]
     pub fn device_loss_reason(&self) -> Option<String> {
         #[cfg(target_os = "macos")]
         if let Some(r) = self.metal_loss.get().and_then(|l| l.reason()) {
@@ -837,6 +858,7 @@ impl GpuContext {
     /// Wire a Metal loss latch into [`Self::device_lost`] (see `metal_loss`).
     /// One latch per context; a second wire returns `false` rather than
     /// swapping domains.
+    #[inline]
     #[cfg(target_os = "macos")]
     pub(crate) fn wire_metal_loss_latch(
         &self,
@@ -869,8 +891,9 @@ impl GpuContext {
     /// This context as the device layer's wgpu arm. The Metal arm wraps the
     /// armed renderer's own mint (`renderer.rs::MetalArmLive::layer`), which
     /// lives on the render thread rather than on this context.
+    #[inline]
     #[cfg(wgpu_arm)]
-    pub(crate) fn device_layer(&self) -> crate::device_layer::DeviceHandle<'_> {
+    pub(crate) const fn device_layer(&self) -> crate::device_layer::DeviceHandle<'_> {
         crate::device_layer::DeviceHandle::Wgpu {
             device: &self.device,
             queue: &self.queue,
@@ -914,13 +937,15 @@ impl GpuContext {
     /// The offscreen colour-target format (the `off.view` format), from
     /// [`crate::format_plan`]. Every pipeline whose pass attaches `off.view`
     /// builds with it.
+    #[inline]
     #[cfg(wgpu_arm)]
-    pub(crate) fn offscreen_format(&self) -> wgpu::TextureFormat {
+    pub(crate) const fn offscreen_format(&self) -> wgpu::TextureFormat {
         crate::format_plan::offscreen_format(self.srgb_offscreen)
     }
 
     /// The sRGB view format attached by the base, cursor and deco-over passes.
     /// See [`crate::format_plan`].
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn offscreen_srgb_view_format(&self) -> wgpu::TextureFormat {
         crate::format_plan::offscreen_srgb_view_format(self.srgb_offscreen)
@@ -930,6 +955,7 @@ impl GpuContext {
     /// [`crate::pipeline_table::TargetFormats::resolve`]; each pipeline's
     /// [`crate::pipeline_table::TargetRole`] chooses. Add the swapchain with
     /// `with_present`.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) fn pipeline_targets(&self) -> crate::pipeline_table::TargetFormats {
         crate::pipeline_table::TargetFormats {

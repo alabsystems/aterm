@@ -43,6 +43,7 @@ const HISTORY_LINK_BUDGET_DIVISOR: usize = 4;
 /// [`ScrolledRowExtras::retained_memory_used`] and
 /// [`ScrolledRowExtras::link_bytes`] count them. Fixed while the slot sits in
 /// the ring: nothing mutates a held box except [`RingExtras::strip_oldest_links`].
+#[inline]
 fn slot_bytes(slot: &RingSlot) -> (usize, usize) {
     slot.as_deref()
         .map_or((0, 0), |e| (e.retained_memory_used(), e.link_bytes()))
@@ -71,6 +72,7 @@ pub(crate) struct RingExtras {
 
 impl RingExtras {
     /// An empty ring.
+    #[inline]
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -102,13 +104,13 @@ impl RingExtras {
     /// Out-of-line bytes the slots retain (boxes, vectors, strings, image
     /// shares), O(1).
     #[inline]
-    pub(crate) fn retained_bytes(&self) -> usize {
+    pub(crate) const fn retained_bytes(&self) -> usize {
         self.retained
     }
 
     /// The OSC 8 share of [`retained_bytes`](Self::retained_bytes), O(1).
     #[inline]
-    pub(crate) fn link_bytes(&self) -> usize {
+    pub(crate) const fn link_bytes(&self) -> usize {
         self.links
     }
 
@@ -177,6 +179,7 @@ impl RingExtras {
     }
 
     /// Drop every slot.
+    #[inline]
     pub(crate) fn clear(&mut self) {
         self.slots.clear();
         self.retained = 0;

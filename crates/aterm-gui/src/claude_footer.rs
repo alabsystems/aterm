@@ -54,6 +54,11 @@
 //!   off its `/status` and `/usage` cards on the glass, as agy's is read off its
 //!   launch card; until a card has shown, Muse Code's quota says `weekly
 //!   unavailable` rather than a guess.
+//!   After a known Muse account switch, or adoption of a terminal's old
+//!   glass, anonymous usage cannot prove its account: quota stays unavailable
+//!   for that terminal. A matching account-bearing status card may still
+//!   supply its own plan. A pane rebuild or process restart does not clear
+//!   that provenance boundary.
 //! * THE ACCOUNT. Where `accounts.toml` lists two or more, `⎆ <label>` names
 //!   the roster row the process's login is (`accounts::footer_label`),
 //!   between the model and the path. The login is what the exec environment
@@ -76,6 +81,15 @@
 //!   published beside the facts (`SessionTimeline::set_claude_excerpts`), so
 //!   `survey` reads no transcript; a worker's task head is read once per
 //!   image from the file its environment names ([`Identity::task`]).
+//! * THE SIDE ([`FactSide`]: the absolute working directory, its
+//!   repository's root, the session's traffic over time and its subagents'
+//!   calls in flight) is published beside the facts too
+//!   (`SessionTimeline::set_claude_side`), for the fact menus, the traffic
+//!   card and the agents panel's dots (`crate::claude_panel`): never in the
+//!   facts' `Hash`/`Eq`, read by a frame only for the flight table's `Arc`
+//!   (one clone under the splice's one timeline lock), rebuilt only when one
+//!   of its parts moved ([`side_after`]), each part kept as it was where its
+//!   own generation did not.
 //! * A CLOSED TAB's fold goes when the tab does ([`stop_session`], from the
 //!   status observer's own retirement), not at the end of its watch; the
 //!   process's tail stays while the process lives ([`ProcessTails`]).
@@ -88,8 +102,21 @@
 //!   cells that are plain rule glyphs in the rule's own colours
 //!   (`footer::rule_run`); any other ink there is Claude's and stays. Claude's own
 //!   footer row under the rule — its mode pill, `(shift+tab to cycle)`, `←
-//!   for agents`, `esc to interrupt`, its right-hand notices — is NEVER
-//!   written, colours included. The facts are drawn QUIET (owner,
+//!   for agents`, `esc to interrupt`, its right-hand notices — is not
+//!   written, colours included, but for ONE relabel (owner, 2026-10-19:
+//!   "Replace '⏵⏵ bypass permissions on' with 'YOLO on' (or off)"): on a
+//!   Claude Code pane whose composer border aterm draws ([`relabels_pill`]),
+//!   the bypass pill reads `YOLO on` and the manual-mode pill `YOLO off`, in
+//!   the pill cells' own style, and the row's left items after it are packed
+//!   left behind the label (`  YOLO on · 14 shells · ← for agents …`), the
+//!   right-hand notices where Claude drew them ([`collect_pill_relabel`]).
+//!   Every other mode keeps Claude's pill, and a cut pill, a selection, the
+//!   cursor, a BiDi row or any cell that is not the row's plain text leaves
+//!   the row as drawn. The glass then shows cells away from their grid
+//!   columns, so the write records where ([`GlassColumns`]) and the pointer's
+//!   every reader maps a glass column back to its grid cell
+//!   (`App::pixel_to_cell`): a click on the glass's `14 shells` reports
+//!   Claude's `14 shells` cell. The facts are drawn QUIET (owner,
 //!   2026-09-30): `Script::Sub` — smaller and set low in the rule's cells,
 //!   below the vivid rail of the cursor trail under the composer row above
 //!   (`aterm_render::SUB_CEILING`) — and EASY TO READ (owner, 2026-10-08):
@@ -100,9 +127,14 @@
 //!   (`compose_rule_spans`). `[claude_footer] usage = false` hides `Σ` (shown by
 //!   default), applied here and in the repaint key. The Claude lights
 //!   (`crate::claude_lights`) go in the same rule, left of the facts, rule
-//!   glyphs between.
+//!   glyphs between. The agents panel under it (owner, 2026-10-19: "I want
+//!   to see rainbow") is re-inked (fg only) and lit on glass while the
+//!   harness theme is on: its names and a workflow's `▰` bar along the
+//!   theme's palette, each dot telling its agent's work
+//!   (`crate::claude_panel`, `[claude_footer] agents`).
 //! * WHAT IS NOT TOUCHED. The terminal GRID. `text`/`screen` read the engine
-//!   and keep Claude Code's real row, because aterm's own supervisor reads it
+//!   and keep Claude Code's real row (its `⏵⏵ bypass permissions on`
+//!   included), because aterm's own supervisor reads it
 //!   (`aterm_phase` busy detection keys on `esc to interrupt` there). `image`
 //!   shows the glass, footer included — the capture paths run this splice too.
 //! * THE REDRAW PATH STAYS ON. A host write into a window's scratch bumps its
@@ -126,9 +158,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aterm_agent::harness::accounts;
-use aterm_agent::harness::footer::{self, FooterFacts, LaunchFacts};
+use aterm_agent::harness::footer::{self, FactKind, FactMask, FooterFacts, LaunchFacts};
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::RenderCell;
+use aterm_effects::cli_marks::CliMark;
 use aterm_window::event_loop::EventLoopProxy;
 
 use crate::session_timeline::SessionTimeline;
@@ -169,9 +202,65 @@ struct Lit {
     term_row: usize,
     /// The frame column the lights (not the title) start at.
     lights_col: usize,
+    /// The frame columns of the title slot's words (empty: no title).
+    title: std::ops::Range<usize>,
     block: crate::claude_lights::Block,
     /// The write put its row on the frame: its hits are noted.
     shown: bool,
+}
+
+/// One pane's composed top rule to write: its cells at `col` of frame row
+/// `frame_row` (leaf `leaf_index`'s [`ComposedTop`]), `ground` the pane's
+/// blank.
+struct TopWrite {
+    frame_row: usize,
+    col: usize,
+    leaf_index: usize,
+    ground: RenderCell,
+}
+
+/// The top-effort key's target on a top rule: frame columns `cols` of frame
+/// row `frame_row` (`term_row` in the window's grid). `ghost` is aterm's
+/// ghost, a target only where its write took; else Claude's own tag, a
+/// target only where the frame still holds the key's own chars there.
+struct TopHit {
+    frame_row: usize,
+    term_row: usize,
+    cols: (usize, usize),
+    session: u64,
+    ghost: bool,
+}
+
+/// A top line's lockup on the glass, the hover title's target (design §7):
+/// frame columns `cols` of frame row `frame_row` (`term_row` in the window's
+/// grid), a target only where the write at `edit_col` took.
+struct MarkWrite {
+    frame_row: usize,
+    term_row: usize,
+    edit_col: usize,
+    cols: std::ops::Range<usize>,
+    session: u64,
+}
+
+/// What one pane's top line is spliced with ([`App::splice_top_line`],
+/// design §6.2): the pane, its leaf and session and the group the key's
+/// evidence is kept for, the program its lockup names (the identified
+/// agent), the pane's blank, the harness switch and the theme the line
+/// wears, whether the footer holds the program's facts (the hover title's
+/// version), and the window's cell and the marks' ink.
+struct TopLineAt {
+    leaf_index: usize,
+    session: u64,
+    program_pgid: i32,
+    program: aterm_phase::Program,
+    region: PaneTextRegion,
+    pane: crate::claude_card::PaneGeom,
+    blank: RenderCell,
+    switch: Option<SwitchPaint>,
+    palette: Option<aterm_effects::harness_card::CardPalette>,
+    held: bool,
+    cell: (u16, u16),
+    mark_fg: [u8; 3],
 }
 
 /// One undoable row edit for agy's transcript presentation on `RenderInput`.
@@ -197,20 +286,43 @@ pub(crate) struct SpliceLists {
     bare: Vec<u64>,
     /// The rules' compositions, written as [`rule_edits`].
     rules: Vec<RuleWrite>,
-    /// Top-rule composer border brand and tool logo edits, buffers reused across frames.
-    border_edits: Vec<AgyRowEdit>,
-    border_live: usize,
     /// agy's glass-only transcript markdown edits.
     agy_edits: Vec<AgyRowEdit>,
+    /// Claude's mode pills relabelled `YOLO on`/`YOLO off`
+    /// ([`collect_pill_relabel`]), their cells in `relabel_cells`.
+    relabels: Vec<RelabelWrite>,
+    relabel_cells: Vec<RenderCell>,
+    /// The composer top rules' compositions, written as their cells
+    /// borrowed from the panes' footers ([`ComposedTop`]).
+    tops: Vec<TopWrite>,
+    /// The top-effort key's targets each top rule would put on the glass
+    /// (Claude's tag, aterm's ghost): targets once the glass shows them
+    /// ([`TopHit`]).
+    top_hits: Vec<TopHit>,
+    /// Sessions whose top rule showed Claude's top-effort tag for a process
+    /// not yet noted as having shown it (`SessionFacts::top_seen`).
+    top_seen: Vec<(u64, i32)>,
+    /// The lockups each top line would put on the glass: the hover title's
+    /// targets once their write took ([`MarkWrite`]).
+    marks: Vec<MarkWrite>,
+    /// The leaves whose top line alone was read (Gemini CLI's, Codex's:
+    /// no footer facts): their rows and composition are kept as a footer's
+    /// are ([`PaneTextCache::retain_active`]).
+    top_only: Vec<usize>,
     /// The harness switches this splice drew on composer top rules, each
     /// noted as reachable once its write reached the glass.
     border_toggles: Vec<crate::claude_lights::BorderSwitch>,
     lit: Vec<Lit>,
+    /// The facts each rule's write would put on the glass: targets once the
+    /// write took ([`FactWrite`]).
+    facts: Vec<FactWrite>,
     /// The rule row's coverable cells ([`rule_mask_into`]), one pane's at a time.
     mask: Vec<bool>,
     /// Sessions whose log the launch card's amend moved: their watchers are
     /// woken after the frame (addendum A28, ruling S29).
     log_owed: Vec<u64>,
+    /// The agents panels this frame lights (`crate::claude_panel`).
+    panels: Vec<crate::claude_panel::PanelLeaf>,
 }
 
 /// One pane's composition for its composer rule ([`compose_rule_spans`],
@@ -225,6 +337,23 @@ struct RuleWrite {
     glass: std::ops::Range<usize>,
 }
 
+/// One fact a rule's write would put on the glass (`footer::fact_spans`,
+/// laid at the rule's column): a target only where the edit that carries
+/// it — the rule's tail, its facts — took (`write_edits`), as a light's
+/// hits are only where its block did ([`Lit::shown`]).
+struct FactWrite {
+    frame_row: usize,
+    term_row: usize,
+    /// The column of the edit that writes the facts: the rule's own column,
+    /// or the tail's past the rule glyphs the glass already shows
+    /// ([`rule_edits`]).
+    edit_col: usize,
+    session: u64,
+    cols: (usize, usize),
+    kind: FactKind,
+    restores: FactMask,
+}
+
 impl SpliceLists {
     /// Empty every list, keeping its buffer.
     fn clear(&mut self) {
@@ -232,12 +361,20 @@ impl SpliceLists {
         self.seen.clear();
         self.bare.clear();
         self.rules.clear();
-        self.border_live = 0;
         self.agy_edits.clear();
+        self.relabels.clear();
+        self.relabel_cells.clear();
+        self.tops.clear();
+        self.top_hits.clear();
+        self.top_seen.clear();
+        self.marks.clear();
+        self.top_only.clear();
         self.border_toggles.clear();
         self.lit.clear();
+        self.facts.clear();
         self.mask.clear();
         self.log_owed.clear();
+        self.panels.clear();
     }
 }
 
@@ -264,6 +401,11 @@ struct FooterPane {
         Option<aterm_agent::supervise::Autopilot>,
         crate::autopilot::AutopilotView,
     ),
+    /// Whether Claude's mode pill reads `YOLO on`/`YOLO off` on this pane's
+    /// glass: the relabel collected under [`relabels_pill`]'s gate
+    /// ([`collect_pill_relabel`]'s answer, review G2), what the mode light's
+    /// word follows (`crate::claude_lights`, review C8).
+    relabelled: bool,
 }
 
 /// A visible Claude Code pane and the lights' reading of its rows, held
@@ -299,6 +441,8 @@ pub(crate) struct PaneTextCache {
     rebuilds: u64,
     /// The rows a rebuild found changed ([`Self::rows`]), reused.
     changed: Vec<usize>,
+    /// The top rules' mark contents, shared by the leaves ([`MarkContents`]).
+    marks: MarkContents,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,12 +482,52 @@ struct CachedPaneText {
     /// (`footer::launch_card_read`): read at most once per rebuild, and only
     /// while the facts leave one open ([`PaneTextCache::footer_card`]).
     footer_card: std::cell::OnceCell<Option<(aterm_phase::Program, aterm_phase::LaunchCardRead)>>,
+    /// Claude Code's context indicator on `rows`, per cent left, where it
+    /// shows it (`aterm_phase::phase::context_left_shown`), for the footer's
+    /// context fact: read at most once per rebuild, and only for a Claude
+    /// Code pane ([`PaneTextCache::context_reading`]).
+    ctx_reading: std::cell::OnceCell<Option<u8>>,
+    /// Whether `rows` say Claude Code's indicator has gone
+    /// (`footer::context_gone`): read at most once per rebuild, and only
+    /// while a reading is shown and `rows` show none
+    /// ([`PaneTextCache::indicator_gone`]).
+    ctx_gone: std::cell::OnceCell<bool>,
+    /// The signed-in account on `rows`: agy's launch card's
+    /// (`aterm_phase::agy::launch_card_account`) or Muse Code's `/status`
+    /// card's (`aterm_phase::muse::status_card_account`): read at most once
+    /// per rebuild, and only while the footer shows an account
+    /// ([`PaneTextCache::screen_account`]).
+    account: std::cell::OnceCell<Option<(String, Option<String>)>>,
+    /// Muse Code's weekly quota on `rows`, as the footer's words
+    /// (`aterm_phase::muse::usage_card_weekly`): read at most once per
+    /// rebuild, and only while the footer shows an account
+    /// ([`PaneTextCache::usage_weekly`]).
+    weekly: std::cell::OnceCell<Option<aterm_phase::muse::UsageCardWeekly>>,
+    /// Muse Code's subscription tier on `rows`, where a card names one
+    /// with no account row for it to ride on
+    /// (`aterm_phase::muse::subscription_card_plan`): read at most once
+    /// per rebuild, and only while the footer shows an account
+    /// ([`PaneTextCache::subscription_plan`]).
+    plan: std::cell::OnceCell<Option<String>>,
     /// The rule's coverable run and its glyph on frame row `.0`
     /// ([`rule_mask`], `footer::rule_run`): taken at most once per rebuild —
     /// the scratch it was read off is the one `key`'s tokens name — and kept
     /// past one where the engine's revisions vouch its row's cells unchanged
     /// and no image is placed on it ([`Self::stamps`]).
     rule_run: std::cell::Cell<Option<KeptRun>>,
+    /// The top rule's plain run on frame row `.frame_row` ([`read_top_run`]):
+    /// taken at most once per rebuild, and kept as [`Self::rule_run`] is.
+    top_run: std::cell::Cell<Option<KeptTop>>,
+    /// Gemini CLI's top line on `rows`, its live zone's `─` rule
+    /// (`aterm_phase::gemini::top_rule`, behind the reader's panic fence):
+    /// read at most once per rebuild, and only for a Gemini pane
+    /// ([`top_line`]).
+    gemini_top: std::cell::OnceCell<Option<usize>>,
+    /// Codex's top line on `rows`, its composer slab's top pad row
+    /// (`aterm_phase::codex::composer_pad`, behind the reader's panic
+    /// fence): a candidate its cells must prove ([`TopLine::Slab`]), read at
+    /// most once per rebuild, and only for a Codex pane ([`top_line`]).
+    codex_pad: std::cell::OnceCell<Option<usize>>,
     /// The harness card's reading of `rows` (`crate::claude_card::read_card`): taken at most
     /// once per rebuild and only when a card is wanted, or kept from the last rebuild where
     /// no row it reads changed (`CardReading::holds`); shared with every frame that reuses
@@ -354,6 +538,23 @@ struct CachedPaneText {
     /// nothing), and the LAST rebuild's own is held through rows the reader
     /// does not place it on (`crate::claude_card::read_card`).
     card_before: std::cell::Cell<Option<crate::claude_card::CardBefore>>,
+    /// The agents panel's reading of `rows` and the frame they were read
+    /// from (`crate::claude_panel::read_panel`): taken at most once per
+    /// rebuild, and only where the panel's gate holds ([`PaneTextCache::agents_panel`]).
+    panel: std::cell::OnceCell<Option<Arc<crate::claude_panel::PanelRead>>>,
+    /// The last reading's panel, until this rebuild's is taken: an equal
+    /// reading is the same one, shared, and the panel's fold is not run for
+    /// it (`App::compose_claude_panels`).
+    panel_before: std::cell::Cell<Option<Arc<crate::claude_panel::PanelRead>>>,
+    /// Claude Code's update notice under the card on `rows`
+    /// (`aterm_phase::update_notice_scan`, for the harness banner drawn over
+    /// it): scanned at most once per rebuild, only under a decorated card —
+    /// or kept from the last rebuild where no row it read changed
+    /// (`aterm_phase::update_notice_unmoved`). Apart from [`Self::card`], so
+    /// a change to the notice's rows costs no card read. Keyed by the row
+    /// the scan starts at (the card's foot); `None` inside: the reader
+    /// panicked, and is not asked again until the rows are rebuilt.
+    notice: std::cell::Cell<Option<(usize, Option<aterm_phase::NoticeScan>)>>,
     /// The engine's revisions of the rows `rows` were read from
     /// ([`RowStamps`]): what lets the next rebuild skip every row whose
     /// cells they vouch did not change — and keep [`Self::rule_run`] where
@@ -470,6 +671,30 @@ impl KeptRun {
     }
 }
 
+/// A composer top line's plain run read off frame row `frame_row` as a line
+/// of kind `line` for a pane ground `bg` ([`CachedPaneText::top_run`]):
+/// `None` where the row holds none a brand edit may write on.
+#[derive(Debug, Clone, Copy)]
+struct KeptTop {
+    frame_row: usize,
+    line: TopLine,
+    bg: [u8; 3],
+    run: Option<TopRun>,
+    /// Claude's own top-effort tag on the row, its key's frame columns
+    /// (`footer::top_rule_tag`).
+    tag: Option<(usize, usize)>,
+    /// The row held an image placement when it was read.
+    images: bool,
+}
+
+impl KeptTop {
+    /// The frame row it was read off, where it may be kept past its
+    /// rebuild: read off a row with no image on it.
+    fn row(&self) -> Option<usize> {
+        (!self.images).then_some(self.frame_row)
+    }
+}
+
 impl std::fmt::Debug for CachedPaneText {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachedPaneText")
@@ -500,6 +725,11 @@ struct Readings {
     rule: FooterRead,
     /// The lights'.
     lights: LightsRead,
+    /// Claude's mode pill under the bottom rule, where it reads `YOLO on`
+    /// or `YOLO off` on the glass (`footer::relabel_under`): read with the
+    /// rule and kept with it, so a frame at rest reads no row for it
+    /// ([`collect_pill_relabel`]).
+    relabel: Option<footer::Relabel>,
 }
 
 impl Readings {
@@ -559,10 +789,19 @@ fn read_pane(
                 .map(|(_, bottom)| aterm_agent::harness::lights::reading_under(rows, bottom)),
             None => aterm_agent::harness::lights::read_lights(rows),
         });
+    let relabel = rule.and_then(|read| {
+        #[cfg(test)]
+        crate::work_counts::pill_relabel_read();
+        crate::reader_guard::read_or_none(session, "Claude Code mode pill", rows, || {
+            footer::relabel_under(rows, read.rule)
+        })
+        .flatten()
+    });
     Readings {
         reach,
         rule,
         lights,
+        relabel,
     }
 }
 
@@ -578,15 +817,35 @@ impl PaneTextCache {
     /// transcript resident just because another pane still has one — nor its
     /// facts or its composition. A pane whose card alone was read this frame
     /// (`card`: a drawer with no facts yet) keeps its transcript, where the
-    /// card's reading lives, and forgets its footer.
-    fn retain_active(&mut self, active: impl Fn(usize) -> bool, card: impl Fn(usize) -> bool) {
+    /// card's reading lives, and forgets its footer. A pane whose top line
+    /// alone was read (`top`: Gemini CLI's, Codex's) keeps its transcript and
+    /// its top line's composition, and forgets the rest of its footer: no
+    /// facts are its.
+    fn retain_active(
+        &mut self,
+        active: impl Fn(usize) -> bool,
+        card: impl Fn(usize) -> bool,
+        top: impl Fn(usize) -> bool,
+    ) {
         for (index, cached) in self.panes.iter_mut().enumerate() {
-            if !active(index) && !card(index) {
+            if !active(index) && !card(index) && !top(index) {
                 *cached = None;
             }
         }
         for (index, footer) in self.footers.iter_mut().enumerate() {
-            if !active(index) && (footer.from.is_some() || footer.rule.key.is_some()) {
+            if active(index) {
+                continue;
+            }
+            if top(index) {
+                if footer.from.is_some() || footer.rule.key.is_some() {
+                    *footer = PaneFooter {
+                        session: footer.session,
+                        top: std::mem::take(&mut footer.top),
+                        ..PaneFooter::default()
+                    };
+                }
+            } else if footer.from.is_some() || footer.rule.key.is_some() || footer.top.key.is_some()
+            {
                 *footer = PaneFooter::default();
             }
         }
@@ -661,7 +920,18 @@ impl PaneTextCache {
                 scratch.row_rev.get(frame_row(r)).copied().unwrap_or(0)
             })
         };
-        let (text, readings, drift, card, card_before, stamps, rule_run) = match last {
+        let (
+            text,
+            readings,
+            drift,
+            card,
+            card_before,
+            notice,
+            stamps,
+            rule_run,
+            panel_before,
+            top_run,
+        ) = match last {
             Some(cached) => {
                 // Row `r` is the last rebuild's, cell for cell: the same
                 // lane, and the same non-zero revision of it in both.
@@ -705,6 +975,10 @@ impl PaneTextCache {
                     .rule_run
                     .get()
                     .filter(|kept| kept.row().is_some_and(keeps));
+                let top_run = cached
+                    .top_run
+                    .get()
+                    .filter(|kept| kept.row().is_some_and(keeps));
                 // The footer's and the lights' readings: kept where no row
                 // they read changed, else read anew — and the drift check's
                 // build with them.
@@ -718,6 +992,12 @@ impl PaneTextCache {
                 // card and changed no row hands it on as it was), never a
                 // card from before a reading that had none, nor across a
                 // change no reading saw.
+                // The panel the last rebuild read here (or, where it read
+                // none, the one before): an equal reading shares it.
+                let panel_before = match cached.panel.into_inner() {
+                    Some(read) => read,
+                    None => cached.panel_before.into_inner(),
+                };
                 let reading = cached.card.into_inner();
                 let before = cached.card_before.into_inner();
                 let (card, card_before) = match reading {
@@ -737,6 +1017,18 @@ impl PaneTextCache {
                         before.map(crate::claude_card::CardBefore::earlier),
                     ),
                 };
+                // The update notice the last rebuild scanned for: kept where
+                // no row the scan read changed (exact, under the same card:
+                // the cache asks again for another), else scanned again when
+                // asked.
+                let notice = cached.notice.get().filter(|(_, scan)| {
+                    scan.is_some_and(|scan| {
+                        crate::reader_guard::read_or_none(session, "harness notice", &rows, || {
+                            aterm_phase::update_notice_unmoved(&rows, &scan, changed)
+                        })
+                        .unwrap_or(false)
+                    })
+                });
                 // This scratch's revisions, into the last rebuild's buffer.
                 let mut stamps = cached.stamps;
                 stamps.lane = lane;
@@ -744,7 +1036,18 @@ impl PaneTextCache {
                 if lane.is_some() {
                     stamps.revs.extend((0..region.rows).map(rev));
                 }
-                (rows, readings, drift, card, card_before, stamps, rule_run)
+                (
+                    rows,
+                    readings,
+                    drift,
+                    card,
+                    card_before,
+                    notice,
+                    stamps,
+                    rule_run,
+                    panel_before,
+                    top_run,
+                )
             }
             None => {
                 let rows = Arc::new(fresh());
@@ -763,7 +1066,10 @@ impl PaneTextCache {
                     None,
                     std::cell::OnceCell::new(),
                     None,
+                    None,
                     stamps,
+                    None,
+                    None,
                     None,
                 )
             }
@@ -781,9 +1087,20 @@ impl PaneTextCache {
             readings,
             drift: std::cell::Cell::new(drift),
             footer_card: std::cell::OnceCell::new(),
+            ctx_reading: std::cell::OnceCell::new(),
+            ctx_gone: std::cell::OnceCell::new(),
+            account: std::cell::OnceCell::new(),
+            weekly: std::cell::OnceCell::new(),
+            plan: std::cell::OnceCell::new(),
             rule_run: std::cell::Cell::new(rule_run),
+            top_run: std::cell::Cell::new(top_run),
+            gemini_top: std::cell::OnceCell::new(),
+            codex_pad: std::cell::OnceCell::new(),
             card,
             card_before: std::cell::Cell::new(card_before),
+            panel: std::cell::OnceCell::new(),
+            panel_before: std::cell::Cell::new(panel_before),
+            notice: std::cell::Cell::new(notice),
             stamps,
         });
         text
@@ -841,6 +1158,118 @@ impl PaneTextCache {
             .as_ref()
     }
 
+    /// Claude Code's context indicator on leaf `leaf_index`'s cached rows,
+    /// per cent left, where the screen shows it
+    /// (`aterm_phase::phase::context_left_shown`: above the composer, or at
+    /// the end of 2.1.305's mode row; behind the reader's panic fence): read
+    /// at most once per rebuild of the rows, every frame that reuses them
+    /// sharing the reading — a frame at rest scans nothing.
+    fn context_reading(&self, leaf_index: usize) -> Option<u8> {
+        let cached = self.panes.get(leaf_index)?.as_ref()?;
+        *cached.ctx_reading.get_or_init(|| {
+            crate::reader_guard::read_or_none(
+                cached.key.session,
+                "Claude Code context indicator",
+                &cached.rows,
+                || aterm_phase::phase::context_left_shown(&cached.rows),
+            )
+            .flatten()
+        })
+    }
+
+    /// Whether leaf `leaf_index`'s cached rows say Claude Code's context
+    /// indicator has gone, as after `/compact` (`footer::context_gone`,
+    /// behind the reader's panic fence; `false` where it panicked or there
+    /// are no rows): read at most once per rebuild of the rows.
+    fn indicator_gone(&self, leaf_index: usize) -> bool {
+        let Some(Some(cached)) = self.panes.get(leaf_index) else {
+            return false;
+        };
+        *cached.ctx_gone.get_or_init(|| {
+            crate::reader_guard::read_or_none(
+                cached.key.session,
+                "Claude Code context indicator gone",
+                &cached.rows,
+                || footer::context_gone(&cached.rows),
+            )
+            .unwrap_or(false)
+        })
+    }
+
+    /// The signed-in account on leaf `leaf_index`'s cached rows, its email
+    /// and its plan: Muse Code's `/status` card's
+    /// (`aterm_phase::muse::status_card_account`), any other `agent`'s
+    /// agy's launch card's (`aterm_phase::agy::launch_card_account`), behind
+    /// the reader's panic fence: read and copied at most once per rebuild of
+    /// the rows.
+    fn screen_account(
+        &self,
+        leaf_index: usize,
+        agent: Option<aterm_phase::Program>,
+    ) -> Option<(&str, Option<&str>)> {
+        let cached = self.panes.get(leaf_index)?.as_ref()?;
+        cached
+            .account
+            .get_or_init(|| {
+                crate::reader_guard::read_or_none(
+                    cached.key.session,
+                    "launch or status card account",
+                    &cached.rows,
+                    || match agent {
+                        Some(aterm_phase::Program::Muse) => {
+                            aterm_phase::muse::status_card_account(&cached.rows)
+                        }
+                        _ => aterm_phase::agy::launch_card_account(&cached.rows)
+                            .map(|(email, plan)| (email.to_owned(), plan.map(str::to_owned))),
+                    },
+                )
+                .flatten()
+            })
+            .as_ref()
+            .map(|(email, plan)| (email.as_str(), plan.as_deref()))
+    }
+
+    /// Muse Code's weekly quota on leaf `leaf_index`'s cached rows, as the
+    /// footer's words (`aterm_phase::muse::usage_card_weekly`, behind the
+    /// reader's panic fence): read at most once per rebuild of the rows.
+    fn usage_weekly(&self, leaf_index: usize) -> Option<(&str, Option<&str>)> {
+        let cached = self.panes.get(leaf_index)?.as_ref()?;
+        cached
+            .weekly
+            .get_or_init(|| {
+                crate::reader_guard::read_or_none(
+                    cached.key.session,
+                    "Muse Code usage card weekly",
+                    &cached.rows,
+                    || aterm_phase::muse::usage_card_weekly(&cached.rows),
+                )
+                .flatten()
+            })
+            .as_ref()
+            .map(|weekly| (weekly.text.as_str(), weekly.reset.as_deref()))
+    }
+
+    /// Muse Code's subscription tier on leaf `leaf_index`'s cached rows
+    /// (`aterm_phase::muse::subscription_card_plan`, behind the reader's
+    /// panic fence): read at most once per rebuild of the rows. A
+    /// `/usage` card alone names it, where [`Self::screen_account`] (its
+    /// account row on `/status`) sees nothing.
+    fn subscription_plan(&self, leaf_index: usize) -> Option<&str> {
+        let cached = self.panes.get(leaf_index)?.as_ref()?;
+        cached
+            .plan
+            .get_or_init(|| {
+                crate::reader_guard::read_or_none(
+                    cached.key.session,
+                    "Muse Code subscription card plan",
+                    &cached.rows,
+                    || aterm_phase::muse::subscription_card_plan(&cached.rows),
+                )
+                .flatten()
+            })
+            .as_deref()
+    }
+
     /// The run of leaf `leaf_index`'s composer rule on frame row `frame_row`
     /// of `scratch` that aterm may cover, and the rule's glyph
     /// ([`rule_mask_into`] into `mask`, `footer::rule_run`): read off the
@@ -880,6 +1309,97 @@ impl PaneTextCache {
             _ => read(mask),
         };
         run.map(|(start, end, rule)| (start..end, rule))
+    }
+
+    /// The plain run of leaf `leaf_index`'s composer top line (pane row
+    /// `top_rule` of `region`, a line of kind `line`) on `scratch`
+    /// ([`read_top_run`]) and, on a rule, Claude's top-effort tag on it, its
+    /// key's frame columns (`footer::top_rule_tag` of the pane's rows, behind
+    /// the reader's panic fence): read at most once per rebuild of the pane's
+    /// rows, as [`Self::rule_run`] is, and kept past one whose revisions vouch
+    /// the row unchanged.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pane, its row and the line kind, as the read is keyed"
+    )]
+    fn top_run(
+        &self,
+        leaf_index: usize,
+        (session, program): (u64, aterm_phase::Program),
+        scratch: &RenderInput,
+        region: PaneTextRegion,
+        top_rule: usize,
+        line: TopLine,
+        blank: RenderCell,
+    ) -> (Option<TopRun>, Option<(usize, usize)>) {
+        let frame_row = region.strip + region.row_off + top_rule;
+        let muse = program == aterm_phase::Program::Muse;
+        let Some(Some(cached)) = self.panes.get(leaf_index) else {
+            return (
+                read_top_run(scratch, region, top_rule, line, blank, muse),
+                None,
+            );
+        };
+        match cached.top_run.get() {
+            Some(kept)
+                if kept.frame_row == frame_row && kept.line == line && kept.bg == blank.bg =>
+            {
+                (kept.run, kept.tag)
+            }
+            _ => {
+                let run = read_top_run(scratch, region, top_rule, line, blank, muse);
+                let tag = match line {
+                    TopLine::Rule => crate::reader_guard::read_or_none(
+                        session,
+                        "Claude Code top rule",
+                        &cached.rows,
+                        || footer::top_rule_tag(cached.rows.get(top_rule)?),
+                    )
+                    .flatten()
+                    .map(|(a, b)| (region.col_off + a, region.col_off + b)),
+                    TopLine::Slab => None,
+                };
+                cached.top_run.set(Some(KeptTop {
+                    frame_row,
+                    line,
+                    bg: blank.bg,
+                    run,
+                    tag,
+                    images: has_images(scratch, frame_row),
+                }));
+                (run, tag)
+            }
+        }
+    }
+
+    /// Where leaf `leaf_index`'s cached rows put `program`'s top line, and
+    /// its kind ([`top_line`]).
+    fn top_line(
+        &self,
+        leaf_index: usize,
+        program: aterm_phase::Program,
+    ) -> Option<(usize, TopLine)> {
+        top_line(program, self.panes.get(leaf_index)?.as_ref()?)
+    }
+
+    /// Leaf `leaf_index`'s top rule composed from `key`
+    /// ([`PaneFooter::compose_top`]), its mark's content from the window's
+    /// kept ones.
+    fn compose_top(&mut self, leaf_index: usize, key: TopKey) -> &ComposedTop {
+        let Self { footers, marks, .. } = self;
+        footers[leaf_index].compose_top(key, marks)
+    }
+
+    /// Leaf `leaf_index`'s composed top rule's mark sprite ([`mark_layer`]).
+    fn top_mark(&self, leaf_index: usize) -> Option<&aterm_core::render::FxLayer> {
+        self.footers.get(leaf_index)?.top.mark.as_ref()
+    }
+
+    /// Leaf `leaf_index`'s composed top rule's cells ([`compose_top`]).
+    fn top_cells(&self, leaf_index: usize) -> &[RenderCell] {
+        self.footers
+            .get(leaf_index)
+            .map_or(&[], |f| f.top.cells.as_slice())
     }
 
     /// Leaf `leaf_index`'s footer, `session`'s: a pane that shows another
@@ -936,6 +1456,80 @@ impl PaneTextCache {
             .clone()?;
         Some((read, cached.text_gen))
     }
+
+    /// The agents panel under leaf `leaf_index`'s composer bottom rule
+    /// `bottom`, while its rows are `session`'s, and what Claude drew it in
+    /// off `scratch` — the frame the rows were read from, cell for cell (a
+    /// frame that reuses them has the scratch their key's tokens name):
+    /// read at most once per rebuild of the rows
+    /// (`crate::claude_panel::read_panel`), every frame that reuses them
+    /// sharing the reading, and a reading equal to the last one sharing that.
+    pub(crate) fn agents_panel(
+        &self,
+        leaf_index: usize,
+        session: u64,
+        bottom: usize,
+        scratch: &RenderInput,
+        pane: crate::claude_card::PaneGeom,
+        blank: RenderCell,
+    ) -> Option<Arc<crate::claude_panel::PanelRead>> {
+        let cached = self.panes.get(leaf_index)?.as_ref()?;
+        if cached.key.session != session {
+            return None;
+        }
+        cached
+            .panel
+            .get_or_init(|| {
+                let read = crate::claude_panel::read_panel(
+                    session,
+                    &cached.rows,
+                    bottom,
+                    scratch,
+                    pane,
+                    blank,
+                )?;
+                match cached.panel_before.take() {
+                    Some(before) if *before == read => Some(before),
+                    _ => Some(Arc::new(read)),
+                }
+            })
+            .clone()
+    }
+
+    /// Claude Code's update notice under the card at `place` on leaf
+    /// `leaf_index`'s cached rows, while they are `session`'s, the pane
+    /// `cols` wide (`aterm_phase::update_notice_scan`, behind the reader's
+    /// panic fence; the rows are the pane's at one width, the cache's key):
+    /// scanned at most once per rebuild of the rows, and not at all where
+    /// the rebuild kept the last scan of the rows under the same card
+    /// ([`Self::rows`]: no row it read changed). `None` where no notice is
+    /// the vendor's whole, and where the reader panicked.
+    pub(crate) fn update_notice(
+        &self,
+        leaf_index: usize,
+        session: u64,
+        place: &aterm_phase::CardPlace,
+        cols: usize,
+    ) -> Option<aterm_phase::NoticePlace> {
+        let cached = self.panes.get(leaf_index)?.as_ref()?;
+        if cached.key.session != session {
+            return None;
+        }
+        let from = place.top.saturating_add(place.rows);
+        if let Some((at, scan)) = cached.notice.get()
+            && at == from
+        {
+            return scan.and_then(|scan| scan.place);
+        }
+        #[cfg(test)]
+        crate::work_counts::card_notice_read();
+        let scan =
+            crate::reader_guard::read_or_none(session, "harness notice", &cached.rows, || {
+                aterm_phase::update_notice_scan(&cached.rows, place, cols)
+            });
+        cached.notice.set(Some((from, scan)));
+        scan.and_then(|scan| scan.place)
+    }
 }
 
 /// One pane's footer as earlier frames composed it (a leaf's, in [`PaneTextCache`]): the
@@ -949,15 +1543,16 @@ struct PaneFooter {
     session: u64,
     /// What [`Self::shown`] is made of: the facts the timeline holds for the
     /// group in front, the launch card it keeps for them, the `[claude_footer]
-    /// usage` switch.
-    from: Option<(FooterFacts, Option<aterm_phase::LaunchCard>, bool)>,
+    /// usage` switch, and the facts the person hid in the session by a click
+    /// (`crate::claude_facts`).
+    from: Option<(FooterFacts, Option<aterm_phase::LaunchCard>, bool, FactMask)>,
     /// The live upgrade's note the timeline holds for the pane, whose words
     /// the rule lays in ([`Self::lay_upgrade`]).
     note: Option<footer::UpgradeNote>,
     /// What the rule shows: `from`'s facts filled from its card where
     /// nothing newer decided them (`FooterFacts::filled_from`), under its
-    /// usage switch ([`with_usage_switch`]), with the upgrade's words this
-    /// frame says.
+    /// usage switch ([`with_usage_switch`]), its hidden facts laid in
+    /// (`FooterFacts::off`), with the upgrade's words this frame says.
     shown: FooterFacts,
     /// Bumped on every change of `shown`; the kept chips' room and composition are keyed by
     /// it.
@@ -970,6 +1565,11 @@ struct PaneFooter {
     chips: Option<(u64, usize, usize)>,
     /// The rule composed from `shown`.
     rule: ComposedRule,
+    /// The composer's top rule as the frames before composed it.
+    top: ComposedTop,
+    /// Whether `shown` names a Claude Code build that takes the top-effort
+    /// key's toggle: `(shown_gen, typed)` ([`Self::key_typed`]).
+    typed: Option<(u64, bool)>,
 }
 
 /// A footer rule as [`PaneFooter::compose`] composed it, and what it was
@@ -987,7 +1587,17 @@ struct ComposedRule {
 struct RulePaint {
     cells: Vec<RenderCell>,
     lights_at: Option<usize>,
+    /// The title slot's words in `cells` (empty: none drawn).
+    title: std::ops::Range<usize>,
     glass: std::ops::Range<usize>,
+    /// Where the facts' cells start in `cells`, and where each fact lies in
+    /// them past that start's blank (`footer::fact_spans`): what the
+    /// pointer can act on, once the write took ([`FactWrite`]).
+    facts_at: usize,
+    spans: footer::FactSpans,
+    /// The facts' native emoji clusters and combining marks at their
+    /// columns in `cells` (`footer::SetFacts`), published only where the
+    /// write took ([`FooterUndo::publish_text`]).
     clusters: Vec<(usize, Box<str>)>,
     combining: Vec<(usize, Box<[char]>)>,
 }
@@ -1000,6 +1610,10 @@ struct RuleKey {
     rule: RenderCell,
     blank: RenderCell,
     mark_fg: [u8; 3],
+    /// The fact the pointer or the keyboard's selection is on, drawn lit
+    /// (`claude_lights::WindowLights::lit_fact`): a hover's start and end
+    /// compose once each, a frame under it none.
+    lit: Option<FactKind>,
 }
 
 /// Every part of a chips' block (`claude_lights::Block`) a composition
@@ -1053,29 +1667,34 @@ impl BlockCopy {
 }
 
 impl PaneFooter {
-    /// Take in the facts the timeline holds (`facts`), the launch card it keeps for them
-    /// (`card`) and the usage switch: what the rule shows is made anew, with a copy of each,
-    /// only where one of them moved. The upgrade's words stay as the last frame laid them.
+    /// Take in the facts the timeline holds (`facts`), the launch card it
+    /// keeps for them (`card`), the usage switch and the facts the person
+    /// hid (`off`): what the rule shows is made anew only where one of them
+    /// moved — a copy of each then, none at rest. The upgrade's words stay
+    /// as the last frame laid them.
     fn note_facts(
         &mut self,
         facts: &FooterFacts,
         card: Option<&aterm_phase::LaunchCard>,
         usage: bool,
+        off: FactMask,
     ) {
-        if let Some((was, kept, switch)) = &self.from
+        if let Some((was, kept, switch, hid)) = &self.from
             && was == facts
             && kept.as_ref() == card
             && *switch == usage
+            && *hid == off
         {
             return;
         }
         let mut shown = facts.filled_from(card);
         with_usage_switch(&mut shown, usage);
+        shown.off = off;
         shown.upgrade = self.shown.upgrade.take();
         self.shown = shown;
         self.shown_gen += 1;
-        self.fp = fingerprint(Some(facts), card, usage);
-        self.from = Some((facts.clone(), card.cloned(), usage));
+        self.fp = fingerprint(Some(facts), card, usage, off);
+        self.from = Some((facts.clone(), card.cloned(), usage, off));
     }
 
     /// The repaint key's term ([`fingerprint`]) for `session`'s `facts`, the `card` the
@@ -1089,9 +1708,14 @@ impl PaneFooter {
         facts: &FooterFacts,
         card: Option<&aterm_phase::LaunchCard>,
         usage: bool,
+        off: FactMask,
     ) -> Option<u64> {
-        let (was, kept, switch) = self.from.as_ref()?;
-        (self.session == session && was == facts && kept.as_ref() == card && *switch == usage)
+        let (was, kept, switch, hid) = self.from.as_ref()?;
+        (self.session == session
+            && was == facts
+            && kept.as_ref() == card
+            && *switch == usage
+            && *hid == off)
             .then_some(self.fp)
     }
 
@@ -1117,10 +1741,34 @@ impl PaneFooter {
         &self.shown
     }
 
+    /// Whether the facts shown name a Claude Code build newer than 2.1.303
+    /// — one whose `/effort` takes the top-effort key's session toggle —
+    /// compared once per change of them, never per frame.
+    fn key_typed(&mut self) -> bool {
+        match self.typed {
+            Some((at, typed)) if at == self.shown_gen => typed,
+            _ => {
+                let typed = self
+                    .shown
+                    .version
+                    .as_deref()
+                    .is_some_and(crate::claude_slash::takes_key_toggle);
+                self.typed = Some((self.shown_gen, typed));
+                typed
+            }
+        }
+    }
+
+    /// The facts the timeline holds for the group in front, as published
+    /// (none of the card's fill): what a key's latch was taken against.
+    fn published(&self) -> Option<&FooterFacts> {
+        self.from.as_ref().map(|(facts, ..)| facts)
+    }
+
     /// The facts' owner where they leave the model or the effort open: the owner a launch
     /// card may be kept for.
     fn card_owner(&self) -> Option<&footer::FactsOwner> {
-        let (facts, _, _) = self.from.as_ref()?;
+        let (facts, _, _, _) = self.from.as_ref()?;
         (facts.model_open || facts.effort_open)
             .then_some(facts.owner.as_ref())
             .flatten()
@@ -1144,11 +1792,32 @@ impl PaneFooter {
         }
     }
 
-    /// The rule's composition in `room` cells with the chips' `block`, the rule's own glyph
-    /// `rule`, the pane's `blank` and the marks' `mark_fg` (`footer::fit_rule`,
-    /// [`compose_rule_spans`]), kept while all of them, the facts and every cell of the
-    /// block are the last frame's. Returns its cell count, where the chips start, and the
-    /// run of the rule's own glyphs in it.
+    /// The composer's top line composed from `key` ([`compose_top`], its
+    /// hover title naming the shown facts' version) and its mark's sprite
+    /// ([`mark_layer`], its content kept in `marks`): kept while `key` is the
+    /// last frame's — a frame at rest composes nothing, seals nothing and
+    /// allocates nothing — else composed anew into the kept buffer.
+    fn compose_top(&mut self, key: TopKey, marks: &mut MarkContents) -> &ComposedTop {
+        if self.top.key != Some(key) {
+            // The hover title names the version the shown facts hold, only
+            // while the key says they are the program's (`title_gen`).
+            let version = (key.title_gen != 0)
+                .then_some(self.shown.version.as_deref())
+                .flatten();
+            compose_top(&key, &mut self.top, version);
+            self.top.mark = mark_layer(&key, &self.top, self.session, marks);
+            self.top.key = Some(key);
+        }
+        &self.top
+    }
+
+    /// The rule's composition in `room` cells with the chips' `block`, the
+    /// rule's own glyph `rule`, the pane's `blank` and the marks' `mark_fg`
+    /// (`footer::fit_rule`, [`compose_rule_spans`]): kept while every one of
+    /// them, the facts and every cell of the block are the last frame's,
+    /// else composed anew; `lit`, the fact drawn lit, is part of the key.
+    /// Its cells' count, where the chips start, the run of the rule's own
+    /// glyphs in it, and where its facts lie ([`RulePaint::spans`]).
     fn compose(
         &mut self,
         room: usize,
@@ -1156,13 +1825,15 @@ impl PaneFooter {
         rule: RenderCell,
         blank: RenderCell,
         mark_fg: [u8; 3],
-    ) -> (usize, Option<usize>, std::ops::Range<usize>) {
+        lit: Option<FactKind>,
+    ) -> Composed {
         let key = RuleKey {
             shown_gen: self.shown_gen,
             room,
             rule,
             blank,
             mark_fg,
+            lit,
         };
         let composed = &mut self.rule;
         let same_block = match (&mut composed.block, block) {
@@ -1182,7 +1853,7 @@ impl PaneFooter {
             });
             let fit = footer::fit_rule(&self.shown, room, widths);
             composed.key = Some(key);
-            composed.paint = compose_rule_spans(&fit, block, rule, blank, mark_fg, room);
+            composed.paint = compose_rule_spans(&fit, block, rule, blank, mark_fg, room, lit);
             match block {
                 Some(block) => composed
                     .block
@@ -1191,12 +1862,30 @@ impl PaneFooter {
                 None => composed.block = None,
             }
         }
-        (
-            composed.paint.cells.len(),
-            composed.paint.lights_at,
-            composed.paint.glass.clone(),
-        )
+        Composed {
+            cells: composed.paint.cells.len(),
+            lights_at: composed.paint.lights_at,
+            title: composed.paint.title.clone(),
+            glass: composed.paint.glass.clone(),
+            facts_at: composed.paint.facts_at,
+            spans: composed.paint.spans,
+        }
     }
+}
+
+/// What a frame reads of a pane's composed rule ([`PaneFooter::compose`]):
+/// its cells' count, where the chips start, the run of the rule's own
+/// glyphs in it, where the facts start and where each fact lies past that
+/// start's blank.
+#[derive(Debug, Clone)]
+struct Composed {
+    cells: usize,
+    lights_at: Option<usize>,
+    /// The title slot's words in the cells (empty: none drawn).
+    title: std::ops::Range<usize>,
+    glass: std::ops::Range<usize>,
+    facts_at: usize,
+    spans: footer::FactSpans,
 }
 
 /// Whether `text` reads as `cells`' chars (`None`: a row the frame does not hold, read as
@@ -2104,6 +2793,127 @@ impl Reads<'_> {
     }
 }
 
+/// What the footer's fact menus act on and its traffic card draws, published
+/// beside the facts (`SessionTimeline::set_claude_side`), never in them: a
+/// new side repaints nothing, and no frame reads it. Shared read-only; a
+/// reader that holds one knows it moved by `Arc::ptr_eq`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct FactSide {
+    /// Where the session's Bash tool stands, else its launch directory,
+    /// absolute: the directory the path fact shows.
+    pub(crate) cwd: Option<PathBuf>,
+    /// Its repository's root: where `footer::read_git_head`'s climb found
+    /// `.git`.
+    pub(crate) repo_root: Option<PathBuf>,
+    /// The session's tokens over time, once its usage fold caught up
+    /// (`footer::FooterCache::traffic`); `None` for a program with no fold.
+    pub(crate) traffic: Option<Arc<aterm_agent::harness::session_usage::TrafficView>>,
+    /// The fold and generation `traffic` was built at
+    /// (`footer::FooterCache::traffic_generation`).
+    built_at: Option<(u64, u64)>,
+    /// The session's agents and workflow runs with their calls in flight,
+    /// once its usage fold caught up (`footer::FooterCache::flights`): what
+    /// the agents panel's dots map their rows to.
+    pub(crate) flights: Option<Arc<aterm_agent::harness::flight::FlightTable>>,
+    /// The fold and generation `flights` was built at
+    /// (`footer::FooterCache::flight_generation`).
+    flights_at: Option<(u64, u64)>,
+}
+
+#[cfg(test)]
+impl FactSide {
+    /// A side at `cwd`, in the repository at `repo_root`, with no traffic:
+    /// what a test publishes beside its facts.
+    pub(crate) fn at(cwd: Option<PathBuf>, repo_root: Option<PathBuf>) -> Self {
+        Self {
+            cwd,
+            repo_root,
+            traffic: None,
+            built_at: None,
+            flights: None,
+            flights_at: None,
+        }
+    }
+
+    /// This side with `flights` beside it, as the resolver publishes a
+    /// session's subagents' calls in flight.
+    pub(crate) fn with_flights(
+        mut self,
+        flights: aterm_agent::harness::flight::FlightTable,
+    ) -> Self {
+        self.flights = Some(Arc::new(flights));
+        self
+    }
+
+    /// This side with `traffic` beside it, as the resolver publishes a
+    /// session's tokens over time. Built where its one caller, a unix
+    /// test, is.
+    #[cfg(unix)]
+    pub(crate) fn with_traffic(
+        mut self,
+        traffic: aterm_agent::harness::session_usage::TrafficView,
+    ) -> Self {
+        self.traffic = Some(Arc::new(traffic));
+        self
+    }
+}
+
+/// What a [`side_after`] read found of the fold: the traffic's generation
+/// and the flight table's, each with what builds it.
+struct SideFold<T, F> {
+    generation: Option<(u64, u64)>,
+    traffic: T,
+    flight_generation: Option<(u64, u64)>,
+    flights: F,
+}
+
+/// The side for a read that found `cwd` and `repo_root` and a fold whose
+/// parts are at `fold`'s generations: `held` itself (the same `Arc`) when
+/// none of them moved, else a new one, each of the traffic and the flight
+/// table `held`'s own where its generation did not move and built anew where
+/// it did. Pure.
+fn side_after<T, F>(
+    held: Option<&Arc<FactSide>>,
+    cwd: Option<PathBuf>,
+    repo_root: Option<PathBuf>,
+    fold: SideFold<T, F>,
+) -> Arc<FactSide>
+where
+    T: FnOnce() -> Option<aterm_agent::harness::session_usage::TrafficView>,
+    F: FnOnce() -> Option<aterm_agent::harness::flight::FlightTable>,
+{
+    let SideFold {
+        generation,
+        traffic,
+        flight_generation,
+        flights,
+    } = fold;
+    if let Some(held) = held
+        && held.cwd == cwd
+        && held.repo_root == repo_root
+        && held.built_at == generation
+        && held.flights_at == flight_generation
+    {
+        return Arc::clone(held);
+    }
+    let traffic = match held {
+        Some(held) if held.built_at == generation => held.traffic.clone(),
+        _ => generation.and_then(|_| traffic()).map(Arc::new),
+    };
+    let flights = match held {
+        Some(held) if held.flights_at == flight_generation => held.flights.clone(),
+        _ => flight_generation.and_then(|_| flights()).map(Arc::new),
+    };
+    Arc::new(FactSide {
+        cwd,
+        repo_root,
+        traffic,
+        built_at: generation,
+        flights,
+        flights_at: flight_generation,
+    })
+}
+
 /// The dev timeline row of one read of an awaited process ([`Reads::resolve`]).
 pub(crate) const REGISTRY_READ: &str = "registry-read";
 
@@ -2523,6 +3333,29 @@ fn resolve_facts_at(
     asks: Asks,
     clock: &footer::ReadClock<'_>,
 ) -> (Option<Option<PathBuf>>, Found) {
+    resolve_facts_at_with_cwd(
+        timeline,
+        identity,
+        tail,
+        fold,
+        roster,
+        (asks, aterm_sysprobe::process_cwd),
+        clock,
+    )
+}
+
+/// The resolver's process-directory capability, passed explicitly so an
+/// owned fixture never probes an arbitrary process bearing its example pid.
+fn resolve_facts_at_with_cwd(
+    timeline: &Arc<Mutex<SessionTimeline>>,
+    identity: &mut Identity,
+    tail: &mut footer::TailCache,
+    fold: &mut footer::FooterCache,
+    roster: &mut RosterMemo,
+    capabilities: (Asks, impl Fn(u32) -> Option<PathBuf>),
+    clock: &footer::ReadClock<'_>,
+) -> (Option<Option<PathBuf>>, Found) {
+    let (asks, cwd_of) = capabilities;
     let is_claude = timeline
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2587,6 +3420,14 @@ fn resolve_facts_at(
                 (asks.home)().as_deref(),
             )
         });
+    // The side's directories: the read's own when it found the process
+    // (`footer::FooterCache::dirs`), else the agy/muse read's below.
+    let mut dirs = facts
+        .as_ref()
+        .and(fold.dirs())
+        .map(|dirs| (Some(dirs.cwd.clone()), dirs.repo_root.clone()));
+    let mut generation = facts.as_ref().and(fold.traffic_generation());
+    let mut flight_generation = facts.as_ref().and(fold.flight_generation());
     if facts.is_none() {
         let (non_registry_prog, prev_sub, prev_ctx) = {
             let held = timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -2609,15 +3450,17 @@ fn resolve_facts_at(
                 aterm_phase::Program::Muse => "muse",
                 _ => "agy",
             };
-            let cwd = u32::try_from(identity.pid)
-                .ok()
-                .and_then(aterm_sysprobe::process_cwd);
+            let cwd = u32::try_from(identity.pid).ok().and_then(cwd_of);
             let home = (asks.home)();
-            let (branch, repo_read_denied) = match cwd.as_deref().map(footer::read_git_head) {
-                Some(footer::GitHeadRead::Found(b)) => (Some(b), None),
-                Some(footer::GitHeadRead::Denied) => (None, cwd.clone()),
-                Some(footer::GitHeadRead::Absent) | None => (None, None),
-            };
+            let (branch, repo_read_denied, repo_root) =
+                match cwd.as_deref().map(footer::read_git_head) {
+                    Some(footer::GitHeadRead::Found(b, root)) => (Some(b), None, Some(root)),
+                    Some(footer::GitHeadRead::Denied) => (None, cwd.clone(), None),
+                    Some(footer::GitHeadRead::Absent) | None => (None, None, None),
+                };
+            dirs = Some((cwd.clone(), repo_root));
+            generation = None;
+            flight_generation = None;
             let args = (asks.args)(identity.pid);
             let launch = args
                 .as_ref()
@@ -2631,16 +3474,33 @@ fn resolve_facts_at(
             // Muse Code's account is its own login store's, read here on
             // the resolver thread; its tier and weekly quota are read off
             // its `/status` and `/usage` cards on the glass and kept in
-            // `prev_sub` between reads, so only a missing address is asked
-            // of the store.
+            // `prev_sub` between reads only while the store names the same
+            // address. A different address replaces the whole tuple, so the
+            // previous account's card facts cannot survive an account
+            // switch in the same process. Where the store names none, the
+            // previous display stays: a transient store read cannot erase
+            // the only account evidence the glass has given.
             let mut sub = prev_sub;
             if prog == aterm_phase::Program::Muse
-                && sub.email.is_none()
-                && let (Some(args), Some(home)) = (args.as_ref(), home.as_deref())
-                && let Some(read) =
-                    aterm_agent::harness::profile::muse_subscription_for(&args.env, home)
+                && muse_weekly_expired(
+                    sub.weekly_reset.as_ref().and_then(|reset| reset.at),
+                    clock.now,
+                )
             {
-                sub.email = read.email;
+                sub.weekly = None;
+                // Keep the occurrence: the same card can remain on glass
+                // after this read and must not place itself anew.
+            }
+            if prog == aterm_phase::Program::Muse
+                && let (Some(args), Some(home)) = (args.as_ref(), home.as_deref())
+                && let Some(read) = aterm_agent::harness::profile::muse_subscription_for(
+                    &args.argv, &args.env, home,
+                )
+            {
+                match sub.email.as_deref() {
+                    Some(previous) if read.email.as_deref() != Some(previous) => sub = read,
+                    _ => sub.email = read.email,
+                }
             }
             facts = Some(FooterFacts {
                 model_open: model.is_none(),
@@ -2662,6 +3522,8 @@ fn resolve_facts_at(
                 }),
                 upgrade: None,
                 account: None,
+                top_effort: None,
+                off: footer::FactMask::default(),
                 subscription: Some(sub),
                 // The plan is read for a Claude Code's model only.
                 plan: None,
@@ -2725,6 +3587,28 @@ fn resolve_facts_at(
         task: identity.task.clone(),
         transcript_len: tail.transcript_len(),
     });
+    // The side, rebuilt only when its directories or the fold's generation
+    // moved: the one held is taken in its own short hold of the (leaf) lock,
+    // and the traffic is built outside it.
+    let side = facts.as_ref().map(|_| {
+        let held = timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .claude_side()
+            .cloned();
+        let (cwd, repo_root) = dirs.take().unwrap_or_default();
+        side_after(
+            held.as_ref(),
+            cwd,
+            repo_root,
+            SideFold {
+                generation,
+                traffic: || fold.traffic(),
+                flight_generation,
+                flights: || fold.flights(),
+            },
+        )
+    });
     let row = facts.is_some();
     let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
     // One unreadable read of the same process (Claude rewrites its sessions file on every
@@ -2761,6 +3645,7 @@ fn resolve_facts_at(
         f.context = Some(prev_ctx.clone());
     }
     timeline.set_claude_excerpts(identity.pid, excerpts);
+    timeline.set_claude_side(identity.pid, side);
     if row {
         timeline.note_claude_footer_read(identity.pid, std::time::Instant::now());
     }
@@ -2773,6 +3658,52 @@ fn resolve_facts_at(
             row,
             timed: needs_recheck(&timeline),
         },
+    )
+}
+
+/// One known reset occurrence has arrived. Shared by the resolver and a
+/// new frame observation; an unplaced reset never expires on a guess.
+fn muse_weekly_expired(reset_at: Option<i64>, now: i64) -> bool {
+    reset_at.is_some_and(|at| at <= now)
+}
+
+fn muse_weekly_reset_at(reset: &str, clock: &footer::ReadClock<'_>) -> Option<i64> {
+    let spec = aterm_agent::supervise::limit::parse_reset(reset)?;
+    let local = (clock.offset_at)(None, clock.now)?;
+    Some(aterm_agent::supervise::limit::reset_at_with(
+        &spec,
+        clock.now,
+        local,
+        &|zone, unix| (clock.offset_at)(Some(zone), unix),
+    ))
+}
+
+/// Admit one card observation. An unchanged reset reuses its occurrence
+/// and its expiry tombstone; settled frames need no clock, parsing or copy.
+fn muse_weekly_observation<'a>(
+    (weekly, reset): (&'a str, Option<&'a str>),
+    kept: Option<&aterm_agent::harness::profile::SubscriptionDisplay>,
+    clock: &dyn Fn() -> footer::ReadClock<'static>,
+) -> (Option<&'a str>, Option<(&'a str, Option<i64>)>) {
+    let Some(words) = reset else {
+        return (Some(weekly), None);
+    };
+    if let Some(kept) = kept
+        && let Some(reset) = kept
+            .weekly_reset
+            .as_ref()
+            .filter(|reset| reset.words == words)
+    {
+        return (
+            kept.weekly.as_ref().map(|_| weekly),
+            Some((words, reset.at)),
+        );
+    }
+    let clock = clock();
+    let at = muse_weekly_reset_at(words, &clock);
+    (
+        (!muse_weekly_expired(at, clock.now)).then_some(weekly),
+        Some((words, at)),
     )
 }
 
@@ -2804,17 +3735,21 @@ fn shown_model(timeline: &SessionTimeline, facts: Option<&FooterFacts>) -> Optio
     facts.filled_model_effort(card).0.map(str::to_owned)
 }
 
-/// A fingerprint of `facts` as shown (filled from the launch card `card` the timeline keeps
-/// for them, `FooterFacts::filled_from`) under the `[claude_footer] usage` switch
-/// ([`with_usage_switch`]) for the repaint key: `0` when there are none, so a frame with no
-/// footer keys as if this module did not exist. Taken without a copy, the fill's model and
-/// effort borrowed (`FooterFacts::filled_model_effort`); with the switch off only the limit
-/// wall stands for the usage, so hidden tokens that keep growing do not move the key. The
-/// destructure names every field: a new one does not compile until it is hashed here.
+/// A fingerprint of `facts` AS SHOWN — filled from the launch card `card`
+/// the timeline keeps for them (`FooterFacts::filled_from`) — under the
+/// `[claude_footer] usage` switch ([`with_usage_switch`]), with the facts
+/// the person hid (`off`, `crate::claude_facts`), for the repaint key: `0`
+/// when there are none, so a frame with no footer keys exactly as it did
+/// before this module existed. Taken without a copy — the fill's
+/// model and effort borrowed (`FooterFacts::filled_model_effort`) — so with
+/// the switch off only the limit wall stands for the usage, and hidden
+/// tokens that keep growing do not move the key. The destructure names
+/// every field: a new one does not compile until it is hashed here.
 pub(crate) fn fingerprint(
     facts: Option<&FooterFacts>,
     card: Option<&aterm_phase::LaunchCard>,
     usage: bool,
+    off: FactMask,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let Some(facts) = facts else {
@@ -2836,6 +3771,10 @@ pub(crate) fn fingerprint(
         owner,
         upgrade,
         account,
+        // The top rule's, not this rule's: it has its own key.
+        top_effort: _,
+        // Never the timeline's: the window lays in the person's (`off`).
+        off: _,
         subscription,
         // The Stats Deck's reading: the footer does not show it.
         plan: _,
@@ -2855,7 +3794,16 @@ pub(crate) fn fingerprint(
         resume,
     )
         .hash(&mut h);
-    (model_open, effort_open, effort_for, owner, upgrade, account).hash(&mut h);
+    (
+        model_open,
+        effort_open,
+        effort_for,
+        owner,
+        upgrade,
+        account,
+        off,
+    )
+        .hash(&mut h);
     subscription.hash(&mut h);
     context.hash(&mut h);
     if usage {
@@ -2945,6 +3893,14 @@ fn rule_mask_into(
 /// Also returned: the run between the lights and the facts that is the rule's own glyph
 /// (`rule`), which the glass already shows and the splice leaves unwritten
 /// ([`rule_edits`]); empty without lights and where the two groups meet.
+///
+/// And where the facts' cells start, and where each fact lies past that
+/// start's blank (`footer::fact_spans`): the targets a click acts on. A
+/// hidden fact's greyed `off` is drawn in Claude's rule gray (`rule.fg`),
+/// not bold. The fact `lit` (hovered or selected) is drawn lit: its values
+/// in the pane's ink, its mark in `mark_fg`, underlined where its glyphs are
+/// drawn (`footer::drawn_cells`), each stretch of the line in the ink of the
+/// lit glyph drawn over it.
 fn compose_rule_spans(
     fit: &footer::RuleFit,
     block: Option<&crate::claude_lights::Block>,
@@ -2952,9 +3908,11 @@ fn compose_rule_spans(
     blank: RenderCell,
     mark_fg: [u8; 3],
     room: usize,
+    lit: Option<FactKind>,
 ) -> RulePaint {
     let mut out: Vec<RenderCell> = Vec::with_capacity(room);
     let mut lights_at = None;
+    let mut title_at = 0..0;
     if let Some(block) = block.filter(|_| fit.chips) {
         let title: &[RenderCell] = match fit.title {
             footer::TitleFit::Full => &block.title,
@@ -2969,10 +3927,12 @@ fn compose_rule_spans(
         // the chips and its words.
         let gap = title.len().min(2);
         out.extend_from_slice(&title[title.len() - gap..]);
+        title_at = out.len()..out.len() + (title.len() - gap);
         out.extend_from_slice(&title[..title.len() - gap]);
         out.push(blank);
     }
     let mut facts: Vec<RenderCell> = Vec::new();
+    let mut spans: footer::FactSpans = [None; 6];
     let mut clusters = Vec::new();
     let mut combining = Vec::new();
     if !fit.segments.is_empty() {
@@ -2984,15 +3944,41 @@ fn compose_rule_spans(
         };
         let mark = quiet(mix(mark_fg, rule.fg, 0.5));
         let value = quiet(mix(rule.fg, blank.fg, VALUE_LIFT));
+        // A hidden fact's `off`: Claude's own rule gray, not bold.
+        let stub = RenderCell {
+            bold: false,
+            ..quiet(rule.fg)
+        };
+        let lifted = |cell: RenderCell, fg: [u8; 3]| RenderCell { fg, ..cell };
         // The set line, a blank cell either side: the rule meets it there.
         let set = footer::set_facts(&fit.segments);
+        spans = footer::fact_spans(&set, &fit.segments);
+        let lit_span = lit.and_then(|kind| {
+            spans
+                .iter()
+                .flatten()
+                .find(|span| span.kind == kind)
+                .copied()
+        });
+        let lit_cells = lit_span.map(|span| usize::from(span.cells.0)..usize::from(span.cells.1));
+        // Each lit glyph's middle as drawn, in nudges, and its ink: the
+        // underline under it takes that ink.
+        let mut lit_inks: Vec<(isize, [u8; 3])> = Vec::new();
         facts = vec![blank; set.cells + 2];
-        for glyph in set.glyphs {
+        for glyph in &set.glyphs {
+            let lit = lit_cells.as_ref().is_some_and(|c| c.contains(&glyph.cell));
             // The wall's `♻` (for "resets") is a mark inside its value.
-            let ink = if glyph.mark || glyph.ch == footer::RESET_MARK {
-                mark
-            } else {
-                value
+            let ink = match (
+                glyph.mark || glyph.ch == footer::RESET_MARK,
+                glyph.quiet,
+                lit,
+            ) {
+                (true, _, false) => mark,
+                (true, _, true) => lifted(mark, mark_fg),
+                (false, true, false) => stub,
+                (false, true, true) => lifted(stub, value.fg),
+                (false, false, false) => value,
+                (false, false, true) => lifted(value, blank.fg),
             };
             let cell = RenderCell {
                 ch: glyph.ch,
@@ -3007,6 +3993,30 @@ fn compose_rule_spans(
                     ..cell
                 };
             }
+            if lit {
+                let n = isize::from(footer::NUDGES_PER_CELL);
+                let middle = glyph.cell as isize * n
+                    + isize::from(glyph.nudge)
+                    + glyph.cols as isize * n / 2;
+                lit_inks.push((middle, cell.fg));
+            }
+        }
+        // The lit fact's underline goes under its glyphs where they are
+        // drawn (`footer::drawn_cells`), not under the cells they stand in:
+        // a cell there may hold a blank or a neighbour's glyph, which keeps
+        // its own ink and wears the lit glyph's underline drawn over it.
+        if let Some(span) = lit_span {
+            let n = isize::from(footer::NUDGES_PER_CELL);
+            for c in footer::drawn_cells(&set, &span) {
+                let middle = c as isize * n + n / 2;
+                let ink = lit_inks
+                    .iter()
+                    .min_by_key(|(at, _)| (at - middle).abs())
+                    .map(|&(_, fg)| fg);
+                let cell = &mut facts[1 + c];
+                cell.underline = aterm_core::terminal::UnderlineStyle::Single;
+                cell.underline_color = ink;
+            }
         }
         clusters = set.clusters;
         combining = set.combining;
@@ -3017,18 +4027,22 @@ fn compose_rule_spans(
         glass = out.len()..out.len() + glyphs;
         out.extend(std::iter::repeat_n(rule, glyphs));
     }
-    let facts_at = out.len() + 1;
+    let facts_at = out.len();
+    // A glyph's cell is past the facts' leading blank.
     for (col, _) in &mut clusters {
-        *col += facts_at;
+        *col += facts_at + 1;
     }
     for (col, _) in &mut combining {
-        *col += facts_at;
+        *col += facts_at + 1;
     }
     out.extend(facts);
     RulePaint {
         cells: out,
         lights_at,
+        title: title_at,
         glass,
+        facts_at,
+        spans,
         clusters,
         combining,
     }
@@ -3045,7 +4059,7 @@ fn compose_rule(
     mark_fg: [u8; 3],
     room: usize,
 ) -> (Vec<RenderCell>, Option<usize>) {
-    let paint = compose_rule_spans(fit, block, rule, blank, mark_fg, room);
+    let paint = compose_rule_spans(fit, block, rule, blank, mark_fg, room, None);
     (paint.cells, paint.lights_at)
 }
 
@@ -3219,6 +4233,9 @@ pub(crate) struct FooterUndo {
     /// Its rows, `rows[..live]`; the rest are spare buffers.
     rows: Vec<RowUndo>,
     live: usize,
+    /// The rows of the write whose glass columns are not the grid's (a
+    /// relabelled pill, [`GlassColumns`]): gone with the write.
+    glass: GlassColumns,
 }
 
 /// The tokens a footer write is undone against ([`FooterUndo`]).
@@ -3232,6 +4249,34 @@ struct WriteSeal {
 }
 
 impl FooterUndo {
+    /// The grid column under glass column `col` of window terminal row
+    /// `row`, as the write on the glass left them ([`GlassColumns::grid_col`]):
+    /// what every reader of the pointer's cell asks (`App::pixel_to_cell`),
+    /// so a click, a hover, a link and a selection on the glass's `14
+    /// shells` land on Claude's own `14 shells`.
+    pub(crate) fn grid_col(&self, row: u16, col: u16) -> u16 {
+        if self.write.is_none() {
+            return col;
+        }
+        self.glass.grid_col(row, col)
+    }
+
+    /// Whether the write on the glass put `(frame_row, col)`'s edit there.
+    fn took(&self, frame_row: usize, col: usize) -> bool {
+        self.written()
+            .iter()
+            .any(|r| (r.frame_row, r.col_off) == (frame_row, col))
+    }
+
+    /// Each row span the write on the glass wrote: its frame row, its first
+    /// column and its width — what another module's test asks.
+    #[cfg(test)]
+    pub(crate) fn painted_spans(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        self.written()
+            .iter()
+            .map(|r| (r.frame_row, r.col_off, r.painted.len()))
+    }
+
     /// Add native text only where this splice actually wrote its cells. A skipped
     /// vendor-owned span gets no metadata, and undo verifies these exact payloads.
     fn publish_text(
@@ -3308,6 +4353,94 @@ impl FooterUndo {
     fn is_written(&self) -> bool {
         self.write.is_some()
     }
+
+    /// Frame row `frame_row` of `scratch`, its cells in `cols`, as the
+    /// PROGRAM wrote them: each cell the write on the glass put there — a
+    /// rule's chips and facts and a hidden fact's `off`, the card's line,
+    /// the banner over Claude's update notice, the top rule's border, ghost
+    /// and switch, a relabelled pill and the run packed behind it, an agy
+    /// transcript edit — read as the cell it covered, and the row ending
+    /// where it ended before the write padded it: what [`undo`] would put
+    /// back, read without writing and without allocating. A row the write
+    /// left alone, and one whose painted span a later splice covered (the
+    /// Autopilot menu, the paste question, the tab menu: the glass there is
+    /// no longer the footer's), reads as presented.
+    #[cfg(any(a11y_tree, test))]
+    fn program_cells<'a>(
+        &'a self,
+        scratch: &'a RenderInput,
+        frame_row: usize,
+        cols: std::ops::Range<usize>,
+    ) -> impl Iterator<Item = &'a RenderCell> + 'a {
+        let row: &[RenderCell] = scratch.cells.get(frame_row).map_or(&[], Vec::as_slice);
+        // The write's records on this row, in the order written: the first
+        // saw the row as the program left it.
+        let on_row = move || {
+            self.written()
+                .iter()
+                .filter(move |r| r.frame_row == frame_row)
+        };
+        let glassed = on_row().next().is_some()
+            && on_row().all(|r| {
+                row.get(r.col_off..r.col_off + r.painted.len())
+                    .is_some_and(|span| span == r.painted.as_slice())
+            });
+        let len = if glassed {
+            on_row()
+                .next()
+                .map_or(row.len(), |r| r.len_before.min(row.len()))
+        } else {
+            row.len()
+        };
+        let end = cols.end.min(len);
+        (cols.start.min(end)..end).map(move |c| {
+            // The first record over the cell holds what the program drew
+            // there (inside the row's old end, every record's `before` reaches
+            // it); a cell no record covers is the program's as presented.
+            glassed
+                .then(|| on_row().find(|r| (r.col_off..r.col_off + r.painted.len()).contains(&c)))
+                .flatten()
+                .and_then(|r| r.before.get(c - r.col_off))
+                .unwrap_or(&row[c])
+        })
+    }
+}
+
+/// A window's PRESENTED frame read as its programs wrote it — the cells
+/// under every glass write of the footer's ([`FooterUndo::program_cells`]):
+/// what the accessibility tree's grid text is read from (review G3, owner
+/// decision 2026-10-20), so a screen reader hears Claude's words as copy,
+/// `text`/`screen` and recordings keep them — `⏵⏵ bypass permissions on`,
+/// Claude's update notice and its changelog link, the rule's own glyphs —
+/// never the glass's `YOLO on`, `✦ alab.systems`, a fact or its `off`, or
+/// the top rule's ghost. aterm's chips, mode light, switch, title slot,
+/// facts and key reach a reader as their own nodes
+/// (`App::claude_chips_a11y`), and every non-text layer
+/// (ink, light, decoration) is not text. Built only while a reader is
+/// attached; nothing is copied.
+#[cfg(any(a11y_tree, test))]
+pub(crate) struct ProgramCells<'a> {
+    scratch: &'a RenderInput,
+    undo: &'a FooterUndo,
+}
+
+#[cfg(any(a11y_tree, test))]
+impl<'a> ProgramCells<'a> {
+    /// `scratch` (the presented frame) under `undo` (its last footer write).
+    pub(crate) fn of(scratch: &'a RenderInput, undo: &'a FooterUndo) -> Self {
+        Self { scratch, undo }
+    }
+}
+
+#[cfg(any(a11y_tree, test))]
+impl crate::accessibility::CellRows for ProgramCells<'_> {
+    fn cells_in(
+        &self,
+        r: usize,
+        cols: std::ops::Range<usize>,
+    ) -> impl Iterator<Item = &RenderCell> {
+        self.undo.program_cells(self.scratch, r, cols)
+    }
 }
 
 /// The pane's exact terminal extraction that supplied its cells to this frame. The
@@ -3346,6 +4479,7 @@ fn frame_source<'a>(
 /// before the first reader of the reuse tokens; the splice also calls it first, so a frame
 /// that presents a scratch without refilling it never paints over its own footer.
 pub(crate) fn undo(slot: &mut FooterUndo, scratch: &mut RenderInput) -> bool {
+    slot.glass.clear();
     let Some(seal) = slot.write.take() else {
         return false;
     };
@@ -3447,6 +4581,7 @@ fn write_edits<'a>(
     let restamp = scratch.shifted_fill_seq != 0 && scratch.host_prepend_blessing();
     slot.write = None;
     slot.live = 0;
+    slot.glass.clear();
     for (frame_row, col_off, painted, ground) in edits {
         let span = col_off..col_off + painted.len();
         if touches(&scratch.clusters, frame_row, &span)
@@ -3567,14 +4702,16 @@ impl App {
                 .and_then(|_| timeline.claude_card());
             // The pane's footer took this term with the facts where they are the ones it holds
             // ([`PaneFooter::fingerprint_of`]): at rest they are compared, not hashed again.
+            // With the facts the person hid there (`crate::claude_facts`).
+            let off = self.fact_mask(session);
             let kept = facts.and_then(|f| {
                 ws.claude_footer_texts
                     .borrow()
                     .footers
                     .get(index)?
-                    .fingerprint_of(session, f, timeline.claude_card(), usage)
+                    .fingerprint_of(session, f, timeline.claude_card(), usage, off)
             });
-            let leaf = kept.unwrap_or_else(|| fingerprint(facts, card, usage));
+            let leaf = kept.unwrap_or_else(|| fingerprint(facts, card, usage, off));
             let shows = facts.is_some();
             // So is the live upgrade's note ([`App::splice_claude_footer`]),
             // laid in only where there are facts to lead: both its wordings,
@@ -3589,10 +4726,22 @@ impl App {
                     note.hash(&mut h);
                     h.finish()
                 });
-            let (agent, group) = (
+            let (agent, group, identified) = (
                 crate::harness_host::agent_of(timeline.agent()),
                 timeline.agent().program_pgid,
+                crate::harness_host::identified_agent(timeline.agent()),
             );
+            // So is what the top-effort key's ghost is decided by beside the
+            // facts (`App::key_face`): its evidence and its latch.
+            let key = self.claude_facts.get(&session).map_or(0, |f| {
+                u64::from(f.top_seen == Some(group))
+                    | u64::from(f.press.as_ref().is_some_and(|p| {
+                        matches!(p.slash, crate::claude_slash::Slash::TopEffort(_))
+                    })) << 1
+                    | u64::from(f.latch.as_ref().is_some_and(|latch| {
+                        latch.holds(group, facts.and_then(|f| f.model.as_deref()))
+                    })) << 2
+            });
             // The harness card's gate (card engine §3.8): the current drawer,
             // its reader and its build policy, which the splice judges the
             // card by — with facts or without them.
@@ -3608,14 +4757,30 @@ impl App {
             // card (`crate::claude_card`): one reading of the Autopilot for
             // both, with the timeline's lock released.
             let harness = if shows {
-                let (word, view, supervised) = self.session_autopilot_for(session, agent, &claims);
+                let (word, view, supervised, _) =
+                    self.session_autopilot_for(session, agent, &claims);
+                let theme = crate::autopilot::harness_theme(
+                    view,
+                    supervised,
+                    word,
+                    self.unhosted_glass(agent),
+                );
                 ws.claude_lights
                     .autopilot_term(session, word, view, self.chip_glass(session))
                     ^ self
-                        .claude_card_term(ws, index, session, view, supervised)
+                        .claude_card_term(wid, ws, index, session, view, supervised)
                         .rotate_left(37)
                     // …and the Team chip (who drives, `crate::team`).
                     ^ self.team_term(session).rotate_left(53)
+                    // …and the composer border's theme, which a claim landing
+                    // or lapsing moves though the card is switched off.
+                    ^ theme_term(theme).rotate_left(61)
+                    // …and the agents panel the theme lights
+                    // (`crate::claude_panel`): its switch, and the frame a
+                    // panel on show wants.
+                    ^ self
+                        .claude_panel_term(ws, index, session, theme)
+                        .rotate_left(43)
                     // …and the harness switch on the top rule: whether the
                     // host holds the session (its branding), a click's write
                     // turning it on, the pointer over it.
@@ -3625,14 +4790,27 @@ impl App {
             } else if drawer {
                 // A drawer with no facts yet takes the card's path alone: no
                 // chips, no team — the card is decorated on its first frame.
-                let (_, view, supervised) = self.session_autopilot_for(session, agent, &claims);
-                self.claude_card_term(ws, index, session, view, supervised)
+                let (_, view, supervised, _) = self.session_autopilot_for(session, agent, &claims);
+                self.claude_card_term(wid, ws, index, session, view, supervised)
                     .rotate_left(37)
                     ^ 0xd7a3_5e11
             } else {
                 0
             } ^ gate.rotate_left(11);
-            fp = fp.rotate_left(7) ^ leaf ^ note.rotate_left(17) ^ harness.rotate_left(29);
+            // Gemini CLI's and Codex's top line, which no facts carry: its
+            // switch, its theme and the pointer over it or the lockup.
+            let top = match identified {
+                Some(prog @ (aterm_phase::Program::Gemini | aterm_phase::Program::Codex)) => {
+                    self.bare_top_term(ws, session, prog, agent, &claims)
+                }
+                _ => 0,
+            };
+            fp = fp.rotate_left(7)
+                ^ leaf
+                ^ note.rotate_left(17)
+                ^ harness.rotate_left(29)
+                ^ key.rotate_left(41)
+                ^ top.rotate_left(31);
         }
         // The `[claude_footer] usage` switch, live: a reload that flips it
         // asks every window for a frame (the config apply), and this term
@@ -3641,6 +4819,287 @@ impl App {
             fp ^= u64::from(usage).rotate_left(47);
         }
         fp
+    }
+
+    /// WHAT aterm DRAWS FOR `session`'s TOP-EFFORT KEY on its top rule
+    /// (design §10.6.14), `tag` Claude's own on the row as the frame read it:
+    /// for a Claude Code that takes the key's toggle alone (`stated` is
+    /// `None` for any other: [`PaneFooter::key_typed`]), the ghost where
+    /// Claude draws no tag — only on evidence the key exists for the
+    /// process (the facts `stated` it, the tag was seen for `pgid`, or this
+    /// session's own press of it is in flight) and not latched off for the
+    /// process and its `model` by Claude's refusal — lit while hovered; the
+    /// mark `◐` while the press runs, `▸` while the keyboard selects the
+    /// key. Map lookups and compares: nothing allocated.
+    fn key_face(
+        &self,
+        ws: &crate::WindowState,
+        session: u64,
+        pgid: i32,
+        stated: Option<bool>,
+        model: Option<&str>,
+        tag: Option<(usize, usize)>,
+    ) -> KeyFace {
+        let Some(stated) = stated else {
+            return KeyFace::default();
+        };
+        let facts = self.claude_facts.get(&session);
+        let pressing = facts
+            .and_then(|f| f.press.as_ref())
+            .is_some_and(|p| matches!(p.slash, crate::claude_slash::Slash::TopEffort(_)));
+        let evidence = stated || facts.and_then(|f| f.top_seen) == Some(pgid) || pressing;
+        let latched = facts
+            .and_then(|f| f.latch.as_ref())
+            .is_some_and(|latch| latch.holds(pgid, model));
+        let (hovered, selected) = ws.claude_lights.top_effort_read(session);
+        let ghost = (tag.is_none() && evidence && !latched).then_some(hovered);
+        let mark = if pressing {
+            crate::autopilot::PENDING_GLYPH.chars().next()
+        } else {
+            selected.then_some('\u{25b8}')
+        };
+        KeyFace {
+            ghost,
+            tag,
+            mark: mark.filter(|_| ghost.is_some() || tag.is_some()),
+        }
+    }
+
+    /// The harness switch and the theme GEMINI CLI's or CODEX's top line
+    /// (`prog`) wears, under `session`'s Autopilot `reading` for its admitted
+    /// `agent` (design §6.2): a switch only where the host admits the agent
+    /// and a host is — never for a vendor `codex`, which no host admits — and
+    /// the theme only where a switch stands. codex-alab carries itself: a
+    /// proven self-claim (`reading.3`) is its harness's, so its line wears
+    /// the palette as a claim of this host's would; every other program
+    /// keeps this host's claim alone.
+    fn bare_top_harness(
+        &self,
+        ws: &crate::WindowState,
+        session: u64,
+        prog: aterm_phase::Program,
+        agent: Option<aterm_phase::Program>,
+        (word, view, supervised, self_proven): (
+            Option<aterm_agent::supervise::Autopilot>,
+            crate::autopilot::AutopilotView,
+            bool,
+            bool,
+        ),
+    ) -> (
+        Option<SwitchPaint>,
+        Option<aterm_effects::harness_card::CardPalette>,
+    ) {
+        let switch = agent
+            .and_then(|_| crate::autopilot::HarnessSwitch::of(view))
+            .map(|face| {
+                let (face, hover) = ws.claude_lights.switch_shown(session, face);
+                SwitchPaint { face, hover }
+            });
+        let carried = supervised || (prog == aterm_phase::Program::Codex && self_proven);
+        let theme =
+            crate::autopilot::harness_theme(view, carried, word, self.unhosted_glass(agent));
+        (switch, theme.filter(|_| switch.is_some()))
+    }
+
+    /// The repaint key's term for GEMINI CLI's or CODEX's top line
+    /// (`prog`, `session`'s, its admitted `agent`): what its switch and theme
+    /// are made of ([`Self::bare_top_harness`]) and the pointer over the
+    /// switch or the lockup — each a change of the line with no grid damage,
+    /// which the footer's facts carry for the others. One Autopilot read.
+    fn bare_top_term(
+        &self,
+        ws: &crate::WindowState,
+        session: u64,
+        prog: aterm_phase::Program,
+        agent: Option<aterm_phase::Program>,
+        claims: &crate::autopilot::ClaimClock,
+    ) -> u64 {
+        let reading = self.session_autopilot_for(session, agent, claims);
+        let (word, view, supervised, self_proven) = reading;
+        let carried = supervised || (prog == aterm_phase::Program::Codex && self_proven);
+        let theme =
+            crate::autopilot::harness_theme(view, carried, word, self.unhosted_glass(agent));
+        view.code()
+            ^ u64::from(agent.is_some()).rotate_left(5)
+            ^ theme_term(theme).rotate_left(13)
+            ^ ws.claude_lights
+                .switch_term(session, carried)
+                .rotate_left(23)
+    }
+
+    /// SPLICE ONE PANE'S TOP LINE (design §6.2): Claude Code's, agy's and
+    /// Muse Code's composer top rule, Gemini CLI's live-zone rule, Codex's
+    /// slab pad ([`top_line`]), its run read once per rebuild of the rows and
+    /// kept with them, and its composition kept while what it is made of
+    /// holds ([`PaneFooter::compose_top`]): a frame at rest reads, composes
+    /// and allocates nothing for it. Its cells go in the footer's write
+    /// (`lists.tops`), and its targets — the key's ghost or tag, the
+    /// harness switch, the lockup the hover title answers — are noted once
+    /// the write takes. On Codex's slab the slab's blank stands in for the
+    /// pane's ([`TopLine::Slab`]).
+    fn splice_top_line(
+        &self,
+        ws: &crate::WindowState,
+        wid: WindowId,
+        texts: &mut PaneTextCache,
+        lists: &mut SpliceLists,
+        at: &TopLineAt,
+    ) {
+        let TopLineAt {
+            leaf_index,
+            session,
+            program_pgid,
+            program,
+            region,
+            pane,
+            blank,
+            switch,
+            palette,
+            held,
+            cell,
+            mark_fg,
+        } = *at;
+        let Some((top, line)) = texts.top_line(leaf_index, program) else {
+            return;
+        };
+        if self.chrome_owns_terminal_row(wid, region.row_off + top) {
+            return;
+        }
+        let (Some(run), tag) = texts.top_run(
+            leaf_index,
+            (session, program),
+            &ws.input_scratch,
+            region,
+            top,
+            line,
+            blank,
+        ) else {
+            return;
+        };
+        // On Codex's slab its blank is the ground every ink is laid on, and
+        // the theme's accent — chosen for the theme's own ground, which the
+        // slab is not — is floored along its own hue to read 4.5:1 on it:
+        // after a dark Codex slab outlives a turn to Default Light, the
+        // light accent's `on` pill (`#1a7f37`) read 2.6:1 there, its letters
+        // the slab's ink on it the same (codex-alab 0.164.0-dev, the real-Codex
+        // lab, 2026-10-21). A rule is on the theme's ground: its accent stays.
+        let (ground, mark_fg) = match line {
+            TopLine::Rule => (blank, mark_fg),
+            TopLine::Slab => {
+                let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+                let [_, r, g, b] = aterm_effects::color_math::floor_contrast_keeping_hue(
+                    pack(mark_fg),
+                    pack(run.rule.bg),
+                    aterm_effects::cli_marks::NAME_CONTRAST,
+                )
+                .to_be_bytes();
+                (run.rule, [r, g, b])
+            }
+        };
+        let mark_hover = ws.claude_lights.mark_hovered(session);
+        let footer = texts.footer(leaf_index, session);
+        let typed = program == aterm_phase::Program::Claude && footer.key_typed();
+        let face = self.key_face(
+            ws,
+            session,
+            program_pgid,
+            typed.then(|| footer.shown().top_effort.is_some()),
+            footer.published().and_then(|f| f.model.as_deref()),
+            tag,
+        );
+        if face.tag.is_some()
+            && self.claude_facts.get(&session).and_then(|f| f.top_seen) != Some(program_pgid)
+        {
+            lists.top_seen.push((session, program_pgid));
+        }
+        let frame_row = region.strip + region.row_off + top;
+        // A SELECTION OVER THE LINE keeps it the program's (§6.6): the
+        // selection is the renderer's overlay, never the cells, so nothing
+        // above proved the row clear of it, and decoration laid under it
+        // would read as selected while the copy gives the grid's own text.
+        // No write, no layer, no lockup or switch to point at; Claude's own
+        // tag is Claude's cells, a target still.
+        if top_line_selected(&ws.input_scratch, frame_row, region) {
+            if let Some(cols) = face.tag {
+                lists.top_hits.push(TopHit {
+                    frame_row,
+                    term_row: region.row_off + top,
+                    cols,
+                    session,
+                    ghost: false,
+                });
+            }
+            return;
+        }
+        let key = TopKey {
+            frame_row,
+            term_row: region.row_off + top,
+            line,
+            run,
+            program,
+            switch,
+            palette,
+            blank: ground,
+            mark_fg,
+            face,
+            cell,
+            clip: pane_grid_px(cell, pane),
+            mark_hover,
+            title_gen: if mark_hover && held {
+                footer.shown_gen
+            } else {
+                0
+            },
+        };
+        let composed = texts.compose_top(leaf_index, key);
+        // The key's target: aterm's ghost where its write takes, Claude's
+        // tag where the glass shows it.
+        let hit = |cols: (usize, usize), ghost: bool| TopHit {
+            frame_row: key.frame_row,
+            term_row: key.term_row,
+            cols,
+            session,
+            ghost,
+        };
+        if let Some(cols) = composed.ghost {
+            lists.top_hits.push(hit(cols, true));
+        } else if let Some(cols) = face.tag {
+            lists.top_hits.push(hit(cols, false));
+        }
+        // The harness switch the composition laid: a target once its write
+        // reaches the glass.
+        if let (Some(laid), Some(paint)) = (composed.switch.clone(), switch) {
+            lists
+                .border_toggles
+                .push(crate::claude_lights::BorderSwitch {
+                    frame_row: key.frame_row,
+                    term_row: key.term_row,
+                    cols: laid.cols,
+                    switch: laid.switch,
+                    button: laid.button,
+                    session,
+                    face: paint.face,
+                    tier: laid.tier,
+                    program,
+                });
+        }
+        if !composed.cells.is_empty() {
+            if !composed.lockup.is_empty() {
+                lists.marks.push(MarkWrite {
+                    frame_row: key.frame_row,
+                    term_row: key.term_row,
+                    edit_col: composed.col,
+                    cols: composed.lockup.clone(),
+                    session,
+                });
+            }
+            lists.tops.push(TopWrite {
+                frame_row: key.frame_row,
+                col: composed.col,
+                leaf_index,
+                ground,
+            });
+        }
     }
 
     /// Write the footer into each visible Claude Code pane's composer rule, inside that
@@ -3657,6 +5116,22 @@ impl App {
         wid: WindowId,
         plan: &crate::tab_model::VisibleLeafPlan,
         route: VisibleContentRoute,
+    ) {
+        self.splice_claude_footer_at(wid, plan, route, &|| footer::ReadClock {
+            read_at: std::time::SystemTime::now(),
+            now: aterm_agent::supervise::limit::unix_now(),
+            offset_at: &offset_at_cached,
+        });
+    }
+
+    /// The same splice with a lazy observation clock: only a newly named
+    /// Muse reset forces it, never an unrelated or settled drawer.
+    fn splice_claude_footer_at(
+        &mut self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+        route: VisibleContentRoute,
+        clock: &dyn Fn() -> footer::ReadClock<'static>,
     ) {
         // The splice's lists are the window's, kept for their buffers: taken
         // here, handed back empty.
@@ -3683,7 +5158,15 @@ impl App {
         }) else {
             return;
         };
-        self.splice_claude_footer_with(wid, plan, route, &mut lists);
+        self.splice_claude_footer_with(wid, plan, route, &mut lists, clock);
+        // A switch or a lockup hovered that this paint moved from under a
+        // still pointer is let go (`settle_glass_hover`).
+        self.settle_glass_hover(wid);
+        // A process whose top rule showed Claude's top-effort tag: evidence
+        // the key exists for it, which its ghost waits for.
+        for (session, pgid) in lists.top_seen.drain(..) {
+            self.claude_facts.entry(session).or_default().top_seen = Some(pgid);
+        }
         // The launch card's amends rang their watchers in the hold that took
         // the owed wake; the loop follows the log (its settle tick, the
         // clause) on its next turn (`Wake::SessionLogMoved`), and a loop with
@@ -3710,6 +5193,7 @@ impl App {
         plan: &crate::tab_model::VisibleLeafPlan,
         route: VisibleContentRoute,
         lists: &mut SpliceLists,
+        clock: &dyn Fn() -> footer::ReadClock<'static>,
     ) {
         // Every Claude Code pane on the glass, for the harness card's pass.
         let mut cards = Vec::new();
@@ -3733,6 +5217,15 @@ impl App {
             return;
         }
         let mark_fg = crate::chrome_band::band_colors(self.theme).accent;
+        // The window's cell in device pixels: what the top rules' mark
+        // sprites are fitted to (`cli_marks::fit`).
+        let cell = {
+            let (cw, ch) = self.win_cell_size(wid);
+            (
+                u16::try_from(cw).unwrap_or(u16::MAX),
+                u16::try_from(ch).unwrap_or(u16::MAX),
+            )
+        };
         let usage = self.config.claude_footer_usage();
         // The pass's claim clock: every pane's Autopilot read shares it.
         let claims = crate::autopilot::ClaimClock::default();
@@ -3765,12 +5258,15 @@ impl App {
                 // upgrade's note —
                 // taken into the pane's footer ([`PaneFooter`]) only where
                 // one of them moved: a frame at rest copies none of them. And
-                // the harness card's gate (card engine §3.8): the current
-                // holder image's token, reader and build policy, facts or
-                // none — a drawer whose facts have not landed takes the
-                // card's path all the same. The pane's one timeline lock this
-                // frame: the PTY reader holds it while Claude streams.
-                let (held, agent, gate) = {
+                // the process the facts are for (its group), which the
+                // harness card matches its card against; the side's flight
+                // table, shared, for the agents panel's dots; and the harness
+                // card's gate (card engine §3.8): the current holder image's
+                // token, reader and build policy, facts or none — a drawer
+                // whose facts have not landed takes the card's path all the
+                // same. The pane's one timeline lock this frame: the PTY
+                // reader holds it while Claude streams.
+                let (held, agent, flights, gate, identified, muse_cards_need_account) = {
                     let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
                     #[cfg(test)]
                     crate::work_counts::footer_timeline_locked();
@@ -3808,7 +5304,12 @@ impl App {
                     let held = timeline.claude_footer().is_some_and(|facts| {
                         let mut texts = ws.claude_footer_texts.borrow_mut();
                         let footer = texts.footer(leaf_index, session);
-                        footer.note_facts(facts, timeline.claude_card(), usage);
+                        footer.note_facts(
+                            facts,
+                            timeline.claude_card(),
+                            usage,
+                            self.fact_mask(session),
+                        );
                         footer.note_upgrade(timeline.upgrade_note());
                         true
                     });
@@ -3818,9 +5319,18 @@ impl App {
                             crate::harness_host::agent_of(timeline.agent()),
                             timeline.agent().program_pgid,
                         ),
+                        timeline.claude_side().and_then(|side| side.flights.clone()),
                         timeline.card_gate(),
+                        // The program the top line's lockup names: the
+                        // agent that owns the prompt, admitted or not (a
+                        // vendor `codex` wears its lockup too).
+                        crate::harness_host::identified_agent(timeline.agent()),
+                        timeline.muse_cards_need_account(),
                     )
                 };
+                // The process group Claude Code runs as: what a key's latch
+                // and its evidence are kept for (`crate::claude_slash`).
+                let program_pgid = agent.1;
                 let row_off = leaf.rect.origin.y.round().max(0.0) as usize;
                 let col_off = leaf.rect.origin.x.round().max(0.0) as usize;
                 let pane_rows = leaf.rect.size.height.round().max(1.0) as usize;
@@ -3832,6 +5342,23 @@ impl App {
                     rows: pane_rows,
                     cols: pane_cols,
                 };
+                let region = PaneTextRegion {
+                    strip,
+                    row_off,
+                    col_off,
+                    rows: pane_rows,
+                    cols: pane_cols,
+                };
+                let blank = source.implicit_blank;
+                // Gemini CLI and Codex hold no footer facts: their top line is
+                // spliced before either gate's `continue` (design §6.2), the
+                // card's path untouched.
+                let bare_top = match identified {
+                    Some(prog @ (aterm_phase::Program::Gemini | aterm_phase::Program::Codex)) => {
+                        Some(prog)
+                    }
+                    _ => None,
+                };
                 if !held && gate.is_none() {
                     // No drawer and no facts: a card this window keeps for
                     // the session left by its identity (Claude stopped or
@@ -3842,6 +5369,35 @@ impl App {
                             leaf_index, session, pane,
                         ));
                     }
+                    if let Some(prog) = bare_top {
+                        let agent = crate::harness_host::admitted_as(&entry.ctx, agent.0, agent.1);
+                        let reading = self.session_autopilot_for(session, agent, &claims);
+                        let (switch, palette) =
+                            self.bare_top_harness(ws, session, prog, agent, reading);
+                        let mut texts = ws.claude_footer_texts.borrow_mut();
+                        texts.rows(leaf_index, session, &ws.input_scratch, region);
+                        lists.top_only.push(leaf_index);
+                        self.splice_top_line(
+                            ws,
+                            wid,
+                            &mut texts,
+                            lists,
+                            &TopLineAt {
+                                leaf_index,
+                                session,
+                                program_pgid,
+                                program: prog,
+                                region,
+                                pane,
+                                blank,
+                                switch,
+                                palette,
+                                held: false,
+                                cell,
+                                mark_fg,
+                            },
+                        );
+                    }
                     continue;
                 }
                 // The agent as the host admits it, read after the timeline's
@@ -3850,21 +5406,14 @@ impl App {
                 // The session's Autopilot, read ONCE for this frame with no
                 // lock held (its own leaf lock alone): what the harness's
                 // chips say and whether the harness card wraps the pane.
-                let (word, view, supervised) = self.session_autopilot_for(session, agent, &claims);
-                let blank = source.implicit_blank;
+                let reading = self.session_autopilot_for(session, agent, &claims);
+                let (word, view, supervised, _) = reading;
                 // The gate's one verdict this frame, for the card and the
                 // footer's kept card alike, made from the frame's own fence.
                 let mut check = crate::claude_card::GateCheck::new(
                     gate,
                     crate::claude_card::FenceFrame::of(source),
                 );
-                let region = PaneTextRegion {
-                    strip,
-                    row_off,
-                    col_off,
-                    rows: pane_rows,
-                    cols: pane_cols,
-                };
                 let mut texts = ws.claude_footer_texts.borrow_mut();
                 texts.rows(leaf_index, session, &ws.input_scratch, region);
                 let texts = &mut *texts;
@@ -3935,6 +5484,7 @@ impl App {
                                     facts,
                                     timeline.claude_card(),
                                     usage,
+                                    self.fact_mask(session),
                                 );
                             }
                         }
@@ -3942,7 +5492,10 @@ impl App {
                 }
                 // A footer held for facts reads its account and context off
                 // the glass; a drawer with no facts has no footer to fill.
-                if held && let Some(Some(cached)) = texts.panes.get(leaf_index) {
+                // Read once per rebuild of the pane's rows and compared with
+                // what the footer shows: a frame at rest scans and copies
+                // nothing (THE FOOTER AT REST COSTS NOTHING).
+                if held && texts.panes.get(leaf_index).is_some_and(Option::is_some) {
                     let shown = texts.footers[leaf_index].shown();
                     // agy's launch card and Muse Code's `/status` card each
                     // name their signed-in account on the glass; Muse
@@ -3959,46 +5512,80 @@ impl App {
                     let want_ctx = agent == Some(aterm_phase::Program::Claude);
                     if want_acct || want_ctx {
                         let screen_acct = want_acct
-                            .then(|| match agent {
-                                Some(aterm_phase::Program::Muse) => {
-                                    aterm_phase::muse::status_card_account(&cached.rows)
-                                }
-                                _ => aterm_phase::agy::launch_card_account(&cached.rows),
-                            })
+                            .then(|| texts.screen_account(leaf_index, agent))
                             .flatten();
+                        // Muse Code's login store names its current
+                        // account; a `/status` card naming another is the
+                        // previous account's historical glass after a
+                        // switch, so none of that card set grafts beside
+                        // the store's account. It may still fill an address
+                        // the store has not named.
+                        let stale_muse_cards = agent == Some(aterm_phase::Program::Muse)
+                            && screen_acct.is_some_and(|(email, _)| {
+                                shown
+                                    .subscription
+                                    .as_ref()
+                                    .and_then(|sub| sub.email.as_deref())
+                                    .is_some_and(|current| current != email)
+                            });
+                        let screen_acct = (!stale_muse_cards).then_some(screen_acct).flatten();
                         let screen_weekly = (agent == Some(aterm_phase::Program::Muse)
-                            && want_acct)
-                            .then(|| aterm_phase::muse::usage_card_weekly(&cached.rows))
+                            && want_acct
+                            && !stale_muse_cards
+                            && !muse_cards_need_account)
+                            .then(|| texts.usage_weekly(leaf_index))
+                            .flatten()
+                            .map(|reading| {
+                                muse_weekly_observation(reading, shown.subscription.as_ref(), clock)
+                            });
+                        // A `/usage` card alone names the tier too, with no
+                        // `/status` card's account row for it to ride on.
+                        let screen_plan = (agent == Some(aterm_phase::Program::Muse)
+                            && want_acct
+                            && !stale_muse_cards)
+                            .then(|| match screen_acct {
+                                Some((_, plan)) => plan,
+                                None if !muse_cards_need_account => {
+                                    texts.subscription_plan(leaf_index)
+                                }
+                                None => None,
+                            })
                             .flatten();
                         let screen_ctx = want_ctx
-                            .then(|| {
-                                aterm_phase::phase::context_left_shown(&cached.rows)
-                                    .map(|pct| format!("ctx {pct}% left"))
-                            })
+                            .then(|| texts.context_reading(leaf_index))
                             .flatten();
-                        let need_acct = screen_acct.as_ref().is_some_and(|(email, plan)| {
+                        let need_acct = screen_acct.is_some_and(|(email, plan)| {
                             shown.subscription.as_ref().is_some_and(|sub| {
-                                sub.email.as_deref() != Some(email.as_str())
-                                    || sub.plan.as_deref() != plan.as_deref()
+                                sub.email.as_deref() != Some(email) || sub.plan.as_deref() != plan
                             })
-                        }) || screen_weekly.as_ref().is_some_and(|weekly| {
+                        }) || screen_plan.is_some_and(|plan| {
                             shown
                                 .subscription
                                 .as_ref()
-                                .is_some_and(|sub| sub.weekly.as_ref() != Some(weekly))
+                                .is_some_and(|sub| sub.plan.as_deref() != Some(plan))
+                        }) || screen_weekly.is_some_and(|(weekly, reset)| {
+                            shown.subscription.as_ref().is_some_and(|sub| {
+                                sub.weekly.as_deref() != weekly
+                                    || sub
+                                        .weekly_reset
+                                        .as_ref()
+                                        .map(|reset| (reset.words.as_str(), reset.at))
+                                        != reset
+                            })
                         });
                         // A new reading is written; a reading Claude Code no longer shows
                         // (as after `/compact`) goes. A box over the composer, a menu in
                         // its footer row's place, or another of its notices in the
                         // indicator's slot hides it without its going: the reading stays
                         // (`footer::context_gone`). Asked only while a reading is shown, so
-                        // a pane with none reads nothing more per frame.
-                        let need_ctx = match &screen_ctx {
-                            Some(ctx) => shown.context.as_ref() != Some(ctx),
+                        // a pane with none reads nothing more per frame, and read at most
+                        // once per rebuild of the rows, so a frame at rest reads nothing.
+                        let need_ctx = match screen_ctx {
+                            Some(pct) => context_left_of(shown.context.as_deref()) != Some(pct),
                             None => {
                                 want_ctx
                                     && shown.context.is_some()
-                                    && footer::context_gone(&cached.rows)
+                                    && texts.indicator_gone(leaf_index)
                             }
                         };
                         if need_acct || need_ctx {
@@ -4006,20 +5593,36 @@ impl App {
                                 entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
                             if let Some((pgid, started)) = timeline.claude_footer_identity()
                                 && let Some(mut facts) = timeline.claude_footer().cloned()
+                                // A resolver can replace the account after this
+                                // frame took its facts. No glass reading taken
+                                // against that snapshot may amend its successor.
+                                && Some(&facts) == texts.footers[leaf_index].published()
+                                && timeline.muse_cards_need_account() == muse_cards_need_account
                             {
                                 if let Some((email, plan)) = screen_acct
                                     && let Some(sub) = facts.subscription.as_mut()
                                 {
-                                    sub.email = Some(email);
-                                    sub.plan = plan;
+                                    sub.email = Some(email.to_owned());
+                                    sub.plan = plan.map(str::to_owned);
                                 }
-                                if let Some(weekly) = screen_weekly
+                                if let Some(plan) = screen_plan
                                     && let Some(sub) = facts.subscription.as_mut()
                                 {
-                                    sub.weekly = Some(weekly);
+                                    sub.plan = Some(plan.to_owned());
+                                }
+                                if let Some((weekly, reset)) = screen_weekly
+                                    && let Some(sub) = facts.subscription.as_mut()
+                                {
+                                    sub.weekly = weekly.map(str::to_owned);
+                                    sub.weekly_reset = reset.map(|(words, at)| {
+                                        aterm_agent::harness::profile::WeeklyReset {
+                                            words: words.to_owned(),
+                                            at,
+                                        }
+                                    });
                                 }
                                 if need_ctx {
-                                    facts.context = screen_ctx;
+                                    facts.context = screen_ctx.map(context_words);
                                 }
                                 timeline.set_claude_footer(pgid, started, Some(facts));
                                 if let Some(facts) = timeline.claude_footer() {
@@ -4027,6 +5630,7 @@ impl App {
                                         facts,
                                         timeline.claude_card(),
                                         usage,
+                                        self.fact_mask(session),
                                     );
                                 }
                             }
@@ -4048,8 +5652,34 @@ impl App {
                     supervised,
                     &mut check,
                 ));
-                // The footer's row is the facts' alone.
+                // The footer's row is the facts' alone; Gemini's and Codex's
+                // top line is theirs all the same (design §6.2).
                 if !held {
+                    if let Some(prog) = bare_top {
+                        let (switch, palette) =
+                            self.bare_top_harness(ws, session, prog, agent, reading);
+                        lists.top_only.push(leaf_index);
+                        self.splice_top_line(
+                            ws,
+                            wid,
+                            texts,
+                            lists,
+                            &TopLineAt {
+                                leaf_index,
+                                session,
+                                program_pgid,
+                                program: prog,
+                                region,
+                                pane,
+                                blank,
+                                switch,
+                                palette,
+                                held: false,
+                                cell,
+                                mark_fg,
+                            },
+                        );
+                    }
                     continue;
                 }
                 let version = texts.footers[leaf_index].shown().version.as_deref();
@@ -4081,20 +5711,35 @@ impl App {
                 if on_glass.is_some() && rule.is_none() {
                     lists.bare.push(session);
                 }
-                // The harness holds the session: its branding stands (the
-                // tinted rule, the tool's logo, the wordmark, agy's and
-                // Muse's glass transcript). With no host nothing holds it.
+                // The harness holds the session: agy's and Muse's glass
+                // transcript stands. With no host nothing holds it.
                 let harness_on = view.carries() && supervised;
-                // …and the switch says whether it does, and turns it on or
-                // off (`autopilot::HarnessSwitch`): drawn wherever a host is.
+                // The switch says whether the harness carries the session,
+                // and turns it on or off (`autopilot::HarnessSwitch`): drawn
+                // wherever a host is.
                 let switch = crate::autopilot::HarnessSwitch::of(view).map(|face| {
                     let (face, hover) = ws.claude_lights.switch_shown(session, face);
-                    SwitchPaint {
-                        face,
-                        branded: harness_on,
-                        hover,
-                    }
+                    SwitchPaint { face, hover }
                 });
+                // The harness glass's theme: the card's palette wherever the
+                // harness's glass is worn — Off's white with no claim — and
+                // the unhosted window's own where its policy would supervise
+                // the agent (`harness_theme`, the one predicate), which the
+                // agents panel wears. The composer's border wears it only
+                // where its switch stands: with no host the rules carry no
+                // branding. The transcript rewrites keep to where the
+                // harness holds the session: Off keeps the raw transcript.
+                let unhosted_on = self.unhosted_glass(agent);
+                let theme = crate::autopilot::harness_theme(view, supervised, word, unhosted_on);
+                let border = theme.filter(|_| switch.is_some());
+                // The pill relabel's gate, read once: the relabel below is
+                // collected only under it, and the mode light's word
+                // (`FooterPane::relabelled`) follows the relabel the glass
+                // actually takes — a pill left as Claude drew it (a
+                // selection, the cursor on its row, a band over it, a cell
+                // the write would skip) keeps Claude's word in the light too.
+                let gate = agent.is_some_and(|prog| relabels_pill(prog, border.is_some()));
+                let mut relabelled = false;
                 let top_rule = readings.reach.and_then(|r| r.rules()).map(|(top, _)| top);
                 if let Some(
                     prog @ (aterm_phase::Program::Claude
@@ -4103,25 +5748,27 @@ impl App {
                 ) = agent
                 {
                     let rule_cell = rule.as_ref().map_or(blank, |(_, _, _, rc)| *rc);
-                    if let Some(top) = top_rule
-                        && let Some(paint) = switch
-                        && !self.chrome_owns_terminal_row(wid, row_off + top)
-                    {
-                        collect_composer_border_brand_edits(
-                            &ws.input_scratch,
+                    // The top rule's lockup and switch (`splice_top_line`).
+                    self.splice_top_line(
+                        ws,
+                        wid,
+                        texts,
+                        lists,
+                        &TopLineAt {
+                            leaf_index,
                             session,
-                            prog,
-                            paint,
+                            program_pgid,
+                            program: identified.unwrap_or(prog),
                             region,
-                            top,
+                            pane,
                             blank,
-                            rule_cell,
+                            switch,
+                            palette: border,
+                            held: true,
+                            cell,
                             mark_fg,
-                            &mut lists.border_edits,
-                            &mut lists.border_live,
-                            &mut lists.border_toggles,
-                        );
-                    }
+                        },
+                    );
                     if harness_on
                         && matches!(prog, aterm_phase::Program::Agy | aterm_phase::Program::Muse)
                         && let Some(Some(cached)) = texts.panes.get(leaf_index)
@@ -4136,6 +5783,60 @@ impl App {
                             rule_cell,
                             mark_fg,
                             &mut lists.agy_edits,
+                        );
+                    }
+                    // The agents panel under the footer wears the theme too
+                    // (`crate::claude_panel`): read once per rebuild of the
+                    // rows, under the bottom rule the reading holds.
+                    if prog == aterm_phase::Program::Claude
+                        && let Some(palette) = theme
+                        && self.config.claude_footer_agents()
+                        && let Some((_, bottom)) = readings.reach.and_then(|r| r.rules())
+                        && let Some(read) = texts.agents_panel(
+                            leaf_index,
+                            session,
+                            bottom,
+                            &ws.input_scratch,
+                            crate::claude_card::PaneGeom {
+                                strip,
+                                row_off,
+                                col_off,
+                                rows: pane_rows,
+                                cols: pane_cols,
+                            },
+                            blank,
+                        )
+                    {
+                        lists.panels.push(crate::claude_panel::PanelLeaf {
+                            leaf_index,
+                            session,
+                            pane: crate::claude_card::PaneGeom {
+                                strip,
+                                row_off,
+                                col_off,
+                                rows: pane_rows,
+                                cols: pane_cols,
+                            },
+                            blank,
+                            palette,
+                            read,
+                            flights: flights.clone(),
+                            skip: 0,
+                        });
+                    }
+                    if gate
+                        && let Some(relabel) = readings.relabel
+                        && let Some(Some(cached)) = texts.panes.get(leaf_index)
+                    {
+                        relabelled = collect_pill_relabel(
+                            &ws.input_scratch,
+                            &cached.rows,
+                            region,
+                            relabel,
+                            |term_row| self.chrome_owns_terminal_row(wid, term_row),
+                            blank,
+                            &mut lists.relabels,
+                            &mut lists.relabel_cells,
                         );
                     }
                 }
@@ -4168,14 +5869,18 @@ impl App {
                     rule,
                     blank,
                     autopilot: (word, view),
+                    relabelled,
                 });
             }
             let seen = &lists.seen;
+            let top_only = &lists.top_only;
             // A pane whose card was read with no facts keeps its text (the
-            // card's reading is the text cache's), its footer forgotten.
+            // card's reading is the text cache's), its footer forgotten; one
+            // whose top line alone was read keeps its text and that line.
             ws.claude_footer_texts.borrow_mut().retain_active(
                 |index| seen.iter().any(|pane| pane.leaf_index == index),
                 |index| cards.iter().any(|card| card.reads(index)),
+                |index| top_only.contains(&index),
             );
         }
         for pane in lists.seen.drain(..) {
@@ -4186,11 +5891,23 @@ impl App {
         }
         // The harness card: its light now, its line in the footer's write.
         self.compose_claude_cards(wid, cards);
-        let lines = self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| ws.claude_card.lines().next().is_some());
-        if lists.panes.is_empty() && !lines && lists.border_live == 0 && lists.agy_edits.is_empty()
+        // The agents panels: their ink and light now, recorded with the card's.
+        self.compose_claude_panels(wid, &mut lists.panels);
+        let lines = self.windows.get(&wid).is_some_and(|ws| {
+            ws.claude_card.lines().next().is_some()
+                || ws.claude_card.notice_edits().next().is_some()
+        });
+        // Nothing to write: no pane's bottom rule, no card line or banner, no
+        // transcript edit, no relabel — and no top rule's border, ghost, key
+        // or switch, which stand where a band covers the bottom rule alone (a
+        // find bar floated to the pane's bottom).
+        if lists.panes.is_empty()
+            && !lines
+            && lists.agy_edits.is_empty()
+            && lists.relabels.is_empty()
+            && lists.tops.is_empty()
+            && lists.top_hits.is_empty()
+            && lists.border_toggles.is_empty()
         {
             return;
         }
@@ -4208,8 +5925,7 @@ impl App {
             // The rule is on the glass whether or not anything fits it: the
             // keyboard's chord is the lights' there (`on_key_claude_lights`).
             self.note_claude_footer_row(wid, pane.session, chips_room);
-            let (word, view) = pane.autopilot;
-            self.note_claude_autopilot(wid, pane.session, word, view);
+            self.note_claude_autopilot(wid, pane.session, pane.autopilot, pane.relabelled);
             self.note_claude_team(wid, pane.session);
             let block = self.claude_lights_block(
                 wid,
@@ -4224,7 +5940,9 @@ impl App {
             // footer's, kept while the facts, the room, the rule, the ground
             // and every cell of the block are the last frame's
             // ([`PaneFooter::compose`]).
+            // The fact hovered or selected here is drawn lit.
             let composed = self.windows.get(&wid).and_then(|ws| {
+                let lit = ws.claude_lights.lit_fact(pane.session);
                 let mut texts = ws.claude_footer_texts.borrow_mut();
                 Some(texts.footer_mut(pane.leaf_index)?.compose(
                     room,
@@ -4232,9 +5950,17 @@ impl App {
                     pane.rule,
                     pane.blank,
                     mark_fg,
+                    lit,
                 ))
             });
-            let Some((cells, lights_at, glass)) = composed.filter(|(cells, _, _)| *cells > 0)
+            let Some(Composed {
+                cells,
+                lights_at,
+                title,
+                glass,
+                facts_at,
+                spans,
+            }) = composed.filter(|c| c.cells > 0)
             else {
                 if let Some(block) = block {
                     self.recycle_claude_lights_block(wid, block);
@@ -4243,6 +5969,28 @@ impl App {
             };
             // Right-aligned against the rule's last glyph, which stays.
             let col = pane.col_off + pane.run.end - 1 - cells;
+            // Each fact, where the write that carries the facts would put
+            // it: the set run starts one blank past `facts_at`.
+            let edit_col = if glass.is_empty() {
+                col
+            } else {
+                col + glass.end
+            };
+            let at = col + facts_at + 1;
+            lists
+                .facts
+                .extend(spans.iter().flatten().map(|span| FactWrite {
+                    frame_row: pane.frame_row,
+                    term_row: pane.term_row,
+                    edit_col,
+                    session: pane.session,
+                    cols: (
+                        at + usize::from(span.cells.0),
+                        at + usize::from(span.cells.1),
+                    ),
+                    kind: span.kind,
+                    restores: span.restores,
+                }));
             match (block, lights_at) {
                 (Some(block), Some(at)) => lists.lit.push(Lit {
                     session: pane.session,
@@ -4250,6 +5998,7 @@ impl App {
                     col,
                     term_row: pane.term_row,
                     lights_col: col + at,
+                    title: col + title.start..col + title.end,
                     block,
                     shown: false,
                 }),
@@ -4278,9 +6027,13 @@ impl App {
                 ..
             } = &mut **ws;
             let texts = claude_footer_texts.borrow();
-            // The card's lines first, borrowed from the card, then the rules,
-            // borrowed from the panes' footers.
-            let card_edits = claude_card.lines().map(crate::claude_card::CardLine::edit);
+            // The card's lines and its banner over Claude's update notice
+            // first, borrowed from the card, then the rules, borrowed from
+            // the panes' footers.
+            let card_edits = claude_card
+                .lines()
+                .map(crate::claude_card::CardLine::edit)
+                .chain(claude_card.notice_edits());
             let rules = lists.rules.iter().flat_map(|r| {
                 rule_edits(
                     r.frame_row,
@@ -4290,18 +6043,66 @@ impl App {
                     r.ground,
                 )
             });
-            let border = lists.border_edits[..lists.border_live]
+            let tops = lists
+                .tops
                 .iter()
-                .map(|e| (e.frame_row, e.col, e.cells.as_slice(), e.ground));
+                .map(|t| (t.frame_row, t.col, texts.top_cells(t.leaf_index), t.ground));
             let agy = lists
                 .agy_edits
                 .iter()
                 .map(|e| (e.frame_row, e.col, e.cells.as_slice(), e.ground));
+            let relabel_cells = &lists.relabel_cells;
+            let relabels = lists.relabels.iter().map(|e| {
+                (
+                    e.frame_row,
+                    e.col,
+                    &relabel_cells[e.cells.clone()],
+                    e.ground,
+                )
+            });
             write_edits(
                 claude_footer_undo,
                 input_scratch,
-                card_edits.chain(rules).chain(border).chain(agy),
+                card_edits
+                    .chain(rules)
+                    .chain(tops)
+                    .chain(agy)
+                    .chain(relabels),
             );
+            // A relabel the write took moves the glass's columns off the
+            // grid's on its row: the pointer's readers map them back.
+            for e in &lists.relabels {
+                if claude_footer_undo.took(e.frame_row, e.col) {
+                    claude_footer_undo.glass.push(e.shift);
+                }
+            }
+            // A top rule's mark stands only over the cells its write put on
+            // the glass (a write refused or never made — a cluster or a
+            // combining mark in its span, a selection on the row, which
+            // `splice_top_line` turns away — puts none), recorded in the
+            // card's own record, so every strip of the card's takes it back
+            // (`claude_card::strip`: the top of a frame, of a compose and of
+            // this splice, and the capture's one-pane refill, which runs no
+            // footer undo).
+            for t in &lists.tops {
+                if claude_footer_undo.took(t.frame_row, t.col)
+                    && let Some(layer) = texts.top_mark(t.leaf_index)
+                {
+                    claude_card.paint_layer(input_scratch, layer.clone());
+                }
+            }
+            // So with the lockups: only one the glass shows answers the
+            // pointer with its hover title (design §7).
+            for m in lists.marks.drain(..) {
+                if claude_footer_undo.took(m.frame_row, m.edit_col) {
+                    claude_lights.mark_hits.push(crate::claude_lights::MarkHit {
+                        frame_row: m.frame_row,
+                        term_row: m.term_row,
+                        cols: m.cols,
+                        session: m.session,
+                    });
+                }
+            }
             for r in &lists.rules {
                 if let Some(footer) = texts.footers.get(r.leaf_index) {
                     claude_footer_undo.publish_text(
@@ -4341,6 +6142,51 @@ impl App {
             for l in &mut lists.lit {
                 l.shown = took((l.frame_row, l.col));
             }
+            // So with the facts: only a fact the glass shows is a target.
+            for f in lists.facts.drain(..) {
+                if took((f.frame_row, f.edit_col)) {
+                    claude_lights.fact_hits.push(crate::claude_lights::FactHit {
+                        frame_row: f.frame_row,
+                        term_row: f.term_row,
+                        cols: f.cols,
+                        session: f.session,
+                        fact: crate::claude_lights::Fact::of(f.kind),
+                        restores: f.restores,
+                    });
+                }
+            }
+            // The top-effort key's: aterm's ghost where its write took,
+            // Claude's own tag where the frame still holds the key's chars.
+            for h in lists.top_hits.drain(..) {
+                let shown = if h.ghost {
+                    rows.iter().any(|r| {
+                        r.frame_row == h.frame_row
+                            && r.col_off <= h.cols.0
+                            && r.col_off + r.painted.len() >= h.cols.1
+                    })
+                } else {
+                    input_scratch
+                        .cells
+                        .get(h.frame_row)
+                        .and_then(|row| row.get(h.cols.0..h.cols.1))
+                        .is_some_and(|cells| {
+                            cells
+                                .iter()
+                                .map(|c| c.ch)
+                                .eq(aterm_primer::CLAUDE_TOP_EFFORT_KEY.chars())
+                        })
+                };
+                if shown {
+                    claude_lights.fact_hits.push(crate::claude_lights::FactHit {
+                        frame_row: h.frame_row,
+                        term_row: h.term_row,
+                        cols: h.cols,
+                        session: h.session,
+                        fact: crate::claude_lights::Fact::TopEffort,
+                        restores: FactMask::default(),
+                    });
+                }
+            }
             // Only a switch the glass shows can be pressed, hovered or read.
             for b in lists.border_toggles.drain(..) {
                 if rows.iter().any(|r| {
@@ -4351,8 +6197,20 @@ impl App {
                     claude_lights.border_toggles.push(b);
                 }
             }
-            // So with the harness card's line: its ink and its star go where
-            // its cells did.
+            // So with the title slots: only a title the glass shows is read.
+            for l in lists.lit.iter().filter(|l| l.shown && !l.title.is_empty()) {
+                claude_lights
+                    .title_hits
+                    .push(crate::claude_lights::TitleHit {
+                        frame_row: l.frame_row,
+                        term_row: l.term_row,
+                        cols: l.title.clone(),
+                        session: l.session,
+                    });
+            }
+            // So with the harness card's line and its banner: their ink and
+            // their stars go where their cells did, and so do the banner's
+            // hits.
             crate::claude_card::ink_lines(claude_card, input_scratch, took);
         }
         for l in lists.lit.drain(..) {
@@ -4377,6 +6235,12 @@ impl App {
         // The lights ride this wake too: a toggle's next step, its deadline
         // and a refusal's end all arrive here (`crate::claude_lights`).
         self.drain_claude_lights();
+        // A fact's title someone reads is built again from the facts as they
+        // now stand (`crate::claude_facts`).
+        self.refresh_fact_readings(session);
+        // An open fact menu shows the facts as they now stand
+        // (`crate::fact_menu`).
+        self.refresh_fact_menu(session);
         // New facts can disagree with the drawer image's build: a fact for
         // later, never a gate (card engine §3.10).
         self.note_claude_build_drift(session);
@@ -4476,49 +6340,324 @@ fn unread_pill_row(rows: &[String]) -> Option<String> {
         .then(|| row.trim_end().to_owned())
 }
 
-/// The wordmark's letter at spectrum stop `stop` (`0..=255`) on the pane
-/// whose blank cell is `blank`. On a dark ground the stop lifted a quarter
-/// toward the pane's ink, as always. On a light ground the paper law's
-/// point-mark ink against the pane's ground (`rainbow_kitty::ribbon`'s
-/// `paper_mark_ink`: the stop at full value, yellow bent to amber, darkened
-/// along its own hue only as far as WCAG AA's 4.5:1 needs), as the harness
-/// card's line letters are (`harness_card`'s `LineInks`): the quarter lift
-/// left the wordmark's yellow and green letters near 1.6:1 on cream paper,
-/// washed out beside the card's print rainbow.
-fn brand_letter_fg(stop: usize, blank: RenderCell) -> [u8; 3] {
-    let c = aterm_effects::spectrum::SPECTRUM_LUT[stop.min(255)];
-    let stop_rgb = [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+/// The harness switch's letter at `t` (`0..=1` along its glyphs,
+/// `SwitchInk::Arc`) in the session's
+/// theme `palette` on the pane whose blank cell is `blank`. On a dark ground
+/// the palette's letter ink (`CardPalette::letter`) lifted a quarter toward
+/// the pane's ink, as always. On a light ground the card's line letter at
+/// rest there (`CardPalette::letter_on`: the paper law's point-mark ink of
+/// the print ramp — the stop at full value, yellow bent to amber, darkened
+/// along its own hue only as far as WCAG AA's 4.5:1 needs; Off's silver
+/// darkened the same way), as the harness card's line letters are
+/// (`harness_card`'s `LineInks`): the quarter lift left the old wordmark's
+/// yellow and green letters near 1.6:1 on cream paper, washed out beside
+/// the card's print rainbow.
+fn brand_letter_fg(
+    palette: aterm_effects::harness_card::CardPalette,
+    t: f32,
+    blank: RenderCell,
+) -> [u8; 3] {
     let bg = u32::from_be_bytes([0, blank.bg[0], blank.bg[1], blank.bg[2]]);
+    let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
     if aterm_effects::harness_card::dark_ground(bg) {
-        mix(stop_rgb, blank.fg, 0.25)
+        mix(rgb(palette.letter(t, true)), blank.fg, 0.25)
     } else {
-        let ink = aterm_effects::rainbow_kitty::ribbon::paper_mark_ink(c & 0x00FF_FFFF, bg);
-        [(ink >> 16) as u8, (ink >> 8) as u8, ink as u8]
+        rgb(palette.letter_on(t, bg))
     }
 }
 
+/// A composer top rule's plain run ([`read_top_run`]): `len` cells of the
+/// rule's own glyph `rule` from frame column `col`, none of them a cluster,
+/// a combining mark or an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TopRun {
+    col: usize,
+    len: usize,
+    rule: RenderCell,
+    /// Muse Code's rule at rest is labelled (`── Voice input (⌥ + v to
+    /// start) ──…`, `aterm_phase::muse::is_idle_voice_rule`): where that
+    /// label stands, untouched, the whole rule from its first `─` to its
+    /// last, label and all (frame column, cells) — what the lockup takes
+    /// where it fits there ([`laid_run`]).
+    voice: Option<(usize, usize)>,
+}
+
+/// THE RUN A TOP LINE IS LAID ON ([`compose_top`]), and how many of its
+/// cells from its left a label takes that the composition writes over.
+/// Muse Code's idle voice label gives way to the lockup on the glass
+/// (owner, 2026-10-21: the tool's logo stands at the rule's left, as
+/// Claude's and agy's do), so where a rung of the ladder lays the lockup on
+/// the whole rule ([`TopRun::voice`]), the run is the whole rule, label and
+/// all, and every one of the label's cells is written over with the rule.
+/// The lockup stands in every state, bare and with no host too, so the
+/// label gives way wherever it does. Elsewhere — a voice state with news
+/// (`Recording`, `Transcribing`, …, which keeps its words), a rule with no
+/// room for the lockup, any other program's rule — the plain run as read,
+/// and `0`. The grid keeps Muse Code's row for its readers either way.
+fn laid_run(key: &TopKey) -> (TopRun, usize) {
+    let run = key.run;
+    let lockup = cli_mark(key.program).map(CliMark::lockup_cells);
+    let whole = run.voice.filter(|&(_, len)| {
+        lay_top(top_span(len, key.face), key.switch, lockup)
+            .is_some_and(|(rung, _)| rung.lockup.is_some())
+    });
+    match whole {
+        Some((col, len)) if col < run.col => (TopRun { col, len, ..run }, run.col - col),
+        _ => (run, 0),
+    }
+}
+
+/// The ghost's first cell in a run of `len` cells under `face`, where it is
+/// drawn: right-aligned, one `─` after it.
+fn ghost_at(len: usize, face: KeyFace) -> Option<usize> {
+    face.ghost
+        .filter(|_| len >= GHOST_RUN)
+        .map(|_| len - GHOST_CELLS - 1)
+}
+
+/// The harness's span in a run of `len` cells under `face`: the run, short
+/// of the ghost ([`ghost_at`]).
+fn top_span(len: usize, face: KeyFace) -> usize {
+    ghost_at(len, face).unwrap_or(len)
+}
+
+/// What a CLI's top line is drawn as ([`top_line`], [`read_top_run`]): what
+/// aterm writes its lockup and switch on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopLine {
+    /// A `─` rule on the pane's ground: Claude Code's, agy's and Muse Code's
+    /// composer top rule, Gemini CLI's live-zone rule.
+    Rule,
+    /// A tinted pad row: Codex's composer slab's top pad, every cell a blank
+    /// on the slab's own ground — Codex's surface, never tinted.
+    Slab,
+}
+
+/// WHERE `program`'S TOP LINE IS on a pane's cached rows, and its kind: one
+/// exhaustive match, so a new program does not compile until it is placed.
+/// Claude Code's, agy's and Muse Code's is the composer frame's top rule the
+/// footer's readings found; Gemini CLI's its live zone's `─` rule above the
+/// mode row, never its `▄` input band (`aterm_phase::gemini::top_rule`);
+/// Codex's its composer slab's top pad (`aterm_phase::codex::composer_pad`),
+/// a candidate the cells must prove ([`read_top_run`]). Gemini's and Codex's
+/// are read at most once per rebuild of the rows, behind the reader's panic
+/// fence. A shell has none.
+fn top_line(program: aterm_phase::Program, cached: &CachedPaneText) -> Option<(usize, TopLine)> {
+    use aterm_phase::Program;
+    let session = cached.key.session;
+    match program {
+        Program::Claude | Program::Agy | Program::Muse => cached
+            .readings
+            .reach
+            .and_then(|r| r.rules())
+            .map(|(top, _)| (top, TopLine::Rule)),
+        Program::Gemini => cached
+            .gemini_top
+            .get_or_init(|| {
+                crate::reader_guard::read_or_none(
+                    session,
+                    "Gemini CLI top rule",
+                    &cached.rows,
+                    || aterm_phase::gemini::top_rule(&cached.rows),
+                )
+                .flatten()
+            })
+            .map(|row| (row, TopLine::Rule)),
+        Program::Codex => cached
+            .codex_pad
+            .get_or_init(|| {
+                crate::reader_guard::read_or_none(
+                    session,
+                    "Codex composer pad",
+                    &cached.rows,
+                    || aterm_phase::codex::composer_pad(&cached.rows),
+                )
+                .flatten()
+            })
+            .map(|row| (row, TopLine::Slab)),
+        Program::Generic => None,
+    }
+}
+
+/// Whether a selection reaches the pane's columns of frame row `frame_row`
+/// ([`App::splice_top_line`]): the renderer draws a selection over the
+/// cells, so no cell read shows it.
+fn top_line_selected(scratch: &RenderInput, frame_row: usize, region: PaneTextRegion) -> bool {
+    scratch
+        .selection_row_span(frame_row)
+        .is_some_and(|(lo, hi)| {
+            usize::from(lo) < region.col_off + region.cols && usize::from(hi) >= region.col_off
+        })
+}
+
+/// The rightmost plain run of the composer's top line (pane row `top_rule`
+/// of `region`) on `scratch`, by its kind:
+///
+/// * [`TopLine::Rule`]: the rule's own `─` — the style most of its `─`
+///   cells wear, its last one's on a tie — over a row whose every cell is on
+///   the pane's ground `blank`. `None` where the row holds no `─`, or a cell
+///   off the ground (a search highlight; a selection is no cell's, and
+///   [`App::splice_top_line`] turns it away before this read is used). For
+///   Muse Code (`muse`), also the whole rule past its idle voice label
+///   ([`TopRun::voice`]).
+/// * [`TopLine::Slab`]: the pane row from its left edge, PROVEN by its cells
+///   (§10.2.7): every cell the one blank `' '`, not underlined, on a
+///   background that is not the pane's own and is the background of the
+///   prompt row's first cell under it, none a cluster or a combining mark;
+///   the run ends at the row's first image cell, a picture the program put
+///   on its own slab (codex-alab's composer kitty), and an image at the left
+///   edge leaves none. Its `rule` is the slab's blank,
+///   which stands in for the pane's in every ink and contrast law. Text alone
+///   never puts aterm on a Codex row: a blank row on the pane's own ground,
+///   a row the slab does not fill reads `None` (and a selection over the pad
+///   is turned away before, [`App::splice_top_line`]).
+fn read_top_run(
+    scratch: &RenderInput,
+    region: PaneTextRegion,
+    top_rule: usize,
+    line: TopLine,
+    blank: RenderCell,
+    muse: bool,
+) -> Option<TopRun> {
+    #[cfg(test)]
+    crate::work_counts::footer_top_read();
+    let frame_row = region.strip + region.row_off + top_rule;
+    let frame_cells = scratch.cells.get(frame_row)?;
+    let pane_end = frame_cells.len().min(region.col_off + region.cols);
+    let pane_slice = frame_cells.get(region.col_off..pane_end)?;
+    if line == TopLine::Slab {
+        let slab = *pane_slice.first()?;
+        let prompt = scratch
+            .cells
+            .get(frame_row + 1)?
+            .get(region.col_off)
+            .filter(|_| top_rule + 1 < region.rows)?;
+        let span = region.col_off..region.col_off + region.cols;
+        let proven = pane_slice.len() == region.cols
+            && slab.ch == ' '
+            && slab.underline == aterm_core::terminal::UnderlineStyle::None
+            && slab.bg != blank.bg
+            && prompt.bg == slab.bg
+            && pane_slice.iter().all(|c| *c == slab)
+            && !touches(&scratch.clusters, frame_row, &span)
+            && !touches(&scratch.combining, frame_row, &span);
+        // A picture the program placed over its own slab (codex-alab's
+        // composer kitty, a 9×5-cell PNG at the pad row's right end) is the
+        // program's ink: the run stops at its first cell, and a picture at
+        // the slab's left edge leaves no run.
+        let end = scratch
+            .images
+            .get(frame_row)
+            .into_iter()
+            .flatten()
+            .map(|(col, _)| *col)
+            .filter(|col| span.contains(col))
+            .min()
+            .unwrap_or(span.end);
+        // The slab's blank stands in for the pane's in every ink law, which
+        // lifts and quiets toward its ink, so that ink must read on the slab.
+        // The slab cell's own foreground is only what Codex erased it with:
+        // after the theme moves under a running Codex (an appearance pair
+        // turning light at dusk), Codex keeps the slab it chose at launch
+        // and its ink is the new theme's, `#2b2d33` on `#2d2f33` (codex-alab
+        // 0.164.0-dev, 2026-10-21), which left the switch's letters at 3.1:1.
+        // The pane's own pair, its ink or its ground, whichever reads farther
+        // from the slab, is the ink the laws use.
+        let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+        let reads = |c: [u8; 3]| aterm_effects::color_math::contrast_ratio(pack(c), pack(slab.bg));
+        let ink = if reads(blank.bg) > reads(blank.fg) {
+            blank.bg
+        } else {
+            blank.fg
+        };
+        return (proven && end > region.col_off).then_some(TopRun {
+            col: region.col_off,
+            len: end - region.col_off,
+            rule: RenderCell { fg: ink, ..slab },
+            voice: None,
+        });
+    }
+    if pane_slice.is_empty() || pane_slice.iter().any(|c| c.bg != blank.bg) {
+        return None;
+    }
+    let first = pane_slice.iter().find(|c| c.ch == '\u{2500}').copied()?;
+    let last = pane_slice
+        .iter()
+        .rev()
+        .find(|c| c.ch == '\u{2500}')
+        .copied()
+        .unwrap_or(first);
+    let count = |style: &RenderCell| pane_slice.iter().filter(|c| *c == style).count();
+    let rule = if first == last || count(&last) >= count(&first) {
+        last
+    } else {
+        first
+    };
+    // The rightmost contiguous run of plain `─` cells in `rule`'s style.
+    let mut best = 0..0;
+    let mut cur_start = None;
+    for (idx, cell) in pane_slice.iter().enumerate() {
+        let col = region.col_off + idx;
+        let plain = *cell == rule
+            && !touches(&scratch.clusters, frame_row, &(col..col + 1))
+            && !touches(&scratch.combining, frame_row, &(col..col + 1))
+            && !touches(&scratch.images, frame_row, &(col..col + 1));
+        if plain {
+            let s = *cur_start.get_or_insert(idx);
+            if idx + 1 - s >= best.len() {
+                best = s..idx + 1;
+            }
+        } else {
+            cur_start = None;
+        }
+    }
+    let untouched = |idx: usize| {
+        let col = region.col_off + idx;
+        !touches(&scratch.clusters, frame_row, &(col..col + 1))
+            && !touches(&scratch.combining, frame_row, &(col..col + 1))
+            && !touches(&scratch.images, frame_row, &(col..col + 1))
+    };
+    let voice = muse
+        .then(|| {
+            let first = pane_slice.iter().position(|c| c.ch == '\u{2500}')?;
+            let last = pane_slice.iter().rposition(|c| c.ch == '\u{2500}')?;
+            (first < best.start
+                && (first..=last).all(untouched)
+                && aterm_phase::muse::is_idle_voice_rule(
+                    &pane_slice.iter().map(|c| c.ch).collect::<String>(),
+                ))
+            .then_some((region.col_off + first, last + 1 - first))
+        })
+        .flatten();
+    Some(TopRun {
+        col: region.col_off + best.start,
+        len: best.len(),
+        rule,
+        voice,
+    })
+}
+
 /// THE HARNESS SWITCH'S PAINT on one pane's composer top rule
-/// ([`collect_composer_border_brand_edits`]): what it says, whether the
-/// harness's branding stands with it, and whether the pointer is over it.
+/// ([`compose_top`]): what it says, and whether the pointer is over it. The
+/// switch carries no branding of its own: the theme the line wears
+/// ([`TopKey::palette`]) inks it, and the lockup at the line's left names
+/// the program ([`lay_top`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SwitchPaint {
     face: crate::autopilot::HarnessSwitch,
-    /// The harness holds the session (it carries it and this window's host
-    /// holds its claim): the rule wears the spectrum, the tool's logo leads
-    /// it and the switch is the ` ✦ alab kitty · ` wordmark's.
-    branded: bool,
     hover: bool,
 }
 
-/// How one cell of a harness switch's face is inked ([`switch_face`]).
+/// How one cell of a harness switch's face is inked ([`switch_face`],
+/// [`switch_cell`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SwitchInk {
-    /// A letter of the ` ✦ alab kitty` wordmark, at its stop of the
-    /// spectrum (`0..=255`).
-    Brand(u8),
-    /// The rule's own ink: the `·` between the wordmark and the switch.
-    Rule,
-    /// The switch's label (`claude harness`).
+    /// A glyph of the switch's words and state on a line that wears a theme,
+    /// at its stop of the theme's arc (`0..=255`): glyph `k` of the `n` from
+    /// the switch's first letter through its state word, blanks skipped,
+    /// stands at `t = k/(n−1)` ([`SwitchFace::on_arc`]).
+    Arc(u8),
+    /// The switch's label (`alab harness`), and the face's blanks.
     Label,
     /// The lit state, `● on`: the accent.
     Lit,
@@ -4529,13 +6668,14 @@ enum SwitchInk {
     /// A cap of the button (`▐`, `▌`): its fill as ink on the ground, so the
     /// button's ends are half a cell, a pill.
     Cap,
-    /// `◐ turning on`: the accent, quieted.
+    /// `◐ turning on`: the accent, quieted and floored to 4.5:1
+    /// ([`turning_ink`]).
     Turning,
 }
 
-/// The cells a switch face may take: the widest, ` ✦ alab kitty · muse
-/// harness ● on `, is 34.
-const SWITCH_FACE_MAX: usize = 40;
+/// The cells a switch face may take: the widest, ` alab harness ○ off ▐ on
+/// ▌ ` and ` alab harness ◐ turning on `, are 27.
+const SWITCH_FACE_MAX: usize = 28;
 
 /// One harness switch face as laid ([`switch_face`]): its cells and where
 /// its parts lie in them — the switch itself (label and state, the
@@ -4567,6 +6707,28 @@ impl SwitchFace {
             }
         }
     }
+
+    /// The face on a line that wears a theme: each glyph of the switch's own
+    /// cells (its words and its state, blanks skipped) takes its stop of the
+    /// theme's arc, `t = k/(n−1)` for glyph `k` of `n` ([`SwitchInk::Arc`]),
+    /// so the switch's first glyph meets the rule's `t = 0` and its last the
+    /// tail's `t = 1` ([`compose_top`]). The `on` button keeps its pill.
+    fn on_arc(&mut self) {
+        let span = self.switch.clone();
+        let n = self.cells[span.clone()]
+            .iter()
+            .filter(|(ch, _)| *ch != ' ')
+            .count();
+        let mut k = 0usize;
+        for (ch, ink) in &mut self.cells[span] {
+            if *ch == ' ' {
+                continue;
+            }
+            let stop = if n > 1 { k * 255 / (n - 1) } else { 0 };
+            *ink = SwitchInk::Arc(u8::try_from(stop).unwrap_or(u8::MAX));
+            k += 1;
+        }
+    }
 }
 
 /// How many forms a switch face has, widest first ([`switch_face`]'s
@@ -4575,90 +6737,66 @@ impl SwitchFace {
 const SWITCH_TIERS: usize = 4;
 
 /// THE HARNESS SWITCH'S FACE, `tier` steps down from its widest
-/// (`0..SWITCH_TIERS`; `None` past the face's last form), for `program`'s
-/// word (`claude`, `agy`, `muse`):
+/// (`0..SWITCH_TIERS`; `None` past the face's last form):
 ///
 /// | switch | 0 | 1 | 2 | 3 |
 /// |---|---|---|---|---|
-/// | on, branded | ` ✦ alab kitty · claude harness ● on ` | ` ✦ alab · claude ● on ` | ` claude ● on ` | ` ● on ` |
-/// | on | ` claude harness ● on ` | ` claude ● on ` | ` ● on ` | |
-/// | off | ` claude harness ○ off ▐ on ▌ ` | ` claude ○ off ▐ on ▌ ` | ` ○ off ▐ on ▌ ` | ` ▐ on ▌ ` |
-/// | turning on | ` claude harness ◐ turning on ` | ` claude ◐ turning on ` | ` ◐ turning on ` | ` ◐ on ` |
+/// | on | ` alab harness ● on ` | ` alab ● on ` | ` ● on ` | |
+/// | off | ` alab harness ○ off ▐ on ▌ ` | ` alab ○ off ▐ on ▌ ` | ` ○ off ▐ on ▌ ` | ` ▐ on ▌ ` |
+/// | turning on | ` alab harness ◐ turning on ` | ` alab ◐ turning on ` | ` ◐ turning on ` | ` ◐ on ` |
 ///
-/// Off draws no wordmark: Off turns the branding off, and the switch
-/// alone stands, its `on` the button (owner, 2026-10-20).
-fn switch_face(paint: SwitchPaint, program: &str, tier: usize) -> Option<SwitchFace> {
+/// The switch names the harness alone: the program is the lockup's to name,
+/// at the line's left ([`lay_top`]), so the ` ✦ alab kitty · ` wordmark and
+/// the program's word left it (owner, 2026-10-21). Each narrowest form is as
+/// wide as the one before the lockup (6, 8 and 6 cells), so the switch
+/// stands wherever it stood. Off's `on` is the button (owner, 2026-10-20).
+fn switch_face(paint: SwitchPaint, tier: usize) -> Option<SwitchFace> {
     use crate::autopilot::HarnessSwitch;
     let mut f = SwitchFace {
-        cells: [(' ', SwitchInk::Rule); SWITCH_FACE_MAX],
+        cells: [(' ', SwitchInk::Label); SWITCH_FACE_MAX],
         len: 0,
         switch: 0..0,
         button: None,
     };
-    // The label's words at `tier`, given up from the right of the switch's
-    // name inward: `claude harness`, then `claude`, then none.
+    // The label's words at `tier`, given up from the right inward:
+    // `alab harness`, then `alab`, then none.
     let label = |f: &mut SwitchFace, words: usize| {
         if words >= 2 {
-            f.push(program, SwitchInk::Label);
-            f.push(" harness ", SwitchInk::Label);
+            f.push("alab harness ", SwitchInk::Label);
         } else if words == 1 {
-            f.push(program, SwitchInk::Label);
-            f.push(" ", SwitchInk::Label);
+            f.push("alab ", SwitchInk::Label);
         }
     };
     match paint.face {
         HarnessSwitch::On => {
-            let wordmark = paint.branded && tier <= 1;
-            // The plain switch has one form fewer: it has no wordmark to give up.
-            let words = if paint.branded {
-                [2, 1, 1, 0].get(tier).copied()?
-            } else {
-                [2, 1, 0].get(tier).copied()?
-            };
-            f.push(" ", SwitchInk::Rule);
-            if wordmark {
-                let mark = if tier == 0 {
-                    "\u{2726} alab kitty "
-                } else {
-                    "\u{2726} alab "
-                };
-                // Each letter its stop of the spectrum, over the wordmark and
-                // its lead space, as the line's letters walk it.
-                let n = 1 + mark.chars().count();
-                f.cells[0].1 = SwitchInk::Brand(0);
-                for (k, ch) in mark.chars().enumerate() {
-                    let stop = ((k + 1) * 255 / n) as u8;
-                    f.push(ch.encode_utf8(&mut [0; 4]), SwitchInk::Brand(stop));
-                }
-                f.push("\u{00b7}", SwitchInk::Rule);
-                f.push(" ", SwitchInk::Label);
-            }
+            let words = [2, 1, 0].get(tier).copied()?;
+            f.push(" ", SwitchInk::Label);
             f.switch.start = f.len;
             label(&mut f, words);
             f.push("\u{25cf} on", SwitchInk::Lit);
             f.switch.end = f.len;
-            f.push(" ", SwitchInk::Rule);
+            f.push(" ", SwitchInk::Label);
         }
         HarnessSwitch::Off(_) => {
             let words = [2, 1, 0, 0].get(tier).copied()?;
-            f.push(" ", SwitchInk::Rule);
+            f.push(" ", SwitchInk::Label);
             f.switch.start = f.len;
             label(&mut f, words);
             if tier < 3 {
                 f.push("\u{25cb} off", SwitchInk::Unlit);
                 f.switch.end = f.len;
-                f.push(" ", SwitchInk::Rule);
+                f.push(" ", SwitchInk::Label);
             } else {
                 f.switch.end = f.len;
             }
             let at = f.len;
             push_on_button(&mut f);
             f.button = Some(at..f.len);
-            f.push(" ", SwitchInk::Rule);
+            f.push(" ", SwitchInk::Label);
         }
         HarnessSwitch::Turning => {
             let words = [2, 1, 0, 0].get(tier).copied()?;
-            f.push(" ", SwitchInk::Rule);
+            f.push(" ", SwitchInk::Label);
             f.switch.start = f.len;
             label(&mut f, words);
             f.push(
@@ -4670,7 +6808,7 @@ fn switch_face(paint: SwitchPaint, program: &str, tier: usize) -> Option<SwitchF
                 SwitchInk::Turning,
             );
             f.switch.end = f.len;
-            f.push(" ", SwitchInk::Rule);
+            f.push(" ", SwitchInk::Label);
         }
     }
     Some(f)
@@ -4686,32 +6824,38 @@ fn push_on_button(f: &mut SwitchFace) {
 }
 
 /// The widest of `paint`'s faces that leaves the rule `room` cells — two
-/// of the rule's own on either side — and its tier.
-fn fitted_switch_face(
-    paint: SwitchPaint,
-    program: &str,
-    room: usize,
-) -> Option<(usize, SwitchFace)> {
+/// of the rule's own on either side — and its tier: the switch alone, as it
+/// stood before the lockup, the law [`lay_top`]'s ladder keeps the switch
+/// to (its `alone` rung).
+#[cfg(test)]
+fn fitted_switch_face(paint: SwitchPaint, room: usize) -> Option<(usize, SwitchFace)> {
     (0..SWITCH_TIERS)
-        .filter_map(|tier| Some((tier, switch_face(paint, program, tier)?)))
+        .filter_map(|tier| Some((tier, switch_face(paint, tier)?)))
         .find(|(_, face)| face.len + 4 <= room)
 }
 
-/// A face cell in its ink on `blank`'s ground: the brand's letters on the
-/// spectrum (`brand_letter_fg`), the label in the agent's ink where the
-/// harness holds the session and quiet where it does not, the lit state and
-/// the button in the accent (`mark_fg`), the button's letters in the ground's
-/// ink on its fill. A hovered switch says what a press acts on: the lit
-/// switch underlined and bold, an off switch's button underlined, its fill
-/// lifted a quarter toward the pane's ink.
+/// A face cell in its ink on `blank`'s ground. Where the line wears a theme
+/// (`palette`), the switch's glyphs walk its arc ([`SwitchInk::Arc`]) in the
+/// switch's letter law ([`brand_letter_fg`]: Cruise's spectrum, Land's
+/// sunset, Off's white moonbow, the print law's inks on paper) — bold while
+/// on, regular while off (hands off reads quieter), and quieted 30% toward
+/// the ground while it turns on. Bare (no theme), hb-int's law: the label in
+/// the agent's ink and bold while on, quiet while off, the lit state and the
+/// button in the accent (`mark_fg`), `○ off` quiet. The `on` button is the
+/// accent's pill on every theme, its letters the ground's ink on its fill: a
+/// control does not change colour with the mode it controls. A hovered
+/// switch says what a press acts on: the lit switch underlined and bold, an
+/// off switch's button underlined, its fill lifted a quarter toward the
+/// pane's ink.
 fn switch_cell(
     ch: char,
     ink: SwitchInk,
     paint: SwitchPaint,
+    palette: Option<aterm_effects::harness_card::CardPalette>,
     blank: RenderCell,
-    rule: RenderCell,
     mark_fg: [u8; 3],
 ) -> RenderCell {
+    use crate::autopilot::HarnessSwitch;
     let quiet = mix(blank.fg, blank.bg, 0.3);
     let agent = mix(mark_fg, blank.fg, 0.35);
     let fill = if paint.hover {
@@ -4722,11 +6866,22 @@ fn switch_cell(
     let on = paint.face.is_on();
     let mut cell = RenderCell { ch, ..blank };
     match ink {
-        SwitchInk::Brand(stop) => {
-            cell.fg = brand_letter_fg(usize::from(stop), blank);
-            cell.bold = true;
+        SwitchInk::Arc(stop) => {
+            // Laid only on a line that wears a theme; Cruise's arc otherwise.
+            let letter = brand_letter_fg(
+                palette.unwrap_or(aterm_effects::harness_card::CardPalette::Cruise),
+                f32::from(stop) / 255.0,
+                blank,
+            );
+            match paint.face {
+                HarnessSwitch::On => {
+                    cell.fg = letter;
+                    cell.bold = true;
+                }
+                HarnessSwitch::Off(_) => cell.fg = letter,
+                HarnessSwitch::Turning => cell.fg = turning_ink(letter, blank.bg),
+            }
         }
-        SwitchInk::Rule => cell.fg = rule.fg,
         SwitchInk::Label => {
             cell.fg = if on { agent } else { quiet };
             cell.bold = on;
@@ -4745,233 +6900,803 @@ fn switch_cell(
             }
         }
         SwitchInk::Cap => cell.fg = fill,
-        SwitchInk::Turning => cell.fg = mix(mark_fg, blank.bg, 0.3),
+        SwitchInk::Turning => cell.fg = turning_ink(mark_fg, blank.bg),
     }
-    if paint.hover && on && matches!(ink, SwitchInk::Label | SwitchInk::Lit) && ch != ' ' {
+    if paint.hover
+        && on
+        && matches!(ink, SwitchInk::Label | SwitchInk::Lit | SwitchInk::Arc(_))
+        && ch != ' '
+    {
         cell.bold = true;
         cell.underline = aterm_core::terminal::UnderlineStyle::Single;
     }
     cell
 }
 
-/// THE COMPOSER TOP RULE'S HARNESS PAINT for `Claude`, `Agy` and `Muse`
-/// (`top_rule`): the harness switch at the rule's right ([`switch_face`],
-/// two of the rule's own cells after it), registered as the switch a press,
-/// a hover and a screen reader reach ([`crate::claude_lights::BorderSwitch`]);
-/// and where the harness holds the session (`paint.branded`) the ALab
-/// rainbow kitty branding with it: the plain `─` run tinted on the 256-stop
-/// spectrum and the tool's logo at its left. Where the harness does not
-/// carry the session only the switch is written, its `on` the button
-/// (owner, 2026-10-20: "there needs to be an "on" button drawn for the
-/// claude harness").
-#[allow(clippy::too_many_arguments)]
-fn collect_composer_border_brand_edits(
-    scratch: &RenderInput,
-    session: u64,
-    program: aterm_phase::Program,
-    paint: SwitchPaint,
-    region: PaneTextRegion,
-    top_rule: usize,
-    blank: RenderCell,
-    fallback_rule: RenderCell,
-    mark_fg: [u8; 3],
-    out: &mut Vec<AgyRowEdit>,
-    out_live: &mut usize,
-    toggles: &mut Vec<crate::claude_lights::BorderSwitch>,
-) {
-    let (left_brand, logo_chars, logo_rgb, word) = match program {
-        aterm_phase::Program::Claude => (
-            " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259C}\u{258C} claude ",
-            8usize,
-            [215, 119, 87],
-            "claude",
-        ),
-        aterm_phase::Program::Agy => (
-            " \u{2584}\u{2580}\u{2580}\u{2584} agy ",
-            5usize,
-            [88, 166, 255],
-            "agy",
-        ),
-        // Muse Code's own done-diamond (`◆`, its reply's glyph) in Meta
-        // blue (`#0082FB`).
-        aterm_phase::Program::Muse => (" \u{25C6} muse ", 2usize, [0, 130, 251], "muse"),
-        _ => return,
-    };
-    let term_row = region.row_off + top_rule;
-    let frame_row = region.strip + term_row;
-    let Some(frame_cells) = scratch.cells.get(frame_row) else {
-        return;
-    };
-    let pane_end = frame_cells.len().min(region.col_off + region.cols);
-    let Some(pane_slice) = frame_cells.get(region.col_off..pane_end) else {
-        return;
-    };
-    if pane_slice.is_empty() || pane_slice.iter().any(|c| c.bg != blank.bg) {
-        return;
+/// THE SETTLING SWITCH'S INK (`◐ turning on`, [`switch_cell`]): `ink` — a
+/// glyph's stop of the theme's arc, or the bare switch's accent — quieted
+/// 30% toward the ground (§4.2), then floored back to 4.5:1 against it, its
+/// hue kept (§8): the words a person reads to see the harness turning on
+/// stay text, and the quieting, the regular weight and `◐` are the state's
+/// cue. A quieted ink that already clears the floor is kept as it is.
+fn turning_ink(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
+    let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+    let floored = aterm_effects::color_math::floor_contrast_keeping_hue(
+        pack(mix(ink, ground, 0.3)),
+        pack(ground),
+        aterm_effects::cli_marks::NAME_CONTRAST,
+    );
+    let [_, r, g, b] = floored.to_be_bytes();
+    [r, g, b]
+}
+
+/// The mark a program's top line wears ([`aterm_effects::cli_marks`]): one
+/// exhaustive match, so a new program does not compile until it is placed.
+/// Every program aterm reads a top line for has one; a shell has none.
+fn cli_mark(program: aterm_phase::Program) -> Option<CliMark> {
+    match program {
+        aterm_phase::Program::Claude => Some(CliMark::Claude),
+        aterm_phase::Program::Codex => Some(CliMark::Codex),
+        aterm_phase::Program::Agy => Some(CliMark::Agy),
+        aterm_phase::Program::Muse => Some(CliMark::Muse),
+        aterm_phase::Program::Gemini => Some(CliMark::Gemini),
+        aterm_phase::Program::Generic => None,
     }
-    let Some(first) = pane_slice.iter().find(|c| c.ch == '\u{2500}').copied() else {
-        return;
+}
+
+/// What a top line's lockup shows on a rung of the ladder ([`Rung`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lockup {
+    /// The icon and the CLI's name, `[##]claude ` (`CliMark::lockup_cells`).
+    Full,
+    /// The icon alone, `[##]` (`cli_marks::ICON_RUN`).
+    Icon,
+}
+
+/// One rung of THE NARROW LADDER ([`ladder`]): the switch's form (`None`:
+/// none drawn), the lockup (`None`: none), the cells before the lockup (its
+/// first cell's place in the span) and the span the rung needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rung {
+    tier: Option<usize>,
+    lockup: Option<Lockup>,
+    lead: usize,
+    need: usize,
+}
+
+/// The most rungs a ladder has: a full rung a switch tier, then the icon,
+/// the icon compact and the switch alone.
+const LADDER_MAX: usize = SWITCH_TIERS + 3;
+
+/// THE NARROW LADDER of a top line whose switch is `switch` (`None`: no
+/// switch, no host to turn a harness on) and whose lockup takes `lockup`
+/// cells (`None`: the program wears no mark), widest first; the first rung
+/// a span holds wins ([`lay_top`]). The switch's words go first (`harness`,
+/// then `alab`, then an off or turning switch's state words), then the CLI's
+/// name, then the icon: the switch's last form outlasts all decoration,
+/// because it is the pane's only way to turn the harness on (owner,
+/// 2026-10-20), and stands at every span its narrowest form needs (`face +
+/// 4`, the switch alone as it stood before the lockup). Two cells stay
+/// free after the switch on every rung, so the key's mark (the span's last
+/// cell) is always a `─`.
+///
+/// | rung | lockup | tier | lead | gap | tail | span needed |
+/// |---|---|---|---|---|---|---|
+/// | full s0 … sN | icon and name | 0 … last | 2 | 2 | 2 | lockup + face + 6 |
+/// | icon sN | icon | last | 2 | 2 | 2 | 4 + face + 6 |
+/// | icon sN compact | icon | last | 1 | 1 | 2 | 4 + face + 4 |
+/// | alone sN | none | last | | | 2 | face + 4 |
+/// | no switch: full, icon, compact | icon and name, the icon | | 2, 2, 1 | ≥ 2, 2, 1 | | lockup + 4, 8, 6 |
+fn ladder(switch: Option<SwitchPaint>, lockup: Option<usize>) -> ([Rung; LADDER_MAX], usize) {
+    let none = Rung {
+        tier: None,
+        lockup: None,
+        lead: 0,
+        need: usize::MAX,
     };
-    let last = pane_slice
-        .iter()
-        .rev()
-        .find(|c| c.ch == '\u{2500}')
-        .copied()
-        .unwrap_or(first);
-    let count = |style: &RenderCell| pane_slice.iter().filter(|c| *c == style).count();
-    let rule_cell = if first == last || count(&last) >= count(&first) {
-        last
-    } else if first.ch == '\u{2500}' {
-        first
-    } else {
-        fallback_rule
+    let mut rungs = [none; LADDER_MAX];
+    let mut n = 0;
+    let mut push = |rung: Rung| {
+        rungs[n] = rung;
+        n += 1;
     };
-    // Find the rightmost contiguous run of plain `─` cells matching `rule_cell`.
-    let mut best = 0..0;
-    let mut cur_start = None;
-    for (idx, cell) in pane_slice.iter().enumerate() {
-        let col = region.col_off + idx;
-        let plain = *cell == rule_cell
-            && !touches(&scratch.clusters, frame_row, &(col..col + 1))
-            && !touches(&scratch.combining, frame_row, &(col..col + 1))
-            && !touches(&scratch.images, frame_row, &(col..col + 1));
-        if plain {
-            let s = *cur_start.get_or_insert(idx);
-            if idx + 1 - s >= best.len() {
-                best = s..idx + 1;
+    let icon = aterm_effects::cli_marks::ICON_RUN;
+    match switch {
+        Some(paint) => {
+            let mut last = None;
+            for tier in 0..SWITCH_TIERS {
+                let Some(face) = switch_face(paint, tier) else {
+                    break;
+                };
+                match lockup {
+                    Some(cells) => push(Rung {
+                        tier: Some(tier),
+                        lockup: Some(Lockup::Full),
+                        lead: 2,
+                        need: cells + face.len + 6,
+                    }),
+                    // No mark: the switch alone, in its widest form that fits.
+                    None => push(Rung {
+                        tier: Some(tier),
+                        lockup: None,
+                        lead: 0,
+                        need: face.len + 4,
+                    }),
+                }
+                last = Some((tier, face.len));
             }
+            if let (Some((tier, len)), Some(_)) = (last, lockup) {
+                push(Rung {
+                    tier: Some(tier),
+                    lockup: Some(Lockup::Icon),
+                    lead: 2,
+                    need: icon + len + 6,
+                });
+                push(Rung {
+                    tier: Some(tier),
+                    lockup: Some(Lockup::Icon),
+                    lead: 1,
+                    need: icon + len + 4,
+                });
+                push(Rung {
+                    tier: Some(tier),
+                    lockup: None,
+                    lead: 0,
+                    need: len + 4,
+                });
+            }
+        }
+        None => {
+            if let Some(cells) = lockup {
+                push(Rung {
+                    tier: None,
+                    lockup: Some(Lockup::Full),
+                    lead: 2,
+                    need: cells + 4,
+                });
+                push(Rung {
+                    tier: None,
+                    lockup: Some(Lockup::Icon),
+                    lead: 2,
+                    need: icon + 4,
+                });
+                push(Rung {
+                    tier: None,
+                    lockup: Some(Lockup::Icon),
+                    lead: 1,
+                    need: icon + 2,
+                });
+            }
+        }
+    }
+    (rungs, n)
+}
+
+/// The first of `rungs` a span of `span` cells holds.
+fn first_fit(span: usize, rungs: &[Rung]) -> Option<Rung> {
+    rungs.iter().copied().find(|r| r.need <= span)
+}
+
+/// THE LADDER LAID ([`ladder`]): the rung a span of `span` cells takes for
+/// a line whose switch is `switch` and whose lockup takes `lockup` cells,
+/// and the switch's face on it; `None` where no rung fits, and the line
+/// stays the vendor's.
+fn lay_top(
+    span: usize,
+    switch: Option<SwitchPaint>,
+    lockup: Option<usize>,
+) -> Option<(Rung, Option<SwitchFace>)> {
+    let (rungs, n) = ladder(switch, lockup);
+    let rung = first_fit(span, &rungs[..n])?;
+    let face = rung
+        .tier
+        .zip(switch)
+        .and_then(|(tier, paint)| switch_face(paint, tier));
+    Some((rung, face))
+}
+
+/// What a composer top line is composed from ([`compose_top`]): where it
+/// is and its kind (a rule, or Codex's slab, whose blank is then `blank`),
+/// its run, the program whose mark the lockup wears, the harness switch it
+/// shows (`None`: no host, no switch), the theme it wears (`None`: bare,
+/// the harness's glass not worn), the pane's blank, the marks' ink, what
+/// aterm draws for the top-effort key there, what the mark's sprite is laid
+/// with — the window's cell in device pixels and the pane's box in grid
+/// pixels, its clip — and the hover title's: whether the pointer is on the
+/// lockup, and the footer's `shown_gen` while it is and the footer holds
+/// the program's facts, whose version the title names (`0`: none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TopKey {
+    frame_row: usize,
+    term_row: usize,
+    line: TopLine,
+    run: TopRun,
+    program: aterm_phase::Program,
+    switch: Option<SwitchPaint>,
+    palette: Option<aterm_effects::harness_card::CardPalette>,
+    blank: RenderCell,
+    mark_fg: [u8; 3],
+    face: KeyFace,
+    cell: (u16, u16),
+    clip: aterm_core::render::PxRect,
+    mark_hover: bool,
+    title_gen: u64,
+}
+
+/// What aterm draws for the top-effort key on a top rule (design §10.6.14): none
+/// of Claude's own ink — its tag is never restyled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct KeyFace {
+    /// aterm's ` KEY off ` ghost in Claude's slot, the key off: `Some(lit)`,
+    /// lit while the pointer is on it.
+    ghost: Option<bool>,
+    /// Claude's own tag on the row: its key's frame columns.
+    tag: Option<(usize, usize)>,
+    /// `◐` while a press of the key is in flight, `▸` while the keyboard
+    /// selects it: in the `─` cell left of the ghost's or the tag's leading
+    /// blank.
+    mark: Option<char>,
+}
+
+/// The ghost's cells: ` KEY off `.
+const GHOST_CELLS: usize = aterm_primer::CLAUDE_TOP_EFFORT_KEY.len() + 6;
+
+/// The shortest run the ghost is drawn in: itself, the `─` after it as
+/// Claude leaves one after its tag, and the rule's lead of `─` before it.
+const GHOST_RUN: usize = GHOST_CELLS + 1 + footer::RULE_LEAD;
+
+/// The ghost's glyphs, in order: the key spelled by its one const.
+fn ghost_chars() -> impl Iterator<Item = char> {
+    std::iter::once(' ')
+        .chain(aterm_primer::CLAUDE_TOP_EFFORT_KEY.chars())
+        .chain(" off ".chars())
+}
+
+/// A composer top rule as [`PaneFooter::compose_top`] composed it: the
+/// cells to write at frame column `col` (none: the rule stays the vendor's),
+/// the harness switch as laid in them, the ghost's glyphs' frame columns
+/// where it is drawn, the lockup's frame columns (pads included; empty: none
+/// laid) and its icon's first, and the mark's sprite over the icon's cells —
+/// one layer per pane, kept while the key holds, so a frame at rest hands
+/// the renderer the same `Arc` ([`mark_layer`]).
+#[derive(Debug, Default)]
+struct ComposedTop {
+    key: Option<TopKey>,
+    cells: Vec<RenderCell>,
+    col: usize,
+    switch: Option<LaidSwitch>,
+    ghost: Option<(usize, usize)>,
+    lockup: std::ops::Range<usize>,
+    icon: Option<usize>,
+    mark: Option<aterm_core::render::FxLayer>,
+}
+
+/// Where [`compose_top`] laid a harness switch, in frame columns: its form
+/// ([`switch_face`]'s tier), every cell a press acts on, the switch's own
+/// cells and an off switch's `on` button — what the splice records as the
+/// `crate::claude_lights::BorderSwitch` once the write takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LaidSwitch {
+    tier: usize,
+    cols: std::ops::Range<usize>,
+    switch: std::ops::Range<usize>,
+    button: Option<std::ops::Range<usize>>,
+}
+
+/// The context fact's words for an indicator reading `pct` per cent left
+/// (`aterm_phase::phase::context_left_shown`): `ctx 84% left`.
+fn context_words(pct: u8) -> String {
+    format!("ctx {pct}% left")
+}
+
+/// The reading the context fact's words `shown` say ([`context_words`]'s
+/// inverse), or `None` for none or any other words: compared with the
+/// screen's reading each frame without allocating.
+fn context_left_of(shown: Option<&str>) -> Option<u8> {
+    shown?
+        .strip_prefix("ctx ")?
+        .strip_suffix("% left")?
+        .parse()
+        .ok()
+}
+
+/// A `0x00RRGGBB` colour's channels.
+fn rgb_of(c: u32) -> [u8; 3] {
+    [(c >> 16) as u8, (c >> 8) as u8, c as u8]
+}
+
+/// THE CLI'S TOP LINE — Claude Code's, agy's and Muse Code's composer top
+/// rule, Gemini CLI's live-zone rule, Codex's composer slab's top pad
+/// ([`top_line`]) — composed from `key` into `top` (owner, 2026-10-21:
+/// "each CLI has an emoji-sized icon and color on the left side of the top
+/// line of CLI to standardize"):
+///
+/// * THE LOCKUP, two `─` in from the run's left: a pad, the CLI's drawn
+///   icon over two blank cells (a sprite on the glass, [`mark_layer`] —
+///   never text glyphs, never the program's grid), a pad, the CLI's name
+///   bold in its brand ink floored to 4.5:1 on the ground
+///   (`cli_marks::name_fg`), a trailing pad: `──[##]claude ────`. It is the
+///   program's identity, not the harness's state, so it stands in every
+///   state — bare and with no host included ([`cli_mark`]).
+/// * THE SWITCH at the rule's right, two `─` from the span's end
+///   ([`switch_face`]): ` alab harness ● on `, ` alab harness ○ off ▐ on ▌ `,
+///   ` alab harness ◐ turning on `, laid where a press, a hover and a screen
+///   reader reach it (`top.switch`, `crate::claude_lights::BorderSwitch`);
+///   with no host there is none.
+/// * THE NARROW LADDER ([`ladder`]) gives up the switch's words first, then
+///   the name, then the icon; the switch's last form stands wherever it
+///   stood before the lockup.
+/// * THE TINT, where the harness's glass is worn (`key.palette`, the
+///   session's theme, [`crate::autopilot::harness_theme`]: the card's own —
+///   Cruise's spectrum, Land's sunset, Off's white moonbow, the owner's of
+///   2026-10-19): the switch's glyphs walk the arc from `t = 0` to `t = 1`
+///   in the palette's legible letter ink ([`switch_cell`]), and the gap's
+///   `─` walk it BACKWARDS, `t = 1` at the lockup down to `t = 0` beside the
+///   switch's first glyph, so the rule flows into the switch on one stop; the
+///   `─` before the lockup and after the switch stand at `t = 1`. One stroke,
+///   no seam, and the lockup framed by the stop farthest from red. Bare (the
+///   master switch or the agent's own off, a claim this host does not hold,
+///   no host), the vendor's rule keeps its ink under the lockup and the
+///   switch.
+///
+/// THE TOP-EFFORT KEY's ghost (`key.face`, design §10.6.14) takes Claude's slot
+/// at the run's right end, the `─` after it left as Claude's: ` KEY off ` in
+/// Claude's rule gray, not bold, at full size — lifted and underlined while
+/// the pointer is on it — the tint, the switch and the lockup laid in the
+/// span short of it. Its mark (`◐`, `▸`) takes the `─` left of its leading
+/// blank, or of Claude's tag's: the span's last cell, which no rung takes.
+/// Where no rung fits, only the ghost and its mark are written.
+///
+/// Every cell written lies in the run it is laid on ([`laid_run`]): a plain
+/// `─` on the pane's ground, or a blank of Codex's proven slab
+/// ([`TopLine::Slab`], whose blank stands in for the pane's in every ink and
+/// contrast law, and which is never tinted: it is Codex's own surface) — and
+/// Muse Code's idle voice label where the lockup takes it, so the lockup
+/// stands at the rule's left (owner, 2026-10-21), the label written over
+/// with the rule on the glass alone. Claude's labels and tag, Muse's voice
+/// states with news, Gemini's band, Codex's prompt row and every other cell
+/// the CLI inks itself are outside it, and are never written.
+///
+/// THE HOVER TITLE (design §7), while the pointer rests on the lockup
+/// (`key.mark_hover`): the name gives way to `<product> <version>`
+/// (`Program::product`, the footer's version, `version`), else the product
+/// alone where no version is held (Gemini, Codex) or the version would leave
+/// fewer than two `─` before the switch (or the span's end), else the name.
+/// The rung is the resting lockup's and the tint the resting layout's, so
+/// the title covers gap cells alone and the switch never moves.
+fn compose_top(key: &TopKey, top: &mut ComposedTop, version: Option<&str>) {
+    compose_top_in(key, top, version, TITLE_LEAD);
+}
+
+/// The `─` the hover title leaves before the switch (or the span's end),
+/// as the lockup's resting rungs leave: two.
+const TITLE_LEAD: usize = 2;
+
+/// [`compose_top`] with the hover title leaving `title_lead` `─` before the
+/// switch: the tests' control lets it into the switch's lead.
+fn compose_top_in(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, title_lead: usize) {
+    #[cfg(test)]
+    crate::work_counts::footer_top_composed();
+    top.cells.clear();
+    top.switch = None;
+    top.ghost = None;
+    top.lockup = 0..0;
+    top.icon = None;
+    let TopKey {
+        line,
+        program,
+        switch,
+        palette,
+        blank,
+        mark_fg,
+        face,
+        ..
+    } = *key;
+    // Muse Code's idle label, where the lockup takes it (`label` cells).
+    let (run, label) = laid_run(key);
+    top.col = run.col;
+    let rule_cell = run.rule;
+    // Codex's slab is its own surface: the switch walks the theme's arc on
+    // it, its blanks are never tinted.
+    let tint = palette.filter(|_| line == TopLine::Rule);
+    // The ghost's first cell, in the run: right-aligned, one `─` after it.
+    let ghost_at = ghost_at(run.len, face);
+    // The mark's cell, in the run: left of the ghost's leading blank, or of
+    // Claude's tag's.
+    let mark_at = face.mark.and_then(|_| match ghost_at {
+        Some(at) => at.checked_sub(1),
+        None => face
+            .tag
+            .and_then(|(start, _)| start.checked_sub(2)?.checked_sub(run.col))
+            .filter(|&at| at < run.len),
+    });
+    let mark_cell = face.mark.map(|ch| RenderCell {
+        ch,
+        fg: mark_fg,
+        bold: false,
+        ..rule_cell
+    });
+    let ghost_cells = |lit: bool| {
+        let fg = if lit {
+            value_fg(rule_cell.fg, blank.fg)
         } else {
-            cur_start = None;
-        }
+            rule_cell.fg
+        };
+        ghost_chars().map(move |ch| RenderCell {
+            ch,
+            fg,
+            bold: false,
+            script: aterm_core::terminal::Script::Normal,
+            underline: if lit && ch != ' ' {
+                aterm_core::terminal::UnderlineStyle::Single
+            } else {
+                aterm_core::terminal::UnderlineStyle::None
+            },
+            ..rule_cell
+        })
+    };
+    if let Some(at) = ghost_at {
+        top.ghost = Some((run.col + at + 1, run.col + at + GHOST_CELLS - 1));
     }
-    // Muse Code's rule at rest is labelled (`── Voice input (⌥ + v to
-    // start) ──…`): where the harness brands the rule, its branding takes
-    // the label's cells too, so the tool's logo stands at the rule's left
-    // as Claude's and agy's do (owner, 2026-10-21) — on the glass alone;
-    // the grid keeps Muse Code's row for its readers, and a voice state
-    // with news (`Recording`, `Transcribing`, …) keeps its words, the
-    // branding staying on the plain run after it.
-    if paint.branded
-        && program == aterm_phase::Program::Muse
-        && let (Some(first), Some(last)) = (
-            pane_slice.iter().position(|c| c.ch == '\u{2500}'),
-            pane_slice.iter().rposition(|c| c.ch == '\u{2500}'),
-        )
-        && first < best.start
-    {
-        let text: String = pane_slice.iter().map(|c| c.ch).collect();
-        let untouched = (first..=last).all(|idx| {
-            let col = region.col_off + idx;
-            !touches(&scratch.clusters, frame_row, &(col..col + 1))
-                && !touches(&scratch.combining, frame_row, &(col..col + 1))
-                && !touches(&scratch.images, frame_row, &(col..col + 1))
-        });
-        if untouched && aterm_phase::muse::is_idle_voice_rule(&text) {
-            best = first..last + 1;
+    // The harness's span: the run, short of the ghost.
+    let span_len = top_span(run.len, face);
+    let mark = cli_mark(program);
+    let Some((rung, sface)) = lay_top(span_len, switch, mark.map(CliMark::lockup_cells)) else {
+        // No rung fits: the rule stays the vendor's but for the key's ghost
+        // and its mark.
+        let first = mark_at.or(ghost_at);
+        if let Some(first) = first {
+            top.col = run.col + first;
+            if let (Some(_), Some(mark)) = (mark_at, mark_cell) {
+                top.cells.push(mark);
+            }
+            if let (Some(_), Some(lit)) = (ghost_at, face.ghost) {
+                top.cells.extend(ghost_cells(lit));
+            }
         }
-    }
-    let span_len = best.len();
-    // No room for the switch, and none for the branding either: the rule is
-    // the vendor's.
-    let Some((tier, face)) = fitted_switch_face(paint, word, span_len) else {
         return;
     };
-    let b_len = face.len;
-    let b_start = span_len - 2 - b_len;
-    if *out_live == out.len() {
-        out.push(AgyRowEdit {
-            frame_row: 0,
-            col: 0,
-            cells: Vec::with_capacity(span_len),
-            ground: blank,
+    // Where the lockup and the switch lie in the span.
+    let lockup_at = rung.lockup.zip(mark).map(|(lockup, mark)| {
+        let cells = match lockup {
+            Lockup::Full => mark.lockup_cells(),
+            Lockup::Icon => aterm_effects::cli_marks::ICON_RUN,
+        };
+        rung.lead..rung.lead + cells
+    });
+    let switch_at = sface.as_ref().map(|f| {
+        let start = span_len - 2 - f.len;
+        start..start + f.len
+    });
+    if let (Some(f), Some(at), Some(tier)) = (&sface, &switch_at, rung.tier) {
+        let col_start = run.col + at.start;
+        let laid = |r: &std::ops::Range<usize>| col_start + r.start..col_start + r.end;
+        top.switch = Some(LaidSwitch {
+            tier,
+            cols: col_start..col_start + f.len,
+            switch: laid(&f.switch),
+            button: f.button.as_ref().map(laid),
         });
     }
-    let edit = &mut out[*out_live];
-    *out_live += 1;
-    edit.frame_row = frame_row;
-    edit.ground = blank;
-    let cells = &mut edit.cells;
-    cells.clear();
-    if paint.branded {
-        // The whole run, tinted, the logo at its left where it fits before
-        // the switch.
-        edit.col = region.col_off + best.start;
-        let denom = span_len.saturating_sub(1).max(1);
+    // The cells written: with a tint the whole span, its `─` tinted; bare
+    // (and on Codex's slab), from the first cell aterm draws to the last (to
+    // the ghost, where it stands), the vendor's rule between.
+    let (lo, hi) = if tint.is_some() {
+        (0, span_len)
+    } else {
+        let firsts = [
+            lockup_at.as_ref().map(|r| r.start),
+            switch_at.as_ref().map(|r| r.start),
+            mark_at,
+        ];
+        let lasts = [
+            lockup_at.as_ref().map(|r| r.end),
+            switch_at.as_ref().map(|r| r.end),
+            mark_at.map(|m| m + 1),
+        ];
+        let lo = firsts.into_iter().flatten().min().unwrap_or(0);
+        let hi = match ghost_at {
+            Some(_) => span_len,
+            None => lasts.into_iter().flatten().max().unwrap_or(lo),
+        };
+        // A label the lockup took is written over to its last cell.
+        (lo, hi.max(label))
+    };
+    top.col = run.col + lo;
+    let cells = &mut top.cells;
+    cells.resize(hi - lo, rule_cell);
+    if let Some(palette) = tint {
+        let dark = crate::claude_card::dark_ground(blank);
+        // The gap: between the lockup's last cell (the span's first, with
+        // none) and the switch's first, walked from `t = 1` down to `t = 0`.
+        let gap = switch_at
+            .as_ref()
+            .map(|s| lockup_at.as_ref().map_or(0, |l| l.end)..s.start);
         for i in 0..span_len {
-            let stop = (i * 255) / denom;
-            let c = aterm_effects::spectrum::SPECTRUM_LUT[stop];
-            let stop_rgb = [(c >> 16) as u8, (c >> 8) as u8, c as u8];
-            let lifted = mix(stop_rgb, blank.fg, 0.25);
+            let mine =
+                |r: &Option<std::ops::Range<usize>>| r.as_ref().is_some_and(|r| r.contains(&i));
+            if mine(&lockup_at) || mine(&switch_at) {
+                continue;
+            }
+            let t = match &gap {
+                Some(gap) if gap.contains(&i) => {
+                    let (j, g) = (i - gap.start, gap.len());
+                    if g <= 1 {
+                        0.0
+                    } else {
+                        1.0 - j as f32 / (g - 1) as f32
+                    }
+                }
+                _ => 1.0,
+            };
+            let lifted = mix(rgb_of(palette.art(t, dark)), blank.fg, 0.25);
             let mut fg = mix(rule_cell.fg, lifted, 0.68);
             if fg == rule_cell.fg {
                 fg[0] ^= 1;
             }
-            cells.push(RenderCell {
+            cells[i - lo] = RenderCell {
                 ch: '\u{2500}',
                 fg,
                 ..rule_cell
-            });
+            };
         }
-        let agent_fg = mix(mark_fg, blank.fg, 0.35);
-        let left_len = left_brand.chars().count();
-        let l_start = 2usize;
-        if l_start + left_len + 2 <= b_start {
-            let logo_fg = mix(logo_rgb, blank.fg, 0.15);
-            for (k, ch) in left_brand.chars().enumerate() {
-                let fg = if k <= logo_chars { logo_fg } else { agent_fg };
-                cells[l_start + k] = RenderCell {
-                    ch,
-                    fg,
-                    bold: true,
-                    ..blank
-                };
+    }
+    if let (Some(at), Some(mark)) = (&lockup_at, mark) {
+        // The pads and the icon's two cells: blanks on the ground, the
+        // sprite drawn over the icon's.
+        let pad = RenderCell { ch: ' ', ..blank };
+        for c in at.clone() {
+            cells[c - lo] = pad;
+        }
+        top.lockup = run.col + at.start..run.col + at.end;
+        top.icon = Some(run.col + at.start + 1);
+        if rung.lockup == Some(Lockup::Full) {
+            let ground = crate::claude_card::pack(blank.bg);
+            let name_at = at.start + aterm_effects::cli_marks::ICON_RUN;
+            let word = mark.word();
+            let word_len = word.chars().count();
+            // The hover title, where it fits: its trailing pad and the
+            // title's lead of `─` before the switch (or the span's end),
+            // over gap cells alone.
+            let limit = switch_at.as_ref().map_or(span_len, |s| s.start);
+            let room = limit.saturating_sub(name_at + 1 + title_lead);
+            let title = key
+                .mark_hover
+                .then(|| hover_title(program.product(), version, room))
+                .flatten()
+                .filter(|t| t.len >= word_len);
+            match title {
+                Some(t) => {
+                    // A bare line writes to its last drawn cell: the title's
+                    // pad may lie past it, over the vendor's rule.
+                    let end = name_at + t.len;
+                    if cells.len() <= end - lo {
+                        cells.resize(end + 1 - lo, rule_cell);
+                    }
+                    // The name's inks spread over the title, so Gemini's
+                    // gradient runs its whole length.
+                    let letter = |k: usize| {
+                        if t.len <= 1 {
+                            0
+                        } else {
+                            (k * (word_len - 1) + (t.len - 1) / 2) / (t.len - 1)
+                        }
+                    };
+                    for (k, ch) in t.chars().enumerate() {
+                        cells[name_at + k - lo] = if ch == ' ' {
+                            pad
+                        } else {
+                            RenderCell {
+                                ch,
+                                fg: rgb_of(aterm_effects::cli_marks::name_fg(
+                                    mark,
+                                    letter(k),
+                                    ground,
+                                )),
+                                bold: true,
+                                ..blank
+                            }
+                        };
+                    }
+                    cells[end - lo] = pad;
+                    top.lockup.end = run.col + end + 1;
+                }
+                None => {
+                    for (k, ch) in word.chars().enumerate() {
+                        cells[name_at + k - lo] = RenderCell {
+                            ch,
+                            fg: rgb_of(aterm_effects::cli_marks::name_fg(mark, k, ground)),
+                            bold: true,
+                            ..blank
+                        };
+                    }
+                }
             }
         }
-        for (k, &(ch, ink)) in face.cells().iter().enumerate() {
-            cells[b_start + k] = switch_cell(ch, ink, paint, blank, rule_cell, mark_fg);
-        }
-    } else {
-        // The switch alone, over the vendor's rule.
-        edit.col = region.col_off + best.start + b_start;
-        cells.extend(
-            face.cells()
-                .iter()
-                .map(|&(ch, ink)| switch_cell(ch, ink, paint, blank, rule_cell, mark_fg)),
-        );
     }
-    let col_start = region.col_off + best.start + b_start;
-    let at = |r: &std::ops::Range<usize>| col_start + r.start..col_start + r.end;
-    toggles.push(crate::claude_lights::BorderSwitch {
-        frame_row,
-        term_row,
-        cols: col_start..col_start + b_len,
-        switch: at(&face.switch),
-        button: face.button.as_ref().map(at),
-        session,
-        face: paint.face,
-        branded: paint.branded,
-        tier,
-        program,
-    });
+    if let (Some(mut f), Some(at), Some(paint)) = (sface, switch_at, switch) {
+        if palette.is_some() {
+            f.on_arc();
+        }
+        for (k, &(ch, ink)) in f.cells().iter().enumerate() {
+            cells[at.start + k - lo] = switch_cell(ch, ink, paint, palette, blank, mark_fg);
+        }
+    }
+    if let (Some(at), Some(mark)) = (mark_at, mark_cell) {
+        cells[at - lo] = mark;
+    }
+    if let (Some(_), Some(lit)) = (ghost_at, face.ghost) {
+        cells.extend(ghost_cells(lit));
+    }
+}
+
+/// THE HOVER TITLE's words ([`hover_title`]): the product, its version
+/// where one is named, and their cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HoverTitle<'a> {
+    product: &'a str,
+    version: Option<&'a str>,
+    len: usize,
+}
+
+impl HoverTitle<'_> {
+    /// The title's glyphs: `Claude Code 2.1.304`.
+    fn chars(&self) -> impl Iterator<Item = char> + '_ {
+        self.product.chars().chain(
+            self.version
+                .into_iter()
+                .flat_map(|v| std::iter::once(' ').chain(v.chars())),
+        )
+    }
+}
+
+/// The widest hover title (design §7) whose words fit `room` cells:
+/// `<product> <version>`, else the product alone (where no `version` is
+/// held, or the version leaves no room); `None` where neither fits, and the
+/// name stays. Nothing allocated.
+fn hover_title<'a>(
+    product: &'a str,
+    version: Option<&'a str>,
+    room: usize,
+) -> Option<HoverTitle<'a>> {
+    let cells = product.chars().count();
+    version
+        .map(|v| HoverTitle {
+            product,
+            version: Some(v),
+            len: cells + 1 + v.chars().count(),
+        })
+        .filter(|t| t.len <= room)
+        .or_else(|| {
+            (cells <= room).then_some(HoverTitle {
+                product,
+                version: None,
+                len: cells,
+            })
+        })
+}
+
+/// The contents of the marks' sprites ([`aterm_effects::cli_marks::content`])
+/// the window's panes were last laid with, by mark, fit and ground: a pane
+/// reopening on a ground it was laid on seals nothing. At most
+/// [`MarkContents::KEPT`]: two grounds for each of the marks.
+#[derive(Debug, Default)]
+struct MarkContents(Vec<MarkContent>);
+
+/// One kept sprite content: its mark, fit and ground, and the content.
+type MarkContent = (
+    CliMark,
+    aterm_effects::cli_marks::Fit,
+    u32,
+    Arc<aterm_core::render::FxContent>,
+);
+
+impl MarkContents {
+    /// How many contents are kept.
+    const KEPT: usize = 2 * CliMark::ALL.len();
+
+    /// `mark`'s content at `fit` on `ground`: the kept one, or one sealed
+    /// now and kept, the oldest let go past [`Self::KEPT`].
+    fn content(
+        &mut self,
+        mark: CliMark,
+        fit: aterm_effects::cli_marks::Fit,
+        ground: u32,
+    ) -> Arc<aterm_core::render::FxContent> {
+        if let Some((.., kept)) = self
+            .0
+            .iter()
+            .find(|(m, f, g, _)| (*m, *f, *g) == (mark, fit, ground))
+        {
+            return Arc::clone(kept);
+        }
+        let content = aterm_effects::cli_marks::content(mark, fit, ground);
+        if self.0.len() >= Self::KEPT {
+            self.0.remove(0);
+        }
+        self.0.push((mark, fit, ground, Arc::clone(&content)));
+        content
+    }
+}
+
+/// Pane `pane`'s box in grid pixels for a window cell of `cell` device
+/// pixels: a mark sprite's clip, so it never draws past its pane. Saturates
+/// past `i32`.
+fn pane_grid_px(
+    cell: (u16, u16),
+    pane: crate::claude_card::PaneGeom,
+) -> aterm_core::render::PxRect {
+    let px = |cells: usize, side: u16| {
+        i32::try_from(cells)
+            .unwrap_or(i32::MAX)
+            .saturating_mul(i32::from(side))
+    };
+    let top = pane.strip + pane.row_off;
+    aterm_core::render::PxRect::new(
+        px(pane.col_off, cell.0),
+        px(top, cell.1),
+        px(pane.col_off + pane.cols, cell.0),
+        px(top + pane.rows, cell.1),
+    )
+}
+
+/// The mark's layer id for `session`'s pane: a hash of `("top-mark",
+/// session)`, stable for the session, so the renderer matches the layer
+/// frame to frame and two panes' marks never share one.
+pub(crate) fn top_mark_id(session: u64) -> u64 {
+    // splitmix64 over the session salted with `top-mark`.
+    let mut z = session ^ 0x746F_702D_6D61_726B;
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// THE MARK'S SPRITE for a top rule composed from `key` into `top`
+/// (design §6.4): where the lockup laid its icon, the program's mark at the
+/// fit law's master and scale for the window's cell
+/// (`cli_marks::fit`), over its inks floored on the pane's ground, laid at
+/// the icon's first cell in grid pixels and clipped to the pane, over the
+/// glyphs (the card's kitty's slot) by the byte-exact law. Its content is
+/// the kept one for the mark, fit and ground (`marks`), so a key that moved
+/// the line alone (a resize) moves the layer and seals nothing. `None` where
+/// no icon is laid or no master fits the cell (the lockup keeps its blank
+/// cells).
+fn mark_layer(
+    key: &TopKey,
+    top: &ComposedTop,
+    session: u64,
+    marks: &mut MarkContents,
+) -> Option<aterm_core::render::FxLayer> {
+    let col = top.icon?;
+    let mark = cli_mark(key.program)?;
+    let (cw, ch) = key.cell;
+    let fit = aterm_effects::cli_marks::fit(mark, cw, ch)?;
+    let content = marks.content(mark, fit, crate::claude_card::pack(key.blank.bg));
+    let px = |cells: usize, side: u16| {
+        i32::try_from(cells)
+            .ok()
+            .and_then(|c| c.checked_mul(i32::from(side)))
+    };
+    Some(aterm_effects::cli_marks::layer(
+        top_mark_id(session),
+        content,
+        (px(col, cw)?, px(key.frame_row, ch)?),
+        key.clip,
+    ))
 }
 
 /// The words switch `b` paints over its switch and over its `on` button,
-/// glyphs aside (`claude harness off`, `on`): what its accessibility nodes'
+/// glyphs aside (`alab harness off`, `on`): what its accessibility nodes'
 /// names begin with (WCAG 2.5.3, `native_ui::visible_label_in_name`).
 /// Rebuilt from what the paint recorded, only where a screen reader asks.
 #[cfg(a11y_tree)]
 pub(crate) fn switch_words(b: &crate::claude_lights::BorderSwitch) -> (String, Option<String>) {
-    let word = match b.program {
-        aterm_phase::Program::Agy => "agy",
-        aterm_phase::Program::Muse => "muse",
-        _ => "claude",
-    };
     let paint = SwitchPaint {
         face: b.face,
-        branded: b.branded,
         hover: false,
     };
-    let Some(face) = switch_face(paint, word, b.tier) else {
+    let Some(face) = switch_face(paint, b.tier) else {
         return (String::new(), None);
     };
     let words = |range: &std::ops::Range<usize>| -> String {
@@ -5305,6 +8030,185 @@ fn render_agy_markdown_row(
     Some(out)
 }
 
+/// Whether Claude's mode pill is relabelled on this pane's glass
+/// (`footer::YOLO_ON`, `footer::YOLO_OFF`): on a Claude Code pane whose
+/// composer border aterm draws — `bordered`, the border's own predicate
+/// (`crate::autopilot::harness_theme` is some: Off's white included), as for
+/// [`compose_top`] and the agents panel. The ONE
+/// gate: where the border's predicate moves, this moves with it.
+fn relabels_pill(program: aterm_phase::Program, bordered: bool) -> bool {
+    program == aterm_phase::Program::Claude && bordered
+}
+
+/// The repaint key's term for a pane's harness theme: none, or which palette.
+fn theme_term(theme: Option<aterm_effects::harness_card::CardPalette>) -> u64 {
+    theme.map_or(0, |p| 1 + p as u64)
+}
+
+/// One relabelled pill ([`collect_pill_relabel`]): its cells, a range of
+/// the splice's shared buffer, written at `col` of `frame_row`, and the
+/// glass→grid shift its write leaves.
+struct RelabelWrite {
+    frame_row: usize,
+    col: usize,
+    cells: std::ops::Range<usize>,
+    ground: RenderCell,
+    shift: GlassShift,
+}
+
+/// One window row whose glass columns are not its grid's: Claude's pill
+/// relabelled, the run behind it packed left. In WINDOW columns of window
+/// terminal row `term_row` ([`footer::Relabel::grid_col`]'s map, moved by
+/// the pane's column).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct GlassShift {
+    term_row: usize,
+    /// The pane's column 0.
+    col_off: usize,
+    relabel: Option<footer::Relabel>,
+}
+
+impl GlassShift {
+    fn grid_col(&self, row: usize, col: usize) -> Option<usize> {
+        let relabel = self.relabel?;
+        if row != self.term_row || col < self.col_off {
+            return None;
+        }
+        Some(self.col_off + relabel.grid_col(col - self.col_off))
+    }
+}
+
+/// The most rows of shifted columns a window keeps: one per pane, for as
+/// many panes as share a window before the rest go unrelabelled.
+const GLASS_SHIFTS: usize = 8;
+
+/// Every row of a window's glass whose columns are not the grid's, as the
+/// last footer write left them: fixed, nothing allocated. Empty when nothing
+/// was relabelled, where every column is the grid's.
+#[derive(Debug, Default)]
+pub(crate) struct GlassColumns {
+    len: usize,
+    rows: [GlassShift; GLASS_SHIFTS],
+}
+
+impl GlassColumns {
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Keep `shift`; a window full of them keeps the first [`GLASS_SHIFTS`].
+    fn push(&mut self, shift: GlassShift) {
+        if let Some(slot) = self.rows.get_mut(self.len) {
+            *slot = shift;
+            self.len += 1;
+        }
+    }
+
+    /// The grid column under glass column `col` of window terminal row
+    /// `row`: `col` itself but on a relabelled row's packed run.
+    pub(crate) fn grid_col(&self, row: u16, col: u16) -> u16 {
+        self.rows[..self.len]
+            .iter()
+            .find_map(|s| s.grid_col(usize::from(row), usize::from(col)))
+            .and_then(|c| u16::try_from(c).ok())
+            .unwrap_or(col)
+    }
+}
+
+/// Collect the relabel of Claude's mode pill `relabel` under pane rows
+/// `rows`' bottom rule, as the pane's readings keep it
+/// (`footer::relabel_under`, read with the rule): `⏵⏵ bypass permissions
+/// on` reads `YOLO on`, `⏸ manual mode on` `YOLO off`, in Claude's own
+/// pill cells' style, and the row's left items after it packed left behind
+/// the label (`  YOLO on · 14 shells · ← for agents …`), the blanks they left
+/// at their run's end; a right-hand notice past the run's gap stays where
+/// Claude drew it. The edit is the footer write's, undone with it, and its
+/// cells go in `cells` (the splice's buffer: nothing allocated once grown).
+///
+/// Nothing is relabelled where the glass is not plainly the row's text: a
+/// chrome row over it (`chrome_owned`, by window terminal row), any
+/// selection in the window (its highlight is the grid's columns), the
+/// cursor on the row, a BiDi row (its column map is the original cells'), a
+/// cell of the span that is wide or asks a presentation, has a background
+/// of its own, or is not the char the row's text holds there; nor where
+/// the span holds a grapheme cluster, a combining mark or an image cell,
+/// which [`write_edits`] would skip. Whether it collected the write: the
+/// glass then reads `YOLO on`/`YOLO off`, and the mode light names the
+/// state the same way (`FooterPane::relabelled`, review C8) only then.
+#[allow(clippy::too_many_arguments)]
+fn collect_pill_relabel(
+    scratch: &RenderInput,
+    rows: &[String],
+    region: PaneTextRegion,
+    relabel: footer::Relabel,
+    chrome_owned: impl Fn(usize) -> bool,
+    blank: RenderCell,
+    out: &mut Vec<RelabelWrite>,
+    cells: &mut Vec<RenderCell>,
+) -> bool {
+    let term_row = region.row_off + relabel.row;
+    let frame_row = region.strip + term_row;
+    if relabel.run_end > region.cols
+        || chrome_owned(term_row)
+        || scratch.any_selection()
+        || (scratch.cursor_visible && scratch.cursor_row == frame_row)
+        || !scratch.visual_to_logical_row(frame_row).is_empty()
+    {
+        return false;
+    }
+    let from = region.col_off + relabel.start;
+    let written = from..region.col_off + relabel.run_end;
+    if touches(&scratch.clusters, frame_row, &written)
+        || touches(&scratch.combining, frame_row, &written)
+        || touches(&scratch.images, frame_row, &written)
+    {
+        return false;
+    }
+    let Some(span) = scratch
+        .cells
+        .get(frame_row)
+        .and_then(|row| row.get(written))
+    else {
+        return false;
+    };
+    // Plain: each cell the row's own char, narrow, asking no presentation;
+    // and the PILL's own cells on the pane's ground. The packed run's cells
+    // are moved with their own style, so Claude's highlight of an item —
+    // `inverse` on the one hovered (its mouse tracking reports the motion
+    // at Claude's column, `Relabel::grid_col`) or selected (`↓ to manage`)
+    // — moves with its text, and the row never snaps back under the
+    // pointer.
+    let text = rows[relabel.row].chars().skip(relabel.start);
+    let pill = relabel.end - relabel.start;
+    let plain = span.iter().zip(text).enumerate().all(|(k, (c, ch))| {
+        c.ch == ch
+            && !c.wide
+            && !c.emoji_presentation
+            && !c.text_presentation
+            && (k >= pill || c.bg == blank.bg)
+    });
+    if !plain || span.len() != relabel.run_end - relabel.start {
+        return false;
+    }
+    let style = span[relabel.words - relabel.start];
+    let at = cells.len();
+    cells.extend(relabel.label.chars().map(|ch| RenderCell { ch, ..style }));
+    cells.extend_from_slice(&span[relabel.end - relabel.start..]);
+    cells.extend(std::iter::repeat_n(blank, relabel.shift()));
+    out.push(RelabelWrite {
+        frame_row,
+        col: from,
+        cells: at..cells.len(),
+        ground: blank,
+        shift: GlassShift {
+            term_row,
+            col_off: region.col_off,
+            relabel: Some(relabel),
+        },
+    });
+    true
+}
+
 /// Collect glass-only undoable markdown edits for an `agy` or `muse` pane. Row
 /// text alone does not prove startup or tool-output provenance, so no transcript
 /// row is deleted as cruft. Fenced code is left literal; a viewport clipped
@@ -5539,6 +8443,18 @@ pub(crate) mod probe;
 #[path = "claude_footer_cost_tests.rs"]
 mod cost_tests;
 
+#[cfg(test)]
+#[path = "claude_footer_top_tests.rs"]
+mod top_tests;
+
+#[cfg(test)]
+#[path = "claude_footer_top_lines_tests.rs"]
+mod top_lines_tests;
+
+#[cfg(all(test, unix))]
+#[path = "claude_footer_yolo_tests.rs"]
+mod yolo_tests;
+
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 #[path = "claude_footer_registry_tests.rs"]
 mod registry_tests;
@@ -5660,40 +8576,29 @@ mod tests {
     use super::*;
 
     /// THE SWITCH'S FORMS ([`switch_face`], owner 2026-10-20: "there needs
-    /// to be an \"on\" button drawn for the claude harness"): one switch in
-    /// every state, its words given up before the switch — every off form
-    /// keeps `▐ on ▌`, and none wears the wordmark, branded or not — and the
-    /// fitter takes the widest form that leaves two rule cells either side.
+    /// to be an \"on\" button drawn for the claude harness"; 2026-10-21:
+    /// "alab harness on"): one switch in every state, naming the harness
+    /// alone — no program word, no wordmark — its words given up before the
+    /// switch, every off form keeping `▐ on ▌`; each narrowest form is as
+    /// wide as hb-int's (6, 8 and 6 cells), and the fitter takes the widest
+    /// form that leaves two rule cells either side.
     /// NEGATIVE CONTROL: a room one cell short of a form takes the next.
     #[test]
     fn the_switch_faces_give_words_up_before_the_switch() {
         use crate::autopilot::{HarnessSwitch, SwitchOff};
-        let paint = |face, branded| SwitchPaint {
-            face,
-            branded,
-            hover: false,
-        };
+        let paint = |face| SwitchPaint { face, hover: false };
         let faces = |p: SwitchPaint| -> Vec<SwitchFace> {
             (0..SWITCH_TIERS)
-                .filter_map(|t| switch_face(p, "claude", t))
+                .filter_map(|t| switch_face(p, t))
                 .collect()
         };
         let texts =
             |p: SwitchPaint| -> Vec<String> { faces(p).iter().map(SwitchFace::text).collect() };
         assert_eq!(
-            texts(paint(HarnessSwitch::On, true)),
+            texts(paint(HarnessSwitch::On)),
             [
-                " \u{2726} alab kitty \u{b7} claude harness \u{25cf} on ",
-                " \u{2726} alab \u{b7} claude \u{25cf} on ",
-                " claude \u{25cf} on ",
-                " \u{25cf} on ",
-            ]
-        );
-        assert_eq!(
-            texts(paint(HarnessSwitch::On, false)),
-            [
-                " claude harness \u{25cf} on ",
-                " claude \u{25cf} on ",
+                " alab harness \u{25cf} on ",
+                " alab \u{25cf} on ",
                 " \u{25cf} on "
             ]
         );
@@ -5702,60 +8607,75 @@ mod tests {
             SwitchOff::Master,
             SwitchOff::Agent(aterm_phase::Program::Claude),
         ] {
-            for branded in [false, true] {
-                let p = paint(HarnessSwitch::Off(off), branded);
-                assert_eq!(
-                    texts(p),
-                    [
-                        " claude harness \u{25cb} off \u{2590} on \u{258c} ",
-                        " claude \u{25cb} off \u{2590} on \u{258c} ",
-                        " \u{25cb} off \u{2590} on \u{258c} ",
-                        " \u{2590} on \u{258c} ",
-                    ],
-                    "{off:?} branded={branded}"
-                );
-                for f in faces(p) {
-                    let button = f.button.clone().expect("every off form has its button");
-                    let drawn: String = f.cells()[button].iter().map(|c| c.0).collect();
-                    assert_eq!(drawn, "\u{2590} on \u{258c}");
-                }
+            let p = paint(HarnessSwitch::Off(off));
+            assert_eq!(
+                texts(p),
+                [
+                    " alab harness \u{25cb} off \u{2590} on \u{258c} ",
+                    " alab \u{25cb} off \u{2590} on \u{258c} ",
+                    " \u{25cb} off \u{2590} on \u{258c} ",
+                    " \u{2590} on \u{258c} ",
+                ],
+                "{off:?}"
+            );
+            for f in faces(p) {
+                let button = f.button.clone().expect("every off form has its button");
+                let drawn: String = f.cells()[button].iter().map(|c| c.0).collect();
+                assert_eq!(drawn, "\u{2590} on \u{258c}");
             }
         }
         assert_eq!(
-            texts(paint(HarnessSwitch::Turning, false)),
+            texts(paint(HarnessSwitch::Turning)),
             [
-                " claude harness \u{25d0} turning on ",
-                " claude \u{25d0} turning on ",
+                " alab harness \u{25d0} turning on ",
+                " alab \u{25d0} turning on ",
                 " \u{25d0} turning on ",
                 " \u{25d0} on ",
             ]
         );
-        let off = paint(HarnessSwitch::Off(SwitchOff::Session), false);
+        for face in [
+            HarnessSwitch::On,
+            HarnessSwitch::Off(SwitchOff::Session),
+            HarnessSwitch::Turning,
+        ] {
+            for f in faces(paint(face)) {
+                assert!(f.len <= SWITCH_FACE_MAX, "{face:?}: {:?}", f.text());
+            }
+        }
+        let off = paint(HarnessSwitch::Off(SwitchOff::Session));
         for (tier, face) in faces(off).into_iter().enumerate() {
             let room = face.len + 4;
             assert_eq!(
-                fitted_switch_face(off, "claude", room).map(|(t, _)| t),
+                fitted_switch_face(off, room).map(|(t, _)| t),
                 Some(tier),
                 "{tier} fits its room"
             );
             assert_eq!(
-                fitted_switch_face(off, "claude", room - 1).map(|(t, _)| t),
+                fitted_switch_face(off, room - 1).map(|(t, _)| t),
                 (tier + 1 < SWITCH_TIERS).then_some(tier + 1),
                 "CONTROL: a cell short of {tier}"
             );
         }
     }
 
-    /// THE WORDMARK READS ON PAPER: every colour the composer rule's ` ✦ alab
-    /// kitty` letters can take (each spectrum stop before its dot) reads at
-    /// 4.5:1 or more against every light built-in's ground, a pure hue (one
-    /// channel at zero) as the card's line letters are; on a dark ground a
-    /// letter is the stop lifted a quarter toward the pane's ink, as before.
-    /// NEGATIVE CONTROL: that lift on a light ground leaves a letter under
-    /// 2:1, the washed-out wordmark.
+    /// THE SWITCH'S ARC READS ON PAPER: every colour a glyph of the harness
+    /// switch can take on a line that wears a theme (`SwitchInk::Arc`,
+    /// [`brand_letter_fg`]), in every theme the border wears (Cruise's
+    /// spectrum, Land's sunset, Off's moonbow), reads at 4.5:1 or more
+    /// against every light built-in's ground — a pure hue (one channel at
+    /// zero) as the card's line letters are under Cruise and Land, a silver
+    /// under Off; on a dark ground a letter is the palette's letter ink
+    /// lifted a quarter toward the pane's ink. The settling switch's glyphs
+    /// (`◐ turning on`, [`switch_cell`]'s `Turning` face, and the bare
+    /// switch's quieted accent) read at 4.5:1 or more on every built-in
+    /// ground, light or dark, each a quieted stop or the accent floored back
+    /// ([`turning_ink`]). NEGATIVE CONTROLS: that lift of the spectrum on a
+    /// light ground leaves a letter under 2:1, the washed-out switch; and the
+    /// quieting alone, unfloored, leaves a settling letter under 3:1 on paper.
     #[test]
-    fn the_wordmark_reads_on_paper() {
+    fn the_switch_arc_reads_on_paper() {
         use aterm_effects::color_math::relative_luminance;
+        use aterm_effects::harness_card::CardPalette;
         use aterm_types::scheme::{Appearance, builtin, builtin_names};
         let contrast = |a: [u8; 3], b: [u8; 3]| {
             let l = |c: [u8; 3]| relative_luminance(u32::from_be_bytes([0, c[0], c[1], c[2]]));
@@ -5763,7 +8683,12 @@ mod tests {
             (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
         };
         let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
-        let (mut light, mut washed) = (0, f32::MAX);
+        let px = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+        let (mut light, mut washed, mut quieted) = (0, f32::MAX, f32::MAX);
+        let turning = SwitchPaint {
+            face: crate::autopilot::HarnessSwitch::Turning,
+            hover: false,
+        };
         for name in builtin_names() {
             let Some(scheme) = builtin(name) else {
                 continue;
@@ -5773,26 +8698,62 @@ mod tests {
                 bg: rgb(scheme.background),
                 ..RenderCell::default()
             };
-            for stop in 0..255 {
-                let fg = brand_letter_fg(stop, blank);
-                let c = aterm_effects::spectrum::SPECTRUM_LUT[stop];
-                let lifted = mix([(c >> 16) as u8, (c >> 8) as u8, c as u8], blank.fg, 0.25);
-                if scheme.appearance == Appearance::Light {
-                    light += 1;
-                    let k = contrast(fg, blank.bg);
-                    assert!(k >= 4.5, "{name} stop {stop}: {fg:?} at {k:.2}:1");
-                    assert!(
-                        fg.contains(&0),
-                        "{name} stop {stop}: {fg:?} is not a pure hue"
+            // An accent of the theme's own: its blue.
+            let accent = rgb(scheme.ansi[4]);
+            let bare = switch_cell('\u{25d0}', SwitchInk::Turning, turning, None, blank, accent);
+            let k = contrast(bare.fg, blank.bg);
+            assert!(k >= 4.5, "{name}: the bare settling switch at {k:.2}:1");
+            for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
+                for stop in 0..255u8 {
+                    let t = f32::from(stop) / 255.0;
+                    let settling = switch_cell(
+                        't',
+                        SwitchInk::Arc(stop),
+                        turning,
+                        Some(palette),
+                        blank,
+                        accent,
                     );
-                    washed = washed.min(contrast(lifted, blank.bg));
-                } else {
-                    assert_eq!(fg, lifted, "{name} stop {stop}: dark as before");
+                    let k = contrast(settling.fg, blank.bg);
+                    assert!(
+                        k >= 4.5 && !settling.bold,
+                        "{name} {palette:?} settling at {t:.3}: {k:.2}:1"
+                    );
+                    if scheme.appearance == Appearance::Light {
+                        let raw = mix(brand_letter_fg(palette, t, blank), blank.bg, 0.3);
+                        quieted = quieted.min(contrast(raw, blank.bg));
+                    }
+                }
+                for stop in 0..255 {
+                    let t = stop as f32 / 254.0;
+                    let fg = brand_letter_fg(palette, t, blank);
+                    let what = format!("{name} {palette:?} at {t:.3}: {fg:?}");
+                    if scheme.appearance == Appearance::Light {
+                        light += 1;
+                        let k = contrast(fg, blank.bg);
+                        assert!(k >= 4.5, "{what} at {k:.2}:1");
+                        if palette == CardPalette::Off {
+                            let spread =
+                                fg.iter().max().unwrap_or(&0) - fg.iter().min().unwrap_or(&0);
+                            assert!(spread <= 32, "{what} is not a silver");
+                        } else {
+                            assert!(fg.contains(&0), "{what} is not a pure hue");
+                        }
+                        let c = aterm_effects::spectrum::SPECTRUM_LUT[stop];
+                        washed = washed.min(contrast(mix(px(c), blank.fg, 0.25), blank.bg));
+                    } else {
+                        assert_eq!(
+                            fg,
+                            mix(px(palette.letter(t, true)), blank.fg, 0.25),
+                            "{what}: dark, the palette's letter lifted"
+                        );
+                    }
                 }
             }
         }
-        assert!(light >= 7 * 255, "{light} light letters");
+        assert!(light >= 3 * 7 * 255, "{light} light letters");
         assert!(washed < 2.0, "CONTROL: {washed:.2}");
+        assert!(quieted < 3.0, "CONTROL: the quieting alone, {quieted:.2}");
     }
 
     /// THE FOOTER STANDS WHERE THE HOST SUPERVISES CLAUDE CODE OR AGY BY NAME:
@@ -5859,9 +8820,10 @@ mod tests {
     /// and the cell after them are blank — never a rule glyph, a title's
     /// word or a fact — and the chips always fit (main's other half: the gap
     /// never costs the chips their place). The widths are the rows' own:
-    /// Autopilot alone at rest (`∞`, 1 cell; `⤓ land`, 6), a light alone,
-    /// and Autopilot beside a light (`∞ ⏸ plan`, 8), each with the titles a
-    /// hover gives them (and wider rows still). The painted row, on the measured screen:
+    /// Autopilot at rest (`∞`, 1 cell; `⤓ land`, 6), a light alone (`⏸
+    /// plan`, 6) and beside Autopilot (`∞ ⏸ plan`, 8), and wider rows a
+    /// Team chip or a longer pill makes (3, 10, 14), each with the titles a
+    /// hover gives them. The painted row, on the measured screen:
     /// `claude_lights`'
     /// `the_effort_tail_stays_on_claudes_row_and_every_chip_stands_clear_in_the_rule`.
     #[test]
@@ -6219,7 +9181,7 @@ mod tests {
         let changed = cache.rows(0, 8, &scratch, full);
         assert_eq!(&changed[0], "zbcd");
         assert!(!Arc::ptr_eq(&other_session, &changed));
-        cache.retain_active(|index| index == 1, |_| false);
+        cache.retain_active(|index| index == 1, |_| false, |_| false);
         assert!(cache.panes[0].is_none());
         assert!(cache.panes[1].is_some());
         cache.trim(1);
@@ -6317,10 +9279,7 @@ mod tests {
             .split("   ")
             .map(|fact| {
                 let (mark, text) = fact.split_once(' ').expect("<mark> <text>");
-                footer::Segment {
-                    mark: mark.chars().next().expect("a mark"),
-                    text: text.to_owned(),
-                }
+                footer::Segment::plain(mark.chars().next().expect("a mark"), text)
             })
             .collect();
         footer::segments_width(&segments) + 2
@@ -6401,8 +9360,7 @@ mod tests {
         );
         // With a harness host, Autopilot stands at the rule's left end at
         // rest (owner, 2026-10-15), full size — Cruise's `∞` in the marks'
-        // accent itself, and no settings button beside it (owner,
-        // 2026-10-20) — the rule's glyphs run on to the owner's facts,
+        // accent itself — the rule's glyphs run on to the owner's facts,
         // unchanged at its right end.
         let harness = crate::claude_lights::Block::of_autopilot(
             crate::autopilot::AutopilotView::Cruise,
@@ -6464,6 +9422,122 @@ mod tests {
             "CONTROL: {}",
             cells.len()
         );
+    }
+
+    /// A LIT FACT'S UNDERLINE LIES UNDER ITS INK (lab, 2026-10-20: on the
+    /// model and the effort it sat about a glyph off the text, on the path it
+    /// ran two to three cells past it, the clicks landing right). On the
+    /// lab's line, the account and the weekly wall ahead of the model, each
+    /// glyph is drawn well off the cell it stands in; hovering each fact in
+    /// turn, the underline takes exactly the cells whose middles lie between
+    /// the left edge of the fact's first glyph and the right edge of its
+    /// last, as the painter places them (its cell plus its nudge), each in
+    /// the ink of the lit glyph drawn nearest it; the fact's glyphs are
+    /// lifted, and every other cell keeps its rest glyph and ink (a
+    /// neighbour's glyph under the underline included). NEGATIVE CONTROL: on
+    /// this line the cells the path's glyphs stand in start more than a cell
+    /// and a half left of its ink and end as far past it, so an underline on
+    /// the glyphs' own cells fails.
+    #[test]
+    fn a_lit_facts_underline_lies_under_its_ink() {
+        use aterm_core::terminal::{Script, UnderlineStyle};
+        let blank = cell(' ', [200, 200, 200]);
+        let rule = cell('\u{2500}', [60, 60, 60]);
+        let mark_fg = [0, 128, 255];
+        let fit = footer::RuleFit {
+            segments: vec![
+                footer::Segment::plain(footer::ACCOUNT_MARK, "account unavailable"),
+                footer::Segment::plain(footer::WEEKLY_MARK, "weekly unavailable"),
+                footer::Segment {
+                    split: Some("Opus 5.5 ".len()),
+                    ..footer::Segment::plain(footer::MODEL_MARK, "Opus 5.5 xhigh")
+                },
+                footer::Segment::plain(footer::PATH_MARK, "/private/tmp/at.SnYH/proj"),
+                footer::Segment::plain(footer::BRANCH_MARK, "main"),
+            ],
+            title: footer::TitleFit::None,
+            chips: false,
+        };
+        let room = 120;
+        let rest = compose_rule_spans(&fit, None, rule, blank, mark_fg, room, None);
+        assert!(
+            rest.cells
+                .iter()
+                .all(|c| c.underline == UnderlineStyle::None),
+            "CONTROL: nothing underlined at rest"
+        );
+        let step = 1.0 / f32::from(Script::NUDGES_PER_CELL);
+        for kind in [
+            FactKind::Model,
+            FactKind::Effort,
+            FactKind::Path,
+            FactKind::Branch,
+        ] {
+            let paint = compose_rule_spans(&fit, None, rule, blank, mark_fg, room, Some(kind));
+            let span = paint
+                .spans
+                .iter()
+                .flatten()
+                .find(|span| span.kind == kind)
+                .copied()
+                .expect("the fact is on the line");
+            let at = paint.facts_at + 1;
+            let own = at + usize::from(span.cells.0)..at + usize::from(span.cells.1);
+            // The fact's glyphs where the painter draws them.
+            let mut drawn: Vec<(f32, f32, [u8; 3])> = Vec::new();
+            for c in own.clone() {
+                let cell = paint.cells[c];
+                if cell.ch == ' ' {
+                    continue;
+                }
+                let Script::Sub { nudge } = cell.script else {
+                    panic!("{kind:?}: cell {c} is no set glyph");
+                };
+                let cols = if paint.cells.get(c + 1).is_some_and(|n| n.wide) {
+                    2.0
+                } else {
+                    1.0
+                };
+                let left = c as f32 + f32::from(nudge) * step;
+                drawn.push((left, left + cols, cell.fg));
+                assert_ne!(cell.fg, rest.cells[c].fg, "{kind:?}: cell {c} is lifted");
+            }
+            let left = drawn.iter().map(|d| d.0).fold(f32::MAX, f32::min);
+            let right = drawn.iter().map(|d| d.1).fold(f32::MIN, f32::max);
+            for (c, cell) in paint.cells.iter().enumerate() {
+                let middle = c as f32 + 0.5;
+                let under = (left..right).contains(&middle);
+                assert_eq!(
+                    cell.underline == UnderlineStyle::Single,
+                    under,
+                    "{kind:?}: cell {c} ({:?}), the ink {left}..{right}",
+                    cell.ch
+                );
+                if under {
+                    let nearest = drawn
+                        .iter()
+                        .min_by(|a, b| {
+                            let d = |g: &(f32, f32, [u8; 3])| ((g.0 + g.1) / 2.0 - middle).abs();
+                            d(a).total_cmp(&d(b))
+                        })
+                        .map(|g| g.2);
+                    assert_eq!(cell.underline_color, nearest, "{kind:?}: cell {c}'s ink");
+                }
+                if !own.contains(&c) {
+                    assert_eq!(
+                        (cell.ch, cell.fg, cell.script),
+                        (rest.cells[c].ch, rest.cells[c].fg, rest.cells[c].script),
+                        "{kind:?}: cell {c} is as at rest"
+                    );
+                }
+            }
+            if kind == FactKind::Path {
+                assert!(
+                    left - own.start as f32 > 1.5 && own.end as f32 - right > 1.5,
+                    "NEGATIVE CONTROL: the path's own cells {own:?} are not its ink {left}..{right}"
+                );
+            }
+        }
     }
 
     /// `⎆ <label>` stands between the model and the path, mark and label in their inks, whole
@@ -7368,6 +10442,198 @@ mod tests {
     }
 
     #[test]
+    fn a_muse_login_store_switch_drops_the_previous_accounts_card_facts() {
+        const PID: i32 = 4246;
+        let root = crate::test_scratch::process_root("footer-muse-account-switch");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        let store = home.join(".config/muse");
+        std::fs::create_dir_all(&store).unwrap();
+        let auth = store.join("auth.json");
+        let write_auth = |email: &str| {
+            std::fs::write(
+                &auth,
+                format!(
+                    r#"{{"providers":{{"meta":{{"mechanism":"oauth","user_email":"{email}"}}}}}}"#
+                ),
+            )
+            .unwrap()
+        };
+        write_auth("first@example.test");
+        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        {
+            let mut held = timeline.lock().unwrap();
+            held.note_foreground_group(PID);
+            held.set_program(PID, Some("muse".into()));
+            assert!(held.set_claude_footer(
+                PID,
+                None,
+                Some(FooterFacts {
+                    owner: Some(footer::FactsOwner {
+                        floor: None,
+                        session_id: format!("muse-{PID}"),
+                    }),
+                    subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
+                        email: Some("first@example.test".into()),
+                        plan: Some("Muse Code Max Usage".into()),
+                        weekly: Some("weekly 29% left".into()),
+                        weekly_reset: None,
+                    },),
+                    ..FooterFacts::default()
+                }),
+            ));
+        }
+        let mut identity = unread(PID, &root.join("claude"));
+        let mut tail = footer::TailCache::default();
+        let mut fold = footer::FooterCache::default();
+        let mut memo = RosterMemo::default();
+        let asks = Asks {
+            args: |_| {
+                let root = crate::test_scratch::process_root("footer-muse-account-switch");
+                Some(atpkg::caller_shell::ProcArgs {
+                    argv: vec!["muse".into()],
+                    env: vec![format!("HOME={}", root.join("home").display())],
+                    ..Default::default()
+                })
+            },
+            roster: || None,
+            home: scratch_home,
+            stored_login: |_, _, _| true,
+        };
+        let refresh = |identity: &mut Identity,
+                       tail: &mut footer::TailCache,
+                       fold: &mut footer::FooterCache,
+                       memo: &mut RosterMemo,
+                       now| {
+            let clock = footer::ReadClock {
+                read_at: std::time::UNIX_EPOCH,
+                now,
+                offset_at: &|_, _| Some(0),
+            };
+            resolve_facts_at_with_cwd(
+                &timeline,
+                identity,
+                tail,
+                fold,
+                memo,
+                (asks, |_| None),
+                &clock,
+            );
+            timeline
+                .lock()
+                .unwrap()
+                .claude_footer()
+                .and_then(|facts| facts.subscription.clone())
+                .unwrap()
+        };
+        const RESET: i64 = 1_792_947_600;
+        let first = refresh(&mut identity, &mut tail, &mut fold, &mut memo, RESET - 1);
+        assert_eq!(first.email.as_deref(), Some("first@example.test"));
+        assert_eq!(first.plan.as_deref(), Some("Muse Code Max Usage"));
+        assert_eq!(first.weekly.as_deref(), Some("weekly 29% left"));
+        // This is still A's window, before any switch. Its occurrence is
+        // placed once, remains valid before the deadline, then expires at
+        // it while the account and plan stand. The retained reset is what
+        // makes an unchanged card an expired observation, not a fresh one.
+        let clock = footer::ReadClock {
+            read_at: std::time::UNIX_EPOCH,
+            now: RESET - 1,
+            offset_at: &|_, _| Some(0),
+        };
+        let reset = aterm_agent::harness::profile::WeeklyReset {
+            words: "Oct 25 at 5:00 PM".into(),
+            at: muse_weekly_reset_at("Oct 25 at 5:00 PM", &clock),
+        };
+        assert_eq!(reset.at, Some(RESET));
+        {
+            let mut held = timeline.lock().unwrap();
+            let mut facts = held.claude_footer().cloned().expect("facts");
+            let sub = facts.subscription.as_mut().expect("subscription");
+            sub.weekly_reset = Some(reset.clone());
+            assert!(held.set_claude_footer(PID, None, Some(facts)));
+        }
+        let before = refresh(&mut identity, &mut tail, &mut fold, &mut memo, RESET - 1);
+        assert_eq!(before.weekly.as_deref(), Some("weekly 29% left"));
+        assert_eq!(before.weekly_reset.as_ref(), Some(&reset));
+        let expired = refresh(&mut identity, &mut tail, &mut fold, &mut memo, RESET);
+        assert_eq!(expired.email.as_deref(), Some("first@example.test"));
+        assert_eq!(expired.plan.as_deref(), Some("Muse Code Max Usage"));
+        assert_eq!(
+            (expired.weekly, expired.weekly_reset.as_ref()),
+            (None, Some(&reset)),
+            "expiry keeps the observation's occurrence, not its percentage"
+        );
+        // A relative reset is placed once; repeated reads cannot keep
+        // moving that occurrence an hour into the future.
+        let relative = aterm_agent::harness::profile::WeeklyReset {
+            words: "in 1 hour".into(),
+            at: muse_weekly_reset_at("in 1 hour", &clock),
+        };
+        let relative_at = RESET - 1 + 3600;
+        assert_eq!(relative.at, Some(relative_at));
+        {
+            let mut held = timeline.lock().unwrap();
+            let mut facts = held.claude_footer().cloned().unwrap();
+            let sub = facts.subscription.as_mut().unwrap();
+            sub.weekly = Some("weekly 29% left".into());
+            sub.weekly_reset = Some(relative.clone());
+            assert!(held.set_claude_footer(PID, None, Some(facts)));
+        }
+        let before = refresh(
+            &mut identity,
+            &mut tail,
+            &mut fold,
+            &mut memo,
+            relative_at - 1,
+        );
+        assert_eq!(before.weekly.as_deref(), Some("weekly 29% left"));
+        let expired = refresh(&mut identity, &mut tail, &mut fold, &mut memo, relative_at);
+        assert_eq!(
+            (expired.weekly, expired.weekly_reset),
+            (None, Some(relative))
+        );
+        // Unknown reset words retain their explicit lack of a placed
+        // occurrence: the clock cannot invent an expiry for them.
+        let unknown = aterm_agent::harness::profile::WeeklyReset {
+            words: "not a reset".into(),
+            at: muse_weekly_reset_at("not a reset", &clock),
+        };
+        assert_eq!(unknown.at, None);
+        {
+            let mut held = timeline.lock().unwrap();
+            let mut facts = held.claude_footer().cloned().unwrap();
+            let sub = facts.subscription.as_mut().unwrap();
+            sub.weekly = Some("weekly 29% left".into());
+            sub.weekly_reset = Some(unknown.clone());
+            assert!(held.set_claude_footer(PID, None, Some(facts)));
+        }
+        let kept = refresh(
+            &mut identity,
+            &mut tail,
+            &mut fold,
+            &mut memo,
+            relative_at + 60,
+        );
+        assert_eq!(kept.weekly.as_deref(), Some("weekly 29% left"));
+        assert_eq!(kept.weekly_reset, Some(unknown));
+        write_auth("second@example.test");
+        let second = refresh(
+            &mut identity,
+            &mut tail,
+            &mut fold,
+            &mut memo,
+            relative_at + 61,
+        );
+        assert_eq!(second.email.as_deref(), Some("second@example.test"));
+        assert_eq!(
+            (second.plan, second.weekly, second.weekly_reset),
+            (None, None, None),
+            "the previous account's tier, quota and reset cannot survive"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn subscription_requires_stored_auth_for_the_registered_image_and_directory() {
         const PID: i32 = 4245;
         const IMAGE: u64 = 1_790_607_848;
@@ -7795,6 +11061,131 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// THE SIDE RIDES BESIDE THE FACTS: a read publishes the absolute cwd
+    /// (the registry's, outside any repository: no root) and no traffic
+    /// before the session has a transcript; a read that moved nothing
+    /// republishes the SAME side, the facts unchanged, so nothing repaints;
+    /// and a new side on the timeline leaves the facts as they were (a
+    /// republish of them moves nothing). CONTROLS, each a new side: a
+    /// repository around the cwd names its root; a transcript, once folded,
+    /// brings its traffic; a moved cwd. A group not in front is neither
+    /// given a side nor shown one.
+    #[test]
+    fn the_side_rides_beside_the_facts() {
+        const PID: i32 = 4244;
+        const IMAGE: u64 = 1_790_607_848;
+        let (root, claude) = claude_home("footer-side", PID, IMAGE);
+        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        timeline.lock().unwrap().note_foreground_group(PID);
+        let asks = Asks {
+            args: |_| Some(args_of(&["HOME=/home/someone"])),
+            roster: || None,
+            home: scratch_home,
+            stored_login: |_, _, _| false,
+        };
+        let mut identity = unread(PID, &claude);
+        let (mut tail, mut fold, mut memo) = (
+            footer::TailCache::default(),
+            footer::FooterCache::default(),
+            RosterMemo::default(),
+        );
+        let mut read = || {
+            let (moved, ..) = resolve_into(
+                &timeline,
+                &mut identity,
+                &mut tail,
+                &mut fold,
+                &mut memo,
+                asks,
+            );
+            let timeline = timeline.lock().unwrap();
+            (
+                moved.is_some(),
+                Arc::clone(timeline.claude_side().expect("a side")),
+                timeline.claude_footer().cloned().expect("facts"),
+            )
+        };
+        let work = root.join("work");
+        let (moved, first, facts) = read();
+        assert!(moved, "the first facts");
+        assert_eq!(first.cwd.as_deref(), Some(work.as_path()));
+        assert_eq!(
+            (first.repo_root.as_ref(), first.traffic.as_ref()),
+            (None, None)
+        );
+        let (moved, again, same) = read();
+        assert!(!moved, "nothing moved: nothing repaints");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "the same side, not a rebuilt one"
+        );
+        assert_eq!(same, facts);
+        // A new side leaves the facts as they were: republishing them moves
+        // nothing.
+        {
+            let mut timeline = timeline.lock().unwrap();
+            timeline.set_claude_side(PID, Some(Arc::new(FactSide::default())));
+            assert_eq!(timeline.claude_footer(), Some(&facts));
+            assert!(!timeline.set_claude_footer(PID, None, Some(facts.clone())));
+            timeline.set_claude_side(PID, Some(Arc::clone(&first)));
+        }
+        // CONTROL: a repository around the cwd.
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        std::fs::write(work.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let (_, rooted, _) = read();
+        assert!(!Arc::ptr_eq(&first, &rooted));
+        assert_eq!(rooted.repo_root.as_deref(), Some(work.as_path()));
+        // CONTROL: a transcript, graphed once folded, and held while nothing
+        // moved.
+        std::fs::write(
+            super::rig::transcript_of(&root, &claude),
+            concat!(
+                r#"{"type":"assistant","timestamp":"2026-10-19T12:00:05Z","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":10,"output_tokens":7,"cache_read_input_tokens":990}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let (_, graphed, _) = read();
+        assert!(!Arc::ptr_eq(&rooted, &graphed));
+        let traffic = graphed.traffic.as_ref().expect("its traffic");
+        assert_eq!(
+            (traffic.totals, &*traffic.buckets),
+            ((1_000, 7), &[(1_000, 7)][..])
+        );
+        let (moved, held, _) = read();
+        assert!(
+            !moved && Arc::ptr_eq(&graphed, &held),
+            "held while nothing moved"
+        );
+        // CONTROL: a moved cwd.
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(
+            claude.join(format!("sessions/{PID}.json")),
+            format!(
+                r#"{{"pid":{PID},"sessionId":"{}","cwd":{},"startedAt":{},"version":"2.1.287"}}"#,
+                super::rig::SESSION_ID,
+                aterm_json::to_string(&elsewhere.display().to_string()).unwrap(),
+                IMAGE * 1000 + 684
+            ),
+        )
+        .unwrap();
+        let (_, moved_side, _) = read();
+        assert!(!Arc::ptr_eq(&held, &moved_side));
+        assert_eq!(moved_side.cwd.as_deref(), Some(elsewhere.as_path()));
+        // A group not in front: its side is not taken, and none is shown.
+        let mut timeline = timeline.lock().unwrap();
+        timeline.set_claude_side(PID + 1, Some(Arc::new(FactSide::default())));
+        assert!(Arc::ptr_eq(
+            timeline.claude_side().expect("still this group's"),
+            &moved_side
+        ));
+        timeline.note_foreground_group(PID + 1);
+        assert!(timeline.claude_side().is_none());
+        drop(timeline);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// THE LOGIN IS THE REGISTERED IMAGE'S. What the process was started with
     /// before Claude Code wrote its registry row may be a launcher's — a
     /// shim named `claude` that sets its variables and execs in place, the
@@ -7936,7 +11327,7 @@ mod tests {
         let mut s = engine_fill(4);
         let original = s.cells.clone();
         let painted = row_of("  \u{25C6} Opus 5.5 xhigh", [1, 1, 1]);
-        let chip = row_of("\u{221e} \u{2699}", [2, 2, 2]);
+        let chip = row_of("\u{221e} \u{23F8} plan", [2, 2, 2]);
         let ground = cell(' ', [0, 0, 0]);
         let edits = [(3, 0, &painted[..], ground), (2, 30, &chip[..], ground)];
         let mut slot = FooterUndo::default();
@@ -7965,11 +11356,12 @@ mod tests {
                 email: Some("jose\u{0301}👩‍💻@example.com".into()),
                 plan: Some("Pro".into()),
                 weekly: Some("weekly 29% left".into()),
+                weekly_reset: None,
             }),
             ..FooterFacts::default()
         };
         let fit = footer::fit_rule(&facts, 76, None);
-        let paint = compose_rule_spans(&fit, None, rule, blank, [0, 128, 255], 76);
+        let paint = compose_rule_spans(&fit, None, rule, blank, [0, 128, 255], 76, None);
         assert!(!paint.clusters.is_empty() && !paint.combining.is_empty());
         let mut scratch = engine_fill(3);
         scratch.cells[2] = vec![rule; 100];
@@ -8051,6 +11443,54 @@ mod tests {
         assert_eq!(s.row_rev, vec![100, 101, 102, 103]);
     }
 
+    /// THE PROGRAM'S CELLS UNDER THE GLASS (review G3,
+    /// [`FooterUndo::program_cells`]): read without writing, every row reads
+    /// in every column window what the undo puts back — a span over a row's
+    /// text as the text it covered, a span past a row's trimmed end as the
+    /// row ending where it ended — and nothing is allocated. A row whose
+    /// painted span a later splice covered reads as presented: the glass
+    /// there is no longer the footer's. NEGATIVE CONTROL: the presented rows
+    /// hold the glass's cells.
+    #[test]
+    fn the_program_cells_read_what_the_undo_puts_back() {
+        let mut s = engine_fill(4);
+        let original = s.cells.clone();
+        let ground = cell(' ', [0, 0, 0]);
+        let over = row_of("YOLO on", [1, 1, 1]);
+        let past = row_of("\u{25C6} Opus", [2, 2, 2]);
+        let slot = written(&mut s, vec![(1, 2, over, ground), (2, 20, past, ground)]);
+        let text = |cells: &mut dyn Iterator<Item = &RenderCell>| -> String {
+            cells.map(|c| c.ch).collect()
+        };
+        assert!(text(&mut s.cells[1].iter()).contains("YOLO on"), "CONTROL");
+        assert!(
+            text(&mut s.cells[2].iter()).ends_with("\u{25C6} Opus"),
+            "CONTROL"
+        );
+        for (row, engine) in original.iter().enumerate() {
+            for cols in [0..40, 0..5, 3..30, 25..40, 13..13] {
+                let want: String = engine
+                    .iter()
+                    .skip(cols.start)
+                    .take(cols.len())
+                    .map(|c| c.ch)
+                    .collect();
+                assert_eq!(
+                    text(&mut slot.program_cells(&s, row, cols.clone())),
+                    want,
+                    "row {row}, columns {cols:?}"
+                );
+            }
+        }
+        let (count, allocations) =
+            crate::work_counts::allocations_in(|| slot.program_cells(&s, 2, 0..40).count());
+        assert_eq!((count, allocations), (original[2].len(), 0));
+        // A later splice over the relabel's cells: the row as presented.
+        s.cells[1][3].ch = 'M';
+        let presented = text(&mut s.cells[1].iter());
+        assert_eq!(text(&mut slot.program_cells(&s, 1, 0..40)), presented);
+    }
+
     /// Anything else writing after the footer — or a refill that moved no
     /// token but changed the cells — and the undo changes nothing.
     #[test]
@@ -8089,7 +11529,7 @@ mod tests {
             s.cells[2] = vec![rule; 48];
             s
         };
-        let mut cells = row_of(" \u{221e} \u{2699} ", [2, 2, 2]);
+        let mut cells = row_of(" \u{221e} \u{23F8} plan ", [2, 2, 2]);
         let glass = cells.len()..cells.len() + 24;
         cells.extend(std::iter::repeat_n(rule, glass.len()));
         cells.extend(row_of(" Opus 5.5 ", [3, 3, 3]));
@@ -8363,6 +11803,14 @@ mod tests {
     /// One frame through the capture route's splices (the terminal arm of
     /// `App::render_image`): extract, the strip, then the footer.
     fn frame(app: &mut App, wid: WindowId) {
+        frame_with_clock(app, wid, None);
+    }
+
+    fn frame_with_clock(
+        app: &mut App,
+        wid: WindowId,
+        clock: Option<&dyn Fn() -> footer::ReadClock<'static>>,
+    ) {
         let prepared = app.prepare_terminal_capture_grid_with_cursor_fx_and_plan_outcome(
             wid,
             crate::app_render::ComposedCursorFxClock::Advance(std::time::Instant::now()),
@@ -8371,13 +11819,13 @@ mod tests {
             panic!("the headless capture must produce a frame");
         };
         app.splice_tab_strip(wid);
-        app.splice_claude_footer(
-            wid,
-            &plan,
-            VisibleContentRoute::Terminal {
-                composed: grid.composed,
-            },
-        );
+        let route = VisibleContentRoute::Terminal {
+            composed: grid.composed,
+        };
+        match clock {
+            Some(clock) => app.splice_claude_footer_at(wid, &plan, route, clock),
+            None => app.splice_claude_footer(wid, &plan, route),
+        }
     }
 
     fn glass(cols: u16) -> (App, WindowId, u64) {
@@ -9025,13 +12473,24 @@ mod tests {
 
     #[test]
     fn no_facts_keys_like_no_footer() {
-        assert_eq!(fingerprint(None, None, true), 0);
-        assert_ne!(fingerprint(Some(&facts()), None, false), 0);
+        let none = FactMask::default();
+        assert_eq!(fingerprint(None, None, true, none), 0);
+        assert_ne!(fingerprint(Some(&facts()), None, false, none), 0);
         let mut other = facts();
         other.branch = Some("feature".into());
         assert_ne!(
-            fingerprint(Some(&facts()), None, true),
-            fingerprint(Some(&other), None, true)
+            fingerprint(Some(&facts()), None, true, none),
+            fingerprint(Some(&other), None, true, none)
+        );
+        // A fact the person hid keys apart: its `off` is a repaint.
+        assert_ne!(
+            fingerprint(Some(&facts()), None, true, none),
+            fingerprint(
+                Some(&facts()),
+                None,
+                true,
+                none.with(FactKind::Branch, true)
+            )
         );
     }
 
@@ -9044,7 +12503,8 @@ mod tests {
             ..facts()
         };
         for usage in [true, false] {
-            let key = |facts: &FooterFacts| fingerprint(Some(facts), None, usage);
+            let key =
+                |facts: &FooterFacts| fingerprint(Some(facts), None, usage, FactMask::default());
             assert_ne!(key(&on("main")), key(&on("work-2")), "another account");
             assert_ne!(key(&on("main")), key(&facts()), "one where there was none");
             assert_eq!(key(&on("main")), key(&on("main")), "the same account");
@@ -9305,13 +12765,22 @@ mod tests {
         );
         let top_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 7]);
         assert!(
-            top_rule.contains("\u{2726} alab kitty \u{00B7} agy harness \u{25CF} on"),
-            "agy top rule has ALab rainbow kitty harness brand: {top_rule:?}"
+            top_rule.starts_with("\u{2500}\u{2500}    agy \u{2500}")
+                && top_rule.contains(" alab harness \u{25CF} on "),
+            "agy top rule has its lockup and the harness switch: {top_rule:?}"
+        );
+        assert!(
+            app.windows[&wid]
+                .claude_card
+                .painted_layers()
+                .iter()
+                .any(|l| l.id == top_mark_id(session) && !l.content.items().is_empty()),
+            "agy's icon drawn over its lockup's cells"
         );
         let bottom_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom_rule.contains('\u{221E}') && !bottom_rule.contains('\u{2699}'),
-            "agy composer rule has the autopilot chip and no settings button: {bottom_rule:?}"
+            bottom_rule.contains('\u{221E}'),
+            "agy composer rule has the autopilot chip: {bottom_rule:?}"
         );
         assert!(
             bottom_rule
@@ -9501,13 +12970,22 @@ mod tests {
         );
         let top_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 3]);
         assert!(
-            top_rule.contains("\u{2726} alab kitty \u{00B7} muse harness \u{25CF} on"),
-            "muse top rule has ALab rainbow kitty harness brand: {top_rule:?}"
+            top_rule.starts_with("\u{2500}\u{2500}    muse \u{2500}")
+                && top_rule.contains(" alab harness \u{25CF} on "),
+            "muse top rule has its lockup and the harness switch: {top_rule:?}"
+        );
+        assert!(
+            app.windows[&wid]
+                .claude_card
+                .painted_layers()
+                .iter()
+                .any(|l| l.id == top_mark_id(session) && !l.content.items().is_empty()),
+            "muse's icon drawn over its lockup's cells"
         );
         let bottom_rule = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
         assert!(
-            bottom_rule.contains('\u{221E}') && !bottom_rule.contains('\u{2699}'),
-            "muse composer rule has the autopilot chip and no settings button: {bottom_rule:?}"
+            bottom_rule.contains('\u{221E}'),
+            "muse composer rule has the autopilot chip: {bottom_rule:?}"
         );
         assert!(
             bottom_rule.contains("\u{25C6} gpt-5.4 high   \u{2302} ~/aterm   \u{2387} main"),
@@ -9517,15 +12995,27 @@ mod tests {
     }
 
     /// MUSE CODE'S SIGNED-IN CARDS POPULATE THE FOOTER (owner, 2026-10-21;
-    /// measured on 1.4.11 signed in): with a `/status` and a `/usage` card
-    /// over the composer the bottom rule names the account, its tier and
-    /// `weekly 29% left` — not `account unavailable` / `weekly
-    /// unavailable` — and the top rule's branding stands where its idle
+    /// measured on 1.4.11 signed in): the login store has given the
+    /// account address, and a `/usage` card alone over the composer fills
+    /// its tier and `weekly 29% left` beside it — `/status` need not be
+    /// opened first — while the top rule's lockup stands where its idle
     /// `Voice input` label was. CONTROL: the same pane before any card
-    /// shows the unavailable words and keeps them.
+    /// shows the address with `weekly unavailable` and keeps it.
     #[test]
     fn muse_signed_in_cards_populate_the_footer() {
         let (mut app, wid, session) = glass(160);
+        const RESET: i64 = 1_792_947_600;
+        let now = std::cell::Cell::new(RESET - 1);
+        let clock_reads = std::cell::Cell::new(0usize);
+        let clock = || {
+            clock_reads.set(clock_reads.get() + 1);
+            footer::ReadClock {
+                read_at: std::time::UNIX_EPOCH,
+                now: now.get(),
+                offset_at: &|_, _| Some(0),
+            }
+        };
+        let frame = |app: &mut App, wid| frame_with_clock(app, wid, Some(&clock));
         {
             let entry = app.pool.get(session).expect("session");
             let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -9543,12 +13033,14 @@ mod tests {
                         floor: None,
                         session_id: "muse-6161".into(),
                     }),
-                    subscription: Some(
-                        aterm_agent::harness::profile::SubscriptionDisplay::default(),
-                    ),
+                    subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
+                        email: Some("redacted-user@example.test".into()),
+                        ..Default::default()
+                    },),
                     ..FooterFacts::default()
                 }),
             ));
+            assert!(!timeline.muse_cards_need_account());
         }
         let host = crate::harness_host::HostHandle::for_supervised_test(
             Vec::new(),
@@ -9585,20 +13077,217 @@ mod tests {
         let strip = strip(&app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
         assert!(
-            bottom.contains("account unavailable") && bottom.contains("weekly unavailable"),
+            bottom.contains("redacted-user@example.test") && bottom.contains("weekly unavailable"),
             "CONTROL: no card shown yet: {bottom:?}"
         );
 
-        let carded = vec![
+        let mut carded = vec![
             String::new(),
             "  Muse Code 0.9.3".into(),
-            "\u{250C}".to_owned() + &"\u{2500}".repeat(80) + "\u{2510}",
-            "\u{2502}  MUSE CODE 0.9.3                                                    IDLE \u{2502}".into(),
-            "\u{2502}  ACCOUNT        Redacted User (redacted-user@example.test)              \u{2502}".into(),
-            "\u{2502}  BILLING        Subscription \u{00B7} Muse Code Max Usage                     \u{2502}".into(),
-            "\u{2514}".to_owned() + &"\u{2500}".repeat(80) + "\u{2518}",
             "\u{250C}".to_owned() + &"\u{2500}".repeat(55) + "\u{2510}",
             "\u{2502}  Session usage                                        \u{2502}".into(),
+            "\u{2502}  Subscription \u{00B7} Muse Code Max Usage                   \u{2502}".into(),
+            "\u{2502}    Weekly         71% used \u{00B7} Resets Oct 25 at 5:00 PM \u{2502}".into(),
+            "\u{2514}".to_owned() + &"\u{2500}".repeat(55) + "\u{2518}",
+            labelled.clone(),
+            "\u{276F} ".into(),
+            rule.clone(),
+            footer_row.into(),
+        ];
+        feed_rows(&app, session, &carded);
+        frame(&mut app, wid);
+        // The reading is written back for the next compose.
+        frame(&mut app, wid);
+        let top = text_of(&app.windows[&wid].input_scratch.cells[strip + 7]);
+        assert!(
+            !top.contains("Voice input") && top.starts_with("\u{2500}\u{2500}    muse \u{2500}"),
+            "the lockup at the top rule's left, where its idle label was: {top:?}"
+        );
+        let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
+        assert!(
+            bottom.contains("redacted-user@example.test")
+                && bottom.contains("Muse Code Max Usage")
+                && bottom.contains("weekly 29% left")
+                && !bottom.contains("unavailable"),
+            "the usage card populates its tier and weekly beside the account: {bottom:?}"
+        );
+        // Even before a switch, an account-bearing status without its own
+        // billing row cannot borrow a separate card's plan. Usage-only
+        // bootstrap is distinct from filling a known status card's holes.
+        let mut account_only = carded.clone();
+        let status = vec![
+            "┌".to_owned() + &"─".repeat(83) + "┐",
+            format!("│{:<83}│", "  MUSE CODE 1.4.11 / first-session IDLE"),
+            format!(
+                "│{:<83}│",
+                "  ACCOUNT        Redacted User (redacted-user@example.test)"
+            ),
+            "└".to_owned() + &"─".repeat(83) + "┘",
+        ];
+        drop(account_only.splice(7..7, status));
+        let account_only_bottom = strip + account_only.len() - 2;
+        feed_rows(&app, session, &account_only);
+        frame(&mut app, wid);
+        frame(&mut app, wid);
+        let bottom = text_of(&app.windows[&wid].input_scratch.cells[account_only_bottom]);
+        assert!(
+            bottom.contains("redacted-user@example.test")
+                && !bottom.contains("Muse Code Max Usage"),
+            "a named status card cannot borrow another card's plan: {bottom:?}"
+        );
+        feed_rows(&app, session, &carded);
+        frame(&mut app, wid);
+        frame(&mut app, wid);
+        let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
+        assert!(
+            bottom.contains("Muse Code Max Usage") && bottom.contains("weekly 29% left"),
+            "usage-only bootstrap remains available before any switch: {bottom:?}"
+        );
+        let already_read = clock_reads.get();
+        frame(&mut app, wid);
+        assert_eq!(
+            clock_reads.get(),
+            already_read,
+            "a settled reset does not read the clock again"
+        );
+        // The actual resolver expires this SAME occurrence at its bound.
+        // All external reads are inert: no registry directory, exec args,
+        // roster, home or process-directory probe is supplied.
+        now.set(RESET);
+        let timeline = &app.pool.get(session).expect("session").ctx.timeline;
+        let mut identity = unread(6161, std::path::Path::new("unused"));
+        identity.dir = None;
+        resolve_facts_at_with_cwd(
+            timeline,
+            &mut identity,
+            &mut footer::TailCache::default(),
+            &mut footer::FooterCache::default(),
+            &mut RosterMemo::default(),
+            (
+                Asks {
+                    args: |_| None,
+                    roster: || None,
+                    home: || None,
+                    stored_login: |_, _, _| false,
+                },
+                |_| None,
+            ),
+            &footer::ReadClock {
+                read_at: std::time::UNIX_EPOCH,
+                now: now.get(),
+                offset_at: &|_, _| Some(0),
+            },
+        );
+        {
+            let held = timeline.lock().unwrap();
+            let sub = held.claude_footer().unwrap().subscription.as_ref().unwrap();
+            assert!(sub.weekly.is_none());
+            assert_eq!(
+                sub.weekly_reset.as_ref().and_then(|reset| reset.at),
+                Some(RESET)
+            );
+        }
+        // No new terminal output: both reusing the pane and rebuilding it
+        // must respect the retained expiry, not import the old card again.
+        frame(&mut app, wid);
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .claude_footer_texts
+            .borrow_mut()
+            .trim(0);
+        frame(&mut app, wid);
+        let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
+        assert!(
+            bottom.contains("redacted-user@example.test")
+                && bottom.contains("weekly unavailable")
+                && !bottom.contains("weekly 29% left"),
+            "an unchanged expired card cannot graft its quota again: {bottom:?}"
+        );
+        assert_eq!(
+            clock_reads.get(),
+            already_read,
+            "expiry tombstones need no frame clock"
+        );
+        // A genuinely later reset is a new observation, admitted normally
+        // while the account still stands. Its quota must then be revoked
+        // by the known switch below, along with the reset occurrence.
+        carded[5] = carded[5].replace("Oct 25", "Oct 26");
+        feed_rows(&app, session, &carded);
+        frame(&mut app, wid);
+        frame(&mut app, wid);
+        let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
+        assert!(
+            bottom.contains("weekly 29% left"),
+            "a new window is admitted: {bottom:?}"
+        );
+        // A login-store switch in the same process. Publication must drop
+        // unattributed fields even if a caller carries the previous tuple;
+        // the first account's cards still on the glass cannot refill them.
+        {
+            let entry = app.pool.get(session).expect("session");
+            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            let mut facts = timeline.claude_footer().cloned().expect("facts");
+            facts.subscription.as_mut().expect("subscription").email =
+                Some("second@example.test".into());
+            assert!(timeline.set_claude_footer(6161, None, Some(facts)));
+            assert!(timeline.muse_cards_need_account());
+            let sub = timeline
+                .claude_footer()
+                .unwrap()
+                .subscription
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                (&sub.plan, &sub.weekly, &sub.weekly_reset),
+                (&None, &None, &None)
+            );
+        }
+        // The usage-only card is STILL the first account's, even though it
+        // has no address for the mismatch guard to compare. No terminal
+        // output is needed to expose the account change.
+        frame(&mut app, wid);
+        frame(&mut app, wid);
+        let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
+        assert!(
+            bottom.contains("second@example.test")
+                && bottom.contains("weekly unavailable")
+                && !bottom.contains("Muse Code Max Usage")
+                && !bottom.contains("weekly 29% left"),
+            "anonymous old usage cannot be attributed to the new login: {bottom:?}"
+        );
+        // Neither forgetting a pane's cache nor unrelated new terminal
+        // text supplies the missing account provenance.
+        app.windows
+            .get_mut(&wid)
+            .expect("window")
+            .claude_footer_texts
+            .borrow_mut()
+            .trim(0);
+        let mut rebuilt = carded.clone();
+        rebuilt[10] = "  gpt-5.4 · high · ~/other · Auto-review".into();
+        feed_rows(&app, session, &rebuilt);
+        frame(&mut app, wid);
+        frame(&mut app, wid);
+        let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
+        assert!(
+            bottom.contains("second@example.test")
+                && bottom.contains("weekly unavailable")
+                && !bottom.contains("Muse Code Max Usage")
+                && !bottom.contains("weekly 29% left"),
+            "a new pane/text generation cannot reattribute the old card: {bottom:?}"
+        );
+        let stale = vec![
+            String::new(),
+            "  Muse Code 0.9.3".into(),
+            "\u{250C}".to_owned() + &"\u{2500}".repeat(83) + "\u{2510}",
+            "\u{2502}  MUSE CODE 1.4.11 / redacted-session                                            IDLE \u{2502}".into(),
+            "\u{2502}  ACCOUNT        Redacted User (redacted-user@example.test)                          \u{2502}".into(),
+            "\u{2502}  BILLING        Subscription \u{00B7} Muse Code Max Usage                                  \u{2502}".into(),
+            "\u{2514}".to_owned() + &"\u{2500}".repeat(83) + "\u{2518}",
+            "\u{250C}".to_owned() + &"\u{2500}".repeat(55) + "\u{2510}",
+            "\u{2502}  Session usage                                        \u{2502}".into(),
+            "\u{2502}  Subscription \u{00B7} Muse Code Max Usage                   \u{2502}".into(),
             "\u{2502}    Weekly         71% used \u{00B7} Resets Oct 25 at 5:00 PM \u{2502}".into(),
             "\u{2514}".to_owned() + &"\u{2500}".repeat(55) + "\u{2518}",
             labelled,
@@ -9606,22 +13295,50 @@ mod tests {
             rule,
             footer_row.into(),
         ];
-        feed_rows(&app, session, &carded);
+        let stale_bottom_row = strip + stale.len() - 2;
+        feed_rows(&app, session, &stale);
         frame(&mut app, wid);
-        // The reading is written back for the next compose.
         frame(&mut app, wid);
-        let top = text_of(&app.windows[&wid].input_scratch.cells[strip + 11]);
+        let bottom = text_of(&app.windows[&wid].input_scratch.cells[stale_bottom_row]);
         assert!(
-            !top.contains("Voice input") && top.contains("\u{25C6} muse"),
-            "the branded top rule: {top:?}"
+            bottom.contains("second@example.test")
+                && bottom.contains("weekly unavailable")
+                && !bottom.contains("redacted-user@example.test")
+                && !bottom.contains("weekly 29% left"),
+            "the previous account's cards stay historical after a switch: {bottom:?}"
         );
-        let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 13]);
+        // A matching account-bearing card supplies its OWN plan, but the
+        // separate old usage card below it still names no account. Even
+        // matching status glass cannot attach that anonymous quota to B.
+        let mut current = stale.clone();
+        current[4] = format!(
+            "│{:<83}│",
+            "  ACCOUNT        Second User (second@example.test)"
+        );
+        current[5] = format!("│{:<83}│", "  BILLING        Subscription · Muse Code Pro");
+        feed_rows(&app, session, &current);
+        frame(&mut app, wid);
+        frame(&mut app, wid);
+        let bottom = text_of(&app.windows[&wid].input_scratch.cells[stale_bottom_row]);
         assert!(
-            bottom.contains("redacted-user@example.test")
-                && bottom.contains("weekly 29% left")
-                && !bottom.contains("unavailable"),
-            "the cards populate account and weekly: {bottom:?}"
+            bottom.contains("second@example.test")
+                && bottom.contains("Muse Code Pro")
+                && bottom.contains("weekly unavailable")
+                && !bottom.contains("Muse Code Max Usage")
+                && !bottom.contains("weekly 29% left"),
+            "only the matching status card's own fields are attributable: {bottom:?}"
         );
+        {
+            let entry = app.pool.get(session).expect("session");
+            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            assert!(timeline.clear_claude_footer());
+            timeline.note_foreground_group(6162);
+            timeline.set_program(6162, Some("muse".into()));
+            assert!(
+                timeline.muse_cards_need_account(),
+                "clearing facts and changing process cannot clear surviving old glass"
+            );
+        }
         host.shutdown_and_join();
     }
 
@@ -9957,8 +13674,14 @@ mod tests {
         );
     }
 
+    /// THE SINGLE TOGGLE TURNS THE HARNESS WHITE AND BACK, for Claude Code,
+    /// agy and Muse Code: Off (one call, the running session's) takes the
+    /// harness's hands off — agy's transcript goes back to its raw cells —
+    /// and turns its glass white: the composer's switch says `○ off` and the
+    /// launch card says `autopilot ○ off`; the same call again is Cruise,
+    /// the switch `● on` and the card Cruise's.
     #[test]
-    fn single_toggle_switch_disables_and_reenables_entire_harness_for_claude_agy_and_muse() {
+    fn single_toggle_turns_the_harness_white_and_back_for_claude_agy_and_muse() {
         let rule = "\u{2500}".repeat(160);
         let claude_fixture = vec![
             String::new(),
@@ -10055,17 +13778,13 @@ mod tests {
             frame(&mut app, wid);
 
             let strip = strip(&app, wid);
-            let expected_left_logo = match prog {
-                "claude" => "\u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259C}\u{258C} claude",
-                "agy" => "\u{2584}\u{2580}\u{2580}\u{2584} agy",
-                "muse" => "\u{25C6} muse",
-                _ => unreachable!(),
-            };
-            let expected_badge = format!("\u{2726} alab kitty \u{00B7} {prog} harness \u{25CF} on");
+            // The lockup: two `─`, the icon's pads and cells, the CLI's name.
+            let expected_lockup = format!("\u{2500}\u{2500}    {prog} \u{2500}");
+            let expected_switch = " alab harness \u{25CF} on ";
             let top_on = text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
             assert!(
-                top_on.contains(expected_left_logo) && top_on.contains(&expected_badge),
-                "{prog}: active harness brands composer top rule with left tool logo and right toggle: {top_on:?}"
+                top_on.starts_with(&expected_lockup) && top_on.contains(expected_switch),
+                "{prog}: active harness lays the lockup at the top rule's left and the switch at its right: {top_on:?}"
             );
             let bottom_on =
                 text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row + 2]);
@@ -10083,19 +13802,25 @@ mod tests {
                 );
             }
             if prog == "muse" {
+                // Muse Code's idle voice label gives way to the lockup on
+                // the glass (owner, 2026-10-21), so it stands at the rule's
+                // left as Claude's and agy's do: `starts_with` above.
                 assert!(
                     !top_on.contains("Voice input"),
-                    "muse: the branded top rule takes the idle voice label's cells: {top_on:?}"
+                    "muse: the lockup takes the idle voice label's cells: {top_on:?}"
                 );
-                let diamond = app.windows[&wid].input_scratch.cells[strip + top_rule_row]
-                    .iter()
-                    .find(|c| c.ch == '\u{25C6}')
-                    .expect("the muse diamond");
-                assert!(
-                    diamond.fg[2] > 150 && diamond.fg[0] < 80,
-                    "muse: the diamond is Meta blue, not purple: {:?}",
-                    diamond.fg
-                );
+                let row = &app.windows[&wid].input_scratch.cells[strip + top_rule_row];
+                let at = row
+                    .windows(4)
+                    .position(|w| w.iter().map(|c| c.ch).eq("muse".chars()))
+                    .expect("the muse word");
+                for letter in &row[at..at + 4] {
+                    assert!(
+                        letter.fg[2] > 150 && letter.fg[0] < 80,
+                        "muse: the name is Meta blue, not purple: {:?}",
+                        letter.fg
+                    );
+                }
             }
             let card_on = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);
             assert!(
@@ -10123,13 +13848,17 @@ mod tests {
 
             let top_off = text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
             assert!(
-                !top_off.contains("alab kitty"),
-                "{prog}: toggled-off harness restores raw top rule: {top_off:?}"
+                top_off.contains(" alab harness \u{25CB} off \u{2590} on \u{258C} ")
+                    && top_off.starts_with(&expected_lockup)
+                    && !top_off.contains("alab kitty"),
+                "{prog}: toggled-off harness draws its off switch, `on` its button, on the \
+                 white top rule, the lockup still at its left and no wordmark: {top_off:?}"
             );
             let card_off = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);
             assert!(
-                !card_off.contains("enhanced by aterm harness"),
-                "{prog}: toggled-off harness removes launch card banner: {card_off:?}"
+                card_off.contains("enhanced by aterm harness")
+                    && card_off.contains("autopilot \u{25CB} off"),
+                "{prog}: toggled-off harness wears the white card: {card_off:?}"
             );
             if prog == "agy" {
                 let raw_md = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
@@ -10152,7 +13881,7 @@ mod tests {
             let top_reenabled =
                 text_of(&app.windows[&wid].input_scratch.cells[strip + top_rule_row]);
             assert!(
-                top_reenabled.contains(&expected_badge),
+                top_reenabled.contains(expected_switch),
                 "{prog}: re-enabled harness restores composer top rule branding: {top_reenabled:?}"
             );
             let card_reenabled = text_of(&app.windows[&wid].input_scratch.cells[strip + card_row]);
@@ -10161,8 +13890,8 @@ mod tests {
                 "{prog}: re-enabled harness restores launch card banner: {card_reenabled:?}"
             );
 
-            // Verify border_toggles remains registered in both On and Off states so
-            // clicking the top-right badge position can toggle On -> Off and Off -> On.
+            // The switch stays registered in both On and Off states, so a
+            // click on it turns the harness off and on again.
             assert!(
                 !app.windows[&wid].claude_lights.border_toggles.is_empty(),
                 "{prog}: border_toggles registered when On"
@@ -10171,11 +13900,325 @@ mod tests {
             frame(&mut app, wid);
             assert!(
                 !app.windows[&wid].claude_lights.border_toggles.is_empty(),
-                "{prog}: border_toggles still registered when Off so top-right click can re-enable"
+                "{prog}: border_toggles still registered when Off, so its `on` turns it back on"
             );
 
             host.shutdown_and_join();
         }
+    }
+
+    /// THE COMPOSER BORDER WEARS THE CARD'S PALETTE (owner, 2026-10-19: "I
+    /// want a white themed for 'off' and that this theme is incorporated into
+    /// the persistent harness border"; 2026-10-21: "alab harness on" in
+    /// rainbow): Cruise's rule runs the spectrum's whole arc BACKWARD over
+    /// the gap between the lockup and the switch — `t = 1` at the lockup down
+    /// to `t = 0` at the switch, whose glyphs walk it forward again — its
+    /// lead and tail at `t = 1`, so true blue shows in the gap; Land's is the
+    /// sunset, warm in every cell; Off's is the moonbow, near neutral in
+    /// every cell, its switch saying `○ off` with its `on` button and no
+    /// wordmark (owner, 2026-10-20), as white with its claim given back (the
+    /// real host's Off) as with it — and a press on that switch turns the
+    /// harness back on (Cruise). With the card switched off, a claim landing
+    /// moves the footer's repaint key (the border's theme, folded in:
+    /// nothing else in it reads the claim then) and the border follows. On a
+    /// light ground the switch's letters and the lockup's name are legible
+    /// ink, and Off's state reads too. NEGATIVE CONTROLS: the old reading of
+    /// the spectrum (`SPECTRUM_LUT[i * 255 / n]`, half of its 511 entries)
+    /// never reaches blue or violet, and its letters on paper are too pale
+    /// to read; Cruise's run is not warm; an unclaimed Cruise is bare, its
+    /// rule untinted; and under the master switch off, the word Off draws
+    /// the bare off switch, no wordmark. (The seam between the gap and the
+    /// switch, and its control, are `top_tests::the_rule_flows_into_the_switch`.)
+    #[test]
+    fn the_composer_border_wears_the_cards_palette() {
+        use aterm_agent::supervise::Autopilot;
+        let rule = "\u{2500}".repeat(120);
+        let rows: Vec<String> = vec![
+            String::new(),
+            " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259C}\u{258C}   Claude Code v2.1.92".into(),
+            "\u{259D}\u{259C}\u{2588}\u{2588}\u{2588}\u{2588}\u{2588}\u{259B}\u{2598}  Opus 4.6 \u{00B7} Claude Max".into(),
+            "  \u{2598}\u{2598} \u{259D}\u{259D}    ~/aterm".into(),
+            String::new(),
+            rule.clone(),
+            "\u{276F} ".into(),
+            rule,
+            "  \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle)".into(),
+        ];
+        let (mut app, wid, session) = glass(120);
+        {
+            let entry = app.pool.get(session).expect("session");
+            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline.note_foreground_group(7000);
+            timeline.set_program(7000, Some("claude".into()));
+            assert!(timeline.set_claude_footer(
+                7000,
+                None,
+                Some(FooterFacts {
+                    model_open: true,
+                    effort_open: true,
+                    path: Some("~/aterm".into()),
+                    branch: Some("main".into()),
+                    owner: Some(footer::FactsOwner {
+                        floor: None,
+                        session_id: "claude-7000".into(),
+                    }),
+                    ..FooterFacts::default()
+                }),
+            ));
+        }
+        let host = crate::harness_host::HostHandle::for_supervised_test(
+            Vec::new(),
+            std::sync::Arc::new(|_| crate::harness_host::BodyEnd::Stopped),
+        );
+        app.harness = Some(host.clone());
+        let ctx = app.pool.get(session).expect("session").ctx.clone();
+        let claim = || {
+            crate::session_timeline::claim_supervisor(
+                &ctx,
+                &crate::harness_host::holder(),
+                None,
+                None,
+                crate::metrics::now_us(),
+            )
+            .expect("claim");
+        };
+        let release = || {
+            crate::session_timeline::release_supervisor(
+                &ctx,
+                None,
+                crate::metrics::now_us(),
+                aterm_slog::Actor::Ctl,
+            );
+        };
+        feed_rows(&app, session, &rows);
+        // The rule's run under `word`: its `─` cells' inks, and its text.
+        let under = |app: &mut App, word: Autopilot| {
+            app.set_session_autopilot(session, Some(word), crate::autopilot::Surface::Chip);
+            frame(app, wid);
+            let top = strip(app, wid) + 5;
+            let cells = &app.windows[&wid].input_scratch.cells[top];
+            let run: Vec<[u8; 3]> = cells
+                .iter()
+                .filter(|c| c.ch == '\u{2500}')
+                .map(|c| c.fg)
+                .collect();
+            (run, text_of(cells))
+        };
+
+        // The card switched off, Cruise without the claim: bare. The claim
+        // landing moves the key, and the border follows.
+        app.config.claude_footer = Some(crate::app_config::ClaudeFooterConfig {
+            card: Some(false),
+            ..Default::default()
+        });
+        let (bare, text) = under(&mut app, Autopilot::Cruise);
+        assert!(
+            bare.windows(2).all(|w| w[0] == w[1]) && !text.contains("alab kitty"),
+            "CONTROL: unclaimed bare, the rule untinted: {text:?}"
+        );
+        let plan = app.active_visible_leaf_plan(wid).expect("plan");
+        let unclaimed = app.claude_footer_fp(wid, &plan);
+        assert_eq!(app.claude_footer_fp(wid, &plan), unclaimed, "no churn");
+        claim();
+        assert_ne!(
+            app.claude_footer_fp(wid, &plan),
+            unclaimed,
+            "the claim landing repaints the border with the card off"
+        );
+        let (claimed, text) = under(&mut app, Autopilot::Cruise);
+        assert!(
+            text.contains("harness \u{25CF} on") && claimed.windows(2).any(|w| w[0] != w[1]),
+            "claimed, tinted: {text:?}"
+        );
+        app.config.claude_footer = None;
+        let blue_violet = |c: [u8; 3]| {
+            i32::from(c[2]) >= i32::from(c[0]) + 24 && i32::from(c[2]) >= i32::from(c[1]) + 24
+        };
+        let warm = |c: [u8; 3]| c[0] >= c[1] && c[0] >= c[2];
+        // True blue, not azure nor violet: blue well over red and green, and
+        // no more red than green. Over the dark ground's spectrum, as the rule
+        // mixes it, the whole-run mapping's bluest visible cell is the azure
+        // just left of the switch (blue about 46 over green) and the visible
+        // mapping's is about 110 over.
+        let blue = |c: [u8; 3]| c[0] <= c[1] && i32::from(c[2]) >= i32::from(c[0].max(c[1])) + 56;
+
+        let (cruise, text) = under(&mut app, Autopilot::Cruise);
+        assert!(text.contains("harness \u{25CF} on"), "{text:?}");
+        assert!(cruise.len() > 60, "the run: {}", cruise.len());
+        assert!(
+            cruise.iter().copied().any(blue_violet),
+            "Cruise's rule reaches blue and violet: {cruise:?}"
+        );
+        assert!(
+            cruise.iter().copied().any(blue),
+            "Cruise's visible rule shows true blue: {cruise:?}"
+        );
+        // The rule as laid: the 120-cell run, the 11-cell lockup two cells
+        // in (2..13, `    claude `), the 19-cell lit switch two cells from
+        // its end (99..118), each `─` the palette's stop at `t` mixed as the
+        // border mixes it, over the rule's ink and the pane's: the lead and
+        // the tail at `t = 1`, the gap's 86 cells walking from 1 to 0.
+        let ground = app.windows[&wid].input_scratch.implicit_blank;
+        let dark = crate::claude_card::dark_ground(ground);
+        let paint = |t: f32| {
+            let c = aterm_effects::harness_card::CardPalette::Cruise.art(t, dark);
+            let stop = [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+            super::mix([90, 90, 90], super::mix(stop, ground.fg, 0.25), 0.68)
+        };
+        assert!(
+            text.starts_with("\u{2500}\u{2500}    claude \u{2500}")
+                && text.ends_with(" alab harness \u{25CF} on \u{2500}\u{2500}"),
+            "the lockup at the rule's left, the switch at its right: {text:?}"
+        );
+        let paint = |t: f32| {
+            let fg = paint(t);
+            if fg == [90, 90, 90] {
+                [fg[0] ^ 1, fg[1], fg[2]]
+            } else {
+                fg
+            }
+        };
+        let shown: Vec<[u8; 3]> = [paint(1.0), paint(1.0)]
+            .into_iter()
+            .chain((0..86).map(|j| paint(1.0 - j as f32 / 85.0)))
+            .chain([paint(1.0), paint(1.0)])
+            .collect();
+        assert_eq!(cruise, shown, "the palette backward over the gap");
+        assert!(
+            !cruise.iter().copied().all(warm),
+            "CONTROL: Cruise's rule is not a sunset"
+        );
+        let mut old_half = (0..=255).map(|i| {
+            let c = aterm_effects::spectrum::SPECTRUM_LUT[i];
+            [(c >> 16) as u8, (c >> 8) as u8, c as u8]
+        });
+        assert!(
+            !old_half.any(blue_violet),
+            "CONTROL: the old reading stopped short of blue"
+        );
+
+        let (land, text) = under(&mut app, Autopilot::Land);
+        assert!(text.contains("harness \u{25CF} on"), "{text:?}");
+        assert!(
+            land.iter().copied().all(warm),
+            "Land's rule is the sunset: {land:?}"
+        );
+
+        let (off, text) = under(&mut app, Autopilot::Off);
+        assert!(
+            text.contains(" alab harness \u{25CB} off \u{2590} on \u{258C} ")
+                && !text.contains("alab kitty"),
+            "Off's switch says off, `on` its button, no wordmark: {text:?}"
+        );
+        for c in &off {
+            let spread = c.iter().max().unwrap() - c.iter().min().unwrap();
+            assert!(spread <= 24, "Off's rule is the moonbow: {c:?} in {off:?}");
+        }
+        assert_ne!(off, cruise, "Off is not Cruise");
+        // Off as the host runs it: its worker stopped, the claim given back.
+        release();
+        assert!(!app.session_autopilot(session).2, "the claim is given back");
+        let (released, text) = under(&mut app, Autopilot::Off);
+        assert!(
+            text.contains("alab harness \u{25CB} off"),
+            "no claim: {text:?}"
+        );
+        assert_eq!(released, off, "white with no claim");
+        // A press on the white rule's switch: the harness back on.
+        let (frame_row, cols) = app.windows[&wid]
+            .claude_lights
+            .border_toggles
+            .iter()
+            .find(|t| t.session == session)
+            .map(|t| (t.frame_row, t.cols.clone()))
+            .expect("the switch is a target");
+        let col = cols.start + 2;
+        let (cw, ch) = app.win_cell_size(wid);
+        let (ox, oy) = app.frame_origin(wid);
+        let x = ox as f64 + (app.win_pad(wid) + col * cw + cw / 2) as f64;
+        let y =
+            oy as f64 + (app.win_pad_top(wid) + app.win_head(wid) + frame_row * ch + ch / 2) as f64;
+        assert_eq!(app.frame_cell_at(wid, x, y), Some((frame_row, col)));
+        app.windows.get_mut(&wid).expect("window").last_cursor_px = (x, y);
+        assert!(app.press_claude_light(wid), "the switch takes the press");
+        assert_eq!(
+            app.session_autopilot(session).0,
+            Some(Autopilot::Cruise),
+            "Off's switch turns the harness back on"
+        );
+
+        // On paper (a white ground, a dark ink): every glyph of the lit
+        // switch, `alab harness ● on`, holds the paper law the card's line
+        // holds (WCAG 4.5:1 or more against the ground) under Cruise, and so
+        // do the lockup's name and Off's state. CONTROL: the old letters, raw
+        // spectrum mixed a quarter toward the ink, are not all legible.
+        claim();
+        {
+            let term = app.pool.get(session).expect("session").term.clone();
+            crate::term_lock(&term)
+                .process(b"\x1b]11;rgb:ff/ff/ff\x1b\\\x1b]10;rgb:20/20/20\x1b\\");
+        }
+        let contrast = |c: [u8; 3]| {
+            use aterm_effects::color_math::relative_luminance;
+            let y = relative_luminance(u32::from_be_bytes([0, c[0], c[1], c[2]]));
+            let paper = relative_luminance(0x00FF_FFFF);
+            (y.max(paper) + 0.05) / (y.min(paper) + 0.05)
+        };
+        for word in [Autopilot::Cruise, Autopilot::Off] {
+            let (_, text) = under(&mut app, word);
+            let cells = &app.windows[&wid].input_scratch.cells[strip(&app, wid) + 5];
+            if word == Autopilot::Off {
+                assert!(
+                    !text.contains('\u{2726}'),
+                    "Off wears no wordmark: {text:?}"
+                );
+                let off = cells.iter().position(|c| c.ch == '\u{25CB}').unwrap();
+                assert!(contrast(cells[off].fg) >= 4.5, "Off's state on paper");
+                continue;
+            }
+            let face: Vec<char> = "alab harness \u{25CF} on".chars().collect();
+            let at = (0..cells.len().saturating_sub(face.len()))
+                .find(|&k| {
+                    cells[k..k + face.len()]
+                        .iter()
+                        .map(|c| c.ch)
+                        .eq(face.iter().copied())
+                })
+                .unwrap_or_else(|| panic!("{word:?}: the switch on paper: {text:?}"));
+            let letters: Vec<[u8; 3]> = cells[at..at + face.len()]
+                .iter()
+                .chain(&cells[6..12])
+                .filter(|c| c.ch != ' ')
+                .map(|c| c.fg)
+                .collect();
+            assert_eq!(
+                letters.len(),
+                "alabharness\u{25CF}onclaude".chars().count(),
+                "{text:?}"
+            );
+            for c in &letters {
+                assert!(contrast(*c) >= 4.5, "{word:?}: {c:?} too pale on paper");
+            }
+        }
+        let ink = [0x20, 0x20, 0x20];
+        let head: Vec<char> = " alab harness \u{25CF} on ".chars().collect();
+        let old_pale = (0..head.len()).filter(|&k| head[k] != ' ').any(|k| {
+            let c = aterm_effects::spectrum::SPECTRUM_LUT[(k * 255) / head.len()];
+            contrast(mix([(c >> 16) as u8, (c >> 8) as u8, c as u8], ink, 0.25)) < 4.5
+        });
+        assert!(old_pale, "CONTROL: the old letters vanish on paper");
+
+        // NEGATIVE CONTROL: no harness runs under the master switch off.
+        app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
+            crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
+        );
+        let (_, text) = under(&mut app, Autopilot::Off);
+        assert!(
+            !text.contains("alab kitty")
+                && text.contains(" alab harness \u{25CB} off \u{2590} on \u{258C} "),
+            "master off: the bare off switch {text:?}"
+        );
+        host.shutdown_and_join();
     }
 
     #[test]

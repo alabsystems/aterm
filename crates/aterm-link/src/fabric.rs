@@ -122,8 +122,8 @@
 //! * THE SUBJECT BUDGET — BROKER's `subjects` line: how many of the 4096
 //!   distinct subjects one node may ever mint this node has spent
 //!   ([`subjects_of`]), a WARNING from three quarters. Only a closed
-//!   session's own `ev` face is ever reclaimed, and only under `[fabric] log
-//!   = "turns"` (`bridge.rs` module docs): every `presence`, `say` and mail
+//!   session's own `ev` face is ever reclaimed, and only while the session-log
+//!   mirror runs (`[fabric] log`; `bridge.rs` module docs): every `presence`, `say` and mail
 //!   lane subject stays spent.
 //! * THE LOG'S HEALTH — BROKER's `health` line is the broker's own word, its
 //!   `Hello`'s entry 0x04: whether its log is POISONED (it refuses every write
@@ -210,8 +210,8 @@ control sockets (fabric.toml) is read when the file has no command.
                    attach and head query, whether it checks capabilities, the
                    broker's pid and launchd job, `subjects`: how many of the
                    4096 distinct subjects a node may ever mint this one has spent —
-                   only a closed session's `ev` face is ever given back, under
-                   [fabric] log = \"turns\", so three quarters is a WARNING —
+                   only a closed session's `ev` face is ever given back, while
+                   the session-log mirror runs, so three quarters is a WARNING —
                    `health`: the broker's own word on whether its log is
                    POISONED, refusing every write until it is reopened (a
                    WARNING), and its flushes, and `holds`: astream's snapshot
@@ -873,30 +873,42 @@ pub fn presence_from_config() -> crate::presence::Mode {
 /// `in_toml`: `default` when there is no file or no key, and ALSO — said on
 /// stderr (`fallback` names it), not fatal — when the file cannot be read or
 /// the value is wrong.
-fn key_from_config<T>(
+fn key_from_config<T: Copy>(
     in_toml: fn(&str) -> Result<Option<T>, String>,
     default: T,
     fallback: &str,
 ) -> T {
+    key_from_config_or(in_toml, default, default, fallback)
+}
+
+/// [`key_from_config`] with what a file that cannot be read, or a wrong
+/// value, answers (`broken`) apart from what no file or no key does
+/// (`absent`): a default that publishes falls back to the side that does not.
+fn key_from_config_or<T>(
+    in_toml: fn(&str) -> Result<Option<T>, String>,
+    absent: T,
+    broken: T,
+    fallback: &str,
+) -> T {
     let Some(path) = config_path() else {
-        return default;
+        return absent;
     };
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return default,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return absent,
         Err(e) => {
             eprintln!(
                 "aterm-link: {} could not be read ({e}); {fallback}",
                 path.display()
             );
-            return default;
+            return broken;
         }
     };
     match in_toml(&text) {
-        Ok(v) => v.unwrap_or(default),
+        Ok(v) => v.unwrap_or(absent),
         Err(e) => {
             eprintln!("aterm-link: {}: {e}; {fallback}", path.display());
-            default
+            broken
         }
     }
 }
@@ -938,29 +950,33 @@ pub fn receipts_from_config() -> bool {
     key_from_config(receipts_in_toml, true, "receipts default to on")
 }
 
-/// `[fabric] log` in `text` (session log phase 4): `"off"` or `"turns"`.
+/// `[fabric] log` in `text` (session log phase 4; `auto` since Phase 6 step
+/// 6E-3): `"auto"`, `"off"` or `"turns"`.
 ///
 /// # Errors
 ///
-/// A value that is not one of the two words, or not a string.
+/// A value that is not one of the three words, or not a string.
 pub fn log_in_toml(text: &str) -> Result<Option<crate::mirror::LogMode>, String> {
     fabric_key(text, "log", |v| match v.as_str() {
-        Some(s) => crate::mirror::LogMode::parse(s)
-            .map(Some)
-            .ok_or_else(|| format!("`[fabric] log = {s:?}` is neither \"off\" nor \"turns\"")),
+        Some(s) => crate::mirror::LogMode::parse(s).map(Some).ok_or_else(|| {
+            format!("`[fabric] log = {s:?}` is none of \"auto\", \"off\" and \"turns\"")
+        }),
         None => Err("`[fabric] log` is not a string".to_string()),
     })
 }
 
 /// `[fabric] log` from the aterm.toml [`config_path`] resolves, for a `serve`
-/// whose command line did not say: the bus mirror of the session logs. OFF
-/// when the file has no such key (owner decision D4 is open: the default
-/// publishes nothing), and ALSO off — said on stderr, not fatal — when the
-/// file cannot be read or the value is wrong, the side that publishes nothing.
+/// whose command line did not say: the bus mirror of the session logs. AUTO
+/// when the file has no such key (owner decision D4, session log Phase 6 step
+/// 6E-3: the turn class mirrored over a broker that retains it,
+/// [`crate::mirror::LogMode::Auto`]), and OFF — said on stderr, not fatal —
+/// when the file cannot be read or the value is wrong, the side that
+/// publishes nothing. `"off"` is the opt-out.
 #[must_use]
 pub fn log_from_config() -> crate::mirror::LogMode {
-    key_from_config(
+    key_from_config_or(
         log_in_toml,
+        crate::mirror::LogMode::Auto,
         crate::mirror::LogMode::Off,
         "the session-log mirror stays off",
     )
@@ -2171,7 +2187,10 @@ fn last_records(
         for filter in &filters {
             let mut next = start;
             loop {
-                let (page, (after, now_head)) = conn.fetch(next, filter, transport::POST_PAGE)?;
+                // A window below what the broker's retention keeps reads from
+                // the floor: the table is of the traffic the log still holds.
+                let ((page, (after, now_head)), _) =
+                    transport::fetch_kept(conn, next, filter, transport::POST_PAGE)?;
                 for (off, subject, raw) in &page {
                     let older = merged.len() >= n
                         && merged
@@ -2204,6 +2223,8 @@ fn last_records(
 /// The publisher's `t=` of the record at exactly `off` under `filter`, if the
 /// log still holds it.
 fn record_t(conn: &mut Conn, filter: &str, off: u64) -> Option<u64> {
+    // A record the broker's retention gave up is answered `retained-from=`:
+    // the log no longer holds it, which is this function's `None`.
     let (page, _) = conn.fetch(off, filter, 1).ok()?;
     let (at, _, raw) = page.first()?;
     (*at == off).then(|| Body::decode(raw).0.t)
@@ -2260,7 +2281,10 @@ fn overdue_work(
     for filter in &filters {
         let mut next = head.saturating_sub(OVERDUE_SCAN_SPAN);
         loop {
-            let (page, (after, now_head)) = conn.fetch(next, filter, transport::POST_PAGE)?;
+            // Asks the broker's retention gave up are no longer on the bus to
+            // be overdue: the scan reads on from the floor.
+            let ((page, (after, now_head)), _) =
+                transport::fetch_kept(conn, next, filter, transport::POST_PAGE)?;
             for (off, subject, raw) in &page {
                 if fed.insert(*off) {
                     scan.feed(fleet, *off, subject, raw);
@@ -2810,8 +2834,9 @@ impl NodeRow {
 
 /// The distinct-subject bound one producer — one node — may ever hold
 /// (`astream-broker`'s `MAX_SUBJECTS_PER_PRODUCER`). Almost nothing reclaims a
-/// subject — only a closed session's own `ev` face, retired under `[fabric] log =
-/// "turns"` (`bridge.rs` module docs) — so `status` says how much is spent.
+/// subject — only a closed session's own `ev` face, retired while the session-log
+/// mirror runs (`[fabric] log`, `bridge.rs` module docs) — so `status` says how
+/// much is spent.
 pub const SUBJECT_BUDGET: usize = astream_broker::store::MAX_SUBJECTS_PER_PRODUCER;
 
 /// How much of [`SUBJECT_BUDGET`] spent is a WARNING: three quarters, while a
@@ -3725,14 +3750,14 @@ fn warnings(
         ));
     }
     // THE SUBJECT BUDGET IS ALMOST NEVER RECLAIMED (`bridge.rs` module docs:
-    // only a closed session's `ev` face, under `[fabric] log = "turns"`): said
+    // only a closed session's `ev` face, while the session-log mirror runs): said
     // while there is still room to act on it.
     if let (Some(Ok(used)), Some(node)) = (&r.subjects, r.node.as_deref()) {
         if *used >= SUBJECT_BUDGET_WARN {
             w.push(format!(
                 "node {} holds {used} of the {SUBJECT_BUDGET} distinct subjects one node may \
-                 ever mint, and none but a closed session's own `ev` face (under [fabric] log = \
-                 \"turns\") is ever given back: past the bound a new session gets no presence \
+                 ever mint, and none but a closed session's own `ev` face (while the session-log \
+                 mirror runs) is ever given back: past the bound a new session gets no presence \
                  row and its posts are refused; the remedy is a new node id",
                 safe(node, 64)
             ));
@@ -4066,7 +4091,10 @@ pub fn retire_progress(
         // A FACE OF ROWS — this node's own `ev` lines, which only its bridge
         // writes — so a page as wide as the broker's own `Last` page
         // ([`transport::ROW_PAGE`]).
-        while let Ok((page, (after, now_head))) = conn.fetch(next, &ev, transport::ROW_PAGE) {
+        // From the floor when the broker's retention cut below `since`.
+        while let Ok(((page, (after, now_head)), _)) =
+            transport::fetch_kept(&mut conn, next, &ev, transport::ROW_PAGE)
+        {
             for (_, _, raw) in &page {
                 let (body, _) = Body::decode(raw);
                 let Some(ev) = body.unknown.get("ev") else {
@@ -4480,7 +4508,7 @@ pub fn render_text(r: &Report) -> String {
                 Ok(n) => format!(
                     "{n} of {SUBJECT_BUDGET} spent by this node — one per presence, `ev` and \
                      `say` face and lane it ever wrote; only a closed session's `ev` face is ever \
-                     given back, under [fabric] log = \"turns\""
+                     given back, while the session-log mirror runs"
                 ),
                 Err(e) => format!("- (could not be counted: {})", safe(e, 256)),
             },
@@ -5038,7 +5066,7 @@ pub fn render_json(r: &Report) -> String {
                 // snapshot beside the log ([`crate::broker_health`]).
                 ("health", health_json(b, r.now_ms)),
                 // THIS node's spend of the subject budget, which only a closed
-                // session's `ev` face (under `[fabric] log = "turns"`) ever gives back.
+                // session's `ev` face (while the session-log mirror runs) ever gives back.
                 (
                     "subjects",
                     r.subjects.as_ref().map_or(J::Null, |s| {

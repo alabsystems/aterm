@@ -16,6 +16,7 @@ use atpkg_publish::artifact::package::{
 };
 use atpkg_publish::channel::Log;
 use atpkg_publish::channel::index::{parse_delta, publish_with};
+use atpkg_publish::channel::mirror::{self, MirrorOptions};
 use atpkg_publish::ctx::Ctx;
 use atpkg_publish::error::Error;
 use atpkg_publish::host::Slug;
@@ -50,6 +51,8 @@ struct World {
     /// Its main's head.
     commit: String,
     tools: FakeTools,
+    /// The rostered machine's keys, which sign a quad the mirror reads.
+    keys: Keys,
 }
 
 fn world(label: &str) -> World {
@@ -88,6 +91,7 @@ fn world(label: &str) -> World {
         source,
         commit,
         tools: FakeTools::new(MAC),
+        keys,
     }
 }
 
@@ -164,6 +168,8 @@ struct Lay {
     id: Option<String>,
     exe: Vec<u8>,
     alab_build: bool,
+    /// The record's `upstream` field, raw JSON; none for a package from before it.
+    upstream: Option<String>,
 }
 
 impl World {
@@ -182,6 +188,7 @@ impl World {
             id: None,
             exe: codesigned(&self.root, &["--force", "--sign", "-"]),
             alab_build: true,
+            upstream: None,
         }
     }
 
@@ -209,13 +216,16 @@ impl World {
                 format!(
                     "{{\"source\": \"{}\", \"version\": \"{}\", \"target\": \"{}\", \"compiler\": \
                      {{\"rustc\": \"rustc\", \"rustc_vV\": {}, \"sysroot\": {}, \
-                     \"binaries_sha256\": \"{}\", \"id\": \"{id}\"}}, \"ripgrep\": \"15.2.0\"}}\n",
+                     \"binaries_sha256\": \"{}\", \"id\": \"{id}\"}}, \"ripgrep\": \"15.2.0\"{}}}\n",
                     lay.source,
                     lay.version,
                     lay.build_target,
                     json_string(&lay.vv),
                     json_string(&lay.sysroot),
-                    lay.binaries
+                    lay.binaries,
+                    lay.upstream
+                        .as_ref()
+                        .map_or_else(String::new, |u| format!(", \"upstream\": {u}"))
                 )
                 .as_bytes(),
             );
@@ -440,6 +450,70 @@ fn upload_goes_to_the_staging_codex_alab_release_only_when_asked() {
             .is_none(),
         "the public owner is the index's to write (mirror), never the pack's"
     );
+}
+
+/// THE PAGES NAME THE UPSTREAM BASE: the staging release `--upload` writes and the public one
+/// the mirror creates both say `Based on upstream openai/codex …` when the package's record
+/// names its base (the public page reading it off the archive as a client stages it). A
+/// package from before the field, and one whose field is malformed, name no base on either.
+#[test]
+fn both_release_pages_name_the_upstream_base_the_package_records() {
+    crate::shared::need_compressor();
+    let w = world("pkg-upstream");
+    let sha = "e8aa7c1678caa9a368243d72bf0e9b7859d97f15";
+    let recorded = format!(
+        r#"{{"release": "rust-v0.163.0", "commits_since_release": 241, "commit": "{sha}", "commit_date": "2026-10-20T13:50:13Z"}}"#
+    );
+    let malformed = format!(
+        r#"{{"release": "rust-v0.163.0", "commits_since_release": "241", "commit": "{sha}"}}"#
+    );
+    let line =
+        "Based on upstream openai/codex rust-v0.163.0 + 241 commits (e8aa7c1678ca, 2026-10-20)";
+    for (build, field, said) in [
+        (ALAB, Some(recorded), Some(line)),
+        (ALAB + 1, None, None),
+        (ALAB + 2, Some(malformed), None),
+    ] {
+        let lay = Lay {
+            upstream: field,
+            ..w.lay()
+        };
+        let pkg = w.package(&format!("upstream-{build}"), &lay);
+        let mut req = w.request(&pkg, build);
+        req.upload = true;
+        let o = w.pack(&req).expect("packs");
+        let tag = format!("atpkg-codex-{build}");
+        let with = |notes: String| match said {
+            Some(line) => format!("{notes}\n\n{line}"),
+            None => notes,
+        };
+        assert_eq!(
+            w.host.notes_of(&w.staging(), &tag),
+            Some(with(format!(
+                "atpkg pack of codex {} ({MAC}, source {}). Signed pkg manifest + tarball.",
+                o.version, w.commit
+            ))),
+            "{build}"
+        );
+
+        // The mirror makes the pack public.
+        let dir = w.root.join(format!("quad-{build}"));
+        w.keys.write_quad(
+            &dir,
+            &w.keys
+                .index_toml(72, &[("codex", "codex-alab")], &[("codex", build)]),
+        );
+        let q = quad::verify_dir(&w.ctx, &dir).expect("the quad verifies");
+        let mut log = Log::capture("test");
+        let report = mirror::mirror(&w.ctx, &q, &MirrorOptions::publish(), &mut log)
+            .unwrap_or_else(|e| panic!("{e}\n{}", log.text()));
+        assert_eq!(report.created, std::slice::from_ref(&tag));
+        assert_eq!(
+            w.host.notes_of(&w.ctx.public_slug("codex-alab"), &tag),
+            Some(with(mirror::PUBLIC_NOTES.to_string())),
+            "{build}"
+        );
+    }
 }
 
 /// Every gate refuses before a manifest exists: the build id outside the window, each

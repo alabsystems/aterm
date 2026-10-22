@@ -1,0 +1,14 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (50x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the update notice at 50 columns, inline renderer (launched at 50 columns, `lastReleaseNotesSeen` seeded to 2.1.290): the bold summary wraps onto two rows at column 2 (`Updated to latest. Got 66 features, 424` / `bugfixes, and 126 other changes.`; the spaces between its words are not bold), the dim details row still fits on one (47 cells with its indent); the transient `◐ medium · /effort` row stands right-aligned UNDER the mode row on this renderer
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.IbLp/proj
+
+  Updated to latest. Got 66 features, 424
+  bugfixes, and 126 other changes.
+  code.claude.com/docs/en/changelog for details
+
+
+──────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

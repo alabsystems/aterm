@@ -792,6 +792,78 @@ fn the_exit_table_tells_a_crash_from_a_refusal_and_an_end() {
     }
 }
 
+/// A WORKER'S OWN RESTART NAMES THE ID IT REFUSED ([`restart_id`]): `42`
+/// from a launch under `--session-id <uuid>` (a worker's line: the id, then
+/// its attached first prompt), the id whichever way it is written — the
+/// caller holds it to the start-time rule. NEGATIVE CONTROLS: any other
+/// status (`1` a crash, `0`, `199` the restart's own code, which the parent
+/// never relays); `42` from a launch under no `--session-id`, one naming a
+/// session to resume (`--resume`, bare or by id, `-r`) or a file to import
+/// (`--session-file`), and one whose id is no UUID; and the status alone,
+/// which is a refusal ([`exit_kind`]).
+#[test]
+fn a_workers_own_restart_names_the_id_it_refused() {
+    let worker = launch(&[
+        "--model",
+        "gemini-3.5-flash",
+        "--session-id",
+        S1,
+        "--prompt-interactive=fix it\n(Started by `s-1`)",
+    ]);
+    assert_eq!(restart_id(42, &worker), Some(S1));
+    assert_eq!(
+        restart_id(42, &launch(&[&format!("--session-id={S1}")])),
+        Some(S1)
+    );
+    assert_eq!(exit_kind(42), ExitKind::Refused, "the status alone");
+    for status in [1, 0, 41, 199] {
+        assert_eq!(restart_id(status, &worker), None, "{status}");
+    }
+    for other in [
+        launch(&[]),
+        launch(&["--resume", S1]),
+        launch(&["--session-id", S1, "--resume"]),
+        launch(&["--session-id", S1, "-r", S2]),
+        launch(&["--session-id", S1, "--session-file", "/tmp/s.json"]),
+        launch(&["--session-id", "my-task"]),
+    ] {
+        assert_eq!(restart_id(42, &other), None, "{other:?}");
+    }
+    assert_eq!(ExitKind::Restarted.word(), "restarted");
+}
+
+/// A WORKER'S TRUSTED-FOLDERS FILE IS READ OFF A RECORD'S WORDS BY NAME
+/// ([`trusted_folders_of_words`]), where absolute: what its relaunch carries
+/// while the file stands. NEGATIVE CONTROLS: a record's homes still keep
+/// none ([`env_of_words`]); a relative file, and a record naming none, give
+/// none.
+#[test]
+fn a_workers_trusted_folders_file_is_read_off_its_record() {
+    let words = env_words(&[
+        ("GEMINI_CLI_HOME".to_string(), "/g/home".to_string()),
+        (
+            TRUSTED_FOLDERS_ENV.to_string(),
+            "/state/tasks/s-1-1.trust.json".to_string(),
+        ),
+    ]);
+    assert_eq!(
+        trusted_folders_of_words(&words),
+        Some("/state/tasks/s-1-1.trust.json")
+    );
+    assert_eq!(
+        env_of_words(&words),
+        [("GEMINI_CLI_HOME".to_string(), "/g/home".to_string())]
+    );
+    assert_eq!(
+        trusted_folders_of_words(&[format!("{TRUSTED_FOLDERS_ENV}=tasks/s.json")]),
+        None
+    );
+    assert_eq!(
+        trusted_folders_of_words(&["HOME=/Users//alt".to_string()]),
+        None
+    );
+}
+
 // ---------------------------------------------------------------- the line
 
 /// The homes a line carries: `GEMINI_CLI_HOME` where set, `HOME` where it is

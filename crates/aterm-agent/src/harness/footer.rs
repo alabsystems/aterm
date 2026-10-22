@@ -52,6 +52,13 @@
 //!   account the process runs on ([`FooterFacts::account`]), only where the
 //!   roster lists two or more.
 //!
+//! A fact the person hid by a click reads greyed, its value and `off`
+//! after it (`◆ Opus 5.5 off xhigh`, `⌂ ~/aterm off`: [`FooterFacts::off`],
+//! [`OFF_STUB`]), the first thing a narrow rule gives up; [`fact_spans`] says which cells of the set facts are which fact, for
+//! the window's click targets. The top rule's effort tag is read where Claude
+//! draws it ([`top_rule_tag`]), and its `/effort <key> on|off` answers from
+//! the transcript ([`TailFacts::top`]) and the screen ([`top_effort_answer`]).
+//!
 //! Nothing is written anywhere and the user's Claude settings are not touched.
 //! Vendor output is read as a third party's: an unrecognised rule is left as
 //! drawn, a moved file or result shape yields no fact, and facts are keyed to one
@@ -226,6 +233,18 @@ pub struct FooterFacts {
     /// resolver fills it, from the process's own exec environment. Shown
     /// after the model, whole or not at all ([`facts_ladder`]).
     pub account: Option<String>,
+    /// What the newest statement since the process started says of the
+    /// top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]): on or off for this session,
+    /// from its own `/effort <key> on|off` result or the ` · <Key> on|off` an
+    /// effort result ends with ([`TailFacts::top`]). Not shown in the bottom
+    /// rule; the top rule's mark takes it as evidence that the key exists for
+    /// this account. `None`: nothing said.
+    pub top_effort: Option<bool>,
+    /// The facts the person hid in this session by a click (hidden facts read
+    /// as a greyed `off`, [`fact_segments`]). Never read off Claude Code's
+    /// files: only the window lays it in, from its per-session state, as it
+    /// lays the usage switch in.
+    pub off: FactMask,
     /// Volatile email, subscription and weekly quota from the selected process's own
     /// profile. Replaced on every read, including account changes and missing data.
     pub subscription: Option<super::profile::SubscriptionDisplay>,
@@ -237,6 +256,99 @@ pub struct FooterFacts {
     /// The context left, as read off the agent's own indicator on the glass (`ctx 84% left`).
     /// `None` until one is read: no reading is no fact, never a placeholder.
     pub context: Option<String>,
+}
+
+/// One of the footer's facts a person can act on in the bottom rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FactKind {
+    /// The model's name (`Opus 5.5`).
+    Model,
+    /// The effort level (`xhigh`).
+    Effort,
+    /// The working directory (`~/aterm`).
+    Path,
+    /// The branch (`main`).
+    Branch,
+    /// What is left of the context window (`ctx 84% left`).
+    Context,
+    /// The session's usage (`Σ 6m33s ↑20M ↓82k`); never hidden by a click.
+    Usage,
+}
+
+impl FactKind {
+    /// Its bit in a [`FactMask`]: none for [`FactKind::Usage`], which the
+    /// `[claude_footer] usage` switch alone hides.
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Model => 1,
+            Self::Effort => 2,
+            Self::Path => 4,
+            Self::Branch => 8,
+            Self::Context => 16,
+            Self::Usage => 0,
+        }
+    }
+
+    /// The mark its segment leads with; none for the effort, which shares
+    /// the model's (`◆ Opus 5.5 xhigh`).
+    #[must_use]
+    pub const fn mark(self) -> Option<char> {
+        match self {
+            Self::Model => Some(MODEL_MARK),
+            Self::Effort => None,
+            Self::Path => Some(PATH_MARK),
+            Self::Branch => Some(BRANCH_MARK),
+            Self::Context => Some(CONTEXT_MARK),
+            Self::Usage => Some(USAGE_MARK),
+        }
+    }
+}
+
+/// A set of hidden facts ([`FooterFacts::off`]): the model, the effort, the
+/// path, the branch and the context, each on its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FactMask(u8);
+
+impl FactMask {
+    /// The model hidden.
+    pub const MODEL: Self = Self(FactKind::Model.bit());
+    /// The effort hidden.
+    pub const EFFORT: Self = Self(FactKind::Effort.bit());
+    /// The working directory hidden.
+    pub const PATH: Self = Self(FactKind::Path.bit());
+    /// The branch hidden.
+    pub const BRANCH: Self = Self(FactKind::Branch.bit());
+    /// The context window's indicator hidden.
+    pub const CONTEXT: Self = Self(FactKind::Context.bit());
+
+    /// Whether `kind` is in the set (never [`FactKind::Usage`]).
+    #[must_use]
+    pub const fn has(self, kind: FactKind) -> bool {
+        kind.bit() != 0 && self.0 & kind.bit() != 0
+    }
+
+    /// The set with `kind` in it (`on`) or out of it; [`FactKind::Usage`]
+    /// changes nothing.
+    #[must_use]
+    pub const fn with(self, kind: FactKind, on: bool) -> Self {
+        if on {
+            Self(self.0 | kind.bit())
+        } else {
+            Self(self.0 & !kind.bit())
+        }
+    }
+
+    /// Both sets together.
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Nothing hidden.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
 }
 
 /// One wording of an [`UpgradeNote`]: whole, and short for a narrow rule.
@@ -358,13 +470,55 @@ pub fn launch_facts_of(argv: &[String], env: &[String]) -> LaunchFacts {
 }
 
 /// One marked value in the footer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Segment {
     /// The mark ([`MODEL_MARK`], [`PATH_MARK`], [`BRANCH_MARK`]).
     pub mark: char,
     /// The value after it.
     pub text: String,
+    /// Where the model-and-effort segment's effort starts in `text` (a byte
+    /// offset): its head is the model, its tail the effort ([`fact_spans`]).
+    /// `Some(0)` with no model known; `None` with no effort, and for every
+    /// other segment.
+    pub split: Option<usize>,
+    /// Whether the head and the tail (`split`) are a hidden fact's stub —
+    /// its value greyed, [`OFF_STUB`] after it — rather than a value shown
+    /// ([`fact_segments`]). A model and effort hidden together are two
+    /// stubs either side of the split: `(true, true)`.
+    pub quiet: (bool, bool),
 }
+
+impl Segment {
+    /// A shown value with no split: `mark` and `text`.
+    #[must_use]
+    pub fn plain(mark: char, text: impl Into<String>) -> Self {
+        Self {
+            mark,
+            text: text.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Its mark and the part of its text a value shows, its stubs left
+    /// out: what a reason never takes the room of compares by this
+    /// ([`same_top`]).
+    fn shown_part(&self) -> (char, &str) {
+        let text = self.text.as_str();
+        let shown = match (self.split, self.quiet) {
+            (_, (false, false)) => text,
+            (Some(at), (true, false)) => text.get(at..).unwrap_or(""),
+            (Some(at), (false, true)) => text.get(..at).unwrap_or("").trim_end(),
+            (None, (false, true)) => text,
+            (_, (true, _)) => "",
+        };
+        (self.mark, shown)
+    }
+}
+
+/// What a hidden fact says after its greyed value — `◆ Opus 5.5 off`, `⌂
+/// ~/aterm off`, `⎇ main off` — as the top rule's key says it after its
+/// greyed name.
+pub const OFF_STUB: &str = "off";
 
 /// The Claude Code directory of one process, from its environment at exec
 /// (`config_dir`, its raw `CLAUDE_CONFIG_DIR`; `home`, its raw `HOME`) and the
@@ -1195,6 +1349,7 @@ fn restored_facts(model: Said) -> TailFacts {
         },
         model,
         effort_for,
+        top: None,
     }
 }
 
@@ -1508,6 +1663,19 @@ fn conversation_model(path: &Path, before: u64) -> Option<Said> {
     }
 }
 
+/// The directories beside one read's facts ([`FooterCache::dirs`]): what the
+/// window's folder and branch actions act on, never shown and never in the
+/// facts' own `Hash`/`Eq`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactDirs {
+    /// Where the session's Bash tool stands, else its launch directory:
+    /// the directory the path fact shows, absolute.
+    pub cwd: PathBuf,
+    /// Its repository's root ([`GitHeadRead::Found`]), when it is in one the
+    /// branch read could read.
+    pub repo_root: Option<PathBuf>,
+}
+
 /// The resolver's per-session usage fold
 /// ([`super::session_usage::SessionUsage`]), so each read folds only what was
 /// appended. Dropping it releases the fold. The transcript tail lives in
@@ -1529,6 +1697,12 @@ pub struct FooterCache {
     /// Whether the last registry read's transcript path was certain
     /// ([`transcript_lookup`]): an uncertain one's steps are partial.
     steps_certain: bool,
+    /// The directories the last read that found the process stood in
+    /// ([`Self::dirs`]).
+    dirs: Option<FactDirs>,
+    /// How many folds this cache has dropped: a new fold's generations start
+    /// over, so [`Self::traffic_generation`] names the fold too.
+    dropped: u64,
 }
 
 impl Default for FooterCache {
@@ -1540,6 +1714,8 @@ impl Default for FooterCache {
             budget: FOLD_BUDGET,
             steps: None,
             steps_certain: true,
+            dirs: None,
+            dropped: 0,
         }
     }
 }
@@ -1702,9 +1878,66 @@ impl FooterCache {
         self.steps_certain = found.is_some_and(|(_, certain)| certain);
     }
 
+    /// The directories the last read that found the process stood in
+    /// ([`read_pid`]): where the Bash tool stands (else the launch
+    /// directory), absolute, and its repository's root. `None` before such a
+    /// read.
+    #[must_use]
+    pub fn dirs(&self) -> Option<&FactDirs> {
+        self.dirs.as_ref()
+    }
+
+    /// The session's traffic over time
+    /// ([`super::session_usage::SessionUsage::traffic`]), only once the fold
+    /// has caught up: a half-folded session draws no graph.
+    #[must_use]
+    pub fn traffic(&self) -> Option<super::session_usage::TrafficView> {
+        self.caught_up_usage()
+            .map(super::session_usage::SessionUsage::traffic)
+    }
+
+    /// The session's agents and workflow runs with what their files say of
+    /// their calls in flight (`session_usage::SessionUsage::flights`), under
+    /// [`Self::traffic`]'s rule: `None` until the fold has caught up, so a
+    /// table never shows a call a read behind has already seen answered.
+    #[must_use]
+    pub fn flights(&self) -> Option<super::flight::FlightTable> {
+        self.caught_up_usage()
+            .map(super::session_usage::SessionUsage::flights)
+    }
+
+    /// What moves whenever [`Self::flights`] would (`None` until caught up):
+    /// which fold this cache holds, and its
+    /// [`super::session_usage::SessionUsage::flight_generation`].
+    #[must_use]
+    pub fn flight_generation(&self) -> Option<(u64, u64)> {
+        self.caught_up_usage()
+            .map(|usage| (self.dropped, usage.flight_generation()))
+    }
+
+    /// What moves whenever [`Self::traffic`] would, under the same rule
+    /// (`None` until the fold has caught up): which fold this cache holds,
+    /// and its [`super::session_usage::SessionUsage::traffic_generation`]. A
+    /// reader that keeps what it built from [`Self::traffic`] rebuilds it
+    /// only when this moved.
+    #[must_use]
+    pub fn traffic_generation(&self) -> Option<(u64, u64)> {
+        self.caught_up_usage()
+            .map(|usage| (self.dropped, usage.traffic_generation()))
+    }
+
+    /// The fold, once its last refresh caught up.
+    fn caught_up_usage(&self) -> Option<&super::session_usage::SessionUsage> {
+        self.refreshed
+            .filter(|refresh| refresh.caught_up)
+            .and(self.usage.as_ref())
+    }
+
     /// Drop the fold and what was read from it.
     fn forget(&mut self) {
-        self.usage = None;
+        if self.usage.take().is_some() {
+            self.dropped = self.dropped.wrapping_add(1);
+        }
         self.refreshed = None;
         self.wall_basis = None;
     }
@@ -1883,6 +2116,12 @@ pub struct TailFacts {
     /// ([`Self::over`]); `Some` when nothing older named a model, leaving it
     /// to the launch flag or card ([`facts_for_entry_at`]).
     effort_for: Option<String>,
+    /// The top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]) on or off, from the
+    /// newest statement of it: its own `/effort <key> on|off` result, or the
+    /// ` · <Key> on|off` an effort result ends with ([`effort_result`]). Not
+    /// part of [`Self::settled`]: a scan that settled model and effort first
+    /// leaves it to the rows read before (the carry, the process's facts).
+    pub top: Option<bool>,
 }
 
 impl TailFacts {
@@ -1923,6 +2162,7 @@ impl TailFacts {
             model,
             effort,
             effort_for,
+            top: self.top.or(older.top),
         }
     }
 
@@ -2012,34 +2252,147 @@ pub fn footer_model_name(display: &str) -> Option<String> {
     plain.then(|| name.to_owned())
 }
 
-/// What an `/effort` result says: its level ([`effort_level`]), or
-/// [`Said::Unread`] for `auto` or an unknown level. `None` when not an effort
-/// result.
-fn effort_result(content: &str) -> Option<Said> {
+/// What an `/effort` result says ([`effort_result`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EffortSaid {
+    /// A level set or shown (`Set effort level to …`, `Current effort level:
+    /// …`, `Effort level set to auto`), and the top-effort key's state when
+    /// the result ends with ` · <Key> on|off`.
+    Level { said: Said, top: Option<bool> },
+    /// The key's own `/effort <key> on|off` result: on or off for this
+    /// session, and the level that stays.
+    Top { on: bool, stays: Said },
+    /// The key refused (`<Key> needs dynamic workflows enabled …`, `<Key>
+    /// isn't available on <model>. …`): it answers its command and decides
+    /// neither the effort nor the key.
+    Refused,
+}
+
+impl EffortSaid {
+    /// The effort it decides, if any.
+    fn effort(&self) -> Option<Said> {
+        match self {
+            Self::Level { said, .. } => Some(said.clone()),
+            Self::Top { stays, .. } => Some(stays.clone()),
+            Self::Refused => None,
+        }
+    }
+
+    /// The key's state it says, if any.
+    fn top(&self) -> Option<bool> {
+        match self {
+            Self::Level { top, .. } => *top,
+            Self::Top { on, .. } => Some(*on),
+            Self::Refused => None,
+        }
+    }
+}
+
+/// `text` past a head naming the top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]),
+/// compared without case: the vendor writes it capitalised at the start of
+/// its sentences, and the key's one spelling stays the const's.
+fn past_key(text: &str) -> Option<&str> {
+    let key = CLAUDE_TOP_EFFORT_KEY.as_bytes();
+    text.as_bytes()
+        .get(..key.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(key))
+        // The key is ASCII, so the matched head ends on a char boundary.
+        .then(|| &text[key.len()..])
+}
+
+/// The key's state an effort result ends with (`… · <Key> off`): the text
+/// after its last ` · ` (the clauses' join, typography aterm's own rows
+/// share, so no anchor) names the key, then ` on` or ` off` as a word.
+fn key_suffix(body: &str) -> Option<bool> {
+    let (_, last) = body.rsplit_once(" \u{b7} ")?;
+    let rest = past_key(last)?;
+    let word = |w: &str| {
+        rest.strip_prefix(w)
+            .is_some_and(|after| !after.starts_with(|c: char| c.is_ascii_alphanumeric()))
+    };
+    if word(aterm_phase::anchor("effort.key_on")) {
+        Some(true)
+    } else if word(aterm_phase::anchor("effort.key_off")) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// The level a result's `word…` names ([`effort_level`]): `Is` it, else
+/// [`Said::Unread`] (`auto`, a level this build does not know).
+fn level_word(text: &str) -> Said {
+    let word: String = text
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect();
+    effort_level(&word).map_or(Said::Unread, |level| Said::Is(level.to_owned()))
+}
+
+/// What an `/effort` result says ([`EffortSaid`]): a level ([`effort_level`];
+/// [`Said::Unread`] for `auto` or an unknown level) with the key's state where
+/// it ends with one; the key's own on or off and the level that stays; or the
+/// key refused. `None` when not an effort result.
+fn effort_result(content: &str) -> Option<EffortSaid> {
+    use aterm_phase::anchor;
     let body = content
         .trim_start()
         .strip_prefix(COMMAND_STDOUT)?
         .trim_start();
     let body = crate::harness::upgrade_models::strip_sgr(body);
-    if body.starts_with(aterm_phase::anchor("effort.auto")) {
-        return Some(Said::Unread);
+    if let Some(rest) = past_key(&body) {
+        if let Some(after) = rest.strip_prefix(anchor("effort.top_on")) {
+            let stays = anchor("effort.stays");
+            let stays = after
+                .find(stays)
+                .map_or(Said::Unread, |at| level_word(&after[at + stays.len()..]));
+            return Some(EffortSaid::Top { on: true, stays });
+        }
+        if let Some(after) = rest.strip_prefix(anchor("effort.top_off")) {
+            return Some(EffortSaid::Top {
+                on: false,
+                stays: level_word(after),
+            });
+        }
+        if rest.starts_with(anchor("effort.top_needs"))
+            || rest.starts_with(anchor("effort.top_unavailable"))
+        {
+            return Some(EffortSaid::Refused);
+        }
+    }
+    let top = key_suffix(&body);
+    if body.starts_with(anchor("effort.auto")) {
+        return Some(EffortSaid::Level {
+            said: Said::Unread,
+            top,
+        });
     }
     ["effort.set", "effort.current"].into_iter().find_map(|id| {
-        let rest = body.strip_prefix(aterm_phase::anchor(id))?;
-        let word: String = rest
-            .chars()
-            .take_while(char::is_ascii_alphanumeric)
-            .collect();
-        Some(effort_level(&word).map_or(Said::Unread, |level| Said::Is(level.to_owned())))
+        let rest = body.strip_prefix(anchor(id))?;
+        Some(EffortSaid::Level {
+            said: level_word(rest),
+            top,
+        })
     })
+}
+
+/// Which facts a local command's result row answered ([`fold_result`]), so
+/// [`scan`] can pair a command row with its own result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Answered {
+    /// A readable model was named.
+    model: bool,
+    /// It is an `/effort` result, a refused key included.
+    effort: bool,
 }
 
 /// A local command's result row folded into `facts`, newest first. A model
 /// result ([`crate::harness::upgrade_models::model_result_of`]) names the model
 /// ([`TailFacts::meet_model`]) and any `with … effort`; without that clause the
 /// earlier effort stands only for the same model. An `/effort` result names
-/// the effort. Returns whether a readable model was named, so [`scan`] can
-/// pair a `/model` command row with its own result.
+/// the effort and, where it says one, the top-effort key's state
+/// ([`EffortSaid`]); a refused key names neither. Returns what it answered, so
+/// [`scan`] can pair a `/model` or `/effort` command row with its own result.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -2048,7 +2401,7 @@ fn effort_result(content: &str) -> Option<Said> {
         project = "conformance_footer_model::project"
     )
 )]
-fn fold_result(content: &str, facts: &mut TailFacts) -> bool {
+fn fold_result(content: &str, facts: &mut TailFacts) -> Answered {
     use crate::harness::upgrade_models::model_result_of;
     if let Some(result) = model_result_of(content) {
         let model = result
@@ -2067,14 +2420,26 @@ fn fold_result(content: &str, facts: &mut TailFacts) -> bool {
                 (None, _) => facts.decide_effort(Said::Unread),
             }
         }
-        return readable;
+        return Answered {
+            model: readable,
+            effort: false,
+        };
+    }
+    let Some(said) = effort_result(content) else {
+        return Answered::default();
+    };
+    if facts.top.is_none() {
+        facts.top = said.top();
     }
     if !facts.effort.decided()
-        && let Some(said) = effort_result(content)
+        && let Some(effort) = said.effort()
     {
-        facts.decide_effort(said);
+        facts.decide_effort(effort);
     }
-    false
+    Answered {
+        model: false,
+        effort: true,
+    }
 }
 
 /// [`read_tail_facts`]'s scan, pure: rows newest first, stopping once both facts
@@ -2117,9 +2482,9 @@ fn rows_of(body: &[u8]) -> impl Iterator<Item = &str> {
 )]
 fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
     let mut facts = TailFacts::default();
-    // The command or result row met last — the one directly under the next
-    // command row up — was a readable model result: that command's own.
-    let mut under = false;
+    // What the command or result row met last — the one directly under the
+    // next command row up — answered: that command's own result.
+    let mut under = Answered::default();
     for &line in rows {
         if facts.settled() {
             break;
@@ -2175,14 +2540,20 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
             }
             if content.starts_with(COMMAND_NAME) {
                 let answered = std::mem::take(&mut under);
-                if content.starts_with(MODEL_COMMAND) && !answered {
+                if content.starts_with(MODEL_COMMAND) && !answered.model {
                     // No readable result under it: a choice this build
                     // cannot read, which may have moved the effort too.
                     facts.meet_model(Said::Unread);
                     if !facts.effort.decided() {
                         facts.decide_effort(Said::Unread);
                     }
-                } else if content.starts_with(EFFORT_COMMAND) && !facts.effort.decided() {
+                } else if content.starts_with(EFFORT_COMMAND)
+                    && !answered.effort
+                    && !facts.effort.decided()
+                {
+                    // No effort result under it: an answer this build cannot
+                    // read. A refused key under it answered it and moved
+                    // nothing, so the older effort stands.
                     facts.decide_effort(Said::Unread);
                 }
                 continue;
@@ -2253,7 +2624,7 @@ pub fn model_display(id: &str) -> String {
 /// outside a repository or when the read was refused.
 pub fn git_head(cwd: &Path) -> Option<String> {
     match read_git_head(cwd) {
-        GitHeadRead::Found(branch) => Some(branch),
+        GitHeadRead::Found(branch, _) => Some(branch),
         GitHeadRead::Absent | GitHeadRead::Denied => None,
     }
 }
@@ -2261,8 +2632,9 @@ pub fn git_head(cwd: &Path) -> Option<String> {
 /// What [`read_git_head`] found for a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitHeadRead {
-    /// The branch.
-    Found(String),
+    /// The branch, and the repository's root: the directory the climb
+    /// found `.git` in (a worktree's own, where `.git` is its file).
+    Found(String, PathBuf),
     /// Not inside a repository (or not one this bounded read can parse).
     Absent,
     /// A read failed with `EPERM` (macOS folder privacy consent); the host
@@ -2336,9 +2708,9 @@ fn read_git_head_in(home: Option<&Path>, cwd: &Path) -> GitHeadRead {
                 }
                 return match read_head(&git_dir.join("HEAD")) {
                     Err(()) => GitHeadRead::Denied,
-                    Ok(Some(head)) => {
-                        branch_of_head(&head).map_or(GitHeadRead::Absent, GitHeadRead::Found)
-                    }
+                    Ok(Some(head)) => branch_of_head(&head).map_or(GitHeadRead::Absent, |branch| {
+                        GitHeadRead::Found(branch, dir.to_path_buf())
+                    }),
                     Ok(None) => GitHeadRead::Absent,
                 };
             }
@@ -2439,10 +2811,12 @@ pub fn facts_for_entry_at(
         cache,
         read_at,
     )
+    .0
 }
 
 /// [`facts_for_entry_at`] over the caller's transcript lookup
-/// ([`transcript_path`]), shared with the usage fold so both read one file.
+/// ([`transcript_path`]), shared with the usage fold so both read one file,
+/// and the directories beside the facts ([`FactDirs`]).
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -2461,7 +2835,7 @@ fn facts_for_entry_from(
     launch: &LaunchFacts,
     cache: &mut TailCache,
     read_at: SystemTime,
-) -> FooterFacts {
+) -> (FooterFacts, FactDirs) {
     let floor = floor_of(started, entry);
     // With no floor the transcript stays out rather than risk a
     // predecessor's model ([`facts_for_entry_at`]).
@@ -2526,11 +2900,12 @@ fn facts_for_entry_from(
         ),
         None => read.facts,
     };
-    let (branch, repo_read_denied) = match read_git_head(&dir) {
-        GitHeadRead::Found(branch) => (Some(branch), None),
-        GitHeadRead::Absent => (None, None),
-        GitHeadRead::Denied => (None, Some(dir.clone())),
+    let (branch, repo_read_denied, repo_root) = match read_git_head(&dir) {
+        GitHeadRead::Found(branch, root) => (Some(branch), None, Some(root)),
+        GitHeadRead::Absent => (None, None, None),
+        GitHeadRead::Denied => (None, Some(dir.clone()), None),
     };
+    let top_effort = tail.top;
     let (model, model_open) = match tail.model {
         Said::Is(model) => (Some(model), false),
         Said::Unread => (None, false),
@@ -2552,7 +2927,7 @@ fn facts_for_entry_from(
             _ => (None, true, Some(to)),
         },
     };
-    FooterFacts {
+    let facts = FooterFacts {
         model,
         effort,
         path: home_path(&dir, aterm_types::dirs::home_dir().as_deref()),
@@ -2570,10 +2945,19 @@ fn facts_for_entry_from(
         }),
         upgrade: None,
         account: None,
+        top_effort,
+        off: FactMask::default(),
         subscription: None,
         plan: None,
         context: None,
-    }
+    };
+    (
+        facts,
+        FactDirs {
+            cwd: dir,
+            repo_root,
+        },
+    )
 }
 
 /// Claude Code's launch card, read for the footer only under a live REPL
@@ -2754,7 +3138,7 @@ pub fn read_pid(
             .map(|(path, certain)| (path.as_path(), *certain)),
     );
     let transcript = found.map(|(path, _)| path);
-    let mut facts = facts_for_entry_from(
+    let (mut facts, dirs) = facts_for_entry_from(
         claude_dir,
         pid,
         started,
@@ -2764,6 +3148,7 @@ pub fn read_pid(
         tail,
         clock.read_at,
     );
+    fold.dirs = Some(dirs);
     facts.usage = fold.usage(transcript, clock.now, clock.offset_at);
     let home = user_home.map_or_else(Vec::new, |user_home| {
         super::resume::home_env(user_home, launch.config.as_deref(), Some(claude_dir))
@@ -2860,7 +3245,7 @@ pub fn is_bare_footer_row(row: &str) -> bool {
 /// the pill-less row, is not a mode row.
 #[must_use]
 pub fn is_mode_row(row: &str) -> bool {
-    let Some(rest) = row.strip_prefix("  ") else {
+    let Some(rest) = pill_lead(row) else {
         return false;
     };
     PILLS.iter().any(|pill| {
@@ -2871,6 +3256,42 @@ pub fn is_mode_row(row: &str) -> bool {
                 || cycle_hint_len(after) > 0
         })
     })
+}
+
+/// VIM'S INSERT INDICATOR, the vendor's (anchor `vim.insert`): with the
+/// composer's vim editor mode in INSERT (`editorMode: "vim"`), Claude Code
+/// draws `-- INSERT --` dim at the mode row's head and its pill one cell
+/// after it — `  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)`, the
+/// indicator at column 2 and the pill at column 15, MEASURED on 2.1.304
+/// (`claude-2.1.304-top-vim-insert-120col.txt`). NORMAL draws nothing of its
+/// own. (The 2.1.304 bundle draws VISUAL's the same way; unmeasured, a row
+/// opening with it is read as no pill row at all, as before.)
+const VIM_INSERT: &str = aterm_phase::anchor_text("vim.insert");
+
+/// `row` past the lead its pill stands after: the two-space indent, and
+/// where Claude draws it, vim's INSERT indicator and its one-cell gap
+/// ([`vim_insert`]). `None` without the indent.
+fn pill_lead(row: &str) -> Option<&str> {
+    let rest = row.strip_prefix("  ")?;
+    Some(after_vim_insert(rest).unwrap_or(rest))
+}
+
+/// `rest` (a row past its indent) past vim's INSERT indicator and the cell
+/// after it, if it opens with them.
+fn after_vim_insert(rest: &str) -> Option<&str> {
+    rest.strip_prefix(VIM_INSERT)?.strip_prefix(' ')
+}
+
+/// Whether `row` opens with vim's INSERT indicator before its pill
+/// (anchor `vim.insert`'s row: `  -- INSERT -- ⏵⏵ auto mode on …`): Claude
+/// Code's composer then takes keys through vim, and the facts' typing path
+/// (`aterm-gui`'s `claude_slash`) types nothing into it. The pill after it is
+/// read as on any mode row ([`pill_indicator`]).
+#[must_use]
+pub fn vim_insert(row: &str) -> bool {
+    row.strip_prefix("  ")
+        .and_then(after_vim_insert)
+        .is_some_and(|after| PILLS.iter().any(|pill| after.starts_with(pill.glyph)))
 }
 
 /// `rest` past the pill (`<glyph> <indicator> on`) it opens with, if it
@@ -2944,7 +3365,7 @@ pub(super) const PILLS: [Pill; 6] = [
 /// `footer_mode`.
 #[must_use]
 pub fn pill_indicator(row: &str) -> Option<&'static str> {
-    let rest = row.strip_prefix("  ")?;
+    let rest = pill_lead(row)?;
     PILLS
         .iter()
         .find(|pill| after_pill(rest, pill).is_some())
@@ -2956,22 +3377,242 @@ pub fn pill_indicator(row: &str) -> Option<&'static str> {
 /// the host logs the drift.
 #[must_use]
 pub fn opens_with_pill_glyph(row: &str) -> bool {
-    row.strip_prefix("  ")
-        .is_some_and(|rest| PILLS.iter().any(|pill| rest.starts_with(pill.glyph)))
+    pill_lead(row).is_some_and(|rest| PILLS.iter().any(|pill| rest.starts_with(pill.glyph)))
 }
 
 /// Whether `row` is a known pill cut short by a narrow pane
-/// (`⏵⏵ bypass permissi`): geometry, not drift.
+/// (`⏵⏵ bypass permissi`): geometry, not drift. Allocation-free: the panel's
+/// locator ([`agents_panel_under`]) asks it on every frame the GUI paints.
 #[must_use]
 pub fn is_cut_pill(row: &str) -> bool {
-    let Some(rest) = row.strip_prefix("  ") else {
+    let Some(rest) = pill_lead(row) else {
         return false;
     };
     let rest = rest.trim_end();
     !rest.is_empty()
         && PILLS
             .iter()
-            .any(|pill| format!("{} {}", pill.glyph, pill.text).starts_with(rest))
+            .any(|pill| prefix_of_parts(rest, &[pill.glyph, " ", pill.text]))
+}
+
+/// Whether `cut` is a prefix of `parts` joined, without joining them.
+fn prefix_of_parts(cut: &str, parts: &[&str]) -> bool {
+    let mut rest = cut;
+    for part in parts {
+        if rest.len() <= part.len() {
+            return part.starts_with(rest);
+        }
+        let Some(after) = rest.strip_prefix(part) else {
+            return false;
+        };
+        rest = after;
+    }
+    rest.is_empty()
+}
+
+/// What aterm draws over Claude's bypass pill (`⏵⏵ bypass permissions on`)
+/// on the glass (owner, 2026-10-19: "Replace '⏵⏵ bypass permissions on'
+/// with 'YOLO on' (or off)").
+pub const YOLO_ON: &str = "YOLO on";
+/// What it draws over the manual-mode pill (`⏸ manual mode on`), the mode
+/// that asks before each tool: YOLO's off.
+pub const YOLO_OFF: &str = "YOLO off";
+
+/// Claude's mode pill as [`relabel_under`] found it, in PANE COLUMNS of the
+/// GUI's pane text (one char per cell), for the glass to relabel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Relabel {
+    /// The mode row.
+    pub row: usize,
+    /// Claude's pill, its glyph to its `on`: `start..end`.
+    pub start: usize,
+    pub end: usize,
+    /// Where the pill's words start (after the glyph and its space): the
+    /// cell whose style the label takes.
+    pub words: usize,
+    /// The end of the row's left items, from the pill's end to the first
+    /// two blanks (or the row's text end): the run the glass packs left
+    /// behind the label. Cells from here on stay where Claude drew them.
+    pub run_end: usize,
+    /// [`YOLO_ON`] or [`YOLO_OFF`].
+    pub label: &'static str,
+}
+
+impl Relabel {
+    /// How far the run moves left: the pill's cells less the label's.
+    #[must_use]
+    pub fn shift(&self) -> usize {
+        (self.end - self.start).saturating_sub(self.label.len())
+    }
+
+    /// The column after the label.
+    #[must_use]
+    pub fn label_end(&self) -> usize {
+        self.start + self.label.len()
+    }
+
+    /// The grid column under glass column `col` of the relabelled row: the
+    /// label's cells over Claude's pill (whose cells answer no click), the
+    /// packed run `shift` columns right of where it shows, the blanks it
+    /// left at the run's end over the pill's first cell, the rest as drawn.
+    #[must_use]
+    pub fn grid_col(&self, col: usize) -> usize {
+        let shift = self.shift();
+        if col < self.label_end() || col >= self.run_end {
+            col
+        } else if col + shift < self.run_end {
+            col + shift
+        } else {
+            self.start
+        }
+    }
+}
+
+/// Claude Code's mode pill to relabel under the composer bottom rule
+/// `bottom`: the pill a mode row ([`is_mode_row`]) opens with, whole and at
+/// the row's start (column 2, or 15 after vim INSERT's indicator,
+/// [`vim_insert`]), when it is EXACTLY the bypass pill ([`YOLO_ON`]) or the
+/// manual-mode one ([`YOLO_OFF`]). `None` for every other mode (auto, plan,
+/// accept edits, don't ask: Claude's pill stays), a pill a narrow pane cut,
+/// a pill's words anywhere but the row's start, a row above the rule, and a
+/// screen that is not Claude's (agy and Muse Code draw no such pill; the
+/// host asks only on a Claude pane). Pure and allocation-free.
+#[must_use]
+pub fn relabel_under(rows: &[String], bottom: usize) -> Option<Relabel> {
+    let row = pill_row_under(rows, bottom)?;
+    let text = &rows[row];
+    if !is_mode_row(text) {
+        return None;
+    }
+    let rest = pill_lead(text)?;
+    let (pill, label) = [("mode.bypass", YOLO_ON), ("mode.manual", YOLO_OFF)]
+        .into_iter()
+        .find_map(|(id, label)| {
+            let pill = PILLS.iter().find(|p| p.id == id)?;
+            let after = after_pill(rest, pill)?;
+            (after.is_empty() || after.starts_with(' ')).then_some((pill, label))
+        })?;
+    // The pill's column: after the indent, and vim INSERT's indicator where
+    // Claude draws one (column 15, MEASURED).
+    let start = text[..text.len() - rest.len()].chars().count();
+    let words = start + pill.glyph.chars().count() + 1;
+    let end = words + pill.text.chars().count();
+    let len = text.trim_end().chars().count();
+    let mut run_end = len;
+    let mut blank_before = false;
+    for (k, c) in text.chars().enumerate().take(len).skip(end) {
+        if c == ' ' && blank_before {
+            run_end = k - 1;
+            break;
+        }
+        blank_before = c == ' ';
+    }
+    Some(Relabel {
+        row,
+        start,
+        end,
+        words,
+        run_end: run_end.max(end),
+        label,
+    })
+}
+
+/// How many rows of Claude's footer the panel's locator passes before the
+/// panel: the footer row and up to three more (a left slot a narrow pane
+/// wraps, a right-hand notice on its own row).
+const FOOTER_ROWS_MAX: usize = 4;
+
+/// Claude Code's agents panel under the composer bottom rule `bottom`, read
+/// in PANE CELLS (one char per cell, as the GUI's pane text holds them:
+/// [`aterm_phase::agents_panel::one_cell`]); [`agents_panel_under_with`]
+/// takes the width of text whose wide glyphs stand alone. The ONE locator of
+/// the panel: the reader (`aterm_phase::agents_panel`) reads its rows, this
+/// says which rows they are.
+///
+/// Under the rule: Claude's live footer row ([`is_mode_row`],
+/// [`is_bare_footer_row`], [`is_cut_pill`], an unknown pill
+/// ([`opens_with_pill_glyph`]), or a transient hint in its left slot —
+/// `paste again to expand` over a running workflow, MEASURED in
+/// `aterm-phase/src/fixtures/wait_bg2.out`, and `↑/↓ to select` or `Enter
+/// to view · x to stop` while the panel holds the keys, MEASURED on 2.1.304
+/// (`claude-2.1.304-agents-panel-*-selected.txt`)), up to three rows more
+/// of it, then at most one blank (2.1.304's container has `marginTop: 1`,
+/// measured; older builds drew the panel straight under the footer), then
+/// the panel: its
+/// first row the main row or a workflow (a task row is never first: 2.1.304
+/// draws `main` whenever it draws a task, and older builds drew workflows
+/// alone), then every row the reader reads, one blank slot passed when a
+/// workflow row follows it (the lone space 2.1.304 leaves where `↓ N more`
+/// would be), to the first row it does not (`⧉  <artifact> · canvas`, the
+/// screen's end). Never above the frame: the walk starts under `bottom`.
+/// `None` where no panel hangs there.
+#[must_use]
+pub fn agents_panel_under(
+    rows: &[String],
+    bottom: usize,
+) -> Option<aterm_phase::agents_panel::AgentsPanel> {
+    agents_panel_under_with(rows, bottom, aterm_phase::agents_panel::one_cell)
+}
+
+/// [`agents_panel_under`], its spans counted in `width`'s columns
+/// (`aterm_grapheme::char_width` for a screen's text whose wide glyphs are
+/// one char each, such as `aterm ctl text`).
+#[must_use]
+pub fn agents_panel_under_with(
+    rows: &[String],
+    bottom: usize,
+    width: aterm_phase::agents_panel::Width,
+) -> Option<aterm_phase::agents_panel::AgentsPanel> {
+    use aterm_phase::agents_panel::{AgentsPanel, RowKind, parse_row};
+    let blank = |i: usize| rows.get(i).is_some_and(|r| r.trim().is_empty());
+    let read = |i: usize| rows.get(i).and_then(|r| parse_row(r, width));
+    let leads =
+        |i: usize| read(i).is_some_and(|r| matches!(r.kind, RowKind::Main | RowKind::Workflow));
+    let first = bottom.checked_add(1)?;
+    let footer = rows.get(first)?;
+    let known = is_mode_row(footer)
+        || is_bare_footer_row(footer)
+        || is_cut_pill(footer)
+        || opens_with_pill_glyph(footer);
+    // The row in the footer's slot is a panel row only where it is no
+    // footer: manual and plan mode's pill opens with `⏸`, a paused
+    // workflow's bullet, so their footer reads as a panel row too.
+    if footer.trim().is_empty() || (!known && read(first).is_some()) {
+        return None;
+    }
+    if !known && !footer.starts_with("  ") {
+        return None;
+    }
+    let mut at = first + 1;
+    while at < rows.len() && !blank(at) && !leads(at) {
+        if at - first >= FOOTER_ROWS_MAX {
+            return None;
+        }
+        at += 1;
+    }
+    if blank(at) {
+        at += 1;
+    }
+    if !leads(at) {
+        return None;
+    }
+    let mut panel = AgentsPanel::EMPTY;
+    while at < rows.len() {
+        let parsed = match read(at) {
+            Some(parsed) => parsed,
+            None if blank(at) && read(at + 1).is_some_and(|r| r.kind == RowKind::Workflow) => {
+                at += 1;
+                continue;
+            }
+            None => break,
+        };
+        let Ok(row) = u16::try_from(at) else { break };
+        if !panel.push(row, parsed) {
+            break;
+        }
+        at += 1;
+    }
+    Some(panel)
 }
 
 /// The footer's marked values, in order: a live upgrade waiting on the person
@@ -2980,7 +3621,8 @@ pub fn is_cut_pill(row: &str) -> bool {
 /// moves); model and effort under one mark; the account
 /// ([`FooterFacts::account`]); the working directory; the branch; and the
 /// session's tokens last, the first a narrow row gives up. A value the facts
-/// lack is left out, not shown as a placeholder.
+/// lack is left out, not shown as a placeholder; one the person hid
+/// ([`FooterFacts::off`]) reads greyed, [`OFF_STUB`] after it.
 pub fn segments(facts: &FooterFacts) -> Vec<Segment> {
     let mut out: Vec<Segment> = facts
         .upgrade
@@ -2988,34 +3630,103 @@ pub fn segments(facts: &FooterFacts) -> Vec<Segment> {
         .map(|note| upgrade_segment(&note.whole))
         .into_iter()
         .collect();
-    out.extend(fact_segments(facts));
+    out.extend(fact_segments(facts, true));
     out
 }
 
 /// The upgrade note's segment, `text` its whole or its short words.
 fn upgrade_segment(text: &str) -> Segment {
-    Segment {
-        mark: UPGRADE_MARK,
-        text: text.to_owned(),
+    Segment::plain(UPGRADE_MARK, text)
+}
+
+/// The model-and-effort segment under the mask ([`FooterFacts::off`]): `◆
+/// Opus 5.5 xhigh` split at the effort; a hidden model or effort is its
+/// stub — its value greyed, [`OFF_STUB`] after it (`◆ Opus 5.5 off xhigh`,
+/// `◆ Opus 5.5 xhigh off`, both `◆ Opus 5.5 off xhigh off`, each side of the
+/// split its own) — or with no `stubs` is left out (`◆ xhigh`, `◆ Opus 5.5`,
+/// nothing). A fact the facts lack is never a stub.
+fn model_effort_segment(facts: &FooterFacts, stubs: bool) -> Option<Segment> {
+    let off = facts.off;
+    let model = facts.model.as_deref();
+    let effort = facts.effort.as_deref();
+    let hide_model = model.is_some() && off.has(FactKind::Model);
+    let hide_effort = effort.is_some() && off.has(FactKind::Effort);
+    let segment = |text: String, split: Option<usize>, quiet: (bool, bool)| Segment {
+        mark: MODEL_MARK,
+        text,
+        split,
+        quiet,
+    };
+    match (model, effort) {
+        (None, None) => None,
+        (Some(model), None) => match (hide_model, stubs) {
+            (false, _) => Some(segment(model.to_owned(), None, (false, false))),
+            (true, true) => Some(segment(format!("{model} {OFF_STUB}"), None, (true, false))),
+            (true, false) => None,
+        },
+        (None, Some(effort)) => match (hide_effort, stubs) {
+            (false, _) => Some(segment(effort.to_owned(), Some(0), (false, false))),
+            (true, true) => Some(segment(
+                format!("{effort} {OFF_STUB}"),
+                Some(0),
+                (false, true),
+            )),
+            (true, false) => None,
+        },
+        (Some(model), Some(effort)) => match (hide_model, hide_effort, stubs) {
+            (false, false, _) => Some(segment(
+                format!("{model} {effort}"),
+                Some(model.len() + 1),
+                (false, false),
+            )),
+            (true, false, true) => Some(segment(
+                format!("{model} {OFF_STUB} {effort}"),
+                Some(model.len() + OFF_STUB.len() + 2),
+                (true, false),
+            )),
+            (true, false, false) => Some(segment(effort.to_owned(), Some(0), (false, false))),
+            (false, true, true) => Some(segment(
+                format!("{model} {effort} {OFF_STUB}"),
+                Some(model.len() + 1),
+                (false, true),
+            )),
+            (false, true, false) => Some(segment(model.to_owned(), None, (false, false))),
+            (true, true, true) => Some(segment(
+                format!("{model} {OFF_STUB} {effort} {OFF_STUB}"),
+                Some(model.len() + OFF_STUB.len() + 2),
+                (true, true),
+            )),
+            (true, true, false) => None,
+        },
     }
 }
 
-/// [`segments`] but the upgrade note: what Claude Code's own files say.
-fn fact_segments(facts: &FooterFacts) -> Vec<Segment> {
+/// [`segments`] but the upgrade note: what Claude Code's own files say, a
+/// hidden fact as its stub (`stubs`) or left out.
+fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
     let usage = facts.usage.as_ref();
-    let model_effort = match (&facts.model, &facts.effort) {
-        (Some(model), Some(effort)) => Some(format!("{model} {effort}")),
-        (Some(one), None) | (None, Some(one)) => Some(one.clone()),
-        (None, None) => None,
+    // A hidden path, branch or context: its stub (its value greyed, `off`
+    // after it), or nothing.
+    let hidable = |kind: FactKind, value: &Option<String>| -> Option<Segment> {
+        let mark = kind.mark()?;
+        let value = value.as_ref()?;
+        if !facts.off.has(kind) {
+            return Some(Segment::plain(mark, value.clone()));
+        }
+        stubs.then(|| Segment {
+            quiet: (true, false),
+            ..Segment::plain(mark, format!("{value} {OFF_STUB}"))
+        })
     };
+    let plain = |mark: char, text: Option<String>| text.map(|text| Segment::plain(mark, text));
     [
-        (
+        plain(
             WALL_MARK,
             usage
                 .and_then(|u| u.wall.as_ref())
                 .map(super::session_usage::wall_text),
         ),
-        (
+        plain(
             ACCOUNT_MARK,
             facts.subscription.as_ref().map(|s| {
                 s.email
@@ -3023,11 +3734,11 @@ fn fact_segments(facts: &FooterFacts) -> Vec<Segment> {
                     .unwrap_or_else(|| "account unavailable".into())
             }),
         ),
-        (
+        plain(
             PLAN_MARK,
             facts.subscription.as_ref().and_then(|s| s.plan.clone()),
         ),
-        (
+        plain(
             WEEKLY_MARK,
             facts.subscription.as_ref().map(|s| {
                 s.weekly
@@ -3035,18 +3746,18 @@ fn fact_segments(facts: &FooterFacts) -> Vec<Segment> {
                     .unwrap_or_else(|| "weekly unavailable".into())
             }),
         ),
-        (MODEL_MARK, model_effort),
-        (
+        model_effort_segment(facts, stubs),
+        plain(
             ACCOUNT_MARK,
             facts
                 .account
                 .clone()
                 .filter(|_| facts.subscription.is_none()),
         ),
-        (PATH_MARK, facts.path.clone()),
-        (BRANCH_MARK, facts.branch.clone()),
-        (CONTEXT_MARK, facts.context.clone()),
-        (
+        hidable(FactKind::Path, &facts.path),
+        hidable(FactKind::Branch, &facts.branch),
+        hidable(FactKind::Context, &facts.context),
+        plain(
             USAGE_MARK,
             usage.and_then(|u| {
                 super::session_usage::usage_text_at(u, super::session_usage::UsageGrain::Total)
@@ -3054,17 +3765,18 @@ fn fact_segments(facts: &FooterFacts) -> Vec<Segment> {
         ),
     ]
     .into_iter()
-    .filter_map(|(mark, text)| Some(Segment { mark, text: text? }))
+    .flatten()
     .collect()
 }
 
 /// The model alone as a segment — the rung a narrow rule gives up last
-/// ([`facts_ladder`]).
+/// ([`facts_ladder`]). None while the model is hidden.
 fn model_alone(facts: &FooterFacts) -> Option<Segment> {
-    facts.model.as_ref().map(|model| Segment {
-        mark: MODEL_MARK,
-        text: model.clone(),
-    })
+    facts
+        .model
+        .as_ref()
+        .filter(|_| !facts.off.has(FactKind::Model))
+        .map(|model| Segment::plain(MODEL_MARK, model.clone()))
 }
 
 /// The cells `text` takes on the glass: a wide char two, a combining mark
@@ -3095,6 +3807,12 @@ pub struct SetGlyph {
     pub nudge: i8,
     /// A fact's mark (`◆`, `⌂`, ...) rather than a character of its value.
     pub mark: bool,
+    /// A character of the model-and-effort segment's effort, past its
+    /// [`Segment::split`] ([`fact_spans`]).
+    pub tail: bool,
+    /// A character of a hidden fact's greyed stub, its value and
+    /// [`OFF_STUB`] ([`Segment::quiet`]).
+    pub quiet: bool,
 }
 
 /// The facts set as a line of small type ([`set_facts`]).
@@ -3139,12 +3857,26 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
         if i > 0 {
             line += GAP;
         }
+        // Whether a char of the segment's text (at its byte `at`) is in the
+        // effort (past the split), and part of a hidden fact's stub; the
+        // mark and the space after it are neither.
+        let quiet = |tail: bool| {
+            if tail {
+                segment.quiet.1
+            } else {
+                segment.quiet.0
+            }
+        };
+        let of_text = |own: bool, at: usize| {
+            let tail = own && segment.split.is_some_and(|split| at >= split);
+            (tail, own && quiet(tail))
+        };
         let mut mark_buf = [0; 4];
         let mark_text = segment.mark.encode_utf8(&mut mark_buf);
-        for (text, mark) in [
-            (mark_text as &str, true),
-            (" ", false),
-            (&segment.text, false),
+        for (text, mark, own) in [
+            (mark_text as &str, true, false),
+            (" ", false, false),
+            (&segment.text, false, true),
         ] {
             let mut grid = aterm_grapheme::GridColumns::new();
             let mut base = None;
@@ -3162,6 +3894,7 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
                                 .is_some_and(aterm_grapheme::is_emoji_presentation));
                     grid.advance_str(cluster.text);
                     let index = glyphs.len();
+                    let (tail, quiet) = of_text(own, cluster.byte_offset);
                     place.push(line);
                     glyphs.push(SetGlyph {
                         ch: cluster.text.chars().next().unwrap_or(' '),
@@ -3169,6 +3902,8 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
                         cols: cluster.width,
                         nudge: 0,
                         mark,
+                        tail,
+                        quiet,
                     });
                     if cluster.codepoint_count > 1 {
                         clusters.push((index, Box::<str>::from(cluster.text)));
@@ -3179,7 +3914,11 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
                 }
                 // Match the native grid: a non-emoji cluster may open several
                 // cells, while its marks attach to the preceding spacing base.
-                for ch in cluster.text.chars().filter(|ch| !ch.is_control()) {
+                for (at, ch) in cluster
+                    .text
+                    .char_indices()
+                    .filter(|(_, ch)| !ch.is_control())
+                {
                     match grid.step(ch) {
                         aterm_grapheme::GridStep::Opens { width, .. } => {
                             if ch.is_whitespace() {
@@ -3187,6 +3926,7 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
                                 base = None;
                                 continue;
                             }
+                            let (tail, quiet) = of_text(own, cluster.byte_offset + at);
                             base = Some(glyphs.len());
                             place.push(line);
                             glyphs.push(SetGlyph {
@@ -3195,6 +3935,8 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
                                 cols: width,
                                 nudge: 0,
                                 mark,
+                                tail,
+                                quiet,
                             });
                             line += width as f32;
                         }
@@ -3289,6 +4031,129 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
         }
         cells += 1;
     }
+}
+
+/// Where one fact lies in the facts as set ([`fact_spans`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FactSpan {
+    /// Which fact.
+    pub kind: FactKind,
+    /// Its cells in the set run ([`SetFacts::cells`]), `start..end`: its mark
+    /// (where the fact leads its segment) through its last glyph.
+    pub cells: (u16, u16),
+    /// The hidden facts a click on it shows again: empty for a shown fact,
+    /// the stub's own fact for a stub.
+    pub restores: FactMask,
+}
+
+/// Every fact of one rule's facts, in reading order ([`fact_spans`]): at most
+/// one span each for the model, the effort, the path, the branch, the context
+/// and the usage. Fixed, so a frame keeps them with no allocation.
+pub type FactSpans = [Option<FactSpan>; 6];
+
+/// The fact a glyph of segment `segment` stands for (`tail`: past its split,
+/// the effort), and what a click on it shows again; `None` for the segments
+/// that are no fact (a limit wall, the account, the upgrade note).
+fn glyph_fact(segment: &Segment, tail: bool, quiet: bool) -> Option<(FactKind, FactMask)> {
+    let kind = if tail {
+        FactKind::Effort
+    } else {
+        match segment.mark {
+            MODEL_MARK => FactKind::Model,
+            PATH_MARK => FactKind::Path,
+            BRANCH_MARK => FactKind::Branch,
+            CONTEXT_MARK => FactKind::Context,
+            USAGE_MARK => FactKind::Usage,
+            _ => return None,
+        }
+    };
+    let restores = if quiet {
+        FactMask::default().with(kind, true)
+    } else {
+        FactMask::default()
+    };
+    Some((kind, restores))
+}
+
+/// Where each fact of `segments`, as [`set_facts`] set them (`set`), lies: a
+/// mark glyph starts the next segment; a glyph past the model-and-effort
+/// segment's split is the effort, any other its segment's fact (the model,
+/// the path, the branch, the context, the usage); a mark joins its first
+/// character's fact.
+/// A limit wall, the account and the upgrade note are no fact. Pure.
+#[must_use]
+pub fn fact_spans(set: &SetFacts, segments: &[Segment]) -> FactSpans {
+    let mut spans: FactSpans = [None; 6];
+    let room = spans.len();
+    let mut n = 0usize;
+    let mut segment: Option<&Segment> = None;
+    let mut next = 0usize;
+    // A mark's lead cell, until its first character names the fact.
+    let mut mark_at: Option<usize> = None;
+    let cell = |at: usize| u16::try_from(at).unwrap_or(u16::MAX);
+    for glyph in &set.glyphs {
+        if glyph.mark {
+            segment = segments.get(next);
+            next += 1;
+            mark_at = Some(glyph.cell);
+            continue;
+        }
+        let Some((kind, restores)) = segment.and_then(|s| glyph_fact(s, glyph.tail, glyph.quiet))
+        else {
+            mark_at = None;
+            continue;
+        };
+        let start = mark_at.take().unwrap_or(glyph.cell);
+        let end = glyph.cell + glyph.cols;
+        match n.checked_sub(1).and_then(|last| spans[last].as_mut()) {
+            // The same fact goes on (one segment's run of one fact).
+            Some(span) if span.kind == kind && span.restores == restores && start == glyph.cell => {
+                span.cells.1 = cell(end);
+            }
+            _ if n < room => {
+                spans[n] = Some(FactSpan {
+                    kind,
+                    cells: (cell(start), cell(end)),
+                    restores,
+                });
+                n += 1;
+            }
+            _ => break,
+        }
+    }
+    spans
+}
+
+/// The cells of the set run ([`SetFacts::cells`]) an underline under `span`'s
+/// fact takes, so that it lies under the fact's glyphs where they are drawn
+/// rather than under the cells they stand in. Each glyph has a cell of its
+/// own but is drawn its nudge from it ([`SetGlyph::nudge`]): along a word set
+/// tighter than the grid the glyphs drift off their cells, a cell or two on a
+/// long path, and come back across the gaps, so the fact's own cells
+/// (`span.cells`, the click's target) are not where its ink is. The run is
+/// every cell whose middle lies between the left edge of the fact's first
+/// glyph as drawn and the right edge of its last; empty where no glyph
+/// stands in `span`. Pure.
+#[must_use]
+pub fn drawn_cells(set: &SetFacts, span: &FactSpan) -> std::ops::Range<usize> {
+    let n = isize::from(NUDGES_PER_CELL);
+    let own = usize::from(span.cells.0)..usize::from(span.cells.1);
+    let mut edges: Option<(isize, isize)> = None;
+    for glyph in set.glyphs.iter().filter(|g| own.contains(&g.cell)) {
+        let left = glyph.cell as isize * n + isize::from(glyph.nudge);
+        let right = left + glyph.cols as isize * n;
+        edges = Some(edges.map_or((left, right), |(l, r)| (l.min(left), r.max(right))));
+    }
+    let Some((left, right)) = edges else {
+        return 0..0;
+    };
+    // The first cell whose middle (`c * n + n / 2`) is at or past `edge`.
+    let first = |edge: isize| {
+        (edge - n / 2 + n - 1)
+            .div_euclid(n)
+            .clamp(0, set.cells as isize) as usize
+    };
+    first(left)..first(right)
 }
 
 /// The run of the composer's bottom rule aterm may write into: the widest run
@@ -3416,16 +4281,18 @@ fn rule_width(
     facts + lights + if facts > 0 && lights > 0 { RULE_SEP } else { 0 }
 }
 
-/// The facts as a narrow rule gives them up: the usage first (its total
-/// narrowed to its runtime alone, `Σ 7h52m`, then gone), then the path cut to
-/// `…/<dir>`, the branch, the path, the effort and the model, a limit wall
-/// standing alone last. The account ([`FooterFacts::account`]) stands whole
-/// beside whatever fits without it, or not at all (a clipped label would name
-/// another account): it takes only the tokens' room. A rule too narrow for the
-/// wall gives up the wall, not everything behind it: the same rungs follow
-/// without it, so a narrow pane keeps the model it showed before the limit
-/// (Claude's own screen carries the notice), and the model alone is the last
-/// rung ([`model_alone`]). Never empty: the whole facts are the first rung.
+/// The facts as a narrow rule gives them up: a hidden fact's stub first
+/// ([`OFF_STUB`]: the whole facts with their stubs, then without them), then
+/// the usage (its total narrowed to its runtime alone, `Σ 7h52m`, then gone),
+/// then the path cut to `…/<dir>`, the branch, the path, the effort and the
+/// model, a limit wall standing alone last. The account
+/// ([`FooterFacts::account`]) stands whole beside whatever fits without it,
+/// or not at all (a clipped label would name another account): it takes only
+/// the tokens' room. A rule too narrow for the wall gives up the wall, not
+/// everything behind it: the same rungs follow without it, so a narrow pane
+/// keeps the model it showed before the limit (Claude's own screen carries
+/// the notice), and the model alone is the last rung ([`model_alone`]). Never
+/// empty: the whole facts are the first rung.
 ///
 /// A live upgrade waiting on the person here ([`FooterFacts::upgrade`]) gives
 /// way as a light's reason does ([`fit_rule`]): whole beside the whole facts,
@@ -3443,7 +4310,7 @@ fn facts_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     };
     let whole = &plain[0];
     let mut out = vec![led(&note.whole, whole)];
-    for rung in plain.iter().filter(|rung| top_of(rung).eq(top_of(whole))) {
+    for rung in plain.iter().filter(|rung| same_top(rung, whole)) {
         let rung = led(&note.short, rung);
         if !out.contains(&rung) {
             out.push(rung);
@@ -3464,12 +4331,37 @@ fn top_of(rung: &[Segment]) -> impl Iterator<Item = &Segment> {
     })
 }
 
-/// [`facts_ladder`] of the facts alone, with no upgrade note.
+/// Whether rungs `a` and `b` show the same [`top_of`], a hidden fact's stub
+/// aside ([`Segment::shown_part`]): a stub gives way before a reason does.
+fn same_top(a: &[Segment], b: &[Segment]) -> bool {
+    let shown = |rung| {
+        top_of(rung)
+            .map(Segment::shown_part)
+            .filter(|(_, text)| !text.is_empty())
+    };
+    shown(a).eq(shown(b))
+}
+
+/// [`facts_ladder`] of the facts alone, with no upgrade note: the whole facts
+/// with their stubs, then today's rungs of the facts without them
+/// ([`bare_ladder`]).
 fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
+    let mut out = vec![fact_segments(facts, true)];
+    for rung in bare_ladder(facts) {
+        if !out.contains(&rung) {
+            out.push(rung);
+        }
+    }
+    out
+}
+
+/// [`plain_ladder`] without a hidden fact's stub: a hidden fact is left out
+/// of every rung.
+fn bare_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     if facts.subscription.is_some() {
         return subscription_ladder(facts);
     }
-    let whole = fact_segments(facts);
+    let whole = fact_segments(facts, false);
     let mark = |mark: char| whole.iter().find(|s| s.mark == mark).cloned();
     let (wall, model_effort, account, path, branch) = (
         mark(WALL_MARK),
@@ -3481,11 +4373,9 @@ fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     let short = facts
         .path
         .as_deref()
+        .filter(|_| !facts.off.has(FactKind::Path))
         .and_then(elide_path)
-        .map(|text| Segment {
-            mark: PATH_MARK,
-            text,
-        });
+        .map(|text| Segment::plain(PATH_MARK, text));
     let model = model_alone(facts);
     // The `Σ` segment narrows to the runtime alone before it goes.
     let runtime: Option<Vec<Segment>> = facts
@@ -3499,10 +4389,7 @@ fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
                 .iter()
                 .filter(|s| s.mark != USAGE_MARK)
                 .cloned()
-                .chain(std::iter::once(Segment {
-                    mark: USAGE_MARK,
-                    text,
-                }))
+                .chain(std::iter::once(Segment::plain(USAGE_MARK, text)))
                 .collect()
         });
     // Where the account does not fit, the rule with no account: the whole
@@ -3575,7 +4462,7 @@ fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
 /// workspace and usage details have given way. The native footer without this display
 /// keeps its established ladder above.
 fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
-    let mut rung = fact_segments(facts);
+    let mut rung = fact_segments(facts, false);
     let mut out = vec![rung.clone()];
     for mark in [
         CONTEXT_MARK,
@@ -3630,7 +4517,7 @@ fn shorten_subscription_account(segments: &mut [Segment], limit: usize) -> bool 
 /// The account/quota pair that controls must leave room for. A limit wall
 /// retains priority when a pane cannot hold it and the pair together.
 fn subscription_reservation(facts: &FooterFacts, room: usize) -> usize {
-    let segments = fact_segments(facts);
+    let segments = fact_segments(facts, false);
     let wall = segments.iter().find(|s| s.mark == WALL_MARK).cloned();
     let mut essentials: Vec<_> = segments
         .into_iter()
@@ -3714,7 +4601,7 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
     .filter_map(|title| Some((alone?, title, chips)));
     let reasons = ladder[1..]
         .iter()
-        .filter(|rung| reason && top_of(rung).eq(top_of(whole)))
+        .filter(|rung| reason && same_top(rung, whole))
         .map(|rung| (rung.as_slice(), TitleFit::Short, chips));
     let bare = ladder
         .iter()
@@ -3761,6 +4648,155 @@ pub fn chips_room(facts: &FooterFacts, room: usize) -> usize {
         0
     };
     room.saturating_sub(beside + 2)
+}
+
+/// Where Claude Code's top-effort tag ([`CLAUDE_TOP_EFFORT_KEY`]) stands in the
+/// composer's TOP rule `row` (`──── <key> ─`, right-aligned the way it writes
+/// its labels): the char columns `start..end` of the key as a whole token in
+/// the rule's trailing ` <labels> ─` zone, after its last run of two or more
+/// `─`, labels split on two spaces and words on one. `None` for a row that is
+/// no rule ([`aterm_phase::phase::is_rule`]), a rule with no labels, or labels
+/// that do not hold the key alone (a path ending in it is not it).
+#[must_use]
+pub fn top_rule_tag(row: &str) -> Option<(usize, usize)> {
+    if !aterm_phase::phase::is_rule(row) {
+        return None;
+    }
+    let chars: Vec<char> = row.trim_end().chars().collect();
+    let n = chars.len();
+    // ` <labels> ─`: the rule's last glyph alone after a blank.
+    if n < 4 || chars[n - 1] != '\u{2500}' || chars[n - 2] != ' ' {
+        return None;
+    }
+    // Just past the last run of two or more `─` before it.
+    let zone = (1..n - 2)
+        .rev()
+        .find(|&i| chars[i] == '\u{2500}' && chars[i - 1] == '\u{2500}')?
+        + 1;
+    let key: Vec<char> = CLAUDE_TOP_EFFORT_KEY.chars().collect();
+    let labels = &chars[zone..n - 2];
+    let mut at = 0;
+    while at < labels.len() {
+        if labels[at] == ' ' {
+            at += 1;
+            continue;
+        }
+        let end = (at..labels.len())
+            .find(|&i| labels[i] == ' ')
+            .unwrap_or(labels.len());
+        if labels[at..end] == key[..] {
+            return Some((zone + at, zone + end));
+        }
+        at = end;
+    }
+    None
+}
+
+/// What Claude Code answered an `/effort <key> on|off` with on the screen
+/// ([`top_effort_answer`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TopAnswer {
+    /// `<Key> on (this session only): …`.
+    On,
+    /// `<Key> off. Effort stays …`.
+    Off,
+    /// `<Key> needs dynamic workflows enabled (see /config). …`.
+    NeedsWorkflows,
+    /// `<Key> isn't available on <model>. …`.
+    Unavailable,
+}
+
+/// How many rows an answer [`top_effort_answer`] reads may take: its `⎿`
+/// row and the rows it wraps onto (MEASURED on 2.1.304: the refusal wraps to
+/// six rows at 26 columns).
+const TOP_ANSWER_ROWS: usize = 8;
+
+/// What Claude Code answered an `/effort <key> on|off` with
+/// ([`top_effort_reply`]): the answer, and the model it names where it names
+/// one (`<Key> isn't available on claude-sonnet-4-5. …` names the model's ID,
+/// MEASURED on 2.1.304).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TopReply {
+    pub answer: TopAnswer,
+    pub model: Option<String>,
+}
+
+/// Claude Code's transient level hint, right-aligned above the composer's
+/// top rule a moment after an `/effort` (`◐ medium · /effort`, `◐ medium ·
+/// <key> · /effort`; MEASURED on 2.1.304): no answer's row.
+fn is_effort_hint(text: &str) -> bool {
+    text.ends_with(aterm_phase::anchor("effort.hint_tail"))
+}
+
+/// The answer to an `/effort <key> on|off` that the screen `rows` show above
+/// the composer's top rule (row `top_rule`) — [`top_effort_reply`]'s answer.
+/// Pure.
+#[must_use]
+pub fn top_effort_answer(rows: &[String], top_rule: usize) -> Option<TopAnswer> {
+    top_effort_reply(rows, top_rule).map(|reply| reply.answer)
+}
+
+/// The answer to an `/effort <key> on|off` that the screen `rows` show above
+/// the composer's top rule (row `top_rule`): the NEWEST `⎿` result block
+/// over the rule — past the blank rows the fullscreen renderer leaves between
+/// a short transcript and the composer and past the transient level hint
+/// ([`is_effort_hint`]) — its `⎿` row and the rows it wraps onto (at most
+/// [`TOP_ANSWER_ROWS`] in all) joined back with a blank, so an anchor a
+/// narrow pane broke across rows is read whole (MEASURED on 2.1.304: at 26
+/// and 34 columns ` on (this session only): ` and ` needs dynamic workflows
+/// enabled` break, the gutter after `⎿` one blank; at 80 columns `. Effort
+/// stays ` does). Reading stops at a `❯` row — a person's echo, under which
+/// an older answer is not this one's — a message, a status row or a blank
+/// row inside the block. Pure.
+#[must_use]
+pub fn top_effort_reply(rows: &[String], top_rule: usize) -> Option<TopReply> {
+    use aterm_phase::anchor;
+    let top_rule = top_rule.min(rows.len());
+    // Up from the rule over the blank rows and the level hint.
+    let mut end = top_rule;
+    while end > 0 {
+        let text = rows[end - 1].trim();
+        if !(text.is_empty() || is_effort_hint(text)) {
+            break;
+        }
+        end -= 1;
+    }
+    let first = end.saturating_sub(TOP_ANSWER_ROWS);
+    let at = (first..end).rev().find_map(|i| {
+        let text = rows[i].trim_start();
+        if text.is_empty() || text.starts_with(['\u{276F}', '\u{23FA}', '\u{25CF}', '\u{273B}']) {
+            return Some(None);
+        }
+        text.starts_with('\u{23BF}').then_some(Some(i))
+    })??;
+    let head = rows[at].trim_start().strip_prefix('\u{23BF}')?;
+    // The answer's text, the rows it wraps onto joined back with a blank.
+    let mut body = head.trim().to_owned();
+    for more in &rows[at + 1..end] {
+        body.push(' ');
+        body.push_str(more.trim());
+    }
+    let rest = past_key(&body)?;
+    let answer = if rest.starts_with(anchor("effort.top_on")) {
+        TopAnswer::On
+    } else if rest.starts_with(anchor("effort.top_off")) {
+        TopAnswer::Off
+    } else if rest.starts_with(anchor("effort.top_needs")) {
+        TopAnswer::NeedsWorkflows
+    } else {
+        let named = rest.strip_prefix(anchor("effort.top_unavailable"))?;
+        // The model's ID, up to the sentence's end.
+        let id = named.split_whitespace().next().unwrap_or("");
+        let id = id.strip_suffix('.').unwrap_or(id);
+        return Some(TopReply {
+            answer: TopAnswer::Unavailable,
+            model: (!id.is_empty()).then(|| id.to_owned()),
+        });
+    };
+    Some(TopReply {
+        answer,
+        model: None,
+    })
 }
 
 /// The environment actions of `ClaudeFooterModel`

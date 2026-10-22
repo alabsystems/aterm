@@ -592,6 +592,13 @@ aux_targets! {
         /// `autopilot-menu/settings`), and `open autopilot-menu` opens it
         /// from the front window's focused session's chip.
         AutopilotMenu = "autopilot-menu",
+        /// A fact's menu, the same card hung from a fact of Claude Code's
+        /// composer rule (the usage's: its Traffic card, a graph over time);
+        /// `open fact-menu <model|effort|path|branch|context|usage>` opens the front
+        /// window's focused session's, `open fact-menu close`
+        /// closes it, and `controls fact-menu` lists its rows by their stable
+        /// keys (`fact-menu/<fact>/<act>`), its first line naming the fact.
+        FactMenu = "fact-menu",
         /// The Overview (`docs/DESIGN-owner-surfaces-2026-10-16.md` §6, was
         /// the Connection Map); `open overview` raises it on the front window,
         /// `controls overview` reads the open card's groups, chips and manages
@@ -2276,7 +2283,9 @@ pub const VERBS: &[VerbSpec] = &[
          stable keys (`autopilot-menu/mode/<word>`, `autopilot-menu/land-in/<minutes>`, \
          `autopilot-menu/land-at`, `autopilot-menu/land-cancel`, `autopilot-menu/settings`); \
          a place a row left while it was open is `autopilot-menu gap index=<i>`, blank and \
-         inert, so the rows after it keep their frame rows. `controls overview` is \
+         inert, so the rows after it keep their frame rows. `controls fact-menu` reads a \
+         fact's menu the same way (`fact-menu open=true session=<sid> fact=<fact>`, rows \
+         keyed `fact-menu/<fact>/<act>`). `controls overview` is \
          Owner-escalated; the rest answer at any scope. Off macOS `front` \
          ends with `confirm open=<true|false>`: a close or quit waiting on an answer in the \
          window, `by=` who asked. When a control client asked, `answer=\"confirm yes\"` goes \
@@ -3173,8 +3182,9 @@ pub const VERBS: &[VerbSpec] = &[
          `handoff` above). It is written to disk on macOS and Linux, following restore_session, \
          unless `[session_log] journal = false` (on by default; a headless instance keeps none), \
          so `log @<sid>` also answers, owner only, a session of an earlier process; and \
-         its turn and bus class reach the fabric only with `[fabric] log = \"turns\"` (off by \
-         default; `aterm fabric brief` reads that mirror). `log n` reads the INSTANCE's node log \
+         its turn and bus class reach the fabric by default, once the node's bridge is attached \
+         to a broker that retains its `ev` faces (`[fabric] log = \"auto\"`; \"turns\" \
+         mirrors over any broker, \"off\" never; `aterm fabric brief` reads that mirror). `log n` reads the INSTANCE's node log \
          instead (Owner-only, like `brief all`; no selector; answered with no terminal): 1024 \
          records at node `n`, oldest evicted first, in memory only (never journaled, carried or \
          mirrored) — `open n start prev_end=<clean|handoff|killed|signal|panic|running|unknown|\
@@ -4197,9 +4207,12 @@ pub const VERBS: &[VerbSpec] = &[
             open_aliases!(),
             "); reply `OK opened \
              <target>` (`OK closed <target>`). `front` is always open; `window <target>` \
-             photographs and `controls <target>` reads each one. While any session is held, \
-             opening `menu`, `tab-menu`, `overview` or `autopilot-menu` answers `ERR halted` \
-             as `invoke` does (see `hold`)"
+             photographs and `controls <target>` reads each one. `open fact-menu \
+             <model|effort|path|branch|context|usage>` opens that fact's menu (the usage's \
+             Traffic card) from the front pane's composer rule; `open fact-menu close` \
+             closes it. While any session is held, \
+             opening `menu`, `tab-menu`, `overview`, `autopilot-menu` or `fact-menu` answers \
+             `ERR halted` as `invoke` does (see `hold`)"
         ),
     )
     // Outside the halt as a verb: opens a native tab app (settings, markdown, editor) or a
@@ -5390,11 +5403,13 @@ pub const VERBS: &[VerbSpec] = &[
          above `seen=`, not merely one nobody listed — plus broadcasts a full quota refused and, \
          across a seamless update (which keeps the count), the broadcasts still unhandled when \
          it was drawn, which it does not carry — and `pending=` the unlisted delivered \
-         rows this reply did not carry. A DROPPED ROW IS NOT LOST: every one of this session's \
-         records from `oldest_on_bus=@<off>` (the lowest offset ever delivered here) to \
-         `bus_head=` is on the broker's durable log whether or not the ring still holds it, and \
-         `inbox get @<off>` fetches it through the bridge — the offsets in between are shared \
-         with the whole fleet, so most belong to other sessions (`ERR no such record`). \
+         rows this reply did not carry. A DROPPED ROW IS STILL ON THE BUS WHILE THE BROKER KEEPS \
+         IT: every one of this session's records from `oldest_on_bus=@<off>` (the lowest offset \
+         ever delivered here) to `bus_head=` that the broker's retention still keeps is on its \
+         durable log whether or not the ring still holds it, and `inbox get @<off>` fetches it \
+         through the bridge; one it gave up answers `ERR retained-from=<floor>`, where what it \
+         keeps of this session's lane starts — the offsets in between are shared with the \
+         whole fleet, so most belong to other sessions (`ERR no such record`). \
          `verdict=<handled|refused|deferred>` rides a \
          `kind=ack` row: the RECIPIENT's word on the ask/task at `re=`, published by their \
          bridge when they ran `inbox seen <id> <verdict>` (a receipt; `re-id=` names your post). \
@@ -5428,8 +5443,9 @@ pub const VERBS: &[VerbSpec] = &[
          than that), the record's fields on the tail because it has no row id: nothing is \
          re-appended, no watermark, quota or event moves. Every one of this session's records \
          from the header's `oldest_on_bus=` to `bus_head=` is fetchable while the broker holds \
-         it; the offsets in between are shared with the whole fleet, so most answer `ERR no \
-         such record`. The read PARKS for the bridge: its `fetch` event wakes the bridge \
+         it, and one below what its retention keeps of this session's lane answers `ERR \
+         retained-from=<floor> off=<n>`; the offsets in between are shared with the whole fleet, \
+         so most answer `ERR no such record`. The read PARKS for the bridge: its `fetch` event wakes the bridge \
          at once, and the bridge's 2 s roster round finds one it missed; it is bounded at 10 s (`ERR timeout off=<n>`); with no bridge that \
          can read it answers `ERR fabric <state> off=<n>` at once; at most 8 reads park per \
          session (`ERR busy`). `ERR no such record off=<n>` is the ONE answer for an offset that \
@@ -5603,7 +5619,8 @@ pub const VERBS: &[VerbSpec] = &[
          off=`) with the record as read from the broker's log — the row fields without `off=`, \
          and `len=<true size>` when the record is over 256 KiB and the body is cut there — or \
          `err=<token>` (`no-record`, `unreadable`, `observer`, `forged-self`, `via`, `malformed`, \
-         `oversize`, `refused`) for why there is none. A body that does not fit one line arrives \
+         `oversize`, `refused`, and `retained` with `floor=<n>`, below what the broker's \
+         retention keeps of the session's lane) for why there is none. A body that does not fit one line arrives \
          in CHUNKS, each a whole `fetched=` line with the same fields: `at=<n>` is the byte \
          offset where its `text=` starts in the decoded body and `more=1` marks all but the \
          last. It touches no ring: the parked read takes the answer, nothing is appended, and a \
@@ -5658,9 +5675,12 @@ pub const VERBS: &[VerbSpec] = &[
          only what names an offset at or above it (a queued reply, an owed receipt, a parked \
          read, a dedup entry, a row's threading) and keeps the rest; a session on any other log \
          forgets everything. `was=` must be an earlier generation of the same log. `mirror \
-         on|stopped|capped [reason=<token>]` is the bus mirror's state (session log phase 4, \
-         only from a bridge whose `hello` said `log=turns`), which `fabric status` prints as \
-         `mirror=` beside `bridge_log=turns`. `link bye <quit|handoff>` is the bridge \
+         on|stopped|capped|budget|unretained [reason=<token>]` is the bus mirror's state \
+         (session log phase 4, only from a bridge whose `hello` said `log=turns` or `log=auto`; \
+         `budget`, lane 6, the node's bytes in a retaining broker's window at their budget, a \
+         wait and not a stop; `unretained`, lane 6, an `auto` bridge over a broker that retains \
+         none of its `ev` faces, which mirrors nothing), which `fabric status` prints as \
+         `mirror=` beside `bridge_log=turns` or `bridge_log=auto`. `link bye <quit|handoff>` is the bridge \
          TAKING the instance's last word, the `EVENT * bye <word>` the instance pushes before \
          it closes the lanes — `quit` at the end of a quit, `handoff` at a seamless update's \
          Commit: a quit waits for this ack (1 s at most) and retires the bridge supervisor, \
@@ -5774,7 +5794,7 @@ pub const VERBS: &[VerbSpec] = &[
              held — including the aimed `@<sid> tab …` form, which drives the window HOSTING that \
              session and therefore answers `ERR halted` whenever any session of that instance is \
              held, not only the one it names. So is `open` of a card whose rows are acts — `open \
-             menu|palette`, `open tab-menu`, `open autopilot-menu`, `open overview|connections` \
+             menu|palette`, `open tab-menu`, `open autopilot-menu`, `open fact-menu`, `open overview|connections` \
              (closing one stays answerable) — since each is `invoke`'s rows behind a key. That instance-wide halt is \
              deliberate under a person's Take Over: it is what keeps an agent from `hwkey`ing a \
              menu shortcut, `pointer`-clicking Hand Back or opening a card to press it, and its \
@@ -5884,8 +5904,9 @@ pub const VERBS: &[VerbSpec] = &[
         BridgeOnly,
         "log-take [n=<1..64>] [tier=wire|meta] [key=<hex>]: the bus mirror's next slots",
         "BRIDGE-ONLY, and served only to a bridge whose recorded `hello` said `log=turns` \
-         (`[fabric] log = \"turns\"`; the default `off` sends neither verb; any other bridge is \
-         answered `ERR mirror off`). `OK <nbytes> \
+         (`[fabric] log = \"turns\"`, or the default `auto` once its broker retains the node's \
+         `ev` faces, when it says `hello` again with `log=turns`; `off` sends neither verb; any \
+         other bridge is answered `ERR mirror off`). `OK <nbytes> \
          slots=<k>[ more=1]` then that many bytes: one `<sid> <ep>:<seq>:<ms> <v=2 body>` line \
          per slot, oldest first per session, sessions round robin, at most `n` (64, the \
          default) in all. A slot is a bus-class record of the session log (the turn class, the \
@@ -6523,7 +6544,11 @@ pub fn is_any_scope_meta(verb: &str) -> bool {
 /// said at the bridge's start and as the owner empties it, which at 0 ends the instance's entry
 /// for the owner's look), which an instance at lane 4 answers `ERR usage`; a bridge says it only
 /// to a lane-5 instance.
-pub const BRIDGE_LANE: u32 = 5;
+/// 6, the bus mirror's waiting state `link mirror budget` (session log Phase 6: the node's bytes
+/// in a retaining broker's window at their budget) and `link mirror unretained` (an `auto`
+/// bridge over a broker that retains none of its `ev` faces), which an instance at lane 5
+/// answers `ERR usage`; a bridge says them only to a lane-6 instance.
+pub const BRIDGE_LANE: u32 = 6;
 
 /// The lane that added `link quarantine torn=<k>` (5 in [`BRIDGE_LANE`]'s list), for both
 /// sides: a bridge says it only to an instance at this lane or later, and an instance reads off a

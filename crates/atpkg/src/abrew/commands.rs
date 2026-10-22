@@ -382,6 +382,172 @@ fn print_formula_info(prefix: &Prefix, f: &Formula) {
 /// emit the same documents abrew parsed. v1 (and bare `--json`) is
 /// a flat array; v2 groups under formulae/casks keys. Delegating
 /// this would report another prefix's records.
+/// Keg receipt mtime as epoch seconds (brew's tab `time`).
+fn keg_time(dir: &std::path::Path) -> Option<u64> {
+    let meta = std::fs::metadata(dir.join("INSTALL_RECEIPT.json"))
+        .or_else(|_| std::fs::metadata(dir))
+        .ok()?;
+    meta.modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+/// Brew's `to_hash` installed-state fields, derived from abrew's
+/// receipts: the API record ships them empty, and scripts read
+/// `.[0].installed` / `linked_keg` / `pinned` / `outdated`.
+/// `runtime_dependencies` is reconstructed from the record's
+/// declared graph against the current census (brew reads its
+/// stored tab; abrew receipts do not record the closure).
+fn enrich_formula_json(prefix: &Prefix, api: &Api, value: &mut aterm_json::Value) {
+    let aterm_json::Value::Object(map) = value else {
+        return;
+    };
+    let Some(name) = map
+        .get("name")
+        .and_then(aterm_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let parsed = api.formula(&name).ok();
+    let runtime: Vec<aterm_json::Value> = match &parsed {
+        Some(f) => {
+            let closure = flat_dependencies(f, false, |n| api.formula(n).ok());
+            closure
+                .iter()
+                .filter_map(|dep| {
+                    let inst = prefix.installed_one(Kind::Formula, dep)?;
+                    let mut row = aterm_json::Map::new();
+                    row.insert(
+                        "full_name".to_string(),
+                        aterm_json::Value::String(prefix.full_name(&inst)),
+                    );
+                    row.insert(
+                        "pkg_version".to_string(),
+                        aterm_json::Value::String(inst.version.clone()),
+                    );
+                    row.insert(
+                        "declared_directly".to_string(),
+                        aterm_json::Value::Bool(f.dependencies.iter().any(|d| d == dep)),
+                    );
+                    Some(aterm_json::Value::Object(row))
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let mut installed_rows = Vec::new();
+    let mut linked = aterm_json::Value::Null;
+    let mut outdated = false;
+    if let Some(inst) = prefix.installed_one(Kind::Formula, &name) {
+        for version in &inst.versions {
+            let keg = prefix.keg(&name, version);
+            let sbom = keg.join("sbom.spdx.json");
+            let mut row = aterm_json::Map::new();
+            row.insert(
+                "sbom".to_string(),
+                if sbom.is_file() {
+                    aterm_json::Value::String(sbom.to_string_lossy().into_owned())
+                } else {
+                    aterm_json::Value::Null
+                },
+            );
+            row.insert(
+                "version".to_string(),
+                aterm_json::Value::String(version.clone()),
+            );
+            row.insert(
+                "used_options".to_string(),
+                aterm_json::Value::Array(Vec::new()),
+            );
+            row.insert("built_as_bottle".to_string(), aterm_json::Value::Bool(true));
+            row.insert(
+                "poured_from_bottle".to_string(),
+                aterm_json::Value::Bool(true),
+            );
+            row.insert(
+                "time".to_string(),
+                keg_time(&keg).map_or(aterm_json::Value::Null, aterm_json::Value::from),
+            );
+            row.insert(
+                "runtime_dependencies".to_string(),
+                aterm_json::Value::Array(runtime.clone()),
+            );
+            row.insert(
+                "installed_on_request".to_string(),
+                aterm_json::Value::Bool(
+                    super::prefix::receipt_word(&keg, "installed_on_request").as_deref()
+                        == Some("true"),
+                ),
+            );
+            installed_rows.push(aterm_json::Value::Object(row));
+        }
+        if let Some(v) = linked_keg_version(prefix, &inst) {
+            linked = aterm_json::Value::String(v);
+        }
+        if let Some(f) = &parsed {
+            outdated = version_cmp(&inst.version, &f.version) == Ordering::Less;
+        }
+    }
+    map.insert(
+        "installed".to_string(),
+        aterm_json::Value::Array(installed_rows),
+    );
+    map.insert("linked_keg".to_string(), linked);
+    map.insert(
+        "pinned".to_string(),
+        aterm_json::Value::Bool(prefix.is_pinned(&name)),
+    );
+    map.insert("outdated".to_string(), aterm_json::Value::Bool(outdated));
+}
+
+/// The cask half of [`enrich_formula_json`]: brew's cask `to_hash`
+/// installed fields. Cask pins are not an abrew concept, so
+/// `pinned` stays false; `outdated` follows brew's non-greedy rule
+/// (auto-updating casks never report outdated here).
+fn enrich_cask_json(prefix: &Prefix, value: &mut aterm_json::Value) {
+    let aterm_json::Value::Object(map) = value else {
+        return;
+    };
+    let Some(token) = map
+        .get("token")
+        .and_then(aterm_json::Value::as_str)
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let latest = map
+        .get("version")
+        .and_then(aterm_json::Value::as_str)
+        .map(str::to_string);
+    let auto_updates = map
+        .get("auto_updates")
+        .and_then(aterm_json::Value::as_bool)
+        .unwrap_or(false);
+    let (installed, installed_time, outdated) = match prefix.installed_one(Kind::Cask, &token) {
+        Some(inst) => {
+            let dir = prefix.cask_dir(&token, &inst.version);
+            let outdated = !auto_updates
+                && latest
+                    .as_deref()
+                    .is_some_and(|l| version_cmp(&inst.version, l) == Ordering::Less);
+            (
+                aterm_json::Value::String(inst.version.clone()),
+                keg_time(&dir).map_or(aterm_json::Value::Null, aterm_json::Value::from),
+                outdated,
+            )
+        }
+        None => (aterm_json::Value::Null, aterm_json::Value::Null, false),
+    };
+    map.insert("installed".to_string(), installed);
+    map.insert("installed_time".to_string(), installed_time);
+    map.insert("pinned".to_string(), aterm_json::Value::Bool(false));
+    map.insert("pinned_version".to_string(), aterm_json::Value::Null);
+    map.insert("outdated".to_string(), aterm_json::Value::Bool(outdated));
+}
+
 fn info_json(
     prefix: &Prefix,
     api: &Api,
@@ -456,6 +622,12 @@ fn info_json(
                 return Err(no_such(api, n, None));
             }
         }
+    }
+    for v in &mut formulae {
+        enrich_formula_json(prefix, api, v);
+    }
+    for v in &mut casks {
+        enrich_cask_json(prefix, v);
     }
     let value = if v2 {
         let mut map = aterm_json::Map::new();
@@ -1275,12 +1447,41 @@ fn shellenv(prefix: &Prefix) -> String {
     )
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ShellKind {
+    Posix,
+    Fish,
+    Csh,
+    Pwsh,
+}
+
+/// Brew's shellenv family for a shell name (operand, parent process
+/// or `$SHELL`): basename with any login `-` stripped; everything
+/// unrecognised falls to the bourne form, as brew's `*)` arm does.
+fn shell_kind(name: &str) -> ShellKind {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    let base = base.strip_prefix('-').unwrap_or(base);
+    match base {
+        "fish" => ShellKind::Fish,
+        "csh" | "tcsh" => ShellKind::Csh,
+        "pwsh" | "pwsh-preview" | "powershell" => ShellKind::Pwsh,
+        _ => ShellKind::Posix,
+    }
+}
+
 pub(super) fn cmd_shellenv(prefix: &Prefix, rest: &[String]) -> ExitCode {
-    let shell = operands(rest).into_iter().next().unwrap_or_default();
+    // Brew's resolution order: explicit operand, then the invoking
+    // shell (parent process, else $SHELL) — `eval "$(abrew shellenv)"`
+    // from fish must not receive POSIX syntax.
+    let shell = operands(rest)
+        .into_iter()
+        .next()
+        .or_else(crate::caller_shell::invoking_shell)
+        .unwrap_or_default();
     let root = prefix.root.to_string_lossy();
-    let text = match shell.as_str() {
-        "" | "bash" | "zsh" | "sh" => shellenv(prefix),
-        "fish" => {
+    let text = match shell_kind(&shell) {
+        ShellKind::Posix => shellenv(prefix),
+        ShellKind::Fish => {
             let q = |s: &str| {
                 s.replace('\\', "\\\\")
                     .replace('"', "\\\"")
@@ -1295,7 +1496,7 @@ pub(super) fn cmd_shellenv(prefix: &Prefix, rest: &[String]) -> ExitCode {
                 q(&root)
             )
         }
-        "csh" | "tcsh" => {
+        ShellKind::Csh => {
             // Real csh syntax: no ${VAR+:} expansion exists there
             // (brew's own csh output has this bug; tcsh rejects it
             // with "Missing '}'"). PATH is always set in csh;
@@ -1314,7 +1515,31 @@ pub(super) fn cmd_shellenv(prefix: &Prefix, rest: &[String]) -> ExitCode {
                 quote(&format!("{info}:")),
             )
         }
-        other => return usage(&format!("unknown shell {other}")),
+        ShellKind::Pwsh => {
+            // PowerShell single-quoted strings escape a quote by doubling it.
+            let q = |s: &str| s.replace('\'', "''");
+            let set = |name: &str, value: String| {
+                format!(
+                    "[System.Environment]::SetEnvironmentVariable('{name}',{value},[System.EnvironmentVariableTarget]::Process)\n"
+                )
+            };
+            format!(
+                "{}{}{}{}",
+                set("ABREW_PREFIX", format!("'{}'", q(&root))),
+                set(
+                    "PATH",
+                    format!("('{}/bin:{}/sbin:'+$ENV:PATH)", q(&root), q(&root))
+                ),
+                set(
+                    "MANPATH",
+                    format!("('{}/share/man:'+${{ENV:MANPATH}})", q(&root))
+                ),
+                set(
+                    "INFOPATH",
+                    format!("('{}/share/info:'+${{ENV:INFOPATH}})", q(&root))
+                ),
+            )
+        }
     };
     print!("{text}");
     ExitCode::SUCCESS
@@ -1383,8 +1608,10 @@ fn linked_keg_version(prefix: &Prefix, i: &Installed) -> Option<String> {
 pub(super) fn cmd_doctor(prefix: &Prefix, rest: &[String]) -> ExitCode {
     let quiet = has_flag(rest, "--quiet", "-q");
     let mut problems = 0usize;
+    // Brew prints doctor warnings and the trailer to stderr,
+    // keeping stdout for the ready line scripts may capture.
     let mut note = |m: String| {
-        println!("Warning: {m}");
+        eprintln!("Warning: {m}");
         problems += 1;
     };
     if prefix.ensure().is_err() {
@@ -1463,7 +1690,13 @@ pub(super) fn cmd_doctor(prefix: &Prefix, rest: &[String]) -> ExitCode {
             prefix.bin().display()
         ));
     }
-    let _ = prefix.rebuild_state();
+    // State recovery is opportunistic bookkeeping: take the writer
+    // lock only if it is free, so doctor still reports while a
+    // writer (possibly the hung one being diagnosed) holds it.
+    if let Some(_lock) = super::prefix::Lock::try_acquire(prefix) {
+        prefix.restore_stale_asides();
+        let _ = prefix.rebuild_state();
+    }
     if problems == 0 {
         if !quiet {
             println!("Your abrew is ready to brew.");
@@ -1471,7 +1704,7 @@ pub(super) fn cmd_doctor(prefix: &Prefix, rest: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         if !quiet {
-            println!("Please note that these warnings are just used to help abrew maintainers.");
+            eprintln!("Please note that these warnings are just used to help abrew maintainers.");
         }
         ExitCode::from(1)
     }
@@ -1601,10 +1834,16 @@ pub(super) fn cmd_install(
         };
         match result {
             Ok(()) => landed = true,
-            Err(error) => {
+            // Brew keeps a single failed install from aborting the
+            // rest of the batch while still failing the run.
+            Err(install::InstallError::Failed(msg)) => {
+                eprintln!("{msg}");
+                failures += 1;
+            }
+            Err(error @ install::InstallError::PassThrough(_)) => {
                 if names.len() > 1 && landed {
                     let install::InstallError::PassThrough(reason) = &error else {
-                        return from_install(prefix, args, Err(error));
+                        unreachable!()
                     };
                     eprintln!("abrew: {reason}; skipped");
                     failures += 1;
@@ -2001,7 +2240,7 @@ pub(super) fn cmd_upgrade(
         let mut failures = 0;
         for (name, have, latest) in rows {
             if prefix.is_pinned(&name) {
-                println!("==> {name} ({have}) is pinned; skipping");
+                eprintln!("==> {name} ({have}) is pinned; skipping");
                 continue;
             }
             println!("==> Upgrading {name} {have} -> {latest}");
@@ -2068,7 +2307,7 @@ fn upgrade_formula_names(
                 .map(|f| install::keg_version(&f));
             match latest {
                 Some(latest) if version_cmp(&before.version, &latest) != Ordering::Less => {
-                    println!("abrew: {short} {} already installed", before.version);
+                    eprintln!("Warning: {short} {} already installed", before.version);
                 }
                 _ => {
                     eprintln!("abrew: {short} is pinned; skipping");
@@ -2160,12 +2399,14 @@ fn cmd_upgrade_casks(
             Err(error) => return from_install(prefix, args, Err(error.into())),
         };
         if names.is_empty() && c.auto_updates && !has_flag(rest, "--greedy", "") {
-            println!("==> {token} ({have}) auto-updates; skipping");
+            eprintln!("==> {token} ({have}) auto-updates; skipping");
             continue;
         }
         if super::formula::version_cmp(&have, &c.version) != std::cmp::Ordering::Less {
             if !names.is_empty() {
-                println!("abrew: {token} {have} already installed");
+                eprintln!(
+                    "Warning: Not upgrading {token}, the latest version is already installed"
+                );
             }
             continue;
         }
@@ -3976,8 +4217,10 @@ pub(super) fn cmd_tap(prefix: &Prefix, rest: &[String]) -> ExitCode {
     }
     let url = ops.get(1).map(String::as_str);
     match tap::add(prefix, ops.first().map_or("", String::as_str), url) {
-        Ok(t) => {
-            println!("Tapped {} ({})", t.name(), t.path.display());
+        Ok((t, newly)) => {
+            if newly {
+                println!("Tapped {} ({})", t.name(), t.path.display());
+            }
             ExitCode::SUCCESS
         }
         Err(e) => failed(&e),
@@ -5136,6 +5379,98 @@ mod tests {
                 b"current"
             );
         }
+    }
+
+    #[test]
+    fn info_json_enrichment_reports_installed_state() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(temp.path());
+        prefix.ensure_api_cache().unwrap();
+        let api_dir = prefix.cache().join("api");
+        std::fs::write(
+            api_dir.join("formula-demo.json"),
+            br#"{"name":"demo","versions":{"stable":"2"},"dependencies":["dep"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            api_dir.join("formula-dep.json"),
+            br#"{"name":"dep","versions":{"stable":"3"}}"#,
+        )
+        .unwrap();
+        let keg = prefix.keg("demo", "1");
+        std::fs::create_dir_all(&keg).unwrap();
+        prefix
+            .write_receipt(
+                &keg,
+                &[
+                    ("installed_by", "abrew"),
+                    ("name", "demo"),
+                    ("version", "1"),
+                    ("installed_on_request", "true"),
+                    ("full_name", "demo"),
+                ],
+            )
+            .unwrap();
+        owned_keg(&prefix, "dep", "3");
+        let api = Api::new(prefix.clone());
+        let mut record = aterm_json::json!({"name": "demo"});
+        enrich_formula_json(&prefix, &api, &mut record);
+        let installed = record
+            .get("installed")
+            .and_then(aterm_json::Value::as_array)
+            .unwrap();
+        assert_eq!(installed.len(), 1);
+        let row = &installed[0];
+        assert_eq!(row.get("version").unwrap(), &aterm_json::json!("1"));
+        assert_eq!(
+            row.get("installed_on_request").unwrap(),
+            &aterm_json::json!(true)
+        );
+        assert!(row.get("time").is_some_and(|t| !t.is_null()));
+        let runtime = row
+            .get("runtime_dependencies")
+            .and_then(aterm_json::Value::as_array)
+            .unwrap();
+        assert_eq!(runtime.len(), 1);
+        assert_eq!(
+            runtime[0].get("full_name").unwrap(),
+            &aterm_json::json!("homebrew/core/dep")
+        );
+        assert_eq!(
+            runtime[0].get("declared_directly").unwrap(),
+            &aterm_json::json!(true)
+        );
+        assert!(record.get("linked_keg").is_some_and(|v| v.is_null()));
+        assert_eq!(record.get("pinned").unwrap(), &aterm_json::json!(false));
+        assert_eq!(record.get("outdated").unwrap(), &aterm_json::json!(true));
+        // An uninstalled record stays empty, not fabricated.
+        let mut absent = aterm_json::json!({"name": "dep"});
+        enrich_formula_json(&prefix, &api, &mut absent);
+        assert_eq!(
+            absent
+                .get("installed")
+                .and_then(aterm_json::Value::as_array)
+                .unwrap()
+                .len(),
+            1,
+            "dep itself is installed"
+        );
+    }
+
+    #[test]
+    fn shell_kind_follows_brew_families() {
+        assert_eq!(shell_kind("fish"), ShellKind::Fish);
+        assert_eq!(shell_kind("-fish"), ShellKind::Fish);
+        assert_eq!(shell_kind("/usr/local/bin/fish"), ShellKind::Fish);
+        assert_eq!(shell_kind("tcsh"), ShellKind::Csh);
+        assert_eq!(shell_kind("-csh"), ShellKind::Csh);
+        assert_eq!(shell_kind("pwsh"), ShellKind::Pwsh);
+        assert_eq!(shell_kind("pwsh-preview"), ShellKind::Pwsh);
+        assert_eq!(shell_kind("powershell"), ShellKind::Pwsh);
+        assert_eq!(shell_kind("zsh"), ShellKind::Posix);
+        assert_eq!(shell_kind("bash"), ShellKind::Posix);
+        assert_eq!(shell_kind("nushell"), ShellKind::Posix);
+        assert_eq!(shell_kind(""), ShellKind::Posix);
     }
 
     #[cfg(unix)]

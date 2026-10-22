@@ -808,7 +808,7 @@ fn fits_in(text: &str, width: f32, role: SemanticRole, style: StyleRef) -> bool 
 /// A NOTE KEEPS THE COUNTS' ROOM: where Hero type would hold it, a note is
 /// drawn plain in the Hero line's slot, so the counts that replace it (the
 /// first reading, the day's first act) move nothing under STATUS — not
-/// SESSIONS, not a row `Harness settings…` has just landed on.
+/// SESSIONS, not a row the Autopilot menu has just landed on.
 ///
 /// THE BUDGET is what the page's first screen has left once SESSIONS' top
 /// is on it (§4 item 2: SESSIONS shares the first screen with the status).

@@ -94,17 +94,20 @@ impl FxRegistry {
 }
 
 /// Whether `a` and `b` are the same picture: kind, size and bytes.
+#[inline]
 fn same_art(a: &FxArt, b: &FxArt) -> bool {
     a.texels() == b.texels() && a.w() == b.w() && a.h() == b.h() && a.data() == b.data()
 }
 
 /// Book one art build on the thread's test counter.
+#[inline]
 fn count_build() {
     #[cfg(any(test, debug_assertions))]
     crate::test_counters::count_art_build();
 }
 
 /// Validate the art's dimensions before a builder allocates its texels.
+#[inline]
 fn art_dimensions(w: usize, h: usize) -> Option<(u16, u16, usize)> {
     let (w, h) = (u16::try_from(w).ok()?, u16::try_from(h).ok()?);
     if w > aterm_core::render::FX_ART_MAX_SIDE || h > aterm_core::render::FX_ART_MAX_SIDE {
@@ -170,34 +173,39 @@ pub struct PieceArt {
 impl PieceArt {
     /// Where the arts' top-left texel lies in the pieces' space: a sprite
     /// that lays the pieces at `(x, y)` sits at `(x + origin.0, y + origin.1)`.
+    #[inline]
     #[must_use]
     pub const fn origin(&self) -> (i32, i32) {
         self.origin
     }
 
     /// The folded art: texel `k > 0` is class `k − 1` ([`Self::classes`]).
+    #[inline]
     #[must_use]
-    pub fn folded(&self) -> &Arc<FxArt> {
+    pub const fn folded(&self) -> &Arc<FxArt> {
         &self.folded
     }
 
     /// Each class's member pieces, in the order they were laid (a piece id
     /// once per covering piece): class `k − 1` for folded texel `k`.
+    #[inline]
     #[must_use]
-    pub fn classes(&self) -> &[Box<[u8]>] {
+    pub const fn classes(&self) -> &[Box<[u8]>] {
         &self.classes
     }
 
     /// The peeled arts: in art `j`, texel `id + 1` names the `j`-th piece
     /// covering the pixel (piece id `id`), `0` where fewer cover it.
+    #[inline]
     #[must_use]
-    pub fn peeled(&self) -> &[Arc<FxArt>] {
+    pub const fn peeled(&self) -> &[Arc<FxArt>] {
         &self.peeled
     }
 
     /// The most pieces covering one pixel: the peeled form's depth.
+    #[inline]
     #[must_use]
-    pub fn depth(&self) -> usize {
+    pub const fn depth(&self) -> usize {
         self.peeled.len()
     }
 }
@@ -275,6 +283,7 @@ const COVER_EXACT_MAX: usize = 2048;
 /// Whether texel `i` of `art` can write a byte: an Index8 texel above 0, an
 /// Rgba8Premul texel with any byte set (its light adds even at alpha 0), an
 /// Rgba8Straight texel with alpha.
+#[inline]
 fn draws(art: &FxArt, i: usize) -> bool {
     let d = art.data();
     match art.texels() {
@@ -487,21 +496,33 @@ pub fn cover(art: &FxArt, max: usize) -> Box<[PxRect]> {
 /// pixel `l` reads texel `⌊l·w / dw⌋`, so the columns reading `[t0, t1)` are
 /// `[⌈t0·dw / w⌉, ⌈t1·dw / w⌉)`, and under `flip_x` those reading
 /// `[w − t1, w − t0)`; the rows alike. Empty for an empty art.
+#[inline]
 #[must_use]
-pub fn cover_px(t: PxRect, (w, h): (u16, u16), (dw, dh): (u16, u16), flip_x: bool) -> PxRect {
+pub const fn cover_px(t: PxRect, (w, h): (u16, u16), (dw, dh): (u16, u16), flip_x: bool) -> PxRect {
     if w == 0 || h == 0 {
         return PxRect::EMPTY;
     }
-    let up = |v: i32, n: u16, d: u16| {
+    #[inline]
+    const fn clamp_i32(v: i32, hi: i32) -> i32 {
+        if v < 0 {
+            0
+        } else if v > hi {
+            hi
+        } else {
+            v
+        }
+    }
+    #[inline]
+    const fn up(v: i32, n: u16, d: u16) -> i32 {
         // Non-negative: the ceiling is the floor of `v·d + n − 1`.
-        let v = i64::from(v.clamp(0, i32::from(n)));
-        ((v * i64::from(d) + i64::from(n) - 1) / i64::from(n)) as i32
-    };
+        let v = clamp_i32(v, n as i32) as i64;
+        ((v * (d as i64) + (n as i64) - 1) / (n as i64)) as i32
+    }
     // Clamp arbitrary public edges, including EVERYWHERE's MIN/MAX, before
     // subtracting them. Mirroring an unclamped MIN would overflow i32.
-    let (tx0, tx1) = (t.x0.clamp(0, i32::from(w)), t.x1.clamp(0, i32::from(w)));
+    let (tx0, tx1) = (clamp_i32(t.x0, w as i32), clamp_i32(t.x1, w as i32));
     let (tx0, tx1) = if flip_x {
-        (i32::from(w) - tx1, i32::from(w) - tx0)
+        (w as i32 - tx1, w as i32 - tx0)
     } else {
         (tx0, tx1)
     };

@@ -198,7 +198,7 @@ pub enum RainSignal {
 impl RainSignal {
     #[must_use]
     #[inline]
-    pub fn from_code(code: u32) -> Option<Self> {
+    pub const fn from_code(code: u32) -> Option<Self> {
         Some(match code {
             0 => Self::AssistantStream,
             1 => Self::Inspect,
@@ -216,7 +216,7 @@ impl RainSignal {
     }
 
     #[inline]
-    fn priority(self) -> u8 {
+    const fn priority(self) -> u8 {
         match self {
             Self::Failure | Self::Interrupted => 3,
             Self::Success | Self::Waiting => 2,
@@ -369,32 +369,32 @@ struct FrameRegion {
 /// The Unicode Box Drawing block — a sound short-circuit for every `frame_*`
 /// classifier below, all of whose literals lie in U+2500..=U+257A.
 #[inline]
-fn in_box_drawing_block(ch: char) -> bool {
+const fn in_box_drawing_block(ch: char) -> bool {
     matches!(ch as u32, 0x2500..=0x257F)
 }
 
 #[inline]
-fn frame_top_left(ch: char) -> bool {
+const fn frame_top_left(ch: char) -> bool {
     matches!(ch, '┌' | '┏' | '╔' | '╒' | '╓' | '╭')
 }
 
 #[inline]
-fn frame_top_right(ch: char) -> bool {
+const fn frame_top_right(ch: char) -> bool {
     matches!(ch, '┐' | '┓' | '╗' | '╕' | '╖' | '╮')
 }
 
 #[inline]
-fn frame_bottom_left(ch: char) -> bool {
+const fn frame_bottom_left(ch: char) -> bool {
     matches!(ch, '└' | '┗' | '╚' | '╘' | '╙' | '╰')
 }
 
 #[inline]
-fn frame_bottom_right(ch: char) -> bool {
+const fn frame_bottom_right(ch: char) -> bool {
     matches!(ch, '┘' | '┛' | '╝' | '╛' | '╜' | '╯')
 }
 
 #[inline]
-fn frame_horizontal(ch: char) -> bool {
+const fn frame_horizontal(ch: char) -> bool {
     matches!(
         ch,
         '─' | '━' | '═' | '┄' | '┅' | '┈' | '┉' | '╌' | '╍' | '╴' | '╶' | '╸' | '╺'
@@ -402,7 +402,7 @@ fn frame_horizontal(ch: char) -> bool {
 }
 
 #[inline]
-fn frame_vertical(ch: char) -> bool {
+const fn frame_vertical(ch: char) -> bool {
     matches!(
         ch,
         '│' | '┃'
@@ -790,23 +790,25 @@ impl MatrixRain {
     /// unbumped, so the scan runs on the first frame the gate lifts.
     #[must_use]
     #[inline]
-    pub fn can_emit(&self) -> bool {
+    pub const fn can_emit(&self) -> bool {
         self.cfg.enabled
             && !self.reduced_motion
-            && (self.visibility == RainVisibility::Focused || self.drain_ticks < DRAIN_TICKS)
+            && (matches!(self.visibility, RainVisibility::Focused)
+                || self.drain_ticks < DRAIN_TICKS)
     }
 
     /// Whether literal mode needs a fresh authoritative host sample even if
     /// occupancy is already current (for example after a live mode switch).
     #[must_use]
     #[inline]
-    pub fn needs_material_sample(&self) -> bool {
+    pub const fn needs_material_sample(&self) -> bool {
         self.cfg.output_material && self.material_sample_needed
     }
 
     /// Restore the host's composer provenance baseline when a web pipeline
     /// recreates this lazily-owned engine after an off/on toggle.
-    pub(crate) fn set_material_editing(&mut self, editing: bool) {
+    #[inline]
+    pub(crate) const fn set_material_editing(&mut self, editing: bool) {
         self.material_editing = editing;
         self.material_sample_needed |= editing && self.cfg.output_material;
     }
@@ -818,7 +820,8 @@ impl MatrixRain {
 
     /// Enter a reading-only viewport without scanning its translated cells.
     /// Returning to live must rebuild occupancy from a fresh coherent frame.
-    pub fn defer_reading(&mut self) {
+    #[inline]
+    pub const fn defer_reading(&mut self) {
         self.have_scanned = false;
         self.reading_gated = true;
         self.last_emit_nonempty = false;
@@ -832,6 +835,7 @@ impl MatrixRain {
     /// draft; kept, it would leave the new grid dark until its next Enter — the
     /// cursor/hidden-band exclusions still protect the new composer). Weather
     /// and clock survive: the swap is a viewpoint change, not a restart.
+    #[inline]
     pub fn note_grid_replaced(&mut self) {
         self.have_scanned = false;
         self.clear_material_bank();
@@ -853,26 +857,30 @@ impl MatrixRain {
     /// A keystroke: keeps CALM alive; keystrokes alone never reach WORKING.
     /// Literal sampling also fails closed until explicit TurnStart, so an
     /// arbitrarily tall unsent draft cannot become rain material.
-    pub fn note_keystroke(&mut self) {
+    #[inline]
+    pub const fn note_keystroke(&mut self) {
         self.pending_key = true;
         self.material_editing = true;
     }
 
     /// Visual bell: arms the 2 s amber ALERT hue-ramp (when `bell_alert`).
-    pub fn note_bell(&mut self) {
+    #[inline]
+    pub const fn note_bell(&mut self) {
         self.pending_bell = true;
     }
 
     /// A command completed (OSC 133/633 exit code, host-fed): success fires
     /// the finishing head-sweep; failure holds the 2 s ember tint. Gated by
     /// the `exit_tint` knob at apply time. Last completion in a frame wins.
-    pub fn note_exit_status(&mut self, failed: bool) {
+    #[inline]
+    pub const fn note_exit_status(&mut self, failed: bool) {
         self.pending_exit = Some(failed);
     }
 
     /// Ingest one payload-free observable-work pulse. `code` is
     /// [`RainSignal`] and `weight` is a saturating visual-coherence hint. No
     /// text, command, path, URL, prompt, or tool input is retained here.
+    #[inline]
     pub fn note_signal(&mut self, code: u32, weight: u32) {
         let Some(signal) = RainSignal::from_code(code) else {
             return;
@@ -897,11 +905,13 @@ impl MatrixRain {
 
     /// Wheel/PgUp input while in the alt screen: stamps the scroll-quiet
     /// deadline (reading a fullscreen transcript never summons a downpour).
-    pub fn note_alt_scroll(&mut self) {
+    #[inline]
+    pub const fn note_alt_scroll(&mut self) {
         self.pending_alt_scroll = true;
     }
 
     /// Host-reported pane visibility (drain-on-unfocus policy).
+    #[inline]
     pub fn set_visibility(&mut self, v: RainVisibility) {
         if v == self.visibility {
             return;
@@ -922,7 +932,8 @@ impl MatrixRain {
     }
 
     /// OS/config reduce-motion: rain emits nothing, fp 0, inactive.
-    pub fn set_reduced_motion(&mut self, on: bool) {
+    #[inline]
+    pub const fn set_reduced_motion(&mut self, on: bool) {
         if on && !self.reduced_motion {
             self.pending_signal = None;
             self.pending_turn_start = false;
@@ -936,7 +947,7 @@ impl MatrixRain {
     /// True when the grid changed since the last Tier-A scan.
     #[must_use]
     #[inline]
-    pub fn needs_rescan(&self, epoch: u64) -> bool {
+    pub const fn needs_rescan(&self, epoch: u64) -> bool {
         !self.have_scanned || epoch != self.last_epoch
     }
 
@@ -946,8 +957,12 @@ impl MatrixRain {
     /// shows a host that stopped feeding it).
     #[must_use]
     #[inline]
-    pub fn scanned_epoch(&self) -> Option<u64> {
-        self.have_scanned.then_some(self.last_epoch)
+    pub const fn scanned_epoch(&self) -> Option<u64> {
+        if self.have_scanned {
+            Some(self.last_epoch)
+        } else {
+            None
+        }
     }
 
     /// Rebuild the Tier-A occupancy bitset from the frame snapshot (the same
@@ -1185,13 +1200,15 @@ impl MatrixRain {
 
     /// Clockless advance for web hosts: accumulate host milliseconds; whole
     /// engine ticks are consumed by the next [`Self::emit`].
-    pub fn advance_ms(&mut self, dt_ms: u64) {
+    #[inline]
+    pub const fn advance_ms(&mut self, dt_ms: u64) {
         self.clock_ms = self.clock_ms.saturating_add(dt_ms);
     }
 
     /// Native tick: sync the internal clock from the injected instant (the
     /// epoch latches on first call), then emit. Field math never sees the
     /// `Instant` — determinism is `(seed, tick)` only.
+    #[inline]
     pub fn tick(
         &mut self,
         now: Instant,
@@ -1205,6 +1222,7 @@ impl MatrixRain {
     }
 
     /// Latch the epoch on first call and advance the clock monotonically.
+    #[inline]
     fn sync_clock(&mut self, now: Instant) {
         let epoch = *self.epoch.get_or_insert(now);
         let ms = now.saturating_duration_since(epoch).as_millis() as u64;
@@ -1219,6 +1237,7 @@ impl MatrixRain {
     /// the weather starves to SLEEP after `idle_secs`, the drain completes, and
     /// [`Self::is_active`] self-disarms. Resuming rebuilds the weather from
     /// fresh notes.
+    #[inline]
     pub fn tick_suspended(&mut self, now: Instant) {
         self.sync_clock(now);
         self.step_suspended();
@@ -1226,6 +1245,7 @@ impl MatrixRain {
 
     /// Clockless core of [`Self::tick_suspended`] (web hosts pair it with
     /// [`Self::advance_ms`], exactly like `emit`).
+    #[inline]
     pub fn step_suspended(&mut self) {
         // Activity notes are dropped while suspended: a keystroke would hold the
         // pane at CALM and keep a 12 Hz timer armed for a pane that draws
@@ -1306,6 +1326,7 @@ impl MatrixRain {
     /// Whether the host should keep the rain timer armed. Sleep + drained +
     /// empty ⇒ `false` (the timer disarms; idle is 0 wakes).
     #[must_use]
+    #[inline]
     pub fn is_active(&self) -> bool {
         if !self.cfg.enabled || self.reduced_motion {
             return false;
@@ -1334,6 +1355,7 @@ impl MatrixRain {
 
     /// The versioned 64-tile atlas for this frame's `rain_quads`. `None`
     /// until the first bake — rain-free frames carry no atlas.
+    #[inline]
     pub fn rain_atlas(&mut self) -> Option<Arc<SceneAtlas>> {
         self.baker.atlas()
     }
@@ -1341,7 +1363,7 @@ impl MatrixRain {
     /// The atlas version (folded into the fingerprint; exposed for hosts).
     #[must_use]
     #[inline]
-    pub fn atlas_version(&self) -> u64 {
+    pub const fn atlas_version(&self) -> u64 {
         self.baker.version()
     }
 
@@ -1487,12 +1509,18 @@ impl MatrixRain {
     /// does not wake for ticks that advance nothing.
     #[must_use]
     #[inline]
-    pub fn current_period_ms(&self) -> u64 {
-        u64::from(match self.eff_weather() {
+    pub const fn current_period_ms(&self) -> u64 {
+        let ms = match self.eff_weather() {
             RainWeather::Working => self.tick_ms,
-            _ => self.tick_ms.max(CALM_TICK_MS),
-        })
-        .max(1)
+            RainWeather::Calm | RainWeather::Sleep => {
+                if self.tick_ms > CALM_TICK_MS {
+                    self.tick_ms
+                } else {
+                    CALM_TICK_MS
+                }
+            }
+        } as u64;
+        if ms > 1 { ms } else { 1 }
     }
 
     /// Remaining milliseconds until the next engine tick. Unlike the raw
@@ -1500,21 +1528,21 @@ impl MatrixRain {
     /// between rain frames, so web timers neither gap nor double-step.
     #[must_use]
     #[inline]
-    pub fn next_tick_in_ms(&self) -> u64 {
+    pub const fn next_tick_in_ms(&self) -> u64 {
         let period = self.current_period_ms();
         let backlog = self.clock_ms.saturating_sub(self.consumed_ms);
-        period.saturating_sub(backlog.min(period))
+        let consumed = if backlog < period { backlog } else { period };
+        period.saturating_sub(consumed)
     }
 
     /// Weather capped by visibility (`min`: unfocused ≤ CALM, hidden = SLEEP).
     #[inline]
-    fn eff_weather(&self) -> RainWeather {
-        let cap = match self.visibility {
-            RainVisibility::Focused => RainWeather::Working,
-            RainVisibility::VisibleUnfocused => RainWeather::Calm,
-            RainVisibility::Hidden => RainWeather::Sleep,
-        };
-        self.weather.min(cap)
+    const fn eff_weather(&self) -> RainWeather {
+        match (self.weather, self.visibility) {
+            (w, RainVisibility::Focused) => w,
+            (RainWeather::Sleep, _) | (_, RainVisibility::Hidden) => RainWeather::Sleep,
+            (_, RainVisibility::VisibleUnfocused) => RainWeather::Calm,
+        }
     }
 
     /// Consume whole engine ticks from the accumulated clock; returns whether
@@ -1957,8 +1985,9 @@ impl MatrixRain {
     /// Body coverage for a trail level: linear in level, capped at the
     /// derived body alpha (level 15 body cells sit just under the head).
     #[inline]
-    fn alpha_of(&self, lvl: u32) -> u8 {
-        ((u32::from(self.body_alpha) * (lvl + 1)) / 16).max(1) as u8
+    const fn alpha_of(&self, lvl: u32) -> u8 {
+        let a = (self.body_alpha as u32 * (lvl + 1)) / 16;
+        if a > 1 { a as u8 } else { 1 }
     }
 
     /// Recognize closed Unicode box-drawn surfaces and clear their interiors
@@ -2258,8 +2287,10 @@ fn clamp_config(mut cfg: RainConfig) -> RainConfig {
 /// Quantize the EMA byte onto the density staircase (steps of 21 — one
 /// WORKING density unit), so ring change-points stay a handful per front.
 #[inline]
-fn quantize_density(v: i32) -> u8 {
-    (((v.max(0) + 10) / 21) * 21).min(255) as u8
+const fn quantize_density(v: i32) -> u8 {
+    let v = if v > 0 { v } else { 0 };
+    let q = ((v + 10) / 21) * 21;
+    if q < 255 { q as u8 } else { 255 }
 }
 
 /// Below this HSV chroma (`max − min` of the channels, 0..1) a colour has no
@@ -2347,14 +2378,13 @@ fn luminance_match(mut ramp: [u32; 16], reference: [u32; 16]) -> [u32; 16] {
 /// the CPU stamp's `(c·a + b·(255-a) + 127)/255` rounding, so the invariant
 /// is checked on the bytes the renderer actually lands.
 #[inline]
-fn srgb_over(tint: u32, alpha: u8, bg: u32) -> u32 {
-    let a = u32::from(alpha);
-    let ch = |sh: u32| {
-        let t = (tint >> sh) & 0xFF;
-        let b = (bg >> sh) & 0xFF;
-        (t * a + b * (255 - a) + 127) / 255
-    };
-    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+const fn srgb_over(tint: u32, alpha: u8, bg: u32) -> u32 {
+    let a = alpha as u32;
+    let inv = 255 - a;
+    let r = (((tint >> 16) & 0xFF) * a + ((bg >> 16) & 0xFF) * inv + 127) / 255;
+    let g = (((tint >> 8) & 0xFF) * a + ((bg >> 8) & 0xFF) * inv + 127) / 255;
+    let b = ((tint & 0xFF) * a + (bg & 0xFF) * inv + 127) / 255;
+    (r << 16) | (g << 8) | b
 }
 
 /// SGR-2 faint `fg` on `bg` (packed `0x00RRGGBB`) at the default opacity,

@@ -196,6 +196,15 @@ impl Terminal {
         self.modes.focus_reporting
     }
 
+    /// How many times the program has turned DEC 1004 on from off (`CSI ? 1004 h`,
+    /// XTRESTORE), wrapping: a host that compares it with the value it last saw learns of
+    /// an enable it has not answered yet. The host's own arming (`apply_config`) is not
+    /// counted. Never rewinds, not even at a reset.
+    #[must_use]
+    pub fn focus_arms(&self) -> u32 {
+        self.transient.focus_arms
+    }
+
     /// Check if DEC mode 2031 (color-scheme update notifications) is enabled.
     #[must_use]
     pub fn report_color_scheme_enabled(&self) -> bool {

@@ -21,9 +21,10 @@
 //! The arts are built on the first admitted ask per cell height
 //! ([`CardArts`], registered in [`aterm_render::fx::registry`]), which can be
 //! the first draw at that height; a warmed frame is a
-//! palette and a handful of items. The settled frame is kept and replayed as
-//! the same `Arc`s ([`SettledFrame`]); an episode refills a ring of three
-//! contents in place ([`CardFrames`]), so it allocates nothing once warm.
+//! palette and a handful of items. The settled frame, and a flowing card's
+//! current step, is kept and replayed as the same `Arc`s ([`KeptFrame`]);
+//! every frame drawn refills a ring of three contents in place
+//! ([`CardFrames`]), so the card allocates nothing once warm.
 
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
@@ -124,6 +125,10 @@ impl CardShape {
             pad_below: u16::try_from(below).unwrap_or(u16::MAX),
             top: 1,
             clip,
+            // The ripple's origin is a grid cell: its row moves with the
+            // box's first row, which is row 1 here (a wand over the box,
+            // which no host passes, is held at the box's air row).
+            wand: s.wand.map(|(c, r)| (c, (r + 1).saturating_sub(s.top))),
             ..*s
         };
         (Self { local }, origin)
@@ -240,17 +245,29 @@ impl CardFrame {
     }
 }
 
-/// One card's last SETTLED frame: its shape and its two contents, kept so
-/// that a card at rest is replayed rather than drawn again
-/// ([`super::HarnessCard::replay`]): the same `Arc`s, frame after frame.
+/// One card's last KEPT frame: its shape, which flow step of which grid it
+/// is (`None`: the SETTLED frame) and its two contents, kept so that a held
+/// card, or a flowing one between two of its steps, is replayed rather than
+/// drawn again ([`super::HarnessCard::replay`],
+/// [`super::HarnessCard::replay_step`]): the same `Arc`s, frame after frame.
 #[derive(Clone, Debug)]
-pub struct SettledFrame {
+pub struct KeptFrame {
     pub(super) shape: CardShape,
+    /// The flow step and the grid it was drawn on
+    /// ([`super::HarnessCard::flow_step`]); `None` for the settled frame.
+    pub(super) step: Option<(u64, u32)>,
     pub(super) under: Arc<FxContent>,
     pub(super) over: Arc<FxContent>,
 }
 
-impl SettledFrame {
+impl KeptFrame {
+    /// The flow step the kept frame is (`None`: the settled frame).
+    #[must_use]
+    #[inline]
+    pub fn step(&self) -> Option<u64> {
+        self.step.map(|(step, _)| step)
+    }
+
     /// The kept frame laid at `origin`.
     #[inline]
     pub(super) fn at(&self, origin: (i32, i32)) -> CardFrame {
@@ -264,26 +281,28 @@ impl SettledFrame {
 
 /// One card's frames, kept by its host beside the card
 /// ([`super::HarnessCard::draw`], [`super::HarnessCard::replay`]): the
-/// settled frame it keeps, the ring of contents its episode frames are
-/// built in, and its cell height's arts. `Default` holds nothing.
+/// frame it keeps (settled, or the flow's current step), the ring of
+/// contents its frames are built in, and its cell height's arts. `Default`
+/// holds nothing.
 #[derive(Debug, Default)]
 pub struct CardFrames {
-    kept: Option<SettledFrame>,
+    kept: Option<KeptFrame>,
     ring: [Option<(Arc<FxContent>, Arc<FxContent>)>; RING],
     next: usize,
     arts: Option<Arc<CardArts>>,
 }
 
 impl CardFrames {
-    /// The settled frame kept, if any.
+    /// The frame kept, if any: the settled frame or a flow step.
     #[inline]
-    pub(super) fn kept(&self) -> Option<&SettledFrame> {
+    #[must_use]
+    pub fn kept(&self) -> Option<&KeptFrame> {
         self.kept.as_ref()
     }
 
-    /// Keep `kept` (an episode frame keeps nothing).
+    /// Keep `kept` (an intro frame keeps nothing).
     #[inline]
-    pub(super) fn keep(&mut self, kept: Option<SettledFrame>) {
+    pub(super) fn keep(&mut self, kept: Option<KeptFrame>) {
         self.kept = kept;
     }
 
@@ -297,6 +316,7 @@ impl CardFrames {
 
     /// Two empty contents: a frame with nothing to draw. Shared, so it
     /// seals nothing.
+    #[inline]
     pub(super) fn nothing() -> (Arc<FxContent>, Arc<FxContent>) {
         static EMPTY: OnceLock<Arc<FxContent>> = OnceLock::new();
         let empty = EMPTY.get_or_init(|| Arc::new(FxContent::default()));

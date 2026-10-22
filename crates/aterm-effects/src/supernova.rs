@@ -155,7 +155,7 @@ pub fn combo_chance(cfg: u8, level: u32) -> u8 {
 /// Total visible window per tier — the host's `nova_done` edge and ember start.
 #[inline]
 #[must_use]
-pub fn total_ms(tier: SuperTier) -> u64 {
+pub const fn total_ms(tier: SuperTier) -> u64 {
     match tier {
         SuperTier::Flash => 1100,
         SuperTier::Nova => SUPER_TOTAL_MS,
@@ -447,6 +447,7 @@ pub fn emit_super(
 /// falloff, hues and proportions. The probe is row-bucketed and edge-swept
 /// ([`peak_additive_channel`]): cost `Σ_r (m_r log m_r + m_r²)` over per-row
 /// populations `m_r`.
+#[inline]
 fn bound_additive_overlap(quads: &mut [GlowQuad]) {
     let peak = peak_additive_channel(quads);
     if peak <= MAX_VIEWPORT_OVERLAY {
@@ -589,6 +590,7 @@ fn charge_mote_pos(env: &SuperEnv, k: usize, p: f32) -> (i32, i32) {
 
 /// The 8-point star crown, additive (dark themes): 4 axes (2 orthogonal + 2
 /// diagonal), 3 tapered segments per point ⇒ ≤ 8 × 3 + 2 = 26 ≤ 50 quads.
+#[inline]
 fn emit_crown_quads(sink: &mut QuadSink<'_>, env: &SuperEnv, env_a: f32) {
     let reach = env.r_max; // ~6 rows
     let core = premul(0x00FF_FFFF, env_a);
@@ -617,6 +619,7 @@ fn emit_crown_quads(sink: &mut QuadSink<'_>, env: &SuperEnv, env_a: f32) {
 
 /// One ring as ≤ [`SUPER_RING_BANDS`] row-band chord pairs (annulus geometry:
 /// ≤ 2 chords per band).
+#[inline]
 fn emit_ring_chords(sink: &mut QuadSink<'_>, env: &SuperEnv, r: f32, thick: f32, premul: u32) {
     if r <= 1.0 {
         return;
@@ -911,6 +914,7 @@ const SHADE_TAB: usize = 1 << SHADE_TAB_BITS;
 /// or probing cannot terminate. [`bound_shade_opacity`] admits at most
 /// `SHADE_TAB / 2` stamps and routes larger populations (unreachable from
 /// `emit_super_decos`) to the quadratic reference.
+#[inline]
 fn peak_shade_probe(decos: &[WordDecoration]) -> u32 {
     // `u64::MAX` cannot collide with a real key: keys are `row << 16 | col`
     // over two u16s, so they occupy only the low 32 bits.
@@ -970,6 +974,7 @@ fn peak_shade_quadratic(decos: &[WordDecoration]) -> u32 {
 /// exact overlap class. One frame-wide scale from the worst cell keeps the
 /// radial falloff; the peak scan ([`peak_shade_probe`]) is linear and runs only
 /// while Shade stamps exist.
+#[inline]
 fn bound_shade_opacity(decos: &mut [WordDecoration]) {
     if decos.is_empty() {
         return;

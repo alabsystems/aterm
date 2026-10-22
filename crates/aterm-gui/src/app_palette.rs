@@ -96,7 +96,7 @@ impl App {
             state = state.with_native_commands(scope);
         }
         state = state.with_themes(self.palette_themes());
-        state.resolve(&self.palette_live());
+        state.resolve(&self.palette_live_for_window(Some(wid)));
         state
     }
 
@@ -197,7 +197,7 @@ impl App {
             })
             .collect();
         let mut state = PaletteState::new().with_themes(themes);
-        state.resolve(&self.palette_live());
+        state.resolve(&self.palette_live_for_window(Some(wid)));
         self.palette_open_state(wid, state.themes_only());
     }
 
@@ -370,11 +370,17 @@ impl App {
         }
     }
 
-    /// The live predicates that resolve each row's enabled/checked state off the front window
-    /// (the same conditions `validateMenuItem:` uses), plus the update-flow state the Version
-    /// rows mirror. The closed-palette `controls menu` fallback resolves against it too.
+    /// The front window's live predicates, shared with native menu validation.
     pub(crate) fn palette_live(&self) -> PaletteLive {
-        let has_selection = self.frontmost_window.is_some_and(|wid| {
+        self.palette_live_for_window(self.frontmost_window)
+    }
+
+    /// Resolve content and window facts for the palette's own window. Update,
+    /// theme, fleet and other process-wide facts remain shared; `None` is the
+    /// native menu's windowless state.
+    fn palette_live_for_window(&self, wid: Option<crate::WindowId>) -> PaletteLive {
+        let window = wid.and_then(|wid| self.windows.get(&wid));
+        let has_selection = wid.is_some_and(|wid| {
             if self.active_native_view(wid).is_some() {
                 self.native_selection_text(wid).is_some()
             } else {
@@ -385,19 +391,15 @@ impl App {
                 })
             }
         });
-        let fullscreen = self
-            .front()
+        let fullscreen = window
             .and_then(|ws| ws.os_window.as_ref())
             .and_then(|w| w.fullscreen())
             .is_some();
-        let maximized = self
-            .front()
+        let maximized = window
             .and_then(|ws| ws.os_window.as_ref())
             .is_some_and(|w| w.is_maximized());
-        let multi_tab = self.front().is_some_and(|ws| ws.tab_set.len() >= 2);
-        let native_tab_active = self
-            .frontmost_window
-            .is_some_and(|wid| self.active_native_view(wid).is_some());
+        let multi_tab = window.is_some_and(|ws| ws.tab_set.len() >= 2);
+        let native_tab_active = wid.is_some_and(|wid| self.active_native_view(wid).is_some());
         // The staged build (only ever strictly newer) drives the one-click row; the realized
         // arrow (after an update, until `REALIZED_ARROW_TTL`) the fading celebration row.
         // `resolve` prefers staged when both are live.
@@ -419,35 +421,24 @@ impl App {
         };
         // The front session's effective rain state (override, else config); false with no
         // front terminal, where the row is disabled anyway.
-        let rain_on = self
-            .frontmost_window
+        let rain_on = wid
             .and_then(|wid| self.front_terminal(wid))
             .is_some_and(|terminal| self.session_rain_enabled(terminal.session));
         // Checked when this window's promotable kitty (the tenured program cat, else the
         // launch kitty) is the pinned favourite: the look `App::favourite_kitty_checked`
         // promotes. `is_favourite` takes `&self`, so this cannot poll the startup import; the
         // render loop does every tick.
-        let promotable = self
-            .frontmost_window
-            .map_or(self.launch_kitty, |wid| self.promotable_kitty(wid));
+        let promotable = wid.map_or(self.launch_kitty, |wid| self.promotable_kitty(wid));
         let kitty_favourited = self.kitty_log.is_favourite(promotable);
         // Per-session rows need a real front terminal: false over a native whole tab and
         // with no window at all.
-        let terminal_front = self
-            .frontmost_window
-            .is_some_and(|wid| self.front_terminal(wid).is_some());
-        let can_rename = self
-            .frontmost_window
-            .is_some_and(|wid| self.can_rename_session(wid));
+        let terminal_front = wid.is_some_and(|wid| self.front_terminal(wid).is_some());
+        let can_rename = wid.is_some_and(|wid| self.can_rename_session(wid));
         // The person's hold on the front session (Take Over / Hand Back) —
         // read from the session's own fabric leaf, the fact the native bar's
         // static carries too.
-        let front_person_hold = self
-            .frontmost_window
-            .is_some_and(|wid| self.front_person_hold(wid));
-        let front_remote_hold = self
-            .frontmost_window
-            .is_some_and(|wid| self.front_remote_hold(wid));
+        let front_person_hold = wid.is_some_and(|wid| self.front_person_hold(wid));
+        let front_remote_hold = wid.is_some_and(|wid| self.front_remote_hold(wid));
         // Accelerator hints for menu rows (keyboard audit #6): the resolved
         // chord for every menu action bound in the EFFECTIVE keybinding table,
         // deduped by action (a command listed in two menus shows one truth).
@@ -474,19 +465,14 @@ impl App {
             hints
         };
         // Whether the front session draws a theme of its own to clear.
-        let tab_theme = self
-            .frontmost_window
+        let tab_theme = wid
             .and_then(|wid| self.front_terminal(wid))
             .is_some_and(|terminal| self.pool.theme(terminal.session).is_some());
         PaletteLive {
             has_selection,
-            can_save: self
-                .frontmost_window
-                .is_some_and(|wid| self.can_save_document(wid)),
-            can_find: self.frontmost_window.is_some_and(|wid| self.can_find(wid)),
-            can_find_again: self
-                .frontmost_window
-                .is_some_and(|wid| self.can_find_again(wid)),
+            can_save: wid.is_some_and(|wid| self.can_save_document(wid)),
+            can_find: wid.is_some_and(|wid| self.can_find(wid)),
+            can_find_again: wid.is_some_and(|wid| self.can_find_again(wid)),
             can_rename,
             tab_theme,
             rain_on,
@@ -494,7 +480,9 @@ impl App {
             serious_mode: self.serious_mode_enabled(),
             fullscreen,
             maximized,
-            front_tab_split: self.front_tab_split(),
+            front_tab_split: window
+                .and_then(|ws| ws.tab_set.active())
+                .is_some_and(|tab| tab.root.len() > 1),
             multi_tab,
             native_tab_active,
             terminal_front,
@@ -526,6 +514,7 @@ impl App {
 
     /// Whether the front window's active tab is split, so ⌘W closes a pane
     /// rather than the tab (`close_active_tab`).
+    #[cfg(any(target_os = "macos", test))]
     fn front_tab_split(&self) -> bool {
         self.front()
             .and_then(|ws| ws.tab_set.active())
@@ -580,15 +569,20 @@ impl App {
     /// (`Wake::UpdateStaged`, the realized arrow's spawn or expiry) so open Version rows update
     /// in place.
     pub(crate) fn palette_refresh_live(&mut self) {
-        let live = self.palette_live();
-        let mut touched = Vec::new();
-        for (&wid, ws) in &mut self.windows {
-            if let Some(p) = ws.palette_mut() {
+        let touched: Vec<_> = self
+            .windows
+            .iter()
+            .filter_map(|(&wid, ws)| ws.palette().is_some().then_some(wid))
+            .collect();
+        for &wid in &touched {
+            let live = self.palette_live_for_window(Some(wid));
+            if let Some(ws) = self.windows.get_mut(&wid)
+                && let Some(p) = ws.palette_mut()
+            {
                 p.resolve(&live);
                 if let Some(w) = &ws.os_window {
                     w.request_redraw();
                 }
-                touched.push(wid);
             }
         }
         for wid in touched.iter().copied() {
@@ -605,7 +599,7 @@ impl App {
     /// own view generation. The query survives, while selection returns to the first match.
     pub(crate) fn palette_sync_native_scope(&mut self, wid: crate::WindowId) {
         let scope = self.native_palette_scope(wid);
-        let live = self.palette_live();
+        let live = self.palette_live_for_window(Some(wid));
         let mut changed = false;
         if let Some(palette) = self
             .windows
@@ -641,10 +635,10 @@ impl App {
         self.palette_open_state(wid, state);
     }
 
-    /// Put `state` up as the front window's palette (no-op if one is open).
+    /// Put `state` up in its owning window (no-op if one is open).
     fn palette_open_state(&mut self, wid: crate::WindowId, state: PaletteState) {
         let mut opened = false;
-        if let Some(ws) = self.front_mut()
+        if let Some(ws) = self.windows.get_mut(&wid)
             && ws.palette().is_none()
         {
             ws.overlay = Some(crate::overlay::Overlay::Palette(state));
@@ -698,7 +692,7 @@ impl App {
             section: format!("{} Close Recovery", app.descriptor().name),
             commands,
         });
-        state.resolve(&self.palette_live());
+        state.resolve(&self.palette_live_for_window(Some(wid)));
 
         let window = self
             .windows
@@ -1165,6 +1159,96 @@ mod tests {
         assert!(app.windows[&wid].search.is_none());
     }
 
+    #[test]
+    fn each_window_palette_keeps_its_own_find_availability_on_snapshot_rescope_and_refresh() {
+        use crate::menu::MenuAction;
+        use crate::native_app::{AppEvent, AppKind};
+        use crate::native_editor::EditorCommand;
+        use crate::palette::PaletteState;
+        use amacs::input::EditorInput;
+        use aterm_types::keyboard::{Key, Modifiers, NamedKey};
+
+        fn find_enabled(palette: &PaletteState) -> [bool; 3] {
+            [MenuAction::Find, MenuAction::FindNext, MenuAction::FindPrev].map(|action| {
+                palette
+                    .rows()
+                    .iter()
+                    .find(|row| row.action == action)
+                    .expect("shared Find row")
+                    .enabled
+            })
+        }
+
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("find.md");
+        std::fs::write(&path, "needle then needle\n").unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let mut app = App::headless_for_test();
+        let editor_window = WindowId(0);
+        app.open_document_tab_in_window(editor_window, AppKind::Editor, &uri)
+            .unwrap();
+        let (instance, _) = app.active_native_view(editor_window).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let original = app.document_store.snapshot(document).unwrap();
+        app.dispatch_native_event(
+            editor_window,
+            AppEvent::EditorCommand(EditorCommand::IncrementalSearch),
+        )
+        .unwrap();
+        app.dispatch_native_event(
+            editor_window,
+            AppEvent::EditorInput(EditorInput::Text("needle".to_string())),
+        )
+        .unwrap();
+        app.dispatch_native_event(
+            editor_window,
+            AppEvent::EditorInput(EditorInput::Key {
+                key: Key::Named(NamedKey::Enter),
+                mods: Modifiers::empty(),
+                text: None,
+            }),
+        )
+        .unwrap();
+
+        let sid = app.next_session_id;
+        let reader_window = app.insert_logical_window(crate::stub_session(sid), 24, 80);
+        app.open_document_tab_in_window(reader_window, AppKind::Markdown, &uri)
+            .unwrap();
+        assert_eq!(app.frontmost_window, Some(reader_window));
+        let editor_palette = app.palette_snapshot(editor_window);
+        let reader_palette = app.palette_snapshot(reader_window);
+        assert_eq!(find_enabled(&editor_palette), [true; 3]);
+        assert_eq!(find_enabled(&reader_palette), [false; 3]);
+        assert!(
+            !app.palette_live().can_find,
+            "the menu still follows the front window"
+        );
+
+        app.palette_open_state(editor_window, editor_palette);
+        assert!(app.windows[&editor_window].palette().is_some());
+        assert!(app.windows[&reader_window].palette().is_none());
+        app.palette_open_state(reader_window, reader_palette);
+        app.palette_refresh_live();
+        assert_eq!(
+            find_enabled(app.windows[&editor_window].palette().unwrap()),
+            [true; 3]
+        );
+        assert_eq!(
+            find_enabled(app.windows[&reader_window].palette().unwrap()),
+            [false; 3]
+        );
+
+        app.palette_sync_native_scope(editor_window);
+        assert_eq!(
+            find_enabled(app.windows[&editor_window].palette().unwrap()),
+            [true; 3]
+        );
+        assert_eq!(app.frontmost_window, Some(reader_window));
+        let after = app.document_store.snapshot(document).unwrap();
+        assert_eq!(after.seq, original.seq);
+        assert_eq!(after.text, original.text);
+    }
+
     fn assert_find_availability(app: &App, wid: WindowId, open: bool, again: bool) {
         use crate::menu::{MenuAction, menu_live};
 
@@ -1191,6 +1275,124 @@ mod tests {
                 "{action:?}: disabled rows cannot activate"
             );
         }
+    }
+
+    #[test]
+    fn editor_find_availability_preserves_other_prompts_and_restores_after_exit() {
+        use crate::native_app::{AppEvent, AppKind, AppViewState};
+        use crate::native_editor::{EditorBufferView, EditorCommand, Minibuffer};
+        use crate::native_ui::UiKey;
+        use amacs::input::EditorInput;
+        use aterm_types::keyboard::{Key, Modifiers, NamedKey};
+
+        fn buffer(app: &App, view: crate::tab_model::ViewId) -> &EditorBufferView {
+            match app.native_runtime.view_state(view) {
+                Some(AppViewState::Editor(state)) => state.buffer.as_ref().unwrap(),
+                _ => panic!("editor view"),
+            }
+        }
+
+        fn assert_editor_find(app: &App, wid: WindowId, open: bool, again: bool) {
+            assert_find_availability(app, wid, open, again);
+            let (instance, view) = app.active_native_view(wid).unwrap();
+            let commands = app.native_runtime.commands(instance, view).unwrap();
+            let find = commands
+                .iter()
+                .find(|command| command.id.as_str() == "editor/find")
+                .unwrap();
+            assert_eq!(find.enabled, open);
+            let compiled = app.compiled_native_ui(wid).unwrap();
+            let toolbar = compiled
+                .semantic(&UiKey::new("editor/find-button"))
+                .expect("editor Find toolbar button");
+            assert_eq!(toolbar.state.unwrap().enabled, open);
+        }
+
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("prompts.txt");
+        let source = "needle one\nneedle two\n";
+        std::fs::write(&path, source).unwrap();
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &uri).unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        let original = app.document_store.snapshot(document).unwrap();
+        let enter = AppEvent::EditorInput(EditorInput::Key {
+            key: Key::Named(NamedKey::Enter),
+            mods: Modifiers::empty(),
+            text: None,
+        });
+
+        assert_editor_find(&app, wid, true, false);
+        app.find_requested_in(wid);
+        app.dispatch_native_event(
+            wid,
+            AppEvent::EditorInput(EditorInput::Text("needle".into())),
+        )
+        .unwrap();
+        app.dispatch_native_event(wid, enter.clone()).unwrap();
+        assert_editor_find(&app, wid, true, true);
+
+        for command in [
+            EditorCommand::GotoLine,
+            EditorCommand::ExecuteCommand,
+            EditorCommand::SwitchBuffer,
+            EditorCommand::KillBuffer,
+        ] {
+            app.dispatch_native_event(wid, AppEvent::EditorCommand(command))
+                .unwrap();
+            app.dispatch_native_event(wid, AppEvent::EditorInput(EditorInput::Text("2".into())))
+                .unwrap();
+            let prompt = buffer(&app, view).minibuffer.clone();
+            assert!(matches!(
+                (command, &prompt),
+                (EditorCommand::GotoLine, Minibuffer::GotoLine { .. })
+                    | (EditorCommand::ExecuteCommand, Minibuffer::Command { .. })
+                    | (EditorCommand::SwitchBuffer, Minibuffer::Buffer { .. })
+                    | (EditorCommand::KillBuffer, Minibuffer::Prompt { .. })
+            ));
+            assert_editor_find(&app, wid, false, false);
+            app.find_requested_in(wid);
+            assert_eq!(buffer(&app, view).minibuffer, prompt);
+            assert_editor_find(&app, wid, false, false);
+            let exit = if command == EditorCommand::GotoLine {
+                enter.clone()
+            } else {
+                AppEvent::EditorCommand(EditorCommand::Abort)
+            };
+            app.dispatch_native_event(wid, exit).unwrap();
+            assert!(matches!(
+                buffer(&app, view).minibuffer,
+                Minibuffer::Inactive
+            ));
+            assert_editor_find(&app, wid, true, true);
+        }
+
+        app.find_requested_in(wid);
+        app.dispatch_native_event(
+            wid,
+            AppEvent::EditorInput(EditorInput::Text("needle".into())),
+        )
+        .unwrap();
+        assert_editor_find(&app, wid, true, true);
+        let first = buffer(&app, view).primary_selection().range();
+        app.find_requested_in(wid);
+        assert_ne!(buffer(&app, view).primary_selection().range(), first);
+        assert!(matches!(
+            &buffer(&app, view).minibuffer,
+            Minibuffer::Search { query, .. } if query == "needle"
+        ));
+        app.search_find_again_in(wid, false).unwrap();
+        assert_eq!(buffer(&app, view).primary_selection().range(), first);
+        app.dispatch_native_event(wid, enter).unwrap();
+        assert_editor_find(&app, wid, true, true);
+
+        let after = app.document_store.snapshot(document).unwrap();
+        assert_eq!(after.seq, original.seq);
+        assert_eq!(after.text, original.text);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), source);
     }
 
     /// Find availability follows the focused content and its own query through

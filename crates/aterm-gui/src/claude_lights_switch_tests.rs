@@ -3,10 +3,10 @@
 
 //! THE HARNESS SWITCH ON THE COMPOSER'S TOP RULE (owner, 2026-10-20: "there
 //! needs to be an \"on\" button drawn for the claude harness"; design §2.3):
-//! wherever a host is, Claude Code's top rule draws ONE switch where the
-//! wordmark's `claude harness ● on` stands — lit while the harness carries
-//! the session, and in every off state (the session's own word, its agent's
-//! switch, the master switch) `claude harness ○ off ▐ on ▌`, whose `on`
+//! wherever a host is, Claude Code's top rule draws ONE switch at its right,
+//! `alab harness ● on` — lit while the harness carries the session, and in
+//! every off state (the session's own word, its agent's switch, the master
+//! switch) `alab harness ○ off ▐ on ▌`, whose `on`
 //! button turns the harness on from whichever switch holds it off, opening
 //! nothing. Driven through the window's own pointer path on the real
 //! engine, read off the frame the capture route splices.
@@ -133,10 +133,10 @@ fn not_saved(app: &App, key: &str) -> Option<String> {
 }
 
 /// The off switch's face, every form: label, state, the `on` button.
-const OFF_FACE: &str = " claude harness \u{25cb} off \u{2590} on \u{258c} ";
+const OFF_FACE: &str = " alab harness \u{25cb} off \u{2590} on \u{258c} ";
 
 /// AN OFF SESSION'S `on` TURNS IT ON (the session's own word `off`): the
-/// lit switch reads `claude harness ● on`; Off draws `claude harness ○ off
+/// lit switch reads `alab harness ● on`; Off draws `alab harness ○ off
 /// ▐ on ▌` — no wordmark, the switch alone — and a click on `on` writes the
 /// session's word `cruise`, so the next frame's switch is lit again; and
 /// the lit switch's click turns it off, as before. Nothing reaches the PTY
@@ -149,7 +149,7 @@ fn an_off_sessions_on_button_turns_it_on() {
     let lit = switch(&app, wid).expect("a hosted Claude Code pane draws the switch");
     assert_eq!((lit.face, lit.button.clone()), (HarnessSwitch::On, None));
     assert!(
-        top_rule(&app, wid).contains(" claude harness \u{25cf} on "),
+        top_rule(&app, wid).contains(" alab harness \u{25cf} on "),
         "{:?}",
         top_rule(&app, wid)
     );
@@ -428,7 +428,7 @@ fn a_switch_turning_on_says_so_and_takes_no_click() {
         (HarnessSwitch::Turning, None)
     );
     assert!(
-        top_rule(&app, wid).contains(" claude harness \u{25d0} turning on "),
+        top_rule(&app, wid).contains(" alab harness \u{25d0} turning on "),
         "{:?}",
         top_rule(&app, wid)
     );
@@ -486,8 +486,8 @@ type Case = (&'static str, fn(&mut App), HarnessSwitch);
 /// WHERE THE SWITCH STANDS: in every state a host gives a Claude Code pane —
 /// Cruise and Land lit, Off, the master switch off and the agent's off with
 /// the `on` button — and on no pane without a host (Unhosted: nothing
-/// supervises, so no switch and no branding) or without an agent (a
-/// shell's rule). NEGATIVE CONTROL: the same pane with its host back draws
+/// supervises, so no switch, the lockup alone on Claude's rule) or without
+/// an agent (a shell's rule, as the shell drew it). NEGATIVE CONTROL: the same pane with its host back draws
 /// it again.
 #[test]
 fn the_switch_stands_in_every_hosted_state_and_on_no_other_pane() {
@@ -530,7 +530,7 @@ fn the_switch_stands_in_every_hosted_state_and_on_no_other_pane() {
         let rule = top_rule(&app, wid);
         assert!(
             rule.contains(if face.is_on() {
-                " claude harness \u{25cf} on "
+                " alab harness \u{25cf} on "
             } else {
                 OFF_FACE
             }),
@@ -543,10 +543,11 @@ fn the_switch_stands_in_every_hosted_state_and_on_no_other_pane() {
     frame(&mut app, wid);
     assert_eq!(autopilot(&app, session).1, AutopilotView::Unhosted);
     assert_eq!(switch(&app, wid), None, "unhosted: no switch");
+    let rule = top_rule(&app, wid);
     assert!(
-        top_rule(&app, wid).chars().all(|c| c == '\u{2500}'),
-        "unhosted: the rule as Claude drew it: {:?}",
-        top_rule(&app, wid)
+        rule.starts_with("\u{2500}\u{2500}    claude \u{2500}")
+            && rule.chars().skip(13).all(|c| c == '\u{2500}'),
+        "unhosted: the lockup on the rule as Claude drew it: {rule:?}"
     );
     // NEGATIVE CONTROL: the host back.
     app.harness = held;
@@ -556,11 +557,16 @@ fn the_switch_stands_in_every_hosted_state_and_on_no_other_pane() {
     set_program(&app, session, None);
     frame(&mut app, wid);
     assert_eq!(switch(&app, wid), None, "no agent: no switch");
+    assert!(
+        top_rule(&app, wid).chars().all(|c| c == '\u{2500}'),
+        "no agent: the rule as the shell drew it: {:?}",
+        top_rule(&app, wid)
+    );
 }
 
 /// A NARROW PANE (`footer::fit_rule`'s rule for the top rule: the switch
 /// gives way LATE, after its words): narrowing column by column from 120,
-/// the off switch sheds `harness`, then `claude`, then `○ off`, and keeps
+/// the off switch sheds `harness`, then `alab`, then `○ off`, and keeps
 /// its `on` button to the last — never a form back once a wider pane gave
 /// it up — and goes only where the rule has no room for `▐ on ▌` with a
 /// rule cell either side. CONTROL: every form is met.
@@ -649,7 +655,7 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
         (HarnessChip::Switch, Some(Toggled::True))
     );
     let visual = words(&painted(&app, wid, &b, b.switch.clone()));
-    assert_eq!(visual, "claude harness on");
+    assert_eq!(visual, "alab harness on");
     assert!(
         crate::native_ui::visible_label_in_name(&visual, &lit[0].label),
         "{visual:?} in {:?}",
@@ -715,24 +721,101 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
     );
 }
 
-/// THE HARNESS'S TINT IS THE RULE'S; ITS MARK AND SWITCH ARE THE HOST'S, for
-/// the resident pet (`crate::pet_chrome`). With the harness carrying the
-/// session the composer's top rule is repainted whole in its tint, the
-/// tool's mark at its left and the lit switch at its right. The strokes are
-/// the rule they were (the pet reads the program's own rule as ink); only the
-/// mark's and the switch's cells are protected ground. Noted whole, the rule
+/// DECORATION HAS NO NODE (spec §8; WCAG 1.1.1 and 2.5.3): a Claude Code
+/// pane wearing the lockup — the CLI's icon, a sprite over two blank cells,
+/// and its name — publishes the switch as one node named by the words it
+/// paints and the product it no longer spells, `alab harness on: Claude
+/// Code`, and no node over the lockup's cells, nor any node of the tree that
+/// names or holds them: the lockup is decoration, the switch the control.
+///
+/// NEGATIVE CONTROL: hb-int's law (a name that holds `harness` is the
+/// painted words alone) names the switch `alab harness on`, which lacks the
+/// product, and the name check refuses it.
+#[cfg(a11y_tree)]
+#[test]
+fn decoration_has_no_node() {
+    use crate::a11y_tree::HarnessChip;
+    let (app, wid, session, _reader, _host) = claude_pane(120);
+    let b = switch(&app, wid).expect("lit");
+    let strip = usize::from(app.chrome_rows(wid));
+    let rule = top_rule(&app, wid);
+    let lockup = "    claude ";
+    let at = rule.find(lockup).expect("the lockup on the glass");
+    let cols = rule[..at].chars().count()..rule[..at].chars().count() + lockup.chars().count();
+    assert_eq!(cols, 2..13, "two `\u{2500}` in: {rule:?}");
+    let product = b.program.product();
+    let (words, _) = crate::claude_footer::switch_words(&b);
+    // The name holds the painted words whole and in order, then the product.
+    let names = |label: &str| {
+        crate::native_ui::visible_label_in_name(&words, label) && label.ends_with(product)
+    };
+    let chips = app.claude_chips_a11y(wid);
+    let switches: Vec<_> = chips
+        .iter()
+        .filter(|c| c.session == session && c.chip == HarnessChip::Switch)
+        .collect();
+    assert_eq!(switches.len(), 1, "{chips:?}");
+    assert_eq!(switches[0].label, "alab harness on: Claude Code");
+    assert!(names(&switches[0].label), "{:?}", switches[0].label);
+    assert_eq!(
+        crate::claude_lights::switch_label(&words, product),
+        switches[0].label
+    );
+    let over: Vec<_> = chips
+        .iter()
+        .filter(|c| {
+            c.row + strip == b.frame_row && c.col < cols.end && c.col + c.width.max(1) > cols.start
+        })
+        .collect();
+    assert!(over.is_empty(), "no node over the lockup: {over:?}");
+    let tree = app.grid_a11y_tree(wid, None).expect("the grid's tree");
+    let held: Vec<_> = tree
+        .nodes
+        .iter()
+        .filter(|(_, n)| {
+            let holds =
+                |s: &str| s.contains("\u{2500}    claude") || s.contains("    claude \u{2500}");
+            n.label().is_some_and(holds) || n.value().is_some_and(holds)
+        })
+        .map(|(_, n)| n.role())
+        .collect();
+    assert!(held.is_empty(), "no node names the lockup: {held:?}");
+    // NEGATIVE CONTROL: hb-int's law.
+    let hb_int = |words: &str, product: &str| {
+        if words.contains("harness") {
+            words.to_owned()
+        } else {
+            format!("{words}: {product} harness")
+        }
+    };
+    let old = hb_int(&words, product);
+    assert_eq!(old, "alab harness on", "CONTROL: hb-int's name");
+    assert!(
+        !names(&old),
+        "CONTROL: a name without the product is refused"
+    );
+}
+
+/// THE HARNESS'S TINT IS THE RULE'S; ITS LOCKUP AND SWITCH ARE THE HOST'S,
+/// for the resident pet (`crate::pet_chrome`). With the harness carrying the
+/// session the composer's top rule is repainted whole in its tint, the CLI's
+/// lockup at its left and the lit switch at its right. The strokes are the
+/// rule they were (the pet reads the program's own rule as ink); only the
+/// lockup's cells (its pads, the icon's two cells under its sprite, the
+/// name) and the switch's are protected ground. Noted whole, the rule
 /// refused every stand on the composer's first line (the pet's 1.7-row body
 /// reaches into it), and the cat waited off the line, up to fifty columns
 /// behind the caret, and bounded back at every line (2026-10-20, real Claude
 /// Code 2.1.305 with the harness on, windowed).
 ///
-/// NEGATIVE CONTROL (as run): the write noted whole (`PetChrome::note` over
-/// its length), all 68 of the rule's strokes are held.
+/// NEGATIVE CONTROL (as run on hb-int): the write noted whole
+/// (`PetChrome::note` over its length), every one of the rule's strokes is
+/// held.
 #[test]
 fn the_harness_tint_is_the_rules_and_only_its_mark_and_switch_are_held() {
     let (mut app, wid, session, _reader, _host) = claude_pane(120);
     // The host holds the session's live supervisor claim: the harness
-    // carries it, and its tint, mark and wordmark stand on the rule.
+    // carries it, and its tint, lockup and switch stand on the rule.
     let ctx = app.pool.get(session).expect("session").ctx.clone();
     crate::session_timeline::claim_supervisor(
         &ctx,
@@ -747,7 +830,7 @@ fn the_harness_tint_is_the_rules_and_only_its_mark_and_switch_are_held() {
     app.splice_autopilot_menu(wid);
     let b = switch(&app, wid).expect("a hosted Claude Code pane draws the switch");
     assert!(
-        b.branded && b.face == HarnessSwitch::On,
+        b.face == HarnessSwitch::On,
         "fixture: the harness carries the session: {b:?}"
     );
     let row: Vec<char> = app.windows[&wid].input_scratch.cells[b.frame_row]
@@ -767,8 +850,8 @@ fn the_harness_tint_is_the_rules_and_only_its_mark_and_switch_are_held() {
         .filter(|&c| row[c] != '\u{2500}' && row[c] != ' ')
         .collect();
     assert!(
-        strokes.len() > 60 && marks.len() > 20 && marks.iter().any(|&c| c < 20),
-        "fixture: the tinted rule, the mark at its left, the switch: {:?}",
+        strokes.len() > 60 && marks.len() >= 20 && marks.iter().any(|&c| c < 20),
+        "fixture: the tinted rule, the lockup at its left, the switch: {:?}",
         row.iter().collect::<String>()
     );
     let held_strokes: Vec<usize> = strokes.iter().copied().filter(|&c| covered(c)).collect();
@@ -826,7 +909,7 @@ fn a_pointed_agents_panel_row_keeps_the_switch_the_facts_and_the_chip() {
             "{main:?} / {agent:?}: the top rule"
         );
         let face = painted(&app, wid, &b, b.switch.clone());
-        assert!(face.contains("claude harness \u{25cf} on"), "{face:?}");
+        assert!(face.contains("alab harness \u{25cf} on"), "{face:?}");
         let facts = row_text(&app, wid, strip + 19);
         assert!(
             facts.contains(WHOLE_FACTS),

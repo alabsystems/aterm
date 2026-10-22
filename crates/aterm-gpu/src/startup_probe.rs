@@ -84,12 +84,14 @@ static CELL_PIPELINE_NS: [AtomicU64; CELL_PIPELINE_COUNT] =
 
 /// Clamp a measured duration into the slot encoding: saturate at `u64::MAX` ns
 /// and floor at 1 ns so a recorded leg is never read as unset.
+#[inline]
 fn slot_ns(elapsed: Duration) -> u64 {
     u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1)
 }
 
 /// Record `elapsed` for `leg`, first write wins, publishing every leg recorded before it (see
 /// the module docs).
+#[inline]
 pub fn record(leg: Leg, elapsed: Duration) {
     let _ = LEG_NS[leg as usize].compare_exchange(
         0,
@@ -126,11 +128,13 @@ pub(crate) fn split_cell_pipeline(index: usize, since: Instant) -> Instant {
 
 /// Read one leg; 0 means it never ran in this process. Set, it carries every leg recorded
 /// before it (see the module docs).
+#[inline]
 pub fn leg_ns(leg: Leg) -> u64 {
     LEG_NS[leg as usize].load(Ordering::Acquire)
 }
 
 /// Read the per-cell-pipeline split, in [`CELL_PIPELINE_NAMES`] order.
+#[inline]
 pub fn cell_pipeline_ns() -> [u64; CELL_PIPELINE_COUNT] {
     std::array::from_fn(|index| CELL_PIPELINE_NS[index].load(Ordering::Relaxed))
 }
@@ -155,6 +159,7 @@ pub(crate) fn record_effect_build(index: usize, elapsed: Duration) {
 
 /// `(count, nanoseconds, slot bitmask)` of demand-built effect pipelines;
 /// `(0, 0, 0)` for a launch with default settings.
+#[inline]
 pub fn effect_build_ledger() -> (u64, u64, u64) {
     (
         EFFECT_BUILDS.load(Ordering::Relaxed),

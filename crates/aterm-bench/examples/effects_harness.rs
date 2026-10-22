@@ -20,9 +20,18 @@
 // The scenes, at the desk's cell (JetBrains Mono at 30 px: 18x40) on a 26x190 grid (the
 // 3420x1040 drawable §5's pass costs are stated at), on the shipped dark theme with bloom and
 // shimmer on:
-//   episode  the harness card's arm-to-settle episode (`HarnessCard::draw` on its 33 ms clock,
-//            the ride-in included), every frame the card asks for, the settled one last;
-//   settled  the settled card replayed while a key a frame lands in the composer under it;
+//   episode  the harness card's intro (`HarnessCard::draw` on its 33 ms clock, the ride-in
+//            included), every frame the card asks for, the flow's first frame (the one the
+//            intro hands over to) last;
+//   flowing  the card flowing on after its intro while a key a twelfth of a second lands in
+//            the composer under it: a frame at each key and at each of the flow's 128 ms steps
+//            (`HarnessCard::deadline`), a step drawing its palette on the fixed rim art and a
+//            key between two steps replaying that step's kept frame (`replay_step`); REPORTED,
+//            not gated: the lane's floors are the baseline its box recorded, and gating it
+//            waits for a record there (docs/DESIGN-card-engine-2026-10-19.md §4.8.1);
+//   settled  the held card (`animate` false: Reduce Motion, or its window out of focus)
+//            replayed while a key a frame lands in the composer under it, its first held frame
+//            drawn unmeasured;
 //   typing   the shipped cursor glow (Rainbow Kitty) ticked at 120 Hz while 12 keys a second
 //            land at a shell prompt, then its run-out; a tick whose fingerprint did not move
 //            presents nothing, as in the app;
@@ -106,7 +115,7 @@ use aterm_core::render::{DecoBlend, DecoGlyph, FxSlot, InkCell, PxRect, WordDeco
 use aterm_core::terminal::Terminal;
 use aterm_effects::cursor_glow::{CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConfig, GlowStyle};
 use aterm_effects::harness_card::{
-    CardFrame, CardFrames, CardPalette, CardScene, EPISODE_MS, FRAME_MS, HarnessCard,
+    CardFrame, CardFrames, CardPalette, CardScene, EPISODE_MS, FRAME_MS, HarnessCard, LineAt,
     card_layer_id, dark_ground,
 };
 use aterm_gpu::gpu_time::{self, Settled};
@@ -127,6 +136,10 @@ const RUNS: usize = 5;
 
 /// Keys typed into the composer under the settled card.
 const SETTLED_KEYS: usize = 120;
+/// Keys typed into the composer under the flowing card, and their pace (the typist's, 12 a
+/// second): a key falls between two of the flow's 128 ms steps or on one.
+const FLOWING_KEYS: usize = 48;
+const FLOWING_KEYS_HZ: u32 = 12;
 /// The glow's frame clock and the typist's pace: a key every 10 ticks at 120 Hz is 12 a
 /// second (the Rainbow Kitty frame-cost gate's prose pace), then a second of run-out.
 const TYPING_HZ: u32 = 120;
@@ -661,6 +674,8 @@ impl Rig {
             serious: false,
             coat: 0x00E8_A060,
             eye: 0x0040_C080,
+            // No mascot read: the flow's glints start at the box's inner top-left corner.
+            wand: None,
         }
     }
 
@@ -886,7 +901,7 @@ impl Rig {
 const CARD_ID: u64 = 1;
 
 /// The card's host: the app's replay-or-draw (`claude_card.rs`): the card's frames (its kept
-/// settled frame, the ring its episode frames are built in, its arts), the frame the last
+/// settled or flow frame, the ring its episode frames are built in, its arts), the frame the last
 /// emit made, which the splice lays as the card's two fx layers, and the card's line.
 #[derive(Default)]
 struct CardHost {
@@ -918,11 +933,15 @@ impl LineHost {
         }
         self.row = Some(row);
         self.ink.clear();
+        let at = LineAt {
+            row,
+            col: LINE_COL,
+            len: LINE_TEXT.chars().count() as u16,
+            ..LineAt::default()
+        };
         card.line_ink_into(
             (!still).then_some(now),
-            row,
-            LINE_COL,
-            LINE_TEXT.chars().count() as u16,
+            &at,
             scene.ground,
             true,
             &mut self.ink,
@@ -957,13 +976,19 @@ impl LineHost {
 }
 
 impl CardHost {
-    /// The producer: replayed (`true`) when the card holds its kept settled frame for a scene of
-    /// this shape (an inline scroll is the same shape at a new origin), else drawn on `now`.
-    fn emit(&mut self, now: Instant, scene: &CardScene) -> (bool, Spent) {
+    /// The producer, in the app's order: replayed (`true`) when the card is held at the settled
+    /// frame it keeps for a scene of this shape (an inline scroll is the same shape at a new
+    /// origin), or flows and keeps the frame of `now`'s step, else drawn on `now`. `animate`
+    /// is the motion verdict the app ticks the card with.
+    fn emit(&mut self, now: Instant, scene: &CardScene, animate: bool) -> (bool, Spent) {
         let watch = Stopwatch::start();
-        let (frame, replayed) = match self.card.replay(scene, true, &self.frames) {
+        let kept = self
+            .card
+            .replay(scene, animate, &self.frames)
+            .or_else(|| self.card.replay_step(scene, animate, &self.frames, now));
+        let (frame, replayed) = match kept {
             Some(frame) => (frame, true),
-            None => (self.card.draw(now, scene, true, &mut self.frames), false),
+            None => (self.card.draw(now, scene, animate, &mut self.frames), false),
         };
         self.frame = Some(frame);
         self.line.make(&self.card, scene, now);
@@ -1099,8 +1124,9 @@ fn banner_at(term: &Terminal, row: u16, scratch: &mut Vec<char>) -> bool {
     scratch.len() >= banner.len() && scratch[..banner.len()] == banner[..]
 }
 
-/// The episode, then the settled card under typing, on one launch.
-fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run) {
+/// The intro, then the flowing card under typing, then the held card under typing, on one
+/// launch.
+fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run, Run) {
     let mut term = Terminal::new(ROWS as u16, COLS as u16);
     term.process(b"$ claude");
     print_card(&mut term, CARD_TOP);
@@ -1120,37 +1146,88 @@ fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run) {
     let mut episode = Vec::new();
     let mut now = t0;
     let most = (EPISODE_MS / FRAME_MS) as usize + 8;
+    // The intro asks for a frame every FRAME_MS; the first tick past it lets the intro go and
+    // draws the flow's first frame, after which the card flows on the ripple's steps.
     loop {
         Rig::extract(&mut term, &mut input);
-        let (replayed, emit) = host.emit(now, &scene);
+        let (replayed, emit) = host.emit(now, &scene, true);
         if replayed {
             fail("an episode frame replayed: the card was not armed");
         }
         let splice_ns = host.splice(&scene, rig.grid(), &mut input);
         episode.push(rig.present(&mut win, &input, emit, splice_ns));
+        if !host.card.intro_live() {
+            break;
+        }
         match host.card.deadline(now) {
             Some(next) if episode.len() < most => now = next,
-            Some(_) => fail(format!("the episode still asks for frames after {most}")),
-            None => break,
+            Some(_) => fail(format!("the intro still asks for frames after {most}")),
+            None => fail("the intro stopped asking for frames before it was over"),
         }
     }
-    if !host.drew_whole() {
-        fail("the episode ended without a settled frame");
+    if host.frames.kept().is_none_or(|k| k.step().is_none()) || !host.drew_whole() {
+        fail("the intro did not hand over to the flow");
     }
     let episode = rig.take_run(episode);
+
+    // The card flowing on: the app presents at each key and at each step the card asks for.
+    let key_every = Duration::from_secs(1) / FLOWING_KEYS_HZ;
+    let typed_from = now;
+    let mut flowing = Vec::with_capacity(FLOWING_KEYS * 2);
+    let (mut keys, mut drawn, mut replays) = (0, 0, 0);
+    while keys < FLOWING_KEYS {
+        let key_at = typed_from + key_every * (keys as u32 + 1);
+        let Some(step_at) = host.card.deadline(now) else {
+            fail("the flowing card stopped asking for its steps");
+        };
+        if key_at <= step_at {
+            now = key_at;
+            term.process(&[PROSE[keys % PROSE.len()]]);
+            keys += 1;
+        } else {
+            now = step_at;
+        }
+        Rig::extract(&mut term, &mut input);
+        let (replayed, emit) = host.emit(now, &scene, true);
+        if replayed {
+            replays += 1;
+        } else {
+            drawn += 1;
+        }
+        let splice_ns = host.splice(&scene, rig.grid(), &mut input);
+        flowing.push(rig.present(&mut win, &input, emit, splice_ns));
+    }
+    if drawn == 0 || replays == 0 {
+        fail(format!(
+            "the flowing card drew {drawn} and replayed {replays} of its frames: a step draws, a \
+             key between two steps replays"
+        ));
+    }
+    let flowing = rig.take_run(flowing);
+
+    // The card held (the motion verdict false): its first held frame draws the settled frame,
+    // unmeasured, so the window shows it before the keys land; every later one replays it.
+    Rig::extract(&mut term, &mut input);
+    let (replayed, _) = host.emit(now, &scene, false);
+    if replayed || host.frames.kept().is_none_or(|k| k.step().is_some()) {
+        fail("the held card did not draw its settled frame");
+    }
+    let _ = host.splice(&scene, rig.grid(), &mut input);
+    rig.settle_window(&mut win, &mut input);
+    rig.refs.clear();
 
     let mut settled = Vec::with_capacity(SETTLED_KEYS);
     for key in 0..SETTLED_KEYS {
         term.process(&[PROSE[key % PROSE.len()]]);
         Rig::extract(&mut term, &mut input);
-        let (replayed, emit) = host.emit(now, &scene);
+        let (replayed, emit) = host.emit(now, &scene, false);
         if !replayed {
             fail("the settled card was drawn again rather than replayed");
         }
         let splice_ns = host.splice(&scene, rig.grid(), &mut input);
         settled.push(rig.present(&mut win, &input, emit, splice_ns));
     }
-    (episode, rig.take_run(settled))
+    (episode, flowing, rig.take_run(settled))
 }
 
 /// What the caret does in a glow scene, on the glow's 120 Hz clock, before the run-out.
@@ -1266,7 +1343,7 @@ fn scroll_scene(rig: &mut Rig) -> Run {
         let now = Instant::now();
         Rig::extract(&mut term, &mut input);
         let scene = rig.card_scene(SCROLL_TOP);
-        let (replayed, _) = host.emit(now, &scene);
+        let (replayed, _) = host.emit(now, &scene, true);
         if replayed || !host.drew_whole() {
             fail("the unarmed card's first frame was not drawn whole");
         }
@@ -1287,7 +1364,7 @@ fn scroll_scene(rig: &mut Rig) -> Run {
                 ));
             }
             let scene = rig.card_scene(top);
-            let (replayed, emit) = host.emit(now, &scene);
+            let (replayed, emit) = host.emit(now, &scene, true);
             if !replayed {
                 fail("a scrolled settled card was drawn again: it is the same frame moved");
             }
@@ -1725,6 +1802,7 @@ fn main() {
     };
     let mut scenes = [
         scene("episode", true),
+        scene("flowing", true),
         scene("settled", false),
         scene("typing", true),
         scene("scroll", true),
@@ -1735,7 +1813,7 @@ fn main() {
         scene("flood", true),
     ];
     for run in 0..WARMUP + RUNS {
-        let (episode, settled) = card_scenes(&mut rig, 0x00C0_FFEE + run as u64);
+        let (episode, flowing, settled) = card_scenes(&mut rig, 0x00C0_FFEE + run as u64);
         let typed = |keys| Script::Type {
             keys,
             every: KEY_TICKS,
@@ -1760,7 +1838,7 @@ fn main() {
             continue;
         }
         let runs = [
-            episode, settled, typing, scroll, bolt, comet, classic, meteor, flood,
+            episode, flowing, settled, typing, scroll, bolt, comet, classic, meteor, flood,
         ];
         for (scene, run) in scenes.iter_mut().zip(runs) {
             scene.runs.push(run);

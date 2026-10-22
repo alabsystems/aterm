@@ -70,6 +70,7 @@ impl Tier {
     pub const COUNT: usize = 8;
 
     /// This tier's bit in a coverage bitvector.
+    #[inline]
     #[must_use]
     pub const fn bit(self) -> u8 {
         1u8 << (self as u8)
@@ -149,6 +150,7 @@ pub enum Resolution {
 
 impl Resolution {
     /// The `GlyphKey::source` this resolution produces.
+    #[inline]
     #[must_use]
     pub const fn key_source(self) -> FaceId {
         match self {
@@ -160,6 +162,7 @@ impl Resolution {
     }
 
     /// The record this resolution wrote, if the rasterizer needs one to recover the face.
+    #[inline]
     #[must_use]
     pub const fn recovery_slot(self) -> Option<RecoverySlot> {
         match self {
@@ -173,6 +176,7 @@ impl Resolution {
 
 /// The record `Renderer::fallback_mono_raster` reads for a key with this face: the mirror of
 /// [`Resolution::recovery_slot`], both sides of P3 in one place.
+#[inline]
 #[must_use]
 pub const fn slot_for_source(source: FaceId) -> Option<RecoverySlot> {
     match source {
@@ -202,6 +206,7 @@ pub trait ChainProbe {
 }
 
 /// The tiers `policy` admits — the declared chain, independent of any code point.
+#[inline]
 #[must_use]
 pub const fn reachable_mask(policy: ChainPolicy) -> u8 {
     let configured = Tier::Procedural.bit()
@@ -224,6 +229,7 @@ pub const fn reachable_mask(policy: ChainPolicy) -> u8 {
 
 /// The tiers that need no font-file I/O: everything except the pathname lane. Sealing may
 /// not cost a code point a tier in here (P4).
+#[inline]
 #[must_use]
 pub const fn io_free_mask(policy: ChainPolicy) -> u8 {
     reachable_mask(policy) & !Tier::RuntimeDecisions.bit()
@@ -231,12 +237,14 @@ pub const fn io_free_mask(policy: ChainPolicy) -> u8 {
 
 /// Whether `ch` sits in a Private Use Area (the BMP block or either supplementary plane);
 /// see [`ChainPolicy::prefers_symbol`] for why PUA reorders the chain.
+#[inline]
 #[must_use]
 pub const fn is_private_use(ch: char) -> bool {
     matches!(ch, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}')
 }
 /// Walk the chain. Pure: every fact comes from `probe`, every policy bit from `policy`, and no
 /// tier is consulted twice.
+#[inline]
 pub fn resolve_chain<P: ChainProbe + ?Sized>(probe: &mut P, policy: ChainPolicy) -> Resolution {
     if probe.covers(Tier::Procedural) {
         return Resolution::Face(FaceId::Procedural);
@@ -296,6 +304,7 @@ pub fn resolve_chain<P: ChainProbe + ?Sized>(probe: &mut P, policy: ChainPolicy)
 
 /// The chain's final tier, shared by both give-up exits: the fontless symbol synthesis, else
 /// `.notdef`. It is the highest tier index, so probing it last keeps P2's order on either exit.
+#[inline]
 fn synthetic_or_notdef<P: ChainProbe + ?Sized>(probe: &mut P) -> Resolution {
     if probe.covers(Tier::Synthetic) {
         Resolution::Face(FaceId::Procedural)
@@ -322,6 +331,7 @@ pub struct BitProbe {
 }
 
 impl BitProbe {
+    #[inline]
     #[must_use]
     pub const fn new(covered: u8, pending: u8) -> Self {
         Self {
@@ -335,6 +345,7 @@ impl BitProbe {
 }
 
 impl ChainProbe for BitProbe {
+    #[inline]
     fn covers(&mut self, tier: Tier) -> bool {
         let i = tier as i8;
         if i <= self.last {
@@ -345,6 +356,7 @@ impl ChainProbe for BitProbe {
         (self.covered >> (tier as u8)) & 1 == 1
     }
 
+    #[inline]
     fn parse_pending(&mut self, tier: Tier) -> bool {
         match tier {
             Tier::Fallback => self.pending & 1 == 1,

@@ -35,6 +35,7 @@ const ZWJ: char = '\u{200D}';
 /// The default word character: a letter or digit of any script, or `_` (the
 /// readline and xterm convention).
 #[must_use]
+#[inline]
 pub fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -55,7 +56,8 @@ pub fn is_word_char(c: char) -> bool {
 /// the marks right after it, so no character is classified more than a few
 /// times. A range starts and ends on character boundaries, and its first
 /// character is never a mark or a format control.
-pub fn words<F: Fn(char) -> bool>(text: &str, is_word: F) -> Words<'_, F> {
+#[inline]
+pub const fn words<F: Fn(char) -> bool>(text: &str, is_word: F) -> Words<'_, F> {
     Words {
         text,
         is_word,
@@ -123,8 +125,13 @@ pub fn word_start_before<F: Fn(char) -> bool>(
 }
 
 /// The largest character boundary of `text` at or before `position`.
-fn floor_char_boundary(text: &str, position: usize) -> usize {
-    let mut at = position.min(text.len());
+#[inline]
+const fn floor_char_boundary(text: &str, position: usize) -> usize {
+    let mut at = if position < text.len() {
+        position
+    } else {
+        text.len()
+    };
     while !text.is_char_boundary(at) {
         at = at.saturating_sub(1);
     }
@@ -149,6 +156,7 @@ pub struct Words<'t, F> {
 
 impl<F: Fn(char) -> bool> Words<'_, F> {
     /// Whether `c`, standing on its own, is a word character.
+    #[inline]
     fn is_word_base(&self, c: char) -> bool {
         role(c) == Role::Base && (self.is_word)(c)
     }
@@ -299,12 +307,16 @@ struct ScriptControls {
 }
 
 impl ScriptControls {
-    fn has_control(&self, c: char) -> bool {
-        (self.controls.0..=self.controls.1).contains(&u32::from(c))
+    #[inline]
+    const fn has_control(&self, c: char) -> bool {
+        let cp = c as u32;
+        self.controls.0 <= cp && cp <= self.controls.1
     }
 
-    fn has_letter(&self, c: char) -> bool {
-        (self.letters.0..=self.letters.1).contains(&u32::from(c))
+    #[inline]
+    const fn has_letter(&self, c: char) -> bool {
+        let cp = c as u32;
+        self.letters.0 <= cp && cp <= self.letters.1
     }
 }
 
@@ -335,12 +347,14 @@ static SCRIPT_CONTROLS: [ScriptControls; 3] = [
 ];
 
 /// The script `c` is one of the own format controls of, if any.
+#[inline]
 fn script_controls(c: char) -> Option<&'static ScriptControls> {
     SCRIPT_CONTROLS.iter().find(|script| script.has_control(c))
 }
 
 /// Whether `c` is `Extended_Pictographic`, an element an emoji ZWJ sequence
 /// joins.
+#[inline]
 fn is_pictographic(c: char) -> bool {
     gcb_class(c) == GCB::Extended_Pictographic
 }
@@ -348,6 +362,7 @@ fn is_pictographic(c: char) -> bool {
 /// Whether `c` is a virama (`Canonical_Combining_Class=9`, Virama), the sign
 /// that kills a consonant's vowel and that a joiner after or before it turns
 /// into a half form, an eyelash ra or a ya-phala.
+#[inline]
 fn is_virama(c: char) -> bool {
     in_ranges(VIRAMA, c as u32)
 }
@@ -356,6 +371,7 @@ fn is_virama(c: char) -> bool {
 /// Right or Join_Causing): the letters of Arabic, Syriac, N'Ko, Mongolian and
 /// the other cursive scripts, between which ZWNJ and ZWJ decide whether two
 /// letters join.
+#[inline]
 fn joins_cursively(c: char) -> bool {
     in_ranges(JOINING, c as u32)
 }

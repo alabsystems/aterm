@@ -40,6 +40,7 @@ pub(crate) struct ComplexCharRing {
 
 impl ComplexCharRing {
     /// Create a new ring buffer for the visible grid.
+    #[inline]
     fn new(visible_rows: u16, cols: u16) -> Self {
         let capacity = (visible_rows as usize) * (cols as usize);
         Self {
@@ -242,7 +243,8 @@ pub(crate) struct RgbColorRing {
 }
 
 impl RgbColorRing {
-    fn new(visible_rows: u16, cols: u16) -> Self {
+    #[inline]
+    const fn new(visible_rows: u16, cols: u16) -> Self {
         Self {
             fg: None,
             bg: None,
@@ -254,7 +256,7 @@ impl RgbColorRing {
 
     /// Flat backing-array capacity (`visible_rows * stride`).
     #[inline(always)]
-    fn capacity(&self) -> usize {
+    const fn capacity(&self) -> usize {
         (self.visible_rows as usize) * (self.stride as usize)
     }
 
@@ -351,7 +353,7 @@ impl RgbColorRing {
 
     /// Pack `rgb` as `0x01RRGGBB` (the struct's encoding).
     #[inline(always)]
-    fn pack_rgb(rgb: [u8; 3]) -> u32 {
+    const fn pack_rgb(rgb: [u8; 3]) -> u32 {
         0x01_000000 | ((rgb[0] as u32) << 16) | ((rgb[1] as u32) << 8) | (rgb[2] as u32)
     }
 
@@ -725,28 +727,28 @@ impl<'a> CellRenderData<'a> {
     /// Get the cell's `CellExtra` entry when the HAS_EXTRAS flag requested it.
     #[must_use]
     #[inline]
-    pub fn cell_extra(&self) -> Option<&'a CellExtra> {
+    pub const fn cell_extra(&self) -> Option<&'a CellExtra> {
         self.extra
     }
 
     /// Get the base codepoint for a complex cell.
     #[must_use]
     #[inline]
-    pub fn complex_char(&self) -> Option<char> {
+    pub const fn complex_char(&self) -> Option<char> {
         self.complex_char
     }
 
     /// Get the foreground RGB overflow color for the cell.
     #[must_use]
     #[inline]
-    pub fn fg_rgb(&self) -> Option<[u8; 3]> {
+    pub const fn fg_rgb(&self) -> Option<[u8; 3]> {
         self.fg_rgb
     }
 
     /// Get the background RGB overflow color for the cell.
     #[must_use]
     #[inline]
-    pub fn bg_rgb(&self) -> Option<[u8; 3]> {
+    pub const fn bg_rgb(&self) -> Option<[u8; 3]> {
         self.bg_rgb
     }
 }

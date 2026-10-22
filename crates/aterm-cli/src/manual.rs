@@ -127,11 +127,12 @@ Setup choices:
 Finder, Trash and running apps may still appear in the Dock.
 
 The vault URL starts as http://alab-secrets.local:7484/v1/alab and is editable.
-Enter its join password, or leave it blank for approval from another Mac.
+Enter its join password, or leave it blank: an open vault lets this Mac in
+within seconds, and any other waits for approval from another Mac.
 Synced credentials handle GitHub authentication; no separate login is needed.
 Existing checkouts stay intact. macOS permission switches still need your clicks.
 
-Setup saves choices and retries unfinished stages while aterm stays open.
+Approved setup resumes unfinished stages on later launches without another countdown.
 Completed setup preserves later local changes. Nested terminal sessions, -e
 commands, headless runs, private lab homes and utilities do not initialize the Mac.
 A terminal-only launch accepts any key to cancel before starting its shell.
@@ -895,8 +896,8 @@ Without [github], the command configures only the workstation settings above.
 Secrets: when this login has no secrets vault configured, init first looks for
 the ALab vault on this network (http://alab-secrets.local:7484/v1/alab). When
 it answers, init asks only for its join password (an admin Mac shows it:
-aterm secrets password; Enter waits for approval by code instead) and joins
-it. Otherwise init asks for the vault's URL: Enter keeps the ALab default, a
+aterm secrets password; Enter joins without one, which an open vault lets in
+within seconds and any other approves by code) and joins it. Otherwise init asks for the vault's URL: Enter keeps the ALab default, a
 path to a vault or to a private text file works too; a URL is followed by the
 join password. `none` at either prompt skips the step. Both are asked before
 anything changes, so Ctrl-C at either stops init with nothing changed. Either
@@ -952,7 +953,10 @@ JOINING
   seconds. Without it, an admin approves the machine by its code, 16
   characters (xxxx-xxxx-xxxx-xxxx) the machine prints when it asks, and never
   by a host name, which anyone can ask for. Either way the subscriber
-  finishes the join once it is approved, so nobody has to wait for it. A
+  finishes the join once it is approved, so nobody has to wait for it. An
+  open vault (`aterm secrets password open`) needs neither: an admin Mac's
+  subscriber lets in every machine that asks, so a Mac that reaches its
+  server joins with no password, at the terminal or in the setup tab. A
   machine still waiting after a mistyped password runs `aterm secrets join`
   again: it asks for the password again and sends a new proof. For a vault
   other than the ALab default the join names its URL (and a --name given),
@@ -963,7 +967,11 @@ THE FILE (what `aterm secrets edit` opens)
   [admins]            one machine name per line: the machines that may publish
   [everyone]          entries every machine gets
   [m3 m22]            entries only those hosts get, over [everyone]'s
-  [join]              `password = …`, the join password (only admins read it)
+  [join]              `password = …`, the join password (only admins read it),
+                      or `open = yes`: every machine that asks is let in;
+                      `code-only = age1…`: a key an open vault lets in only
+                      by its code (one it let go, or one that asked before
+                      it opened)
   name=value          the rest of the line, verbatim
   name<<END           the lines up to one that is exactly END
   name<<END base64    the same lines, decoded (for binary files)
@@ -1001,8 +1009,9 @@ A MACHINE
       on the URL or path, the ALab vault's key built into aterm, else the
       signer's fingerprint, which a person at the terminal confirms; with no
       terminal an unpinned source is refused); sync if a locker opens. If
-      none does, ask for the join password (Enter asks to be approved by code
-      instead) and ask to join; the subscriber is installed as soon as the
+      none does, ask for the join password (Enter asks without one: an open
+      vault lets the machine in, any other approves it by code) and ask to
+      join; the subscriber is installed as soon as the
       request is queued, and the join waits up to ten minutes for the
       approval (Ctrl-C stops waiting; the machine still joins by itself). With
       no operand, the ALab default. --name is the host name to ask for;
@@ -1059,14 +1068,25 @@ AN ADMIN
       nothing from a version holding one, and cannot open it as an admin.
   aterm secrets unset <name> [--for <host>…]
       Remove it.
-  aterm secrets password [show|set|new|off]
+  aterm secrets password [show|set|new|open|off]
       The join password: print it (the bare verb), set one typed twice at
       the terminal or piped in (12 characters at least), make a new random
-      one and print it, or remove it (machines then wait for approval by
-      code).
+      one and print it, open the vault, or remove it (machines then wait
+      for approval by code). An open vault lets in every machine that
+      reaches its server and asks, with no password and no code, and it
+      reads [everyone]'s entries: what a LAN of one person's Macs wants, and
+      nothing more. A machine you let go from an open vault is kept out: its
+      key goes on a `code-only` line in [join], which outlives closing and
+      opening the vault, and only approving it by code lets it back in.
+      Opening lists the machines already waiting and asks before letting
+      them in; any not let in join only by code (one may be a machine let
+      go while the vault was closed). `set` or `new` closes it with a
+      password, `off` closes it to approval by code. An admin Mac on an
+      older aterm cannot open a vault that has been opened until it
+      updates.
   aterm secrets requests
-      The pending join requests: host, code, key, age, and whether the
-      request carries a join-password proof.
+      The pending join requests: host, code, key, age, whether the request
+      carries a join-password proof, and whether its key joins only by code.
   aterm secrets approve <code>… | --all | <age1…> --name <host>
       Add them to [machines] and publish. A code is the 16 characters the
       machine printed: compare them. --all lists every request and asks for
@@ -1340,10 +1360,18 @@ WHAT IT IS
   the cursor and Enter), under aterm.toml's [harness] table. Gemini CLI's shell,
   write and edit boxes get their `Allow once`, never `Allow for this session`; its
   usage-limit dialog (`Keep trying` / `Stop`) is waited on through the reset it
-  names (`Access resets at <time>.`) and a minute, then gets its `Keep trying`
-  (`limit-retry@v1`, `limit_wait`; again after a back-off if the quota still
-  stands); one that names no reset, and any API error it does not retry by
-  itself, go to the menu bar.
+  names (`Access resets at <time> <zone>.`, read in the zone it names, else in
+  this Mac's and looked at every 30 min till then) and a minute, then gets its
+  `Keep trying` (`limit-retry@v1`, `limit_wait`) — the first one within 30 min
+  whatever it names, since a dialog found standing may name a reset long
+  passed; one that names no reset (a per-day quota) gets it on the turn-end
+  back-off ladder (30 min, 2 h, then every 6 h) while the menu bar says so,
+  through each try's spinner, and the badge comes down once a try gets
+  through. Each time the dialog comes back after a try the wait climbs (2 min
+  doubling to 30 min past a named reset), journaled and ledgered `WAITING …
+  try <n>`; a try that got through (the agent working 5 min on) ends it, so a
+  limit met later starts over. Any API error it does not retry by itself goes
+  to the menu bar.
   Unless the table says otherwise it is FULLY AUTOMATIC — nobody is at the
   keyboard, so nothing waits on a person:
   * every box gets its answer: a permission box its one-shot allow (any tool, any
@@ -2357,7 +2385,9 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                            `/resume`d since gets what `continue` gives it
   limit_wait [true]        at Claude Code's usage-limit dialog, choose "Wait here,
                            then continue automatically" (it continues at the reset)
-                           — never a spending row; independent of approve
+                           — never a spending row; at Gemini CLI's, "Keep trying"
+                           past the reset it names, or on a back-off ladder when it
+                           names none; independent of approve
   accounts ["early"]       with accounts listed (`aterm harness accounts`): a
                            session whose turn ends on a usage limit is relaunched
                            on its own conversation under the next account that can
@@ -3040,23 +3070,30 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   notice Claude Code wrote into the transcript, placed from that row's own time,
   gone once the reset passes or a reply is served after it. The band's `limited →`
   reads the screen instead, so the two can differ for a notice scrolled away. Only
-  plain rule glyphs are covered: Claude's own row under the rule — its mode pill,
-  `(shift+tab to cycle)`, `← for agents`, its live status and notices — is never
-  touched, and the facts show in every mode, default mode included. Where no input
-  box is drawn (a dialog or a picker is up) nothing is written. With no account
-  named the facts fit whole at 80 columns: a light's title while it is pointed
-  at, selected or switching gives way first, short then gone. A light's REASON
-  — where a mode return stopped — outranks the tokens, the account, the branch
-  and the path: once the path is cut to `…/<dir>` it takes their room, never
-  the model's, the effort's or a limit's. A narrower pane then keeps Σ's
-  working time alone (`Σ 7h52m`), drops Σ, drops the account (whole: a label is
-  never cut, a cut one would name another account; Σ is back where it fits
-  without the label), cuts the path and drops the branch, the path, the effort
-  and the model, a limit standing alone last (a pane too narrow even for it
-  shows the model instead), then the chip — the model last.
-  It is GLASS ONLY: `ctl text` and every reader keep Claude's real rows,
-  `ctl image` shows the footer as the window does. The model is the one THIS
-  process runs, named the moment it is chosen: its newest answer, or the result
+  plain rule glyphs are covered: Claude's own row under the rule — `(shift+tab
+  to cycle)`, `← for agents`, its live status and notices — is never written,
+  and the facts show in every mode, default mode included. Its mode pill alone
+  is relabelled, on the glass, where aterm draws the composer's border: `⏵⏵
+  bypass permissions on` reads `YOLO on`, `⏸ manual mode on` reads `YOLO off`,
+  the row's items moved up behind it; copies, `text`, `screen`, recordings and a
+  click on the row keep Claude's words and columns. A pill the glass cannot
+  relabel plainly (a selection in the window, the cursor or a band on its row)
+  stays as Claude drew it. Where no input box is drawn
+  (a dialog or a picker is up) nothing is written. With no account named the
+  facts fit whole at 80 columns: a light's title while it is pointed at,
+  selected or switching gives way first, short then gone. A light's REASON —
+  where a mode return stopped — outranks the tokens, the account, the branch and
+  the path: once the path is cut to `…/<dir>` it takes their room, never the
+  model's, the effort's or a limit's. A narrower pane then keeps Σ's working
+  time alone (`Σ 7h52m`), drops Σ, drops the account (whole: a label is never
+  cut, a cut one would name another account; Σ is back where it fits without the
+  label), cuts the path and drops the branch, the path, the effort and the
+  model, a limit standing alone last (a pane too narrow even for it shows the
+  model instead), then the chip — the model last.
+  It is GLASS ONLY: `ctl text` and every reader — a screen reader too — keep
+  Claude's real rows, `ctl image` shows the footer as the window does. The
+  model is the one THIS process runs, named the moment it is chosen: its
+  newest answer, or the result
   Claude writes for its own `/model`, `/effort` or `/fast` (Claude Code's
   top-effort mode shows as `xhigh`, the level it runs at). A model switch whose
   result names no effort keeps the effort on show only if it was read for the
@@ -3089,12 +3126,35 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   The facts come from files Claude keeps (its `sessions/<pid>.json`, the
   transcript and its subagents', `.git/HEAD`) and its screen; nothing is written
   to Claude's settings.
+  THE FACTS ARE CLICKABLE. A click on the model, the effort, the working
+  directory or the branch hides it for the session while aterm runs: it reads
+  greyed in Claude's rule gray with `off` after it (`◆ Opus 5.5 off xhigh`,
+  `⌂ ~/aterm off`, `⎇ main off`), a click on it shows it again, and a hidden
+  fact gives way first in a narrow rule. A right-click (ctrl-click on macOS)
+  opens a fact's menu: the folder's opens a tab there or copies its path, the
+  branch's copies its name or opens a tab at the repository's root, every menu
+  hides its fact or shows a hidden one, and the effort's turns the top-effort
+  key on or off. A click on `Σ` opens the Traffic card: the tokens in and out
+  as two bars over the session, each scaled to its own peak, the minutes Claude
+  worked shaded, the span, totals and peaks under them; it reads nothing while
+  closed. THE TOP-EFFORT KEY: on a build that has it, the right end of the top
+  rule shows Claude's own tag while the key is on, and aterm's greyed name with
+  `off` after it while it is off. A click types `/effort <key> on` or `off`
+  into an empty composer as the person's own keys, waits for the echo, then
+  presses Return, and says the answer beside the chips. A draft, a running
+  turn, a dialog, a halt, a park or another driver refuses it with the reason;
+  a key or a click Claude is sent stops it before Return, and a stop after the
+  `/` went names what it left in the composer.
   A light appears left of the facts ONLY when the permission mode differs from
   what you expect; at rest nothing is drawn. Bypass and auto are both expected.
   In manual, accept edits, plan or don't ask a chip (`⏸ plan`) shows in the rule,
-  Claude's own pill staying on its row; a click presses shift+tab forward through
-  Claude's own cycle to the nearest of bypass and auto (from don't ask through
-  manual), each press waiting for its own answer, decided from the session itself
+  Claude's own pill staying on its row. Where that pill reads `YOLO on`/`YOLO off`
+  on the glass (above), the chip and its titles name bypass and manual the same
+  way (`⏸ YOLO off`, `stopped in YOLO off`); a pill left as Claude drew it, and
+  every other mode, keep Claude's word. A click
+  presses shift+tab forward through Claude's own cycle to the nearest of bypass
+  and auto (from don't ask through manual), each press waiting for its own
+  answer, decided from the session itself
   (a background tab finishes too). The click's press goes at once; aterm's next
   presses wait for Claude to be idle, because a shift+tab that lands in a
   permission box answers it. One that stops early names the mode it stopped in;
@@ -3115,7 +3175,8 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   landed and `⤓ quiet` after a person's own exchange; `○ off`; `⊘ off` while the harness is
   off in Settings — and its title says what the mode does (its sentence,
   above), what a click does and that a right-click opens its menu (`·
-  right-click: more`, below). Under `⤓ land` it says why the landing still
+  right-click: more`, below), in an ink of its own: stronger than the facts,
+  softer than your text. Under `⤓ land` it says why the landing still
   holds: before a land act's reply is read, the sentence then `· landing
   since 14:02`; after one that did not land, the reasons instead
   (`autopilot: land — not landed yet: needs you: rotate the deploy key; 2
@@ -3138,28 +3199,39 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   stands while the word is read back. Under `⊘ off` a click turns on the
   switch that holds the harness off instead (the master switch, or the
   agent's own), as the harness switch's `on` does (below), and opens nothing.
-  An aterm with no control socket runs no harness and draws no chip; its
-  Settings ▸ Harness says why.
+  Its menu's last row, `⚙ Harness settings…`, opens Settings ▸ Harness in
+  that window, landed on the session's row. An aterm with no control socket
+  runs no harness and draws no chip; its Settings ▸ Harness says why.
   ctrl+shift+tab reveals and selects it as it does the mode light; Return or
   Space acts. A narrow rule gives it up after every fact but the model.
-  THE HARNESS SWITCH. Claude Code's top rule (agy's and Muse Code's too)
-  carries one switch at its right wherever aterm runs a harness: `claude
-  harness ● on` while the harness carries the session (`✦ alab kitty ·` before
-  it and the rule tinted while this window's harness holds it), and in every
+  THE CLI'S LOCKUP. Claude Code's top rule (agy's and Muse Code's too)
+  carries the CLI's own icon, drawn at emoji size in its brand colours (Claude
+  Code's whole alien, agy's banner, Muse Code's mark), and its name in its
+  brand colour at the rule's left, two `─` in, in every harness state —
+  harness on, off, or no harness at all. The icon is drawn on the glass over
+  two blank cells; copy, `text` and a screen reader keep the program's own
+  rule. A narrow rule gives up the switch's words first, then the name, then
+  the icon.
+  THE HARNESS SWITCH. The same top rule carries one switch at its right
+  wherever aterm runs a harness: `alab harness ● on` while the harness carries
+  the session (the rule tinted in the harness's theme and the switch's
+  letters on its rainbow while this window's harness holds it), and in every
   off state — the session's own Autopilot off, the agent's own switch off, or
-  the harness off in Settings — `claude harness ○ off ▐ on ▌`, no branding,
-  its `on` a button. A click on `on` turns the harness on from whichever
+  the harness off in Settings — `alab harness ○ off ▐ on ▌`, its `on` a
+  button. A click on `on` turns the harness on from whichever
   switch holds it off: the session's word becomes cruise, or aterm.toml's
   switch (`[harness] enabled`, `[harness] headless` in a headless instance,
   `[harness.<agent>] enabled`) is written true, `◐ turning on` standing until
   the change is read back; nothing opens and nothing reaches the agent. A
   click on the lit switch turns the session off. A double click is one
   click: its second click never turns back what the first did. An aterm
-  with no control socket draws no switch and no branding. A narrow rule drops
-  `harness`, then the agent's name, then `○ off`, keeping `▐ on ▌` to the
-  last. Where the accessibility tree is built the switch is a switch named in
-  its words and told on or off, and `on` a button (`on: turn the Claude Code
-  harness on`).
+  with no control socket draws no switch and no tint (the lockup still
+  stands). A narrow rule drops `harness`, then `alab`, then `○ off`, keeping
+  `▐ on ▌` to the last, and stands wherever it stood before the lockup.
+  Where the accessibility tree is built the switch is a switch named in its
+  words and the product (`alab harness on: Claude Code`) and told on or off,
+  `on` a button (`on: turn the Claude Code harness on`), and the lockup is
+  decoration with no node.
   THE ACT TICKER. Right of the chips, what the harness just did shows for 3 s
   in the chip's ink: `✓ approved`, `✗ declined`, `? answered` (a question
   dialog's keys light once, until 3 s after its last key, so the label is
@@ -3181,7 +3253,11 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   commits. Landing since 14:02, 3 nudges.`), a harness's need (`Needs you:
   <the need>. And 1 more. Carrying on.`), the pause, and the newest act
   (`Last: approved at 14:05.`; `on Thursday` from another day, none older
-  than a day).
+  than a day). So are the mode light (`Permission mode: plan.`, what a click
+  does its description) and the top rule's harness switch (a switch, on or
+  off, with its `on` button beside it when off), and the words beside the
+  chips are text a reader can read, never interrupted by them: a reader
+  hears Claude's own rule under all of these.
   THE PAUSE. Where the harness backs off after short turns (the back-off
   `continue` below doubles, 2 min to an hour; the first idle point it meets is
   one short turn), the chip's face stays as it is and its title says so after
@@ -3252,7 +3328,8 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   `autopilot-menu/land-at`, `autopilot-menu/land-cancel`,
   `autopilot-menu/settings`; a blank place is `autopilot-menu gap`);
   `aterm ctl open autopilot-menu` opens it from the front pane's chip. On
-  Linux, where the accessibility tree is built, the Autopilot chip says it
+  Linux, macOS and Windows, where the accessibility tree is built, the
+  Autopilot chip says it
   has a menu and offers "show menu", which opens it with its first choice
   lit; the open menu is a menu in words
   (`Cruise for 1 hour, then land`), its mode checked, its disabled rows
@@ -3276,22 +3353,40 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   three rows tall, as tall as Claude's mascot, with a one-pixel rim in the
   border's colours so a dark coat reads on a dark background; a path long
   enough to reach the rainbow keeps it two rows tall, and a pane with no room
-  beside the card shows none. The rainbow runs
-  at the height of its body, right up to its haunch. It moves for a few seconds
-  when the card is first found (the kitty flies in along the rainbow, laying it
-  behind it, and lands with a burst of stars; the rainbow's glints flare as its
-  sheen runs over them; it blinks and flicks its tail), and again, the kitty in
-  its seat, when Autopilot changes and when the window regains focus; then it
-  stands still, the glints small and steady
-  (reduced motion and an unfocused window: still from the start; serious mode:
-  no kitty, trail or stars). Glass only, as the footer is: no cell, copy, read
-  or recording changes, and a card scrolled back draws none. Off and the master
-  switch off show the vendor's card bare; `[claude_footer] card = false` turns
-  it off.
+  beside the card shows none. The rainbow runs at the height of its body,
+  right up to its haunch. An intro plays for a few seconds when the card is
+  first found (the kitty flies in along the rainbow, laying it behind it, and
+  lands with a burst of stars; the rainbow's glints flare as its sheen runs over them; it
+  blinks and flicks its tail), and again, the kitty in its seat, when
+  Autopilot changes and when the window regains focus. Then the card flows
+  on: the rainbow's hue travels clockwise round the box, once in about 12 s,
+  and Claude's ripple, the glint its mascot shimmers with, runs out from the
+  mascot's wand across the border, the trail and its glints (each flaring as
+  the ripple passes it, as Claude's `✦` flares on its wand), the kitty's rim,
+  the stars and the line, a step every 128 ms, kept in step with Claude's own
+  shimmer where its wand flares; the kitty blinks once in about six seconds.
+  It flows while the window is focused and on screen and motion is allowed;
+  reduced motion, an unfocused window and aterm shedding load hold it still,
+  the glints small and steady (still from the start if so when it is found),
+  and it flows on from its still colours when they pass. Serious mode: no
+  kitty, trail or stars, and a still border. Glass only, as the footer is: no
+  cell, copy, read or recording changes, and a card scrolled back draws none.
+  Off wears the card in white (a moonbow: white, pearl, silver, steel) and its
+  line ends `· autopilot ○ off`; the master switch off, the agent's own switch
+  off and a window with no harness show the vendor's card bare;
+  `[claude_footer] card = false` turns it off. Claude's update notice under a
+  decorated card (`Updated to latest. …` and its changelog row) shows `✦
+  alab.systems` instead, its changelog row blank; a Cmd-click (Ctrl-click off
+  macOS) on it opens https://alab.systems. Once no row of the card is left on
+  the screen, under a find bar and in aterm's own scrollback the notice shows
+  as Claude drew it.
   The card is found by its shape (the mascot down the left,
   its three rows of text in one column), so the vendor's top-effort card, its
-  mascot holding a wand (`╱✦`), wears it too; a narrow pane's four-row card
-  stays bare. On the fullscreen renderer the mascot plays an entrance once per
+  mascot holding a wand (`╱✦`), wears it too, and so does the four-row card
+  Claude Code draws in a narrow pane (its banner alone on the first row), down
+  to 31 columns (33 with the wand); there the line keeps the bold `aterm` and
+  gives up the version (`aterm harness · ∞ cruise`, `aterm · ∞ cruise`,
+  `aterm ∞`). On the fullscreen renderer the mascot plays an entrance once per
   build (about a second: it steps, sits a row low in its dust, raises its arms).
   The decoration is on the card's first frame, the kitty riding in, on
   either renderer: aterm names the running build from the program the system
@@ -3315,15 +3410,41 @@ THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   through the rest of the entrance while the card's words stand where they
   were, and goes on the frame the card is scrolled, cleared, covered or
   resized away, or a newer card shows under it.
+  THE AGENTS PANEL. Wherever aterm draws the composer's border, Claude Code's
+  agents panel under it (`⏺ main`, `◯ general-purpose …`, a workflow's `▰▰▱`
+  bar) wears the rainbow: each name in its own colour of the theme's palette,
+  top to bottom, and a workflow's bar along it, a crest running over its
+  filled cells while an agent works in a focused window, in step with the
+  harness card's ripple where one is on screen (reduced motion: still).
+  Each dot tells its agent's work: its hue is which agent, its brightness and
+  glow how much it is doing (a halo on a dark ground, a round tint behind a
+  printed ring on a light one, the hollow `◯` filled with light while it runs),
+  its saturation how fresh its last work is. An agent waiting on one long
+  command of its own keeps its full colour with a dimmer, steady light held
+  inside its ring (no glow past it) while that call is inside its own timeout
+  and 30 s (a `Bash` call's declared
+  `timeout`, else two minutes), read from its transcript beside the session's
+  token counts, and with Claude's `❯` on its row the composer rule says what it
+  waits on (`in Bash 4m12s`); a row aterm cannot tie to exactly one agent's
+  transcript (same name and activity, started when its clock says) keeps the
+  screen's rule. A grey dot that breathes has shown no work for two and a half
+  minutes with nothing of its own in flight, or its call has outlived its
+  timeout (stuck; it breathes for a minute, and again when the window regains
+  focus), an amber ring waits on approval, and a finished or failed agent
+  keeps Claude's green or red. Activity, elapsed time
+  and tokens keep Claude's grey. Glass only: no cell, copy, read or recording
+  changes; a coloured cell, the cursor's row, a selection or a scrolled-back
+  view keeps Claude's look, and serious mode keeps the colours but drops the
+  glow and the breath. `[claude_footer] agents = false` turns it off.
 
 SETTINGS ▸ HARNESS
-  The harness's own page (`/harness`): the Autopilot menu's `Harness settings…`
-  (landed on the session's row), View ▸ Coding Agent Harness… and the palette
-  (both at its top, an open page's too) and `aterm ctl open app
-  settings /harness` open it, and `aterm ctl settings section harness` turns an
-  open Settings to it (`autopilot`, `supervisor` and each supervised agent's
-  name — `claude`, `codex`, `agy`, `gemini` — name it there too). Its cards, in
-  order:
+  The harness's own page (`/harness`): the Autopilot chip's menu (its last row,
+  `⚙ Harness settings…`), the chip itself while the harness is off, View ▸
+  Coding Agent Harness… and the palette (both at its top, an open page's too)
+  and `aterm ctl open app settings /harness` open it, and `aterm ctl settings
+  section harness` turns an open Settings to it (`autopilot`, `supervisor` and
+  each supervised agent's name — `claude`, `codex`, `agy`, `gemini` — name it
+  there too). Its cards, in order:
   * STATUS — the policy in force (Supervision) and how many of the open agent
     sessions it supervises (or why none: the master switch, no control
     socket), then today's numbers since the local midnight: the first three
@@ -8530,8 +8651,10 @@ BROADCAST — ONE RECORD, HOWEVER MANY READERS
   evicted (`dropped=`), a listing cut, or the delivery cut (`truncated=1`) is gone from
   this endpoint, not from the bus. The header's `oldest_on_bus=@<off>` is the lowest
   offset ever delivered here, and every one of YOUR records from it to `bus_head=` is
-  fetchable while the broker holds it — the offsets in between are shared with the whole
-  fleet, so most belong to other sessions and answer `ERR no such record`; the offsets
+  fetchable while the broker holds it; one its retention gave up answers `ERR
+  retained-from=<floor>`, where what it keeps of your lane starts — the offsets in between
+  are shared with the whole fleet, so most belong to other sessions and answer `ERR no
+  such record`; the offsets
   you want are the `off=` of rows you saw. The read is answered from the ring when it
   holds the whole row, else fetched through the bridge, WHOLE up to 256 KiB (`truncated=1
   len=` only past that): `OK <nbytes> off=<n> from=<p> kind=<k> trust=<t> …` then the
@@ -8773,16 +8896,20 @@ WHO IS DOING WHAT — PRESENCE WITH MEANING
   re-advertises the same sids. `aterm fabric` BROKER counts this node's share of the 4096
   distinct subjects a node may ever mint (one presence and one `ev` face per session ever
   hosted, one per topic shouted on, one per peer session and kind posted to, answered or
-  noticed; only a closed session's `ev` face is ever given back, and only under
-  `[fabric] log = "turns"`), and says `rows=4096+ truncated` when the roster is longer
+  noticed; only a closed session's `ev` face is ever given back, and only while the
+  session-log mirror runs), and says `rows=4096+ truncated` when the roster is longer
   than it reads.
     [fabric]
     presence = "meta"       # the default; "minimal" writes attention= alone
     receipts = true         # the default, with or without this line: an `inbox seen`
                             # verdict on an ask/task acks the sender. false is
                             # off, and off means their `ask` waits out its deadline.
-  `aterm link serve --presence meta|minimal` and `--receipts`/`--no-receipts` on the
-  bridge's command line win over the file. A bridge older than these fields leaves
+    log = "auto"            # the default: each session log's turns, runs and needs
+                            # reach the bus while the broker retains them
+                            # (`aterm fabric brief`); "turns" over any broker,
+                            # "off" never.
+  `aterm link serve --presence meta|minimal`, `--receipts`/`--no-receipts` and `--log` on
+  the bridge's command line win over the file. A bridge older than these fields leaves
   them `-` and sends no receipts.
 
 IN THE WINDOW (no bus menu: the Agents menu, ❯, the needs border, Take Over)

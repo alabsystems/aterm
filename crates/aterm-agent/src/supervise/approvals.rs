@@ -1938,6 +1938,12 @@ pub struct CheckOwed {
     /// ([`RULE_TASK_DONE`]; no check's answer ends one now). Nothing ends
     /// here: a turn read busy since is a later one.
     pub answered: bool,
+    /// A FULL CONTEXT CUT IT: the last act is a `/compact` typed at its point
+    /// (or under its cut, or again on the context's ladder). That wall writes
+    /// no row, and the policy types `/compact` at no other. The compaction's
+    /// continuation types the check again (`TurnEndState::compact_owes`); the
+    /// points before it judge nothing.
+    pub compact: bool,
 }
 
 /// THE DONE CHECK `sid`'s LEDGER TEXT `body` SAYS IS OWED ITS ANSWER, as the
@@ -1950,14 +1956,39 @@ pub struct CheckOwed {
 /// screen it was typed at) and no other end ([`RULE_WALL_WAIT_END`]: the
 /// worker's work, a person's turn) since; an API error's wall writes no
 /// row, so the retry mark on the check's point is its cut, and someone's
-/// point after it its end. A loop that follows reads that
-/// answer's done report as the check's, as the loop that asked it does
+/// point after it its end; nor does a full context, so a `/compact` typed at
+/// the check's point is its cut ([`CheckOwed::compact`]). A loop that follows
+/// reads that answer's done report as the check's, as the loop that asked it does
 /// (`TurnEndState::seed_done_check`): read as a first one, it typed the
 /// check again after the task had ended, and through a whole wall's wait
 /// after the retry that delivered a check the wall cut (the verifier of
 /// 5b72b1613, M7-5). `None` where the last act is any other, or none.
 #[must_use]
 pub fn done_check_owed_in(body: &str, sid: Option<&str>) -> Option<CheckOwed> {
+    let (owed, judged) = walk_done_check(body, sid);
+    // Judged and the task not ended there: the loop that asked it read its
+    // answer as no done report, and a done report after it is a first one.
+    // Owed still, a successor read a person's later done report as the
+    // check's answer and ended the task where the loop that asked it asked
+    // the check (the verifier of 97daeeace, RS8-R4).
+    owed.filter(|o| judged == 0 || o.answered)
+}
+
+/// THE CHECK WHOSE ANSWER THE POINT JUDGED LAST WAS, nothing typed since and
+/// no wall's row after it ([`done_check_owed_in`] owes it no more): a loop
+/// that follows reads that point again first, and a wall there cut the check
+/// (`TurnEndState::seed_check_point`). A full context writes no row, so only
+/// the screen says.
+#[must_use]
+pub fn check_point_last_in(body: &str, sid: Option<&str>) -> Option<&'static str> {
+    let (owed, judged) = walk_done_check(body, sid);
+    owed.filter(|o| judged == 1 && !o.answered && !o.cut && !o.compact)
+        .map(|o| o.rule)
+}
+
+/// [`done_check_owed_in`]'s walk: the check in hand at the end, and the points
+/// judged since the act owed.
+fn walk_done_check(body: &str, sid: Option<&str>) -> (Option<CheckOwed>, u32) {
     use super::policy::turn_end::{
         RULE_COMPACT, RULE_DONE_CHECK, RULE_OPEN_ITEMS, RULE_UNCOMMITTED, RULE_USAGE_PROBE,
         is_wall_retry,
@@ -1982,6 +2013,7 @@ pub fn done_check_owed_in(body: &str, sid: Option<&str>) -> Option<CheckOwed> {
         }
         let rule = text("rule_id").unwrap_or("");
         if text("decision") == Some("typed") {
+            let judged_before = judged;
             if rule != RULE_USAGE_PROBE {
                 judged = 0;
                 api_cut = false;
@@ -2008,6 +2040,24 @@ pub fn done_check_owed_in(body: &str, sid: Option<&str>) -> Option<CheckOwed> {
                         read_ms: None,
                         unread: in_place && check.is_some(),
                         answered: false,
+                        compact: false,
+                    })
+                }
+                // A `/compact` typed at the check's own point (its one point judged), under its
+                // cut, or again: a full context cut it, and the continuation owes it.
+                RULE_COMPACT
+                    if text("command")
+                        .is_some_and(|c| c.trim() == crate::harness::steps::COMPACT)
+                        && owed.is_some_and(|o| o.compact || o.cut || judged_before == 1) =>
+                {
+                    owed.map(|o| CheckOwed {
+                        cut: false,
+                        check: None,
+                        read_ms: None,
+                        unread: false,
+                        answered: false,
+                        compact: true,
+                        ..o
                     })
                 }
                 r if is_wall_retry(r)
@@ -2021,6 +2071,7 @@ pub fn done_check_owed_in(body: &str, sid: Option<&str>) -> Option<CheckOwed> {
                         read_ms: None,
                         unread: false,
                         answered: false,
+                        compact: false,
                         ..o
                     })
                 }
@@ -2035,8 +2086,9 @@ pub fn done_check_owed_in(body: &str, sid: Option<&str>) -> Option<CheckOwed> {
             o.unread = false;
         }
         match rule {
+            // A wall the `/compact` met cuts nothing: the act at it drops the check.
             RULE_WALL_WAIT => {
-                if let Some(o) = owed.as_mut() {
+                if let Some(o) = owed.as_mut().filter(|o| !o.compact) {
                     if !o.cut {
                         o.read_ms = v.get("ts").and_then(aterm_json::Value::as_i64);
                     }
@@ -2055,13 +2107,16 @@ pub fn done_check_owed_in(body: &str, sid: Option<&str>) -> Option<CheckOwed> {
                     other => other,
                 };
             }
-            // Off stood: a check a wall cut is delivered again no more.
-            RULE_OFF_STOOD => owed = owed.filter(|o| !o.cut),
+            // Off stood: a check a wall cut (a full context too), or whose answer is judged, is
+            // delivered again no more.
+            RULE_OFF_STOOD => {
+                owed = owed.filter(|o| !o.cut && !o.compact && (judged == 0 || o.answered));
+            }
             // An API error's wall writes no wall-wait row: the check's point carrying the wall's
             // retry mark is the cut, and the wall's retry delivers the check again.
             RULE_POINT
                 if judged == 0
-                    && owed.is_some_and(|o| !o.cut)
+                    && owed.is_some_and(|o| !o.cut && !o.compact)
                     && text("reason").and_then(retry_mark_of).is_some() =>
             {
                 if let Some(o) = owed.as_mut() {
@@ -2081,7 +2136,7 @@ pub fn done_check_owed_in(body: &str, sid: Option<&str>) -> Option<CheckOwed> {
             // it, no wall cutting it — and a second is a later turn's, after
             // which the check is nobody's to answer.
             RULE_POINT => {
-                if let Some(o) = owed.as_mut().filter(|o| !o.cut) {
+                if let Some(o) = owed.as_mut().filter(|o| !o.cut && !o.compact) {
                     judged += 1;
                     // Awaited no more: its point is judged.
                     o.check = None;
@@ -2099,12 +2154,7 @@ pub fn done_check_owed_in(body: &str, sid: Option<&str>) -> Option<CheckOwed> {
             _ => {}
         }
     }
-    // Judged and the task not ended there: the loop that asked it read its
-    // answer as no done report, and a done report after it is a first one.
-    // Owed still, a successor read a person's later done report as the
-    // check's answer and ended the task where the loop that asked it asked
-    // the check (the verifier of 97daeeace, RS8-R4).
-    owed.filter(|o| judged == 0 || o.answered)
+    (owed, judged)
 }
 
 /// Whether a typed row's `command` is the done check, or an older build's
@@ -2126,16 +2176,21 @@ fn delivers_check(command: Option<&str>) -> bool {
 /// Whether a typed row's `command` is a land act again, as a `/compact`'s
 /// continuation types the one a full context cut ([`delivers_check`]): by
 /// its opening words ([`super::policy::turn_end::LAND`],
-/// [`super::policy::turn_end::LAND_NUDGE`], or an older build's
-/// [`super::policy::turn_end::RETIRED_LANDS`] and
-/// [`super::policy::turn_end::RETIRED_LAND_NUDGES`]).
+/// [`super::policy::turn_end::LAND_NUDGE`],
+/// [`super::policy::turn_end::LAND_ANSWER`], or an older build's
+/// [`super::policy::turn_end::RETIRED_LANDS`],
+/// [`super::policy::turn_end::RETIRED_LAND_NUDGES`] and
+/// [`super::policy::turn_end::RETIRED_LAND_ANSWERS`]).
 fn delivers_land(command: Option<&str>) -> bool {
-    use super::policy::turn_end::{LAND, LAND_NUDGE, RETIRED_LAND_NUDGES, RETIRED_LANDS};
+    use super::policy::turn_end::{
+        LAND, LAND_ANSWER, LAND_NUDGE, RETIRED_LAND_ANSWERS, RETIRED_LAND_NUDGES, RETIRED_LANDS,
+    };
     command.is_some_and(|c| {
-        [LAND, LAND_NUDGE]
+        [LAND, LAND_NUDGE, LAND_ANSWER]
             .into_iter()
             .chain(RETIRED_LANDS)
             .chain(RETIRED_LAND_NUDGES)
+            .chain(RETIRED_LAND_ANSWERS)
             .any(|head| opens_with(head, c))
     })
 }
@@ -2185,6 +2240,26 @@ pub struct LandSeed {
     /// ledger's cut keeps them. `since_ms` `None` where the row names no
     /// time.
     pub hold: super::policy::turn_end::HoldStart,
+    /// A FULL CONTEXT CUT THAT ACT: the last act is a `/compact` typed at its
+    /// point (its one point judged), under its cut, or again on the context's
+    /// ladder. That wall writes no row, and the policy types `/compact` at no
+    /// other. The compaction's continuation types the act again
+    /// (`TurnEndState::compact_owes`), as for the check ([`CheckOwed::compact`]).
+    pub compact: bool,
+    /// ITS ANSWER WAS JUDGED AT ONE POINT, nothing typed and no wall's row
+    /// since, the task not landed there: a loop that follows reads that point
+    /// again first where it is the point recorded last, and a wall there (a
+    /// full context writes no row) cut the act
+    /// (`TurnEndState::seed_land_point`), as for the check
+    /// ([`check_point_last_in`]). Set by the walk's answer alone.
+    pub judged: bool,
+    /// WHICH OF LAND'S ACTS a wall's retry or a `/compact`'s continuation
+    /// delivers again (`landing`, `cut`, `compact` or `judged`), by its rule:
+    /// what a loop that follows types for it (`TurnEndState::seed_land_owed`),
+    /// where the loop that typed it types its words again
+    /// (`TurnEndState::cut_text`). Part of the walk's state, so a ledger's
+    /// cut keeps which act is owed as well as the episode's phase.
+    pub owed: Option<&'static str>,
 }
 
 /// THE LAST ACT OF A LAND EPISODE IN HAND ([`LandSeed::act`]): what a loop
@@ -2213,6 +2288,7 @@ pub struct LandAct {
 /// RS7-2).
 #[must_use]
 pub fn land_episode_in(body: &str, sid: Option<&str>) -> Option<LandSeed> {
+    use super::policy::turn_end::RULE_USAGE_PROBE;
     let want = sid.map(|s| s.trim_start_matches('@'));
     let mut walk = LandWalk::default();
     let mut act = None;
@@ -2228,9 +2304,8 @@ pub fn land_episode_in(body: &str, sid: Option<&str>) -> Option<LandSeed> {
         // A typed row the walk leaves landing on is the episode's last act
         // (one of Land's, or a wall's retry or `/compact` that delivers it).
         let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
-        if text("decision") == Some("typed")
-            && text("rule_id") != Some(super::policy::turn_end::RULE_USAGE_PROBE)
-        {
+        let rule = text("rule_id").unwrap_or("");
+        if text("decision") == Some("typed") && rule != RULE_USAGE_PROBE {
             act = walk
                 .ep
                 .filter(|e| e.landing)
@@ -2247,6 +2322,14 @@ pub fn land_episode_in(body: &str, sid: Option<&str>) -> Option<LandSeed> {
         act: act.filter(|_| e.landing),
         ..e
     })
+}
+
+/// `rule` as the constant of the one of Land's acts it names, if any.
+fn land_rule(rule: &str) -> Option<&'static str> {
+    use super::policy::turn_end::{RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE};
+    [RULE_LAND, RULE_LAND_NUDGE, RULE_LAND_ANSWER]
+        .into_iter()
+        .find(|r| *r == rule)
 }
 
 /// WHAT [`land_episode_in`] HOLDS AS IT WALKS ONE SESSION'S ROWS: the
@@ -2285,6 +2368,8 @@ impl LandWalk {
         let rule = text("rule_id").unwrap_or("");
         match text("decision") {
             Some("typed") => {
+                let judged = self.judged;
+                let owed = self.ep.and_then(|e| e.owed);
                 if rule != RULE_USAGE_PROBE {
                     self.judged = 0;
                 }
@@ -2295,6 +2380,9 @@ impl LandWalk {
                     answered: false,
                     act: None,
                     hold,
+                    compact: false,
+                    judged: false,
+                    owed: None,
                 };
                 // The hold begins at this row (`TurnEndState::acted`): its
                 // `since` the row's `ts`, its nudges those after it.
@@ -2316,6 +2404,18 @@ impl LandWalk {
                         Some(land(nudges, true, hold))
                     }
                     (r, _) if is_continue_rule(r) => None,
+                    // A `/compact` typed at the act's own point (its one point judged), under its
+                    // cut, or again: a full context cut it, and the continuation owes it.
+                    (RULE_COMPACT, Some(e))
+                        if text("command")
+                            .is_some_and(|c| c.trim() == crate::harness::steps::COMPACT)
+                            && (e.compact || e.cut || (e.landing && judged == 1)) =>
+                    {
+                        Some(LandSeed {
+                            compact: true,
+                            ..land(e.nudges, false, e.hold)
+                        })
+                    }
                     (r, Some(e)) => Some(land(
                         e.nudges,
                         (e.cut && is_wall_retry(r))
@@ -2324,6 +2424,20 @@ impl LandWalk {
                     )),
                     (_, None) => None,
                 };
+                // This identity is part of Standing's equality, not a reader-only accumulator:
+                // an answer can otherwise return the walk to the instruction's state and a
+                // ledger cut would discard it before the `/compact` that still owes it.
+                if rule != RULE_USAGE_PROBE
+                    && let Some(e) = self.ep.as_mut()
+                {
+                    e.owed = if let Some(rule) = land_rule(rule) {
+                        Some(rule)
+                    } else if e.compact || (e.landing && is_wall_retry(rule)) {
+                        owed
+                    } else {
+                        None
+                    };
+                }
                 return;
             }
             Some("waiting") => {}
@@ -2378,9 +2492,13 @@ impl LandWalk {
     /// answer judged and the task not ended there, no landing in hand
     /// ([`done_check_owed`]'s RS8-R4).
     fn answer(self) -> Option<LandSeed> {
-        self.ep.map(|e| LandSeed {
-            landing: e.landing && (self.judged == 0 || e.answered),
-            ..e
+        self.ep.map(|mut e| {
+            e.judged = e.landing && self.judged == 1 && !e.answered;
+            e.landing &= self.judged == 0 || e.answered;
+            e.owed = e
+                .owed
+                .filter(|_| e.landing || e.cut || e.compact || e.judged);
+            e
         })
     }
 }
@@ -5466,6 +5584,450 @@ mod tests {
         assert_eq!(owed("unmarked", &[check, point(310_000, None)]), None);
     }
 
+    /// A `/COMPACT` TYPED AT THE CHECK'S OWN POINT OWES THE CHECK TO ITS
+    /// CONTINUATION ([`CheckOwed::compact`]): only a full context draws a
+    /// `/compact`, and that wall writes no row. Owed through the compaction's
+    /// points and a `/compact` typed again, after a 529's retry too and under
+    /// a wall row's cut; the continuation with the check's words awaits its
+    /// answer, one with `keep going` owes nothing. Off, a wall the `/compact`
+    /// met and its try, or a 529 it met and its retry drop it, as for the
+    /// loop that typed it (`TurnEndState::compact_owes`). The check's point
+    /// the last record, a loop that follows reads it again
+    /// ([`check_point_last_in`]). FAILS WITHOUT THE FIX: the `/compact` owed
+    /// nothing. NEGATIVE CONTROLS: a `/compact` after a later turn's point;
+    /// the check's point followed by any record but its own.
+    #[test]
+    fn a_compact_at_the_checks_point_owes_the_check_to_its_continuation() {
+        use super::super::policy::turn_end::{
+            DONE_CHECK, RULE_API_RETRY, RULE_COMPACT, RULE_DONE_CHECK, RULE_LIMIT_RESUME,
+        };
+        let sid = Some("@s-9");
+        let body = |rows: &[(i64, &str, Outcome, &str, String)]| -> String {
+            rows.iter()
+                .map(|(ts, rule_id, outcome, command, reason)| {
+                    let row = Row {
+                        rule_id,
+                        outcome: *outcome,
+                        command,
+                        reason,
+                        box_seq: 1,
+                    };
+                    format!("{}\n", row.to_json(*ts, sid))
+                })
+                .collect()
+        };
+        let owed =
+            |rows: &[(i64, &str, Outcome, &str, String)]| done_check_owed_in(&body(rows), sid);
+        let typed = |ts: i64, rule: &'static str, words: &'static str| {
+            (ts, rule, Outcome::Typed, words, act_reason(None))
+        };
+        let check = typed(10_000, RULE_DONE_CHECK, DONE_CHECK);
+        let mark = RetryMark {
+            kind: aterm_phase::WallKind::Overloaded,
+            attempts: 0,
+            ups: 0,
+            since_ms: 20_000,
+        };
+        let point = |ts: i64, retry: Option<RetryMark>| {
+            (
+                ts,
+                RULE_POINT,
+                Outcome::Waiting,
+                "",
+                point_reason(Carried { short: 0, retry }, false),
+            )
+        };
+        let waiting =
+            |ts: i64, rule: &'static str, reason: String| (ts, rule, Outcome::Waiting, "", reason);
+        let compact = |ts: i64| typed(ts, RULE_COMPACT, "/compact");
+        let cut = [check.clone(), point(20_000, None), compact(30_000)];
+        let compacted = [cut.as_slice(), &[point(40_000, None)]].concat();
+        for (name, rows) in [
+            ("the /compact", cut.to_vec()),
+            ("its answer", compacted.clone()),
+            (
+                "again on the ladder",
+                [
+                    compacted.as_slice(),
+                    &[compact(50_000), point(60_000, None)],
+                ]
+                .concat(),
+            ),
+            (
+                "after a 529's retry",
+                vec![
+                    check.clone(),
+                    point(20_000, Some(mark)),
+                    typed(25_000, RULE_API_RETRY, "(the retry)"),
+                    point(28_000, None),
+                    compact(30_000),
+                ],
+            ),
+            (
+                "under a wall row's cut",
+                vec![
+                    check.clone(),
+                    waiting(20_000, RULE_WALL_WAIT, spend_wall_reason()),
+                    compact(30_000),
+                ],
+            ),
+            (
+                "a wall the /compact met",
+                [
+                    cut.as_slice(),
+                    &[waiting(40_000, RULE_WALL_WAIT, spend_wall_reason())],
+                ]
+                .concat(),
+            ),
+        ] {
+            let o = owed(&rows).unwrap_or_else(|| panic!("{name}: owed"));
+            assert!(o.compact && !o.cut && o.check.is_none(), "{name}: {o:?}");
+        }
+        // The continuation that types the check again awaits its answer.
+        let again = [
+            compacted.as_slice(),
+            &[typed(50_000, RULE_COMPACT, DONE_CHECK)],
+        ]
+        .concat();
+        let o = owed(&again).expect("again");
+        assert!(!o.compact && !o.cut, "{o:?}");
+        for (name, rows) in [
+            (
+                "keep going",
+                [
+                    compacted.as_slice(),
+                    &[typed(50_000, RULE_COMPACT, "keep going")],
+                ]
+                .concat(),
+            ),
+            (
+                "Off before the /compact",
+                vec![
+                    check.clone(),
+                    point(20_000, None),
+                    waiting(25_000, RULE_OFF_STOOD, OFF_STOOD.to_string()),
+                    compact(30_000),
+                ],
+            ),
+            (
+                "Off after it",
+                [
+                    cut.as_slice(),
+                    &[waiting(35_000, RULE_OFF_STOOD, OFF_STOOD.to_string())],
+                ]
+                .concat(),
+            ),
+            (
+                "a wall's try",
+                [
+                    cut.as_slice(),
+                    &[
+                        waiting(40_000, RULE_WALL_WAIT, spend_wall_reason()),
+                        typed(50_000, RULE_LIMIT_RESUME, "keep going"),
+                    ],
+                ]
+                .concat(),
+            ),
+            (
+                "a 529's retry",
+                [
+                    cut.as_slice(),
+                    &[
+                        point(40_000, Some(mark)),
+                        typed(50_000, RULE_API_RETRY, "(the retry)"),
+                    ],
+                ]
+                .concat(),
+            ),
+            // NEGATIVE CONTROL: a later turn's point between.
+            (
+                "a later turn's",
+                vec![
+                    check.clone(),
+                    point(20_000, None),
+                    point(25_000, None),
+                    compact(30_000),
+                ],
+            ),
+        ] {
+            assert_eq!(owed(&rows), None, "{name}");
+        }
+        // The check's point the last record: read again first by a loop that follows.
+        let last =
+            |rows: &[(i64, &str, Outcome, &str, String)]| check_point_last_in(&body(rows), sid);
+        assert_eq!(
+            last(&[check.clone(), point(20_000, None)]),
+            Some(RULE_DONE_CHECK)
+        );
+        for (name, rows) in [
+            ("the check unanswered", vec![check.clone()]),
+            (
+                "its point cut",
+                vec![check.clone(), point(20_000, Some(mark))],
+            ),
+            (
+                "a later turn's",
+                vec![check.clone(), point(20_000, None), point(25_000, None)],
+            ),
+            (
+                "Off",
+                vec![
+                    check.clone(),
+                    point(20_000, None),
+                    waiting(25_000, RULE_OFF_STOOD, OFF_STOOD.to_string()),
+                ],
+            ),
+            ("the /compact", cut.to_vec()),
+        ] {
+            assert_eq!(last(&rows), None, "{name}");
+        }
+    }
+
+    /// A `/COMPACT` TYPED AT A LAND ACT'S OWN POINT OWES THE ACT TO ITS
+    /// CONTINUATION ([`LandSeed::compact`]), as for the check: only a full
+    /// context draws a `/compact`, and that wall writes no row. Owed through
+    /// the compaction's points and a `/compact` typed again, after a 529's
+    /// retry too and under a wall row's cut, and named by its rule
+    /// ([`LandSeed::owed`]: the instruction, a nudge, an answer; a
+    /// continuation that typed one again names it too, and lands as it does).
+    /// `keep going`, Off, a wall's try, a 529's retry, or a later turn's point
+    /// owe nothing. The act's point the last record, a loop that follows reads
+    /// it again ([`LandSeed::judged`]). FAILS WITHOUT THE FIX: the `/compact`
+    /// owed nothing, nothing named the act, and an answer typed again landed
+    /// nothing. NEGATIVE CONTROLS: a `/compact` after a later turn's point;
+    /// the act's point followed by any record but its own.
+    #[test]
+    fn a_compact_at_a_land_acts_point_owes_the_act_to_its_continuation() {
+        use super::super::policy::turn_end::{
+            LAND, LAND_ANSWER, LAND_NUDGE, RULE_API_RETRY, RULE_COMPACT, RULE_LAND,
+            RULE_LAND_ANSWER, RULE_LAND_NUDGE, RULE_LIMIT_RESUME,
+        };
+        type R = (i64, &'static str, Outcome, &'static str, String);
+        let sid = Some("@s-9");
+        let ep = |rows: &[R]| -> Option<LandSeed> {
+            let body: String = rows
+                .iter()
+                .map(|(ts, rule_id, outcome, command, reason)| {
+                    let row = Row {
+                        rule_id,
+                        outcome: *outcome,
+                        command,
+                        reason,
+                        box_seq: 1,
+                    };
+                    format!("{}\n", row.to_json(*ts, sid))
+                })
+                .collect();
+            land_episode_in(&body, sid)
+        };
+        let typed = |ts: i64, rule: &'static str, words: &'static str| -> R {
+            (ts, rule, Outcome::Typed, words, act_reason(None))
+        };
+        let mark = RetryMark {
+            kind: aterm_phase::WallKind::Overloaded,
+            attempts: 0,
+            ups: 0,
+            since_ms: 20_000,
+        };
+        let point = |ts: i64, retry: Option<RetryMark>| -> R {
+            (
+                ts,
+                RULE_POINT,
+                Outcome::Waiting,
+                "",
+                point_reason(Carried { short: 0, retry }, false),
+            )
+        };
+        let waiting = |ts: i64, rule: &'static str, reason: String| -> R {
+            (ts, rule, Outcome::Waiting, "", reason)
+        };
+        let compact = |ts: i64| typed(ts, RULE_COMPACT, "/compact");
+        let given = typed(10_000, RULE_LAND, LAND);
+        let cut = [given.clone(), point(20_000, None), compact(30_000)];
+        let compacted = [cut.as_slice(), &[point(40_000, None)]].concat();
+        let owes = |name: &str, rows: &[R], rule: &str| {
+            let e = ep(rows).unwrap_or_else(|| panic!("{name}: in hand"));
+            assert!(e.compact && !e.landing && !e.cut, "{name}: {e:?}");
+            assert_eq!(e.owed, Some(rule), "{name}");
+        };
+        for (name, rows) in [
+            ("the /compact", cut.to_vec()),
+            ("its answer", compacted.clone()),
+            (
+                "again on the ladder",
+                [
+                    compacted.as_slice(),
+                    &[compact(50_000), point(60_000, None)],
+                ]
+                .concat(),
+            ),
+            (
+                "after a 529's retry",
+                vec![
+                    given.clone(),
+                    point(20_000, Some(mark)),
+                    typed(25_000, RULE_API_RETRY, "(the retry)"),
+                    point(28_000, None),
+                    compact(30_000),
+                ],
+            ),
+            (
+                "under a wall row's cut",
+                vec![
+                    given.clone(),
+                    waiting(20_000, RULE_WALL_WAIT, spend_wall_reason()),
+                    compact(30_000),
+                ],
+            ),
+            (
+                "a wall the /compact met",
+                [
+                    cut.as_slice(),
+                    &[waiting(40_000, RULE_WALL_WAIT, spend_wall_reason())],
+                ]
+                .concat(),
+            ),
+        ] {
+            owes(name, &rows, RULE_LAND);
+        }
+        // A nudge's, an answer's.
+        for (rule, words) in [
+            (RULE_LAND_NUDGE, LAND_NUDGE),
+            (RULE_LAND_ANSWER, LAND_ANSWER),
+        ] {
+            let rows = [
+                given.clone(),
+                point(12_000, None),
+                typed(14_000, rule, words),
+                point(20_000, None),
+                compact(30_000),
+            ];
+            owes(rule, &rows, rule);
+        }
+        // The continuation that types it again lands as the act does, and names it for its own
+        // cut; so does an answer's.
+        let answer = [
+            given.clone(),
+            point(12_000, None),
+            typed(14_000, RULE_LAND_ANSWER, LAND_ANSWER),
+        ];
+        for (rule, words, mut rows) in [
+            (RULE_LAND, LAND, vec![given.clone()]),
+            (RULE_LAND_ANSWER, LAND_ANSWER, answer.to_vec()),
+        ] {
+            rows.extend([
+                point(20_000, None),
+                compact(30_000),
+                point(40_000, None),
+                typed(50_000, RULE_COMPACT, words),
+            ]);
+            let e = ep(&rows).expect("again");
+            assert!(e.landing && !e.compact, "{rule}: {e:?}");
+            assert_eq!(e.owed, Some(rule), "{rule}");
+            rows.extend([point(60_000, None), compact(70_000)]);
+            owes("its continuation's own cut", &rows, rule);
+        }
+        for (name, rows) in [
+            (
+                "keep going",
+                [
+                    compacted.as_slice(),
+                    &[typed(50_000, RULE_COMPACT, "keep going")],
+                ]
+                .concat(),
+            ),
+            (
+                "Off before the /compact",
+                vec![
+                    given.clone(),
+                    point(20_000, None),
+                    waiting(25_000, RULE_OFF_STOOD, OFF_STOOD.to_string()),
+                    compact(30_000),
+                ],
+            ),
+            (
+                "Off after it",
+                [
+                    cut.as_slice(),
+                    &[waiting(35_000, RULE_OFF_STOOD, OFF_STOOD.to_string())],
+                ]
+                .concat(),
+            ),
+            (
+                "a wall's try",
+                [
+                    cut.as_slice(),
+                    &[
+                        waiting(40_000, RULE_WALL_WAIT, spend_wall_reason()),
+                        typed(50_000, RULE_LIMIT_RESUME, "keep going"),
+                    ],
+                ]
+                .concat(),
+            ),
+            (
+                "a 529's retry",
+                [
+                    cut.as_slice(),
+                    &[
+                        point(40_000, Some(mark)),
+                        typed(50_000, RULE_API_RETRY, "(the retry)"),
+                    ],
+                ]
+                .concat(),
+            ),
+            // NEGATIVE CONTROL: a later turn's point between.
+            (
+                "a later turn's",
+                vec![
+                    given.clone(),
+                    point(20_000, None),
+                    point(25_000, None),
+                    compact(30_000),
+                ],
+            ),
+        ] {
+            let e = ep(&rows);
+            assert!(
+                e.is_none_or(|e| !e.compact && !e.landing && e.owed.is_none()),
+                "{name}: {e:?}"
+            );
+        }
+        // The act's point the last record: read again first by a loop that follows.
+        let e = ep(&[given.clone(), point(20_000, None)]).expect("judged");
+        assert!(e.judged && !e.landing, "{e:?}");
+        assert_eq!(e.owed, Some(RULE_LAND));
+        for (name, rows) in [
+            ("the act unanswered", vec![given.clone()]),
+            (
+                "its point cut",
+                vec![given.clone(), point(20_000, Some(mark))],
+            ),
+            (
+                "a later turn's",
+                vec![given.clone(), point(20_000, None), point(25_000, None)],
+            ),
+            (
+                "Off",
+                vec![
+                    given.clone(),
+                    point(20_000, None),
+                    waiting(25_000, RULE_OFF_STOOD, OFF_STOOD.to_string()),
+                ],
+            ),
+            (
+                "landed there",
+                vec![
+                    given.clone(),
+                    point(20_000, None),
+                    waiting(21_000, RULE_TASK_DONE, TASK_DONE.to_string()),
+                ],
+            ),
+            ("the /compact", cut.to_vec()),
+        ] {
+            assert!(ep(&rows).is_none_or(|e| !e.judged), "{name}");
+        }
+    }
+
     /// A CUT KEEPS WHAT THE READERS READ OF A RUN OF THE LOOP'S RECORDS
     /// ([`bound`], [`fold_records`]; the verifier of 75b03ac6d, RS9-R1). A
     /// tab's ledger past [`MAX_BYTES`]: older approvals, a model fallback
@@ -5602,8 +6164,8 @@ mod tests {
     #[test]
     fn a_cut_keeps_the_rows_of_the_states_that_stand_past_a_run_of_acts() {
         use super::super::policy::turn_end::{
-            RULE_API_RETRY, RULE_CONTINUE, RULE_LAND, RULE_LAND_ANSWER, RULE_LAND_NUDGE,
-            RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE,
+            LAND, LAND_ANSWER, RULE_API_RETRY, RULE_COMPACT, RULE_CONTINUE, RULE_LAND,
+            RULE_LAND_ANSWER, RULE_LAND_NUDGE, RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE,
         };
         let dir = crate::supervise::ScratchDir::new("apr-seed", "cut-acts");
         let sid = Some("@s-9");
@@ -5739,6 +6301,34 @@ mod tests {
         }
         let landed = held("land-held", &land);
         assert!(landed.1.is_some_and(|e| e.nudges == 2), "{landed:?}");
+        // The answer returns the episode to the instruction's phase and hold, but owes
+        // different words. Its following compact must retain that identity through the actual
+        // ledger cut, even with every relevant row older than the retained approvals.
+        let mut compact_answered = vec![
+            (t, RULE_LAND, Outcome::Typed, LAND, act_reason(None)),
+            point(t + 1),
+            (
+                t + 2,
+                RULE_LAND_ANSWER,
+                Outcome::Typed,
+                LAND_ANSWER,
+                act_reason(None),
+            ),
+            point(t + 3),
+            (
+                t + 4,
+                RULE_COMPACT,
+                Outcome::Typed,
+                "/compact",
+                act_reason(None),
+            ),
+        ];
+        compact_answered.extend(land.iter().skip(6).cloned());
+        let owed = held("land-answer-compacted", &compact_answered)
+            .1
+            .expect("the answer's compact");
+        assert!(owed.compact && !owed.landing, "{owed:?}");
+        assert_eq!(owed.owed, Some(RULE_LAND_ANSWER));
         // Its questions answered under Land, each answer judged at its point:
         // the episode back where it stood after each, and every row a move;
         // then a later turn's point, and approvals.

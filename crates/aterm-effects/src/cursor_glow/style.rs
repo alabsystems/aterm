@@ -180,7 +180,7 @@ impl GlowStyle {
     /// spellings.
     #[inline]
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Lumen => "lumen",
             Self::Phaser => "phaser",
@@ -203,6 +203,7 @@ impl GlowStyle {
     /// still draws the mono face. Both faces resolve to [`Self::Classic`]; the
     /// fork lands where the colour is picked (Classic with a trail colour
     /// draws it too, `cursor_fx::resolve_glow_config`).
+    #[inline]
     #[must_use]
     pub fn style_names_classic_mono(style_raw: &str) -> bool {
         let s = style_raw.trim();
@@ -215,6 +216,7 @@ impl GlowStyle {
     /// [`spellings::canonical`]. `off` and an unknown spelling are `Lumen`,
     /// the documented fallback of a page's `set_cursor_glow` (the native host
     /// resolves unknown spellings to its own default before it gets here).
+    #[inline]
     pub fn parse(s: &str) -> Self {
         let s = s.trim();
         spellings::row(s)
@@ -224,7 +226,7 @@ impl GlowStyle {
     /// Whether this style spawns particles (sparks / embers / droplets /
     /// laser-ablation sparks / beam stardust / comet debris glitter).
     #[inline]
-    pub(super) fn has_particles(self) -> bool {
+    pub(super) const fn has_particles(self) -> bool {
         matches!(
             self,
             Self::Sparkle | Self::Fire | Self::Water | Self::Laser | Self::Beam | Self::Comet
@@ -415,7 +417,7 @@ impl GlowStyle {
     /// * `FireShimmer`: Fire alone.
     #[inline]
     #[must_use]
-    pub fn reads_knob(self, knob: TrailKnob, ctx: KnobContext) -> bool {
+    pub const fn reads_knob(self, knob: TrailKnob, ctx: KnobContext) -> bool {
         use GlowStyle::{
             Beam, Classic, Comet, Fire, Laser, Lumen, Phaser, RainbowKitty, Sparkle, Water,
         };
@@ -437,7 +439,7 @@ impl GlowStyle {
                 Sparkle | Phaser => ctx.ring,
                 RainbowKitty | Fire | Laser | Beam | Water => false,
             },
-            TrailKnob::FireShimmer => self == Fire,
+            TrailKnob::FireShimmer => matches!(self, Fire),
         }
     }
 
@@ -446,12 +448,14 @@ impl GlowStyle {
     /// live cursor's. A style that does not keeps both on the cursor colour.
     #[inline]
     #[must_use]
-    pub fn draws_trail_color(self) -> bool {
+    pub const fn draws_trail_color(self) -> bool {
         self.reads_knob(
             TrailKnob::Color,
             KnobContext {
                 dark: true,
-                ..KnobContext::default()
+                bar: false,
+                ring: false,
+                classic_tinted: false,
             },
         )
     }
@@ -480,7 +484,7 @@ pub fn style_has_beam(style_raw: &str) -> bool {
 /// between spellings of one [`GlowStyle`] needs no call-site changes.
 #[inline]
 #[must_use]
-pub fn style_has_beam_of(style: GlowStyle, _style_raw: &str) -> bool {
+pub const fn style_has_beam_of(style: GlowStyle, _style_raw: &str) -> bool {
     !matches!(style, GlowStyle::Water | GlowStyle::RainbowKitty)
 }
 

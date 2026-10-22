@@ -1409,8 +1409,7 @@ impl App {
                 )
             });
             if !still_referenced {
-                self.native_runtime
-                    .finish_system_state_close(native.instance, scope);
+                self.finish_system_state_close(native.instance, scope);
                 self.native_runtime.remove_instance(native.instance);
                 self.refresh_disambiguated_document_titles();
             }
@@ -2723,6 +2722,23 @@ impl App {
         wid: WindowId,
         axis: crate::tab_model::SplitAxis,
     ) -> (u64, crate::tab_model::ViewId) {
+        self.split_active_with_stub_terminal_with_sink(
+            wid,
+            axis,
+            std::sync::Arc::new(aterm_session::sink::SinkWriter::new(-1)),
+        )
+    }
+
+    /// [`Self::split_active_with_stub_terminal`] with a caller-provided sink
+    /// for the new pane's session, so a test can observe the bytes that pane
+    /// sends its program (a mouse report from a mixed tab's press).
+    #[cfg(test)]
+    pub(crate) fn split_active_with_stub_terminal_with_sink(
+        &mut self,
+        wid: WindowId,
+        axis: crate::tab_model::SplitAxis,
+        sink: std::sync::Arc<aterm_session::sink::SinkWriter>,
+    ) -> (u64, crate::tab_model::ViewId) {
         // THIS IS THE CANONICAL ARM ONLY: it splits `tab_set` and never mirrors
         // into `layouts`. That is correct exactly when the active tab owns no
         // compatibility entry — a native or heterogeneous tab. An ALL-TERMINAL
@@ -2749,7 +2765,7 @@ impl App {
             .is_some_and(|tab| tab.split_focused(axis, view));
         assert!(split, "canonical heterogeneous split succeeds");
         self.next_session_id = self.next_session_id.saturating_add(1);
-        self.pool.insert(crate::stub_session(sid));
+        self.pool.insert(crate::stub_session_with_sink(sid, sink));
         self.resize_panes(wid);
         self.resync_active_or_window(wid);
         (sid, view)
@@ -4656,6 +4672,33 @@ impl App {
         session: crate::Session,
         parent: Option<aterm_session::SessionId>,
     ) {
+        self.install_tab_session_at(owner, session, parent, None);
+    }
+
+    /// [`Self::install_tab_session`] for a tab that lands behind the one at index `kept`
+    /// (a wire `spawn` that does not raise): the `tab_strip` model's NewTab, then
+    /// SelectTab of `kept`, re-mirrored once after both. The window's front never moves,
+    /// so the program in front is told nothing: re-mirrored between the steps, it would
+    /// be blurred (DEC 1004 `ESC[O`) and focused again (`ESC[I`) for a tab nobody
+    /// switched to, and the control handle would name the newborn in between.
+    pub(crate) fn install_tab_session_behind(
+        &mut self,
+        owner: WindowId,
+        session: crate::Session,
+        parent: Option<aterm_session::SessionId>,
+        kept: usize,
+    ) {
+        self.install_tab_session_at(owner, session, parent, Some(kept));
+    }
+
+    /// The body of [`Self::install_tab_session`] and [`Self::install_tab_session_behind`].
+    fn install_tab_session_at(
+        &mut self,
+        owner: WindowId,
+        session: crate::Session,
+        parent: Option<aterm_session::SessionId>,
+        behind: Option<usize>,
+    ) {
         let id = session.id;
         // P1.1: register in the process-wide registry (additive index) so a
         // cross-session `@<selector>` verb can reach this tab.
@@ -4670,6 +4713,18 @@ impl App {
             ws.layouts.push(layout);
             ws.tabs.add();
             ws.tab_set.push(tab).expect("fresh tab id");
+            // Selected again as `switch_tab_in` selects a tab, before any re-mirror.
+            if let Some(front) = behind
+                .and_then(|kept| ws.tab_set.tab_at(kept))
+                .map(|t| t.id)
+            {
+                let switched = ws.tab_set.switch_to(front);
+                debug_assert!(switched);
+                if let Some(index) = terminal_projection_index(&ws.tab_set, &self.view_store, front)
+                {
+                    ws.tabs.switch_to(index);
+                }
+            }
         }
         self.resync_active_or_window(owner);
     }
@@ -5565,6 +5620,14 @@ impl App {
         scope: crate::native_app::CloseScope,
         visibility: ClosePreflightVisibility,
     ) -> Result<bool, String> {
+        if matches!(
+            scope,
+            crate::native_app::CloseScope::Relaunch
+                | crate::native_app::CloseScope::CarriedRelaunch
+        ) && self.system_state_cancel_pending()
+        {
+            return Ok(false);
+        }
         let windows = self.windows.keys().copied().collect::<Vec<_>>();
         for wid in windows {
             if !self.prepare_window_native_shutdown_with(wid, scope, visibility)? {
@@ -7576,6 +7639,8 @@ impl App {
         // its is folded again.
         self.forget_harness_glass(id);
         self.autopilot_timers.forget(id);
+        // What the person hid of its footer goes too: a new session shows all.
+        self.claude_facts.remove(&id);
         // …and what its Autopilot records said (§11.7.3, item 3).
         self.autopilot_recorded.remove(&id);
         // The front pane may be another now: a warm spare follows it (`spare`).

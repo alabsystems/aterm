@@ -53,12 +53,14 @@ pub(crate) fn light_floor_at(theme_fg: u32, bar: f32) -> f32 {
 /// A walk toward white by `w`: `c + w · (255 − c)`. Channel differences
 /// survive unscaled, so the hue direction is kept and only saturation falls.
 #[inline]
-fn toward_white(rgb: u32, w: f32) -> u32 {
-    let ch = |sh: u32| {
-        let c = ((rgb >> sh) & 0xff) as f32;
-        ((c + w * (255.0 - c)) + 0.5).clamp(0.0, 255.0) as u32
-    };
-    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+const fn toward_white(rgb: u32, w: f32) -> u32 {
+    let ch16 = ((rgb >> 16) & 0xff) as f32;
+    let ch8 = ((rgb >> 8) & 0xff) as f32;
+    let ch0 = (rgb & 0xff) as f32;
+    let r = ((ch16 + w * (255.0 - ch16)) + 0.5).clamp(0.0, 255.0) as u32;
+    let g = ((ch8 + w * (255.0 - ch8)) + 0.5).clamp(0.0, 255.0) as u32;
+    let b = ((ch0 + w * (255.0 - ch0)) + 0.5).clamp(0.0, 255.0) as u32;
+    (r << 16) | (g << 8) | b
 }
 
 /// The composite of `ink` at opacity `a` over `bg`, through the renderer's
@@ -189,6 +191,7 @@ pub(crate) const LIGHT_MARK_QUADS: usize = 4096;
     reason = "stream + geometry + centre + both radii + ink + peak + budget: the ellipse IS this \
               parameter set"
 )]
+#[inline]
 pub(crate) fn push_ink_ellipse(
     under: &mut Vec<GlowQuad>,
     geom: Geom,
@@ -383,6 +386,7 @@ fn soft_ellipse(
 /// it) as source-over ink at that coverage, capped at `cap`: the light-ground
 /// form of any additive beam, its own anti-aliasing intact. `ink_at` picks
 /// each quad's ink (a run's colour along its path, or one ink for all).
+#[inline]
 pub(crate) fn reink_quads(quads: &mut [GlowQuad], cap: u8, ink_at: impl Fn(&GlowQuad) -> u32) {
     for q in quads {
         let a = ((q.color & 0xff) as u8).min(cap);
@@ -422,7 +426,7 @@ impl LightGround {
     /// The ground of a resolved config.
     #[inline]
     #[must_use]
-    pub(crate) fn of(cfg: &GlowConfig) -> Self {
+    pub(crate) const fn of(cfg: &GlowConfig) -> Self {
         Self {
             fg: cfg.theme_fg,
             bg: cfg.theme_bg,

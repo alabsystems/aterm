@@ -25,6 +25,7 @@
 /// solved directly on the forward Bresenham lattice, so cost is O(limit), not
 /// O(distance), and the forward walk's asymmetric tie choices on shallow
 /// diagonals are preserved.
+#[inline]
 pub fn line_cells_tail(
     out: &mut Vec<(i32, i32)>,
     origin: (i32, i32),
@@ -151,13 +152,15 @@ pub fn wrap_fold_cells_in_pane(
 /// minting light.
 #[inline]
 #[must_use]
-pub fn physical_margin_fold(prev: (u16, u16), cur: (u16, u16), col0: u16, cols: u16) -> bool {
+pub const fn physical_margin_fold(prev: (u16, u16), cur: (u16, u16), col0: u16, cols: u16) -> bool {
     if cols == 0 {
         return false;
     }
-    let col1 = u32::from(col0) + u32::from(cols);
+    let col1 = (col0 as u32) + (cols as u32);
     let last = col1.saturating_sub(1);
-    prev.0.checked_add(1) == Some(cur.0) && u32::from(prev.1) == last && cur.1 == col0
+    matches!(prev.0.checked_add(1), Some(r) if r == cur.0)
+        && (prev.1 as u32) == last
+        && cur.1 == col0
 }
 
 #[cfg(test)]

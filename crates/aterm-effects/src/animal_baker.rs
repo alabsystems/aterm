@@ -65,15 +65,15 @@ impl AnimalBakeKey {
     /// salt separates it from pet tiles.
     #[inline]
     #[must_use]
-    pub fn host_id(&self) -> u64 {
+    pub const fn host_id(&self) -> u64 {
         const ANIMAL_SALT: u64 = 0xA111_3A15;
         host_tile_id(&[
             ANIMAL_SALT,
             self.species as u64,
-            u64::from(self.colors.accent),
-            u64::from(self.colors.background),
-            u64::from(self.w),
-            u64::from(self.h),
+            self.colors.accent as u64,
+            self.colors.background as u64,
+            self.w as u64,
+            self.h as u64,
         ])
     }
 }
@@ -132,8 +132,9 @@ impl AnimalBaker {
     /// produce a NaN/∞ destination rect.
     #[inline]
     #[must_use]
-    pub fn aspect(species: AnimalGlyphId) -> f32 {
-        (f32::from(ANIMAL_GLYPHS[species as usize].aspect_x1000) / 1000.0).max(0.001)
+    pub const fn aspect(species: AnimalGlyphId) -> f32 {
+        let a = (ANIMAL_GLYPHS[species as usize].aspect_x1000 as f32) / 1000.0;
+        if a > 0.001 { a } else { 0.001 }
     }
 }
 

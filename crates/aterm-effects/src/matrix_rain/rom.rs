@@ -284,6 +284,7 @@ pub fn rasterize_master() -> RomMaster {
 /// The material path forks it (a 12 KB copy) on every charset change instead
 /// of re-rasterizing ~55k plots. Process-wide because each `EffectsPipeline`
 /// builds its own rain engine; `RomMaster` is `Send + Sync`.
+#[inline]
 pub(crate) fn decorative_master() -> &'static RomMaster {
     static DECORATIVE: OnceLock<RomMaster> = OnceLock::new();
     DECORATIVE.get_or_init(rasterize_master)

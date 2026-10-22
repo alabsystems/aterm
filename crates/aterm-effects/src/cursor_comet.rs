@@ -64,6 +64,7 @@ const COMA_DISCS: [(f32, f32, f32, f32); 4] = [
     (0.38, 1.00, 0.86, 0.14),
 ];
 
+#[inline]
 const fn cov_capped(cov: f32) -> f32 {
     if cov < COV_CAP { cov } else { COV_CAP }
 }
@@ -167,6 +168,7 @@ impl CursorComet {
     /// Whether the host must keep arming the animation tick: only while the
     /// comet is charged (typing, or a jump flare cooling).
     #[must_use]
+    #[inline]
     pub fn is_active(&self) -> bool {
         self.blaze > SETTLED_BLAZE
     }
@@ -524,6 +526,7 @@ fn ring_row(
 /// near-white): dimmed hue, pure hue, whitened hue, [`ICE_WHITE`]. Derived from
 /// the config colour, so an explicit `cursor_trail_color` re-tints the nucleus
 /// with the tail.
+#[inline]
 fn ice_ramp(color: u32, t: f32) -> u32 {
     let t = t.clamp(0.0, 1.0);
     if t < 0.45 {

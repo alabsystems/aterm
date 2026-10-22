@@ -40,15 +40,27 @@
 //!   ([`turn::launch_card_place`], for the harness card drawn around it, with
 //!   the build it names: [`turn::launch_card_version`], and its words, by
 //!   which the card is held through the vendor's entrance:
-//!   [`turn::launch_card_held`]);
+//!   [`turn::launch_card_held`], and known again with its top scrolled off:
+//!   [`turn::launch_card_scrolled`]);
+//! * [`notice`] — the update notice Claude Code draws under the launch card
+//!   on a new build's first launch, placed by its own shape
+//!   ([`notice::update_notice_scan`]) for the harness banner drawn over it,
+//!   and kept across a rebuild that changed no row it read
+//!   ([`notice::update_notice_unmoved`]);
 //! * [`reader::identify`] / [`reader::read`] — the reader for the session's
 //!   PROGRAM (Claude Code, Codex, agy, Muse Code, Gemini CLI, anything else), and one
 //!   screen read whole; [`reader::Program::supervisable`] — the programs the
 //!   supervisor hosts. Codex is named, never read: aterm's Codex screen lane
 //!   was retired on 2026-10-16 ([`reader::CodexReader`]);
 //! * [`agy`] — agy's (Google's Antigravity CLI), measured on 1.4.0;
+//! * [`codex`] — where Codex draws its composer (measured on 0.154.0),
+//!   placed for the glass and never read: presentation only;
 //! * [`muse`] — Muse Code's, measured on 1.4.9-R6297.1 and 1.4.10-R6427.1;
 //! * [`gemini`] — Gemini CLI's (Google's), measured on 0.46.0;
+//! * [`agents_panel`] — Claude Code's agents panel under the composer's
+//!   footer, one row at a time: its kind (main, agent, workflow, idle
+//!   summary, `↓ N more`) and the pane columns of its bullet, name, status,
+//!   bar and counts, read in the 2.1.304 bundle;
 //! * [`panel`] — Claude Code's Settings panel (`/usage`'s dialog): whether
 //!   it is what the screen shows, by which renderer, and what a row under
 //!   its header says of the Usage tab;
@@ -75,14 +87,17 @@
 //! under [`prompt::fixtures`] are the screens those sessions showed, each
 //! newer one with its program, version and provenance on its first line.
 
+pub mod agents_panel;
 pub mod agy;
 pub mod anchors;
 pub mod autocompact;
+pub mod codex;
 pub mod credits;
 pub mod disk_full;
 pub mod gemini;
 pub mod login;
 pub mod muse;
+pub mod notice;
 pub mod panel;
 pub mod phase;
 pub mod prompt;
@@ -108,6 +123,7 @@ pub use login::{
     LoginAtWall, LoginMethod, LoginScreen, Picker as LoginPicker, login_at_wall, login_interrupted,
     login_screen,
 };
+pub use notice::{NoticePlace, NoticeScan, update_notice_scan, update_notice_unmoved};
 pub use panel::{
     PanelRenderer, SettingsPanel, panel_tail, settings_panel, usage_tab_mark, usage_unsettled,
 };
@@ -135,10 +151,12 @@ pub use reset::{
 };
 pub use survey::{SurveyBlock, SurveyKind, survey_block};
 pub use turn::{
-    BannerBuild, CardPlace, LaunchCard, LaunchCardRead, answered_prompt, continuation_suggestion,
-    goal_active, idle_compacted, interrupted, launch_card, launch_card_held, launch_card_place,
-    launch_card_read, launch_card_scan, launch_card_unmoved, launch_card_version,
-    launch_card_words, said_tail, said_whole, turn_history_stop, turn_said_before, turn_whole,
+    BannerBuild, CardPlace, CardWords, LaunchCard, LaunchCardRead, WAND_FLARE_DARK,
+    WAND_FLARE_LIGHT, WAND_FLARE_TOLERANCE, answered_prompt, continuation_suggestion, goal_active,
+    idle_compacted, interrupted, launch_card, launch_card_held, launch_card_place,
+    launch_card_read, launch_card_scan, launch_card_scrolled, launch_card_scrolled_unmoved,
+    launch_card_unmoved, launch_card_version, launch_card_words, said_tail, said_whole,
+    turn_history_stop, turn_said_before, turn_whole, wand_flare,
 };
 pub use wall::{
     ApiCause, AutoContinue, Placement, SinceLimit, Wall, WallKind, WordsAbove, auto_continue_end,

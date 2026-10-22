@@ -9,7 +9,11 @@ use aterm_secrets::SecretBytes;
 use aterm_types::macos_setup::Plan;
 
 mod check;
-pub use check::check_initial_setup;
+pub use check::{check_initial_setup, check_initial_setup_observed};
+mod observation;
+pub use observation::{InitialSetupObservation, InitialSetupObserved};
+mod authorization;
+pub use authorization::InitialSetupAuthorization;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
@@ -212,6 +216,11 @@ fn validate_plan(plan: &Plan) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate immutable setup input without reading state or probing the OS.
+pub fn validate_initial_setup_plan(plan: &Plan) -> Result<(), String> {
+    validate_plan(plan)
+}
+
 fn save_plan(root: &Path, plan: &Plan) -> Result<(), String> {
     validate_plan(plan)?;
     write_json(
@@ -221,13 +230,29 @@ fn save_plan(root: &Path, plan: &Plan) -> Result<(), String> {
 }
 
 pub(super) fn save_explicit_workstation_plan(root: &Path) -> Result<(), String> {
+    let stopped = stopped_at(root)?.is_some();
     let Some(mut progress) = progress(root)? else {
-        save_workstation_authorization(root, &Plan::from(Selection::all().workstation()))?;
-        return save_automatic_plan(root, Selection::all().workstation());
+        let plan = Plan::from(Selection::all().workstation());
+        if stopped {
+            // Retire legacy run zero before clearing its stop. A successful
+            // explicit profile pass completes this original-eight-only run.
+            return restart_at(root, &plan).map(|_| ());
+        }
+        save_workstation_authorization(root, &plan)?;
+        return save_automatic_plan(root, plan.selection);
     };
     let mut plan = saved_plan(root)?.ok_or("the initial setup plan is missing")?;
     if !progress.belongs_to(&plan) {
         progress = progress.next_for_plan(&plan)?;
+    } else if stopped {
+        progress.revision = next_revision(progress.revision)?;
+    }
+    let admitted = progress.admitted;
+    if stopped {
+        // An older worker may retain a password across its backoff. Publish
+        // its retirement before replacing Cancel/Restore, including on crash.
+        progress.admitted = false;
+        save_progress(root, progress)?;
     }
     for setting in Setting::ALL {
         if setting.is_workstation() {
@@ -237,13 +262,31 @@ pub(super) fn save_explicit_workstation_plan(root: &Path) -> Result<(), String> 
     // Invalidate the old subset's completion before publishing its expanded
     // plan or clearing its done bit. If explicit preflight fails, the existing
     // worker must retry these settings rather than accept that stale marker.
-    // Keep its revision so independent vault work retains its in-memory password.
+    // A live run retains its revision and vault password; reviving a stopped
+    // run above deliberately retires those workers.
     save_workstation_authorization(root, &plan)?;
     save_plan(root, &plan)?;
     progress.plan = plan_digest(&plan);
     progress.done &= !Stage::Workstation.bit();
     progress.completed = false;
     progress.running = None;
+    progress.admitted = admitted;
+    save_progress(root, progress)
+}
+
+pub(super) fn complete_explicit_workstation_plan(root: &Path) -> Result<(), String> {
+    let Some(mut progress) = progress(root)? else {
+        return Ok(());
+    };
+    let plan = saved_plan(root)?.ok_or("the initial setup plan is missing")?;
+    if !progress.belongs_to(&plan) || !progress.admitted {
+        return Ok(());
+    }
+    progress.done |= Stage::Workstation.bit();
+    progress.running = None;
+    progress.completed = Stage::ALL
+        .iter()
+        .all(|stage| !stage.selected(&plan) || progress.done & stage.bit() != 0);
     save_progress(root, progress)
 }
 
@@ -270,25 +313,172 @@ pub fn automatic_plan() -> Result<Plan, String> {
 
 /// Authorize the exact selected stages and source before any OS probes. A
 /// password must be supplied separately to [`apply_initial_setup`] and is never saved.
-/// Returns false if an earlier finished decision won, and true only after this
-/// exact choice is durably admitted, including an empty checklist.
-pub fn authorize_initial_setup(plan: &Plan) -> Result<bool, String> {
-    ensure_person_scope()?;
-    let root = state_root()?;
-    let _lock = HeldLock::take(&root)?;
-    authorize_at(&root, plan)
+/// Returns None if an earlier finished decision won, or the exact run revision
+/// after this choice is durably admitted, including an empty checklist.
+pub fn authorize_initial_setup(plan: &Plan) -> Result<Option<u64>, String> {
+    authorize_initial_setup_observed(plan).result
+}
+
+/// Authorize with a result identity captured before releasing the profile lock.
+pub fn authorize_initial_setup_observed(plan: &Plan) -> InitialSetupObserved<Option<u64>> {
+    observe_person_mutation(
+        Err("another doctor profile pass is running".into()),
+        |root| authorize_at(root, plan),
+    )
 }
 
 /// Explicitly run the selected plan again, superseding an earlier completion,
 /// cancellation or restoration. Original preference before-images are retained.
-pub fn restart_initial_setup(plan: &Plan) -> Result<(), String> {
-    ensure_person_scope()?;
-    let root = state_root()?;
-    let _lock = HeldLock::take(&root)?;
-    restart_at(&root, plan)
+pub fn restart_initial_setup(plan: &Plan) -> Result<u64, String> {
+    restart_initial_setup_observed(plan).result
 }
 
-fn restart_at(root: &Path, plan: &Plan) -> Result<(), String> {
+/// Restart with a result identity captured before releasing the profile lock.
+pub fn restart_initial_setup_observed(plan: &Plan) -> InitialSetupObserved<u64> {
+    observe_person_mutation(
+        Err("another doctor profile pass is running".into()),
+        |root| restart_at(root, plan),
+    )
+}
+
+/// One explicit restart, retaining ownership only while its final admission
+/// save needs recovery. Keep the original plan, password and UI receipt until
+/// this returns a revision or is no longer pending; never reuse a finished attempt.
+#[derive(Default)]
+pub struct InitialSetupRestart {
+    started: bool,
+    final_commit: Option<RestartCommit>,
+}
+
+struct RestartCommit {
+    plan: Plan,
+    staged: Records,
+    admitted: Records,
+    publications: observation::Publications,
+    progress: Progress,
+}
+
+impl InitialSetupRestart {
+    /// Whether the same final admission step can still be confirmed or retried.
+    /// Errors before that step do not leave a pending operation.
+    pub fn pending(&self) -> bool {
+        self.final_commit.is_some()
+    }
+
+    /// Persist this exact restart. Some is its durably admitted revision; None
+    /// means it was superseded or already ended. Retry errors only while pending.
+    pub fn persist_observed(&mut self, plan: &Plan) -> InitialSetupObserved<Option<u64>> {
+        observe_person_mutation(
+            Err("another doctor profile pass is running".into()),
+            |root| {
+                self.persist_with(root, plan, save_progress, |root| {
+                    observation_at(root).map_err(|error| error.to_string())
+                })
+            },
+        )
+    }
+
+    fn persist_with(
+        &mut self,
+        root: &Path,
+        plan: &Plan,
+        commit: impl FnOnce(&Path, Progress) -> Result<(), String>,
+        observe: impl FnOnce(&Path) -> Result<InitialSetupObservation, String>,
+    ) -> Result<Option<u64>, String> {
+        // The caller holds profile.lock for staging, confirmation, and any
+        // final write. A durable stop wins even if other records are unreadable.
+        if self.pending() {
+            if !owns_publications(root, &self.final_commit.as_ref().unwrap().publications)? {
+                self.final_commit = None;
+                return Ok(None);
+            }
+            let current = observe(root)?;
+            let owned = self.final_commit.as_ref().unwrap();
+            if owned.plan != *plan
+                || current.publications() != owned.publications
+                || (current.records != owned.staged && current.records != owned.admitted)
+            {
+                self.final_commit = None;
+                return Ok(None);
+            }
+            if current.records == owned.admitted {
+                let revision = owned.progress.revision;
+                self.final_commit = None;
+                return Ok(Some(revision));
+            }
+        } else {
+            if self.started {
+                return Ok(None);
+            }
+            self.started = true;
+            let mut next = stage_restart(root, plan)?;
+            let staged = observe(root)?;
+            if !staged
+                .records
+                .plan
+                .as_ref()
+                .is_some_and(|(saved, modern)| *modern && saved == plan)
+                || staged.records.progress != Some(next)
+                || !matches!(
+                    staged.records.decision,
+                    Decision::Pending | Decision::Applied(true)
+                )
+            {
+                return Err("the staged setup restart changed before admission".into());
+            }
+            next.admitted = true;
+            let mut admitted = staged.records.clone();
+            admitted.progress = Some(next);
+            self.final_commit = Some(RestartCommit {
+                plan: plan.clone(),
+                staged: staged.records.clone(),
+                admitted,
+                publications: staged.publications(),
+                progress: next,
+            });
+        }
+
+        let next = self.final_commit.as_ref().unwrap().progress;
+        match commit(root, next) {
+            Ok(()) => {
+                self.final_commit = None;
+                Ok(Some(next.revision))
+            }
+            Err(why) => {
+                // A failed flush can leave either the staged file or our new
+                // admitted file visible. Pin its identity before unlocking,
+                // without relying on reads or another flush to succeed now.
+                match observation::publications(root) {
+                    Ok(publications) => {
+                        self.final_commit.as_mut().unwrap().publications = publications;
+                    }
+                    Err(_) => {
+                        // An unbound failure must never adopt whatever becomes
+                        // readable later as this operation's publication.
+                        self.final_commit = None;
+                    }
+                }
+                Err(why)
+            }
+        }
+    }
+}
+
+fn owns_publications(root: &Path, expected: &observation::Publications) -> Result<bool, String> {
+    let stop = stopped_at(root);
+    if matches!(stop, Ok(Some(_))) {
+        return Ok(false);
+    }
+    // A malformed replacement is still supersession. Only an error reading
+    // our unchanged decision belongs to this operation and remains retryable.
+    if observation::publications(root)? != *expected {
+        return Ok(false);
+    }
+    stop?;
+    Ok(true)
+}
+
+fn restart_at(root: &Path, plan: &Plan) -> Result<u64, String> {
     restart_with(root, plan, save_progress)
 }
 
@@ -296,9 +486,16 @@ fn restart_with(
     root: &Path,
     plan: &Plan,
     commit: impl FnOnce(&Path, Progress) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
+    let mut next = stage_restart(root, plan)?;
+    next.admitted = true;
+    commit(root, next)?;
+    Ok(next.revision)
+}
+
+fn stage_restart(root: &Path, plan: &Plan) -> Result<Progress, String> {
     validate_plan(plan)?;
-    let mut next = progress(root)?.unwrap_or_default().next_for_plan(plan)?;
+    let next = progress(root)?.unwrap_or_default().next_for_plan(plan)?;
     save_plan(root, plan)?;
     save_progress(root, next)?;
     match std::fs::remove_file(root.join("automatic-attempt.json")) {
@@ -313,8 +510,7 @@ fn restart_with(
     // Release an earlier stop only after the new plan and progress are durable.
     // The final admission record is still required before any setup can run.
     save_workstation_authorization(root, plan)?;
-    next.admitted = true;
-    commit(root, next)
+    Ok(next)
 }
 
 fn save_workstation_authorization(root: &Path, plan: &Plan) -> Result<(), String> {
@@ -328,7 +524,7 @@ fn save_workstation_authorization(root: &Path, plan: &Plan) -> Result<(), String
     )
 }
 
-fn authorize_at(root: &Path, plan: &Plan) -> Result<bool, String> {
+fn authorize_at(root: &Path, plan: &Plan) -> Result<Option<u64>, String> {
     authorize_with(root, plan, save_progress)
 }
 
@@ -336,9 +532,9 @@ fn authorize_with(
     root: &Path,
     plan: &Plan,
     commit: impl FnOnce(&Path, Progress) -> Result<(), String>,
-) -> Result<bool, String> {
+) -> Result<Option<u64>, String> {
     if finished_at(root)? {
-        return Ok(false);
+        return Ok(None);
     }
     validate_plan(plan)?;
     let previous = saved_plan(root)?;
@@ -366,7 +562,7 @@ fn authorize_with(
     // visible after an interrupted write without releasing permission UI.
     current.admitted = true;
     commit(root, current)?;
-    Ok(true)
+    Ok(Some(current.revision))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -410,15 +606,62 @@ pub fn initial_setup_revision() -> Result<u64, String> {
     revision_at(&state_root()?)
 }
 
-fn revision_at(root: &Path) -> Result<u64, String> {
+pub(super) fn revision_at(root: &Path) -> Result<u64, String> {
     let Some(progress) = progress(root)? else {
         return Ok(0);
     };
-    let plan = saved_plan(root)?.ok_or("the initial setup plan is missing")?;
-    if !progress.belongs_to(&plan) {
+    plan_revision(Some(progress), saved_plan(root)?.as_ref())
+}
+
+fn plan_revision(progress: Option<Progress>, plan: Option<&Plan>) -> Result<u64, String> {
+    let Some(progress) = progress else {
+        return Ok(0);
+    };
+    let plan = plan.ok_or("the initial setup plan is missing")?;
+    if !progress.belongs_to(plan) {
         return Err("the initial setup plan changed before its progress reset completed".into());
     }
     Ok(progress.revision)
+}
+
+/// A coherent observation of a durably admitted modern setup run. This does
+/// not grant an execution lease; workers must still fence effects by revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitialSetupAdmission {
+    pub plan: Plan,
+    pub revision: u64,
+    pub completed: bool,
+}
+
+/// Read the admitted run without loading fallback vault configuration, probing
+/// the OS or changing records. Staged choices and stopped runs return None;
+/// a durable stop takes precedence over unreadable plan/progress records.
+/// Otherwise unreadable or changing records are errors, not missing admission.
+pub fn initial_setup_admission() -> Result<Option<InitialSetupAdmission>, String> {
+    admission_at(&state_root()?)
+}
+
+fn admission_at(root: &Path) -> Result<Option<InitialSetupAdmission>, String> {
+    if stopped_at(root)?.is_some() {
+        return Ok(None);
+    }
+    let Records {
+        plan: Some((plan, true)),
+        progress: Some(progress),
+        decision: Decision::Pending | Decision::Applied(true),
+    } = observation_at(root)
+        .map_err(|error| error.to_string())?
+        .records
+    else {
+        return Ok(None);
+    };
+    Ok(
+        (progress.admitted && progress.belongs_to(&plan)).then_some(InitialSetupAdmission {
+            plan,
+            revision: progress.revision,
+            completed: progress.completed,
+        }),
+    )
 }
 
 /// One observation of the saved plan, its progress and the permission decision.
@@ -434,6 +677,8 @@ pub struct InitialSetupSnapshot {
     /// Whether existing native permission guidance may run. Errors or absent
     /// authorization must be treated as false by callers.
     pub permissions_allowed: bool,
+    /// Identity of the same coherent records used for these rows and policy.
+    pub observation: InitialSetupObservation,
 }
 
 /// A concurrent progress publication is expected; a record read failure is not.
@@ -454,6 +699,82 @@ impl std::fmt::Display for InitialSetupSnapshotError {
 
 impl std::error::Error for InitialSetupSnapshotError {}
 
+/// Observe only existing setup records. This neither authorizes work nor
+/// waits behind a profile pass; callers must discard results on read failure.
+pub fn initial_setup_observation() -> Result<InitialSetupObservation, InitialSetupSnapshotError> {
+    observation_at(&state_root().map_err(InitialSetupSnapshotError::Read)?)
+}
+
+/// Injected state root for composition tests; never inspects the live machine.
+#[cfg(any(test, debug_assertions))]
+pub fn initial_setup_observation_at(
+    root: &Path,
+) -> Result<InitialSetupObservation, InitialSetupSnapshotError> {
+    observation_at(root)
+}
+
+pub(super) fn observation_at(
+    root: &Path,
+) -> Result<InitialSetupObservation, InitialSetupSnapshotError> {
+    observation::at(root)
+}
+
+pub(super) fn observe_person_mutation<T>(
+    busy: Result<T, String>,
+    operation: impl FnOnce(&Path) -> Result<T, String>,
+) -> InitialSetupObserved<T> {
+    let root = state_root();
+    let before = root
+        .as_ref()
+        .ok()
+        .and_then(|root| observation_at(root).ok());
+    if let Err(why) = ensure_person_scope() {
+        return InitialSetupObserved::new(Err(why), before);
+    }
+    let root = match root {
+        Ok(root) => root,
+        Err(why) => return InitialSetupObserved::new(Err(why), before),
+    };
+    observe_mutation_at(&root, before, busy, operation)
+}
+
+pub(super) fn observe_mutation_at<T>(
+    root: &Path,
+    before: Option<InitialSetupObservation>,
+    busy: Result<T, String>,
+    operation: impl FnOnce(&Path) -> Result<T, String>,
+) -> InitialSetupObserved<T> {
+    let _lock = match HeldLock::try_take(root) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => return InitialSetupObserved::new(busy, before),
+        Err(why) => return InitialSetupObserved::new(Err(why), before),
+    };
+    let result = operation(root);
+    // Capture errors too: Restore may have durably stopped the run before a
+    // later recovery failure. The writer lock still excludes a newer choice.
+    InitialSetupObserved::new(result, observation_at(root).ok())
+}
+
+pub(super) fn observe_read_only<T>(
+    root: Result<PathBuf, String>,
+    operation: impl FnOnce(&Path) -> Result<T, String>,
+) -> InitialSetupObserved<T> {
+    let root = match root {
+        Ok(root) => root,
+        Err(why) => return InitialSetupObserved::new(Err(why), None),
+    };
+    let before = observation_at(&root).ok();
+    let idle_before = HeldLock::profile_active(&root).is_ok_and(|active| !active);
+    let result = operation(&root);
+    let after = observation_at(&root).ok();
+    let idle_after = HeldLock::profile_active(&root).is_ok_and(|active| !active);
+    // Restore publishes its stop before its effects. Matching records alone
+    // cannot certify a Check that overlaps that already-running writer.
+    let observation =
+        before.filter(|before| idle_before && idle_after && Some(before) == after.as_ref());
+    InitialSetupObserved::new(result, observation)
+}
+
 /// Read only aterm's records/configuration, without probing OS grants, accounts
 /// or preferences. Concurrent record changes are refused for the caller to retry;
 /// this never waits for a long-running profile pass to release its lock.
@@ -461,6 +782,15 @@ pub fn initial_setup_snapshot() -> Result<InitialSetupSnapshot, InitialSetupSnap
     let root = state_root().map_err(InitialSetupSnapshotError::Read)?;
     let fallback = automatic_plan().map_err(InitialSetupSnapshotError::Read)?;
     snapshot_at(&root, fallback)
+}
+
+/// Injected record root and fallback plan for composition tests.
+#[cfg(any(test, debug_assertions))]
+pub fn initial_setup_snapshot_at(
+    root: &Path,
+    fallback: Plan,
+) -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
+    snapshot_at(root, fallback)
 }
 
 /// The saved plan and recorded stage progress for System State. The boolean
@@ -523,17 +853,37 @@ fn snapshot_at(
     root: &Path,
     fallback: Plan,
 ) -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
-    snapshot_with(fallback, || Records::read(root))
+    let observation = observation_at(root)?;
+    let active = HeldLock::profile_active(root).map_err(InitialSetupSnapshotError::Read)?;
+    Ok(snapshot_from_observation(fallback, active, observation))
 }
 
+#[cfg(test)]
 fn snapshot_with(
     fallback: Plan,
+    activity: impl FnOnce() -> Result<bool, String>,
     mut read: impl FnMut() -> Result<Records, String>,
 ) -> Result<InitialSetupSnapshot, InitialSetupSnapshotError> {
     let records = read().map_err(InitialSetupSnapshotError::Read)?;
     if records != read().map_err(InitialSetupSnapshotError::Read)? {
         return Err(InitialSetupSnapshotError::Updating);
     }
+    // This is a current liveness sample, not an execution lease. No shared
+    // observation lock spans the record durability reads or the UI's work.
+    let active = activity().map_err(InitialSetupSnapshotError::Read)?;
+    Ok(snapshot_from_observation(
+        fallback,
+        active,
+        observation::from_records(records),
+    ))
+}
+
+fn snapshot_from_observation(
+    fallback: Plan,
+    active: bool,
+    observation: InitialSetupObservation,
+) -> InitialSetupSnapshot {
+    let records = &observation.records;
     let plan = records
         .plan
         .as_ref()
@@ -574,6 +924,9 @@ fn snapshot_with(
             // Restore stops convergence before any preference writes. Its marker
             // therefore cannot certify either the profile or successful restoration.
             let restoring = stopped == Some(Stop::Restored) && *stage == Stage::Workstation;
+            let recorded_running =
+                progress.is_some_and(|progress| progress.running == Some(*stage));
+            let interrupted = !finished && !completed && recorded_running && !active;
             Row {
                 name: stage.name().into(),
                 status: if restoring {
@@ -582,7 +935,7 @@ fn snapshot_with(
                     "applied"
                 } else if finished {
                     "stopped"
-                } else if progress.is_some_and(|progress| progress.running == Some(*stage)) {
+                } else if recorded_running && active {
                     "running"
                 } else {
                     "pending"
@@ -592,19 +945,22 @@ fn snapshot_with(
                     "Restore requested; see results.".into()
                 } else if finished && !completed {
                     "Not applied by this run.".into()
+                } else if interrupted {
+                    "Not running; Apply to retry.".into()
                 } else {
                     String::new()
                 },
             }
         })
         .collect();
-    Ok(InitialSetupSnapshot {
+    InitialSetupSnapshot {
         plan,
         finished,
         rows,
         revision: progress.map_or(0, |progress| progress.revision),
         permissions_allowed,
-    })
+        observation,
+    }
 }
 
 #[cfg(test)]
@@ -633,7 +989,11 @@ fn resume_vault(
     use aterm_secrets::client::Membership;
     !password_supplied
         && status.config.as_ref().is_some_and(|config| {
-            &config.source == source && aterm_secrets::client::pin_admitted(config, requested_pin)
+            &config.source == source
+                && aterm_secrets::client::pin_admitted(config, requested_pin)
+                // Signed vault sync needs the key that owns the pending proof
+                // or locker. Join recreates a missing key before enrollment.
+                && (config.signer.is_none() || status.machine.is_some())
         })
         && matches!(
             status.membership,
@@ -762,7 +1122,9 @@ impl InitialHost for LiveInitial {
                         source: plan.vault_url.clone(),
                         host: None,
                         interactive: false,
-                        wait: std::time::Duration::ZERO,
+                        // An open vault, or one whose password this Apply carries, lets
+                        // the Mac in within seconds: wait for it, so one Apply ends synced.
+                        wait: APPROVAL_WAIT,
                         confirm: &|_| false,
                         password: &|| password.cloned(),
                         requested: &requested,
@@ -817,17 +1179,20 @@ impl InitialHost for LiveInitial {
                 "Secrets vault",
                 false,
                 format!(
-                    "waiting for vault approval for {host}, code {code}; subscriber will retry"
+                    "waiting for the vault to approve this Mac ({host}, code {code}); it joins by itself once approved"
                 ),
             )]),
             (_, Membership::Pending) => Ok(vec![readiness_row(
                 "Secrets vault",
                 false,
                 match status.machine {
-                    Some((_, code)) => {
-                        format!("waiting for vault approval, code {code}; subscriber will retry")
+                    Some((_, code)) => format!(
+                        "waiting for the vault to approve this Mac (code {code}); it joins by itself once approved"
+                    ),
+                    None => {
+                        "waiting for the vault to approve this Mac; it joins by itself once approved"
+                            .into()
                     }
-                    None => "waiting for vault approval; subscriber will retry".into(),
                 },
             )]),
             _ => Ok(vec![readiness_row(
@@ -852,6 +1217,12 @@ impl InitialHost for LiveInitial {
         .map(item_rows)
     }
 }
+
+/// How long the setup's join waits for the vault to let this Mac in. An admin Mac's
+/// subscriber reads the join queue every 2 s, so an open vault, or a request that proves the
+/// join password, is approved and synced well within it; past it the row says the Mac waits,
+/// and the subscriber finishes the join once approved.
+const APPROVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn readiness_row(name: &str, ready: bool, detail: String) -> Row {
     Row {
@@ -978,16 +1349,38 @@ fn execute_initial(
 /// Apply independently selected setup stages after authorization. Pending
 /// enrollment, permissions and offline services remain retryable. This never
 /// reads a terminal or stores the optional join password.
-pub fn apply_initial_setup(password: Option<&SecretBytes>) -> Result<Option<Report>, String> {
+pub fn apply_initial_setup(
+    expected_revision: u64,
+    password: Option<&SecretBytes>,
+) -> Result<Option<Report>, String> {
+    apply_initial_setup_observed(expected_revision, password).result
+}
+
+/// Apply with an observation captured under the existing profile lock.
+pub fn apply_initial_setup_observed(
+    expected_revision: u64,
+    password: Option<&SecretBytes>,
+) -> InitialSetupObserved<Option<Report>> {
     if aterm_types::dirs::runs_under_private_state_root() {
+        return InitialSetupObserved::new(Ok(None), None);
+    }
+    observe_person_mutation(Ok(None), |root| {
+        execute_initial_for_revision(&mut LiveInitial, root, expected_revision, password)
+    })
+}
+
+fn execute_initial_for_revision(
+    host: &mut dyn InitialHost,
+    root: &Path,
+    expected_revision: u64,
+    password: Option<&SecretBytes>,
+) -> Result<Option<Report>, String> {
+    // The caller holds profile.lock: a legacy doctor Apply can revive a stopped
+    // run without taking automatic.lock after a scheduler's earlier revision read.
+    if revision_at(root)? != expected_revision {
         return Ok(None);
     }
-    ensure_person_scope()?;
-    let root = state_root()?;
-    let Some(_lock) = HeldLock::try_take(&root)? else {
-        return Ok(None);
-    };
-    execute_initial(&mut LiveInitial, &root, password)
+    execute_initial(host, root, password)
 }
 
 #[cfg(test)]
@@ -1084,6 +1477,878 @@ mod tests {
             selection.set(*setting, true);
         }
         Plan::from(selection)
+    }
+
+    #[test]
+    fn an_old_startup_offer_cannot_replace_a_newer_pending_doctor_plan() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let offered = Plan::default();
+        let baseline = observation_at(root.path()).unwrap();
+        let mut authorization = InitialSetupAuthorization::capture_at(root.path()).unwrap();
+        assert_eq!(revision_at(root.path()).unwrap(), 0);
+        // Restore stops first even when recovery preflight fails. Doctor Apply
+        // then revives only its eight groups before hitting the same bad backup.
+        std::fs::write(
+            root.path().join("original-preferences.json"),
+            b"invalid backup",
+        )
+        .unwrap();
+        assert!(super::super::tests::restore_without_effects(root.path()).is_err());
+        save_explicit_workstation_plan(root.path()).unwrap();
+        let doctor_plan = saved_plan(root.path()).unwrap().unwrap();
+        assert_eq!(doctor_plan.selection, Selection::all().workstation());
+        assert_eq!(revision_at(root.path()).unwrap(), 1);
+        assert!(!finished_at(root.path()).unwrap());
+        let before = observation_at(root.path()).unwrap();
+        assert_ne!(before, baseline);
+
+        // The intervening stop is already gone when the old window's untouched
+        // timer returns Begin. Its captured publications must still fence it.
+        let accepted = authorization
+            .persist_at(root.path(), &offered)
+            .result
+            .unwrap();
+        let mut old_worker = Fake {
+            failure: Some(Stage::Workstation),
+            ..Fake::default()
+        };
+        if let Some(revision) = accepted {
+            execute_initial_for_revision(&mut old_worker, root.path(), revision, None).unwrap();
+        }
+        assert!(
+            old_worker.calls.is_empty(),
+            "a stale offer ran stages from its older plan"
+        );
+        assert_eq!(accepted, None);
+        assert_eq!(revision_at(root.path()).unwrap(), 1);
+        assert_eq!(saved_plan(root.path()).unwrap(), Some(doctor_plan));
+        assert_eq!(observation_at(root.path()).unwrap(), before);
+    }
+
+    fn restart_attempt(
+        attempt: &mut InitialSetupRestart,
+        root: &Path,
+        plan: &Plan,
+        commit: impl FnOnce(&Path, Progress) -> Result<(), String>,
+        observe: impl FnOnce(&Path) -> Result<InitialSetupObservation, String>,
+    ) -> InitialSetupObserved<Option<u64>> {
+        observe_mutation_at(
+            root,
+            observation_at(root).ok(),
+            Err("busy".into()),
+            |root| {
+                assert!(HeldLock::try_take(root)?.is_none());
+                attempt.persist_with(root, plan, commit, observe)
+            },
+        )
+    }
+
+    fn observe_restart(root: &Path) -> Result<InitialSetupObservation, String> {
+        observation_at(root).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn restart_final_save_recovers_before_or_after_publication_without_a_new_revision() {
+        for empty in [false, true] {
+            for published in [false, true] {
+                let root = aterm_tempfile::tempdir().unwrap();
+                let plan = selected(if empty { &[] } else { &[Setting::Secrets] });
+                let original = authorize_at(root.path(), &plan).unwrap().unwrap();
+                let mut attempt = InitialSetupRestart::default();
+                let failed = restart_attempt(
+                    &mut attempt,
+                    root.path(),
+                    &plan,
+                    |root, next| {
+                        if published {
+                            save_progress(root, next)?;
+                        }
+                        Err("injected final namespace flush failure".into())
+                    },
+                    observe_restart,
+                );
+                assert!(failed.result.is_err());
+                assert!(attempt.pending());
+                let staged = progress(root.path()).unwrap().unwrap();
+                assert_eq!(staged.revision, original + 1);
+                assert_eq!(staged.admitted, published);
+                let before = observation_at(root.path()).unwrap();
+                let commits = std::cell::Cell::new(0);
+                let recovered = restart_attempt(
+                    &mut attempt,
+                    root.path(),
+                    &plan,
+                    |root, next| {
+                        commits.set(commits.get() + 1);
+                        save_progress(root, next)
+                    },
+                    observe_restart,
+                );
+                assert_eq!(recovered.result.unwrap(), Some(staged.revision));
+                assert!(!attempt.pending());
+                assert_eq!(commits.get(), usize::from(!published));
+                assert_eq!(revision_at(root.path()).unwrap(), staged.revision);
+                assert_eq!(saved_plan(root.path()).unwrap(), Some(plan));
+                if published {
+                    assert_eq!(observation_at(root.path()).unwrap(), before);
+                }
+                let password = SecretBytes::from(b"test-only-retained-password".as_slice());
+                let mut host = Fake::default();
+                execute_initial_for_revision(
+                    &mut host,
+                    root.path(),
+                    staged.revision,
+                    Some(&password),
+                )
+                .unwrap();
+                assert_eq!(
+                    host.calls,
+                    if empty {
+                        Vec::new()
+                    } else {
+                        vec![Stage::Secrets]
+                    }
+                );
+                assert_eq!(host.password_seen, !empty);
+                assert!(finished_at(root.path()).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_restart_commit_and_confirmation_errors_retain_the_owned_publications() {
+        for published in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let plan = selected(&[Setting::Secrets]);
+            let mut attempt = InitialSetupRestart::default();
+            assert!(
+                restart_attempt(
+                    &mut attempt,
+                    root.path(),
+                    &plan,
+                    |root, next| {
+                        if published {
+                            save_progress(root, next)?;
+                        }
+                        Err("injected final flush failure".into())
+                    },
+                    observe_restart,
+                )
+                .result
+                .is_err()
+            );
+            let owned = observation_at(root.path()).unwrap();
+            for _ in 0..2 {
+                let failed = restart_attempt(
+                    &mut attempt,
+                    root.path(),
+                    &plan,
+                    |_, _| Err("injected repeated final flush failure".into()),
+                    |root| {
+                        if published {
+                            Err("injected confirmation directory flush failure".into())
+                        } else {
+                            observe_restart(root)
+                        }
+                    },
+                );
+                assert!(failed.result.is_err());
+                assert!(attempt.pending());
+                assert_eq!(observation_at(root.path()).unwrap(), owned);
+            }
+            let recovered = restart_attempt(
+                &mut attempt,
+                root.path(),
+                &plan,
+                save_progress,
+                observe_restart,
+            );
+            assert_eq!(recovered.result.unwrap(), Some(1));
+            assert!(!attempt.pending());
+            assert_eq!(revision_at(root.path()).unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn restart_prefinal_failures_never_confirm_an_older_same_plan_admission() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Secrets]);
+        authorize_at(root.path(), &plan).unwrap();
+        let mut prior = progress(root.path()).unwrap().unwrap();
+        prior.revision = u64::MAX;
+        save_progress(root.path(), prior).unwrap();
+        let before = observation_at(root.path()).unwrap();
+        let mut attempt = InitialSetupRestart::default();
+        let failed = restart_attempt(
+            &mut attempt,
+            root.path(),
+            &plan,
+            |_, _| panic!("a preflight failure cannot reach final admission"),
+            observe_restart,
+        );
+        assert!(failed.result.is_err());
+        assert!(!attempt.pending());
+        assert_eq!(observation_at(root.path()).unwrap(), before);
+        assert_eq!(
+            admission_at(root.path()).unwrap().unwrap().revision,
+            u64::MAX
+        );
+        assert_eq!(
+            restart_attempt(
+                &mut attempt,
+                root.path(),
+                &plan,
+                save_progress,
+                observe_restart
+            )
+            .result
+            .unwrap(),
+            None
+        );
+        assert_eq!(observation_at(root.path()).unwrap(), before);
+
+        let staged = aterm_tempfile::tempdir().unwrap();
+        let mut attempt = InitialSetupRestart::default();
+        assert!(
+            restart_attempt(
+                &mut attempt,
+                staged.path(),
+                &plan,
+                |_, _| panic!("an unconfirmed staged run cannot reach final admission"),
+                |_| Err("injected staged observation failure".into()),
+            )
+            .result
+            .is_err()
+        );
+        assert!(!attempt.pending());
+        assert!(admission_at(staged.path()).unwrap().is_none());
+        let mut host = Fake::default();
+        assert!(
+            execute_initial(&mut host, staged.path(), None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(host.calls.is_empty());
+    }
+
+    #[test]
+    fn restart_recovery_retires_after_a_stop_new_run_or_same_content_publication() {
+        for replacement in 0..5 {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let plan = selected(&[Setting::Secrets]);
+            let mut attempt = InitialSetupRestart::default();
+            assert!(
+                restart_attempt(
+                    &mut attempt,
+                    root.path(),
+                    &plan,
+                    |root, next| {
+                        save_progress(root, next)?;
+                        Err("injected published admission failure".into())
+                    },
+                    observe_restart,
+                )
+                .result
+                .is_err()
+            );
+            {
+                let _writer = HeldLock::take(root.path()).unwrap();
+                match replacement {
+                    0 | 1 => {
+                        write_json(
+                            &root.path().join("first-run.json"),
+                            &json!({"profile":PROFILE,"state":if replacement == 0 {"cancelled"} else {"restored"}}),
+                        ).unwrap();
+                        let progress = root.path().join("initial-setup.json");
+                        std::fs::remove_file(&progress).unwrap();
+                        std::fs::create_dir(progress).unwrap();
+                    }
+                    2 => {
+                        restart_at(root.path(), &plan).unwrap();
+                    }
+                    3 => {
+                        save_progress(root.path(), progress(root.path()).unwrap().unwrap())
+                            .unwrap();
+                    }
+                    _ => {
+                        aterm_machines::port::write_atomic(
+                            &root.path().join("first-run.json"),
+                            b"invalid decision",
+                            0o600,
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+            let before = observation_at(root.path()).ok();
+            let progress_bytes = std::fs::read(root.path().join("initial-setup.json")).ok();
+            let decision_bytes = std::fs::read(root.path().join("first-run.json")).unwrap();
+            let recovered = restart_attempt(
+                &mut attempt,
+                root.path(),
+                &plan,
+                |_, _| panic!("supersession cannot write the old admission"),
+                observe_restart,
+            );
+            assert_eq!(recovered.result.unwrap(), None);
+            assert!(!attempt.pending());
+            assert_eq!(observation_at(root.path()).ok(), before);
+            assert_eq!(
+                std::fs::read(root.path().join("initial-setup.json")).ok(),
+                progress_bytes
+            );
+            if replacement <= 1 {
+                assert!(root.path().join("initial-setup.json").is_dir());
+            }
+            assert_eq!(
+                std::fs::read(root.path().join("first-run.json")).unwrap(),
+                decision_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn failed_restart_publication_capture_cannot_bind_a_later_readable_record() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Secrets]);
+        let mut attempt = InitialSetupRestart::default();
+        let final_progress = std::cell::Cell::new(None);
+        assert!(
+            restart_attempt(
+                &mut attempt,
+                root.path(),
+                &plan,
+                |root, next| {
+                    final_progress.set(Some(next));
+                    let path = root.join("initial-setup.json");
+                    std::fs::remove_file(&path).unwrap();
+                    std::fs::create_dir(path).unwrap();
+                    Err("injected inaccessible publication".into())
+                },
+                observe_restart,
+            )
+            .result
+            .is_err()
+        );
+        assert!(!attempt.pending());
+        std::fs::remove_dir(root.path().join("initial-setup.json")).unwrap();
+        save_progress(root.path(), final_progress.get().unwrap()).unwrap();
+        let before = observation_at(root.path()).unwrap();
+        let retired = restart_attempt(
+            &mut attempt,
+            root.path(),
+            &plan,
+            |_, _| panic!("an unbound failure cannot adopt a later publication"),
+            observe_restart,
+        );
+        assert_eq!(retired.result.unwrap(), None);
+        assert_eq!(observation_at(root.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn admitted_run_observation_preserves_the_source_revision_and_stage_history() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut plan = selected(&[Setting::Widgets, Setting::Secrets, Setting::Repositories]);
+        plan.vault_url = "https://vault.example/v1/team".into();
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let mut saved = progress(root.path()).unwrap().unwrap();
+        saved.done = Stage::Workstation.bit();
+        saved.running = Some(Stage::Secrets);
+        save_progress(root.path(), saved).unwrap();
+        let before = observation_at(root.path()).unwrap();
+
+        assert_eq!(
+            admission_at(root.path()).unwrap(),
+            Some(InitialSetupAdmission {
+                plan: plan.clone(),
+                revision,
+                completed: false,
+            })
+        );
+        assert_eq!(observation_at(root.path()).unwrap(), before);
+        assert_eq!(progress(root.path()).unwrap(), Some(saved));
+        assert!(!root.path().join("profile.lock").exists());
+
+        saved.done |= Stage::Secrets.bit() | Stage::Repositories.bit();
+        saved.running = None;
+        saved.completed = true;
+        save_progress(root.path(), saved).unwrap();
+        assert_eq!(
+            admission_at(root.path()).unwrap(),
+            Some(InitialSetupAdmission {
+                plan,
+                revision,
+                completed: true,
+            })
+        );
+    }
+
+    #[test]
+    fn staged_mismatched_legacy_and_missing_choices_are_not_admitted_runs() {
+        let absent = aterm_tempfile::tempdir().unwrap();
+        let missing_root = absent.path().join("not-created");
+        assert_eq!(admission_at(&missing_root).unwrap(), None);
+        assert!(!missing_root.exists());
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Secrets]);
+        authorize_at(root.path(), &plan).unwrap();
+        let saved = progress(root.path()).unwrap().unwrap();
+        save_progress(
+            root.path(),
+            Progress {
+                admitted: false,
+                ..saved
+            },
+        )
+        .unwrap();
+        assert_eq!(admission_at(root.path()).unwrap(), None);
+
+        save_progress(root.path(), saved).unwrap();
+        let mut replacement = plan.clone();
+        replacement.vault_url = "https://vault.example/v1/other".into();
+        save_plan(root.path(), &replacement).unwrap();
+        assert_eq!(admission_at(root.path()).unwrap(), None);
+
+        save_automatic_plan(root.path(), plan.selection).unwrap();
+        assert_eq!(admission_at(root.path()).unwrap(), None);
+        save_plan(root.path(), &plan).unwrap();
+        for decision in [Decision::Missing, Decision::Applied(false)] {
+            let path = root.path().join("first-run.json");
+            if decision == Decision::Missing {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                write_json(
+                    &path,
+                    &json!({"profile":PROFILE,"state":"applied","accounts_verified":false}),
+                )
+                .unwrap();
+            }
+            assert_eq!(admission_at(root.path()).unwrap(), None);
+        }
+        save_workstation_authorization(root.path(), &plan).unwrap();
+        for record in ["automatic-plan.json", "initial-setup.json"] {
+            let path = root.path().join(record);
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(admission_at(root.path()).unwrap(), None);
+            std::fs::write(path, bytes).unwrap();
+        }
+        assert!(admission_at(root.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_empty_admission_published_before_an_error_can_be_confirmed_without_rewriting_it() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let empty = selected(&[]);
+        assert!(
+            authorize_with(root.path(), &empty, |root, progress| {
+                save_progress(root, progress)?;
+                Err("injected failure after publishing the final admission".into())
+            })
+            .is_err()
+        );
+        let before = observation_at(root.path()).unwrap();
+        let admitted = admission_at(root.path()).unwrap().unwrap();
+        assert_eq!(admitted.plan, empty);
+        assert!(admitted.completed);
+        assert_eq!(admitted.revision, revision_at(root.path()).unwrap());
+        assert_eq!(observation_at(root.path()).unwrap(), before);
+        let mut host = Fake::default();
+        assert!(
+            execute_initial(&mut host, root.path(), None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(host.calls.is_empty());
+
+        for state in ["cancelled", "restored"] {
+            write_json(
+                &root.path().join("first-run.json"),
+                &json!({"profile":PROFILE,"state":state}),
+            )
+            .unwrap();
+            assert_eq!(admission_at(root.path()).unwrap(), None);
+        }
+        let next_plan = selected(&[Setting::Secrets]);
+        let next_revision = restart_at(root.path(), &next_plan).unwrap();
+        assert_eq!(
+            admission_at(root.path()).unwrap(),
+            Some(InitialSetupAdmission {
+                plan: next_plan,
+                revision: next_revision,
+                completed: false,
+            })
+        );
+        assert_ne!(next_revision, admitted.revision);
+
+        let unpublished = aterm_tempfile::tempdir().unwrap();
+        assert!(
+            authorize_with(unpublished.path(), &empty, |_, _| {
+                Err("injected failure before publishing the final admission".into())
+            })
+            .is_err()
+        );
+        assert_eq!(admission_at(unpublished.path()).unwrap(), None);
+        assert!(!finished_at(unpublished.path()).unwrap());
+    }
+
+    #[test]
+    fn unreadable_admission_records_return_errors_instead_of_absence() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(root.path(), &selected(&[Setting::Secrets])).unwrap();
+        for record in [
+            "automatic-plan.json",
+            "initial-setup.json",
+            "first-run.json",
+        ] {
+            let path = root.path().join(record);
+            let bytes = std::fs::read(&path).unwrap();
+            std::fs::write(&path, b"invalid setup record").unwrap();
+            assert!(admission_at(root.path()).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), b"invalid setup record");
+            std::fs::write(path, bytes).unwrap();
+        }
+        assert!(admission_at(root.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_durable_stop_ends_admission_even_when_plan_or_progress_is_unreadable() {
+        for record in ["automatic-plan.json", "initial-setup.json"] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            authorize_at(root.path(), &selected(&[Setting::Secrets])).unwrap();
+            let path = root.path().join(record);
+            std::fs::write(&path, b"invalid setup record").unwrap();
+            assert!(admission_at(root.path()).is_err());
+            for state in ["cancelled", "restored"] {
+                write_json(
+                    &root.path().join("first-run.json"),
+                    &json!({"profile":PROFILE,"state":state}),
+                )
+                .unwrap();
+                assert!(finished_at(root.path()).unwrap());
+                assert_eq!(admission_at(root.path()).unwrap(), None);
+                assert_eq!(std::fs::read(&path).unwrap(), b"invalid setup record");
+            }
+            write_json(
+                &root.path().join("first-run.json"),
+                &json!({"profile":PROFILE,"state":"pending"}),
+            )
+            .unwrap();
+            assert!(admission_at(root.path()).is_err());
+        }
+    }
+
+    #[test]
+    fn observations_are_read_only_and_unchanged_records_remain_equal() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let absent = observation_at(root.path()).unwrap();
+        assert_eq!(observation_at(root.path()).unwrap(), absent);
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+        authorize_at(root.path(), &selected(&[Setting::Secrets])).unwrap();
+        let current = observation_at(root.path()).unwrap();
+        assert_ne!(current, absent);
+        assert_eq!(current.clone(), observation_at(root.path()).unwrap());
+        assert_eq!(
+            snapshot_at(root.path(), Plan::default())
+                .unwrap()
+                .observation,
+            current
+        );
+    }
+
+    #[test]
+    fn observed_read_only_pass_expires_across_a_pending_stage_aba() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(root.path(), &selected(&[Setting::Secrets])).unwrap();
+        let original = Records::read(root.path()).unwrap();
+        let before = observation_at(root.path()).unwrap();
+        let stable = observe_read_only(Ok(root.path().into()), |_| Ok(7));
+        assert_eq!(stable.result.unwrap(), 7);
+        assert_eq!(stable.observation, Some(before.clone()));
+
+        let changed = observe_read_only(Ok(root.path().into()), |root| {
+            let _writer = HeldLock::take(root)?;
+            let mut host = Fake {
+                pending: Some(Stage::Secrets),
+                ..Fake::default()
+            };
+            let report = execute_initial(&mut host, root, None)?.unwrap();
+            assert!(report.needs_attention());
+            assert_eq!(host.calls, [Stage::Secrets]);
+            Ok(7)
+        });
+        assert_eq!(changed.result.unwrap(), 7);
+        assert!(changed.observation.is_none());
+        assert_eq!(Records::read(root.path()).unwrap(), original);
+        assert_ne!(observation_at(root.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn observed_check_cannot_bind_during_a_profile_pass_with_unchanged_records() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(root.path(), &selected(&[Setting::Secrets])).unwrap();
+        let context = observation_at(root.path()).unwrap();
+        let writer = HeldLock::take(root.path()).unwrap();
+        let observed = observe_read_only(Ok(root.path().into()), |_| Ok(7));
+        assert_eq!(observed.result.unwrap(), 7);
+        assert!(observed.observation.is_none());
+        assert_eq!(observation_at(root.path()).unwrap(), context);
+        drop(writer);
+        let observed = observe_read_only(Ok(root.path().into()), |_| Ok(7));
+        assert_eq!(observed.result.unwrap(), 7);
+        assert_eq!(observed.observation, Some(context));
+    }
+
+    #[test]
+    fn observed_restore_error_is_bound_under_lock_and_expires_after_a_new_run() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Widgets, Setting::Secrets]);
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let before = observation_at(root.path()).unwrap();
+        let cancelled =
+            InitialSetupCancellation::default().persist_observed_at(root.path(), Some(before));
+        assert!(cancelled.result.unwrap());
+        let cancelled = cancelled.observation.unwrap();
+        assert_eq!(revision_at(root.path()).unwrap(), revision);
+        std::fs::write(
+            root.path().join("original-preferences.json"),
+            b"invalid backup",
+        )
+        .unwrap();
+        let restored = observe_mutation_at(
+            root.path(),
+            Some(cancelled.clone()),
+            Err("busy".into()),
+            |root| {
+                assert!(HeldLock::try_take(root)?.is_none());
+                super::super::tests::restore_without_effects(root)
+            },
+        );
+        assert!(restored.result.is_err());
+        let restored = restored.observation.unwrap();
+        assert_ne!(restored, cancelled);
+        assert_eq!(revision_at(root.path()).unwrap(), revision);
+        let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
+        assert!(snapshot.finished);
+        assert_eq!(snapshot.observation, restored);
+
+        // Publication can be delayed until after another process accepts Apply.
+        // The old failure must retain its original context rather than borrow it.
+        restart_at(root.path(), &plan).unwrap();
+        assert_ne!(observation_at(root.path()).unwrap(), restored);
+    }
+
+    #[test]
+    fn observed_busy_failure_keeps_only_its_pre_attempt_context() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Secrets]);
+        authorize_at(root.path(), &plan).unwrap();
+        let before = observation_at(root.path()).unwrap();
+        let writer = HeldLock::take(root.path()).unwrap();
+        let refused: InitialSetupObserved<()> = observe_mutation_at(
+            root.path(),
+            Some(before.clone()),
+            Err("busy".into()),
+            |_| panic!("a busy profile must not run the operation"),
+        );
+        assert!(refused.result.is_err());
+        assert_eq!(refused.observation, Some(before));
+        drop(writer);
+        restart_at(root.path(), &plan).unwrap();
+        assert_ne!(
+            refused.observation,
+            Some(observation_at(root.path()).unwrap())
+        );
+    }
+
+    #[test]
+    fn observation_read_failures_never_relabel_an_operation_result() {
+        for directory in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let path = root.path().join("first-run.json");
+            if directory {
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                std::fs::write(&path, b"invalid decision").unwrap();
+            }
+            assert!(matches!(
+                observation_at(root.path()),
+                Err(InitialSetupSnapshotError::Read(_))
+            ));
+            let observed: InitialSetupObserved<()> =
+                observe_read_only(Ok(root.path().into()), |_| Err("original failure".into()));
+            assert_eq!(observed.result.unwrap_err(), "original failure");
+            assert!(observed.observation.is_none());
+        }
+    }
+
+    #[test]
+    fn a_saved_running_stage_needs_a_live_profile_pass() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Secrets]);
+        authorize_at(root.path(), &plan).unwrap();
+        let mut saved = progress(root.path()).unwrap().unwrap();
+        saved.running = Some(Stage::Secrets);
+        save_progress(root.path(), saved).unwrap();
+        {
+            let _active = HeldLock::take(root.path()).unwrap();
+            let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
+            assert_eq!(snapshot.rows[0].status, "running");
+        }
+        for missing_lock in [false, true] {
+            if missing_lock {
+                std::fs::remove_file(root.path().join("profile.lock")).unwrap();
+            }
+            let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
+            assert_eq!(
+                snapshot.rows[0].status, "pending",
+                "an ended worker cannot remain live after restart"
+            );
+            assert!(!snapshot.rows[0].detail.is_empty());
+            assert!(!snapshot.finished);
+            assert_eq!(snapshot.revision, saved.revision);
+            assert_eq!(progress(root.path()).unwrap().unwrap(), saved);
+            if missing_lock {
+                assert!(!root.path().join("profile.lock").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn a_snapshot_samples_profile_activity_after_its_record_reads() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Secrets]);
+        authorize_at(root.path(), &plan).unwrap();
+        let mut saved = progress(root.path()).unwrap().unwrap();
+        saved.running = Some(Stage::Secrets);
+        save_progress(root.path(), saved).unwrap();
+        let reads = std::cell::Cell::new(0);
+        let writer = std::cell::RefCell::new(None);
+        let snapshot = snapshot_with(
+            Plan::default(),
+            || {
+                assert_eq!(reads.get(), 2);
+                HeldLock::profile_active(root.path())
+            },
+            || {
+                let record = Records::read(root.path())?;
+                reads.set(reads.get() + 1);
+                if reads.get() == 2 {
+                    *writer.borrow_mut() = Some(HeldLock::take(root.path())?);
+                }
+                Ok(record)
+            },
+        )
+        .unwrap();
+        assert_eq!(snapshot.rows[0].status, "running");
+        drop(writer.into_inner());
+        assert!(!HeldLock::profile_active(root.path()).unwrap());
+        let _next_writer = HeldLock::take(root.path()).unwrap();
+    }
+
+    #[test]
+    fn stale_cancel_retry_cannot_stop_a_newer_pending_run() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Secrets]);
+        authorize_at(root.path(), &plan).unwrap();
+        let original = revision_at(root.path()).unwrap();
+        let mut cancel = InitialSetupCancellation::default();
+        // Another process is still applying this run when Cancel is chosen.
+        let active = HeldLock::take(root.path()).unwrap();
+        assert!(cancel.persist_at(root.path()).is_err());
+        drop(active);
+
+        // That process can accept a new Apply while the old Cancel retains
+        // only its own process's busy reservation during the retry backoff.
+        restart_at(root.path(), &plan).unwrap();
+        assert!(revision_at(root.path()).unwrap() > original);
+        assert!(!cancel.persist_at(root.path()).unwrap());
+        assert!(
+            !finished_at(root.path()).unwrap(),
+            "the old retry stopped the new run"
+        );
+    }
+
+    #[test]
+    fn explicit_mac_apply_retires_workers_when_it_revives_a_stopped_modern_run() {
+        for stop in ["cancelled", "restored"] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            let plan = selected(&[Setting::Secrets]);
+            authorize_at(root.path(), &plan).unwrap();
+            let original = revision_at(root.path()).unwrap();
+            write_json(
+                &root.path().join("first-run.json"),
+                &json!({"profile":PROFILE,"state":stop}),
+            )
+            .unwrap();
+            save_explicit_workstation_plan(root.path()).unwrap();
+            let current = revision_at(root.path()).unwrap();
+            assert!(
+                current > original,
+                "{stop}: explicit apply revived an older worker's password"
+            );
+            // The scheduler can have read the old revision immediately before
+            // this revival. Its actual effect boundary must check under lock.
+            let _profile = HeldLock::take(root.path()).unwrap();
+            let password = SecretBytes::from(b"test-only-old-run-password".as_slice());
+            let mut host = Fake::default();
+            assert!(
+                execute_initial_for_revision(&mut host, root.path(), original, Some(&password))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(host.calls.is_empty());
+            assert!(!host.password_seen);
+            execute_initial_for_revision(&mut host, root.path(), current, None).unwrap();
+            assert_eq!(host.calls, [Stage::Workstation, Stage::Secrets]);
+        }
+    }
+
+    #[test]
+    fn explicit_mac_apply_retires_legacy_run_zero_after_an_earlier_stop() {
+        for stop in ["cancelled", "restored"] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            assert_eq!(revision_at(root.path()).unwrap(), 0);
+            write_json(
+                &root.path().join("first-run.json"),
+                &json!({"profile":PROFILE,"state":stop}),
+            )
+            .unwrap();
+            save_explicit_workstation_plan(root.path()).unwrap();
+            assert_ne!(
+                revision_at(root.path()).unwrap(),
+                0,
+                "{stop}: legacy run zero survived"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_cancel_retries_the_same_run_and_accepts_its_already_finished_decision() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(root.path(), &selected(&[Setting::Secrets])).unwrap();
+        let mut cancel = InitialSetupCancellation::default();
+        let active = HeldLock::take(root.path()).unwrap();
+        assert!(cancel.persist_at(root.path()).is_err());
+        drop(active);
+        assert!(cancel.persist_at(root.path()).unwrap());
+        assert!(finished_at(root.path()).unwrap());
+        assert!(cancel.persist_at(root.path()).unwrap());
+    }
+
+    #[test]
+    fn explicit_workstation_completion_does_not_complete_independent_stages() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[Setting::Permissions, Setting::Secrets]);
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        save_explicit_workstation_plan(root.path()).unwrap();
+        complete_explicit_workstation_plan(root.path()).unwrap();
+        let current = progress(root.path()).unwrap().unwrap();
+        assert_eq!(current.revision, revision);
+        assert_eq!(current.done, Stage::Workstation.bit());
+        assert!(!current.completed);
+        assert!(!finished_at(root.path()).unwrap());
     }
 
     #[test]
@@ -1194,11 +2459,15 @@ mod tests {
         let after = Records::read(root.path()).unwrap();
         let mut reads = [before, after].into_iter();
         assert!(matches!(
-            snapshot_with(Plan::default(), || Ok(reads.next().unwrap())),
+            snapshot_with(Plan::default(), || Ok(false), || Ok(reads.next().unwrap())),
             Err(InitialSetupSnapshotError::Updating)
         ));
         assert!(matches!(
-            snapshot_with(Plan::default(), || Err("injected read failure".into())),
+            snapshot_with(
+                Plan::default(),
+                || Ok(false),
+                || Err("injected read failure".into())
+            ),
             Err(InitialSetupSnapshotError::Read(_))
         ));
         assert!(
@@ -1229,7 +2498,7 @@ mod tests {
             );
             assert!(host.calls.is_empty());
 
-            assert!(authorize_at(root.path(), &plan).unwrap());
+            assert!(authorize_at(root.path(), &plan).unwrap().is_some());
             let admitted = snapshot_at(root.path(), Plan::default()).unwrap();
             assert_eq!(
                 admitted.permissions_allowed,
@@ -1240,7 +2509,11 @@ mod tests {
             execute_initial(&mut host, root.path(), None).unwrap();
             let completed = snapshot_at(root.path(), Plan::default()).unwrap();
             assert!(completed.finished);
-            assert!(!authorize_at(root.path(), &Plan::default()).unwrap());
+            assert!(
+                authorize_at(root.path(), &Plan::default())
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(revision_at(root.path()).unwrap(), completed.revision);
         }
     }
@@ -1307,7 +2580,7 @@ mod tests {
                 .is_none()
         );
         assert!(host.calls.is_empty());
-        assert!(authorize_at(root.path(), &plan).unwrap());
+        assert!(authorize_at(root.path(), &plan).unwrap().is_some());
         execute_initial(&mut host, root.path(), None).unwrap();
         remove_admission();
         let completed = snapshot_at(root.path(), Plan::default()).unwrap();
@@ -1320,6 +2593,7 @@ mod tests {
         let root = aterm_tempfile::tempdir().unwrap();
         let plan = Plan::default();
         authorize_at(root.path(), &plan).unwrap();
+        let _profile = HeldLock::take(root.path()).unwrap();
         let password = SecretBytes::from(b"test-only-join-password".as_slice());
         let mut host = Fake {
             observe: Some(root.path().into()),
@@ -1553,6 +2827,85 @@ mod tests {
         );
     }
 
+    fn restore_preflight_failure_stops_every_stage(record: &str) {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let plan = selected(&[
+            Setting::Widgets,
+            Setting::Permissions,
+            Setting::Secrets,
+            Setting::Repositories,
+        ]);
+        let revision = authorize_at(root.path(), &plan).unwrap().unwrap();
+        let history = std::fs::read(root.path().join("initial-setup.json")).unwrap();
+        let invalid = root.path().join(record);
+        std::fs::write(&invalid, b"invalid recovery record").unwrap();
+        assert!(super::super::tests::restore_without_effects(root.path()).is_err());
+
+        // A fresh reader after process exit must retain the stop even though
+        // the recovery record prevented Restore from changing preferences.
+        let snapshot = snapshot_at(root.path(), Plan::default()).unwrap();
+        assert!(snapshot.finished, "Restore did not stop the durable run");
+        assert!(!snapshot.permissions_allowed);
+        assert_eq!(snapshot.plan, plan);
+        assert_eq!(snapshot.revision, revision);
+        assert!(snapshot.rows.iter().all(|row| row.status == "stopped"));
+        assert_eq!(
+            std::fs::read(root.path().join("initial-setup.json")).unwrap(),
+            history
+        );
+        assert_eq!(std::fs::read(&invalid).unwrap(), b"invalid recovery record");
+        let mut automatic = Fake::default();
+        assert!(
+            execute_initial(&mut automatic, root.path(), None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(automatic.calls.is_empty());
+        assert!(authorize_at(root.path(), &plan).unwrap().is_none());
+    }
+
+    #[test]
+    fn restore_stops_automatic_setup_before_reading_a_corrupt_backup() {
+        restore_preflight_failure_stops_every_stage("original-preferences.json");
+    }
+
+    #[test]
+    fn restore_stops_automatic_setup_before_reading_corrupt_activation() {
+        restore_preflight_failure_stops_every_stage("pending-refresh.json");
+    }
+
+    #[test]
+    fn restore_stop_write_failure_refuses_recovery_preflight_and_effects() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        authorize_at(
+            root.path(),
+            &selected(&[Setting::Widgets, Setting::Secrets]),
+        )
+        .unwrap();
+        let backup = root.path().join("original-preferences.json");
+        save_backup(
+            &backup,
+            &[Saved {
+                target: Target::new("com.apple.dock", "show-recents"),
+                value: Some(PValue::Bool(true)),
+            }],
+        )
+        .unwrap();
+        let before = std::fs::read(&backup).unwrap();
+        let decision = root.path().join("first-run.json");
+        std::fs::remove_file(&decision).unwrap();
+        std::fs::create_dir(&decision).unwrap();
+        assert!(super::super::tests::restore_without_effects(root.path()).is_err());
+        assert!(
+            !root.path().join("pending-refresh.json").exists(),
+            "a refused stop must precede recovery preparation"
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), before);
+        let mut automatic = Fake::default();
+        assert!(execute_initial(&mut automatic, root.path(), None).is_err());
+        assert!(automatic.calls.is_empty());
+    }
+
     #[test]
     fn cancel_keeps_applied_preferences_and_stops_only_unfinished_stages() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -1645,6 +2998,53 @@ mod tests {
     }
 
     #[test]
+    fn a_signed_vault_without_its_machine_identity_requires_join_before_sync() {
+        use aterm_secrets::client::{Config, Membership, Status};
+        use aterm_secrets::transport::Source;
+        let source = Source::Url("https://vault.example/v1/team".into());
+        let mut status = Status {
+            config: Some(Config {
+                source: source.clone(),
+                name: "team".into(),
+                signer: Some([7; 32]),
+                followed: Vec::new(),
+                host: "test-host".into(),
+            }),
+            machine: None,
+            membership: Membership::Pending,
+            names: Vec::new(),
+        };
+        assert!(!resume_vault(&status, &source, None, false));
+        status.membership = Membership::In { seq: 1, heard: 1 };
+        assert!(!resume_vault(&status, &source, None, false));
+
+        // A genuine identity retains its join proof when no replacement
+        // password was supplied; a new password still starts a fresh join.
+        status.machine = Some(vault_machine());
+        status.membership = Membership::Pending;
+        assert!(resume_vault(&status, &source, None, false));
+        assert!(!resume_vault(&status, &source, None, true));
+
+        // Plain local vaults intentionally have no machine key.
+        let plain = Source::Path(PathBuf::from("/test-vault/team.json"));
+        status.config = Some(Config {
+            source: plain.clone(),
+            name: "team".into(),
+            signer: None,
+            followed: Vec::new(),
+            host: "test-host".into(),
+        });
+        status.machine = None;
+        status.membership = Membership::Plain;
+        assert!(resume_vault(&status, &plain, None, false));
+    }
+
+    fn vault_machine() -> (aterm_secrets::age::Recipient, String) {
+        let recipient = aterm_secrets::age::Identity::from_secret_bytes([31; 32]).recipient();
+        (recipient, aterm_secrets::client::join_code(&recipient))
+    }
+
+    #[test]
     fn a_pending_vault_without_a_new_password_resumes_sync_instead_of_erasing_its_proof() {
         use aterm_secrets::client::{Config, Membership, Status};
         use aterm_secrets::transport::Source;
@@ -1657,7 +3057,7 @@ mod tests {
                 followed: Vec::new(),
                 host: "test-host".into(),
             }),
-            machine: None,
+            machine: Some(vault_machine()),
             membership: Membership::Pending,
             names: Vec::new(),
         };
@@ -1687,7 +3087,7 @@ mod tests {
                 followed: vec![original],
                 host: "test-host".into(),
             }),
-            machine: None,
+            machine: Some(vault_machine()),
             membership: Membership::Pending,
             names: Vec::new(),
         };
@@ -1711,7 +3111,7 @@ mod tests {
                 followed: Vec::new(),
                 host: "test-host".into(),
             }),
-            machine: None,
+            machine: Some(vault_machine()),
             membership: Membership::Pending,
             names: Vec::new(),
         };
@@ -1765,6 +3165,7 @@ mod tests {
             vault_url: "https://user:fixture-private@vault.example/v1/team".into(),
             ..Plan::default()
         };
+        assert!(validate_initial_setup_plan(&plan).is_err());
         let error = authorize_at(root.path(), &plan).unwrap_err();
         assert!(!error.contains("fixture-private"));
         assert!(!root.path().join("automatic-plan.json").exists());
@@ -1792,7 +3193,7 @@ mod tests {
         );
         assert!(host.calls.is_empty());
         assert!(!finished_at(root.path()).unwrap());
-        assert!(authorize_at(root.path(), &new).unwrap());
+        assert!(authorize_at(root.path(), &new).unwrap().is_some());
         execute_initial(&mut host, root.path(), None).unwrap();
         assert_eq!(host.calls, [Stage::Workstation, Stage::Secrets]);
         assert!(finished_at(root.path()).unwrap());

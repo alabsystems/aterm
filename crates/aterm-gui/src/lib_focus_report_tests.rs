@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use aterm_session::sink::SinkWriter;
 
@@ -38,6 +39,237 @@ fn drain(pipe: [i32; 2]) -> Vec<u8> {
 fn arm_focus_reporting(app: &App, session: u64) {
     let term = app.pool.get(session).expect("live session").term.clone();
     term_lock(&term).process(b"\x1b[?1004h");
+}
+
+/// `bytes` as program output of `session`, fed to its engine as its reader feeds a batch,
+/// before the reader's output wake.
+fn feed(app: &App, session: u64, bytes: &[u8]) {
+    let term = app.pool.get(session).expect("live session").term.clone();
+    term_lock(&term).process(bytes);
+}
+
+/// [`feed`], then the output wake the reader posts after the batch: the real
+/// `Wake::Output` arm, so whatever the bytes owe the program is paid.
+fn program_writes(app: &mut App, session: u64, bytes: &[u8]) {
+    feed(app, session, bytes);
+    app.on_output_wake(session, Instant::now());
+}
+
+/// A program born in a background tab that turns DEC 1004 on is told at once that it does
+/// not have the keyboard, once per enable: a re-sent `?1004h`, later output and a re-sync
+/// write nothing more, and the switch that brings its tab forward focuses it once.
+#[test]
+fn a_background_tab_that_enables_focus_reporting_is_told_it_is_unfocused() {
+    let (pipe_a, sink_a) = observer();
+    let (pipe_b, sink_b) = observer();
+    let mut app = App::headless_for_test_with_sink(sink_a);
+    let wid = WindowId(0);
+    app.push_stub_tab(wid, stub_session_with_sink(1, sink_b));
+    let _ = drain(pipe_a);
+    let _ = drain(pipe_b);
+    assert_eq!(
+        app.focus_reported,
+        Some(1),
+        "tab 1 is in front, tab 0 behind"
+    );
+
+    program_writes(&mut app, 0, b"\x1b[?1004h");
+    assert_eq!(
+        drain(pipe_a),
+        FOCUS_OUT.to_vec(),
+        "the background program learns it is not focused"
+    );
+    assert!(drain(pipe_b).is_empty(), "the front tab is not written");
+
+    program_writes(&mut app, 0, b"\x1b[?1004h");
+    program_writes(&mut app, 0, b"frame");
+    app.sync_window(wid);
+    assert!(
+        drain(pipe_a).is_empty(),
+        "an enable already answered, a re-sent enable and plain output owe nothing"
+    );
+
+    // Off and on again behind: a new enable, a new answer.
+    program_writes(&mut app, 0, b"\x1b[?1004l\x1b[?1004h");
+    assert_eq!(
+        drain(pipe_a),
+        FOCUS_OUT.to_vec(),
+        "the second enable is answered"
+    );
+
+    app.switch_tab_in(wid, 0);
+    assert_eq!(
+        drain(pipe_a),
+        FOCUS_IN.to_vec(),
+        "brought forward: focused once"
+    );
+    program_writes(&mut app, 0, b"frame");
+    assert!(drain(pipe_a).is_empty(), "and nothing after it");
+}
+
+/// In the session holding the keyboard an enable writes nothing (as in xterm): the
+/// program's assumption that it is focused is right. Leaving it then blurs it once, and an
+/// enable the blur already answered is not answered again by the late output wake.
+#[test]
+fn the_focused_session_enabling_focus_reporting_hears_nothing_until_it_loses_focus() {
+    let (pipe_a, sink_a) = observer();
+    let (pipe_b, sink_b) = observer();
+    let mut app = App::headless_for_test_with_sink(sink_a);
+    let wid = WindowId(0);
+    app.push_stub_tab(wid, stub_session_with_sink(1, sink_b));
+    let _ = drain(pipe_a);
+    let _ = drain(pipe_b);
+
+    program_writes(&mut app, 1, b"\x1b[?1004h");
+    assert!(
+        drain(pipe_b).is_empty(),
+        "the focused program is written nothing at the enable"
+    );
+
+    // An enable whose output wake has not run yet when the keyboard leaves: the switch's
+    // blur is its answer.
+    feed(&app, 1, b"\x1b[?1004l\x1b[?1004h");
+    app.switch_tab_in(wid, 0);
+    assert_eq!(drain(pipe_b), FOCUS_OUT.to_vec(), "the switch blurs it");
+    app.on_output_wake(1, Instant::now());
+    assert!(
+        drain(pipe_b).is_empty(),
+        "the late wake finds the enable answered: one ESC[O, not two"
+    );
+    assert!(
+        drain(pipe_a).is_empty(),
+        "tab 0 never turned DEC 1004 on and is written nothing"
+    );
+}
+
+/// A split's visible pane without the keyboard is as unfocused as a background tab: its
+/// program's enable is answered `ESC[O`, and moving the keyboard to it focuses it once.
+#[test]
+fn a_split_pane_without_the_keyboard_that_enables_focus_reporting_is_told_so() {
+    let (pipe_a, sink_a) = observer();
+    let (pipe_b, sink_b) = observer();
+    let mut app = App::headless_for_test_with_sink(sink_a);
+    let wid = WindowId(0);
+    let right = app.split_active_stub_tab_dir_with_sink(wid, pane::SplitDir::Vertical, sink_b);
+    let _ = drain(pipe_a);
+    let _ = drain(pipe_b);
+    assert_eq!(
+        app.focus_reported,
+        Some(right),
+        "the new pane has the keyboard"
+    );
+
+    program_writes(&mut app, 0, b"\x1b[?1004h");
+    assert_eq!(drain(pipe_a), FOCUS_OUT.to_vec(), "the left pane is told");
+    program_writes(&mut app, right, b"\x1b[?1004h");
+    assert!(drain(pipe_b).is_empty(), "the focused pane is not");
+
+    assert!(
+        app.focus_pane_in(wid, pane::FocusDir::Left),
+        "left neighbour"
+    );
+    assert_eq!(
+        drain(pipe_b),
+        FOCUS_OUT.to_vec(),
+        "the right pane blurs once"
+    );
+    assert_eq!(
+        drain(pipe_a),
+        FOCUS_IN.to_vec(),
+        "the left pane focuses once"
+    );
+}
+
+/// With no aterm window focused no session holds the keyboard, so even the front tab's
+/// program is told it is unfocused when it enables reports; the window's return focuses it.
+#[test]
+fn an_enable_while_the_window_is_away_is_answered_with_focus_out() {
+    let (pipe_a, sink_a) = observer();
+    let mut app = App::headless_for_test_with_sink(sink_a);
+    let wid = WindowId(0);
+    app.on_focus(wid, false);
+    assert!(drain(pipe_a).is_empty(), "nothing was armed yet");
+
+    program_writes(&mut app, 0, b"\x1b[?1004h");
+    assert_eq!(drain(pipe_a), FOCUS_OUT.to_vec(), "the window is away");
+
+    app.on_focus(wid, true);
+    assert_eq!(drain(pipe_a), FOCUS_IN.to_vec(), "the window is back");
+}
+
+/// The window edge reports each change once: a repeated blur or focus, as a platform may
+/// deliver, writes nothing the first one did not.
+#[test]
+fn a_repeated_window_focus_edge_reports_nothing_twice() {
+    let (pipe_a, sink_a) = observer();
+    let mut app = App::headless_for_test_with_sink(sink_a);
+    let wid = WindowId(0);
+    arm_focus_reporting(&app, 0);
+    let _ = drain(pipe_a);
+
+    app.on_focus(wid, true);
+    assert!(drain(pipe_a).is_empty(), "already focused: nothing changed");
+    app.on_focus(wid, false);
+    assert_eq!(drain(pipe_a), FOCUS_OUT.to_vec());
+    app.on_focus(wid, false);
+    assert!(drain(pipe_a).is_empty(), "a second blur changes nothing");
+    app.on_focus(wid, true);
+    assert_eq!(drain(pipe_a), FOCUS_IN.to_vec());
+    app.on_focus(wid, true);
+    assert!(drain(pipe_a).is_empty(), "a second focus changes nothing");
+}
+
+/// Key status moving between two aterm windows, through the real `WindowEvent::Focused`
+/// handler in both orders macOS delivers it, tells the session the keyboard left `ESC[O`
+/// once and the session it reached `ESC[I` once; a tear-out, whose session keeps the
+/// keyboard, tells nobody anything.
+#[test]
+fn key_status_moving_between_windows_reports_each_session_once_in_either_order() {
+    let (pipe_a, sink_a) = observer();
+    let (pipe_b, sink_b) = observer();
+    let (pipe_c, sink_c) = observer();
+    let mut app = App::headless_for_test_with_sink(sink_a);
+    let wid_a = WindowId(0);
+    app.push_stub_tab(wid_a, stub_session_with_sink(1, sink_b));
+    app.push_stub_tab(wid_a, stub_session_with_sink(2, sink_c));
+    for session in [0, 1, 2] {
+        arm_focus_reporting(&app, session);
+    }
+    // Drains every pipe before judging, so a loud one cannot hide what the others hold.
+    let quiet = |pipes: &[[i32; 2]]| {
+        let held: Vec<Vec<u8>> = pipes.iter().map(|pipe| drain(*pipe)).collect();
+        held.iter().all(Vec::is_empty)
+    };
+    let _ = quiet(&[pipe_a, pipe_b, pipe_c]);
+
+    // Tear out session 2, then the OS events that follow: window A resigns key, B takes it.
+    let wid_b = app.detach_active_tab_logical().expect("the tab tears out");
+    app.window_focus_event(wid_a, false);
+    app.window_focus_event(wid_b, true);
+    assert!(
+        quiet(&[pipe_a, pipe_b, pipe_c]),
+        "session 2 kept the keyboard and A's front tab never had it: nothing to report"
+    );
+
+    // Back to A, the new key window's event first.
+    app.window_focus_event(wid_a, true);
+    app.window_focus_event(wid_b, false);
+    assert_eq!(drain(pipe_c), FOCUS_OUT.to_vec(), "B's session blurs once");
+    assert_eq!(
+        drain(pipe_b),
+        FOCUS_IN.to_vec(),
+        "A's front session focuses once"
+    );
+
+    // And to B again, the old key window's event first.
+    app.window_focus_event(wid_a, false);
+    app.window_focus_event(wid_b, true);
+    assert_eq!(drain(pipe_b), FOCUS_OUT.to_vec(), "A's session blurs once");
+    assert_eq!(drain(pipe_c), FOCUS_IN.to_vec(), "B's session focuses once");
+    assert!(
+        drain(pipe_a).is_empty(),
+        "A's background tab is written nothing through all of it"
+    );
 }
 
 /// Switching the active tab reports `ESC[O` to the tab left and `ESC[I` to the tab
@@ -339,4 +571,21 @@ fn a_tab_switch_reports_focus_without_taking_an_engine_lock() {
          {with_reports} acquisitions against the {without_reports} of the \
          same switch with no report owed"
     );
+}
+
+/// A window focus edge, the OS's or the controller's, is still activity to the automatic
+/// update (`input_event_handoff_class` tolerates `Focus`), as when the edge went through
+/// the input seam: an automatic apply waits out a person arriving at or leaving a window.
+#[test]
+fn a_window_focus_edge_is_activity_to_the_automatic_update() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    for focused in [false, true] {
+        let epoch = app.update_handoff_activity_epoch;
+        app.on_focus(wid, focused);
+        assert!(
+            app.update_handoff_activity_epoch > epoch,
+            "on_focus({focused}) moved the quiet clock"
+        );
+    }
 }

@@ -119,6 +119,41 @@ fn the_brief_folds_each_session_from_the_bus_alone() {
     );
 }
 
+/// A SPAWNED SESSION'S OPEN STILL FOLDS (session log Phase 6 step 6E-4):
+/// its open names its parent locally (`parent=`, HOST since this step), the
+/// mirror's wire body carries the open without it, and the brief folds the
+/// session whole from that body (`partial=0`), its parent named nowhere.
+/// NEGATIVE CONTROL, run: `parent=` marked W fails it.
+#[test]
+fn a_spawned_sessions_open_folds_without_its_parent() {
+    let parent = "s-parentqzp6";
+    let mut log = Log::new(1);
+    let f = Fields::new()
+        .id(aterm_slog::Key::Parent, parent)
+        .expect("fields");
+    log.open_session(
+        Kind::Spawn,
+        Src::Aterm,
+        Conf::Exact,
+        Actor::Aterm,
+        f,
+        Stamp::new(1_760_000_000_000, 0),
+    )
+    .expect("opens");
+    let bs = bodies(&mut log);
+    assert!(
+        bs.iter()
+            .all(|b| !b.contains("parent=") && !b.contains(parent)),
+        "{bs:#?}"
+    );
+    let r = read_of(&[("n-1", "s-a", bs)]);
+    let text = render(&cfg(), &BriefOpts::default(), &r, 1_760_000_001_000);
+    let header = text.lines().next().expect("a header");
+    assert!(header.contains(" sessions=1 partial=0 "), "{header}");
+    assert!(text.contains("@s-a@n-1 - ep=1 as_of="), "{text}");
+    assert!(!text.contains(parent), "{text}");
+}
+
 /// RULING Q9: a keeper-recovered session restarts its seqs in a new space;
 /// the brief folds the newest space on its own (never dropping its records
 /// as reordered behind the old space's higher seqs), and says the session
@@ -429,4 +464,44 @@ fn a_brief_refuses_a_roster_or_fold_past_its_session_bound() {
             && nodes.node_inc.len() + nodes.nodes_gone.len() == SESSIONS_MAX,
         "BRIEF_ROSTER_AND_FOLD_MUST_SHARE_THE_BOUND"
     );
+}
+
+/// A WINDOW BELOW A RETAINING BROKER'S FLOOR READS FROM IT (session log Phase 6
+/// step 6E-2): a session's bodies on its `ev` face, the log then cut below the
+/// second. The brief's window reaches offset 0, below what the broker keeps; the
+/// read folds from the floor (`from=` says where), never refuses the whole
+/// brief. NEGATIVE CONTROL, run: the plain `fetch` the read made before is
+/// refused `retained-from=`, and the brief with it.
+#[cfg(unix)]
+#[test]
+fn a_window_below_the_retained_floor_reads_from_it() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("al-brief-kept")
+        .tempdir_in("/tmp")
+        .expect("scratch");
+    let sock = dir.path().join("b.sock");
+    let broker = crate::test_broker(dir.path().join("b.log")).expect("a broker");
+    let _served = broker.serve(&sock).expect("serve the broker");
+    let (mut conn, _closer) =
+        transport::connect(&sock.to_string_lossy(), aterm_spec::wait::MUST_HAPPEN)
+            .expect("connect");
+    let mut log = session(1, 1_760_000_000_000);
+    let offs: Vec<u64> = bodies(&mut log)
+        .iter()
+        .zip(1u64..)
+        .map(|(b, seq)| {
+            conn.publish(91, seq, &face("n-a", "s-a"), b.as_bytes())
+                .expect("publish")
+                .0
+        })
+        .collect();
+    assert!(offs.len() >= 2, "{offs:?}");
+    broker.retain_before(offs[1]).expect("the cut");
+
+    let mut c = cfg();
+    c.broker = sock.to_string_lossy().into_owned();
+    let r = read(&c, &BriefOpts::default()).expect("the brief reads on from the floor");
+    let last = offs[offs.len() - 1];
+    assert_eq!((r.from, r.head), (offs[1], last + 1));
+    assert_eq!(r.sessions.len(), 1, "the session it kept the rest of");
 }

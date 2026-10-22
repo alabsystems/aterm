@@ -11,10 +11,17 @@ use aterm_types::macos_setup::{Selection, Setting};
 
 mod initial;
 pub use initial::{
-    InitialSetupSnapshot, InitialSetupSnapshotError, apply_initial_setup, authorize_initial_setup,
-    automatic_plan, check_initial_setup, initial_setup_finished, initial_setup_revision,
-    initial_setup_snapshot, initial_setup_status, restart_initial_setup,
+    InitialSetupAdmission, InitialSetupAuthorization, InitialSetupObservation,
+    InitialSetupObserved, InitialSetupRestart, InitialSetupSnapshot, InitialSetupSnapshotError,
+    apply_initial_setup, apply_initial_setup_observed, authorize_initial_setup,
+    authorize_initial_setup_observed, automatic_plan, check_initial_setup,
+    check_initial_setup_observed, initial_setup_admission, initial_setup_finished,
+    initial_setup_observation, initial_setup_revision, initial_setup_snapshot,
+    initial_setup_status, restart_initial_setup, restart_initial_setup_observed,
+    validate_initial_setup_plan,
 };
+#[cfg(any(test, debug_assertions))]
+pub use initial::{initial_setup_observation_at, initial_setup_snapshot_at};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -119,17 +126,30 @@ impl Report {
 /// Check, apply, or restore the macOS workstation profile for the actual user.
 /// An isolated instance never changes the login user's machine preferences.
 pub fn run(action: Action) -> Result<Report, String> {
-    let root = state_root()?;
-    let mut host = NativeHost::new();
+    run_observed(action).result
+}
+
+/// Observe the state belonging to a result before releasing its profile lock.
+/// Check instead verifies that its whole read-only pass observed stable records.
+pub fn run_observed(action: Action) -> InitialSetupObserved<Report> {
     if action == Action::Check {
-        return execute(&mut host, &root, action);
+        return initial::observe_read_only(state_root(), |root| {
+            execute(&mut NativeHost::new(), root, action)
+        });
     }
-    ensure_person_scope()?;
-    let _lock = HeldLock::take(&root)?;
-    if action == Action::Apply {
-        initial::save_explicit_workstation_plan(&root)?;
-    }
-    execute(&mut host, &root, action)
+    initial::observe_person_mutation(
+        Err("another doctor profile pass is running".into()),
+        |root| {
+            if action == Action::Apply {
+                initial::save_explicit_workstation_plan(root)?;
+            }
+            let report = execute(&mut NativeHost::new(), root, action)?;
+            if action == Action::Apply && !report.needs_attention() {
+                initial::complete_explicit_workstation_plan(root)?;
+            }
+            Ok(report)
+        },
+    )
 }
 
 /// The saved checklist, or every box checked when no plan has been authorized.
@@ -314,12 +334,85 @@ fn apply_on_first_run_at(root: &Path) -> Result<Option<Report>, String> {
 /// preferences, account registration, or permissions. A profile pass that has
 /// already started holds the same lock, so cancellation then returns an error.
 pub fn cancel_automatic_setup() -> Result<(), String> {
-    ensure_person_scope()?;
-    cancel_automatic_setup_at(&state_root()?)
+    InitialSetupCancellation::default().persist().map(|_| ())
 }
 
+#[cfg(test)]
 fn cancel_automatic_setup_at(root: &Path) -> Result<(), String> {
-    let _lock = HeldLock::take(root)?;
+    InitialSetupCancellation::default()
+        .persist_at(root)
+        .map(|_| ())
+}
+
+/// A retained Cancel choice, bound to the first readable setup run. Capturing
+/// its revision does not take automatic.lock or wait behind a profile pass.
+/// If the initial read fails, persistence remains pending until a run can be bound.
+#[derive(Default)]
+pub struct InitialSetupCancellation {
+    revision: Option<u64>,
+}
+
+impl InitialSetupCancellation {
+    /// Persist this choice through transient errors. False means a newer run
+    /// superseded it; true includes an already finished decision in the same run.
+    pub fn persist(&mut self) -> Result<bool, String> {
+        self.persist_observed().result
+    }
+
+    /// Keep this choice's result bound to its observed setup state.
+    pub fn persist_observed(&mut self) -> InitialSetupObserved<bool> {
+        let root = state_root();
+        let before = root
+            .as_ref()
+            .ok()
+            .and_then(|root| initial::observation_at(root).ok());
+        if let Err(why) = ensure_person_scope() {
+            return InitialSetupObserved::new(Err(why), before);
+        }
+        match root {
+            Ok(root) => self.persist_observed_at(&root, before),
+            Err(why) => InitialSetupObserved::new(Err(why), before),
+        }
+    }
+
+    #[cfg(test)]
+    fn persist_at(&mut self, root: &Path) -> Result<bool, String> {
+        self.persist_observed_at(root, initial::observation_at(root).ok())
+            .result
+    }
+
+    fn persist_observed_at(
+        &mut self,
+        root: &Path,
+        before: Option<InitialSetupObservation>,
+    ) -> InitialSetupObserved<bool> {
+        let revision = match self.revision {
+            Some(revision) => revision,
+            None => {
+                let revision = match initial::revision_at(root) {
+                    Ok(revision) => revision,
+                    Err(why) => return InitialSetupObserved::new(Err(why), before),
+                };
+                self.revision = Some(revision);
+                revision
+            }
+        };
+        initial::observe_mutation_at(
+            root,
+            before,
+            Err("another doctor profile pass is running".into()),
+            |root| {
+                if initial::revision_at(root)? != revision {
+                    return Ok(false);
+                }
+                cancel_automatic_setup_locked_at(root)?;
+                Ok(true)
+            },
+        )
+    }
+}
+
+fn cancel_automatic_setup_locked_at(root: &Path) -> Result<(), String> {
     if initial::finished_at(root)? {
         return Ok(());
     }
@@ -518,6 +611,43 @@ fn account_home(uid: u32) -> Result<PathBuf, String> {
 struct HeldLock(std::fs::File);
 
 impl HeldLock {
+    /// Sample an existing profile pass without creating state or waiting for it.
+    /// Release immediately: a status read must not hold up a profile writer.
+    fn profile_active(root: &Path) -> Result<bool, String> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
+            .open(root.join("profile.lock"))
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(format!("doctor profile lock: {error}")),
+        };
+        if !file
+            .metadata()
+            .map_err(|error| format!("doctor profile lock: {error}"))?
+            .file_type()
+            .is_file()
+        {
+            return Err("doctor profile lock is not a regular file".into());
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "HeldLock::drop releases the shared observation by LOCK_UN, including child-spawn paths"
+        )]
+        match file.try_lock_shared() {
+            Ok(()) => {
+                drop(Self(file));
+                Ok(false)
+            }
+            Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(format!("doctor profile lock: {error}"))
+            }
+        }
+    }
+
     fn take(root: &Path) -> Result<Self, String> {
         Self::try_take(root)?.ok_or_else(|| "another doctor profile pass is running".into())
     }
@@ -1159,6 +1289,13 @@ fn same_original(a: &PValue, b: &PValue) -> bool {
 }
 
 fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Report, String> {
+    // Stop automatic convergence before any fallible recovery preflight. A
+    // corrupt backup or activation record cannot leave automatic setup active.
+    // This records the decision, not successful restoration of preferences.
+    write_json(
+        &root.join("first-run.json"),
+        &json!({ "profile": PROFILE, "state": "restored" }),
+    )?;
     let saved = load_backup(&report.backup)?;
     let mut activation = pending_refresh(root)?;
     for saved in &saved {
@@ -1167,12 +1304,6 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
         }
     }
     save_pending_refresh(root, &activation)?;
-    // Restoration is an explicit decision to stop automatic convergence, even
-    // when reloading a prior runtime-only keyboard mapping needs a new login.
-    write_json(
-        &root.join("first-run.json"),
-        &json!({ "profile": PROFILE, "state": "restored" }),
-    )?;
     if saved.is_empty() {
         report.rows.push(Row {
             name: "Original preferences".into(),
@@ -1198,12 +1329,6 @@ fn restore(host: &mut dyn Host, root: &Path, mut report: Report) -> Result<Repor
         clear_pending_refresh(root)?;
     }
     report.rows.extend(host.restore_runtime(&saved));
-    if !report.needs_attention() {
-        write_json(
-            &root.join("first-run.json"),
-            &json!({ "profile": PROFILE, "state": "restored" }),
-        )?;
-    }
     Ok(report)
 }
 
@@ -1318,6 +1443,18 @@ mod tests {
         account_passes: usize,
         attempted: Vec<Saved>,
         runtime_changed: bool,
+    }
+
+    pub(super) fn restore_without_effects(root: &Path) -> Result<Report, String> {
+        let mut host = Fake {
+            runtime_changed: true,
+            ..Fake::default()
+        };
+        let result = execute(&mut host, root, Action::Restore);
+        assert!(host.writes.is_empty());
+        assert!(host.restarts.is_empty());
+        assert!(host.runtime_changed, "Restore reached runtime activation");
+        result
     }
 
     fn wanted() -> Vec<(Target, PValue)> {
@@ -1718,6 +1855,39 @@ mod tests {
         drop(held);
         cancel_automatic_setup_at(root.path()).expect("cancel after apply");
         assert!(first_run_complete(root.path()).expect("cancelled after release"));
+    }
+
+    #[test]
+    fn a_revived_legacy_profile_finishes_only_after_successful_explicit_apply() {
+        for stopped in ["cancelled", "restored"] {
+            for blocked in [false, true] {
+                let root = aterm_tempfile::tempdir().unwrap();
+                write_json(
+                    &root.path().join("first-run.json"),
+                    &json!({"profile":PROFILE,"state":stopped}),
+                )
+                .unwrap();
+                let _profile = HeldLock::take(root.path()).unwrap();
+                initial::save_explicit_workstation_plan(root.path()).unwrap();
+                let revision = initial::revision_at(root.path()).unwrap();
+                assert_ne!(revision, 0);
+                let mut host = Fake {
+                    accounts_blocked: blocked,
+                    ..Fake::default()
+                };
+                let report = execute(&mut host, root.path(), Action::Apply).unwrap();
+                assert_eq!(report.needs_attention(), blocked);
+                if !report.needs_attention() {
+                    initial::complete_explicit_workstation_plan(root.path()).unwrap();
+                }
+                assert_eq!(initial::finished_at(root.path()).unwrap(), !blocked);
+                assert_eq!(initial::revision_at(root.path()).unwrap(), revision);
+                assert_eq!(
+                    claim_automatic_setup_at(root.path()).unwrap().is_none(),
+                    !blocked
+                );
+            }
+        }
     }
 
     #[test]

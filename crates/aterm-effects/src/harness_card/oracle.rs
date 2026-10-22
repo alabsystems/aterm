@@ -322,7 +322,8 @@ impl HarnessCard {
     /// The oracle's frame: [`Self::draw`]'s step, its quads appended to
     /// `under` and `over`, and the frame's fingerprint returned — `0` when
     /// nothing was drawn; otherwise a hash of every quad appended, folded
-    /// with the frame index while an episode animates.
+    /// with the frame index while an intro animates and with the step in
+    /// the flow.
     pub(super) fn tick(
         &mut self,
         now: Instant,
@@ -346,7 +347,8 @@ impl HarnessCard {
 
 /// A frame's fingerprint ([`HarnessCard::tick`]): `0` when it holds no
 /// quad; otherwise a hash of every quad, `under`'s then `over`'s, folded
-/// with the frame index while an episode animates (`clock`).
+/// with the frame index while an intro animates and with the step in the
+/// flow (`clock`).
 pub(super) fn frame_fp(under: &[GlowQuad], over: &[GlowQuad], clock: Clock) -> u64 {
     if under.is_empty() && over.is_empty() {
         return 0;
@@ -359,6 +361,9 @@ pub(super) fn frame_fp(under: &[GlowQuad], over: &[GlowQuad], clock: Clock) -> u
     }
     if let Some(t) = clock.t_ms {
         h = mix(h ^ (1 + t / super::FRAME_MS));
+    }
+    if let Some(f) = clock.flow {
+        h = mix(h ^ (0xF10F ^ f.step));
     }
     h
 }

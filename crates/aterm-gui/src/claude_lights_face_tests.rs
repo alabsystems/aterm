@@ -366,7 +366,7 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
         let w = lights(row.view, row.glass);
         let block = w.block(7, blank(), now, ACCENT, Keep::Drawn);
         let n = row.drawn.chars().count();
-        assert_eq!(text(&block.lights), row.drawn, "{what}: the chip alone");
+        assert_eq!(text(&block.lights), row.drawn, "{what}");
         assert_eq!(block.cols[0], (0..n, Chip::Autopilot), "{what}");
         let glyph = row.face.glyph().chars().count();
         let (glyph_ink, word_ink) = (ink(row.tones.0), ink(row.tones.1));
@@ -395,7 +395,7 @@ fn the_face_table_gives_every_state_its_face_ink_titles_and_words() {
         }
         // Hovered, the title is the table's.
         let mut w = w;
-        w.hover = Some((7, Chip::Autopilot));
+        w.hover = Some((7, Target::from(Chip::Autopilot)));
         let block = w.block(7, blank(), now, ACCENT, Keep::Drawn);
         assert_eq!(text(&block.title), format!("{}  ", row.whole), "{what}");
         assert_eq!(
@@ -693,7 +693,7 @@ fn every_face_keeps_its_clicks_after_its_explanation() {
             None,
             Some(Chip::Autopilot),
             400,
-            Some((&whole, &short)),
+            (Some((whole.as_str(), short.as_str())), None, None),
             &mut block,
         ));
         let widths = LightsWidth {
@@ -888,10 +888,9 @@ fn each_spoken_label_holds_no_glyph() {
 }
 
 /// EACH `GlyphOnly` RUNG is the face's rung alone, in the glyph's ink —
-/// `∞`, `⤓`, `✓`, `○`, `⊘` — with every light given up, and
-/// measured as laid out. A click in flight is `◐` there as everywhere.
-/// CONTROL: no face has a rung apart from its glyph (Cruise wears no
-/// task's end).
+/// `∞`, `⤓`, `✓`, `○`, `⊘` — with every other chip given up, and measured
+/// as laid out. A click in flight is `◐` there as everywhere. CONTROL: no
+/// face has a rung apart from its glyph (Cruise wears no task's end).
 #[test]
 fn each_glyph_only_rung_is_the_glyph_alone() {
     let now = Instant::now();
@@ -907,7 +906,10 @@ fn each_glyph_only_rung_is_the_glyph_alone() {
             block.lights.iter().all(|c| c.fg == ink(row.tones.0)),
             "{what}"
         );
-        assert_eq!(block.cols.len(), 1, "{what}: Autopilot alone");
+        assert!(
+            block.cols.iter().all(|(_, chip)| *chip == Chip::Autopilot),
+            "{what}: Autopilot alone"
+        );
         let s = &w.sessions[&7];
         let on = drawn_at(s, now, None, None, Keep::GlyphOnly);
         assert_eq!(
@@ -945,9 +947,8 @@ fn each_glyph_only_rung_is_the_glyph_alone() {
 
 /// A NARROW RULE GIVES A STANDING FACE DOWN TO ITS GLYPH (§9.3.2), and v1's
 /// faces as v1 did. Walked from a room that holds the chip down to none,
-/// each state's Autopilot chip is its whole face, then — for a standing
-/// face of v2's alone (`∞ ⤓18:00`,
-/// `✓ landed`, `⤓ quiet`) — its glyph alone, in the
+/// each state's Autopilot chip is its whole face, then — for a standing face
+/// of v2's alone (`∞ ⤓18:00`, `✓ landed`, `⤓ quiet`) — its glyph alone, in the
 /// glyph's ink and holding the room, down to one cell. v1's faces (`∞`,
 /// `⤓ land`, `○ off`, `⊘ off`) give the chip up whole below their width,
 /// as v1's ladder did, so the default glass draws nothing new. No chip comes
@@ -1229,14 +1230,14 @@ fn the_trail_moves_the_term_only_while_the_chip_is_read() {
         w.autopilot_term(7, None, AutopilotView::Cruise, glass)
     };
     assert_eq!(term(&w, 3), term(&w, 4), "no one reads the title");
-    w.hover = Some((7, Chip::Light(Light::Mode)));
+    w.hover = Some((7, Target::from(Chip::Light(Light::Mode))));
     assert_eq!(term(&w, 3), term(&w, 4), "another chip's title");
-    w.hover = Some((8, Chip::Autopilot));
+    w.hover = Some((8, Target::from(Chip::Autopilot)));
     assert_eq!(term(&w, 3), term(&w, 4), "another session's chip");
-    w.hover = Some((7, Chip::Autopilot));
+    w.hover = Some((7, Target::from(Chip::Autopilot)));
     assert_ne!(term(&w, 3), term(&w, 4), "the pointer reads it");
     w.hover = None;
-    w.selected = Some((7, Chip::Autopilot));
+    w.selected = Some((7, Target::from(Chip::Autopilot)));
     assert_ne!(term(&w, 3), term(&w, 4), "the keyboard reads it");
 }
 
@@ -1263,7 +1264,7 @@ fn a_face_clock_that_moves_under_its_face_repaints_the_title_being_read() {
     ));
     let before = app.chip_glass(7);
     let at_rest = term(&w, before);
-    w.hover = Some((7, Chip::Autopilot));
+    w.hover = Some((7, Target::from(Chip::Autopilot)));
     let read = term(&w, before);
     assert!(crate::harness_glass::on_task(
         &mut app,
@@ -1282,7 +1283,7 @@ fn a_face_clock_that_moves_under_its_face_repaints_the_title_being_read() {
         "no one reads it: nothing repaints"
     );
     // NEGATIVE CONTROL: the clock alone moves no bit.
-    w.hover = Some((7, Chip::Autopilot));
+    w.hover = Some((7, Target::from(Chip::Autopilot)));
     let clock_alone = ChipGlass {
         trail: before.trail,
         ..after
@@ -1424,7 +1425,7 @@ fn the_lights_own_hue_clears_the_text_floor_on_every_builtin_theme() {
             }
             let mut w = lights(AutopilotView::Cruise, ChipGlass::default());
             w.sessions.get_mut(&7).expect("session 7").shown.mode = Some(mode);
-            w.hover = Some((7, Chip::Light(Light::Mode)));
+            w.hover = Some((7, Target::from(Chip::Light(Light::Mode))));
             let block = w.block(7, row, now, ACCENT, Keep::Drawn);
             let pill: String = format!("{} {}", mode.glyph(), mode.word());
             let all = text(&block.lights);

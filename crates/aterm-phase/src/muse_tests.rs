@@ -1253,7 +1253,60 @@ fn the_signed_in_cards_name_the_account_and_the_weekly_quota() {
             Some("Muse Code Max Usage".to_owned()),
         ))
     );
-    assert_eq!(usage_card_weekly(&rows).as_deref(), Some("weekly 29% left"));
+    assert_eq!(
+        usage_card_weekly(&rows),
+        Some(UsageCardWeekly {
+            text: "weekly 29% left".to_owned(),
+            reset: Some("Oct 25 at 5:00 PM".to_owned()),
+        })
+    );
+    // The `/usage` card alone (its status card scrolled away) still names
+    // the tier on its own subscription line.
+    let first_card_end = rows
+        .iter()
+        .position(|r| r.starts_with('└'))
+        .expect("the status card's foot");
+    let usage_only: Vec<String> = rows[..2]
+        .iter()
+        .chain(rows[first_card_end + 1..].iter())
+        .cloned()
+        .collect();
+    assert_eq!(status_card_account(&usage_only), None);
+    assert_eq!(
+        subscription_card_plan(&usage_only).as_deref(),
+        Some("Muse Code Max Usage")
+    );
+    // A later account-bearing status must not borrow its plan from an
+    // earlier account's status, or from an anonymous usage card. The
+    // matching card's own billing row remains a positive control.
+    let at = rows
+        .iter()
+        .rposition(|row| is_idle_voice_rule(row))
+        .expect("the composer top rule");
+    let status = vec![
+        "┌".to_owned() + &"─".repeat(83) + "┐",
+        format!("│{:<83}│", "  MUSE CODE 1.4.11 / second-session IDLE"),
+        format!(
+            "│{:<83}│",
+            "  ACCOUNT        Second User (second@example.test)"
+        ),
+        "└".to_owned() + &"─".repeat(83) + "┘",
+    ];
+    let mut mixed = rows.clone();
+    drop(mixed.splice(at..at, status.clone()));
+    assert_eq!(
+        status_card_account(&mixed),
+        Some(("second@example.test".into(), None)),
+        "an account's plan cannot come from another card"
+    );
+    mixed.insert(
+        at + status.len() - 1,
+        format!("│{:<83}│", "  BILLING        Subscription · Muse Code Pro"),
+    );
+    assert_eq!(
+        status_card_account(&mixed),
+        Some(("second@example.test".into(), Some("Muse Code Pro".into())))
+    );
     let r = muse(USAGE_SIGNED_IN);
     assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, true));
     for text in [USAGE_CARD, STATUS_CARD] {

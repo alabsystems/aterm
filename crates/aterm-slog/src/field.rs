@@ -160,8 +160,12 @@ keys! {
     // The session that spawned this one (`SessionHandle::parent`), on the
     // session's open: a sid, like `prev=` and `lineage=`. The design writes it
     // `par=`, but `par=` is the line's header token for a node's parent, and a
-    // session's parent is no node of its log.
-    Parent "parent" Wire Cap::Id,
+    // session's parent is no node of its log. HOST since session log Phase 6
+    // step 6E-4 (D4's "senders stay local"): who spawned whom is the node's
+    // own fact, so it never crosses the fabric with the mirror's open, where
+    // `prev=` and `lineage=` (the node's own earlier sessions, whose faces are
+    // already its subjects, ruling U23(c)) still do.
+    Parent "parent" Host Cap::Id,
     Field "field" Wire Cap::Tok(Charset::Lower, 24),
     // A bus snapshot's open path (phase 4, §5.5): `<node>:<kind>` for the
     // deepest open run, turn and need-bearing step, comma-separated; only

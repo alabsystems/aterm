@@ -86,6 +86,7 @@ impl CursorGlow {
     /// terminal is no longer the same content stream (a tab/pane switch, a
     /// scroll fence), so the diff never compares two streams into a phantom
     /// poof.
+    #[inline]
     pub fn drop_row_probe(&mut self) {
         self.recent_typed_run = None;
         self.park_source_intact = None;
@@ -102,6 +103,7 @@ impl CursorGlow {
 
     /// Clear the neighbour captures (both generations, [`NbrProbe`]) wherever
     /// the row probe is dropped, retaining capacity.
+    #[inline]
     pub(super) fn clear_neighbor_rows(&mut self) {
         self.row_above_cur.clear();
         self.row_above_prev.clear();
@@ -115,7 +117,8 @@ impl CursorGlow {
     /// viewport) keeps the previous sample. Feeds [`Self::echo_anchor_pass`]
     /// and this tick's distant-park print provenance; never a licence by itself.
     /// Clears the anchor's glyph.
-    pub fn observe_print_anchor(&mut self, anchor: Option<(u16, u16, u64)>) {
+    #[inline]
+    pub const fn observe_print_anchor(&mut self, anchor: Option<(u16, u16, u64)>) {
         if let Some(sample) = anchor {
             self.print_anchor = Some(sample);
             self.print_anchor_glyph = None;
@@ -128,7 +131,8 @@ impl CursorGlow {
     /// [`Self::echo_anchor_pass`] lays a key's echo only where the run ends on
     /// that key's glyph, since the caret row's flanking probes cannot see a
     /// status row two or more rows below (zsh's Ctrl-R under a wrapped match).
-    pub fn observe_print_anchor_glyph(
+    #[inline]
+    pub const fn observe_print_anchor_glyph(
         &mut self,
         anchor: Option<(u16, u16, u64)>,
         glyph: Option<char>,
@@ -229,7 +233,8 @@ impl CursorGlow {
     /// Host observation: whether DECTCEM draws the caret handed to
     /// [`Self::tick`] this frame (the single-pane window hands over hidden
     /// carets too). Feeds only the minibuffer gate of [`Self::echo_anchor_pass`].
-    pub fn observe_caret_drawn(&mut self, drawn: bool) {
+    #[inline]
+    pub const fn observe_caret_drawn(&mut self, drawn: bool) {
         self.caret_hidden = !drawn;
     }
 
@@ -238,6 +243,7 @@ impl CursorGlow {
     /// wide continuations, `' '` for blanks; see `Terminal::row_cols_into`).
     /// Call it immediately before [`Self::tick`]; skipping a frame leaves the
     /// previous probe and the poof detector idle.
+    #[inline]
     pub fn observe_row(&mut self, row: u16, caret: u16, cols: &[char], now: Instant) {
         self.observe_row_with_trust(row, caret, cols, now, ProbeTrust::Full);
     }
@@ -282,6 +288,7 @@ impl CursorGlow {
     /// counts as ink), or a light horizontal rule, whose ink never reaches the
     /// sky band (a bordered TUI prompt puts one across the row above the typed
     /// line).
+    #[inline]
     pub(super) fn v2_probe_row(&mut self, row: i32, cols: &[char]) {
         self.v2_probe_scratch.clear();
         self.v2_probe_scratch
@@ -346,6 +353,7 @@ impl CursorGlow {
     /// replaces the earlier sample; past [`CURSOR_WITNESS_ROWS`] rows it is
     /// dropped. Read right after this frame's [`Self::tick`]. Inert for other
     /// styles.
+    #[inline]
     pub fn observe_ribbon_row(&mut self, row: u16, cols: &[char]) {
         let Some(slot) = self.witness_row_slot(row) else {
             return;
@@ -358,6 +366,7 @@ impl CursorGlow {
     /// the terminal lock that captured this frame's caret, in the same
     /// per-column convention, saving a copy under the lock. `fill` is not
     /// called when Rainbow Kitty is disengaged or all slots are full.
+    #[inline]
     pub fn capture_ribbon_row(&mut self, row: u16, fill: impl FnOnce(&mut Vec<char>)) {
         let Some(slot) = self.witness_row_slot(row) else {
             return;
@@ -366,6 +375,7 @@ impl CursorGlow {
         fill(&mut slot.cols);
     }
 
+    #[inline]
     pub(super) fn witness_row_slot(&mut self, row: u16) -> Option<&mut WitnessRowBuf> {
         if !self.v2.engaged() {
             return None;
@@ -395,6 +405,7 @@ impl CursorGlow {
     /// Rainbow Kitty's laid ribbon, read-only, `Some` only while v2 owns the
     /// frame. Conformance tests read the resident cells from it; `trail
     /// status`'s `ribbon_segments=` stays the lit count.
+    #[inline]
     #[must_use]
     pub fn v2_ribbon(&self) -> Option<&rk::ribbon::Ribbon> {
         self.v2.engaged().then(|| self.v2.ribbon())

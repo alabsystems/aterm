@@ -63,12 +63,14 @@ pub struct TrayCardRing {
 /// present samples the slot shown when it is encoded and a slot records its
 /// reader before that present takes its number.
 #[must_use]
-pub fn present_may_read(seq: u64, last_read: u64) -> bool {
+#[inline]
+pub const fn present_may_read(seq: u64, last_read: u64) -> bool {
     seq <= last_read
 }
 
 /// The rows `[y0, y1)` covering both `a` (if any) and `b`.
 #[must_use]
+#[inline]
 pub fn union_band(a: Option<(u32, u32)>, b: (u32, u32)) -> (u32, u32) {
     a.map_or(b, |(y0, y1)| (y0.min(b.0), y1.max(b.1)))
 }
@@ -77,6 +79,7 @@ impl TrayCardRing {
     /// A freshly minted ring of one slot, `height` rows, holding the card and
     /// shown, read by `reader` as [`Self::read_unchanged`] says.
     #[must_use]
+    #[inline]
     pub fn fresh(height: u32, reader: Option<u64>) -> Self {
         Self {
             slots: vec![TrayCardSlot {
@@ -90,12 +93,14 @@ impl TrayCardRing {
 
     /// The slot the card's draw samples.
     #[must_use]
-    pub fn shown(&self) -> usize {
+    #[inline]
+    pub const fn shown(&self) -> usize {
         self.shown
     }
 
     /// Slot `index`'s bookkeeping.
     #[must_use]
+    #[inline]
     pub fn slot(&self, index: usize) -> Option<TrayCardSlot> {
         self.slots.get(index).copied()
     }
@@ -104,6 +109,7 @@ impl TrayCardRing {
     /// that will take the number `reader`, which it records, or (`None`) by a
     /// command buffer waited inline (a readback's tray bake), which leaves no
     /// reader in flight to record.
+    #[inline]
     pub fn read_unchanged(&mut self, reader: Option<u64>) {
         if let Some(reader) = reader {
             self.slots[self.shown].last_read = Some(reader);
@@ -113,6 +119,7 @@ impl TrayCardRing {
     /// The write a change of rows `band` needs, deciding everything and
     /// changing nothing (a texture mint may still fail).
     #[must_use]
+    #[inline]
     pub fn plan_change(&self, band: (u32, u32)) -> TrayCardWrite {
         if self.slots.len() < TRAY_CARD_SLOTS {
             // Undefined until written: every row is to be written, and no
@@ -140,6 +147,7 @@ impl TrayCardRing {
     /// command buffer waited inline, as [`Self::read_unchanged`] says). Its
     /// earlier readers were settled before the write
     /// ([`TrayCardWrite::settle_through`]).
+    #[inline]
     pub fn land_change(&mut self, write: TrayCardWrite, band: (u32, u32), reader: Option<u64>) {
         if write.mint {
             debug_assert_eq!(write.slot, self.slots.len(), "a mint is the next slot");

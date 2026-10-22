@@ -17,9 +17,12 @@
 //! file is written only where none exists: "fill gaps") or ` if-absent=<anchor>` (and only
 //! where the entry named `<anchor>`, another ` if-absent` entry every machine receiving
 //! this one also receives, is not the machine's own: a set of files filled together);
-//! `[join]` (a whole vault's only, so never in a locker) holds at most one `password = …`,
-//! the join password (`crate::join`). A section may appear more than once; its items
-//! accumulate. Errors carry a 1-based line number and never quote a value.
+//! `[join]` (a whole vault's only, so never in a locker) holds at most one of `password = …`,
+//! the join password (`crate::join`), and `open = yes` (an open vault: an admin's subscriber
+//! lets in every machine that asks to join, no password), and a `code-only = age1…` line for
+//! each key an open vault leaves to approval by code (a machine it let go, or one that asked
+//! before it opened). A section may appear more than once; its items accumulate. Errors carry
+//! a 1-based line number and never quote a value.
 
 use crate::SecretBytes;
 use std::collections::{BTreeMap, BTreeSet};
@@ -82,6 +85,12 @@ pub struct Entry {
     /// machine's own. An aterm older than anchors refuses a locker that holds one.
     pub anchor: Option<String>,
 }
+
+/// An open vault's `[join]` line: an admin's subscriber lets in every machine that asks, with
+/// no password and no person at an admin Mac, except a key on a `code-only` line. Only an admin
+/// makes a vault open (`aterm secrets password open`, or the line written in `aterm secrets
+/// edit`); a vault without the line is not.
+const OPEN_LINE: &str = "open = yes";
 
 /// A parse failure: the 1-based line and what is wrong, never the line's contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +183,10 @@ const ANCHOR_NAME: &str =
 const INVALID_MACHINE: &str =
     "an invalid machine name: [a-z0-9][a-z0-9-]{0,62}, not machines, admins, everyone or join";
 
+/// Why a recipient is refused.
+const INVALID_RECIPIENT: &str =
+    "an invalid recipient: expected age1… (lowercase bech32, 62 characters)";
+
 /// What a section header declares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SectionKind {
@@ -211,6 +224,10 @@ struct Model {
     admins: Vec<(String, usize)>,
     /// The join password and its line.
     join: Option<(SecretBytes, usize)>,
+    /// Where an open vault's `[join]` line is (never beside a password).
+    open: Option<usize>,
+    /// The keys `[join]`'s `code-only` lines name, and where.
+    code_only: Vec<(String, usize)>,
     sections: Vec<Section>,
     entries: Vec<Located>,
 }
@@ -233,9 +250,9 @@ impl Document {
     /// Parse and validate a whole vault text: every section known, every host in an
     /// audience or `[admins]` declared in `[machines]`, at least one admin, every recipient
     /// a valid `age1…`, no duplicate machine, recipient, admin, or entry name within one
-    /// audience, no entry name in two host sections that share a host, at most one join
-    /// password and a strong one, heredocs terminated, base64 heredocs canonical, names and
-    /// values within their rules and sizes.
+    /// audience, no entry name in two host sections that share a host, at most one `[join]`
+    /// line (a strong join password, or an `open` line), heredocs terminated, base64 heredocs
+    /// canonical, names and values within their rules and sizes.
     pub fn parse(text: &str) -> Result<Document, TextError> {
         let lines = split_lines(text)?;
         match parse_lines(&lines, Mode::Vault) {
@@ -299,7 +316,8 @@ impl Document {
     }
 
     /// Set the join password (`Some`), replacing any, or remove it (`None`). Refuses a weak
-    /// one ([`crate::join::strength`]) without quoting it. Blanks around it are dropped.
+    /// one ([`crate::join::strength`]) without quoting it. Blanks around it are dropped. A
+    /// password set on an open vault closes it: it takes the `open` line's place.
     pub fn set_join_password(&mut self, password: Option<&[u8]>) -> Result<(), TextError> {
         let existing = self.model.join.as_ref().map(|(_, line)| *line);
         let Some(password) = password else {
@@ -315,7 +333,7 @@ impl Document {
             return Err(whole("a join password is UTF-8 text"));
         };
         let spelled = format!("password = {text}");
-        match existing {
+        match existing.or(self.model.open) {
             Some(line) => {
                 let mut lines = self.lines.clone();
                 std::mem::replace(&mut lines[line], spelled).zeroize();
@@ -323,6 +341,62 @@ impl Document {
             }
             None => self.append_to(&SectionKind::Join, "[join]", vec![spelled]),
         }
+    }
+
+    /// Whether the vault is open (`[join]`'s `open = yes`): an admin's subscriber lets in
+    /// every machine that asks, with no password, except a key [`Document::code_only`] names.
+    pub fn open(&self) -> bool {
+        self.model.open.is_some()
+    }
+
+    /// Make the vault open (`true`), its line in the join password's place if it has one, or
+    /// close it (`false`), removing the `open` line and leaving a join password be. Either
+    /// leaves the `code-only` lines be, and the state it is already in changes nothing, however its
+    /// line is spelled.
+    pub fn set_open(&mut self, open: bool) -> Result<(), TextError> {
+        match (self.model.open, open) {
+            (Some(_), true) | (None, false) => Ok(()),
+            (Some(line), false) => {
+                let mut lines = self.lines.clone();
+                lines.remove(line).zeroize();
+                self.commit(lines)
+            }
+            (None, true) => match self.model.join.as_ref().map(|(_, line)| *line) {
+                Some(line) => {
+                    let mut lines = self.lines.clone();
+                    std::mem::replace(&mut lines[line], OPEN_LINE.to_string()).zeroize();
+                    self.commit(lines)
+                }
+                None => self.append_to(&SectionKind::Join, "[join]", vec![OPEN_LINE.to_string()]),
+            },
+        }
+    }
+
+    /// The keys an open vault leaves to approval by code (`[join]`'s `code-only` lines), in
+    /// file order: a machine it let go, or one that asked before it opened. Its approver never
+    /// lets one in by itself.
+    pub fn code_only(&self) -> Vec<String> {
+        self.model
+            .code_only
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Name `recipient` on a `code-only` line in `[join]`, unless one does already. Refuses a
+    /// bad recipient. [`Document::add_machine`] removes the line again.
+    pub fn add_code_only(&mut self, recipient: &str) -> Result<(), TextError> {
+        if !valid_recipient(recipient) {
+            return Err(whole(INVALID_RECIPIENT));
+        }
+        if self.model.code_only.iter().any(|(key, _)| key == recipient) {
+            return Ok(());
+        }
+        self.append_to(
+            &SectionKind::Join,
+            "[join]",
+            vec![format!("code-only = {recipient}")],
+        )
     }
 
     /// Every entry, in file order.
@@ -406,16 +480,15 @@ impl Document {
         plans
     }
 
-    /// Append `name = recipient` to `[machines]` (creating the section if absent). Refuses a
-    /// duplicate name or recipient, a bad name, or a bad recipient.
+    /// Append `name = recipient` to `[machines]` (creating the section if absent), and remove
+    /// the `code-only` line naming `recipient`, if any. Refuses a duplicate name or recipient, a
+    /// bad name, or a bad recipient.
     pub fn add_machine(&mut self, name: &str, recipient: &str) -> Result<(), TextError> {
         if !valid_machine_name(name) {
             return Err(whole(INVALID_MACHINE));
         }
         if !valid_recipient(recipient) {
-            return Err(whole(
-                "an invalid recipient: expected age1… (lowercase bech32, 62 characters)",
-            ));
+            return Err(whole(INVALID_RECIPIENT));
         }
         for (machine, _) in &self.model.machines {
             if machine.name == name {
@@ -428,8 +501,25 @@ impl Document {
                 )));
             }
         }
-        let line = format!("{name} = {recipient}");
-        self.append_to(&SectionKind::Machines, "[machines]", vec![line])
+        let mut next = self.clone();
+        next.append_to(
+            &SectionKind::Machines,
+            "[machines]",
+            vec![format!("{name} = {recipient}")],
+        )?;
+        // A key let in is no longer one left to approval by code.
+        let held = next
+            .model
+            .code_only
+            .iter()
+            .find(|(key, _)| key == recipient);
+        if let Some(line) = held.map(|(_, line)| *line) {
+            let mut lines = next.lines.clone();
+            lines.remove(line);
+            next.commit(lines)?;
+        }
+        *self = next;
+        Ok(())
     }
 
     /// Remove a machine: its `[machines]` line, its `[admins]` line, and its name from every
@@ -709,6 +799,11 @@ const TEMPLATE: &[&str] = &[
     "#             [everyone] entry of the same name.",
     "# [join]      `password = ...`: a machine whose person types it at `aterm secrets",
     "#             join` is let in by an admin's subscriber within seconds.",
+    "#             Or `open = yes` instead: every machine that reaches the server and",
+    "#             asks is let in, with no password, and reads [everyone].",
+    "#             `code-only = age1...`: a key an open vault lets in only by its code",
+    "#             (a machine it let go, or one that asked before it opened); approving",
+    "#             it by code drops the line.",
     "#",
     "# Entries:",
     "#   name=value          the rest of the line, verbatim (no quotes, no comments)",
@@ -855,13 +950,41 @@ fn parse_lines(lines: &[String], mode: Mode) -> Result<Model, TextError> {
             SectionKind::Join => {
                 // Read in a plain file too (a locker refuses the header), so an entry
                 // written under [join] by mistake is an error, never silently dropped.
-                if let Some((_, j)) = &model.join {
+                let line = parse_join(trimmed, n)?;
+                let password = model.join.as_ref().map(|(_, j)| *j);
+                let (what, same, other) = match &line {
+                    JoinLine::Password(_) => ("one password", password, model.open),
+                    JoinLine::Open => ("one `open` line", model.open, password),
+                    JoinLine::CodeOnly(key) => (
+                        "one `code-only` line for a key",
+                        model
+                            .code_only
+                            .iter()
+                            .find(|(held, _)| held == key)
+                            .map(|(_, j)| *j),
+                        None,
+                    ),
+                };
+                if let Some(j) = same {
                     return Err(at(
                         n,
-                        format!("[join] holds one password (lines {} and {n})", j + 1),
+                        format!("[join] holds {what} (lines {} and {n})", j + 1),
                     ));
                 }
-                model.join = Some((parse_join(trimmed, n)?, i));
+                if let Some(j) = other {
+                    return Err(at(
+                        n,
+                        format!(
+                            "[join] holds a password or an `open` line, not both (lines {} and {n})",
+                            j + 1
+                        ),
+                    ));
+                }
+                match line {
+                    JoinLine::Password(password) => model.join = Some((password, i)),
+                    JoinLine::Open => model.open = Some(i),
+                    JoinLine::CodeOnly(key) => model.code_only.push((key, i)),
+                }
                 i
             }
             SectionKind::Audience(audience) => {
@@ -946,10 +1069,7 @@ fn parse_machine(trimmed: &str, n: usize) -> Result<Machine, TextError> {
         return Err(at(n, INVALID_MACHINE));
     }
     if !valid_recipient(recipient) {
-        return Err(at(
-            n,
-            "an invalid recipient: expected age1… (lowercase bech32, 62 characters)",
-        ));
+        return Err(at(n, INVALID_RECIPIENT));
     }
     Ok(Machine {
         name: name.to_string(),
@@ -957,18 +1077,38 @@ fn parse_machine(trimmed: &str, n: usize) -> Result<Machine, TextError> {
     })
 }
 
-/// A `[join]` line: `password = …` (spaces around `=` optional), a password
-/// [`crate::join::strength`] accepts. The password is held without the ASCII blanks around
-/// it, as `strength` and [`crate::join::Key::derive`] read it.
-fn parse_join(trimmed: &str, n: usize) -> Result<SecretBytes, TextError> {
-    let Some(("password", value)) = trimmed
-        .split_once('=')
-        .map(|(key, value)| (key.trim_matches(BLANK), value.trim_ascii()))
-    else {
-        return Err(at(n, "expected `password = …` in [join]"));
+/// What a `[join]` line says.
+enum JoinLine {
+    Password(SecretBytes),
+    Open,
+    CodeOnly(String),
+}
+
+/// A `[join]` line (spaces around `=` optional): `password = …`, a password
+/// [`crate::join::strength`] accepts, held without the ASCII blanks around it as `strength`
+/// and [`crate::join::Key::derive`] read it; `open = yes`; or `code-only = age1…`, a key an
+/// open vault leaves to approval by code.
+fn parse_join(trimmed: &str, n: usize) -> Result<JoinLine, TextError> {
+    let shape = "expected `password = …`, `open = yes` or `code-only = age1…` in [join]";
+    let Some((key, value)) = trimmed.split_once('=') else {
+        return Err(at(n, shape));
     };
-    crate::join::strength(value.as_bytes()).map_err(|why| at(n, why))?;
-    Ok(SecretBytes::from(value.as_bytes()))
+    match key.trim_matches(BLANK) {
+        "password" => {
+            let value = value.trim_ascii();
+            crate::join::strength(value.as_bytes()).map_err(|why| at(n, why))?;
+            Ok(JoinLine::Password(SecretBytes::from(value.as_bytes())))
+        }
+        "open" if value.trim_matches(BLANK) == "yes" => Ok(JoinLine::Open),
+        "code-only" => {
+            let value = value.trim_matches(BLANK);
+            if !valid_recipient(value) {
+                return Err(at(n, INVALID_RECIPIENT));
+            }
+            Ok(JoinLine::CodeOnly(value.to_string()))
+        }
+        _ => Err(at(n, shape)),
+    }
 }
 
 /// The entry starting at line index `i`, in a section for `audience`, and its last line
@@ -2504,6 +2644,119 @@ mod tests {
             text(&d)
         );
         assert!(text(&d).contains("[join]\n# none here\n[everyone]"));
+    }
+
+    #[test]
+    fn an_open_vault_is_set_rendered_parsed_and_closed() {
+        let pw = strong("pw");
+        let mut d = Document::parse(&base(&format!("[join]\npassword = {pw}\n"))).expect("valid");
+        assert!(!d.open());
+        // Opening takes the password's place: a vault holds one or the other.
+        d.set_open(true).expect("open");
+        assert!(text(&d).ends_with("[join]\nopen = yes\n"), "{}", text(&d));
+        assert!(d.join_password().is_none());
+        let reread = Document::parse(&text(&d)).expect("parses");
+        assert!(reread.open());
+        assert_eq!(reread.render().as_slice(), d.render().as_slice());
+        // The line it already holds, however spelled, changes nothing.
+        let mut spelled = Document::parse(&base("[join]\n  open=yes \n")).expect("valid");
+        let before = text(&spelled);
+        spelled.set_open(true).expect("same");
+        assert_eq!(text(&spelled), before);
+        // A password closes it in the open line's place; closing a vault with a password
+        // leaves the password be.
+        d.set_join_password(Some(pw.as_bytes())).expect("set");
+        assert!(!d.open());
+        assert!(text(&d).ends_with(&format!("[join]\npassword = {pw}\n")));
+        d.set_open(false).expect("not open");
+        assert!(d.join_password().is_some());
+        // Closing an open vault removes its line and nothing else.
+        let mut open =
+            Document::parse(&base("[join]\nopen = yes\n[everyone]\nx=1\n")).expect("valid");
+        open.set_open(false).expect("close");
+        assert_eq!(text(&open), base("[join]\n[everyone]\nx=1\n"));
+        assert!(!open.open());
+    }
+
+    #[test]
+    fn an_open_line_is_checked_and_never_beside_a_password() {
+        let pw = strong("pw");
+        let e = error(&base(&format!("[join]\nopen = yes\npassword = {pw}\n")));
+        assert_eq!(e.line, 8);
+        assert!(e.why.contains("not both (lines 7 and 8)"), "{e}");
+        assert!(!format!("{e:?}").contains(&pw));
+        let e = error(&base("[join]\nopen = yes\n[join]\nopen = yes\n"));
+        assert!(e.why.contains("one `open` line"), "{e}");
+        for bad in [
+            "open = no",
+            "open = YES",
+            "open =",
+            "open = yes please",
+            "open = after 5",
+            "opened = yes",
+        ] {
+            let e = error(&base(&format!("[join]\n{bad}\n")));
+            assert_eq!(e.line, 7, "{bad}");
+            assert!(e.why.contains("open = yes"), "{bad}: {e}");
+        }
+        // Only a whole vault holds it: a locker refuses [join].
+        assert!(parse_locker(b"[join]\nopen = yes\n").is_err());
+        let mut d = doc();
+        d.set_open(true).expect("open");
+        for plan in d.lockers() {
+            let body = std::str::from_utf8(plan.text.as_slice()).expect("utf-8");
+            assert!(!body.contains("open") && !body.contains("[join]"), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_code_only_key_is_named_once_and_dropped_when_it_is_let_in() {
+        let pw = strong("pw");
+        let gone = recipient(9);
+        let mut d = Document::parse(&base(&format!("[join]\npassword = {pw}\n"))).expect("valid");
+        assert!(d.code_only().is_empty());
+        // Named beside the password, once however often it is let go.
+        d.add_code_only(&gone).expect("code-only");
+        d.add_code_only(&gone).expect("again");
+        assert_eq!(d.code_only(), std::slice::from_ref(&gone));
+        assert!(text(&d).ends_with(&format!("[join]\npassword = {pw}\ncode-only = {gone}\n")));
+        assert_eq!(
+            Document::parse(&text(&d)).expect("parses").code_only(),
+            std::slice::from_ref(&gone)
+        );
+        // Opening and closing the vault leave it be.
+        d.set_open(true).expect("open");
+        assert!(text(&d).ends_with(&format!("[join]\nopen = yes\ncode-only = {gone}\n")));
+        d.set_open(false).expect("close");
+        assert_eq!(d.code_only(), std::slice::from_ref(&gone));
+        d.set_join_password(Some(pw.as_bytes())).expect("set");
+        assert_eq!(d.code_only(), std::slice::from_ref(&gone));
+        // A bad key is refused, written or parsed, and a key named twice names both lines.
+        let before = text(&d);
+        assert!(d.add_code_only("age1nope").is_err());
+        assert_eq!(text(&d), before);
+        let e = error(&base("[join]\ncode-only = age1nope\n"));
+        assert_eq!(e.line, 7);
+        assert!(e.why.contains("invalid recipient"), "{e}");
+        let e = error(&base(&format!(
+            "[join]\ncode-only = {gone}\ncode-only={gone}\n"
+        )));
+        assert_eq!(e.line, 8);
+        assert!(e.why.contains("(lines 7 and 8)"), "{e}");
+        // A key let in again is no longer one the vault let go; another one's line stays.
+        let other = recipient(8);
+        d.add_code_only(&other).expect("code-only");
+        d.add_machine("back", &gone).expect("add");
+        assert_eq!(d.code_only(), std::slice::from_ref(&other));
+        assert!(!text(&d).contains(&format!("code-only = {gone}")));
+        // Never in a locker.
+        for plan in d.lockers() {
+            let body = std::str::from_utf8(plan.text.as_slice()).expect("utf-8");
+            assert!(
+                !body.contains("code-only") && !body.contains(&other),
+                "{body}"
+            );
+        }
     }
 
     #[test]

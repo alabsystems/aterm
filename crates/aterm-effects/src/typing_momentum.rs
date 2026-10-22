@@ -89,6 +89,7 @@ impl TypingMomentum {
     /// One non-delete printable typing advance (forward glyph echo, wrap,
     /// coalesced multi-glyph echo). Decays to `now`, then credits
     /// `RATE × min(gap, CREDIT_CAP_S)`.
+    #[inline]
     pub fn advance(&mut self, now: Instant) {
         let gap = self.at.map_or(TYPING_MOMENTUM_CREDIT_CAP_S, |at| {
             now.saturating_duration_since(at).as_secs_f32()
@@ -100,6 +101,7 @@ impl TypingMomentum {
 
     /// One backspace: never builds, mildly drains, and re-stamps the clock, so
     /// deletes cannot launder accrual time.
+    #[inline]
     pub fn delete(&mut self, now: Instant) {
         self.value = (self.value(now) - TYPING_MOMENTUM_DELETE_DRAIN).max(0.0);
         self.at = Some(now);
@@ -107,6 +109,7 @@ impl TypingMomentum {
 
     /// One kill chord (Ctrl-K/U/W, Alt-D, forward Delete, word-backspace):
     /// drains [`TYPING_MOMENTUM_KILL_DRAIN`].
+    #[inline]
     pub fn kill(&mut self, now: Instant) {
         self.value = (self.value(now) - TYPING_MOMENTUM_KILL_DRAIN).max(0.0);
         self.at = Some(now);
@@ -130,6 +133,7 @@ impl TypingMomentum {
     /// `stamp + τ·ln(v/threshold)`, or the stamp when already at/below it;
     /// `None` while unstamped. Correct even when frames arrive late.
     #[must_use]
+    #[inline]
     pub fn low_crossing(&self, threshold: f32) -> Option<Instant> {
         let at = self.at?;
         if self.value <= threshold {
@@ -145,6 +149,7 @@ impl TypingMomentum {
     /// millisecond past the analytic boundary covers its strict `<` and f32
     /// rounding.
     #[must_use]
+    #[inline]
     pub fn reading_low_crossing(&self, threshold: f32) -> Option<Instant> {
         debug_assert!(threshold.is_finite() && (0.0..=1.0).contains(&threshold));
         let at = self.at?;

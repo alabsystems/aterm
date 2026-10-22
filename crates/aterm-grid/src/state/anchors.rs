@@ -34,12 +34,14 @@ pub struct AnchorId(u16);
 impl AnchorId {
     /// The slot index (a checkpoint carries it).
     #[must_use]
+    #[inline]
     pub const fn index(self) -> u16 {
         self.0
     }
 
     /// The anchor in slot `index`, as a checkpoint names it.
     #[must_use]
+    #[inline]
     pub const fn from_index(index: u16) -> Self {
         Self(index)
     }
@@ -89,33 +91,35 @@ impl AnchorSet {
     /// No anchor lives: every hook returns at once.
     #[must_use]
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.live == 0
     }
 
     /// How many anchors live.
     #[must_use]
-    pub fn live_count(&self) -> usize {
-        usize::from(self.live)
+    #[inline]
+    pub const fn live_count(&self) -> usize {
+        self.live as usize
     }
 
     /// Some motion moved rows no anchor rule describes since the fence last
     /// cleared this ([`Self::clear_lost`]).
     #[must_use]
     #[inline]
-    pub fn lost(&self) -> bool {
+    pub const fn lost(&self) -> bool {
         self.lost
     }
 
     /// The fence absorbed the loss (it tainted every mark holding an anchor).
-    pub fn clear_lost(&mut self) {
+    #[inline]
+    pub const fn clear_lost(&mut self) {
         self.lost = false;
     }
 
     /// The seal epoch (see the type doc).
     #[must_use]
     #[inline]
-    pub fn seal_epoch(&self) -> u64 {
+    pub const fn seal_epoch(&self) -> u64 {
         self.seal_epoch
     }
 
@@ -161,6 +165,7 @@ impl AnchorSet {
 
     /// The live anchor in `id`, if any.
     #[must_use]
+    #[inline]
     pub fn get(&self, id: AnchorId) -> Option<Anchor> {
         self.anchors
             .get(usize::from(id.0))
@@ -171,12 +176,14 @@ impl AnchorSet {
     /// The live anchor's row (`None` for a freed or unknown slot, which a
     /// reader treats as lost).
     #[must_use]
+    #[inline]
     pub fn row(&self, id: AnchorId) -> Option<u64> {
         self.get(id).map(|a| a.row)
     }
 
     /// Move a live anchor to `row` (the fence re-anchoring a span on a full
     /// clear). `false` for a freed slot.
+    #[inline]
     pub fn set_row(&mut self, id: AnchorId, row: u64) -> bool {
         match self.anchors.get_mut(usize::from(id.0)) {
             Some(a) if a.live => {
@@ -189,6 +196,7 @@ impl AnchorSet {
 
     /// Every slot, live or not, in slot order (a checkpoint's projection).
     #[must_use]
+    #[inline]
     pub fn slots(&self) -> &[Anchor] {
         &self.anchors
     }
@@ -290,7 +298,8 @@ impl AnchorSet {
 
     /// Rows moved in a way no anchor rule describes (a rectangle copy or
     /// shift, a reset, a rotation of rows below history).
-    pub(crate) fn lose(&mut self) {
+    #[inline]
+    pub(crate) const fn lose(&mut self) {
         if self.live > 0 {
             self.lost = true;
             self.seal_epoch = self.seal_epoch.wrapping_add(1);
@@ -307,6 +316,7 @@ impl AnchorSet {
             project = "aterm_core::terminal::holder_fence_conformance::project"
         )
     )]
+    #[inline]
     pub(crate) fn lose_renumbered(&mut self) {
         if !knob(FenceKnob::UnlentRenumberKeeps) {
             self.lose();
@@ -315,7 +325,8 @@ impl AnchorSet {
 
     /// Rows were re-keyed under a seal without moving an anchor: history
     /// revealed back onto the screen, or a lend returned.
-    pub(crate) fn note_rekeyed(&mut self) {
+    #[inline]
+    pub(crate) const fn note_rekeyed(&mut self) {
         if self.live > 0 {
             self.seal_epoch = self.seal_epoch.wrapping_add(1);
         }
@@ -323,6 +334,7 @@ impl AnchorSet {
 
     /// Take every anchor out for a lend, leaving an empty set behind (so the
     /// hooks the lent operation runs touch nothing) that keeps the epoch.
+    #[inline]
     pub(crate) fn take_for_lend(&mut self) -> Self {
         let epoch = self.seal_epoch;
         let taken = std::mem::take(self);
@@ -331,18 +343,21 @@ impl AnchorSet {
     }
 
     /// Mutable access to every live anchor, for the lend's return.
+    #[inline]
     pub(crate) fn live_mut(&mut self) -> impl Iterator<Item = (usize, &mut Anchor)> {
         self.anchors.iter_mut().enumerate().filter(|(_, a)| a.live)
     }
 
     /// Mark the set lost unconditionally on the lend's return (the rewrap
     /// could not be verified).
-    pub(crate) fn lose_lent(&mut self) {
+    #[inline]
+    pub(crate) const fn lose_lent(&mut self) {
         self.lose();
     }
 
     /// Bump the seal epoch on the lend's return.
-    pub(crate) fn rekey_lent(&mut self) {
+    #[inline]
+    pub(crate) const fn rekey_lent(&mut self) {
         self.note_rekeyed();
     }
 }

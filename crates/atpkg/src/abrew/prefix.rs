@@ -947,6 +947,12 @@ impl Lock {
         Self::within(prefix, std::time::Duration::from_secs(60))
     }
 
+    /// The lock only if free right now: diagnostics must never wait
+    /// behind (or fail because of) a live writer they exist to diagnose.
+    pub fn try_acquire(prefix: &Prefix) -> Option<Lock> {
+        Self::within(prefix, std::time::Duration::ZERO).ok()
+    }
+
     fn within(prefix: &Prefix, limit: std::time::Duration) -> Result<Lock, String> {
         prefix.ensure()?;
         // Claim the legacy rendezvous first: checking it only after the

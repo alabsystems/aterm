@@ -653,6 +653,7 @@ impl Swapchain {
     }
 
     /// The device-loss latch this swapchain answers to.
+    #[inline]
     pub(crate) const fn latch(&self) -> &Arc<loss::LossLatch> {
         &self.latch
     }
@@ -769,6 +770,7 @@ pub(crate) struct Frame<'sc> {
 impl Frame<'_> {
     /// The drawable's texture: the render-pass colour attachment (and, when
     /// the layer is not `framebufferOnly`, a legal blit source for readback).
+    #[inline]
     pub(crate) const fn texture(&self) -> &Obj {
         &self.texture
     }

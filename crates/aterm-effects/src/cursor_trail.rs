@@ -208,6 +208,7 @@ fn lerp_u32(a: u32, b: u32, q: f32) -> u32 {
 /// Fingerprint the exact trail presentation handed to the renderer. Colour is folded only
 /// while a cell is visible (`0 == idle`); the sentinel bit keeps a black colour from folding to
 /// nothing.
+#[inline]
 fn trail_presentation_fingerprint(cells: &[TrailCell], color: u32) -> u64 {
     let mut fp: u64 = 0;
     for cell in cells {
@@ -230,6 +231,7 @@ fn trail_presentation_fingerprint(cells: &[TrailCell], color: u32) -> u64 {
 /// only new sparks; this attenuates every live cell uniformly without touching engine state,
 /// so a recovery reveals the still-decaying bed. Non-finite input fails closed.
 #[must_use]
+#[inline]
 pub fn project_trail_presentation(cells: &mut Vec<TrailCell>, color: u32, opacity: f32) -> u64 {
     if cells.is_empty() {
         return 0;
@@ -417,6 +419,7 @@ impl CursorTrail {
     /// two render callbacks. One or two cells fit the typed classifier; a
     /// larger batch uses the generic morphology so three typed cells are not
     /// mistaken for a repaint teleport.
+    #[inline]
     pub fn note_typed_batch(&mut self, now: Instant, keys: u32) {
         if keys == 0 {
             return;
@@ -454,6 +457,7 @@ impl CursorTrail {
     /// Stamp the focused pane's exact columns in the coordinate space handed
     /// to [`Self::tick`]. This changes morphology only; the normal fresh key
     /// license remains mandatory at [`Self::spawn`].
+    #[inline]
     pub fn note_pane_columns(&mut self, first_col: u16, cols: usize) {
         self.pane_columns = u16::try_from(cols)
             .ok()
@@ -511,6 +515,7 @@ impl CursorTrail {
 
     /// Explicit test/preview driver for a deliberately scripted move.
     #[doc(hidden)]
+    #[inline]
     pub fn note_synthetic_move(&mut self, now: Instant) {
         self.note_move(now);
     }
@@ -518,6 +523,7 @@ impl CursorTrail {
     /// Scripted typed-move twin for previews, examples and benchmarks that
     /// deliberately exercise the typing classifier without a live terminal.
     #[doc(hidden)]
+    #[inline]
     pub fn note_synthetic_typed(&mut self, now: Instant) {
         self.note_typed(now);
     }
@@ -525,18 +531,21 @@ impl CursorTrail {
     /// Delivery re-stamp for the generic move slot (a queued Enter's [`Self::note_return`], a
     /// queued Tab's or ⌃V's [`Self::note_user_gesture`]): the licence revoked at enqueue is put
     /// back at the writer's completed write (`CursorGlow::note_delivered`'s twin).
+    #[inline]
     pub fn note_move_delivered(&mut self, at: Instant) {
         self.move_hint = Some(at);
     }
 
     /// The nav-slot twin of [`Self::note_move_delivered`]: a queued
     /// navigation key's licence, put back at delivery.
+    #[inline]
     pub fn note_motion_delivered(&mut self, at: Instant) {
         self.nav_hint = Some(at);
     }
 
     /// Cancel only the license written by one not-yet-egressed dispatch. See
     /// `CursorGlow::revoke_input_hints_at` for the host contract.
+    #[inline]
     pub fn revoke_input_hints_at(&mut self, at: Instant) {
         self.type_hint.revoke_at(at);
         for hint in [&mut self.nav_hint, &mut self.move_hint] {
@@ -548,6 +557,7 @@ impl CursorTrail {
 
     /// PTY scroll translation (see `CursorGlow::note_scroll`): every live terminal-coordinate
     /// member moves up `rows`; anything pushed above row 0 retires rather than clamping.
+    #[inline]
     pub fn note_scroll(&mut self, rows: u16) {
         if rows == 0 {
             return;
@@ -559,6 +569,7 @@ impl CursorTrail {
     /// `crate::cursor_glow::band_row`): members on rows `top..=bottom` move by
     /// `delta`, members outside stay, and one carried past the band edge is
     /// retired rather than clamped. Both engines must agree on the replay.
+    #[inline]
     pub fn note_band_move(&mut self, top: u16, bottom: u16, delta: i16) {
         if delta == 0 || top > bottom {
             return;
@@ -568,6 +579,7 @@ impl CursorTrail {
 
     /// Move every live terminal-coordinate member (classifier anchors and sparks) through
     /// `map`; `None` retires the member.
+    #[inline]
     fn remap_rows(&mut self, map: impl Fn(u16) -> Option<u16>) {
         self.last = self
             .last
@@ -593,6 +605,7 @@ impl CursorTrail {
     /// Drop the in-flight comet and forget the last cursor position (twin of
     /// [`crate::cursor_glow::CursorGlow::reset`]), used when the cursor's
     /// coordinate space changes.
+    #[inline]
     pub fn reset(&mut self) {
         self.sparks.clear();
         self.spawn_path.clear();
@@ -921,6 +934,7 @@ pub struct CadenceParams {
 }
 
 impl Default for CadenceParams {
+    #[inline]
     fn default() -> Self {
         Self {
             gain: 1.0,
@@ -974,6 +988,7 @@ pub struct TypingCadence {
 }
 
 impl Default for TypingCadence {
+    #[inline]
     fn default() -> Self {
         Self::new(CadenceParams::default())
     }
@@ -982,7 +997,8 @@ impl Default for TypingCadence {
 impl TypingCadence {
     /// A cold tracker (no heat) with the given tunables.
     #[must_use]
-    pub fn new(params: CadenceParams) -> Self {
+    #[inline]
+    pub const fn new(params: CadenceParams) -> Self {
         Self {
             params,
             heat: 0.0,
@@ -992,6 +1008,7 @@ impl TypingCadence {
 
     /// Register one keystroke at `now`: decay the standing heat to `now`, then add one `gain`
     /// quantum, capped at `knee_hi` so a long hold saturates and decays predictably.
+    #[inline]
     pub fn on_keystroke(&mut self, now: Instant) {
         if let Some(last) = self.last {
             let dt = now.saturating_duration_since(last);

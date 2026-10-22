@@ -44,6 +44,7 @@ pub(crate) enum ShaderLibrary {
 
 impl ShaderLibrary {
     /// The library's short name — the `.metal` file stem.
+    #[inline]
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -88,6 +89,7 @@ pub(crate) enum Factor {
 
 impl Factor {
     /// The `wgpu` spelling.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::BlendFactor {
         match self {
@@ -110,6 +112,7 @@ pub(crate) enum BlendOp {
 
 impl BlendOp {
     /// The `wgpu` spelling.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::BlendOperation {
         match self {
@@ -166,6 +169,7 @@ impl BlendComponent {
     };
 
     /// The `wgpu` spelling.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::BlendComponent {
         wgpu::BlendComponent {
@@ -219,6 +223,7 @@ impl Blend {
 
     /// Whether this state is fixed-function REPLACE — i.e. `src*1 + dst*0` on
     /// both halves, which is arithmetically identical to no blending at all.
+    #[inline]
     #[cfg(any(target_os = "macos", gl_arm))]
     pub(crate) const fn is_replace(self) -> bool {
         matches!(
@@ -242,6 +247,7 @@ impl Blend {
     }
 
     /// The `wgpu` spelling.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::BlendState {
         wgpu::BlendState {
@@ -264,6 +270,7 @@ pub(crate) enum WriteMask {
 
 impl WriteMask {
     /// The `wgpu` spelling.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::ColorWrites {
         match self {
@@ -312,6 +319,7 @@ pub(crate) struct TargetFormats {
 #[cfg(wgpu_arm)]
 impl TargetFormats {
     /// The same formats, now also able to satisfy [`TargetRole::Present`].
+    #[inline]
     pub(crate) const fn with_present(self, format: wgpu::TextureFormat) -> Self {
         Self {
             present: Some(format),
@@ -324,6 +332,7 @@ impl TargetFormats {
     /// # Panics
     /// If `role` is [`TargetRole::Present`] and no destination format was
     /// supplied (a construction-time programming error).
+    #[inline]
     pub(crate) fn resolve(self, role: TargetRole) -> wgpu::TextureFormat {
         match role {
             TargetRole::OffscreenSrgb => self.offscreen_srgb,
@@ -350,6 +359,7 @@ pub(crate) enum Topology {
 #[cfg(any(wgpu_arm, gl_arm, test))]
 impl Topology {
     /// The `wgpu` spelling.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::PrimitiveTopology {
         match self {
@@ -400,6 +410,7 @@ pub(crate) enum AttrFormat {
 
 impl AttrFormat {
     /// The `wgpu` spelling.
+    #[inline]
     #[cfg(wgpu_arm)]
     pub(crate) const fn wgpu(self) -> wgpu::VertexFormat {
         match self {
@@ -608,6 +619,7 @@ pub(crate) const FX_LAYOUT: VertexLayoutSpec = VertexLayoutSpec {
 
 impl VertexLayout {
     /// The layout's stride + attributes, or `None` for a vertex-id-only pass.
+    #[inline]
     #[cfg(any(target_os = "macos", gl_arm))]
     pub(crate) const fn spec(self) -> Option<VertexLayoutSpec> {
         match self {
@@ -623,6 +635,7 @@ impl VertexLayout {
 }
 
 /// The `wgpu` spelling of one [`VertexAttr`].
+#[inline]
 #[cfg(wgpu_arm)]
 const fn wgpu_attr(a: VertexAttr) -> wgpu::VertexAttribute {
     wgpu::VertexAttribute {
@@ -872,6 +885,7 @@ pub(crate) struct PipelineSpec {
 impl PipelineSpec {
     /// The wgpu colour-target state: blend and write mask over the format the
     /// row's [`TargetRole`] resolves to.
+    #[inline]
     #[cfg(wgpu_arm)]
     fn wgpu_color_target(&self, targets: TargetFormats) -> wgpu::ColorTargetState {
         wgpu::ColorTargetState {
@@ -882,8 +896,9 @@ impl PipelineSpec {
     }
 
     /// The `wgpu` vertex-buffer list — `&[]` for a `[[vertex_id]]`-only pass.
+    #[inline]
     #[cfg(wgpu_arm)]
-    fn wgpu_vertex_buffers(&self) -> &'static [wgpu::VertexBufferLayout<'static>] {
+    const fn wgpu_vertex_buffers(&self) -> &'static [wgpu::VertexBufferLayout<'static>] {
         match self.vertex {
             VertexLayout::None => &[],
             VertexLayout::Bg => &BG_BUFFERS,
@@ -897,6 +912,7 @@ impl PipelineSpec {
 
     /// The `wgpu` primitive state — the row's topology over `wgpu`'s defaults
     /// for everything else (no culling, CCW front face, fill mode).
+    #[inline]
     #[cfg(wgpu_arm)]
     fn wgpu_primitive(&self) -> wgpu::PrimitiveState {
         wgpu::PrimitiveState {
@@ -1354,12 +1370,14 @@ pub(crate) const ALL_PIPELINES: [Pipeline; PIPELINE_COUNT] = [
 impl Pipeline {
     /// This pipeline's row. [`PIPELINES`] is a `static`, so every lookup returns
     /// the same object.
-    pub(crate) fn spec(self) -> &'static PipelineSpec {
+    #[inline]
+    pub(crate) const fn spec(self) -> &'static PipelineSpec {
         &PIPELINES[self as usize]
     }
 
     /// The row's stable name — the enum variant, snake-cased, for test
     /// failure messages.
+    #[inline]
     #[cfg(all(test, any(target_os = "macos", gl_arm)))]
     pub(crate) const fn name(self) -> &'static str {
         match self {

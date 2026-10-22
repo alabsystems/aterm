@@ -1732,19 +1732,23 @@ impl FixtureWaits {
         }
     }
 
-    /// Until `pid` is neither readable as `birth`, nor a zombie, nor named by
-    /// a whole listing of our uid: reaped. A process still exiting reads as
-    /// nothing and is no zombie yet, but every listing names it until its exit
-    /// is done (a scan then reads it unsettled, `Unknown`: measured 10 of 667
-    /// runs of `spare::` beside the live spare suite; none of 1449 once this
-    /// waits, which outwaited such an exit 46 times).
+    /// Until `pid` is reaped: readable as another birth (its pid handed out
+    /// again), or unreadable, no zombie, and named by no whole listing of our
+    /// uid. A process still exiting (`P_WEXIT`, after its SIGKILL on a loaded
+    /// host) reads as nothing and is no zombie yet, but every listing names it
+    /// until its exit is done, and a scan then rightly reads it unsettled
+    /// (`Unknown`): waiting on the read alone let the escape fixtures scan
+    /// such a process (measured 10 of 667 runs of `spare::` beside the live
+    /// spare suite; none of 1449 once this waits, which outwaited such an
+    /// exit 46 times).
     fn gone(&self, pid: i32, birth: u64) {
         // SAFETY: `getuid` is a side-effect-free getter.
         let uid = unsafe { libc::getuid() };
-        while bsdinfo_uniq(pid).is_some_and(|i| i.p_uniqueid == birth)
-            || exited(pid)
-            || !uid_pids(uid).is_some_and(|pids| !pids.contains(&pid))
-        {
+        let reaped = || match bsdinfo_uniq(pid) {
+            Some(info) => info.p_uniqueid != birth,
+            None => !exited(pid) && uid_pids(uid).is_some_and(|pids| !pids.contains(&pid)),
+        };
+        while !reaped() {
             assert!(Instant::now() < self.give_up, "{pid} was never reaped");
             std::thread::sleep(Duration::from_millis(10));
         }

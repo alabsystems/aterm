@@ -335,15 +335,15 @@ mod live {
 
     impl Buses for Deadline {
         fn session(&mut self) -> aterm_dbus::Result<Connection> {
-            SessionBuses.session()
+            SessionBuses::default().session()
         }
 
         fn open(&mut self, address: &str) -> aterm_dbus::Result<Connection> {
-            SessionBuses.open(address)
+            SessionBuses::default().open(address)
         }
 
         fn address_override(&self) -> Option<String> {
-            SessionBuses.address_override()
+            SessionBuses::default().address_override()
         }
 
         fn write_timeout(&self) -> Option<Duration> {
@@ -645,7 +645,7 @@ mod live {
         }
 
         let name = format!("aterm-a11y-live-{}", std::process::id());
-        let publisher = Publisher::start(SessionBuses, Some(name.clone()));
+        let publisher = Publisher::start(SessionBuses::default(), Some(name.clone()));
         let (tx, window_heard) = mpsc::channel();
         let mut adapter = publisher.adapter(Window(tx.clone()), Window(tx.clone()), Window(tx));
         assert_eq!(heard(&window_heard), Heard::Activated);

@@ -41,8 +41,8 @@ const COAT_SALT: u64 = 0x646f_6721_636f_6174; // b"dog!coat"
 /// Reduce a mixed seed onto `[0, upper)` with multiply-high (constant-time,
 /// rejection-free, bias at most one part in 2^64).
 #[inline]
-fn scale(entropy: u64, upper: usize) -> usize {
-    ((u128::from(entropy) * upper as u128) >> 64) as usize
+const fn scale(entropy: u64, upper: usize) -> usize {
+    ((entropy as u128 * upper as u128) >> 64) as usize
 }
 
 /// One visit's rolled identity: which authored breed, wearing which
@@ -69,6 +69,7 @@ impl DogCameo {
     /// Summon a dog: roll a breed + coat from `seed` and restart the envelope.
     /// While a dog is visible the roll excludes the resident breed. A no-op on
     /// an empty roster.
+    #[inline]
     pub fn on_summon(&mut self, now: Instant, seed: u64) {
         if DOG_HEADS.is_empty() {
             return;
@@ -99,6 +100,7 @@ impl DogCameo {
 
     /// The visit's presence envelope at `now`: `0..=255` through fade-in →
     /// hold → fade-out, `0` before the first summon and after expiry.
+    #[inline]
     #[must_use]
     pub fn alpha(&self, now: Instant) -> u8 {
         let Some(at) = self.since else {
@@ -120,6 +122,7 @@ impl DogCameo {
 
     /// The entry bounce at `now`, in cell fractions (`<= 0`: up): two damped
     /// hops, then flat. Under reduced motion the host does not call this.
+    #[inline]
     #[must_use]
     pub fn bob(&self, now: Instant) -> f32 {
         let Some(at) = self.since else {

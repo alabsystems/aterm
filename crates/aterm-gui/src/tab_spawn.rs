@@ -1820,20 +1820,27 @@ impl App {
                         let installed = match place {
                             SpawnPlace::Tab => {
                                 // A background tab lands behind the tab active
-                                // NOW, which is selected again once it is in.
+                                // NOW, which is selected again before the window
+                                // is re-mirrored, so its front never moves.
                                 let kept = background
                                     .then(|| self.windows.get(&window)?.tab_set.active_index())
                                     .flatten();
-                                self.install_tab_session(window, session, parent);
+                                match kept {
+                                    Some(index) => {
+                                        self.install_tab_session_behind(
+                                            window, session, parent, index,
+                                        );
+                                    }
+                                    None => self.install_tab_session(window, session, parent),
+                                }
                                 // The window re-gridded (a resize, a font zoom)
                                 // while the tab was in flight: those passes sized
                                 // only the panes it had, so size the newborn's
-                                // now, before its reader reads.
+                                // now, before its reader reads. Every tab's: one
+                                // that landed behind is not the active tab a live
+                                // drag's pass sizes.
                                 if grid.is_some_and(|grid| grid != self.spawn_grid(window)) {
-                                    self.resize_panes(window);
-                                }
-                                if let Some(index) = kept {
-                                    self.switch_tab_in(window, index);
+                                    self.resize_panes_scoped(window, false);
                                 }
                                 Ok(())
                             }
@@ -2433,6 +2440,61 @@ pub(crate) mod tests {
             !app.tab_spawns.summary_pending(),
             "closed host cancels the reservation"
         );
+    }
+
+    /// A tab that does not raise (a worker's `spawn`) lands behind the active one with
+    /// the window's front never moving: the program in front, DEC 1004 on, is told
+    /// nothing, and the newborn, which never held the keyboard, is told `ESC[O` once its
+    /// own program turns DEC 1004 on.
+    #[test]
+    fn a_tab_landing_behind_tells_the_front_nothing_and_the_newborn_it_is_unfocused() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let enable = |app: &mut App, id: u64| {
+            crate::term_lock(&app.pool.get(id).expect("landed").term).process(b"\x1b[?1004h");
+            app.on_output_wake(id, Instant::now());
+        };
+        let front = book(&mut app, wid, TabSpawnThen::Nothing);
+        let (session, front_pty) = piped_session(front);
+        assert!(app.install_spawned_tab(TabSpawned {
+            id: front,
+            window: wid,
+            session: Ok(session),
+            reader_gate: None
+        }));
+        enable(&mut app, front);
+        assert!(
+            drain(&front_pty).is_empty(),
+            "the focused program hears nothing"
+        );
+
+        let behind = book(&mut app, wid, TabSpawnThen::Nothing);
+        app.tab_spawns
+            .in_flight
+            .last_mut()
+            .expect("booked")
+            .background = true;
+        let (session, behind_pty) = piped_session(behind);
+        assert!(app.install_spawned_tab(TabSpawned {
+            id: behind,
+            window: wid,
+            session: Ok(session),
+            reader_gate: None
+        }));
+        assert_eq!(app.windows[&wid].tab_set.len(), 3, "the tab is in");
+        assert_eq!(
+            app.focused_session_id(wid),
+            Some(front),
+            "it landed behind the front"
+        );
+        assert!(
+            drain(&front_pty).is_empty(),
+            "the front's focus never moved: no ESC[O, ESC[I pair"
+        );
+
+        enable(&mut app, behind);
+        assert_eq!(drain(&behind_pty), b"\x1b[O", "the newborn is unfocused");
+        assert!(drain(&front_pty).is_empty());
     }
 
     /// [`book`] for a split of `wid`'s focused pane in `dir`.

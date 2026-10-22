@@ -15,14 +15,16 @@ use super::*;
 /// [`CursorGlow::note_band_move`].
 #[inline]
 #[must_use]
-pub fn band_row(row: u16, top: u16, bottom: u16, delta: i16) -> Option<u16> {
-    if !(top..=bottom).contains(&row) {
+pub const fn band_row(row: u16, top: u16, bottom: u16, delta: i16) -> Option<u16> {
+    if row < top || row > bottom {
         return Some(row);
     }
-    let moved = i32::from(row) + i32::from(delta);
-    (i32::from(top)..=i32::from(bottom))
-        .contains(&moved)
-        .then_some(moved as u16)
+    let moved = row as i32 + delta as i32;
+    if moved >= top as i32 && moved <= bottom as i32 {
+        Some(moved as u16)
+    } else {
+        None
+    }
 }
 
 /// [`band_row`] for a position rather than a mark (the caret, the cell the last
@@ -30,12 +32,18 @@ pub fn band_row(row: u16, top: u16, bottom: u16, delta: i16) -> Option<u16> {
 /// band's edge saturates at that edge.
 #[inline]
 #[must_use]
-pub fn band_pos(row: u16, top: u16, bottom: u16, delta: i16) -> u16 {
-    if !(top..=bottom).contains(&row) {
+pub const fn band_pos(row: u16, top: u16, bottom: u16, delta: i16) -> u16 {
+    if row < top || row > bottom {
         return row;
     }
-    let moved = (i32::from(row) + i32::from(delta)).clamp(i32::from(top), i32::from(bottom));
-    moved as u16
+    let moved = row as i32 + delta as i32;
+    if moved < top as i32 {
+        top
+    } else if moved > bottom as i32 {
+        bottom
+    } else {
+        moved as u16
+    }
 }
 
 /// [`band_row`] for the pixel-addressed pools (starfield, landing ring, fire
@@ -55,28 +63,29 @@ pub struct BandPx {
 impl BandPx {
     /// The band `top..=bottom` by `delta` rows, on a grid of `cell_h` px rows
     /// whose interior starts `origin_y` px down the window.
+    #[inline]
     #[must_use]
-    pub fn new(top: u16, bottom: u16, delta: i16, cell_h: u16, origin_y: u16) -> Self {
-        let ch = f32::from(cell_h);
-        let oy = f32::from(origin_y);
+    pub const fn new(top: u16, bottom: u16, delta: i16, cell_h: u16, origin_y: u16) -> Self {
+        let ch = cell_h as f32;
+        let oy = origin_y as f32;
         Self {
-            y_lo: oy + f32::from(top) * ch,
-            y_hi: oy + (f32::from(bottom) + 1.0) * ch,
-            dy: f32::from(delta) * ch,
+            y_lo: oy + top as f32 * ch,
+            y_hi: oy + (bottom as f32 + 1.0) * ch,
+            dy: delta as f32 * ch,
         }
     }
 
     /// Whether a window-absolute `y` lies in the rows that moved.
     #[inline]
     #[must_use]
-    pub fn inside(&self, y: f32) -> bool {
-        (self.y_lo..self.y_hi).contains(&y)
+    pub const fn inside(&self, y: f32) -> bool {
+        y >= self.y_lo && y < self.y_hi
     }
 
     /// A point: moved iff inside, kept iff still inside; outside, untouched and
     /// kept. Returns the `retain` verdict.
     #[inline]
-    pub fn point(&self, y: &mut f32) -> bool {
+    pub const fn point(&self, y: &mut f32) -> bool {
         if !self.inside(*y) {
             return true;
         }
@@ -88,7 +97,7 @@ impl BandPx {
     /// still inside; neither inside, untouched and kept; one inside, dropped.
     /// Returns the `retain` verdict.
     #[inline]
-    pub fn span(&self, y0: &mut f32, y1: &mut f32) -> bool {
+    pub const fn span(&self, y0: &mut f32, y1: &mut f32) -> bool {
         match (self.inside(*y0), self.inside(*y1)) {
             (false, false) => true,
             (true, true) => {
@@ -145,7 +154,8 @@ impl CursorGlow {
     /// Drop the echo-anchor row memory. It names absolute rows, so it is dropped,
     /// not translated, whenever those rows change content or coordinate space (a
     /// scroll, a band move, a reset).
-    pub(super) fn forget_anchor_rows(&mut self) {
+    #[inline]
+    pub(super) const fn forget_anchor_rows(&mut self) {
         self.anchor_rows = [None; ANCHOR_ROWS];
         self.last_anchor_sweep = None;
     }
@@ -298,6 +308,7 @@ impl CursorGlow {
     /// Whether input still owes an echo: a typed stamp, an unpaid typed cell,
     /// or an erase whose retreat is still owed. This sustains an existing
     /// hand through a content-proved row move; it grants no movement licence.
+    #[inline]
     pub(super) fn key_in_flight(&self, now: Instant) -> bool {
         self.type_hint.any_fresh(now, Self::TYPE_HINT_FRESH)
             || self.type_press_ring.any_within(now)

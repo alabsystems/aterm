@@ -41,7 +41,7 @@ pub const MAGIC_SALT: u64 = 0x5EED_CA71_5EED_CA71;
 
 /// splitmix64 finalizer — decorrelates adjacent seeds and never returns 0.
 #[inline]
-pub fn mix(seed: u64) -> u64 {
+pub const fn mix(seed: u64) -> u64 {
     let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -62,6 +62,7 @@ const FORM_WEIGHT: i32 = 3;
 pub struct VoteScratch(pub [i32; 64]);
 
 impl Default for VoteScratch {
+    #[inline]
     fn default() -> Self {
         Self([0; 64])
     }
@@ -314,6 +315,7 @@ fn csa(a: u64, b: u64, c: u64) -> (u64, u64) {
 /// Bit-sliced majority via the carry-save adder network. Equals
 /// `simhash_majority_reference` on every input (the certificate and the 10k-set
 /// battery below).
+#[inline]
 pub fn simhash_majority_bitsliced(v: &VoterSet) -> u64 {
     // Masked lanes: an absent voter contributes no set bits (and, below, no
     // weight to W) — exactly the reference's "does not vote".
@@ -367,6 +369,7 @@ pub fn simhash_majority_bitsliced(v: &VoterSet) -> u64 {
 /// Collect the voter set for a match span: the same walk, filter and hash as
 /// [`simhash_ctx_reference`] (via [`token_vote_hash`]), materialized instead of
 /// cast.
+#[inline]
 fn collect_ctx_voters(
     chars: &[char],
     start: usize,
@@ -438,7 +441,7 @@ pub const fn gray_decode(mut g: u64) -> u64 {
 /// §3.3 field extractor, verbatim: the `n`-bit field of `gkey` at bit `lo`,
 /// inverse-Gray decoded. No flip ever crosses a field boundary.
 #[inline]
-pub fn field(gkey: u64, lo: u32, n: u32) -> u64 {
+pub const fn field(gkey: u64, lo: u32, n: u32) -> u64 {
     gray_decode((gkey >> lo) & ((1u64 << n) - 1))
 }
 
@@ -462,7 +465,7 @@ pub enum CatAge {
 impl CatAge {
     /// §3.4 body scale: 0.82 / 0.93 / 1.04 / 1.15.
     #[inline]
-    pub fn scale(self) -> f32 {
+    pub const fn scale(self) -> f32 {
         match self {
             CatAge::Kitten => 0.82,
             CatAge::Adolescent => 0.93,
@@ -507,7 +510,7 @@ pub struct NovaFeatures {
 
 /// §3.4 NOVA layout decode.
 #[inline]
-pub fn nova_features(g: u64) -> NovaFeatures {
+pub const fn nova_features(g: u64) -> NovaFeatures {
     NovaFeatures {
         palette: field(g, 0, 3) as u8,
         rays: 5 + field(g, 3, 2) as u8,
@@ -528,19 +531,19 @@ pub fn nova_features(g: u64) -> NovaFeatures {
 /// expressions match the rows above and are pinned bit-for-bit by
 /// `nova_single_field_accessors_match_full_decode`.
 #[inline]
-pub fn nova_duration_ms(g: u64) -> u32 {
+pub const fn nova_duration_ms(g: u64) -> u32 {
     1000 + field(g, 9, 2) as u32 * 400 / 3
 }
 
 /// See [`nova_duration_ms`]: the `palette` row of [`nova_features`], alone.
 #[inline]
-pub fn nova_palette(g: u64) -> u8 {
+pub const fn nova_palette(g: u64) -> u8 {
     field(g, 0, 3) as u8
 }
 
 /// See [`nova_duration_ms`]: the `radius` row of [`nova_features`], alone.
 #[inline]
-pub fn nova_radius(g: u64) -> f32 {
+pub const fn nova_radius(g: u64) -> f32 {
     1.6 + field(g, 5, 2) as f32 * 0.2
 }
 
@@ -583,7 +586,7 @@ pub enum NovaMagic {
 /// §3.5 cat window. Cats consume the LOW window; a genome is never two magics
 /// at once because novas read the shifted window and the classes are disjoint.
 #[inline]
-pub fn cat_magic(magic: u64) -> Option<CatMagic> {
+pub const fn cat_magic(magic: u64) -> Option<CatMagic> {
     match magic % 4096 {
         0..=7 => Some(CatMagic::Fortune),
         8..=11 => Some(CatMagic::Nebula),
@@ -597,7 +600,7 @@ pub fn cat_magic(magic: u64) -> Option<CatMagic> {
 
 /// §3.5 nova window (shifted 12 bits so it is independent of the cat window).
 #[inline]
-pub fn nova_magic(magic: u64) -> Option<NovaMagic> {
+pub const fn nova_magic(magic: u64) -> Option<NovaMagic> {
     match (magic >> 12) % 4096 {
         0..=7 => Some(NovaMagic::Quasar),
         8..=11 => Some(NovaMagic::Singularity),
@@ -655,8 +658,8 @@ pub fn cat_accessory(magic: u64) -> Option<Accessory> {
 /// Reduce the 30-bit head-spill field onto `[0, upper)` by multiply-high:
 /// constant-time, allocation-free, discrepancy at most one ticket in 2^30.
 #[inline]
-fn scale_head_spill(entropy: u64, upper: usize) -> usize {
-    ((u128::from(entropy) * upper as u128) >> 30) as usize
+const fn scale_head_spill(entropy: u64, upper: usize) -> usize {
+    ((entropy as u128 * upper as u128) >> 30) as usize
 }
 
 /// The authored head this genome wears. The largest complete multiple of the
@@ -665,7 +668,7 @@ fn scale_head_spill(entropy: u64, upper: usize) -> usize {
 /// so coat, iris, age, motion and ink fields cannot change the head. No loop or
 /// rejection.
 #[inline]
-fn cat_variant_index_v4(gkey: u64) -> usize {
+const fn cat_variant_index_v4(gkey: u64) -> usize {
     let roster = HEADS.len();
     let ticket = field(gkey, 0, 6) as usize;
     let primary = 64 - 64 % roster;
@@ -679,7 +682,7 @@ fn cat_variant_index_v4(gkey: u64) -> usize {
 /// v4 §3: resolve the bounded unbiased head index to its authored glyph.
 #[inline]
 #[must_use]
-pub fn cat_variant_v4(gkey: u64) -> CatGlyphId {
+pub const fn cat_variant_v4(gkey: u64) -> CatGlyphId {
     HEADS[cat_variant_index_v4(gkey)]
 }
 
@@ -688,7 +691,7 @@ pub fn cat_variant_v4(gkey: u64) -> CatGlyphId {
 /// resolves them via `ResolvedFills::from_indices`.
 #[inline]
 #[must_use]
-pub fn cat_fills_v4(gkey: u64) -> (u8, u8) {
+pub const fn cat_fills_v4(gkey: u64) -> (u8, u8) {
     (field(gkey, 6, 4) as u8, field(gkey, 10, 3) as u8)
 }
 
@@ -696,7 +699,7 @@ pub fn cat_fills_v4(gkey: u64) -> (u8, u8) {
 /// size (0.82 / 0.93 / 1.04 / 1.15). Unchanged role from v2/v3.
 #[inline]
 #[must_use]
-pub fn cat_age_v4(gkey: u64) -> CatAge {
+pub const fn cat_age_v4(gkey: u64) -> CatAge {
     AGES[field(gkey, 13, 2) as usize]
 }
 
@@ -709,7 +712,7 @@ pub fn cat_age_v4(gkey: u64) -> CatAge {
 /// 4/4096 (1/1024) each in `8..=35`.
 #[inline]
 #[must_use]
-pub fn special_variant_v4(magic: u64) -> Option<CatGlyphId> {
+pub const fn special_variant_v4(magic: u64) -> Option<CatGlyphId> {
     match magic % 4096 {
         0..=7 => Some(CatGlyphId::SpecManeki),
         8..=11 => Some(CatGlyphId::SpecWitch),
@@ -731,7 +734,7 @@ pub fn special_variant_v4(magic: u64) -> Option<CatGlyphId> {
 /// (1/256).
 #[inline]
 #[must_use]
-pub fn accessory_variant_v4(magic: u64) -> Option<CatGlyphId> {
+pub const fn accessory_variant_v4(magic: u64) -> Option<CatGlyphId> {
     if special_variant_v4(magic).is_some() {
         return None;
     }

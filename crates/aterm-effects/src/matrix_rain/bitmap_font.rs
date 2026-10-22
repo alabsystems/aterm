@@ -529,6 +529,7 @@ static GLYPHS: [(u32, [u8; 8]); 499] = [
 
 /// The 8x8 bitmap for `c`, or `None` when no supported family covers it.
 #[must_use]
+#[inline]
 pub(crate) fn bitmap(c: char) -> Option<[u8; 8]> {
     let cp = c as u32;
     if (0x0021..=0x007E).contains(&cp) {

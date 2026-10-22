@@ -33,6 +33,7 @@ pub const HDR_GLOW_BOOST: f32 = 1.0;
 /// constants as the WGSL `s2l` (aterm-gpu `renderer.rs`) and the CPU blend helpers, so CPU and
 /// shader agree float-for-float. Input is clamped to `[0, 1]` first (NaN clamps to 0).
 #[must_use]
+#[inline]
 pub fn srgb_channel_to_linear(c: f32) -> f32 {
     let c = if c.is_nan() { 0.0 } else { c.clamp(0.0, 1.0) };
     if c <= 0.040_45 {
@@ -51,6 +52,7 @@ pub fn srgb_channel_to_linear(c: f32) -> f32 {
 /// and only the additive pass may exceed it. The WGSL twin (`fs_blit`'s `b.hdr` arm) applies
 /// the same decode and clamp.
 #[must_use]
+#[inline]
 pub fn hdr_grid_encode(b: u8) -> f32 {
     srgb_channel_to_linear(f32::from(b) / 255.0).clamp(0.0, 1.0)
 }
@@ -59,7 +61,8 @@ pub fn hdr_grid_encode(b: u8) -> f32 {
 /// non-finite or `< 1.0` (the unset per-window default `0.0`, macOS, an SDR desktop) means no
 /// scaling → `1.0`, the same rule as `WindowGpu::sdr_white_scale`.
 #[must_use]
-pub fn sanitize_sdr_white_scale(v: f32) -> f32 {
+#[inline]
+pub const fn sanitize_sdr_white_scale(v: f32) -> f32 {
     if v.is_finite() && v >= 1.0 { v } else { 1.0 }
 }
 
@@ -76,6 +79,7 @@ pub fn sanitize_sdr_white_scale(v: f32) -> f32 {
 /// reads an f16 swapchain at 80 nits = white with no `/scale`, so it shows this present lifted
 /// `scale×`; verify the EDR present with an FP16 capture instead.
 #[must_use]
+#[inline]
 pub fn scrgb_present_channel(b: u8, sdr_white_scale: f32) -> f32 {
     hdr_grid_encode(b) * sanitize_sdr_white_scale(sdr_white_scale)
 }
@@ -88,7 +92,8 @@ pub fn scrgb_present_channel(b: u8, sdr_white_scale: f32) -> f32 {
 /// `1.0 <= sanitize_edr_max(v) <= EDR_MAX_CAP` for every `f32`
 /// (`sanitize_edr_boundaries`: NaN, ±∞, ±0, subnormal, the extremes).
 #[must_use]
-pub fn sanitize_edr_max(v: f32) -> f32 {
+#[inline]
+pub const fn sanitize_edr_max(v: f32) -> f32 {
     if v.is_finite() && v >= 1.0 {
         v.min(EDR_MAX_CAP)
     } else {
@@ -102,7 +107,8 @@ pub fn sanitize_edr_max(v: f32) -> f32 {
 /// # Invariant (checked)
 /// `0.0 <= additive_headroom(v) <= EDR_MAX_CAP - 1.0` for every `f32`.
 #[must_use]
-pub fn additive_headroom(edr_max: f32) -> f32 {
+#[inline]
+pub const fn additive_headroom(edr_max: f32) -> f32 {
     sanitize_edr_max(edr_max) - 1.0
 }
 
@@ -117,7 +123,8 @@ pub fn additive_headroom(edr_max: f32) -> f32 {
 /// encode for every channel byte (`additive_encode_bounded_by_edr_lattice`); hence, under the
 /// One/One blend, a presented pixel is `<= 1.0 + headroom = edr_max`.
 #[must_use]
-pub fn clamp_add(x: f32, headroom: f32) -> f32 {
+#[inline]
+pub const fn clamp_add(x: f32, headroom: f32) -> f32 {
     x.min(headroom.max(0.0)).max(0.0)
 }
 
@@ -151,7 +158,8 @@ pub const SDR_GLOW_BUDGET_BASE: f32 = 0.35;
 // Not `.clamp()`: `f32::clamp` propagates NaN, and the min/max order below relies on
 // `f32::min`/`max` returning the other operand for NaN.
 #[allow(clippy::manual_clamp)]
-pub fn sdr_glow_budget(bg_luma: f32, strength: f32) -> f32 {
+#[inline]
+pub const fn sdr_glow_budget(bg_luma: f32, strength: f32) -> f32 {
     // NaN directions are deliberate: luma clamps min-first so NaN lands on 1.0 (rolloff 0,
     // budget 0); strength clamps max-first so NaN lands on 0.0. Either way a poisoned input
     // disables the boost.
@@ -184,6 +192,7 @@ pub const LIGHT_PAGE_LUMINANCE: f64 = 0.179_128_784_747_792;
     clippy::cast_possible_truncation,
     reason = "a share in 0..=1 narrowed to the strength's f32"
 )]
+#[inline]
 pub fn light_page_bloom_share(bg: u32) -> f32 {
     if crate::theme_is_dark(bg) {
         return 1.0;
@@ -199,7 +208,8 @@ pub fn light_page_bloom_share(bg: u32) -> f32 {
 /// Relative luma (`0..=1`, Rec.601 on the raw sRGB bytes) of a packed
 /// `0x00RRGGBB` colour — the SDR glow budget's background-darkness input.
 #[must_use]
-pub fn packed_luma(bg: u32) -> f32 {
+#[inline]
+pub const fn packed_luma(bg: u32) -> f32 {
     let r = ((bg >> 16) & 0xff) as f32;
     let g = ((bg >> 8) & 0xff) as f32;
     let b = (bg & 0xff) as f32;

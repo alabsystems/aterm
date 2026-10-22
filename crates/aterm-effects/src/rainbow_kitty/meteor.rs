@@ -1422,6 +1422,7 @@ pub struct SkyMask {
 
 impl SkyMask {
     /// Ask the probe about every cell a landing at `(x, y)` may light.
+    #[inline]
     #[must_use]
     fn probe(x: f32, y: f32, probe: &GlyphProbe, geom: Geom) -> Self {
         let (cw, ch) = ((geom.cw as f32).max(1.0), geom.ch as f32);
@@ -1519,6 +1520,7 @@ impl Landing {
     /// behind it, the pin, and the starburst only when `ring`; no flash, sparks or
     /// gold hero, since a bar line is a beat, not an impact. The fan's floor reach
     /// ([`FAN_REACH_BASE_CH`]) leaves with the sky's transient lives (≤ 315 ms).
+    #[inline]
     #[must_use]
     pub fn party(
         at: Instant,
@@ -1579,6 +1581,7 @@ impl Landing {
     /// The last instant any landing mark moves (pin, flash, burst, and each spark
     /// until its chroma cull); the cadence law's motion bound ([`Meteors::brisk`]).
     /// A floor landing is still by `T + 516`, an Enter's (pin only) by `T + 150`.
+    #[inline]
     #[must_use]
     pub fn moving_until(&self) -> Instant {
         let mut ms = PIN_MS;
@@ -1861,6 +1864,7 @@ impl Meteors {
     /// glyph clearance; the meteor never builds a `Star` (§5.7, D2). `ctx` must be
     /// the frame [`Meteors::emit`] just drew with; `Engine::tick` calls it right
     /// after.
+    #[inline]
     pub fn sow_into(&mut self, dust: &mut Stardust, ctx: &Ctx<'_>) {
         // The one sight of the probe: a new landing latches which cells its
         // flash and jets may light (`SkyMask`).
@@ -1897,6 +1901,7 @@ impl Meteors {
     /// retracting (§6.8's 460 ms), a retiring train (§6.9's 60 ms), or a landing
     /// still moving ([`Landing::moving_until`]). The host's train draws every frame
     /// of it (seam point 8). `false` under reduced motion (§6.11).
+    #[inline]
     #[must_use]
     pub fn brisk(&self, now: Instant) -> bool {
         if self.reduced {
@@ -1912,6 +1917,7 @@ impl Meteors {
     /// The attack, asked for every frame at [`super::FRAME_CADENCE`]: the flight,
     /// the pin's close with the white layer (`T .. T + 150`), and a retiring
     /// train's 60 ms finish (§6.9).
+    #[inline]
     fn attack(&self, now: Instant) -> bool {
         if self.reduced {
             return false;
@@ -2055,6 +2061,7 @@ impl Meteors {
     }
 
     /// Drop everything in the air.
+    #[inline]
     pub fn reset(&mut self) {
         self.live.clear();
         self.landings.clear();
@@ -2488,6 +2495,7 @@ enum Layer {
 }
 
 /// Emit §6.5's layers 1, 2 and 3.
+#[inline]
 fn draw_train(
     verts: &mut Vec<RibbonVertex>,
     m: &Meteor,
@@ -3443,6 +3451,7 @@ fn shed(m: &mut Meteor, f: &Flight, ctx: &Ctx<'_>, sown: &mut Vec<Sow>) {
 /// leftward spark vertical when the landing is the floor cell. The landing's row
 /// comes from the pixel endpoint, never [`Spawn::landing`], since a scroll moves
 /// the endpoint and leaves the cell behind (seam point 12).
+#[inline]
 #[must_use]
 fn spark_room(m: &Meteor, ctx: &Ctx<'_>, hand_floor: Option<(u16, u16)>) -> Option<f32> {
     let (row, col) = hand_floor?;

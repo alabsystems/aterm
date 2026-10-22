@@ -1236,8 +1236,10 @@ label_enum! {
         DevToolsHandOver => "devtools_hand_over",
         /// THE HARNESS CARD (`crate::claude_card`, design
         /// `docs/DESIGN-harness-autopilot-2026-10-15.md` §3): a frame ahead while
-        /// a card on show plays its episode, then one wake for the settled frame
-        /// it owes. A settled card, and a window off screen, arm nothing.
+        /// a card on show plays its intro, then, while it flows, one wake a step
+        /// of the ripple (the step's start plus `harness_card::FLOW_SLACK_MS`),
+        /// and one for the frame a card owes when a gate holds it. A held card,
+        /// and a window off screen, arm nothing.
         ClaudeCard => "claude_card",
         /// A transient theme preview's TTL (`theme preview … ttl=`,
         /// `crate::control_theme`): one wake at the instant the preview reverts to
@@ -1288,6 +1290,11 @@ label_enum! {
         /// when an unpinned hover lens's pointer has been gone 300 ms. No rest
         /// and no hover lens arm nothing.
         StatsLens => "stats_lens",
+        /// THE AGENTS PANEL's next frame (`crate::claude_panel`): a crest step of
+        /// a workflow bar's ripple while an agent runs, a stuck dot's breath
+        /// step (for at most a minute), or the fold's next turn of a dot's state;
+        /// a panel with nothing running, breathing or due arms nothing.
+        AgentsPanel => "agents_panel",
     }
 }
 

@@ -55,6 +55,7 @@ pub struct RainBaker {
 impl RainBaker {
     /// Per-tick prologue: a cell-metric change wholesale-restarts the bake
     /// (tiles of the old metric must never be sampled at the new one).
+    #[inline]
     pub fn begin_frame(&mut self, cell_w: u16, cell_h: u16) {
         if (cell_w, cell_h) == (self.cell_w, self.cell_h) {
             return;
@@ -66,6 +67,7 @@ impl RainBaker {
 
     /// Restart the bake from tile 0 (metric change / config rebuild). Keeps
     /// the buffer allocation when the size is unchanged.
+    #[inline]
     pub fn restart(&mut self) {
         let (cw, ch) = (usize::from(self.cell_w), usize::from(self.cell_h));
         self.rgba.clear();
@@ -80,7 +82,7 @@ impl RainBaker {
     /// Whether all 64 tiles are baked at the current metric.
     #[must_use]
     #[inline]
-    pub fn complete(&self) -> bool {
+    pub const fn complete(&self) -> bool {
         self.next_tile >= ROM_GLYPHS || self.cell_w == 0 || self.cell_h == 0
     }
 
@@ -108,7 +110,7 @@ impl RainBaker {
     /// case is excluded.
     #[must_use]
     #[inline]
-    pub fn can_rebake(&self) -> bool {
+    pub const fn can_rebake(&self) -> bool {
         self.cell_w != 0 && self.cell_h != 0 && self.next_tile >= ROM_GLYPHS
     }
 
@@ -142,12 +144,13 @@ impl RainBaker {
     /// Monotonic atlas version (folded into the frame fingerprint).
     #[must_use]
     #[inline]
-    pub fn version(&self) -> u64 {
+    pub const fn version(&self) -> u64 {
         self.version
     }
 
     /// The published atlas snapshot, rebuilt lazily after a bake batch.
     /// `None` until the first bake — rain-free frames carry no atlas.
+    #[inline]
     pub fn atlas(&mut self) -> Option<Arc<SceneAtlas>> {
         if self.dirty {
             self.published = Some(Arc::new(SceneAtlas {
@@ -164,11 +167,11 @@ impl RainBaker {
     /// Atlas texel origin of `glyph`'s tile (its rect is `cell_w × cell_h`).
     #[must_use]
     #[inline]
-    pub fn tile_origin(&self, glyph: u32) -> (u16, u16) {
+    pub const fn tile_origin(&self, glyph: u32) -> (u16, u16) {
         let g = glyph as usize % ROM_GLYPHS;
         (
-            ((g % RAIN_TILE_GRID) * usize::from(self.cell_w)) as u16,
-            ((g / RAIN_TILE_GRID) * usize::from(self.cell_h)) as u16,
+            ((g % RAIN_TILE_GRID) * self.cell_w as usize) as u16,
+            ((g / RAIN_TILE_GRID) * self.cell_h as usize) as u16,
         )
     }
 

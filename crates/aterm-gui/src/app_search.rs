@@ -429,6 +429,11 @@ fn comma_list(words: &[String]) -> String {
 /// consumers (the selection and the highlight-all tint) divide by the width.
 #[derive(Default)]
 pub(crate) struct SearchState {
+    /// A delayed clipboard reply belongs to this open field, even if a new
+    /// field in the same tab later has the same query. The reply retains the
+    /// allocation, so closing and reopening cannot reuse its identity.
+    #[cfg(any(target_os = "linux", all(test, unix)))]
+    paste_lifetime: std::sync::Arc<()>,
     pub(crate) query: String,
     /// Caret byte offset in [`Self::query`], always on a char boundary
     /// ([`Self::edit`] and [`Self::set_query`] keep it there).
@@ -605,7 +610,7 @@ impl SearchState {
 
     /// Next/previous-match step with wraparound and no window or render side
     /// effects; with no matches it only sets the direction. The core of
-    /// [`App::search_step`].
+    /// [`App::search_step_in`].
     pub(crate) fn step(&mut self, forward: bool) {
         // Direction changes even with zero matches: typing the first query after
         // a reverse command must start from the bottom.
@@ -841,7 +846,8 @@ impl App {
                 Some(crate::native_app::AppKind::Settings) => true,
                 Some(crate::native_app::AppKind::Editor) => matches!(
                     self.native_runtime.view_state(view),
-                    Some(crate::native_app::AppViewState::Editor(state)) if state.buffer.is_some()
+                    Some(crate::native_app::AppViewState::Editor(state)) if state.buffer.as_ref()
+                        .is_some_and(crate::native_editor::EditorBufferView::can_start_search)
                 ),
                 _ => false,
             };
@@ -876,6 +882,12 @@ impl App {
         let Some(wid) = self.frontmost_window else {
             return;
         };
+        self.find_requested_in(wid);
+    }
+
+    /// A routed key belongs to its originating window even if focus moved
+    /// while a tab was starting and held the key for replay.
+    pub(crate) fn find_requested_in(&mut self, wid: crate::WindowId) {
         if let Some((instance, _)) = self.active_native_view(wid) {
             let action = self
                 .native_runtime
@@ -901,11 +913,12 @@ impl App {
             return;
         }
         if self.front_terminal(wid).is_some() {
-            self.search_enter();
+            self.search_enter_impl_in(wid, true, true);
         }
     }
 
-    /// Enter (or refresh) plain Cmd-F find mode in the forward direction.
+    /// Frontmost-window convenience wrapper for headless tests.
+    #[cfg(test)]
     pub(crate) fn search_enter(&mut self) {
         let Some(wid) = self.frontmost_window else {
             return;
@@ -916,6 +929,7 @@ impl App {
     /// Enter (or refresh) terminal find in an explicit direction; a fresh find takes
     /// the app-sticky case/regex toggles. The origin viewport is captured before any
     /// recompute moves it, so ⎋/^G can return to it ([`Self::search_cancel_in`]).
+    #[cfg(test)]
     pub(crate) fn search_enter_direction(&mut self, forward: bool) {
         let Some(wid) = self.frontmost_window else {
             return;
@@ -1085,13 +1099,6 @@ impl App {
     /// can re-anchor if output scrolls the grid first.
     pub(crate) fn search_recompute_in(&mut self, wid: crate::WindowId) {
         self.search_recompute_from_anchor_in(wid, false);
-    }
-
-    fn search_recompute_from_anchor(&mut self, strict: bool) {
-        let Some(wid) = self.frontmost_window else {
-            return;
-        };
-        self.search_recompute_from_anchor_in(wid, strict);
     }
 
     fn search_recompute_from_anchor_in(&mut self, wid: crate::WindowId, strict: bool) {
@@ -1506,6 +1513,7 @@ impl App {
     }
 
     /// Cycle to the next (`forward`) / previous match, wrapping.
+    #[cfg(test)]
     pub(crate) fn search_step(&mut self, forward: bool) {
         let Some(wid) = self.frontmost_window else {
             return;
@@ -1554,9 +1562,20 @@ impl App {
     /// Returns why it declined when there is nothing to step (no bar, no remembered
     /// query) so the menu seam reports it; key-path callers discard it.
     pub(crate) fn search_find_again(&mut self, forward: bool) -> Result<(), &'static str> {
-        if let Some(wid) = self.frontmost_window
-            && let Some((_, view)) = self.active_native_view(wid)
-        {
+        let wid = self
+            .frontmost_window
+            .ok_or("there is no window to search")?;
+        self.search_find_again_in(wid, forward)
+    }
+
+    /// Window-targeted repeat for configured shortcuts. Menu actions use the
+    /// frontmost wrapper, while a queued key keeps the window it was typed in.
+    pub(crate) fn search_find_again_in(
+        &mut self,
+        wid: crate::WindowId,
+        forward: bool,
+    ) -> Result<(), &'static str> {
+        if let Some((_, view)) = self.active_native_view(wid) {
             let Some(crate::native_app::AppViewState::Editor(state)) =
                 self.native_runtime.view_state(view)
             else {
@@ -1578,8 +1597,11 @@ impl App {
                 .map_err(|_| "the editor could not navigate its search")?;
             return Ok(());
         }
-        if self.front().is_some_and(|ws| ws.search.is_some()) {
-            self.search_step(forward);
+        if self.front_terminal(wid).is_none() {
+            return Err("there is no terminal search in this window");
+        }
+        if self.windows.get(&wid).is_some_and(|ws| ws.search.is_some()) {
+            self.search_step_in(wid, forward);
             return Ok(());
         }
         if self.search_last_query.is_empty() {
@@ -1590,32 +1612,29 @@ impl App {
         // Both row-identity stamps: a width reflow renumbers history without moving
         // `absolute_row_revision`, so the revision alone would resume ⌘G from a
         // renumbered line.
-        let session_identity = self
-            .frontmost_window
-            .and_then(|wid| self.front_terminal(wid))
-            .map(|terminal| {
-                let term = term_lock(&terminal.term);
-                (
-                    terminal.session,
-                    term.absolute_row_revision(),
-                    term.grid().history_renumber_epoch(),
-                )
-            });
+        let session_identity = self.front_terminal(wid).map(|terminal| {
+            let term = term_lock(&terminal.term);
+            (
+                terminal.session,
+                term.absolute_row_revision(),
+                term.grid().history_renumber_epoch(),
+            )
+        });
         let anchor = self
             .search_last_anchor
             .filter(|(anchor_session, anchor_revision, anchor_epoch, ..)| {
                 Some((*anchor_session, *anchor_revision, *anchor_epoch)) == session_identity
             })
             .map(|(_, _, _, row, start, end)| (row, start, end));
-        self.search_enter_direction(forward);
-        if let Some(search) = self.front_mut().and_then(|ws| ws.search.as_mut()) {
+        self.search_enter_direction_in(wid, forward);
+        if let Some(search) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
             search.set_query(query);
             if let Some((row, start, _)) = anchor {
                 search.anchor_absolute_row = row;
                 search.anchor_col = start;
             }
         }
-        self.search_recompute_from_anchor(anchor.is_some());
+        self.search_recompute_from_anchor_in(wid, anchor.is_some());
         Ok(())
     }
 
@@ -1707,14 +1726,43 @@ impl App {
             let Some(proxy) = self.proxy.clone() else {
                 return;
             };
+            let Some(owner) = self
+                .windows
+                .get(&wid)
+                .and_then(|ws| ws.search.as_ref())
+                .map(|search| search.paste_lifetime.clone())
+            else {
+                return;
+            };
             let _ = std::thread::Builder::new()
                 .name("aterm-x11-paste".into())
                 .spawn(move || {
                     if let Some(text) = crate::control::pbpaste() {
-                        let _ = proxy.send_event(crate::Wake::FindPasteReady { wid, text });
+                        let _ = proxy.send_event(crate::Wake::FindPasteReady { wid, owner, text });
                     }
                 });
         }
+    }
+
+    /// Complete a foreign clipboard read only while its original find field
+    /// remains open. Window focus alone does not change that ownership.
+    #[cfg(any(target_os = "linux", all(test, unix)))]
+    pub(crate) fn complete_search_paste_in(
+        &mut self,
+        wid: crate::WindowId,
+        owner: std::sync::Arc<()>,
+        text: String,
+    ) -> bool {
+        if self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.search.as_ref())
+            .is_none_or(|search| !std::sync::Arc::ptr_eq(&search.paste_lifetime, &owner))
+        {
+            return false;
+        }
+        self.search_edit_in(wid, SearchEdit::Insert(text));
+        true
     }
 
     /// A click inside the find field's well: put the caret before character `slot`
@@ -2116,6 +2164,118 @@ mod tests {
             Vec::<u8>::new(),
             "a find type against an OPEN bar put bytes on the PTY"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delayed_find_paste_keeps_its_field_across_focus_but_not_close_and_reopen() {
+        let (mut app, pipe) = app_observing_pty();
+        let a = WindowId(0);
+        app.find_requested_in(a);
+        app.search_edit_in(a, SearchEdit::Insert("same".to_string()));
+        let owner = app.windows[&a]
+            .search
+            .as_ref()
+            .unwrap()
+            .paste_lifetime
+            .clone();
+        assert!(app.complete_search_paste_in(a, owner.clone(), " query".to_string()));
+        assert_eq!(app.windows[&a].search.as_ref().unwrap().query, "same query");
+
+        app.search_close_in(a, false);
+        assert!(!app.complete_search_paste_in(a, owner.clone(), " closed".to_string()));
+        assert!(app.windows[&a].search.is_none());
+        app.find_requested_in(a);
+        app.search_edit_in(a, SearchEdit::Insert("same query".to_string()));
+        assert!(!app.complete_search_paste_in(a, owner, " reopened".to_string()));
+        assert_eq!(app.windows[&a].search.as_ref().unwrap().query, "same query");
+
+        let owner = app.windows[&a]
+            .search
+            .as_ref()
+            .unwrap()
+            .paste_lifetime
+            .clone();
+        let session = app.front_terminal(a).unwrap().session;
+        let sink = app.pool.get(session).unwrap().ctx.sink.clone();
+        let sid = app.next_session_id;
+        let b = app.insert_logical_window(crate::stub_session_with_sink(sid, sink), 24, 80);
+        app.find_requested_in(b);
+        app.search_edit_in(b, SearchEdit::Insert("other".to_string()));
+        assert!(app.complete_search_paste_in(a, owner.clone(), " kept".to_string()));
+        assert_eq!(app.frontmost_window, Some(b));
+        assert_eq!(
+            app.windows[&a].search.as_ref().unwrap().query,
+            "same query kept"
+        );
+        assert_eq!(app.windows[&b].search.as_ref().unwrap().query, "other");
+        assert!(!app.complete_search_paste_in(b, owner, " wrong window".to_string()));
+        assert_eq!(app.windows[&b].search.as_ref().unwrap().query, "other");
+        assert!(
+            drained(pipe).is_empty(),
+            "find paste never writes to either PTY"
+        );
+        drop(app);
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delayed_find_paste_does_not_follow_a_replaced_tab_pane_or_window() {
+        for replacement in ["tab", "pane", "window"] {
+            let (mut app, pipe) = app_observing_pty();
+            let a = WindowId(0);
+            app.find_requested_in(a);
+            app.search_edit_in(a, SearchEdit::Insert("same query".to_string()));
+            let owner = app.windows[&a]
+                .search
+                .as_ref()
+                .unwrap()
+                .paste_lifetime
+                .clone();
+            let session = app.front_terminal(a).unwrap().session;
+            let sink = app.pool.get(session).unwrap().ctx.sink.clone();
+            let sid = app.next_session_id;
+            let target = match replacement {
+                "tab" => {
+                    app.next_session_id += 1;
+                    app.install_tab_session(a, crate::stub_session_with_sink(sid, sink), None);
+                    a
+                }
+                "pane" => {
+                    app.install_split_pane(
+                        a,
+                        crate::pane::SplitDir::Vertical,
+                        crate::stub_session_with_sink(sid, sink),
+                    )
+                    .unwrap();
+                    a
+                }
+                _ => {
+                    app.close_window_logical(a);
+                    app.insert_logical_window(crate::stub_session_with_sink(sid, sink), 24, 80)
+                }
+            };
+            assert!(app.windows.get(&a).is_none_or(|ws| ws.search.is_none()));
+            app.find_requested_in(target);
+            app.search_edit_in(target, SearchEdit::Insert("same query".to_string()));
+            assert!(app.front_terminal(target).unwrap().session != session);
+            assert!(!app.complete_search_paste_in(a, owner, " late".to_string()));
+            assert_eq!(
+                app.windows[&target].search.as_ref().unwrap().query,
+                "same query",
+                "{replacement}"
+            );
+            assert!(drained(pipe).is_empty(), "{replacement}: no PTY input");
+            drop(app);
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+        }
     }
 
     /// The verb runs the field editor the keystrokes run, and reports the query the

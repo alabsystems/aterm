@@ -26,7 +26,7 @@ pub const DENSITY_RING: usize = 8;
 /// murmur3 finalizer — the one field hash (WGSL-trivial, bit-exact in u32).
 #[must_use]
 #[inline]
-pub fn rain_hash32(mut x: u32) -> u32 {
+pub const fn rain_hash32(mut x: u32) -> u32 {
     x ^= x >> 16;
     x = x.wrapping_mul(0x85EB_CA6B);
     x ^= x >> 13;
@@ -39,14 +39,14 @@ pub fn rain_hash32(mut x: u32) -> u32 {
 /// notation `x.bits(a..b)`.
 #[must_use]
 #[inline]
-pub fn bits(x: u32, a: u32, b: u32) -> u32 {
+pub const fn bits(x: u32, a: u32, b: u32) -> u32 {
     (x >> a) & ((1 << (b - a)) - 1)
 }
 
 /// 32-bit cell packing `(row << 16) | col` (grids < 2^16 on both axes).
 #[must_use]
 #[inline]
-pub fn pack(row: u32, col: u32) -> u32 {
+pub const fn pack(row: u32, col: u32) -> u32 {
     (row << 16) | col
 }
 
@@ -78,9 +78,10 @@ pub struct FieldParams {
 /// Round `ms` to whole ticks, floored at 1.
 #[must_use]
 #[inline]
-pub fn ticks_of(ms: u32, tick_ms: u32) -> u32 {
-    let t = tick_ms.max(1);
-    ((ms + t / 2) / t).max(1)
+pub const fn ticks_of(ms: u32, tick_ms: u32) -> u32 {
+    let t = if tick_ms > 1 { tick_ms } else { 1 };
+    let n = (ms + t / 2) / t;
+    if n > 1 { n } else { 1 }
 }
 
 impl FieldParams {
@@ -88,7 +89,7 @@ impl FieldParams {
     /// the smallest multiple of `mq` at or above `ticks(350ms)`.
     #[must_use]
     #[inline]
-    pub fn quanta(tick_ms: u32, mutation_ms: u32) -> (u32, u32, u32) {
+    pub const fn quanta(tick_ms: u32, mutation_ms: u32) -> (u32, u32, u32) {
         let mq = ticks_of(mutation_ms, tick_ms);
         let floor = ticks_of(350, tick_ms);
         let dq = mq * floor.div_ceil(mq);
@@ -120,28 +121,64 @@ pub struct ColParams {
 /// clamp cannot see an 8-row split pane), keeping per-cell re-ignition under
 /// 1 Hz (WCAG 2.3.1).
 #[must_use]
-pub fn col_params(fp: &FieldParams, col: u32) -> ColParams {
+#[inline]
+pub const fn col_params(fp: &FieldParams, col: u32) -> ColParams {
     // Floor at 3: the trail clamps below are `.clamp(3, rows)`, which panics
     // when `min > max`, so a 1–2-row viewport derives its cycle from a 3-row
     // virtual field. Drawing is bounded by the real rows elsewhere, so the
     // only effect is a slightly longer off-screen cycle.
-    let rows = fp.rows.max(3);
+    let rows = if fp.rows > 3 { fp.rows } else { 3 };
     let h = rain_hash32(fp.seed32 ^ ((col << 1) | 1));
     // Step period 2..=5 from the hash, then the speed-knob shift (5 =
     // neutral; faster knobs shorten the period), clamped >= 2.
-    let p0 = i64::from(2 + bits(h, 0, 2));
-    let p = p0
-        .saturating_add(5 - i64::from(fp.speed.clamp(1, 10)))
-        .clamp(2, 16) as u32;
+    let p0 = (2 + bits(h, 0, 2)) as i64;
+    let speed = if fp.speed < 1 {
+        1
+    } else if fp.speed > 10 {
+        10
+    } else {
+        fp.speed
+    } as i64;
+    let p_raw = p0.saturating_add(5 - speed);
+    let p = if p_raw < 2 {
+        2
+    } else if p_raw > 16 {
+        16
+    } else {
+        p_raw as u32
+    };
     // Trail: 3/8..6/8 of the viewport from the hash, then the trail knob
     // (5 = neutral), clamped 3..=rows.
-    let l0 = (rows * (3 + bits(h, 2, 4)) / 8).clamp(3, rows);
-    let l = (l0 * fp.trail.clamp(1, 10) / 5).clamp(3, rows);
+    let l0_raw = rows * (3 + bits(h, 2, 4)) / 8;
+    let l0 = if l0_raw < 3 {
+        3
+    } else if l0_raw > rows {
+        rows
+    } else {
+        l0_raw
+    };
+    let trail = if fp.trail < 1 {
+        1
+    } else if fp.trail > 10 {
+        10
+    } else {
+        fp.trail
+    };
+    let l_raw = l0 * trail / 5;
+    let l = if l_raw < 3 {
+        3
+    } else if l_raw > rows {
+        rows
+    } else {
+        l_raw
+    };
     // Gap: styled `l/2 + bits·l/8`, extended to the flash floor
     // `ceil(1000 / (p·tick_ms)) - rows - l` so `c·p·tick_ms >= 1000`.
     let g_style = l / 2 + bits(h, 4, 7) * l / 8;
-    let floor_c = 1000u32.div_ceil(p * fp.tick_ms.max(1));
-    let g = g_style.max(floor_c.saturating_sub(rows + l));
+    let tick_ms = if fp.tick_ms > 1 { fp.tick_ms } else { 1 };
+    let floor_c = 1000u32.div_ceil(p * tick_ms);
+    let min_g = floor_c.saturating_sub(rows + l);
+    let g = if g_style > min_g { g_style } else { min_g };
     let c = rows + l + g;
     let phi = rain_hash32(h) % (c * p);
     ColParams { h, p, l, g, c, phi }
@@ -151,8 +188,9 @@ pub fn col_params(fp: &FieldParams, col: u32) -> ColParams {
 /// once per 8 stammer windows — `tick' = tick - ((tick/sq) % 8 == 7)`.
 #[must_use]
 #[inline]
-pub fn stammer_tick(tick: u64, sq: u32) -> u64 {
-    tick - u64::from((tick / u64::from(sq.max(1))) % 8 == 7)
+pub const fn stammer_tick(tick: u64, sq: u32) -> u64 {
+    let sq = if sq > 1 { sq } else { 1 } as u64;
+    tick - ((tick / sq) % 8 == 7) as u64
 }
 
 /// A column's resolved cycle state at `tick`.
@@ -176,9 +214,9 @@ pub struct CycleView {
 /// and visually free (the stammer is a single held tick).
 #[must_use]
 #[inline]
-pub fn cycle_at(cp: &ColParams, fp: &FieldParams, tick: u64) -> CycleView {
-    let (p, c) = (u64::from(cp.p), u64::from(cp.c));
-    let phi = u64::from(cp.phi);
+pub const fn cycle_at(cp: &ColParams, fp: &FieldParams, tick: u64) -> CycleView {
+    let (p, c) = (cp.p as u64, cp.c as u64);
+    let phi = cp.phi as u64;
     let s0 = (tick + phi) / p;
     let k0 = s0 / c;
     let ha = rain_hash32(cp.h ^ (k0 as u32));
@@ -210,8 +248,8 @@ pub fn cycle_at(cp: &ColParams, fp: &FieldParams, tick: u64) -> CycleView {
 /// lookup key for cycle admission.
 #[must_use]
 #[inline]
-pub fn cycle_start_tick(cp: &ColParams, k: u64) -> u64 {
-    (k * u64::from(cp.c) * u64::from(cp.p)).saturating_sub(u64::from(cp.phi))
+pub const fn cycle_start_tick(cp: &ColParams, k: u64) -> u64 {
+    (k * cp.c as u64 * cp.p as u64).saturating_sub(cp.phi as u64)
 }
 
 /// Cycle admission: the column rains this cycle iff its re-roll byte clears
@@ -219,8 +257,8 @@ pub fn cycle_start_tick(cp: &ColParams, k: u64) -> u64 {
 /// boundaries, so intensity changes read as weather fronts, never popping.
 #[must_use]
 #[inline]
-pub fn cycle_active(hk: u32, density_byte: u8) -> bool {
-    ((hk >> 8) & 0xFF) < u32::from(density_byte)
+pub const fn cycle_active(hk: u32, density_byte: u8) -> bool {
+    ((hk >> 8) & 0xFF) < density_byte as u32
 }
 
 /// Step-stable, time-based trail level (design §4): decay keys to elapsed
@@ -229,14 +267,15 @@ pub fn cycle_active(hk: u32, density_byte: u8) -> bool {
 /// Returns the level `0..=15`, or `None` when unlit.
 #[must_use]
 #[inline]
-pub fn trail_level(cp: &ColParams, eff_tick: u64, k: u64, row: u32) -> Option<u32> {
-    let ign = ((k * u64::from(cp.c) + u64::from(row)) * u64::from(cp.p)) as i64 - i64::from(cp.phi);
+pub const fn trail_level(cp: &ColParams, eff_tick: u64, k: u64, row: u32) -> Option<u32> {
+    let ign = ((k * cp.c as u64 + row as u64) * cp.p as u64) as i64 - cp.phi as i64;
     let elapsed = eff_tick as i64 - ign;
-    let lp = i64::from(cp.l * cp.p);
-    if !(0..=lp).contains(&elapsed) {
+    let lp = (cp.l * cp.p) as i64;
+    if elapsed < 0 || elapsed > lp {
         return None;
     }
-    Some((LEVELS - (elapsed * i64::from(LEVELS) / lp) as u32).min(LEVELS))
+    let lvl = LEVELS - (elapsed * LEVELS as i64 / lp) as u32;
+    Some(if lvl < LEVELS { lvl } else { LEVELS })
 }
 
 /// Flicker dither from a precomputed epoch: a per-row subtractive twinkle
@@ -244,7 +283,7 @@ pub fn trail_level(cp: &ColParams, eff_tick: u64, k: u64, row: u32) -> Option<u3
 /// is the single hash site so the byte layout cannot drift.
 #[must_use]
 #[inline]
-pub fn dither(h: u32, row: u32, epoch: u32) -> u32 {
+pub const fn dither(h: u32, row: u32, epoch: u32) -> u32 {
     rain_hash32(h ^ row ^ epoch) & 3
 }
 
@@ -252,8 +291,9 @@ pub fn dither(h: u32, row: u32, epoch: u32) -> u32 {
 /// mutation quantum at/above the 350 ms floor). Hoisted once per frame.
 #[must_use]
 #[inline]
-pub fn dither_epoch(tick: u64, dq: u32) -> u32 {
-    (tick / u64::from(dq.max(1))) as u32
+pub const fn dither_epoch(tick: u64, dq: u32) -> u32 {
+    let dq = if dq > 1 { dq } else { 1 } as u64;
+    (tick / dq) as u32
 }
 
 /// Glyph choice + mirror bit from a precomputed epoch:
@@ -261,7 +301,7 @@ pub fn dither_epoch(tick: u64, dq: u32) -> u32 {
 /// byte layout cannot drift. The mirror rides bit 8 of the same hash.
 #[must_use]
 #[inline]
-pub fn glyph_from_epoch(seed32: u32, row: u32, col: u32, glyph_epoch: u32) -> (u32, bool) {
+pub const fn glyph_from_epoch(seed32: u32, row: u32, col: u32, glyph_epoch: u32) -> (u32, bool) {
     let g = rain_hash32(seed32 ^ pack(row, col) ^ glyph_epoch);
     (g % GLYPH_COUNT, (g >> 8) & 1 == 1)
 }
@@ -270,8 +310,9 @@ pub fn glyph_from_epoch(seed32: u32, row: u32, col: u32, glyph_epoch: u32) -> (u
 /// synchronized screen-wide and iso-luminant. Hoisted once per frame.
 #[must_use]
 #[inline]
-pub fn glyph_epoch(tick: u64, mq: u32) -> u32 {
-    (tick / u64::from(mq.max(1))) as u32
+pub const fn glyph_epoch(tick: u64, mq: u32) -> u32 {
+    let mq = if mq > 1 { mq } else { 1 } as u64;
+    (tick / mq) as u32
 }
 
 /// The effective per-frame quad cap: the GPU budget intersected with the
@@ -279,9 +320,16 @@ pub fn glyph_epoch(tick: u64, mq: u32) -> u32 {
 /// cells thin uniformly instead of blowing the CPU stamp bar.
 #[must_use]
 #[inline]
-pub fn quad_cap(cell_w: u32, cell_h: u32) -> usize {
-    let cell = (cell_w.max(1) * cell_h.max(1)) as usize;
-    MAX_RAIN_QUADS.min((MAX_RAIN_TEXELS / cell).max(256))
+pub const fn quad_cap(cell_w: u32, cell_h: u32) -> usize {
+    let cw = if cell_w > 1 { cell_w } else { 1 } as usize;
+    let ch = if cell_h > 1 { cell_h } else { 1 } as usize;
+    let cpu_cap = MAX_RAIN_TEXELS / (cw * ch);
+    let floored = if cpu_cap > 256 { cpu_cap } else { 256 };
+    if MAX_RAIN_QUADS < floored {
+        MAX_RAIN_QUADS
+    } else {
+        floored
+    }
 }
 
 /// Bounded ring of density-staircase change points `(tick, density_byte)`:
@@ -298,10 +346,15 @@ impl DensityRing {
     /// Record a change point. Push only when the quantized byte changes —
     /// the caller (the weather EMA) owns that dedupe.
     #[inline]
-    pub fn push(&mut self, tick: u64, density: u8) {
+    pub const fn push(&mut self, tick: u64, density: u8) {
         self.entries[self.head] = (tick, density);
         self.head = (self.head + 1) % DENSITY_RING;
-        self.len = (self.len + 1).min(DENSITY_RING);
+        let next_len = self.len + 1;
+        self.len = if next_len < DENSITY_RING {
+            next_len
+        } else {
+            DENSITY_RING
+        };
     }
 
     /// The density in force at `tick`: the newest change point at or before
@@ -309,10 +362,11 @@ impl DensityRing {
     /// entry (bounded history, best effort); an empty ring is density 0.
     #[must_use]
     #[inline]
-    pub fn at(&self, tick: u64) -> u8 {
+    pub const fn at(&self, tick: u64) -> u8 {
         let mut oldest = 0u8;
         let mut idx = self.head;
-        for _ in 0..self.len {
+        let mut i = 0;
+        while i < self.len {
             // Newest-first walk: head-1 is the most recent entry.
             idx = if idx == 0 { DENSITY_RING - 1 } else { idx - 1 };
             let (t, d) = self.entries[idx];
@@ -320,13 +374,14 @@ impl DensityRing {
                 return d;
             }
             oldest = d;
+            i += 1;
         }
         oldest
     }
 
     /// Drop all change points (config rebuild / reset).
     #[inline]
-    pub fn clear(&mut self) {
+    pub const fn clear(&mut self) {
         self.len = 0;
         self.head = 0;
     }

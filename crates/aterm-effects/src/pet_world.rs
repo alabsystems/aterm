@@ -52,7 +52,7 @@ impl PetRect {
 
     #[inline]
     #[must_use]
-    pub fn foot_row(self) -> f32 {
+    pub const fn foot_row(self) -> f32 {
         self.row + self.rows - 1.0
     }
 
@@ -176,7 +176,7 @@ pub struct PetPane {
 impl PetPane {
     #[inline]
     #[must_use]
-    pub fn full(input: &RenderInput) -> Self {
+    pub const fn full(input: &RenderInput) -> Self {
         Self {
             row: 0,
             col: 0,
@@ -466,40 +466,40 @@ impl PetWorld {
 
     #[inline]
     #[must_use]
-    pub fn stamp(&self) -> Option<PetWorldStamp> {
+    pub const fn stamp(&self) -> Option<PetWorldStamp> {
         self.stamp
     }
     #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn coverage(&self) -> PetPane {
+    pub const fn coverage(&self) -> PetPane {
         self.coverage
     }
     #[inline]
     #[must_use]
-    pub fn examined_cells(&self) -> usize {
+    pub const fn examined_cells(&self) -> usize {
         self.examined_cells
     }
     #[inline]
     #[must_use]
-    pub fn anchors(&self) -> &[Option<PetAnchor>; MAX_WORLD_ANCHORS] {
+    pub const fn anchors(&self) -> &[Option<PetAnchor>; MAX_WORLD_ANCHORS] {
         &self.anchors
     }
     #[inline]
     #[must_use]
-    pub fn selection_rect(&self) -> Option<PetRect> {
+    pub const fn selection_rect(&self) -> Option<PetRect> {
         self.selection_rect
     }
     #[inline]
     #[must_use]
-    pub fn selection_target(&self) -> Option<(f32, f32)> {
+    pub const fn selection_target(&self) -> Option<(f32, f32)> {
         self.selection_target
     }
     /// The application's last explicit state. No task identity, update event,
     /// or command completion is inferred from this sampled value.
     #[inline]
     #[must_use]
-    pub fn progress(&self) -> Option<TaskbarProgress> {
+    pub const fn progress(&self) -> Option<TaskbarProgress> {
         self.progress
     }
 
@@ -1452,6 +1452,7 @@ impl PetWorld {
     /// Resolve a retained content row only while the exact owner and row
     /// identity fences hold and its block is still observed. A content change
     /// still requires the caller to certify the intended body with `clear`.
+    #[inline]
     #[must_use]
     pub fn resolve(&self, anchor: PetAnchor) -> Option<PetAnchor> {
         let stamp = self.stamp?;
@@ -2169,6 +2170,7 @@ fn intersects_cell(rect: PetRect, row: usize, col: usize) -> bool {
         && rect.col + rect.cols > col as f32
 }
 
+#[inline]
 fn selection_target(input: &RenderInput, pane: PetPane) -> Option<(f32, f32)> {
     let max_col = u16::try_from(input.cols.saturating_sub(1)).unwrap_or(u16::MAX);
     let default_clip = SelectionClip::new(

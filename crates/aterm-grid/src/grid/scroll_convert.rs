@@ -35,12 +35,14 @@ static SCROLLBACK_TEXT_ONLY: AtomicBool = AtomicBool::new(false);
 
 /// Enable/disable the headless scrollback-text-only fast path
 /// ([`SCROLLBACK_TEXT_ONLY`]).
+#[inline]
 pub fn set_scrollback_text_only(enabled: bool) {
     SCROLLBACK_TEXT_ONLY.store(enabled, Ordering::Relaxed);
 }
 
 /// Whether the headless scrollback-text-only fast path is active.
 #[must_use]
+#[inline]
 pub fn scrollback_text_only() -> bool {
     SCROLLBACK_TEXT_ONLY.load(Ordering::Relaxed)
 }
@@ -52,7 +54,7 @@ pub fn scrollback_text_only() -> bool {
 #[inline]
 // Shared with the ring fast materializer (`materialize_from_row_extras`),
 // which must skip exactly these cells.
-pub(in crate::grid) fn is_spacer(cells: &[Cell], idx: usize) -> bool {
+pub(in crate::grid) const fn is_spacer(cells: &[Cell], idx: usize) -> bool {
     cells[idx].is_wide_continuation()
         && !cells[idx].is_wide()
         && idx > 0
@@ -69,19 +71,29 @@ const RUN_DISQUALIFY: CellFlags =
 /// path. `char_data` is a BMP codepoint whenever `COMPLEX` is clear, so this
 /// is one mask and one range test.
 #[inline]
-fn plain_ascii_byte(cell: &Cell) -> Option<u8> {
+const fn plain_ascii_byte(cell: &Cell) -> Option<u8> {
     if cell.flags().intersects(RUN_DISQUALIFY) {
         return None;
     }
     let c = cell.char() as u32;
-    (0x20..0x80).contains(&c).then_some(c as u8)
+    if c >= 0x20 && c < 0x80 {
+        Some(c as u8)
+    } else {
+        None
+    }
 }
 
 /// The attributes of `cell` exactly as the per-cell loop computed them.
 #[inline]
-fn cell_attrs_of(cell: &Cell) -> CellAttrs {
-    let fg_raw = cell.fg_color().map_or(PackedColor::DEFAULT_FG.0, |c| c.0);
-    let bg_raw = cell.bg_color().map_or(PackedColor::DEFAULT_BG.0, |c| c.0);
+const fn cell_attrs_of(cell: &Cell) -> CellAttrs {
+    let fg_raw = match cell.fg_color() {
+        Some(c) => c.0,
+        None => PackedColor::DEFAULT_FG.0,
+    };
+    let bg_raw = match cell.bg_color() {
+        Some(c) => c.0,
+        None => PackedColor::DEFAULT_BG.0,
+    };
     CellAttrs::from_raw(fg_raw, bg_raw, cell.flags().bits())
 }
 

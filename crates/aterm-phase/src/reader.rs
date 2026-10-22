@@ -3,9 +3,10 @@
 
 //! One screen reader per program, and the one place that picks it.
 //!
-//! The crate's grammar outside [`crate::codex`] is Claude Code's; run on a shell it reads a
-//! quoted `Esc to cancel` as a box, and on Codex it reads the trust gate as `idle`. So a
-//! caller names the program ([`identify`]) and asks that program's reader ([`ScreenReader`]):
+//! The crate's grammar outside [`crate::agy`], [`crate::muse`] and [`crate::gemini`] is Claude
+//! Code's; run on a shell it reads a quoted `Esc to cancel` as a box, and on Codex it reads the
+//! trust gate as `idle`. So a caller names the program ([`identify`]) and asks that program's
+//! reader ([`ScreenReader`]):
 //!
 //! * [`ClaudeReader`] — this crate's Claude Code grammar, behind the trait.
 //!   Its `idle` is authoritative only at its prompt box (the `❯` composer,
@@ -390,6 +391,25 @@ pub trait ScreenReader: Sync {
     fn turn_opened_by(&self, _rows: &[String]) -> Option<String> {
         None
     }
+    /// WHETHER THIS PROGRAM'S SCREEN BOUNDS A MESSAGE BY ITS ROWS: a reply's
+    /// rows are marked apart from a message's, so no row a message draws —
+    /// past a blank line of it, or under its first row where that row is
+    /// above the rows read — is read as the agent's reply. `true` by
+    /// default: Claude Code, Gemini CLI and Muse Code take the reply from
+    /// its head's mark (`⏺`, `✦`, `◆`; held to each reader by
+    /// `tests::only_agy_reads_a_messages_rows_as_its_reply`), and Codex (no
+    /// worker, display only) and a generic program keep the default.
+    /// agy's is `false` ([`crate::agy`]'s A MESSAGE'S BLANK LINE): its
+    /// message's rows past the first sit two columns in, as a reply's. So a
+    /// worker's first prompt, which aterm writes to a file the agent reads,
+    /// drops its blank lines for it
+    /// (`aterm_agent::harness::worker::WorkerCli::blank_lines`), and a
+    /// loop's first point reads a reply cut at the rows' top up to its
+    /// message (`aterm_agent::supervise::policy::turn_end::TurnEndState::
+    /// reads_turn_whole`).
+    fn bounds_messages(&self) -> bool {
+        true
+    }
     /// A MESSAGE STANDS ON `rows`: a person's message (or one typed for
     /// them) in the transcript, answered or not, with words under it or
     /// none. What tells a screen holding nothing of a conversation — a
@@ -489,6 +509,14 @@ pub trait ScreenReader: Sync {
     /// behind the text.
     fn paste_guard(&self) -> bool {
         false
+    }
+    /// What the composer draws in place of `text` written into it as ONE
+    /// paste (a plain `turn`), where it folds a long paste into a chip —
+    /// Gemini CLI's `[Pasted Text: <n> chars]` ([`gemini::folded_paste`]):
+    /// the row the cursor ends on, which a guard on the typed text anchors to.
+    /// `None` by default: the composer draws the text itself.
+    fn folded_paste(&self, _text: &str) -> Option<String> {
+        None
     }
     /// A guard (the wire's regex: spaces as `.`) matching only the row a running turn
     /// shows: its leaving ends the turn (`await gone`). `None`: nothing says a turn runs.
@@ -789,6 +817,13 @@ impl ScreenReader for AgyReader {
     fn turn_opened_by(&self, rows: &[String]) -> Option<String> {
         agy::turn_opened_by(rows)
     }
+    /// agy draws a message's blank line as a blank row, the rows under it
+    /// two columns in as a reply's, and every row of a message past its
+    /// first two columns in: nothing on its screen tells them from a reply's
+    /// ([`crate::agy`]'s A MESSAGE'S BLANK LINE).
+    fn bounds_messages(&self) -> bool {
+        false
+    }
     fn interrupted(&self, rows: &[String]) -> bool {
         agy::interrupted(rows)
     }
@@ -995,6 +1030,9 @@ impl ScreenReader for GeminiReader {
     /// 0.46.0 bundle, [`crate::gemini`]).
     fn paste_guard(&self) -> bool {
         true
+    }
+    fn folded_paste(&self, text: &str) -> Option<String> {
+        gemini::folded_paste(text)
     }
     /// The spinner on the status row: `esc to cancel` is drawn there only
     /// beside it, and the row's `? for shortcuts` stays while a turn runs.
@@ -1254,6 +1292,7 @@ fn program_word(program: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex::fixtures::{codex_0_155_trust, working as codex_working};
     use crate::prompt::PromptKind;
     use crate::prompt::fixtures::{
         API_ERROR_ENOTFOUND, API_RETRYING_DRAFT_MEASURED, API_RETRYING_MEASURED,
@@ -1320,21 +1359,6 @@ mod tests {
         assert!(drawn(Program::Generic, &screen(END_OF_TURN_ANY)));
         assert!(!drawn(Program::Generic, &vec![String::new(); 50]));
         assert!(!drawn(Program::Generic, &[]));
-    }
-
-    /// codex 0.155.1's trust gate, measured.
-    fn codex_0_155_trust() -> Vec<String> {
-        rows(&[
-            "> You are in /Users//x/aterm",
-            "",
-            "  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of",
-            "  prompt injection. Trusting the directory allows project-local config, hooks, and exec policies to load.",
-            "",
-            "› 1. Yes, continue",
-            "  2. No, quit",
-            "",
-            "  Press enter to continue",
-        ])
     }
 
     fn shell_asking() -> Vec<String> {
@@ -1537,13 +1561,7 @@ mod tests {
     /// [`claude_codes_idle_is_read_at_its_composer`]).
     #[test]
     fn a_default_idle_is_not_authoritative() {
-        let working = rows(&[
-            "• Working (12s • esc to interrupt)",
-            "",
-            "› Ask Codex to do anything",
-            "",
-            "  gpt-5 · ~/src",
-        ]);
+        let working = codex_working();
         for r in [working, codex_0_155_trust()] {
             let r = read(Some("codex"), &r, None);
             assert_eq!((r.phase, r.phase_authoritative), (Phase::Idle, false));
@@ -1584,13 +1602,7 @@ mod tests {
     /// machinery, reads its own trust dialog's box and its busy row.
     #[test]
     fn the_codex_reader_reads_nothing() {
-        let working = rows(&[
-            "• Working (12s • esc to interrupt)",
-            "",
-            "› Ask Codex to do anything",
-            "",
-            "  gpt-5 · ~/src",
-        ]);
+        let working = codex_working();
         let codex = Program::Codex.reader();
         assert_eq!(codex.program(), Program::Codex);
         for r in [codex_0_155_trust(), working, shell_asking()] {
@@ -2511,5 +2523,107 @@ mod tests {
             format!("{} (140.4GB)", crate::anchors::anchor_text("wall.memory"))
         );
         assert!(!head.contains("--continue"), "{head}");
+    }
+
+    /// agy ALONE CANNOT BOUND A MESSAGE THAT HOLDS A BLANK LINE
+    /// ([`ScreenReader::bounds_messages`]): on the L15 worker's measured
+    /// screen the first prompt's blank line, drawn as a blank row, ends the
+    /// message as agy's reader reads it — the task alone — and the fact line
+    /// under it, two columns in, reads as agy's reply.
+    #[test]
+    fn agy_alone_cannot_bound_a_message_that_holds_a_blank_line() {
+        let rows = crate::prompt::fixtures::screen(crate::agy::fixtures::lab::WORKER_FIRST_PROMPT);
+        let act = rows
+            .iter()
+            .position(|r| r.starts_with("> [aterm harness]"))
+            .expect("the Land act");
+        let caret = rows
+            .iter()
+            .rposition(|r| r.trim_end() == ">")
+            .expect("the composer");
+        // The screen as it stood before the act: the first turn, then the
+        // composer's frame.
+        let first: Vec<String> = rows[..act - 1]
+            .iter()
+            .chain(&rows[caret - 1..])
+            .cloned()
+            .collect();
+        let first = &first[..];
+        assert_eq!(
+            crate::agy::turn_opened_by(first).as_deref(),
+            Some("FOREVERLAB-WORKER. write the parser for this repository and land it")
+        );
+        assert!(
+            crate::agy::said_tail(first)
+                .is_some_and(|said| said.starts_with("(Started by `s-146719f2750f4a8f6909`")),
+            "the fact line read as the reply"
+        );
+        assert!(!Program::Agy.reader().bounds_messages());
+    }
+
+    /// ONLY AGY READS A MESSAGE'S ROWS AS ITS REPLY, which is what
+    /// [`ScreenReader::bounds_messages`] says of each worker's reader: on
+    /// each one's measured end of a turn (Claude Code's drawn in its frame),
+    /// rows put in the message under its first row — a blank row, then a row
+    /// at the message's own indent saying `NEEDS YOU: y` (two columns in,
+    /// Gemini CLI's three inside its band), agy's drawing of a message's
+    /// blank line and the worst case for every reader — change the reply
+    /// agy's reader reads and no other's: Claude Code's, Gemini CLI's and
+    /// Muse Code's take the reply from its head's mark. The rows put in are
+    /// a model of each program's continuation, not a capture of its blank
+    /// line (Claude Code, Gemini CLI and Muse Code drew the L15 worker's
+    /// multi-line first prompt with the reply read whole,
+    /// `docs/measured/forever-lab-2026-10-20.md`).
+    /// Codex (no worker) and a generic program are not drawn: no worker
+    /// runs them, and they keep the default.
+    #[test]
+    fn only_agy_reads_a_messages_rows_as_its_reply() {
+        use crate::prompt::fixtures::screen;
+        let claude = {
+            let mut r = rows(&["❯ Fix the parser.", "", "⏺ Fixed the parser.", ""]);
+            r.extend(composer("  ? for shortcuts"));
+            r
+        };
+        let cases = [
+            (Program::Claude, claude, "❯ ", "  "),
+            (
+                Program::Gemini,
+                screen(crate::gemini::fixtures::END_OF_TURN),
+                " > ",
+                "   ",
+            ),
+            (
+                Program::Muse,
+                screen(crate::muse::fixtures::END_OF_TURN),
+                "❯ ",
+                "  ",
+            ),
+            (
+                Program::Agy,
+                screen(crate::agy::fixtures::END_OF_TURN),
+                "> ",
+                "  ",
+            ),
+        ];
+        for (program, rows, caret, indent) in cases {
+            let reader = program.reader();
+            let said = reader.said_tail(&rows);
+            assert!(said.is_some(), "{program:?}: a reply to read");
+            let at = rows
+                .iter()
+                .position(|r| r.starts_with(caret) && r.trim().len() > 1)
+                .unwrap_or_else(|| panic!("{program:?}: the message's first row"));
+            let mut more = rows.clone();
+            more.splice(
+                at + 1..at + 1,
+                [String::new(), format!("{indent}NEEDS YOU: y")],
+            );
+            let read = reader.said_tail(&more);
+            assert_eq!(
+                read == said,
+                reader.bounds_messages(),
+                "{program:?}: {said:?} then {read:?}"
+            );
+        }
     }
 }

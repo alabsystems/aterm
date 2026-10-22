@@ -106,6 +106,7 @@ impl ProgramClaim {
 }
 
 /// The raw program claim of one shell block; `None` falls to the base cat.
+#[inline]
 fn derive_identity(block: &OutputBlock) -> Option<AppIdentity> {
     match block.state {
         // No parseable commandline (no OSC 633;E, a bare Enter) and a nested
@@ -151,6 +152,7 @@ pub struct KittyTenure {
 impl KittyTenure {
     /// Feed this frame's raw claim; returns the claim on glass. Idempotent for a
     /// stable input at a stable time, so re-observing is harmless.
+    #[inline]
     pub fn observe(&mut self, raw: Option<&AppIdentity>, now: Instant) -> Option<&AppIdentity> {
         if raw == self.worn.as_ref() {
             self.candidate = None;
@@ -188,6 +190,7 @@ impl KittyTenure {
     /// or not: lands the pending candidate and disarms, returning whether the look
     /// moved. A window off the terminal route never re-observes, so this keeps an
     /// armed deadline from spinning the event loop.
+    #[inline]
     pub fn poll(&mut self, now: Instant) -> bool {
         match self.candidate.take() {
             Some((cand, since))
@@ -216,6 +219,7 @@ impl KittyTenure {
     /// [`HOMECOMING`], and skips the landing id: a continuously worn cat never
     /// re-lands, so its stamp can be stale at its own next landing, and expiring
     /// it then would award a spurious ceremony.
+    #[inline]
     fn land(&mut self, cand: Option<AppIdentity>, now: Instant) {
         self.worn = cand;
         let Some(id) = self.worn.as_ref() else {
@@ -296,6 +300,7 @@ impl KittyTenure {
 
 /// Insert a stranger: an empty slot first, else evict the LRU among greeted slots
 /// only. `false` (nothing inserted) when every slot holds an ungreeted debt.
+#[inline]
 fn insert_lru(roster: &mut [Option<Homecoming>; HOMECOMING_SLOTS], id: &str, now: Instant) -> bool {
     let slot = roster.iter().position(|s| s.is_none()).or_else(|| {
         roster
@@ -359,6 +364,7 @@ pub struct LookPolicy {
 
 impl Default for LookPolicy {
     /// A fresh window wears the launch kitty floor until a verdict resolves.
+    #[inline]
     fn default() -> Self {
         Self {
             claim: ProgramClaim::default(),

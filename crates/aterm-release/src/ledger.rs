@@ -205,7 +205,9 @@ impl GitRunner for GitCli {
 
 /// The `-c` pairs on every git that writes a tree (a checkout, an archive; a clone's config
 /// keeps them), so it writes the commit's bytes whatever the releaser's `core.autocrlf`,
-/// `core.eol` or global attributes file says. The repository's `.gitattributes` still apply.
+/// `core.eol` or global attributes file says. The repository's `.gitattributes` still apply,
+/// and its own `info/attributes`, which outranks these, refuses the cut where it rewrites
+/// bytes (`gates::refuse_rewriting_info_attributes`).
 pub(crate) const BYTE_EXACT: [&str; 6] = [
     "-c",
     "core.autocrlf=false",

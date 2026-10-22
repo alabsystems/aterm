@@ -170,7 +170,7 @@ pub struct CursorFxFrame {
 /// the light noses into the bar instead of overshooting it by half a cell.
 #[inline]
 #[must_use]
-pub fn head_dx_for(style: CursorStyle) -> f32 {
+pub const fn head_dx_for(style: CursorStyle) -> f32 {
     if matches!(style, CursorStyle::BlinkingBar | CursorStyle::SteadyBar) {
         0.08
     } else {
@@ -225,7 +225,7 @@ pub struct BlockFillSplice {
 /// contradict the glass.
 #[inline]
 #[must_use]
-pub fn compose_caret_style_override(
+pub const fn compose_caret_style_override(
     bolt: bool,
     rainbow_owns_caret: bool,
     momentum_steady: Option<CursorStyle>,
@@ -247,7 +247,11 @@ pub fn compose_caret_style_override(
 /// engine gets `enabled: false`, paints nothing and reports `hot: false`.
 #[inline]
 #[must_use]
-pub fn momentum_glow_allowed(user_on: bool, host_allows: bool, rainbow_owns_caret: bool) -> bool {
+pub const fn momentum_glow_allowed(
+    user_on: bool,
+    host_allows: bool,
+    rainbow_owns_caret: bool,
+) -> bool {
     user_on && host_allows && !rainbow_owns_caret
 }
 
@@ -262,37 +266,112 @@ pub fn momentum_glow_allowed(user_on: bool, host_allows: bool, rainbow_owns_care
 /// what the host handed that owner to build from (the resolved cursor or trail
 /// colour, per [`BlockFillOwner::base_from`]; `None` for owners whose style is
 /// their colour). A body that ignores its base shows as the two disagreeing.
+#[inline]
 #[must_use]
-pub fn resolve_block_fill(
+pub const fn resolve_block_fill(
     fills: BlockFillSplice,
     cursor_color: u32,
     trail_color: u32,
     cursor_base_pinned: bool,
 ) -> Option<BlockFill> {
-    let owned = |owner: BlockFillOwner, fill: Option<u32>| {
-        fill.map(|fill| BlockFill {
-            owner,
-            fill,
-            base: match owner.base_from() {
-                // Report what was handed: a `CursorColor` owner with no pinned
-                // colour was handed `None` and built from white, so its base is
-                // `None` here too.
-                BlockFillBase::CursorColor => cursor_base_pinned.then_some(cursor_color),
-                BlockFillBase::TrailColor => Some(trail_color),
-                // Handed nothing, and the row says so: the identity ramp is
-                // the whole story for these two.
-                BlockFillBase::StyleIdentity | BlockFillBase::White => None,
-            },
-        })
-    };
-    owned(BlockFillOwner::Rainbow, fills.rainbow)
-        .or_else(|| owned(BlockFillOwner::Forge, fills.forge))
-        .or_else(|| owned(BlockFillOwner::Phaser, fills.phaser))
-        .or_else(|| owned(BlockFillOwner::Bolt, fills.bolt))
-        .or_else(|| owned(BlockFillOwner::Comet, fills.comet))
-        .or_else(|| owned(BlockFillOwner::Droplet, fills.droplet))
-        .or_else(|| owned(BlockFillOwner::BeamRod, fills.beamrod))
-        .or_else(|| owned(BlockFillOwner::Momentum, fills.momentum))
+    const fn owned(
+        owner: BlockFillOwner,
+        fill: Option<u32>,
+        cursor_color: u32,
+        trail_color: u32,
+        cursor_base_pinned: bool,
+    ) -> Option<BlockFill> {
+        let Some(fill) = fill else {
+            return None;
+        };
+        let base = match owner.base_from() {
+            // Report what was handed: a `CursorColor` owner with no pinned
+            // colour was handed `None` and built from white, so its base is
+            // `None` here too.
+            BlockFillBase::CursorColor => {
+                if cursor_base_pinned {
+                    Some(cursor_color)
+                } else {
+                    None
+                }
+            }
+            BlockFillBase::TrailColor => Some(trail_color),
+            // Handed nothing, and the row says so: the identity ramp is
+            // the whole story for these two.
+            BlockFillBase::StyleIdentity | BlockFillBase::White => None,
+        };
+        Some(BlockFill { owner, fill, base })
+    }
+    if let Some(b) = owned(
+        BlockFillOwner::Rainbow,
+        fills.rainbow,
+        cursor_color,
+        trail_color,
+        cursor_base_pinned,
+    ) {
+        return Some(b);
+    }
+    if let Some(b) = owned(
+        BlockFillOwner::Forge,
+        fills.forge,
+        cursor_color,
+        trail_color,
+        cursor_base_pinned,
+    ) {
+        return Some(b);
+    }
+    if let Some(b) = owned(
+        BlockFillOwner::Phaser,
+        fills.phaser,
+        cursor_color,
+        trail_color,
+        cursor_base_pinned,
+    ) {
+        return Some(b);
+    }
+    if let Some(b) = owned(
+        BlockFillOwner::Bolt,
+        fills.bolt,
+        cursor_color,
+        trail_color,
+        cursor_base_pinned,
+    ) {
+        return Some(b);
+    }
+    if let Some(b) = owned(
+        BlockFillOwner::Comet,
+        fills.comet,
+        cursor_color,
+        trail_color,
+        cursor_base_pinned,
+    ) {
+        return Some(b);
+    }
+    if let Some(b) = owned(
+        BlockFillOwner::Droplet,
+        fills.droplet,
+        cursor_color,
+        trail_color,
+        cursor_base_pinned,
+    ) {
+        return Some(b);
+    }
+    if let Some(b) = owned(
+        BlockFillOwner::BeamRod,
+        fills.beamrod,
+        cursor_color,
+        trail_color,
+        cursor_base_pinned,
+    ) {
+        return Some(b);
+    }
+    owned(
+        BlockFillOwner::Momentum,
+        fills.momentum,
+        cursor_color,
+        trail_color,
+        cursor_base_pinned,
+    )
 }
 
 /// The least WCAG contrast an effect-owned caret fill keeps against the
@@ -334,7 +413,7 @@ pub const BED_INK_FLOOR: f32 = 10.0;
 /// configured trail is its own.
 #[inline]
 #[must_use]
-pub fn comet_tail_is_its_streak(glow: &GlowConfig) -> bool {
+pub const fn comet_tail_is_its_streak(glow: &GlowConfig) -> bool {
     glow.beam && matches!(glow.style, GlowStyle::Comet)
 }
 
@@ -346,6 +425,7 @@ pub fn comet_tail_is_its_streak(glow: &GlowConfig) -> bool {
 /// and its head-to-tail shape and only its peak comes down (the
 /// streak budget's rule). `1.0` when the ink is unknown (a page that stamps no
 /// default foreground).
+#[inline]
 #[must_use]
 pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
     if ink == aterm_core::render::COLOR_UNSET || ground == aterm_core::render::COLOR_UNSET {
@@ -404,6 +484,7 @@ pub fn bed_legible_share(color: u32, ground: u32, ink: u32) -> f32 {
 ///
 /// Runs on the candidate BEFORE [`project_block_fill`], so the load-shed fade
 /// still ends exactly on the terminal cursor colour.
+#[inline]
 #[must_use]
 pub fn floor_block_fill(
     candidate: BlockFill,
@@ -439,7 +520,7 @@ pub fn floor_block_fill(
 /// [`floor_block_fill`].)
 #[inline]
 #[must_use]
-pub fn caret_page_floor(owner: BlockFillOwner) -> f32 {
+pub const fn caret_page_floor(owner: BlockFillOwner) -> f32 {
     match owner {
         BlockFillOwner::Rainbow => crate::rainbow_kitty::ribbon::PAPER_CARET_CONTRAST,
         _ => CARET_PAGE_MIN_CONTRAST,
@@ -454,16 +535,16 @@ pub fn caret_page_floor(owner: BlockFillOwner) -> f32 {
 #[inline]
 #[must_use]
 fn bolt_body(color: u32, blaze: f32, dark: bool) -> u32 {
+    const fn mix(color: u32, sh: u32, k: f32) -> u32 {
+        let c = ((color >> sh) & 0xff) as f32;
+        (c + (255.0 - c) * k).min(255.0) as u32
+    }
     let blaze = blaze.clamp(0.0, 1.0);
     if !dark {
         return crate::color_math::light_body_fill(color, blaze);
     }
     let k = 0.55 * blaze;
-    let mix = |sh: u32| {
-        let c = ((color >> sh) & 0xff) as f32;
-        (c + (255.0 - c) * k).min(255.0) as u32
-    };
-    (mix(16) << 16) | (mix(8) << 8) | mix(0)
+    (mix(color, 16, k) << 16) | (mix(color, 8, k) << 8) | mix(color, 0, k)
 }
 
 /// Project the resolved effect-owned cursor body through adaptive shedding.
@@ -599,7 +680,7 @@ pub const fn default_trail_intensity(style: Option<GlowStyle>, classic_mono: boo
 
 /// A non-finite knob is OFF, never NaN in the engine; a finite one clamps.
 #[inline]
-fn finite_clamp_or_off(value: f32, min: f32, max: f32) -> f32 {
+const fn finite_clamp_or_off(value: f32, min: f32, max: f32) -> f32 {
     if value.is_finite() {
         value.clamp(min, max)
     } else {
@@ -611,9 +692,13 @@ fn finite_clamp_or_off(value: f32, min: f32, max: f32) -> f32 {
 /// automatic accent is the colour brightened 1.5×, in every host).
 #[inline]
 #[must_use]
-pub fn brighten(color: u32, factor: f32) -> u32 {
-    let channel = |shift: u32| ((((color >> shift) & 0xff) as f32) * factor).min(255.0) as u32;
-    (channel(16) << 16) | (channel(8) << 8) | channel(0)
+pub const fn brighten(color: u32, factor: f32) -> u32 {
+    const fn channel(color: u32, shift: u32, factor: f32) -> u32 {
+        ((((color >> shift) & 0xff) as f32) * factor).min(255.0) as u32
+    }
+    (channel(color, 16, factor) << 16)
+        | (channel(color, 8, factor) << 8)
+        | channel(color, 0, factor)
 }
 
 /// The style's own hue, `0x00RRGGBB`, or `None` for the styles whose
@@ -780,14 +865,20 @@ pub const fn canonical_glow_color_name(style: GlowStyle) -> Option<&'static str>
 /// pinned (Laser keeps its violet whatever is pinned).
 #[inline]
 #[must_use]
-pub fn own_trail_color(style: GlowStyle, cursor_color_pinned: bool) -> Option<(u32, &'static str)> {
+pub const fn own_trail_color(
+    style: GlowStyle,
+    cursor_color_pinned: bool,
+) -> Option<(u32, &'static str)> {
     if glow_color_follows_live_cursor(style, cursor_color_pinned) {
         return None;
     }
-    Some((
-        canonical_glow_color(style)?,
-        canonical_glow_color_name(style)?,
-    ))
+    let Some(color) = canonical_glow_color(style) else {
+        return None;
+    };
+    let Some(name) = canonical_glow_color_name(style) else {
+        return None;
+    };
+    Some((color, name))
 }
 
 /// What an unset `cursor_trail_color` draws for `style`'s trail on a block,
@@ -798,14 +889,17 @@ pub fn own_trail_color(style: GlowStyle, cursor_color_pinned: bool) -> Option<(u
 /// trail colour turns into its one-colour face.
 #[inline]
 #[must_use]
-pub fn trail_color_default_name(
+pub const fn trail_color_default_name(
     style: GlowStyle,
     cursor_color_pinned: bool,
 ) -> Option<&'static str> {
-    if style == GlowStyle::Classic {
+    if matches!(style, GlowStyle::Classic) {
         return Some("Shifting colors");
     }
-    own_trail_color(style, cursor_color_pinned).map(|(_, name)| name)
+    match own_trail_color(style, cursor_color_pinned) {
+        Some((_, name)) => Some(name),
+        None => None,
+    }
 }
 
 /// The colour an unset accent (native `cursor_trail_accent`) brightens.
@@ -829,21 +923,22 @@ pub enum AccentBase {
 /// chosen, the cursor's among them. Settings names an accent's Reset by it.
 #[inline]
 #[must_use]
-pub fn unset_accent_base(
+pub const fn unset_accent_base(
     style: GlowStyle,
     color: TrailColor,
     cursor_color_pinned: bool,
 ) -> AccentBase {
-    let automatic = || {
-        own_trail_color(style, cursor_color_pinned)
-            .map_or(AccentBase::Cursor, |(own, name)| AccentBase::Own(own, name))
-    };
     match color {
         TrailColor::Pinned(chosen) if style.draws_trail_color() => {
             AccentBase::Trail(chosen & 0x00FF_FFFF)
         }
         TrailColor::Cursor if style.draws_trail_color() => AccentBase::Cursor,
-        TrailColor::Automatic | TrailColor::Pinned(_) | TrailColor::Cursor => automatic(),
+        TrailColor::Automatic | TrailColor::Pinned(_) | TrailColor::Cursor => {
+            match own_trail_color(style, cursor_color_pinned) {
+                Some((own, name)) => AccentBase::Own(own, name),
+                None => AccentBase::Cursor,
+            }
+        }
     }
 }
 
@@ -866,13 +961,47 @@ pub enum TrailColor {
 }
 
 impl TrailColor {
+    /// The word for the cursor's colour in a trail colour setting.
+    pub const CURSOR_WORD: &'static str = "cursor";
+
+    /// A trail colour setting as written (native `cursor_trail_color`, a
+    /// page's `set_cursor_glow_color`): blank is [`Self::Automatic`], the
+    /// word `cursor` (any case) [`Self::Cursor`], an `RRGGBB` or `#RRGGBB`
+    /// colour [`Self::Pinned`]; `None` for anything else.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            Some(Self::Automatic)
+        } else if raw.eq_ignore_ascii_case(Self::CURSOR_WORD) {
+            Some(Self::Cursor)
+        } else {
+            aterm_types::scheme::parse_hex(raw).map(|color| {
+                Self::Pinned(
+                    (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b),
+                )
+            })
+        }
+    }
+
+    /// An explicit colour where one is given, else [`Self::Automatic`]: a
+    /// colour knob that cannot say "the cursor's".
+    #[inline]
+    #[must_use]
+    pub const fn automatic_or_pinned(color: Option<u32>) -> Self {
+        match color {
+            Some(color) => Self::Pinned(color & 0x00FF_FFFF),
+            None => Self::Automatic,
+        }
+    }
+
     /// The colour [`GlowKnobs::color`] takes for this setting, given the
     /// cursor colour the config resolves against (the per-frame step,
     /// [`follow_live_cursor`], moves a cursor-coloured trail with the live
     /// cursor after that).
     #[inline]
     #[must_use]
-    pub fn knob(self, cursor: u32) -> Option<u32> {
+    pub const fn knob(self, cursor: u32) -> Option<u32> {
         match self {
             Self::Automatic => None,
             Self::Cursor => Some(cursor & 0x00FF_FFFF),
@@ -883,7 +1012,7 @@ impl TrailColor {
     /// The same setting with a pinned colour masked to `0x00RRGGBB`.
     #[inline]
     #[must_use]
-    pub fn masked(self) -> Self {
+    pub const fn masked(self) -> Self {
         match self {
             Self::Pinned(color) => Self::Pinned(color & 0x00FF_FFFF),
             other => other,
@@ -894,7 +1023,7 @@ impl TrailColor {
     /// ([`CursorFxInput::user_tinted`]) and Classic draws its one-colour face.
     #[inline]
     #[must_use]
-    pub fn chosen(self) -> bool {
+    pub const fn chosen(self) -> bool {
         !matches!(self, Self::Automatic)
     }
 }
@@ -914,13 +1043,20 @@ impl TrailColor {
 /// brightens, except on a style that does not draw the trail colour on a
 /// block ([`GlowStyle::draws_trail_color`]): it keeps its automatic accent
 /// even while a colour is chosen for the rod.
-pub fn follow_live_cursor(
+///
+/// The comet body wears the colour the glow draws, so trail, nucleus and
+/// crown are one hue — unless the host gives the body a colour of its own
+/// (`body_color`: a web page's `set_cursor_trail` colour, which it configures
+/// apart from the glow; a native window has none), which it then keeps.
+#[inline]
+pub const fn follow_live_cursor(
     glow: &mut GlowConfig,
     trail: &mut TrailConfig,
     live_cursor: u32,
     cursor_color_pinned: bool,
     color: TrailColor,
     explicit_accent: bool,
+    body_color: Option<u32>,
 ) {
     let auto = automatic_glow_color(glow.style, live_cursor, cursor_color_pinned);
     let drawn = match color {
@@ -930,8 +1066,11 @@ pub fn follow_live_cursor(
     };
     if let Some(drawn) = drawn {
         glow.color = drawn;
-        trail.color = drawn;
     }
+    trail.color = match body_color {
+        Some(body) => body & 0x00FF_FFFF,
+        None => glow.color,
+    };
     if explicit_accent {
         return;
     }
@@ -959,7 +1098,7 @@ impl OverInkShares {
 
 /// A block cursor shape, the one every block body needs.
 #[inline]
-fn is_block(style: CursorStyle) -> bool {
+const fn is_block(style: CursorStyle) -> bool {
     matches!(style, CursorStyle::BlinkingBlock | CursorStyle::SteadyBlock)
 }
 
@@ -1078,6 +1217,7 @@ impl CursorFx {
     /// [`CursorRainbow::next_change_deadline`] and
     /// [`MomentumGlow::next_change_deadline`]), `None` when none is settling.
     /// `&mut` because the rainbow's is a memoised dry run of its tick.
+    #[inline]
     #[must_use]
     pub fn bodies_next_change_deadline(
         &mut self,
@@ -1108,6 +1248,7 @@ impl CursorFx {
     /// the ground, `head_dx`); `trail_cfg` likewise, `enabled` folded by the
     /// motion policy and its colour rewired. The comet's ignition from the
     /// typing cadence is stamped here.
+    #[inline]
     pub fn tick(
         &mut self,
         f: &CursorFxInput,
@@ -2694,6 +2835,7 @@ mod tests {
                 pinned,
                 TrailColor::Automatic,
                 false,
+                None,
             );
             (glow, trail)
         };
@@ -2768,6 +2910,7 @@ mod tests {
             true,
             TrailColor::Pinned(0x00E0_218A),
             false,
+            None,
         );
         assert_eq!((glow.color, trail.color), (0x00E0_218A, 0x00E0_218A));
         assert_eq!(
@@ -2792,6 +2935,7 @@ mod tests {
                 false,
                 TrailColor::Pinned(0x00E0_218A),
                 false,
+                None,
             );
             assert_eq!(glow.color, 0x00E0_218A, "{style:?}");
             assert_eq!(glow.accent, brighten(live, 1.5), "{style:?}");
@@ -2807,6 +2951,7 @@ mod tests {
             false,
             TrailColor::Automatic,
             true,
+            None,
         );
         assert_eq!((glow.color, glow.accent), (live, 0x0012_3456));
         // The cursor's colour, chosen, is the live cursor on every style,
@@ -2825,6 +2970,7 @@ mod tests {
                     pinned,
                     TrailColor::Cursor,
                     false,
+                    None,
                 );
                 assert_eq!((glow.color, trail.color), (live, live), "{style:?}");
                 assert_eq!(glow.accent, brighten(live, 1.5), "{style:?}");
@@ -2894,7 +3040,7 @@ mod tests {
                     0.5,
                 );
                 let (_, mut trail) = classic_cfg(true);
-                follow_live_cursor(&mut glow, &mut trail, live, pinned, setting, false);
+                follow_live_cursor(&mut glow, &mut trail, live, pinned, setting, false, None);
                 let base = unset_accent_base(style, setting, pinned);
                 let expected = match base {
                     AccentBase::Cursor => live,

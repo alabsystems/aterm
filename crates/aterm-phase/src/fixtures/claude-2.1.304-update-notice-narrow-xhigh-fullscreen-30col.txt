@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (30x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the same session after `ctl resize 40 30`: the vendor wraps the banner itself (`Claude Code` / `v2.1.304`) and the plain card takes six rows — no row holds the banner whole
+
+           Claude Code
+           v2.1.304
+ ▐▛███▛█   Opus 5.5 with
+▝▜██████▀  xhigh…
+ ▝▝   ▝▝   API Usage Billing
+           /…/tmp/at.r3cj/proj
+
+  Updated to latest. Got 66
+  features, 424 bugfixes, and
+  126 other changes.
+  code.claude.com/docs/en/chan
+  gelog for details
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+──────────────────────────────
+❯
+──────────────────────────────
+  ⏵⏵ auto mode on (shift+tab

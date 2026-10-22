@@ -186,13 +186,15 @@ impl Cell {
     /// complex cells.
     #[must_use]
     #[inline]
-    pub fn char(&self) -> char {
+    pub const fn char(&self) -> char {
         let flags = self.flags;
         let char_data = self.char_data;
         if flags.is_complex() {
             '\u{FFFD}' // Complex - use overflow table
+        } else if let Some(ch) = char::from_u32(char_data as u32) {
+            ch
         } else {
-            char::from_u32(u32::from(char_data)).unwrap_or('\u{FFFD}')
+            '\u{FFFD}'
         }
     }
 
@@ -233,11 +235,11 @@ impl Cell {
         clippy::cast_possible_truncation,
         reason = "cp verified <= 0xFFFF before cast; mask makes the cast provably lossless"
     )]
-    pub(crate) fn set_char(&mut self, c: char) {
+    pub(crate) const fn set_char(&mut self, c: char) {
         let cp = c as u32;
         debug_assert!(
             cp <= Self::MAX_DIRECT_CODEPOINT,
-            "set_char() called with non-BMP character U+{cp:04X}; use set_overflow_index() instead"
+            "set_char() called with non-BMP character; use set_overflow_index() instead"
         );
         let char_data = if cp <= Self::MAX_DIRECT_CODEPOINT {
             (cp & 0xFFFF) as u16
@@ -257,7 +259,7 @@ impl Cell {
 
     /// Set overflow index for complex character.
     #[inline]
-    pub(crate) fn set_overflow_index(&mut self, index: u16) {
+    pub(crate) const fn set_overflow_index(&mut self, index: u16) {
         self.char_data = index;
         let mut flags = self.flags;
         flags.insert(CellFlags::COMPLEX);
@@ -266,14 +268,14 @@ impl Cell {
 
     /// Set the flags.
     #[inline]
-    pub fn set_flags(&mut self, flags: CellFlags) {
+    pub const fn set_flags(&mut self, flags: CellFlags) {
         self.flags = flags;
     }
 
     /// Set the foreground color.
     #[cfg(any(test, debug_assertions))]
     #[inline]
-    pub fn set_fg(&mut self, fg: PackedColor) {
+    pub const fn set_fg(&mut self, fg: PackedColor) {
         let colors = self.colors;
         if fg.is_default() {
             self.colors = colors.set_fg_default();
@@ -323,7 +325,7 @@ impl Cell {
 
     /// Set or clear the HAS_EXTRAS flag on this cell.
     #[inline]
-    pub(crate) fn set_has_extras(&mut self, has: bool) {
+    pub(crate) const fn set_has_extras(&mut self, has: bool) {
         let colors = self.colors;
         self.colors = if has {
             colors.with_extras_flag()

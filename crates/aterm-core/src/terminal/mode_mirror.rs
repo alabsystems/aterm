@@ -7,7 +7,8 @@
 //! Publishes as atomics the fold behind
 //! [`Terminal::keyboard_mode`](super::Terminal::keyboard_mode),
 //! [`Terminal::mouse_mode`](super::Terminal::mouse_mode) and
-//! [`Terminal::focus_reporting_enabled`](super::Terminal::focus_reporting_enabled), plus the
+//! [`Terminal::focus_reporting_enabled`](super::Terminal::focus_reporting_enabled) and
+//! [`Terminal::focus_arms`](super::Terminal::focus_arms), plus the
 //! alternate-screen flag, DEC 1007 (alternate scroll) and DEC 2004 (bracketed paste). The input
 //! seam reads it on every key
 //! press without the terminal mutex; so do the DEC 1004 gate at the window's tab/pane
@@ -33,6 +34,9 @@ pub struct ModeMirror {
     mouse: AtomicU8,
     /// DEC 1004 (focus reporting) — `modes.focus_reporting`.
     focus: AtomicBool,
+    /// The program's DEC 1004 enables — `Terminal::focus_arms()`. Stored after `focus`,
+    /// so a reader that sees a new count sees the mode that enable left on.
+    focus_arms: AtomicU32,
     /// The alternate screen is active — `Terminal::is_alternate_screen()`.
     alternate_screen: AtomicBool,
     /// DEC 1007 (alternate scroll) — `modes.alternate_scroll`: on the alternate
@@ -87,6 +91,15 @@ impl ModeMirror {
         self.focus.load(Ordering::Acquire)
     }
 
+    /// Lock-free twin of `Terminal::focus_arms()`: the host compares it with the count it
+    /// last answered to learn that the program turned DEC 1004 on again. Read it before
+    /// [`Self::focus_reporting_enabled`]: the count is published second, so the mode read
+    /// after it is at least as new as that enable.
+    #[must_use]
+    pub fn focus_arms(&self) -> u32 {
+        self.focus_arms.load(Ordering::Acquire)
+    }
+
     /// Lock-free twin of `Terminal::is_alternate_screen()`.
     #[must_use]
     pub fn alternate_screen(&self) -> bool {
@@ -115,6 +128,7 @@ impl ModeMirror {
         self.mouse.store(term.mouse_mode() as u8, Ordering::Release);
         self.focus
             .store(term.focus_reporting_enabled(), Ordering::Release);
+        self.focus_arms.store(term.focus_arms(), Ordering::Release);
         self.alternate_screen
             .store(term.is_alternate_screen(), Ordering::Release);
         self.alternate_scroll
@@ -171,6 +185,11 @@ impl super::Terminal {
             "focus-report mirror out of sync: a mutation site forgot refresh_mode_mirror()"
         );
         debug_assert_eq!(
+            self.mode_mirror.focus_arms(),
+            self.focus_arms(),
+            "focus-arm mirror out of sync: a mutation site forgot refresh_mode_mirror()"
+        );
+        debug_assert_eq!(
             self.mode_mirror.alternate_screen(),
             self.is_alternate_screen(),
             "alternate-screen mirror out of sync: a mutation site forgot refresh_mode_mirror()"
@@ -214,6 +233,7 @@ mod tests {
             term.focus_reporting_enabled(),
             "focus reporting after {what}"
         );
+        assert_eq!(m.focus_arms(), term.focus_arms(), "focus arms after {what}");
         assert_eq!(
             m.alternate_screen(),
             term.is_alternate_screen(),
@@ -384,5 +404,45 @@ mod tests {
                 .keyboard_mode()
                 .contains(KeyboardMode::APP_CURSOR)
         );
+    }
+
+    /// The arm count moves once per off->on edge of the program's DEC 1004 (DECSET or
+    /// XTRESTORE), never for a re-sent `?1004h`, a disable, the host's own arming or a
+    /// reset, and the lock-free word carries every value.
+    #[test]
+    fn the_focus_arm_count_moves_on_each_program_enable_edge_only() {
+        let mut term = Terminal::new(24, 80);
+        let arms = |term: &Terminal| term.mode_mirror().focus_arms();
+        assert_eq!(arms(&term), 0, "a fresh terminal has armed nothing");
+        let steps: &[(&str, &[u8], u32)] = &[
+            ("first enable", b"\x1b[?1004h", 1),
+            ("a re-sent enable", b"\x1b[?1004h\x1b[?1004h", 1),
+            ("a disable", b"\x1b[?1004l", 1),
+            ("enable again", b"\x1b[?1004h", 2),
+            ("off and on in one batch", b"\x1b[?1004l\x1b[?1004h", 3),
+            (
+                "XTSAVE, off, XTRESTORE",
+                b"\x1b[?1004s\x1b[?1004l\x1b[?1004r",
+                4,
+            ),
+            ("DECSTR turns it off", b"\x1b[!p", 4),
+            ("RIS turns it off", b"\x1b[?1004h\x1bc", 5),
+        ];
+        for (what, bytes, want) in steps {
+            term.process(bytes);
+            assert_eq!(arms(&term), *want, "{what}");
+            assert_in_sync(&term, what);
+        }
+        assert!(!term.focus_reporting_enabled(), "the reset left it off");
+        let mut config = crate::config::TerminalConfig::default();
+        config.focus_reporting = true;
+        let _ = term.apply_config(&config);
+        assert!(term.focus_reporting_enabled(), "the host armed DEC 1004");
+        assert_eq!(
+            arms(&term),
+            5,
+            "the host's arming is not the program's enable"
+        );
+        assert_in_sync(&term, "apply_config(focus_reporting = true)");
     }
 }

@@ -208,9 +208,30 @@ struct Tm {
     tm_zone: *const libc::c_char,
 }
 
+/// The machine's zone's offset from UTC at a unix second, in seconds east
+/// (`localtime_r`'s `tm_gmtoff`).
+#[must_use]
+pub fn local_offset_s(secs: i64) -> i64 {
+    local_tm(secs).tm_gmtoff
+}
+
 /// Local calendar fields of a unix second: (year, month 1-12, day, hour, minute, second).
 #[must_use]
 pub fn local_time(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let tm = local_tm(secs);
+    let u = |v: libc::c_int| u32::try_from(v).unwrap_or(0);
+    (
+        tm.tm_year + 1900,
+        u(tm.tm_mon + 1),
+        u(tm.tm_mday),
+        u(tm.tm_hour),
+        u(tm.tm_min),
+        u(tm.tm_sec),
+    )
+}
+
+/// `localtime_r` of a unix second.
+fn local_tm(secs: i64) -> Tm {
     let t: libc::time_t = secs;
     let mut tm = Tm {
         tm_sec: 0,
@@ -227,15 +248,7 @@ pub fn local_time(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     };
     // SAFETY: both pointers are valid for the call; `localtime_r` writes `tm` only.
     unsafe { localtime_r(&t, &mut tm) };
-    let u = |v: libc::c_int| u32::try_from(v).unwrap_or(0);
-    (
-        tm.tm_year + 1900,
-        u(tm.tm_mon + 1),
-        u(tm.tm_mday),
-        u(tm.tm_hour),
-        u(tm.tm_min),
-        u(tm.tm_sec),
-    )
+    tm
 }
 
 // ------------------------------------------------------------------ processes

@@ -123,7 +123,7 @@ pub fn main_entry(args: Vec<OsString>, base: &dyn Fn(bool) -> Base) -> ExitCode 
         return ExitCode::FAILURE;
     }
     let sys = Live::new();
-    let result = crate::engine::account_journal().and_then(|mut journal| {
+    let result = sys.journal().and_then(|mut journal| {
         let ctx = local_context(&sys)?;
         let mode = if options.action == Action::Apply {
             Mode::Apply
@@ -137,7 +137,7 @@ pub fn main_entry(args: Vec<OsString>, base: &dyn Fn(bool) -> Base) -> ExitCode 
             base(mode == Mode::Apply),
             &groups,
             mode,
-            &mut journal,
+            journal.as_mut(),
         )
     });
     let rows = match result {
@@ -338,8 +338,9 @@ impl Workstation {
     /// # Errors
     /// The journal cannot be resolved or the items' dependency order is invalid.
     pub fn run_recording(self, sys: &dyn System, mode: Mode) -> Result<WorkstationRun, String> {
-        let mut journal = crate::engine::account_journal()?;
-        self.run_recording_with(sys, mode, &mut journal)
+        // The journal of the account `sys` acts as: the items' own port.
+        let mut journal = sys.journal()?;
+        self.run_recording_with(sys, mode, journal.as_mut())
     }
 
     fn run_recording_with(
@@ -744,8 +745,8 @@ fn context_for(sys: &dyn System, group: WorkstationGroup) -> Result<Ctx, String>
 
 fn context_for_selected(
     sys: &dyn System,
-    group: WorkstationGroup,
-    selected: Selection,
+    _group: WorkstationGroup,
+    _selected: Selection,
 ) -> Result<Ctx, String> {
     if sys.euid() == 0 {
         return Err("run as the logged-in user, without sudo".into());
@@ -786,24 +787,11 @@ fn context_for_selected(
             disrupt: true,
         });
     }
-    let keyboards = if group == WorkstationGroup::Accounts || !selected.contains(Setting::CapsLock)
-    {
-        Vec::new()
-    } else {
-        let command = crate::facts::hidutil_keyboards();
-        let keyboard_list = sys
-            .run_complete_stdout(&command)
-            .map_err(|e| format!("{}: {e}", command.display()))?;
-        if !keyboard_list.success() {
-            return Err(format!(
-                "{}: {}",
-                command.display(),
-                keyboard_list.describe()
-            ));
-        }
-        crate::facts::parse_hidutil_keyboards_complete(&keyboard_list.out())?
-    };
-    let facts = HostFacts { keyboards, ..facts };
+    // Live keyboard inventory is deliberately not read here. Searching HID
+    // devices can stall behind the device/Bluetooth stack or its system UI,
+    // and startup must never wait on it. Caps Lock preferences for listed
+    // models still apply; live attached-keyboard activation is not part of
+    // this pass.
     Ok(Ctx {
         facts,
         users: vec![user.clone()],
@@ -1085,6 +1073,36 @@ mod tests {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => panic!("{}: {e}", journal.path().display()),
         }
+    }
+
+    /// The workstation pass (`aterm doctor --apply`, a first launch's setup) journals each
+    /// change in the journal of the system it runs on: the fake's files hold the changed
+    /// item's line, and the item already as wanted writes none. Negative control: the
+    /// journal this process would resolve for itself is never asked, so a mutant that
+    /// asks it leaves the fake's journal empty.
+    #[test]
+    fn a_workstation_pass_journals_in_the_journal_of_the_system_it_runs_on() {
+        let sys = Fake::root();
+        let pass = Workstation {
+            items: vec![
+                Listed::boxed("init.test.changes", vec![change(), ok()]),
+                Listed::boxed("init.test.right", vec![ok()]),
+            ],
+            ctx: ctx(&[user("alice", 501)]),
+            snapshots: None,
+        };
+        let rows = pass.run_recording(&sys, Mode::Apply).unwrap().rows;
+        assert_eq!(rows[0].outcome, Outcome::Changed, "{rows:?}");
+        let text =
+            String::from_utf8(sys.written(Fake::JOURNAL).expect("the fake's journal")).unwrap();
+        let ids: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let line: aterm_json::Value = aterm_json::from_str(line).unwrap();
+                line["id"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(ids, ["init.test.changes"]);
     }
 
     #[test]
@@ -1630,53 +1648,37 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_keyboard_list_at_the_console_is_refused_before_preferences_or_accounts_are_read()
-     {
-        let current_user = || {
-            let mut sys = Fake::root();
-            sys.euid = 501;
-            sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
-            sys.on(
-                "/usr/bin/dscl . -read /Groups/admin GroupMembership",
-                Ran::ok("GroupMembership: alice\n"),
-            );
-            sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
-            sys.stat_of(
-                "/dev/console",
-                Stat {
-                    uid: 501,
-                    gid: 20,
-                    mode: 0o600,
-                    dir: false,
-                    symlink: false,
-                    len: 0,
-                },
-            );
-            sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
-            sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
-            sys
-        };
-        let command = crate::facts::hidutil_keyboards();
-        for invalid in [
-            "Services:\nUnknownHeader\nnonempty unparsed row\n",
-            "Devices:\n",
-        ] {
-            let sys = current_user();
-            sys.on(&command.display(), Ran::ok(invalid));
-            assert!(local_context(&sys).is_err());
-            assert!(
-                !sys.calls()
-                    .iter()
-                    .any(|call| call.contains("defaults") || call.contains("accounts.data"))
-            );
-        }
-        let sys = current_user();
-        sys.on(&command.display(), Ran::ok("Services:\n\nDevices:\n"));
-        assert!(local_context(&sys).unwrap().facts.keyboards.is_empty());
-        let sys = current_user();
-        sys.on(&command.display(), Ran::ok("Services:\n"));
-        sys.refuse_complete_stdout(&command.display(), "incomplete captured service list");
-        assert!(local_context(&sys).is_err());
+    fn local_context_never_inventories_live_keyboards() {
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        sys.on("/usr/bin/id -un", Ran::ok("alice\n"));
+        sys.on(
+            "/usr/bin/dscl . -read /Groups/admin GroupMembership",
+            Ran::ok("GroupMembership: alice\n"),
+        );
+        sys.on("/usr/bin/dscl . -read /Users//alice UniqueID PrimaryGroupID NFSHomeDirectory UserShell", Ran::ok("UniqueID: 501\nPrimaryGroupID: 20\nNFSHomeDirectory: /Users//alice\nUserShell: /bin/zsh\n"));
+        sys.stat_of(
+            "/dev/console",
+            Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: 0,
+            },
+        );
+        sys.on("/usr/bin/uname -m", Ran::ok("arm64\n"));
+        sys.on("/usr/bin/sw_vers -productVersion", Ran::ok("27.0\n"));
+        // No hidutil expectation is installed: startup must not search live
+        // devices or wait on the HID/Bluetooth stack to answer.
+        let ctx = local_context(&sys).unwrap();
+        assert!(ctx.facts.keyboards.is_empty());
+        assert!(
+            !sys.calls().iter().any(|call| call.contains("hidutil")),
+            "calls: {:?}",
+            sys.calls()
+        );
     }
 
     #[test]

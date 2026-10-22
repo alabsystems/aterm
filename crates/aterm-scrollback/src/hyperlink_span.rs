@@ -22,7 +22,8 @@ pub struct HyperlinkSpan {
 impl HyperlinkSpan {
     /// Create a new hyperlink span (no explicit ID).
     #[must_use]
-    pub fn new(start_col: u16, end_col: u16, url: Arc<str>) -> Self {
+    #[inline]
+    pub const fn new(start_col: u16, end_col: u16, url: Arc<str>) -> Self {
         Self {
             start_col,
             end_col,
@@ -33,7 +34,13 @@ impl HyperlinkSpan {
 
     /// Create a new hyperlink span with an explicit OSC 8 ID.
     #[must_use]
-    pub fn with_id(start_col: u16, end_col: u16, url: Arc<str>, id: Option<Arc<str>>) -> Self {
+    #[inline]
+    pub const fn with_id(
+        start_col: u16,
+        end_col: u16,
+        url: Arc<str>,
+        id: Option<Arc<str>>,
+    ) -> Self {
         Self {
             start_col,
             end_col,
@@ -47,7 +54,7 @@ impl HyperlinkSpan {
     /// ENSURES: result == (col >= self.start_col && col < self.end_col)
     #[inline]
     #[must_use]
-    pub fn contains(&self, col: u16) -> bool {
+    pub const fn contains(&self, col: u16) -> bool {
         col >= self.start_col && col < self.end_col
     }
 
@@ -55,7 +62,7 @@ impl HyperlinkSpan {
     #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn width(&self) -> u16 {
+    pub const fn width(&self) -> u16 {
         self.end_col.saturating_sub(self.start_col)
     }
 
@@ -65,6 +72,7 @@ impl HyperlinkSpan {
     /// Saturating only discharges the Trust lane's overflow obligation; in-memory
     /// string lengths always fit.
     #[must_use]
+    #[inline]
     pub fn serialized_size(&self) -> usize {
         let id_len = match self.id.as_ref() {
             Some(id) => id.len(),

@@ -10,7 +10,7 @@
 use aterm_secrets::SecretBytes;
 use aterm_secrets::age::Identity;
 use aterm_secrets::client::{
-    self, JoinOptions, JoinOutcome, Membership, Paths, ProbeOutcome, SyncOutcome,
+    self, Approval, JoinOptions, JoinOutcome, Membership, Paths, ProbeOutcome, SyncOutcome,
 };
 use aterm_secrets::envelope::{self, Unsigned};
 use aterm_secrets::server::{self, Options, Running};
@@ -33,10 +33,16 @@ struct Lab {
     server: Option<Running>,
     url: String,
     hold: Duration,
+    gap: Duration,
 }
 
-fn start(listener: std::net::TcpListener, store: PathBuf, hold: Duration) -> Running {
-    server::start(
+fn start(
+    listener: std::net::TcpListener,
+    store: PathBuf,
+    hold: Duration,
+    gap: Duration,
+) -> Running {
+    server::start_with_join_change_gap(
         listener,
         &Options {
             listen: "127.0.0.1:0".parse().expect("addr"),
@@ -46,6 +52,7 @@ fn start(listener: std::net::TcpListener, store: PathBuf, hold: Duration) -> Run
             hold,
             keep_awake: false,
         },
+        gap,
     )
     .expect("server starts")
 }
@@ -57,15 +64,26 @@ impl Lab {
 
     /// A lab whose server holds a long-poll at most `hold`.
     fn holding(vault: &str, hold: Duration) -> Lab {
+        Lab::tuned(vault, hold, server::JOIN_CHANGE_GAP)
+    }
+
+    /// A lab whose server lets a key change its join request at once (no
+    /// [`server::JOIN_CHANGE_GAP`] sat out on a real clock).
+    fn changing(vault: &str) -> Lab {
+        Lab::tuned(vault, Duration::from_secs(50), Duration::ZERO)
+    }
+
+    fn tuned(vault: &str, hold: Duration, gap: Duration) -> Lab {
         let root = aterm_tempfile::tempdir().expect("tempdir");
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let server = start(listener, root.path().join("store"), hold);
+        let server = start(listener, root.path().join("store"), hold, gap);
         let url = format!("http://{}/v1/{vault}", server.addr);
         Lab {
             root,
             server: Some(server),
             url,
             hold,
+            gap,
         }
     }
 
@@ -77,7 +95,7 @@ impl Lab {
         let store = self.root.path().join("store");
         std::fs::remove_dir_all(&store).expect("store removed");
         let listener = std::net::TcpListener::bind(addr).expect("the same address again");
-        self.server = Some(start(listener, store, self.hold));
+        self.server = Some(start(listener, store, self.hold, self.gap));
     }
 
     /// A machine's home, with its `~/.secrets` absent.
@@ -613,6 +631,188 @@ fn a_machine_that_knows_the_join_password_is_let_in_by_the_admins_subscriber() {
 }
 
 #[test]
+fn an_open_vault_lets_in_every_machine_that_asks_with_no_password() {
+    let lab = Lab::new("open");
+    let admin = lab.home("ma");
+    let token = synthetic("gh");
+    write_private(&admin.home.join(".secrets/gh_access_token"), &token);
+    let created = client::create(
+        &admin,
+        &lab.url,
+        Some(&admin.home.join(".secrets")),
+        Some("ma"),
+    )
+    .expect("create");
+    let password = client::admin_open(&admin)
+        .expect("open")
+        .doc
+        .join_password()
+        .expect("create makes a join password");
+    let pinned = format!("{}#{}", lab.url, created.signer);
+    // Before the vault is open, a machine that asks with no password waits for a person.
+    let early = lab.home("me");
+    join_unattended(&early, &pinned, "me").expect("join");
+    let closed = client::auto_approve(&admin).expect("approve");
+    assert!(closed.approved.is_empty(), "{:?}", closed.approved);
+
+    // The admin opens it: the password goes, and only admins could ever read either. The
+    // machine already waiting joins only by code: it may be one let go while the vault was
+    // closed, its approved request still queued.
+    let opened = client::admin_open(&admin).expect("open");
+    let me = client::requests(&admin, Some(&opened.doc)).expect("requests")[0]
+        .recipient
+        .clone();
+    let mut doc = opened.doc.clone();
+    doc.set_open(true).expect("open");
+    let published = client::admin_publish(&admin, &opened, &doc).expect("publish");
+    let asked: Vec<&str> = published.held.iter().map(|r| r.host.as_str()).collect();
+    assert_eq!(asked, ["me"]);
+    assert!(!published.kept_out);
+    let doc = client::admin_open(&admin).expect("open").doc.clone();
+    assert!(doc.open());
+    assert!(doc.join_password().is_none());
+    assert_eq!(doc.code_only(), std::slice::from_ref(&me));
+    assert_eq!(Approval::of(&doc), Some(Approval::Open));
+
+    // A machine that asks with no password, and one that still sends a proof of the old
+    // password, are both let in in one publish; the one that asked before is not.
+    let machine = lab.home("mb");
+    assert!(matches!(
+        join_unattended(&machine, &pinned, "mb").expect("join"),
+        JoinOutcome::Pending { .. }
+    ));
+    let proving = lab.home("mc");
+    join_with(&proving, &pinned, "mc", Some(password.as_slice())).expect("join");
+    let listed = || client::requests(&admin, None).expect("requests");
+    let mut settled = client::Settled::default();
+    let approval = Approval::Open;
+    assert!(settled.due(held(&admin), &listed(), approval));
+    let done = client::auto_approve(&admin).expect("approve");
+    let mut approved = done.approved.clone();
+    approved.sort_unstable();
+    assert_eq!(approved, ["mb", "mc"]);
+    assert!(done.refused.is_empty());
+    assert_eq!(done.code_only, std::slice::from_ref(&me));
+    settled.settle(done.judged);
+    assert_eq!(
+        client::sync(&early, None).expect("sync"),
+        SyncOutcome::NotIn
+    );
+    // Approved by its code, it is in, and its line goes.
+    approve_key(&admin, "me", &me);
+    assert!(
+        client::admin_open(&admin)
+            .expect("open")
+            .doc
+            .code_only()
+            .is_empty()
+    );
+    for member in [&machine, &proving, &early] {
+        applied(client::sync(member, None).expect("sync"));
+        assert_eq!(
+            read(member, "gh_access_token").as_deref(),
+            Some(token.as_str())
+        );
+    }
+    // The approved requests stay queued: the new version judges them once, as members,
+    // publishes nothing, and the approver rests.
+    let seq = held(&admin);
+    assert!(settled.due(seq, &listed(), approval));
+    let again = client::auto_approve(&admin).expect("approve");
+    assert!(again.approved.is_empty() && again.code_only.is_empty());
+    assert_eq!(again.seq, None);
+    assert_eq!(held(&admin), seq);
+    settled.settle(again.judged);
+    assert!(!settled.due(held(&admin), &listed(), approval));
+
+    // Letting a machine go puts its key on a `code-only` line, so the request mb joined
+    // with, still queued, does not let it straight back in, nor does asking again.
+    let open = client::admin_open(&admin).expect("open");
+    let mb = recipient_of(&open.doc, "mb");
+    let mut doc = open.doc.clone();
+    assert!(doc.remove_machine("mb", false).expect("remove"));
+    let gone = client::admin_publish(&admin, &open, &doc).expect("publish");
+    assert!(gone.kept_out && !gone.password_renewed && gone.held.is_empty());
+    let kept = client::admin_open(&admin).expect("open").doc.clone();
+    assert!(kept.open());
+    assert_eq!(kept.code_only(), std::slice::from_ref(&mb));
+    join_unattended(&machine, &pinned, "mb").expect("join");
+    let after = client::auto_approve(&admin).expect("approve");
+    assert!(after.approved.is_empty(), "{:?}", after.approved);
+    assert_eq!(after.code_only, std::slice::from_ref(&mb));
+    assert_eq!(after.seq, None);
+    assert_eq!(
+        client::sync(&machine, None).expect("sync"),
+        SyncOutcome::NotIn
+    );
+    // A version that lets nobody go leaves the lines be.
+    set(&admin, &Audience::Everyone, "note", "kept");
+    let noted = client::admin_open(&admin).expect("open").doc.clone();
+    assert!(noted.open());
+    assert_eq!(noted.code_only(), std::slice::from_ref(&mb));
+
+    // Closed to approval by code, a machine that asks waits for a person again.
+    let open = client::admin_open(&admin).expect("open");
+    let mut doc = open.doc.clone();
+    doc.set_open(false).expect("close");
+    client::admin_publish(&admin, &open, &doc).expect("publish");
+    let closed = client::admin_open(&admin).expect("open").doc.clone();
+    assert!(!closed.open() && closed.join_password().is_none());
+    assert_eq!(Approval::of(&closed), None);
+    let late = lab.home("md");
+    join_unattended(&late, &pinned, "md").expect("join");
+    let refused = client::auto_approve(&admin).expect("approve");
+    assert!(refused.approved.is_empty(), "{:?}", refused.approved);
+    assert_eq!(client::sync(&late, None).expect("sync"), SyncOutcome::NotIn);
+
+    // Opened again, the machine let go is still kept out (its line outlived closing and
+    // opening), and the one that asked while it was closed joins only by code too.
+    let open = client::admin_open(&admin).expect("open");
+    let md = client::requests(&admin, Some(&open.doc))
+        .expect("requests")
+        .into_iter()
+        .find(|request| request.host == "md")
+        .expect("md asks")
+        .recipient;
+    let mut doc = open.doc.clone();
+    doc.set_open(true).expect("open");
+    let reopened = client::admin_publish(&admin, &open, &doc).expect("publish");
+    let asked: Vec<&str> = reopened.held.iter().map(|r| r.host.as_str()).collect();
+    assert_eq!(asked, ["md"], "mb's key is code-only already");
+    let none = client::auto_approve(&admin).expect("approve");
+    assert!(none.approved.is_empty(), "{:?}", none.approved);
+    let mut waiting = none.code_only.clone();
+    waiting.sort_unstable();
+    let mut want = vec![mb.clone(), md.clone()];
+    want.sort_unstable();
+    assert_eq!(waiting, want);
+
+    // Approved by its code, the machine let go is back, and its line is gone; md's stays.
+    approve_key(&admin, "mb", &mb);
+    let back = client::admin_open(&admin).expect("open").doc.clone();
+    assert_eq!(back.code_only(), std::slice::from_ref(&md));
+    applied(client::sync(&machine, None).expect("sync"));
+}
+
+/// Admit `key` as `host` by hand, as `aterm secrets approve <code>` does.
+fn approve_key(admin_paths: &Paths, host: &str, key: &str) {
+    let open = client::admin_open(admin_paths).expect("open");
+    let mut doc = open.doc.clone();
+    let host = client::free_name(&doc, host);
+    doc.add_machine(&host, key).expect("add");
+    client::admin_publish(admin_paths, &open, &doc).expect("publish");
+}
+
+/// The key of `doc`'s machine `name`.
+fn recipient_of(doc: &Document, name: &str) -> String {
+    doc.machines()
+        .into_iter()
+        .find(|machine| machine.name == name)
+        .expect(name)
+        .recipient
+}
+
+#[test]
 fn letting_a_machine_go_renews_the_join_password_so_it_is_not_let_in_again() {
     let lab = Lab::new("leave");
     let admin = lab.home("ma");
@@ -643,10 +843,11 @@ fn letting_a_machine_go_renews_the_join_password_so_it_is_not_let_in_again() {
 
     // Revoked: the version that lets it go carries a new password...
     let open = client::admin_open(&admin).expect("open");
+    let mb = recipient_of(&open.doc, "mb");
     let mut doc = open.doc.clone();
     assert!(doc.remove_machine("mb", false).expect("remove"));
     let done = client::admin_publish(&admin, &open, &doc).expect("publish");
-    assert!(done.password_renewed);
+    assert!(done.password_renewed && !done.kept_out && done.held.is_empty());
     let renewed = client::admin_open(&admin)
         .expect("open")
         .doc
@@ -676,6 +877,25 @@ fn letting_a_machine_go_renews_the_join_password_so_it_is_not_let_in_again() {
         .join_password()
         .expect("a join password");
     assert_eq!(kept.as_slice(), renewed.as_slice());
+
+    // A closed vault writes no `code-only` line (an older aterm could not read it), but
+    // opening it while the request mb joined with is still queued holds every waiting
+    // request for its code: mb's, and mc's, which never was one.
+    let open = client::admin_open(&admin).expect("open");
+    assert!(open.doc.code_only().is_empty());
+    let mut doc = open.doc.clone();
+    doc.set_open(true).expect("open");
+    let published = client::admin_publish(&admin, &open, &doc).expect("publish");
+    let mut asked: Vec<&str> = published.held.iter().map(|r| r.host.as_str()).collect();
+    asked.sort_unstable();
+    assert_eq!(asked, ["mb", "mc"]);
+    let opened = client::auto_approve(&admin).expect("approve");
+    assert!(opened.approved.is_empty(), "{:?}", opened.approved);
+    assert!(opened.code_only.contains(&mb));
+    assert_eq!(
+        client::sync(&machine, None).expect("sync"),
+        SyncOutcome::NotIn
+    );
 }
 
 #[test]
@@ -999,7 +1219,7 @@ fn removing_an_admin_renews_the_join_password_it_read() {
 
 #[test]
 fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged() {
-    let lab = Lab::new("settle");
+    let lab = Lab::changing("settle");
     let admin = lab.home("ma");
     let created = client::create(&admin, &lab.url, None, Some("ma")).expect("create");
     let password = client::admin_open(&admin)
@@ -1024,23 +1244,22 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
         .expect("join"),
         JoinOutcome::Pending { .. }
     ));
-    assert!(settled.due(held(&admin), &listed()));
+    assert!(settled.due(held(&admin), &listed(), Approval::Password));
     let refused = client::auto_approve(&admin).expect("approve");
     assert!(refused.approved.is_empty());
     assert_eq!(refused.judged.len(), 1);
     settled.settle(refused.judged);
     assert!(
-        !settled.due(held(&admin), &listed()),
+        !settled.due(held(&admin), &listed(), Approval::Password),
         "a refused proof is not judged again"
     );
 
-    // They join again and type it right, once the server lets the key change its request:
-    // the new proof is judged at once, with nothing published between.
-    std::thread::sleep(server::JOIN_CHANGE_GAP + Duration::from_secs(1));
+    // They join again and type it right, the server letting the key change its request
+    // (`Lab::changing`): the new proof is judged at once, with nothing published between.
     join_with(&machine, &pinned, "mb", Some(password.as_slice())).expect("join");
     assert_eq!(held(&admin), 1, "nothing was published since");
     assert!(
-        settled.due(held(&admin), &listed()),
+        settled.due(held(&admin), &listed(), Approval::Password),
         "the corrected request is judged"
     );
     let approved = client::auto_approve(&admin).expect("approve");
@@ -1053,7 +1272,7 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
     // finding mb a machine, and then the approver rests.
     assert!(listed().iter().any(|request| request.host == "mb"));
     assert!(
-        settled.due(held(&admin), &listed()),
+        settled.due(held(&admin), &listed(), Approval::Password),
         "a new version is judged afresh"
     );
     let member = client::auto_approve(&admin).expect("approve");
@@ -1061,7 +1280,7 @@ fn the_approver_judges_a_corrected_request_at_once_and_rests_once_all_are_judged
     assert_eq!(member.seq, None);
     settled.settle(member.judged);
     assert!(
-        !settled.due(held(&admin), &listed()),
+        !settled.due(held(&admin), &listed(), Approval::Password),
         "nothing is left to judge"
     );
 }
@@ -1134,6 +1353,37 @@ fn an_edit_saved_over_a_machine_admitted_meanwhile_keeps_it() {
             .expect("merge")
             .is_empty(),
         "a text that names the key already keeps it"
+    );
+}
+
+#[test]
+fn an_edit_saved_over_an_open_vault_that_let_a_machine_go_keeps_it_out() {
+    let (ma, mb, mc) = (new_key(), new_key(), new_key());
+    let mut base = Document::new_vault("ma", &ma);
+    base.add_machine("mb", &mb).expect("add");
+    base.add_machine("mc", &mc).expect("add");
+    base.set_open(true).expect("open");
+    // Another admin lets mb and mc go while the person edits, which puts their keys on
+    // `code-only` lines...
+    let mut current = base.clone();
+    for (name, key) in [("mb", &mb), ("mc", &mc)] {
+        assert!(current.remove_machine(name, false).expect("remove"));
+        current.add_code_only(key).expect("code-only");
+    }
+    // ...and the person's text, which began with both in, deletes mb and keeps mc.
+    let mut edited = base.clone();
+    assert!(edited.remove_machine("mb", false).expect("remove"));
+    client::keep_admitted(&base, &current, &mut edited).expect("merge");
+    assert_eq!(
+        edited.code_only(),
+        std::slice::from_ref(&mb),
+        "mb's line is kept; mc, a machine of the saved text, needs none"
+    );
+    assert!(
+        edited
+            .machines()
+            .iter()
+            .any(|machine| machine.recipient == mc)
     );
 }
 

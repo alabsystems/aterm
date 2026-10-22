@@ -44,7 +44,8 @@
 
 use super::super::policy::outlook::ExceptionKind;
 use super::super::policy::turn_end::{
-    Conversation, HostTurn, RULE_MODEL_FALLBACK, ended_under, reads_conversation, screen_alone,
+    Conversation, HostTurn, RULE_MODEL_FALLBACK, ended_under, met_under_another,
+    reads_conversation, screen_alone,
 };
 use super::approvals::{self, Outcome, RULE_WALL_WAIT, RULE_WALL_WAIT_END, WALL_LEFT_NO_TASK};
 use super::turn_end_loop::resume_jitter;
@@ -184,13 +185,21 @@ impl<C: Ctl> Session<'_, C> {
     /// its own notice ([`ended_under`]: a person's
     /// short turn under it, which no read saw busy, is work since the wall,
     /// and so is the vendor's own continuation; either under another limit's
-    /// notice is not).
+    /// notice is not). Never a wall met under another agent than the one
+    /// `reader` reads ([`met_under_another`]): read on that agent's
+    /// background work, it held the agent until the other's reset and was
+    /// then resumed into it.
     pub(super) fn remembered_wall(
         &self,
         reader: &dyn ScreenReader,
         rows: &[String],
     ) -> Option<aterm_phase::Wall> {
         let memory = self.wall_memory.as_ref()?;
+        // Another agent's limit is none of this one's
+        // ([`met_under_another`]): its screen stands for no wall of theirs.
+        if met_under_another(memory.program, reader.program()) {
+            return None;
+        }
         ((background_alone(reader, rows) || reader.end_hidden(rows))
             && !ended_under(
                 aterm_phase::since_limit(rows).as_ref(),
@@ -501,16 +510,28 @@ impl<C: Ctl> Session<'_, C> {
     /// a row a host-scoped loop wrote included, is the hostless lane's, and
     /// the remembered limit waits for its reset and resumes as there — held
     /// unread, a Muse Code's limit was looked at every five minutes for good.
-    /// A limit met under another program keeps its scope: Claude Code's,
-    /// unread under a host, is not one of theirs because one of them runs in
-    /// the tab now — released at such an agent's first decision, it was
-    /// written so, and a hostless loop that followed typed its resume into a
-    /// conversation no read confirmed. A row that names no program (an older
-    /// build's) is released as before. Codex and a screen no reader names (a
-    /// shell, a Claude Code drawing neither its composer frame nor a box) name
-    /// no program the limit could be told by, so they keep its scope as it
+    /// A LIMIT MET UNDER ANOTHER AGENT ([`met_under_another`]) is not this
+    /// agent's to scope: it ends at this decision's fold
+    /// ([`TurnEndState::observe`]), holding nothing of this agent's, and
+    /// scoped first it was written once more for nothing. So a Claude Code
+    /// decision under a host does NOT require a limit met under Muse Code, agy
+    /// or Gemini CLI: no read of Claude Code's names such a limit's
+    /// conversation. Required, it was written `"conversation":null` for
+    /// nothing (the other agent's next decision released it again), and
+    /// scoped either way it held Claude Code's tab for good
+    /// (`limit-conversation-unread`, a look every five minutes) where it now
+    /// ends. Nor does one of those agents' decisions release
+    /// Claude Code's unread limit (released, it was written so, and a
+    /// hostless loop that followed typed its resume into a conversation no
+    /// read confirmed). A row that names no program (an older build's) is
+    /// released as before. Codex and a screen no reader names (a shell, a
+    /// Claude Code drawing neither its composer frame nor a box) name no
+    /// program the limit could be told by, so they keep its scope as it
     /// stands. A named scope is kept either way.
     pub(super) fn scope_limit_conversation(&mut self, program: Program, host: bool, seq: u64) {
+        if met_under_another(self.limit_met_under(), program) {
+            return;
+        }
         if screen_alone(program) {
             if self.limit_met_under().is_none_or(screen_alone) {
                 self.rescope_limit(&Conversation::Unknown, &Conversation::Hostless, seq);

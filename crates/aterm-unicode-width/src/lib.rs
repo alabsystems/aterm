@@ -13,6 +13,7 @@
 #![warn(missing_docs)]
 
 /// The C0 controls, DEL and the C1 controls: upstream's `None`.
+#[inline]
 const fn is_control(c: char) -> bool {
     matches!(c, '\0'..='\u{1F}' | '\u{7F}'..='\u{9F}')
 }

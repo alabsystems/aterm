@@ -853,9 +853,11 @@ pub struct CutTree {
 ///
 /// # Errors
 /// A path that exists but is not a worktree of this repository (it is never touched),
-/// a cut tree with changes (the cutter never discards work it did not make), and any
-/// git failure.
+/// a cut tree with changes (the cutter never discards work it did not make), the
+/// repository's own `info/attributes` rewriting the bytes a checkout writes
+/// ([`refuse_rewriting_info_attributes`]), and any git failure.
 pub fn place_cut_tree(git: &dyn GitRunner, repo: &Path, commit: &str) -> Result<CutTree> {
+    refuse_rewriting_info_attributes(git)?;
     let path = cut_tree_path(repo)?;
     if !path.exists() {
         // A tree someone deleted by hand is still registered; `worktree add` refuses a
@@ -924,6 +926,66 @@ pub fn place_cut_tree(git: &dyn GitRunner, repo: &Path, commit: &str) -> Result<
     align_submodules(&tree)?;
     require_clean_cut_tree(&path)?;
     Ok(CutTree { path, moved })
+}
+
+/// The attributes that change the bytes a checkout writes or a blob is hashed from.
+const REWRITING_ATTRIBUTES: [&str; 6] = [
+    "text",
+    "eol",
+    "crlf",
+    "filter",
+    "ident",
+    "working-tree-encoding",
+];
+
+/// Refuses a repository whose own `info/attributes` (the common dir's, so the cut tree's
+/// too) names an attribute that rewrites bytes ([`REWRITING_ATTRIBUTES`], set, unset or in
+/// a macro's definition). That file outranks every `-c`, the global attributes file and
+/// `.gitattributes`, so [`BYTE_EXACT`] cannot hold a checkout or a hashed blob to the
+/// commit's bytes under it: the release refuses before it writes anything.
+fn refuse_rewriting_info_attributes(git: &dyn GitRunner) -> Result<()> {
+    let at = git_ok(
+        git,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/attributes",
+        ],
+    )?
+    .stdout_utf8();
+    let path = PathBuf::from(at.trim_end_matches('\n'));
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Error::new(format!(
+                "cannot read repository attributes {}: {error}. The cut cannot establish \
+                 the commit's bytes until those attributes can be checked. Nothing was claimed.",
+                path.display()
+            )));
+        }
+    };
+    let rewriting = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .find(|line| {
+            line.split_whitespace().skip(1).any(|attr| {
+                let name = attr.trim_start_matches(['-', '!']);
+                let name = name.split_once('=').map_or(name, |(name, _)| name);
+                REWRITING_ATTRIBUTES.contains(&name)
+            })
+        });
+    match rewriting {
+        Some(line) => Err(Error::new(format!(
+            "{} says `{line}`, which rewrites the bytes a checkout writes and outranks every \
+             setting the release passes, so the cut tree would not hold the commit's bytes. \
+             Move that line out of the file, then cut again. Nothing was claimed.",
+            path.display()
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Judge the cut tree both before and after a move. A removed ignore rule can
@@ -4418,6 +4480,44 @@ mod published_commit_tests {
         fs::write(foreign.join("keep"), "mine").unwrap();
         place_published(&repo.git(), &repo.work(), &source(&published)).expect_err("not ours");
         assert_eq!(fs::read_to_string(foreign.join("keep")).unwrap(), "mine");
+    }
+
+    /// The repository's own `info/attributes` outranks every setting the release passes: a
+    /// line that rewrites bytes refuses the cut before any tree is written, and one that
+    /// rewrites nothing leaves it to put the commit's bytes.
+    #[test]
+    fn an_info_attributes_line_that_rewrites_bytes_refuses_the_cut() {
+        let repo = Repo::new("info-attrs");
+        let published = repo.commit("publish me", &[("a", "1\n")]);
+        repo.publish_origin();
+        let info = repo.work().join(".git/info");
+        fs::create_dir_all(&info).unwrap();
+        let cut = repo.root.path().join("work-cut.noindex");
+        for line in ["* text eol=crlf", "a -text", "[attr]crlfy text eol=crlf"] {
+            fs::write(info.join("attributes"), format!("# mine\n{line}\n")).unwrap();
+            let error = place_published(&repo.git(), &repo.work(), &source(&published))
+                .expect_err(line)
+                .to_string();
+            assert!(error.contains(line), "{error}");
+            assert!(!cut.exists(), "{line}: no cut tree was made");
+        }
+        // Git ignores the non-UTF-8 comment and still applies the rewriting
+        // rule. A failed text read must not make that rule disappear.
+        fs::write(info.join("attributes"), b"#\xff\n* text eol=crlf\n").unwrap();
+        assert_eq!(repo.run(&["check-attr", "eol", "--", "a"]), "a: eol: crlf");
+        place_published(&repo.git(), &repo.work(), &source(&published))
+            .expect_err("unreadable attributes cannot establish the checkout's bytes");
+        assert!(!cut.exists(), "no cut tree was made after a failed read");
+
+        fs::remove_file(info.join("attributes")).unwrap();
+        fs::create_dir(info.join("attributes")).unwrap();
+        refuse_rewriting_info_attributes(&repo.git())
+            .expect_err("an attributes directory is not a missing attributes file");
+        fs::remove_dir(info.join("attributes")).unwrap();
+        fs::write(info.join("attributes"), "# mine\n*.png diff=exif\n").unwrap();
+        let checkout = place_published(&repo.git(), &repo.work(), &source(&published))
+            .expect("an attribute that rewrites nothing");
+        assert_eq!(fs::read_to_string(checkout.tree.join("a")).unwrap(), "1\n");
     }
 
     #[test]

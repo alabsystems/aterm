@@ -2779,6 +2779,148 @@ fn slider_and_text_field_rows_say_their_notes() {
     );
 }
 
+/// A CARD'S UNSET FIELDS MARK THEIR DEFAULTS ALIKE: on Cursor Styles'
+/// Adjust card the trail colour and its accent, both unset, either both
+/// paint "(default)" or neither does, at every text size and width, whatever
+/// each colour's name is long ("Brighter cursor color" lost its mark beside
+/// "Shifting colors (default)", "Pale blue (default)" and "Cursor color
+/// (default)"). Each field's value keeps the whole words.
+#[test]
+fn a_cards_unset_fields_mark_their_defaults_alike() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "default marks", |scale| {
+        let mut both = 0;
+        for style in ["classic", "comet", "lumen", "sparkle", "laser"] {
+            for (width, height) in [
+                (1_606.0, 5_000.0),
+                (1_219.0, 5_000.0),
+                (1_095.0, 5_000.0),
+                (744.0, 5_000.0),
+                (584.0, 6_000.0),
+                (318.0, 9_000.0),
+            ] {
+                let mut lab = Lab::new(&format!("cursor_trail_style = \"{style}\"\n"));
+                lab.state_mut().navigate(SettingsRoute::CursorStyles);
+                let compiled = lab.compile(width, height);
+                let painted: Vec<String> = [
+                    prefs::EDIT_CURSOR_TRAIL_COLOR,
+                    prefs::EDIT_CURSOR_TRAIL_ACCENT,
+                ]
+                .iter()
+                .filter_map(|key| {
+                    let control = format!("settings/control/{key}");
+                    compiled.paint.iter().find_map(|node| match &node.content {
+                        UiContent::TextField(field) if node.key.as_str() == control => {
+                            field.spec.placeholder.clone()
+                        }
+                        _ => None,
+                    })
+                })
+                .collect();
+                let [color, accent] = painted.as_slice() else {
+                    continue;
+                };
+                both += 1;
+                assert_eq!(
+                    color.ends_with(" (default)"),
+                    accent.ends_with(" (default)"),
+                    "{style} at {width} and {scale}x: {color:?} beside {accent:?}"
+                );
+                for key in [
+                    prefs::EDIT_CURSOR_TRAIL_COLOR,
+                    prefs::EDIT_CURSOR_TRAIL_ACCENT,
+                ] {
+                    let value = compiled
+                        .semantic(&UiKey::new(format!("settings/control/{key}")))
+                        .and_then(|node| match &node.value {
+                            SemanticValue::Text(value) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    assert!(
+                        value.ends_with(" (default)"),
+                        "{style} at {width} and {scale}x: {key} says {value:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            both > 10,
+            "the Adjust card's two colours drawn in {both} cases"
+        );
+    });
+}
+
+/// THE TRAIL COLOURS' NOTE SAYS WHAT THEY DO FOR THE SAVED STYLE: blank
+/// Classic shifts through colours (never "follows the cursor color"), Fire
+/// on a block does not use them, Laser keeps its violet, Comet its pale blue
+/// until a cursor colour is set; the note Modified paints and each control
+/// says is that style's, the one [`prefs::trail_color_note`] composes.
+#[test]
+fn the_trail_colors_note_names_the_saved_styles_law() {
+    let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (style, says, never) in [
+        (
+            "classic",
+            "Classic shifts through colors",
+            "follows the cursor color",
+        ),
+        (
+            "fire",
+            "Fire draws its own colors on a block cursor",
+            "Blank:",
+        ),
+        (
+            "laser",
+            "Lightning keeps its violet",
+            "until you set a cursor color",
+        ),
+        (
+            "comet",
+            "Comet keeps its pale blue until you set a cursor color",
+            "Lightning",
+        ),
+        ("lumen", "Lumen follows the cursor color", "keeps its"),
+    ] {
+        let mut lab = Lab::new(&format!(
+            "cursor_trail_style = \"{style}\"\ncursor_trail_color = \"#FF0000\"\n\
+             cursor_trail_accent = \"#00FF00\"\n"
+        ));
+        lab.state_mut().navigate(SettingsRoute::Modified);
+        let compiled = lab.compile(1_074.0, 1_400.0);
+        let note = prefs::trail_color_note(style, true, false);
+        assert!(note.contains(says), "{style}: {note}");
+        assert!(!note.contains(never), "{style}: {note}");
+        let painted = compiled
+            .paint
+            .iter()
+            .filter_map(|node| {
+                let key = node.key.as_str();
+                (key.starts_with("settings/shared-note/") && !key.contains("/line-"))
+                    .then(|| key.trim_start_matches("settings/shared-note/").to_string())
+            })
+            .next()
+            .expect("the run note");
+        assert_eq!(
+            words(&painted_text(
+                &compiled,
+                &format!("settings/shared-note/{painted}/line-")
+            )),
+            words(&note),
+            "{style}"
+        );
+        assert!(
+            compiled
+                .semantic(&UiKey::new(format!(
+                    "settings/control/{}",
+                    prefs::EDIT_CURSOR_TRAIL_COLOR
+                )))
+                .and_then(|control| control.description.as_deref())
+                .is_some_and(|description| description.contains(&note)),
+            "{style}: the control says it"
+        );
+    }
+}
+
 /// A NOTE A RUN OF ROWS SHARES IS THE RUN'S ([`prefs::RowNote::Shared`]):
 /// Modified listing both trail colors draws their one note once, as the stop
 /// after the second (`settings/shared-note/<key>`), apart from that row's own
@@ -2787,11 +2929,8 @@ fn slider_and_text_field_rows_say_their_notes() {
 /// its own, inside its row, and no run note.
 #[test]
 fn a_note_a_run_shares_is_the_stop_after_the_run() {
-    let note = prefs::footnote_of(prefs::EDIT_CURSOR_TRAIL_COLOR).expect("the trail colors' note");
-    assert_eq!(
-        prefs::footnote_of(prefs::EDIT_CURSOR_TRAIL_ACCENT),
-        Some(note)
-    );
+    // The two trail colours' one note, for the default style on a block.
+    let note = &prefs::trail_color_note(prefs::DEFAULT_CURSOR_TRAIL_STYLE, true, false);
     let words = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     for (width, height) in [(1_074.0, 900.0), (584.0, 900.0), (390.0, 900.0)] {
         let mut lab =

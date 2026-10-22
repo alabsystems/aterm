@@ -29,8 +29,23 @@
 //! under it two columns in, as a reply's (measured in the lab 2026-10-21,
 //! [`fixtures::lab::WORKER_FIRST_PROMPT`]): nothing on the screen tells it
 //! from the blank row that ends a message, so the rows past it read as the
-//! reply ([`said_tail`]). A worker's first prompt holds none
-//! (`aterm_agent::harness::worker::WorkerCli::blank_lines`).
+//! reply ([`said_tail`]). The fixtures show no other mark either: a message's
+//! continuation rows and a reply's both sit two columns in, and no measured
+//! screen records the cells of a message's continuation rows (the one
+//! colour noted is the sent prompt's first row, bold `5c5cff` behind `> `).
+//! A single line break draws the next row of the same message, no blank row
+//! between (measured, `l15a2`). So NOTHING ATERM TYPES INTO AGY HOLDS A
+//! BLANK LINE: every act the harness types goes as one line (the control
+//! wire frames a request per line; `aterm_agent::supervise`'s act executor
+//! makes an owner's text of two paragraphs one), and a worker's first
+//! prompt, written to a file agy reads, drops its blank lines
+//! ([`crate::ScreenReader::bounds_messages`] is `false` here alone):
+//! aterm's own words are read back as nobody's reply, and no `NEEDS YOU:`
+//! or `Nothing left:` in them as agy's need or defense. A message aterm did
+//! not type — a person's own, typed or pasted, or raw bytes a driver sends
+//! (`send`, `paste --stdin`) — that holds a blank line still reads its later
+//! paragraphs as the reply; telling them apart needs a mark the screen draws
+//! for them (UNMEASURED: the cells of a message's continuation rows).
 //!
 //! **THE EMPTY COMPOSER** draws no placeholder (measured) — but while a
 //! permission mode is on (shift+tab cycles them) it draws the mode's hint
@@ -1860,6 +1875,7 @@ fn agy_card_at(rows: &[String], top: usize) -> Option<CardPlace> {
     Some(CardPlace {
         top,
         rows: 4,
+        mascot_row: 0,
         text_col,
         mascot_end,
         ends: [end0, end1, end2.max(end3)],
@@ -1944,9 +1960,11 @@ fn parse_agy_footer_model(row: &str) -> Option<(String, Option<String>)> {
 }
 
 /// The signed-in email and optional subscription plan on agy's launch card
-/// (`user@example.com (Google AI Ultra)` on row `place.top + 1`).
+/// (`user@example.com (Google AI Ultra)` on row `place.top + 1`), borrowed
+/// from `rows`: a footer that reads it each frame compares it with what it
+/// shows and copies it only when it moved.
 #[must_use]
-pub fn launch_card_account(rows: &[String]) -> Option<(String, Option<String>)> {
+pub fn launch_card_account(rows: &[String]) -> Option<(&str, Option<&str>)> {
     let f = frame(rows)?;
     let (_, place) = launch_card_scan(&rows[..f.top]);
     let p = place?;
@@ -1959,14 +1977,11 @@ pub fn launch_card_account(rows: &[String]) -> Option<(String, Option<String>)> 
         let email = crate::text::trim(email);
         let plan = crate::text::trim(plan);
         if email.contains('@') && !email.chars().any(char::is_whitespace) {
-            return Some((
-                email.to_owned(),
-                (!plan.is_empty()).then(|| plan.to_owned()),
-            ));
+            return Some((email, (!plan.is_empty()).then_some(plan)));
         }
     }
     if t.contains('@') && !t.chars().any(char::is_whitespace) {
-        return Some((t.to_owned(), None));
+        return Some((t, None));
     }
     None
 }

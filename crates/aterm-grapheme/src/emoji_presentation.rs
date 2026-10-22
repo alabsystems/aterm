@@ -234,6 +234,7 @@ static TEXT_DEFAULT_EMOJI: &[(u32, u32)] = &[
 ];
 
 /// Whether `cp` falls in one of `table`'s sorted, disjoint inclusive ranges.
+#[inline]
 pub(crate) fn in_ranges(table: &[(u32, u32)], cp: u32) -> bool {
     // Sorted and disjoint, so a single binary search by range settles
     // membership: find the range whose `lo <= cp`, then check `cp <= hi`.
@@ -261,6 +262,7 @@ pub(crate) fn in_ranges(table: &[(u32, u32)], cp: u32) -> bool {
 /// ENSURES: returns `true` iff `c`'s scalar value is in the Unicode
 /// `Emoji_Presentation=Yes` set.
 #[must_use]
+#[inline]
 pub fn is_emoji_presentation(c: char) -> bool {
     in_ranges(EMOJI_PRESENTATION, c as u32)
 }
@@ -282,6 +284,7 @@ pub fn is_emoji_presentation(c: char) -> bool {
 /// ENSURES: `true` iff `c` is `Emoji=Yes` and `Emoji_Presentation=No` in
 /// Unicode 16.0.0.
 #[must_use]
+#[inline]
 pub fn is_vs16_emoji_capable(c: char) -> bool {
     in_ranges(TEXT_DEFAULT_EMOJI, c as u32)
 }

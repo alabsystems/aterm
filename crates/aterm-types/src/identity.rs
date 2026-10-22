@@ -13,5 +13,8 @@ pub const COMPANY: &str = "ALab";
 /// The project site, as printed (no scheme).
 pub const SITE: &str = "alab.systems";
 
+/// The project site as a link: [`SITE`] behind `https://`.
+pub const SITE_URL: &str = "https://alab.systems";
+
 /// The origin line every text surface prints under its title.
 pub const ORIGIN_LINE: &str = "by Andrew Yates \u{00b7} ALab \u{00b7} alab.systems";

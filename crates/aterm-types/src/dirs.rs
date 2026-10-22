@@ -328,9 +328,8 @@ pub fn runs_under_private_state_root() -> bool {
 /// and `aterm pkg repair` state in their scope. Not under a private state root
 /// ([`runs_under_private_state_root`]), not root (`sudo` keeps `$HOME`, so root would write
 /// root-owned files into the person's tree), and `$HOME` the account record's home
-/// (`getpwuid`), so a scratch `$HOME` never receives what its journal, under the account's
-/// state root ([`account_state_dir`]), records. Off Unix only the private state root
-/// counts.
+/// (`getpwuid`), so a scratch `$HOME` (an isolated release launch, a test's child) is never
+/// taken for the person's own shell. Off Unix only the private state root counts.
 #[must_use]
 pub fn not_own_account() -> Option<&'static str> {
     #[cfg(unix)]
@@ -404,45 +403,61 @@ pub fn state_dir() -> Option<PathBuf> {
     )
 }
 
-/// The state root of THE ACCOUNT this process runs as, where its converge journal lives
-/// (docs/DESIGN-init-system-2026-10-20.md §3.3): the state directory of the account
-/// record's home (`getpwuid`; `%USERPROFILE%` on Windows), never `$HOME`'s, so `sudo aterm
-/// machines here` keeps root's journal under root's home and never writes into the tree of
-/// the person who typed `sudo`. A process under a private state root
-/// ([`runs_under_private_state_root`]: a test binary, a development build's
-/// `ATERM_STATE_HOME`) uses that root as it is. One rule for every surface that journals:
-/// `aterm init`, `aterm machines here`, `aterm doctor` and `aterm pkg repair`.
+/// The state root of THE ACCOUNT whose files this process changes, where its converge
+/// journal lives (docs/DESIGN-init-system-2026-10-20.md §3.3): an item's journal goes where
+/// its account is. That is [`state_dir`], the root every state reader agrees on: a private
+/// state root as it is (a test binary's own, a development build's `ATERM_STATE_HOME`),
+/// else `$HOME`'s. So a run over a scratch `$HOME` (a test's `aterm` or `atpkg` child, an
+/// isolated launch) journals under that scratch, never under the person whose uid it
+/// shares. Root alone is different: `sudo` keeps the invoking person's `$HOME`, and root
+/// must not write into their tree (a root-owned journal there would refuse every later
+/// `aterm init` change), so outside a private state root root's journal is under its own
+/// account record's home (`getpwuid`). One rule for every surface that journals: `aterm
+/// init`, `aterm machines here`, `aterm doctor` and `aterm pkg repair`.
 #[must_use]
 pub fn account_state_dir() -> Option<PathBuf> {
-    #[cfg(unix)]
-    let account_home = aterm_uds::account::home();
-    #[cfg(not(unix))]
-    let account_home = home_dir();
-    account_state_dir_with(
-        runs_under_private_state_root().then(state_dir),
-        account_home,
-    )
+    account_state_dir_as(runs_under_private_state_root())
 }
 
-/// The pure half of [`account_state_dir`]. `private` is `Some` when the process runs under
-/// a private state root, holding what that root resolves to, which is used as it is (and
-/// `None` inside it, a relative `ATERM_STATE_HOME`, resolves no root rather than the
-/// account's). Otherwise the root is the state directory of `account_home`.
+/// [`account_state_dir`] with every live read but the private state root's, which is
+/// `private`: the uid, the account record's home and [`state_dir`]. A test binary always
+/// runs under its own private root, so this is how its test reaches the branch a spawned
+/// `aterm doctor` or `atpkg repair` child over a scratch `$HOME` takes.
+fn account_state_dir_as(private: bool) -> Option<PathBuf> {
+    #[cfg(unix)]
+    let (root, root_home) = if aterm_uds::peer::our_uid() == 0 {
+        (true, aterm_uds::account::home())
+    } else {
+        (false, None)
+    };
+    #[cfg(not(unix))]
+    let (root, root_home) = (false, None);
+    account_state_dir_with(private, root, state_dir(), root_home)
+}
+
+/// The pure half of [`account_state_dir`]: `private` whether the process runs under a
+/// private state root, `root` whether it runs as root, `state` what [`state_dir`] resolves
+/// for it, and `root_home` root's account record's home. The journal's root is `state`
+/// (a relative `ATERM_STATE_HOME` resolves none, and nothing else stands in for it), except
+/// for root outside a private state root, whose root is the state directory of
+/// `root_home`.
 #[must_use]
 pub fn account_state_dir_with(
-    private: Option<Option<PathBuf>>,
-    account_home: Option<PathBuf>,
+    private: bool,
+    root: bool,
+    state: Option<PathBuf>,
+    root_home: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    match private {
-        Some(root) => root,
-        None => resolve_state_dir(
+    if root && !private {
+        return resolve_state_dir(
             None,
             StatePlatform {
-                home: account_home,
+                home: root_home,
                 ..StatePlatform::default()
             },
-        ),
+        );
     }
+    state
 }
 
 /// The platform inputs [`resolve_state_dir`] reads, captured for testing.
@@ -593,6 +608,96 @@ mod tests {
             not_own_account_with(false, 501, None, Some(&home)),
             Some("its HOME is not this account's home"),
             "no HOME is no match"
+        );
+    }
+
+    /// An item's journal goes where its account is. A test's `aterm doctor` or `atpkg
+    /// repair` child, its `$HOME` a scratch under the person's uid, journals under that
+    /// scratch's state root, the one every state reader resolves; negative control: the
+    /// account-record rule (root's, the old rule for every account), evaluated on the same
+    /// inputs, sends that journal into the person's own state. Root, whose `$HOME` `sudo`
+    /// kept from the person, journals under its own account record's home. A private state
+    /// root is used as it is, root's included, and no state root journals nowhere, never in
+    /// the account record's. Live, outside a private root, this account (not root)
+    /// journals under the state root it resolves, not under its account record's home's.
+    #[cfg(unix)]
+    #[test]
+    fn the_journal_root_is_the_state_root_the_items_act_on_and_roots_own_under_sudo() {
+        let state_of = |home: &str| {
+            resolve_state_dir(
+                None,
+                StatePlatform {
+                    home: Some(home.into()),
+                    ..StatePlatform::default()
+                },
+            )
+        };
+        let person = PathBuf::from("/Users//alice");
+        let scratch = state_of("/scratch/home");
+        assert!(scratch.is_some());
+        let child = account_state_dir_with(false, false, scratch.clone(), Some(person.clone()));
+        assert_eq!(
+            child, scratch,
+            "a scratch HOME's run journals in that scratch"
+        );
+        let record_rule =
+            account_state_dir_with(false, true, scratch.clone(), Some(person.clone()));
+        assert_eq!(
+            record_rule,
+            state_of("/Users//alice"),
+            "the account record's home is the person's state"
+        );
+        assert_ne!(child, record_rule);
+        // `sudo aterm machines here apply`, alice's HOME kept: root's own home.
+        assert_eq!(
+            account_state_dir_with(
+                false,
+                true,
+                state_of("/Users//alice"),
+                Some("/var/root".into())
+            ),
+            state_of("/var/root")
+        );
+        let private = Some(PathBuf::from("/scratch/state"));
+        for root in [false, true] {
+            assert_eq!(
+                account_state_dir_with(true, root, private.clone(), Some("/var/root".into())),
+                private
+            );
+            // A relative `ATERM_STATE_HOME`: no root at all.
+            assert_eq!(
+                account_state_dir_with(true, root, None, Some(person.clone())),
+                None
+            );
+        }
+        assert_eq!(
+            account_state_dir_with(false, false, None, Some(person)),
+            None,
+            "no state root is no journal, never the account record's"
+        );
+        assert_eq!(account_state_dir_with(false, true, None, None), None);
+        // The live rule in this test binary (not root): its own state root.
+        assert_eq!(account_state_dir(), state_dir());
+        // The live reads outside a private root, the branch a scratch-HOME child takes: the
+        // state root this process resolves (here the test binary's scratch), never the
+        // state of its account record's home, the person's. Paths only: nothing is written.
+        let live = account_state_dir_as(false);
+        assert_eq!(
+            live,
+            state_dir(),
+            "a non-root account journals where it acts"
+        );
+        let record = resolve_state_dir(
+            None,
+            StatePlatform {
+                home: aterm_uds::account::home(),
+                ..StatePlatform::default()
+            },
+        );
+        assert!(record.is_some(), "this account has a home on record");
+        assert_ne!(
+            live, record,
+            "the account record's home is the person's state"
         );
     }
 

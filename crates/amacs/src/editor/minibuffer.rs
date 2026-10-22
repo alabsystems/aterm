@@ -157,22 +157,17 @@ impl EditorWorkspace {
                 };
                 self.execute(store, view, command)
             }
-            // The selected match is the result; an empty status clears the
-            // `I-search:` line rather than echoing the query back.
-            Minibuffer::Search { query, .. } => {
-                if !query.is_empty() {
+            // Recheck the selected match against current bytes before accepting
+            // it; another view may have changed them since the last search.
+            Minibuffer::Search { query, origin } => {
+                let status = if query.is_empty() {
+                    "Search cancelled"
+                } else {
+                    let matched = self.accept_search_match(store, view, &query, origin)?;
                     view.last_search_query.clone_from(&query);
-                }
-                Ok(vec![EditorEffect::Status(
-                    if query.is_empty() {
-                        "Search cancelled"
-                    } else if view.primary_selection().range().is_empty() {
-                        "Not found"
-                    } else {
-                        ""
-                    }
-                    .to_string(),
-                )])
+                    if matched { "" } else { "Not found" }
+                };
+                Ok(vec![EditorEffect::Status(status.to_string())])
             }
             // A macro being defined keeps each answer with the command its
             // key recorded, as for a command prompt below.

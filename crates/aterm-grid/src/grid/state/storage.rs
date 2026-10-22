@@ -416,25 +416,25 @@ impl GridStorage {
 
     #[must_use]
     #[inline]
-    pub(crate) fn visible_rows(&self) -> u16 {
+    pub(crate) const fn visible_rows(&self) -> u16 {
         self.visible_rows
     }
 
     #[must_use]
     #[inline]
-    pub(crate) fn cols(&self) -> u16 {
+    pub(crate) const fn cols(&self) -> u16 {
         self.cols
     }
 
     #[must_use]
     #[inline]
-    pub(crate) fn total_lines(&self) -> usize {
+    pub(crate) const fn total_lines(&self) -> usize {
         self.total_lines
     }
 
     #[must_use]
     #[inline]
-    pub(crate) fn display_offset(&self) -> usize {
+    pub(crate) const fn display_offset(&self) -> usize {
         self.display_offset
     }
 
@@ -443,6 +443,7 @@ impl GridStorage {
     /// Returns `None` if the row is out of the visible area or in tiered
     /// scrollback (display_offset exceeds ring buffer bounds).
     #[must_use]
+    #[inline]
     pub(crate) fn row(&self, visible_row: u16) -> Option<&Row> {
         if visible_row >= self.visible_rows {
             return None;
@@ -455,6 +456,7 @@ impl GridStorage {
     /// bound: the one-past-the-viewport read the incoming-row apron needs
     /// (`visible_row == visible_rows`). `None` beyond the ring (tiered
     /// history), exactly where [`row`](Self::row) answers `None`.
+    #[inline]
     pub(crate) fn row_past_viewport(&self, visible_row: u16) -> Option<&Row> {
         if self.rows.is_empty() {
             return None;
@@ -467,6 +469,7 @@ impl GridStorage {
     /// the viewport were at the bottom). Absolute-frame readers (block text
     /// extraction) use this so the scroll position cannot shift which row they
     /// read. Equivalent to `row_index`'s `display_offset == 0` fast path.
+    #[inline]
     pub(crate) fn row_at_screen(&self, screen_row: u16) -> Option<&Row> {
         if screen_row >= self.visible_rows || self.rows.is_empty() {
             return None;
@@ -711,33 +714,33 @@ impl GridStorage {
     /// Get the current scroll region.
     #[must_use]
     #[inline]
-    pub fn scroll_region(&self) -> ScrollRegion {
+    pub const fn scroll_region(&self) -> ScrollRegion {
         self.cursor_state.scroll_region()
     }
 
     /// Set the scroll region (DECSTBM).
     #[inline]
-    pub fn set_scroll_region(&mut self, top: u16, bottom: u16) {
+    pub const fn set_scroll_region(&mut self, top: u16, bottom: u16) {
         self.cursor_state
             .set_scroll_region(top, bottom, self.visible_rows);
     }
 
     /// Reset scroll region to full screen.
     #[inline]
-    pub fn reset_scroll_region(&mut self) {
+    pub const fn reset_scroll_region(&mut self) {
         self.cursor_state.reset_scroll_region(self.visible_rows);
     }
 
     /// Get the current horizontal margins (DECSLRM).
     #[must_use]
     #[inline]
-    pub fn horizontal_margins(&self) -> HorizontalMargins {
+    pub const fn horizontal_margins(&self) -> HorizontalMargins {
         self.cursor_state.horizontal_margins()
     }
 
     /// Set horizontal margins (DECSLRM, VT420+).
     #[inline]
-    pub fn set_horizontal_margins(&mut self, left: u16, right: u16) {
+    pub const fn set_horizontal_margins(&mut self, left: u16, right: u16) {
         self.cursor_state
             .set_horizontal_margins(left, right, self.cols);
         // Update fast-path flag: non-full margins require margin-aware wrapping.
@@ -746,7 +749,7 @@ impl GridStorage {
 
     /// Reset horizontal margins to full width.
     #[inline]
-    pub fn reset_horizontal_margins(&mut self) {
+    pub const fn reset_horizontal_margins(&mut self) {
         self.cursor_state.reset_horizontal_margins(self.cols);
         self.has_horizontal_margins = false;
     }

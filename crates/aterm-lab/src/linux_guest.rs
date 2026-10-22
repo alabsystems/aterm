@@ -227,7 +227,9 @@ pub const MESA: &[&str] = &["libgl1-mesa-dri", "libegl-mesa0", "mesa-vulkan-driv
 /// aterm-render's script and emoji tests need, and without them those answer
 /// COULD NOT RUN), the x86_64 cross toolchain with its libc, zsh and fish,
 /// the shells aterm integrates beside bash, whose integration tests run each
-/// one and cannot run without it (pwsh, the fourth, is [`PWSH`]), unzip,
+/// one and cannot run without it (pwsh, the fourth, is [`PWSH`]), the two
+/// build tools [`BASH_3_2_INSTALL`] needs (autotools-dev's `config.guess` and
+/// `config.sub`, which know aarch64, and bison), unzip,
 /// which `verify fetch-browser` unpacks the browser lane's pinned browsers
 /// with, sway (headless wlroots: the one lane compositor that grants
 /// server-side decorations and offers cursor-shape-v1 and a virtual pointer,
@@ -278,6 +280,8 @@ pub const TOOLS: &[&str] = &[
     "libc6-dev-amd64-cross",
     "zsh",
     "fish",
+    "autotools-dev",
+    "bison",
     "sway",
     "grim",
     "gstreamer1.0-tools",
@@ -404,6 +408,52 @@ fi
 ln -sfn "$dir/pwsh" /usr/local/bin/pwsh
 "#;
 
+/// GNU bash 3.2.57, the bash macOS ships as /bin/bash, for the one test that
+/// needs that bash on Linux: the spare hold's SIGWINCH negative control
+/// (`a_spare_hold_survives_sigwinch_and_only_go_releases_it`), whose cut hold a
+/// signal releases only where the hold's FIFO open fails when interrupted.
+/// bash 5 (the guest's 5.2) restarts it, so without this bash the control is
+/// COULD NOT RUN and the shell suite's row fails. Built from GNU's release
+/// archive, held to its sha256 (checked against the copy on ftp.gnu.org
+/// 2026-10-21), by [`BASH_3_2_INSTALL`]; aterm-uds's `bash-3.2` tool row finds it
+/// at `/usr/local/bin/bash-3.2`.
+pub const BASH_3_2: (&str, &str) = (
+    "3.2.57",
+    "3fa9daf85ebf35068f090ce51283ddeeb3c75eb5bc70b1a4a7cb05868bfe06a4",
+);
+
+/// Build [`BASH_3_2`] (`$1` its version, `$2` the archive's sha256) into
+/// `/opt/aterm-lane/bash-<version>` and link it as `/usr/local/bin/bash-3.2`,
+/// run as the guest's user (root only to install). The release's
+/// `config.guess` and `config.sub` (2006) know no aarch64, so autotools-dev's
+/// replace them; its `y.tab.c` predates the patch releases' `parse.y`, so make
+/// runs bison (`configure` picks `bison -y`); glibc's malloc, as distributions
+/// build bash. make runs serially: 3.2.57's lib/readline makes libreadline.a
+/// and libhistory.a from shared objects with no ordering between them, so a
+/// parallel make archives libhistory.a before histexpand.o exists about one
+/// time in five (a serial make costs some 14 s, against configure's 68). The
+/// binary is installed under a temporary name and renamed into place, so a
+/// provisioning run again skips a whole install and replaces a cut one; an
+/// archive whose digest differs builds nothing, and a failed configure or make
+/// says why (its log's tail).
+pub const BASH_3_2_INSTALL: &str = r#"set -eu
+dir=/opt/aterm-lane/bash-$1
+if [ ! -x "$dir/bin/bash" ]; then
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  curl -fsSL -o "$tmp/bash.tar.gz" "https://ftp.gnu.org/gnu/bash/bash-$1.tar.gz"
+  echo "$2  $tmp/bash.tar.gz" | sha256sum -c --quiet
+  tar -xzf "$tmp/bash.tar.gz" -C "$tmp"
+  cd "$tmp/bash-$1"
+  cp /usr/share/misc/config.guess /usr/share/misc/config.sub support/
+  ./configure --prefix="$dir" --without-bash-malloc >"$tmp/build.log" 2>&1 &&
+    make >>"$tmp/build.log" 2>&1 || { tail -40 "$tmp/build.log"; exit 1; }
+  sudo install -D -m 0755 bash "$dir/bin/.bash.new"
+  sudo mv "$dir/bin/.bash.new" "$dir/bin/bash"
+fi
+sudo ln -sfn "$dir/bin/bash" /usr/local/bin/bash-3.2
+"#;
+
 /// Webster's Second International (`web2`), the public-domain word list
 /// aterm-lexicon's dictionary gates walk: their allowlists are curated against
 /// it, so another list decides nothing and they answer COULD NOT RUN without it
@@ -497,6 +547,11 @@ pub fn provision_plan(web2: Option<String>) -> Vec<Step> {
             "pwsh",
             &["sudo", "sh", "-s", "--", PWSH.0, PWSH.1],
             Some(PWSH_INSTALL),
+        ),
+        step(
+            "bash 3.2",
+            &["sh", "-s", "--", BASH_3_2.0, BASH_3_2.1],
+            Some(BASH_3_2_INSTALL),
         ),
     ];
     if let Some(words) = web2 {

@@ -184,6 +184,7 @@ fn smoothstep01(x: f64) -> f64 {
 /// HSV of a `0x00RRGGBB`: hue in degrees, saturation and value in `0..1`. Used
 /// by the continuity measurements.
 #[must_use]
+#[inline]
 pub fn spectrum_hsv(rgb: u32) -> (f64, f64, f64) {
     let chan = |sh: u32| ((rgb >> sh) & 0xff) as f64 / 255.0;
     let (r, g, b) = (chan(16), chan(8), chan(0));
@@ -586,6 +587,7 @@ pub fn spectrum(t: f32) -> u32 {
 /// `s_min · max / (max − min)`, so the maximum channel (value) and channel order
 /// (hue) are kept and the minimum lands at `max · (1 − s_min)`.
 #[must_use]
+#[inline]
 pub fn spectrum_with_min_saturation(rgb: u32, s_min: f32) -> u32 {
     if !s_min.is_finite() {
         return rgb;

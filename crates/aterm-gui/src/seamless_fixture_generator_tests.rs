@@ -5090,12 +5090,10 @@ const NO_HANDOFF_WRITES_OFF_MACOS: &[(&str, &str)] = &[
 /// THE CARRIED FIELDS AND VARIANTS NO HANDOFF WRITES, so no desk can: each one
 /// the update's producer never sets (written by another writer of its struct,
 /// retired, or set by nothing in this build), beside why. The hold refuses a
-/// row a desk writes, and one that names nothing a desk reaches.
+/// row a desk writes, and one absent from both the current walk and the newest
+/// release's written fields. Named session identities need no rows now:
+/// v0.110.0's record already omits both deleted fields; older fixtures remain.
 const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
-    // Named session identities are retired, including their saved labels.
-    // Older published desks carry these fields; this producer no longer does.
-    ("manifest", "SessionRecord.identity"),
-    ("layout", "TerminalLeafRestore.identity"),
     // A crash carry's turn-id count (`handoff_carry::CrashLedger`); an
     // update's sidecar leaves it out (`encode_wire`).
     ("control", "Wire.turn_ids"),

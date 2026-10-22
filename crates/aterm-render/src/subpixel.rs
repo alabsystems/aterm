@@ -55,12 +55,14 @@ impl SubpixelMode {
 
     /// The mode a renderer is built with: always [`SubpixelMode::Off`] (the
     /// config setter opts in; the portable test path keeps it off).
-    pub(crate) fn initial() -> Self {
+    #[inline]
+    pub(crate) const fn initial() -> Self {
         Self::Off
     }
 
     /// The canonical spelling the getter round-trips.
-    pub(crate) fn as_str(self) -> &'static str {
+    #[inline]
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::Rgb => "rgb",
@@ -74,7 +76,8 @@ impl SubpixelMode {
 /// to the 3× resolution; snapping them, as grayscale `full` does, is what subpixel
 /// rendering exists to avoid. `font_hinting = "off"` disables hinting here too (the
 /// caller passes no instance).
-pub(crate) fn lcd_hint_options() -> Target {
+#[inline]
+pub(crate) const fn lcd_hint_options() -> Target {
     Target::Lcd
 }
 

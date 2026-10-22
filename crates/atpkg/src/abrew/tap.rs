@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use super::fetch;
 use super::formula::Formula;
-use super::prefix::Prefix;
+use super::prefix::{Kind, Prefix};
 
 /// One tap on disk: `user/repo` (repo without the `homebrew-` prefix).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,20 +158,45 @@ fn git_protocol_args(local: bool) -> Vec<&'static str> {
     args
 }
 
-/// Clone or update a tap. Default remote is GitHub
-/// (`<user>/homebrew-<repo>`), as brew's is.
-pub fn add(prefix: &Prefix, name: &str, url: Option<&str>) -> Result<Tap, String> {
+/// Clone a tap, as brew's is (default remote `<user>/homebrew-<repo>`
+/// on GitHub). Re-tapping an installed tap is a silent no-op in brew
+/// — no pull, no output — and an explicit different remote is an
+/// error there, so both are judged here before any git work. The
+/// bool reports whether this call newly tapped.
+pub fn add(prefix: &Prefix, name: &str, url: Option<&str>) -> Result<(Tap, bool), String> {
     let (user, repo) = parse_tap_name(name)
         .ok_or_else(|| format!("abrew: tap name must be user/repo, got {name}"))?;
     let (path, update) = mutation_path(prefix, &user, &repo, true)?;
     if update {
-        pull(&path, &user, &repo)?;
+        if let Some(url) = url {
+            let origin = fetch::run_capture(
+                "git",
+                &["-C", &path.to_string_lossy(), "remote", "get-url", "origin"],
+            )
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string());
+            match origin.as_deref() {
+                Some(existing) if existing == url => {}
+                Some(existing) => {
+                    return Err(format!(
+                        "abrew: tap {user}/{repo} is already tapped from {existing}"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "abrew: cannot read the existing remote of tap {user}/{repo}"
+                    ));
+                }
+            }
+        }
+        return Ok((Tap { user, repo, path }, false));
     } else {
         let remote = url.map_or_else(
             || format!("https://github.com/{user}/homebrew-{repo}.git"),
             str::to_owned,
         );
-        println!("==> Tapping {user}/{repo} ({remote})");
+        eprintln!("==> Tapping {user}/{repo} ({remote})");
         // Clone into a staged sibling; only a complete clone is renamed
         // into place, so a failed clone never reads as a tapped repo.
         let parent = path
@@ -192,7 +217,7 @@ pub fn add(prefix: &Prefix, name: &str, url: Option<&str>) -> Result<Tap, String
         super::prefix::publish_directory(&staged, &path, false)
             .map_err(|e| format!("abrew: cannot publish tap {user}/{repo}: {e}"))?;
     }
-    Ok(Tap { user, repo, path })
+    Ok((Tap { user, repo, path }, true))
 }
 
 /// Update a discovered tap only after re-admitting its prefix-relative path.
@@ -209,7 +234,7 @@ pub(super) fn update(prefix: &Prefix, tap: &Tap) -> Result<(), String> {
 }
 
 fn pull(path: &std::path::Path, user: &str, repo: &str) -> Result<(), String> {
-    println!("==> Updating tap {user}/{repo}");
+    eprintln!("==> Updating tap {user}/{repo}");
     // A tap cloned from a local path keeps a local origin: allow
     // the file transport for exactly that recorded remote.
     let local = fetch::run_capture(
@@ -229,11 +254,52 @@ fn pull(path: &std::path::Path, user: &str, repo: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Full names of installed packages whose receipted identity lives
+/// in `user/repo`, split by kind (brew's untap census).
+fn tap_installed_names(prefix: &Prefix, user: &str, repo: &str) -> (Vec<String>, Vec<String>) {
+    let want = format!("{user}/{repo}/");
+    let mut by_kind = (Vec::new(), Vec::new());
+    for (kind, out) in [
+        (Kind::Formula, &mut by_kind.0),
+        (Kind::Cask, &mut by_kind.1),
+    ] {
+        for inst in prefix.installed(kind) {
+            let full = prefix.full_name(&inst);
+            if full.starts_with(&want) {
+                out.push(full);
+            }
+        }
+        out.sort();
+    }
+    by_kind
+}
+
 pub fn remove(prefix: &Prefix, name: &str) -> Result<(), String> {
     let (user, repo) = parse_tap_name(name)
         .ok_or_else(|| format!("abrew: tap name must be user/repo, got {name}"))?;
     if tap_path(prefix, &user, &repo).is_ok_and(|p| std::fs::symlink_metadata(p).is_err()) {
         return Err(format!("abrew: tap {user}/{repo} is not tapped"));
+    }
+    // Brew refuses to untap a non-official tap that still has
+    // installed packages (scripted runs cannot confirm the prompt);
+    // the official API taps are exempt, as in brew's API mode.
+    let official = user == "homebrew" && matches!(repo.as_str(), "core" | "cask");
+    if !official {
+        let (formulae, casks) = tap_installed_names(prefix, &user, &repo);
+        if !formulae.is_empty() || !casks.is_empty() {
+            let types = if casks.is_empty() {
+                "formulae"
+            } else if formulae.is_empty() {
+                "casks"
+            } else {
+                "formulae and casks"
+            };
+            let names: Vec<&str> = formulae.iter().chain(&casks).map(String::as_str).collect();
+            return Err(format!(
+                "abrew: Refusing to untap {user}/{repo} because it contains the following installed {types}:\n{}",
+                names.join("\n")
+            ));
+        }
     }
     let (path, _) = mutation_path(prefix, &user, &repo, false)?;
     std::fs::remove_dir_all(&path).map_err(|e| format!("abrew: {e}"))
@@ -382,6 +448,37 @@ pub fn lookup(prefix: &Prefix, full: &str) -> Option<Formula> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untap_refuses_while_tap_packages_are_installed() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let p = Prefix::at(tmp.path());
+        p.ensure().unwrap();
+        // A receipted formula whose identity lives in someone/tap.
+        let keg = p.keg("tool", "1.0");
+        std::fs::create_dir_all(&keg).unwrap();
+        p.write_receipt(
+            &keg,
+            &[
+                ("installed_by", "abrew"),
+                ("name", "tool"),
+                ("version", "1.0"),
+                ("full_name", "someone/tap/tool"),
+            ],
+        )
+        .unwrap();
+        // The tap stands on disk as a plain directory.
+        let tap_dir = p.taps_dir().join("someone/homebrew-tap");
+        std::fs::create_dir_all(&tap_dir).unwrap();
+        let error = remove(&p, "someone/tap").unwrap_err();
+        assert!(error.contains("Refusing to untap someone/tap"), "{error}");
+        assert!(error.contains("someone/tap/tool"), "{error}");
+        assert!(tap_dir.is_dir(), "tap survives the refusal");
+        // Once the keg is gone, untap proceeds.
+        std::fs::remove_dir_all(p.cellar().join("tool")).unwrap();
+        remove(&p, "someone/tap").unwrap();
+        assert!(!tap_dir.exists());
+    }
 
     #[test]
     fn local_remotes_are_the_only_file_transport() {

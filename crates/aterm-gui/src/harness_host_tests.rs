@@ -3348,6 +3348,7 @@ fn a_crashs_surviving_record_is_what_the_layout_names_through_the_back_off() {
                 agent: aterm_agent::harness::upgrade::Agent::Claude,
                 crashed: None,
                 refused: false,
+                restarted_itself: false,
             })
         });
         // At the attempt, after the back-off: what a layout taken now names
@@ -7275,6 +7276,9 @@ struct Acting {
     sweep_in_backoff: AtomicBool,
     /// The looks taken at exits.
     exit_looks: AtomicUsize,
+    /// A Gemini CLI's exit is its own restart refused for its own session id
+    /// ([`ExitLook::restarted_itself`]); unset, a crash.
+    gemini_restarted_itself: AtomicBool,
     /// What the exit left, as each relaunch was handed it.
     exit_records: Mutex<Vec<&'static str>>,
     /// The foreground group the roster names the agent in.
@@ -7382,6 +7386,95 @@ fn snap(sid: &str) -> Snapshot {
         home: None,
         claude_dir: None,
     }
+}
+
+/// A GEMINI CLI WORKER'S OWN RESTART IS RELAUNCHED WHOEVER TYPED BEFORE IT
+/// (`relaunch::restarted_itself`; the review of b9/spawn-residuals, F2): a
+/// person's `/settings` or IDE trust restart in a worker's tab comes seconds
+/// after their own keys, and Gemini CLI's run of the worker's argv again
+/// meets the `--session-id` its first start wrote (`42`). The keys asked for
+/// the restart, never the exit: the exit is decided with no grace read for
+/// them and its attempt is made (the lane resumes the session by id, quiet),
+/// decided and counted as the same exit with no keys before it is. Read
+/// after the person's grace, as before, the worker was left at its shell.
+/// NEGATIVE CONTROLS: the same exit as a crash right after the person's keys
+/// is theirs, nothing attempted; the own restart under a hold is the
+/// holder's.
+#[test]
+fn a_gemini_workers_own_restart_is_relaunched_whoever_typed_before_it() {
+    use aterm_agent::harness::relaunch::{AgentRun, GeminiRun};
+    let a = Arc::new(Acting::default());
+    let hooks = a.hooks();
+    *a.human_ms.lock().unwrap() = Some(800);
+    let gemini = || {
+        let mut s = snap("s-g");
+        s.program = std::path::PathBuf::from("/opt/homebrew/opt/node/bin/node");
+        s.argv = vec![
+            "/opt/homebrew/opt/node/bin/node".to_string(),
+            "/opt/homebrew/bin/gemini".to_string(),
+            "--session-id".to_string(),
+            "0badf00d-1111-2222-3333-444455556666".to_string(),
+        ];
+        s.run = AgentRun::Gemini(GeminiRun {
+            home: "/u/.gemini".into(),
+            chats: Some("/u/.gemini/tmp/w/chats".into()),
+            env: Vec::new(),
+            started_ms: 0,
+            child: 0,
+            unwitnessed: None,
+            block: None,
+        });
+        s
+    };
+    let run = |itself: bool| {
+        a.gemini_restarted_itself.store(itself, Ordering::SeqCst);
+        a.relaunched.lock().unwrap().clear();
+        a.exit_records.lock().unwrap().clear();
+        let job = left_job("s-g", Program::Gemini, &on());
+        with_kept(&job, |k| k.snapshot = Some(gemini()));
+        on_agent_left(&job, &hooks);
+        (
+            a.relaunched.lock().unwrap().clone(),
+            a.exit_records.lock().unwrap().clone(),
+            with_kept(&job, |k| k.relaunches.crash()),
+        )
+    };
+    let grace = Duration::from_secs(u64::from(on().human_grace_s));
+    let first_try = || {
+        a.pauses
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|p| *p >= relaunch::BACKOFF[0])
+    };
+    a.pauses.lock().unwrap().clear();
+    let (relaunched, left, crash) = run(true);
+    assert_eq!(relaunched, ["s-g"], "its own restart: attempted");
+    assert_eq!(
+        left,
+        ["crashed"],
+        "owed as a crash is, for the lane to tell apart"
+    );
+    // Its first try waits out the person's grace, which its line holds for
+    // (live: tries at 1, 10 and 60 s held, the next ten minutes on).
+    let waited = first_try().expect("a first try");
+    assert!(waited >= grace - Duration::from_millis(800), "{waited:?}");
+    // The person's keys change nothing else of it: with none before it, the
+    // same, its first try the back-off's own.
+    *a.human_ms.lock().unwrap() = None;
+    a.pauses.lock().unwrap().clear();
+    assert_eq!(run(true), (relaunched, left, crash));
+    assert_eq!(first_try(), Some(relaunch::BACKOFF[0]));
+    *a.human_ms.lock().unwrap() = Some(800);
+    // NEGATIVE CONTROL: a crash right after the person's keys is theirs.
+    let (relaunched, _, _) = run(false);
+    assert!(relaunched.is_empty(), "{relaunched:?}");
+    // NEGATIVE CONTROL: under a hold, the holder's.
+    a.held.store(true, Ordering::SeqCst);
+    let (relaunched, _, _) = run(true);
+    assert!(relaunched.is_empty(), "{relaunched:?}");
+    a.held.store(false, Ordering::SeqCst);
 }
 
 /// THE HOST'S WORD OF WHICH SESSIONS IT WOULD RELAUNCH
@@ -7668,6 +7761,17 @@ impl Acting {
         if let Some(home) = self.home.get() {
             return Some(relaunch::look_at_exit(home, snap));
         }
+        // A Gemini CLI's: its shell's word, a crash or its own restart.
+        if snap.gemini().is_some() {
+            return Some(ExitLook {
+                running: false,
+                record: None,
+                agent: aterm_agent::harness::upgrade::Agent::Gemini,
+                crashed: Some(true),
+                refused: false,
+                restarted_itself: self.gemini_restarted_itself.load(Ordering::SeqCst),
+            });
+        }
         if snap.codex().is_some() {
             return Some(ExitLook {
                 running: false,
@@ -7677,6 +7781,7 @@ impl Acting {
                 agent: aterm_agent::harness::upgrade::Agent::Claude,
                 crashed: None,
                 refused: false,
+                restarted_itself: false,
             });
         }
         if look > 0 && self.graceful.load(Ordering::SeqCst) {
@@ -7701,6 +7806,7 @@ impl Acting {
             agent: aterm_agent::harness::upgrade::Agent::Claude,
             crashed: None,
             refused: false,
+            restarted_itself: false,
         })
     }
 
@@ -14758,6 +14864,7 @@ fn an_exit_with_no_login_to_come_back_under_waits_under_its_own_for_the_sign_in(
                 agent: aterm_agent::harness::upgrade::Agent::Claude,
                 crashed: None,
                 refused: false,
+                restarted_itself: false,
             })
         });
         let (r1, world) = (Arc::clone(&relaunched), Arc::clone(&a));
@@ -35203,7 +35310,7 @@ fn the_store_lists_each_task_record_and_reads_a_judged_workers_screen() {
         let spawned = crate::session_store::test_handle(12);
         mark(&spawned, TaskState::Working, None);
         let mut tl = spawned.ctx.timeline.lock().unwrap();
-        tl.set_task_agent(Program::Gemini);
+        tl.set_task_worker(Program::Gemini, None);
         tl.task().expect("a record").carry_row()
     };
     let carried = crate::session_store::test_handle(11);

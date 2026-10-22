@@ -430,8 +430,10 @@ pub struct SupervisorConfig {
     /// At Claude Code's usage-limit dialog (`What do you want to do?`), choose
     /// `Wait here, then continue automatically …` by its label (never a spending row, never
     /// `Stop`), arming the vendor's own continue for the reset (`limit-wait@v1`); at Gemini
-    /// CLI's that names its reset (`Access resets at <time>.`), wait through it and its grace,
-    /// then choose `Keep trying` (`limit-retry@v1`). Off: the dialog is a person's.
+    /// CLI's, wait through the reset it names (`Access resets at <time> <zone>.`, placed in
+    /// that zone) and its grace, or, naming none, through the turn-end back-off ladder's rung
+    /// while a person is told, then choose `Keep trying` (`limit-retry@v1`), climbing the
+    /// ladder each time the dialog comes back. Off: the dialog is a person's.
     pub limit_wait: bool,
     /// At Claude Code's autocompact offer (`We recommend compacting
     /// earlier`, 2.1.302), choose `Autocompact at ‹ <size> › tokens` at this

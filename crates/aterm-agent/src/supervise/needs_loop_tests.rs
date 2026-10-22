@@ -1341,3 +1341,158 @@ fn an_old_tape_replays_in_acts_mode_and_strictly_differs_at_the_new_call() {
         "{account:?}"
     );
 }
+
+/// A LOOP'S FIRST POINT READS A REPLY CUT AT THE ROWS' TOP WHOLE ON AGY
+/// (`TurnEndState::reads_turn_whole`; the review of b9/spawn-residuals, F1):
+/// a reply whose `NEEDS YOU:` row is above the screen, in the history, its
+/// message's caret row with it, is read up to that message and its need put
+/// up — a successor's first read after a seamless update, a restart after a
+/// fault, Off to Land. Read only after a turn ran, the first point folded
+/// the visible rows alone and the need was never raised. And aterm's own
+/// Land act above a reply, its `> [aterm harness]` row in the history and
+/// its later rows on the screen two columns in as a reply's, puts up no need
+/// — with the history read and without it (the act's own `NEEDS YOU:` names
+/// the line, `needs::names_a_head`). NEGATIVE CONTROL: the same need on the
+/// screen, its message with it, is put up.
+#[test]
+fn a_first_point_reads_a_reply_cut_at_the_rows_top_whole() {
+    use aterm_phase::agy::fixtures::lab::WORKER_FIRST_PROMPT;
+    use aterm_phase::prompt::fixtures::screen;
+    const ROWS: usize = 30;
+    let fixture = screen(WORKER_FIRST_PROMPT);
+    let rule = fixture
+        .iter()
+        .position(|r| r.starts_with('─'))
+        .expect("a turn's rule");
+    let caret = fixture
+        .iter()
+        .rposition(|r| r == ">")
+        .expect("the composer");
+    // agy after one turn: the banner, the turn's rule, `message` (its rows
+    // drawn), a blank row, `reply` two columns in, and the composer — as
+    // `(screen, history above it)`, the screen its last `ROWS` rows.
+    let draw = |message: &[String], reply: &[String]| {
+        let mut drawn = fixture[..=rule].to_vec();
+        drawn.extend(message.iter().cloned());
+        drawn.push(String::new());
+        drawn.extend(reply.iter().map(|r| format!("  {r}")));
+        drawn.push(String::new());
+        drawn.extend(fixture[caret - 1..].iter().cloned());
+        if drawn.len() > ROWS {
+            let shown = drawn.split_off(drawn.len() - ROWS);
+            (shown, drawn)
+        } else {
+            (drawn, Vec::new())
+        }
+    };
+    let run = |(shown, above): (Vec<String>, Vec<String>), history: bool| {
+        let mut m = Mock::new(vec![shown.clone()]);
+        m.program = "agy";
+        m.screen_cursors.insert(
+            0,
+            aterm_phase::agy::composer(&shown).expect("agy's composer"),
+        );
+        m.autopilot = Some("land");
+        m.alt_screen = Some(false);
+        if history {
+            m.scrollback = Some(above);
+        }
+        let opts = SuperviseOpts {
+            policy: owners_policy(),
+            ..auto(30)
+        };
+        let mut notes = Notes::default();
+        {
+            let mut s = session(&mut m, None);
+            s.set_clock(TEST_NOW, PDT);
+            s.set_zone_lookup(test_zones);
+            s.reconcile(&mut notes).expect("the loop's start");
+            let screen = s.screen().expect("the point");
+            let point = s.turn_of(screen);
+            // A loop's first point: no turn seen run.
+            let _ = s.turn_end_at_point(&point, None, &opts).expect("decided");
+            for _ in 0..2 {
+                s.task_edge(&point.screen, &opts, &mut notes)
+                    .expect("the point's edge");
+            }
+        }
+        m.needs_calls.clone()
+    };
+    let raised = |calls: &[String]| {
+        calls
+            .iter()
+            .any(|c| c.starts_with("set attention owner=needs ") && c.contains(NEED))
+    };
+    let prompt = vec!["> Fix the parser and land it.".to_string()];
+    let report = |lines: usize| {
+        let mut reply = vec![
+            "Merged the lexer and its suites.".to_string(),
+            format!("NEEDS YOU: {NEED}"),
+        ];
+        reply.extend((0..lines).map(|i| format!("- merged branch {i:02} and ran its suite")));
+        reply.push("Pushing the parser next.".to_string());
+        reply
+    };
+    let tall = draw(&prompt, &report(40));
+    assert!(
+        tall.1.iter().any(|r| r.contains(NEED)),
+        "the need is above the screen"
+    );
+    let calls = run(tall, true);
+    assert!(raised(&calls), "{calls:#?}");
+    // NEGATIVE CONTROL: the need on the screen.
+    let short = draw(&prompt, &report(2));
+    assert!(short.1.is_empty());
+    let calls = run(short, true);
+    assert!(raised(&calls), "{calls:#?}");
+    // aterm's own Land act above a plain report, its first row in the
+    // history: no need, history read or not.
+    let land = crate::supervise::policy::turn_end::land_text(None);
+    let act: Vec<String> = {
+        let words: Vec<&str> = land.split_whitespace().collect();
+        let mut rows = Vec::new();
+        let mut row = String::new();
+        for w in words {
+            if !row.is_empty() && row.chars().count() + 1 + w.chars().count() > 47 {
+                rows.push(std::mem::take(&mut row));
+            }
+            if !row.is_empty() {
+                row.push(' ');
+            }
+            row.push_str(w);
+        }
+        rows.push(row);
+        rows.iter()
+            .enumerate()
+            .map(|(i, r)| format!("{}{r}", if i == 0 { "> " } else { "  " }))
+            .collect()
+    };
+    let filler: Vec<String> = (0..6)
+        .map(|i| format!("Step {i}: the parser's module and suite are in."))
+        .collect();
+    for history in [true, false] {
+        // The screen from the act's third row down.
+        let (mut shown, mut above) = draw(&act, &filler);
+        above.append(&mut shown);
+        let at = above
+            .iter()
+            .position(|r| r.starts_with("> [aterm harness]"))
+            .expect("the act's first row");
+        let shown = above.split_off(at + 2);
+        assert!(
+            above.iter().any(|r| r.starts_with("> [aterm harness]")),
+            "the act's first row is above the screen"
+        );
+        assert!(
+            shown.iter().any(|r| r.contains("NEEDS YOU:")),
+            "the act's NEEDS YOU: row is on the screen"
+        );
+        let calls = run((shown, above), history);
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.starts_with("set attention owner=needs ")),
+            "history={history}: {calls:#?}"
+        );
+    }
+}

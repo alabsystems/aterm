@@ -91,9 +91,9 @@ use super::super::policy::trace::{Outcome as TraceOutcome, TraceStep};
 use super::super::policy::turn_end::{
     ANSWERS_OFF, AccountAnswer, AccountAt, CREDITS_HOLD_MODEL_TOLD, CREDITS_HOLD_TOLD, Composer,
     ComposerRead, Conversation, CreditsCarry, LOGIN_SHARED_LOOK, MENU_DIVERTS, OWN_WORDS_STAND,
-    ProbeGate, RULE_ACCOUNT, RULE_LAND, RULE_LEFT, RULE_LOGIN, RULE_USAGE_PROBE, RecordTurn,
-    Restart, TRY_ANSWER_SLACK, WAKE_KEPT, act_turn_work, decide_turn_end, decide_turn_end_traced,
-    done_row_work, reads_conversation,
+    ProbeGate, RULE_ACCOUNT, RULE_LAND, RULE_LEFT, RULE_LIMIT_RESUME, RULE_LOGIN, RULE_USAGE_PROBE,
+    RecordTurn, Restart, TRY_ANSWER_SLACK, WAKE_KEPT, act_turn_work, decide_turn_end,
+    decide_turn_end_traced, done_row_work, reads_conversation,
 };
 use super::wall_confirm::{Check, LeftRead};
 use super::*;
@@ -168,6 +168,27 @@ pub(super) const REACTION_WAIT: Duration = Duration::from_secs(10);
 /// Muse Code take an Enter within a burst of typed text as a newline): the
 /// guarded `turn`'s own settle (`idle=600`).
 const PASTE_GUARD_SETTLE_MS: &str = "600";
+
+/// AN ACT'S WORDS AS ONE TURN: `text` as it stands, or — where it holds a
+/// line break, as only the owner's own words can (a `continue_text` or
+/// `answer_text` of two paragraphs; everything this policy composes is one
+/// line, the standing rules made one by [`standing_rules_in`]) — one line
+/// ([`limit::one_line`]). The control wire frames a request per line, and
+/// every client refuses a request holding a line terminator before a byte
+/// of it is written (`RelayClient`'s `write_line`, `aterm-ctl`'s
+/// `validate_request_parts`): such an act was never typed, into any
+/// program. And into agy a blank line of it would be the gap that ends a
+/// message, the rest read back as agy's own reply — a `Nothing left:` there
+/// a defense, a `NEEDS YOU:` a need (`aterm_phase::agy`'s header). The words
+/// are the act's: its hashes (`words_lead`, `words_hash`) read whitespace
+/// out.
+pub(crate) fn one_turn(text: &str) -> String {
+    if text.chars().any(limit::breaks_a_line) {
+        limit::one_line(text)
+    } else {
+        text.to_string()
+    }
+}
 
 /// The cursor-row guard for `text` typed into the composer whose caret row
 /// starts with `caret` (the program's, [`ScreenReader::caret`]: `❯` Claude
@@ -735,12 +756,24 @@ impl<C: Ctl> Session<'_, C> {
         // conversation. Keep this scope if the host later leaves. On Muse
         // Code, agy and Gemini CLI the screen is all the evidence there is,
         // host or not, for a limit met under one of them; one met under
-        // another program, and a screen no reader names, keep the scope as it
-        // stands.
+        // another agent is not this one's to scope (it ends at this point's
+        // fold, `met_under_another`), and a screen no reader names keeps the
+        // scope as it stands.
         if check == Check::Decide {
             self.scope_limit_conversation(reader.program(), opts.idle_host.is_some(), screen.seq);
         }
         let mut reading = reader.read(&screen.rows, Some(screen.cursor_col));
+        // GEMINI CLI'S USAGE-LIMIT DIALOG ANSWERED `Stop` by another hand while
+        // this loop waited on its reset: the error it leaves is that limit,
+        // its reset the dialog's ([`Self::limit_stopped`]).
+        let stopped = self.limit_stopped(&reading);
+        if let Some(s) = &stopped {
+            reading.phase = Phase::Limited {
+                message: s.wall.message.clone(),
+                reset: s.wall.reset.clone(),
+            };
+            reading.wall = Some(s.wall.clone());
+        }
         // A screen busy by nothing but the wait Claude Code carries, whose
         // turn the session's transcript said closed with nothing pending:
         // the loop's idle point ([`Self::transcript_wait_over`]), idle here too.
@@ -803,8 +836,17 @@ impl<C: Ctl> Session<'_, C> {
         let wall_was_hidden = reading.wall.is_none();
         self.wall_memory_step(reader, &screen.rows, &mut reading, screen.seq);
         let remembered_wall = (wall_was_hidden || standing_remembered) && reading.wall.is_some();
-        let reset_at = match &reading.wall {
-            Some(w) => {
+        let reset_at = match (&stopped, &reading.wall) {
+            // Placed where the dialog's was, in the zone it named: never
+            // placed again off the words.
+            (Some(s), _) => {
+                self.wall_reset = Some((
+                    reset_key(s.wall.kind, s.wall.reset.as_deref()),
+                    Some(s.reset_unix),
+                ));
+                Some(self.instant_of(s.reset_unix))
+            }
+            (None, Some(w)) => {
                 let text = w.reset.clone();
                 // A session window says so (`session limit`, `5-hour`): five hours at most. A
                 // `Usage limit reached · …` naming no window is placed on the print.
@@ -838,7 +880,7 @@ impl<C: Ctl> Session<'_, C> {
                     &screen.rows,
                 )
             }
-            None => {
+            (None, None) => {
                 // The wall is over once the worker worked (the policy's own
                 // rule, [`TurnEndState::observe`]): the next is a new reset.
                 if worked.is_some() {
@@ -1065,7 +1107,8 @@ impl<C: Ctl> Session<'_, C> {
         //
         // NOT ONLY WHERE THE LAST WORDS CLAIM DONE: wherever a turn that ran
         // ends at a point that folds its needs in or may keep a landing on
-        // the record ([`TurnEndState::reads_turn_whole`]).
+        // the record, and on agy at the loop's first point, which folds in
+        // the needs of the turn on the screen ([`TurnEndState::reads_turn_whole`]).
         let reader = reading.program.reader();
         let turn_cut = reading.said_tail.is_some() && !reader.turn_whole(&screen.rows);
         if check == Check::Decide
@@ -1897,14 +1940,18 @@ impl<C: Ctl> Session<'_, C> {
         }
         // A point that is not Gemini CLI's usage-limit dialog: the worker
         // answered past it, and the `Keep trying` back-off starts over
-        // ([`approval_loop::LimitRetry`]).
+        // ([`approval_loop::LimitRetry`]) — save the error the dialog's
+        // `Stop` leaves, which is that limit still ([`Self::limit_stopped`]).
         let rows = &point.screen.rows;
         let limit_dialog = point.phase == Phase::Prompt
             && self
                 .reader(rows)
                 .prompt(rows)
                 .is_some_and(|p| p.kind == aterm_phase::PromptKind::UsageLimit);
-        if !limit_dialog {
+        let stopped = || {
+            aterm_phase::gemini::wall(rows).is_some_and(|w| aterm_phase::gemini::stopped_error(&w))
+        };
+        if !limit_dialog && !stopped() {
             self.limit_retry = None;
         }
         self.draft_held = None;
@@ -2790,7 +2837,7 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(());
             }
             TurnEndAction::Type { text, rule_id } | TurnEndAction::Accept { text, rule_id } => {
-                (text.clone(), *rule_id)
+                (one_turn(text), *rule_id)
             }
             TurnEndAction::TypeCommand {
                 command, rule_id, ..
@@ -2848,6 +2895,11 @@ impl<C: Ctl> Session<'_, C> {
         let typed = typed?;
         if !typed {
             return Ok(());
+        }
+        // The resume at Gemini CLI's limit whose dialog was answered `Stop`:
+        // a try of that episode ([`Self::limit_resume_typed`]).
+        if rule == RULE_LIMIT_RESUME {
+            self.limit_resume_typed(&point.screen.rows);
         }
         let r = self.turn_end_reread(&point.screen, opts);
         let land = self.turn_end.land_episode().0;
@@ -3390,9 +3442,16 @@ impl<C: Ctl> Session<'_, C> {
             ));
             return Ok(false);
         };
+        // A text the composer folds into a chip (Gemini CLI past its paste
+        // fold) is guarded on the chip: the row the cursor ends on.
+        let drawn = reader.folded_paste(text);
         let submit = format!(
             "submit=guarded:{}",
-            composer_guard_at(caret, reader.caret_column(), text)
+            composer_guard_at(
+                caret,
+                reader.caret_column(),
+                drawn.as_deref().unwrap_or(text)
+            )
         );
         let r = self.call(&["turn", &submit, TURN_IDLE, TURN_TIMEOUT, TURN_YIELD, text])?;
         if self.unserved(&r) {

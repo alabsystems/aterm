@@ -119,6 +119,7 @@ pub(crate) const FX_STREAM_COUNT: usize = FxStream::LinearOver as usize + 1;
 impl FxStream {
     /// The stream a layer draws into, or `None` for the one placement the
     /// engine refuses (a Linear layer at Glow: the CPU draws it nowhere).
+    #[inline]
     pub(crate) const fn of(slot: FxSlot, blend: FxBlend) -> Option<Self> {
         match (slot, blend) {
             (FxSlot::Under, FxBlend::Exact) => Some(Self::Under),
@@ -160,6 +161,7 @@ pub(crate) enum FxAtlasKind {
 
 impl FxAtlasKind {
     /// The atlas an art of `texels` lives in.
+    #[inline]
     pub(crate) const fn of(texels: FxTexels) -> Self {
         match texels {
             FxTexels::Index8 => Self::R8,
@@ -168,6 +170,7 @@ impl FxAtlasKind {
     }
 
     /// The texture's format.
+    #[inline]
     pub(crate) const fn format(self) -> crate::device_layer::TexelFormat {
         match self {
             Self::R8 => crate::device_layer::TexelFormat::R8Unorm,
@@ -176,6 +179,7 @@ impl FxAtlasKind {
     }
 
     /// Bytes per texel, as the art stores them.
+    #[inline]
     pub(crate) const fn bytes_per_texel(self) -> u32 {
         match self {
             Self::R8 => 1,
@@ -184,6 +188,7 @@ impl FxAtlasKind {
     }
 
     /// The debug label every arm mints the texture under.
+    #[inline]
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::R8 => "aterm-gpu fx index8 atlas",
@@ -211,7 +216,8 @@ struct ShelfPack {
 }
 
 impl ShelfPack {
-    fn new(side: u32) -> Self {
+    #[inline]
+    const fn new(side: u32) -> Self {
         Self {
             side,
             shelves: Vec::new(),
@@ -289,21 +295,25 @@ impl FxAtlasSide {
     }
 
     /// The texture side, `0` before the first mint.
-    pub(crate) fn side(&self) -> u32 {
+    #[inline]
+    pub(crate) const fn side(&self) -> u32 {
         self.pack.side
     }
 
     /// The current generation.
-    pub(crate) fn generation(&self) -> u64 {
+    #[inline]
+    pub(crate) const fn generation(&self) -> u64 {
         self.generation
     }
 
     /// This generation's arts and regions, in placement order.
+    #[inline]
     pub(crate) fn log(&self) -> &[(Arc<FxArt>, [u16; 4])] {
         &self.log
     }
 
     /// The resident region of art `id`.
+    #[inline]
     pub(crate) fn region(&self, id: u128) -> Option<[u16; 4]> {
         self.resident.get(&id).copied()
     }
@@ -419,11 +429,13 @@ impl Default for FxAtlas {
 
 impl FxAtlas {
     /// The atlas `kind` lives in.
-    pub(crate) fn side(&self, kind: FxAtlasKind) -> &FxAtlasSide {
+    #[inline]
+    pub(crate) const fn side(&self, kind: FxAtlasKind) -> &FxAtlasSide {
         &self.sides[kind as usize]
     }
 
     /// An art's resident region.
+    #[inline]
     fn region(&self, art: &FxArt) -> Option<[u16; 4]> {
         self.side(FxAtlasKind::of(art.texels())).region(art.id())
     }
@@ -525,6 +537,7 @@ impl FxGpu {
     /// Whether `prefetch` is the list the last admission saw (identity): its
     /// arts are resident, or known not to fit, so a frame that re-presents
     /// cached pixels owes it nothing (`render_input_cached`'s gate).
+    #[inline]
     pub(crate) fn prefetch_admitted(&self, prefetch: &[Arc<FxArt>]) -> bool {
         self.memo_prefetch.len() == prefetch.len()
             && self
@@ -601,6 +614,7 @@ impl FxGpu {
 
 /// Whether a frame feeds the bloom: the cursor aurora, or an fx layer that
 /// blooms. The one gate every bloom site reads (with `enable_bloom`).
+#[inline]
 pub(crate) fn bloom_source_live(input: &RenderInput) -> bool {
     !input.cursor_glow_add.is_empty() || input.fx_layers.iter().any(|l| l.bloom)
 }
@@ -608,6 +622,7 @@ pub(crate) fn bloom_source_live(input: &RenderInput) -> bool {
 /// Whether the present's crown (the HDR or SDR aurora boost over the bloom
 /// source) has light to read: an aurora quad on the grid, or a `bloom` fx
 /// layer. The crown draws only a non-empty source.
+#[inline]
 pub(crate) fn crown_glow_present(input: &RenderInput) -> bool {
     input
         .cursor_glow_add
@@ -867,6 +882,7 @@ pub(crate) struct FxSynced {
 /// frame draws fx (both bindings must exist), else only to make prefetched
 /// arts resident (a generation the arm does not hold yet, or new log
 /// entries). At rest, neither.
+#[inline]
 pub(crate) fn fx_tex_due(slot: &Option<FxArmTex>, side: &FxAtlasSide, drawing: bool) -> bool {
     drawing
         || (side.generation() > 0

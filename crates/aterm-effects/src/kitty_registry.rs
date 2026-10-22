@@ -34,6 +34,7 @@ pub struct KittyLook {
 }
 
 impl Default for KittyLook {
+    #[inline]
     fn default() -> Self {
         Self {
             variant: CatGlyphId::S103,
@@ -111,6 +112,7 @@ pub fn canonical_app_id(basename: &str) -> &str {
 /// in distinct coat families (claude's coat 12 is the stop closest to
 /// terracotta). Everything else takes the [`APP_LOOK_SALT`] hash path in
 /// [`KittyLook::for_app`].
+#[inline]
 fn flagship_look(app_id: &str) -> Option<KittyLook> {
     let (variant, coat, iris, age) = match app_id {
         "claude" => (CatGlyphId::S108, 12, 0, CatAge::Adult),
@@ -139,6 +141,7 @@ impl KittyLook {
     /// A pure function of the host-minted seed, so this crate stays clockless. Decoded
     /// through the v4 genome, so it is always a head; accessories stay `None` (they mark
     /// collected cats).
+    #[inline]
     #[must_use]
     pub fn for_launch(seed: u64) -> Self {
         let gkey = crate::genome::mix(seed ^ LAUNCH_LOOK_SALT);
@@ -160,6 +163,7 @@ impl KittyLook {
     /// other app derives its look from `form_hash` of the name (FNV-1a-64, salted
     /// into its own namespace) through the v4 genome like [`Self::for_launch`].
     /// Accessories stay `None`.
+    #[inline]
     #[must_use]
     pub fn for_app(app_id: &str) -> Self {
         if let Some(look) = flagship_look(app_id) {
@@ -180,6 +184,7 @@ impl KittyLook {
     /// Clamp untrusted persisted indices and restore a renderable composition.
     /// An accessory is never a base glyph (corrupt ledgers degrade to the
     /// default head), and full-cat specials wear no accessory.
+    #[inline]
     #[must_use]
     pub fn normalized(mut self) -> Self {
         self.coat = self.coat.min(15);
@@ -318,11 +323,12 @@ pub fn coat_distance(a: u8, b: u8) -> f32 {
 /// enum discriminant; contributor-added art may change roster ordinals.
 #[inline]
 #[must_use]
-pub fn glyph_key(id: CatGlyphId) -> &'static str {
+pub const fn glyph_key(id: CatGlyphId) -> &'static str {
     GLYPHS[id as usize].id
 }
 
 /// Resolve a persisted semantic glyph key through the generated roster.
+#[inline]
 #[must_use]
 pub fn glyph_from_key(key: &str) -> Option<CatGlyphId> {
     GLYPHS
@@ -334,7 +340,7 @@ pub fn glyph_from_key(key: &str) -> Option<CatGlyphId> {
 /// Stable persistence key for an age band.
 #[inline]
 #[must_use]
-pub fn age_key(age: CatAge) -> &'static str {
+pub const fn age_key(age: CatAge) -> &'static str {
     match age {
         CatAge::Kitten => "kitten",
         CatAge::Adolescent => "adolescent",
@@ -386,7 +392,7 @@ impl KittyType {
 
     /// The stable `kitty-log.toml` / introspection key for this type.
     #[inline]
-    pub fn config_key(self) -> &'static str {
+    pub const fn config_key(self) -> &'static str {
         match self {
             KittyType::HeadPeek => "head_peek",
             KittyType::HeadTilt => "head_tilt",
@@ -428,7 +434,7 @@ impl KittyMagic {
 
     /// The stable `kitty-log.toml` / introspection key for this bucket.
     #[inline]
-    pub fn config_key(self) -> &'static str {
+    pub const fn config_key(self) -> &'static str {
         match self {
             KittyMagic::None => "none",
             KittyMagic::Fortune => "fortune",
@@ -440,7 +446,7 @@ impl KittyMagic {
 
     /// The recorder's mapping from the (config-gated) genome decode.
     #[inline]
-    pub fn from_cat(magic: Option<CatMagic>) -> KittyMagic {
+    pub const fn from_cat(magic: Option<CatMagic>) -> KittyMagic {
         match magic {
             None => KittyMagic::None,
             Some(CatMagic::Fortune) => KittyMagic::Fortune,

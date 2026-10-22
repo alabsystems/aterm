@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab), bypass mode (`--dangerously-skip-permissions`), fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1) · after `/clear`, one turn that started a dynamic workflow (Workflow, its script inline: `meta.name` `stall-probe`, two agents in parallel, `long` whose Bash is `sleep 200` with `timeout: 300000` and `quick` a `sleep 2`), 8 s in: a workflow alone draws no `⏺ main` row and no `· ↓ to manage`, only the blank row and `◯ stall-probe  ▰…▱  1/2 · 8s · ↓ 12.7k tokens` (`formatBarElapsed`); the run's files are `<session>/workflows/scripts/stall-probe-wf_stallrun-f56.js` (written 19 ms before its first agent's first row: the row's start) and `<session>/subagents/workflows/wf_stallrun-f56/agent-*.jsonl` beside each `.meta.json` (`agentType` `workflow-subagent`, `description` the agent's label, `workflowPhase`)
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.19iX/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ Workflow(Long tool call inside a workflow)
+  ⎿  Running in background · /workflows to monitor and save · medium size (/config)
+
+⏺ Tool call done.
+
+✻ Waiting for 1 dynamic workflow to finish
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)
+
+  ◯ stall-probe  ▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱  1/2 · 8s · ↓ 12.7k tokens
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

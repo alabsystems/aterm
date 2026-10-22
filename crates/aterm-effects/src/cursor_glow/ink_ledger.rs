@@ -187,17 +187,17 @@ impl InkLedger {
     /// this first, so a frame that never opens one (a light ground, a dark
     /// tick) leaves no stale account for the caret's bodies to spend.
     #[inline]
-    pub(super) fn close(&mut self) {
+    pub(super) const fn close(&mut self) {
         self.on = false;
         self.print = 0;
     }
 
     /// Fold one cut into the frame's print.
     #[inline]
-    fn note_cut(&mut self, cell: usize, share: f32) {
+    const fn note_cut(&mut self, cell: usize, share: f32) {
         self.print = aterm_hash::fnv_mix_u64(
             self.print | 1,
-            ((cell as u64) << 32) | u64::from(share.to_bits()),
+            ((cell as u64) << 32) | (share.to_bits() as u64),
         );
     }
 
@@ -222,7 +222,7 @@ impl InkLedger {
     /// How far band `band` of a cell `ch` px tall lies from the cell's middle
     /// row of pixels (a streak sample's axis), at its nearest point.
     #[inline]
-    pub(super) fn band_reach(ch: f32, band: usize) -> f32 {
+    pub(super) const fn band_reach(ch: f32, band: usize) -> f32 {
         let h = ch / Self::BANDS as f32;
         let (y0, y1) = (band as f32 * h, (band + 1) as f32 * h);
         let mid = 0.5 * ch;
@@ -520,11 +520,14 @@ impl InkLedger {
     /// Window px of the top-left corner of text cell `cell` (an index into
     /// `under`).
     #[inline]
-    fn cell_origin(&self, cell: usize) -> (i32, i32) {
+    const fn cell_origin(&self, cell: usize) -> (i32, i32) {
         let (ox, oy, cw, ch) = self.grid;
-        let stride = self.stride.max(1);
+        let stride = if self.stride > 1 { self.stride } else { 1 };
         let (slot, col) = (cell / stride, (cell % stride) as i32);
-        let row = self.lines[slot].map_or(0, |l| l.0);
+        let row = match self.lines[slot] {
+            Some(l) => l.0,
+            None => 0,
+        };
         (ox as i32 + col * cw as i32, oy as i32 + row * ch as i32)
     }
 
@@ -623,7 +626,7 @@ impl InkLedger {
 
     /// The pixel box of text cell `cell` and the share it keeps.
     #[inline]
-    fn dim_of(&self, cell: usize, share: f32) -> Dim {
+    const fn dim_of(&self, cell: usize, share: f32) -> Dim {
         let (x0, y0) = self.cell_origin(cell);
         let (_, _, cw, ch) = self.grid;
         Dim {
@@ -916,10 +919,12 @@ fn reserve_to<T>(v: &mut Vec<T>, want: usize) {
 
 /// `rgb` scaled by `share`, per channel (truncating), its top byte kept.
 #[inline]
-fn scale_rgb(c: u32, share: f32) -> u32 {
+const fn scale_rgb(c: u32, share: f32) -> u32 {
     let share = share.clamp(0.0, 1.0);
-    let ch = |sh: u32| (((c >> sh) & 0xff) as f32 * share) as u32;
-    (c & 0xFF00_0000) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+    let r = (((c >> 16) & 0xff) as f32 * share) as u32;
+    let g = (((c >> 8) & 0xff) as f32 * share) as u32;
+    let b = ((c & 0xff) as f32 * share) as u32;
+    (c & 0xFF00_0000) | (r << 16) | (g << 8) | b
 }
 
 /// Scale every additive quad of `quads` (`alpha == 0`) by `share`, colour
@@ -1096,7 +1101,7 @@ impl CursorGlow {
     /// theme's ink and page, or the reference pair when the host handed no
     /// coherent one (`fg == bg` reads as unknown).
     #[inline]
-    pub(crate) fn bed_pair(cfg: &GlowConfig) -> (u32, u32) {
+    pub(crate) const fn bed_pair(cfg: &GlowConfig) -> (u32, u32) {
         let (fg, bg) = (cfg.theme_fg & 0x00FF_FFFF, cfg.theme_bg & 0x00FF_FFFF);
         if fg == bg {
             (Self::STREAK_REF_INK, Self::STREAK_REF_GROUND)
@@ -1109,7 +1114,7 @@ impl CursorGlow {
     /// beam family's bed ([`Self::emit_comet`]) and water's wake. Their
     /// over-text lights spend the over-ink account ([`InkLedger`]).
     #[inline]
-    pub(super) fn streak_lies_under(style: GlowStyle) -> bool {
+    pub(super) const fn streak_lies_under(style: GlowStyle) -> bool {
         matches!(
             style,
             GlowStyle::Lumen
@@ -1128,7 +1133,7 @@ impl CursorGlow {
     /// repaints when only the cuts change. `0` with no cut.
     #[inline]
     #[must_use]
-    pub fn over_ink_print(&self) -> u64 {
+    pub const fn over_ink_print(&self) -> u64 {
         self.ink_ledger.print
     }
 

@@ -3405,9 +3405,17 @@ impl App {
     /// File > Save follows the active editor's own Save command. A terminal,
     /// reader or unavailable editor never reaches a file write.
     pub(crate) fn can_save_document(&self, wid: WindowId) -> bool {
-        self.active_native_view(wid)
-            .and_then(|(instance, _)| self.native_runtime.app(instance))
-            .is_some_and(|app| matches!(app, NativeApp::Editor(editor) if editor.can_save()))
+        let Some((instance, view)) = self.active_native_view(wid) else {
+            return false;
+        };
+        matches!(
+            (
+                self.native_runtime.app(instance),
+                self.native_runtime.view_state(view)
+            ),
+            (Some(NativeApp::Editor(editor)), Some(AppViewState::Editor(state)))
+                if editor.can_save(state)
+        )
     }
 
     pub(crate) fn save_front_document(&mut self) -> Result<(), String> {
@@ -5799,6 +5807,108 @@ mod tests {
         assert!(!app.can_save_document(wid));
         assert!(app.palette_snapshot(wid).action_by_name("Save").is_err());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_save_waits_for_editor_prompts_without_losing_the_draft() {
+        use amacs::input::EditorInput;
+
+        fn assert_save_available(app: &App, wid: WindowId, expected: bool) {
+            assert_eq!(app.can_save_document(wid), expected);
+            app.publish_menu_live();
+            assert_eq!(crate::menu::menu_live().can_save, expected);
+            assert_eq!(
+                app.palette_snapshot(wid).action_by_name("Save").is_ok(),
+                expected
+            );
+            let (instance, view) = app.active_native_view(wid).unwrap();
+            let commands = app.native_runtime.commands(instance, view).unwrap();
+            assert_eq!(
+                commands
+                    .iter()
+                    .find(|command| command.id.as_str() == "editor/save")
+                    .unwrap()
+                    .enabled,
+                expected
+            );
+            let compiled = app.compiled_native_ui(wid).unwrap();
+            assert_eq!(
+                compiled
+                    .semantic(&crate::native_ui::UiKey::new("editor/save-button"))
+                    .unwrap()
+                    .state
+                    .unwrap()
+                    .enabled,
+                expected
+            );
+        }
+
+        let scratch = aterm_tempfile::TempDir::new().unwrap();
+        let path = scratch.path().join("prompts.txt");
+        let source = "first needle\nsecond needle\n";
+        fs::write(&path, source).unwrap();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.open_document_tab(AppKind::Editor, &file_uri(&path))
+            .unwrap();
+        let (instance, view) = app.active_native_view(wid).unwrap();
+        let document = app.native_runtime.document_id(instance).unwrap();
+        assert_save_available(&app, wid, false);
+        commit(&mut app, wid, "draft ");
+        let draft = app.document_store.snapshot(document).unwrap();
+        assert_save_available(&app, wid, true);
+
+        for command in [
+            EditorCommand::GotoLine,
+            EditorCommand::ExecuteCommand,
+            EditorCommand::SwitchBuffer,
+            EditorCommand::KillBuffer,
+            EditorCommand::IncrementalSearch,
+        ] {
+            app.dispatch_native_event(wid, AppEvent::EditorCommand(command))
+                .unwrap();
+            app.dispatch_native_event(wid, AppEvent::EditorInput(EditorInput::Text("2".into())))
+                .unwrap();
+            let prompt = editor_buffer(&app, view).minibuffer.clone();
+            assert!(matches!(
+                (command, &prompt),
+                (EditorCommand::GotoLine, Minibuffer::GotoLine { .. })
+                    | (EditorCommand::ExecuteCommand, Minibuffer::Command { .. })
+                    | (EditorCommand::SwitchBuffer, Minibuffer::Buffer { .. })
+                    | (EditorCommand::KillBuffer, Minibuffer::Prompt { .. })
+                    | (EditorCommand::IncrementalSearch, Minibuffer::Search { .. })
+            ));
+            assert_save_available(&app, wid, false);
+            assert!(app.save_front_document().is_err());
+            assert_eq!(editor_buffer(&app, view).minibuffer, prompt);
+            let after_refusal = app.document_store.snapshot(document).unwrap();
+            assert_eq!(after_refusal.seq, draft.seq);
+            assert_eq!(after_refusal.text, draft.text);
+            assert_eq!(fs::read_to_string(&path).unwrap(), source);
+            let exit = if command == EditorCommand::GotoLine {
+                AppEvent::EditorInput(EditorInput::Key {
+                    key: Key::Named(NamedKey::Enter),
+                    mods: Modifiers::empty(),
+                    text: None,
+                })
+            } else {
+                AppEvent::EditorCommand(EditorCommand::Abort)
+            };
+            app.dispatch_native_event(wid, exit).unwrap();
+            assert!(matches!(
+                editor_buffer(&app, view).minibuffer,
+                Minibuffer::Inactive
+            ));
+            assert_save_available(&app, wid, true);
+        }
+
+        app.save_front_document().unwrap();
+        assert_save_available(&app, wid, false);
+        assert_eq!(app.document_store.dirty(document), Some(false));
+        assert_eq!(fs::read_to_string(&path).unwrap(), draft.text.as_ref());
+        let saved = app.document_store.snapshot(document).unwrap();
+        assert_eq!(saved.seq, draft.seq);
+        assert_eq!(saved.text, draft.text);
     }
 
     #[test]

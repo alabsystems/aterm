@@ -847,6 +847,23 @@ fn the_menu_opens_from_its_chip_acts_and_closes_with_the_chip() {
     host.shutdown_and_join();
 }
 
+/// The menu closes with its window's focus (design §9.3.3) on the controller's
+/// `focus out` too, which drives `App::on_focus` with no `WindowEvent::Focused`, as
+/// every headless drive does; a focus the window already had keeps it.
+#[test]
+fn a_controller_focus_out_closes_the_menu_as_the_os_edge_does() {
+    let (mut app, wid, _session, host) = claude_app();
+    crate::autopilot_timers::set_fake_clocks(None);
+    frame(&mut app, wid);
+    app.open_front_autopilot_menu()
+        .expect("the chip is on the glass");
+    app.on_focus(wid, true);
+    assert!(app.autopilot_menu.is_some(), "the same focus: it stays");
+    app.on_focus(wid, false);
+    assert!(app.autopilot_menu.is_none(), "focus out: closed");
+    host.shutdown_and_join();
+}
+
 /// A CLICK ON A ROW acts for the menu's session: a mode is written as its
 /// own word (the timer dropped, as every hand write drops it), Settings
 /// opens Settings ▸ Harness; a press on the card off a choice keeps it
@@ -1879,7 +1896,8 @@ fn a_readers_click_heard_from_rows_that_moved_chooses_nothing() {
 /// `ShowContextMenu`, which opens it as the keyboard does — its first
 /// choice lit — so once a frame has painted it the tree's focus is Cruise.
 /// NEGATIVE CONTROLS: the chip's Click still cycles the mode and opens no
-/// menu; a request for a chip the glass no longer shows (a box covered the
+/// menu (the Team chip, which offers none, is `a11y_tree`'s control); a
+/// request for a chip the glass no longer shows (a box covered the
 /// composer) opens none.
 #[cfg(a11y_tree)]
 #[test]
@@ -2214,6 +2232,7 @@ fn a_readers_cancel_identity_tracks_its_exact_timer_when_the_face_stays() {
             h: 20,
         };
         let mut menu = AutopilotMenu {
+            owner: MenuOwner::Autopilot,
             wid: WindowId(0),
             session: 7,
             focus: Some(7),

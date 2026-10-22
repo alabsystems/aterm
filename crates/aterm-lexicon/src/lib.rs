@@ -51,6 +51,7 @@ pub enum Class {
 
 impl Class {
     /// Canonical lowercase name of this decoration class.
+    #[inline]
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -63,12 +64,14 @@ impl Class {
     }
 
     /// Return `true` iff this class is [`Class::Animal`].
+    #[inline]
     #[must_use]
     pub const fn is_animal(self) -> bool {
         matches!(self, Self::Animal)
     }
 
     /// Return `true` iff matches in this class paint a sprite/particle overlay (all except [`Class::Emphasis`]).
+    #[inline]
     #[must_use]
     pub const fn has_sprite_overlay(self) -> bool {
         !matches!(self, Self::Emphasis)
@@ -105,18 +108,21 @@ impl LangSet {
     pub const EMPTY: LangSet = LangSet(0);
 
     /// Construct a `LangSet` directly from its raw 64-bit mask.
+    #[inline]
     #[must_use]
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
     }
 
     /// Return the raw 64-bit mask of this set.
+    #[inline]
     #[must_use]
     pub const fn bits(self) -> u64 {
         self.0
     }
 
     /// This set plus `id`.
+    #[inline]
     #[must_use]
     pub const fn with(self, id: LangId) -> LangSet {
         // The `& 63` is a no-op for every id this crate hands out (ids are
@@ -126,30 +132,35 @@ impl LangSet {
     }
 
     /// Whether `id` is in the set.
+    #[inline]
     #[must_use]
     pub const fn contains(self, id: LangId) -> bool {
         self.0 & (1u64 << ((id.0 as u32) & 63)) != 0
     }
 
     /// Set union.
+    #[inline]
     #[must_use]
     pub const fn union(self, other: LangSet) -> LangSet {
         LangSet(self.0 | other.0)
     }
 
     /// True when no language is set.
+    #[inline]
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
 
     /// Number of languages in the set.
+    #[inline]
     #[must_use]
     pub const fn len(self) -> usize {
         self.0.count_ones() as usize
     }
 
     /// Encode the 64-bit language mask into 8 little-endian bytes.
+    #[inline]
     #[must_use]
     pub const fn encode_le(self) -> [u8; 8] {
         let v = self.0;
@@ -166,6 +177,7 @@ impl LangSet {
     }
 
     /// Decode 8 little-endian bytes into a `LangSet`.
+    #[inline]
     #[must_use]
     pub const fn decode_le(bytes: [u8; 8]) -> Self {
         Self(
@@ -182,6 +194,7 @@ impl LangSet {
 
     /// Iterate the members in ascending [`LangId`] order — i.e. lexicon
     /// first-appearance order, so the first yielded id is [`primary_lang`].
+    #[inline]
     pub fn iter(self) -> impl Iterator<Item = LangId> {
         let mut rest = self.0;
         std::iter::from_fn(move || {
@@ -198,6 +211,7 @@ impl LangSet {
 
 /// The set's primary language: the lowest set bit, i.e. the member whose entry appeared first in
 /// the lexicon TOML. An empty set yields the reserved `"unknown"` id.
+#[inline]
 #[must_use]
 pub const fn primary_lang(set: LangSet) -> LangId {
     if set.is_empty() {
@@ -249,24 +263,28 @@ impl FormId {
     pub const UNKNOWN: Self = Self(u64::MAX);
 
     /// Return the raw 64-bit form identifier.
+    #[inline]
     #[must_use]
     pub const fn raw(self) -> u64 {
         self.0
     }
 
     /// Return the low-byte morphology variant tag (`0` for exact table keys).
+    #[inline]
     #[must_use]
     pub const fn variant_byte(self) -> u8 {
         self.0 as u8
     }
 
     /// Return the base table key index (`self.0 >> 8`).
+    #[inline]
     #[must_use]
     pub const fn base_id(self) -> u64 {
         self.0 >> 8
     }
 
     /// Encode this `FormId` into 8 little-endian bytes.
+    #[inline]
     #[must_use]
     pub const fn encode_le(self) -> [u8; 8] {
         let v = self.0;
@@ -283,6 +301,7 @@ impl FormId {
     }
 
     /// Decode 8 little-endian bytes into a `FormId`.
+    #[inline]
     #[must_use]
     pub const fn decode_le(bytes: [u8; 8]) -> Self {
         Self(
@@ -302,10 +321,12 @@ impl FormId {
     /// variant zero; possessive and clitic fallbacks use a nonzero code. This
     /// keeps `kitty`, `kitty's`, and every supported prefix form distinct without
     /// falling back to a probabilistic token hash.
+    #[inline]
     const fn exact(base: u64) -> Self {
         Self(base << 8)
     }
 
+    #[inline]
     const fn with_variant(self, variant: u8) -> Self {
         debug_assert!(variant != 0);
         debug_assert!((self.0 & 0xff) == 0);
@@ -875,6 +896,7 @@ impl Lexicon {
     /// The interned code for `id` (`"en"`, `"ja"`, …); the reserved
     /// [`UNKNOWN_LANG`] slot — and any id this lexicon never handed out —
     /// renders as `"unknown"`.
+    #[inline]
     #[must_use]
     pub fn lang_code(&self, id: LangId) -> &str {
         self.langs
@@ -885,6 +907,7 @@ impl Lexicon {
     /// The interned species id for an animal match (`"monkey"`, `"camel"`, …)
     /// — the renderer's authored-sprite key. An id this lexicon never handed
     /// out renders as `"unknown"`.
+    #[inline]
     #[must_use]
     pub fn species_code(&self, id: SpeciesId) -> &str {
         self.species
@@ -894,31 +917,36 @@ impl Lexicon {
 
     /// Every interned species id, in [`SpeciesId`] order: what `animal_art_quality` checks against
     /// the authored art, both ways.
+    #[inline]
     #[must_use]
-    pub fn species_codes(&self) -> &[String] {
-        &self.species
+    pub const fn species_codes(&self) -> &[String] {
+        self.species.as_slice()
     }
 
     /// Data problems found at build time: a cross-class or cross-species claim, an unknown class
     /// or mode, a surface cap hit, a user surface that can never scan as written. Empty for the
     /// embedded lexicon (`embedded_lexicon_parses_and_has_no_conflicts`).
+    #[inline]
     #[must_use]
-    pub fn conflicts(&self) -> &[String] {
-        &self.conflicts
+    pub const fn conflicts(&self) -> &[String] {
+        self.conflicts.as_slice()
     }
 
     /// Total number of folded single-word surfaces.
+    #[inline]
     #[must_use]
     pub fn spaced_form_count(&self) -> usize {
         self.spaced.len()
     }
 
     /// Iterate the folded whitespace-script surfaces and their class (validator).
+    #[inline]
     pub fn iter_spaced(&self) -> impl Iterator<Item = (&str, Class)> {
         self.spaced.iter().map(|(k, v)| (k.as_str(), v.class))
     }
 
     /// Iterate the CJK compound surfaces and their class (validator).
+    #[inline]
     pub fn iter_cjk(&self) -> impl Iterator<Item = (&str, Class)> {
         self.cjk_forms.iter().map(|(k, v)| (k.as_str(), v.class))
     }
@@ -926,6 +954,7 @@ impl Lexicon {
     /// Whether the spaced surface behind `folded_key` matches only tokens that themselves carry
     /// folded-away marks ([`has_foldable_marks`]); `false` for an unknown key. For validators: a
     /// round-trip test probes such a key with a marked witness.
+    #[inline]
     #[must_use]
     pub fn surface_requires_marks(&self, folded_key: &str) -> bool {
         self.spaced
@@ -1334,7 +1363,8 @@ fn intern_species(table: &mut Vec<String>, code: &str) -> SpeciesId {
 /// Cross-class homograph precedence: `profanity > feline > canine > animal > emphasis`. A surface
 /// that is an expletive in any enabled language ("poes": Dutch pussycat, Afrikaans vulgar) is
 /// profanity, so it sparkles rather than getting a paw.
-fn class_rank(class: Class) -> u8 {
+#[inline]
+const fn class_rank(class: Class) -> u8 {
     match class {
         Class::Profanity => 5,
         Class::Feline => 4,
@@ -1485,6 +1515,7 @@ fn finalize_hits(
 /// resolver) keys per-word tables by the scanner's own hash. Pass the text a match carries: the
 /// [`fold`]ed full token for spaced surfaces (possessives folded whole: `fold(w) + "'s"`), the raw
 /// compound for no-space surfaces.
+#[inline]
 #[must_use]
 pub fn form_hash(surface: &str) -> u64 {
     fnv1a64(surface)
@@ -1493,6 +1524,7 @@ pub fn form_hash(surface: &str) -> u64 {
 /// True when every char of `s` is in a no-space script (CJK, kana, Hangul, Thai, Lao, Khmer):
 /// such a surface must be a `cjk = true` entry with a raw (unfolded) key, or the build drops it
 /// as not a scannable token.
+#[inline]
 #[must_use]
 pub fn is_no_space_surface(s: &str) -> bool {
     !s.is_empty() && s.chars().all(fold::is_no_space_script)
@@ -1500,6 +1532,7 @@ pub fn is_no_space_surface(s: &str) -> bool {
 
 /// FNV-1a over the key's UTF-8 bytes — the [`Match::form_hash`] source. Kept
 /// byte-level (not char-level) so the hash of a `&str` slice never allocates.
+#[inline]
 fn fnv1a64(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
@@ -1512,6 +1545,7 @@ fn fnv1a64(s: &str) -> u64 {
 /// Maximal run of token characters starting at `i`, treating an apostrophe or
 /// hyphen between two token characters as an interior joiner (so `cat's` and
 /// `cat-like` are single tokens).
+#[inline]
 fn token_end(chars: &[char], i: usize) -> usize {
     let n = chars.len();
     let mut j = i;
@@ -1536,8 +1570,9 @@ fn token_end(chars: &[char], i: usize) -> usize {
 /// An apostrophe or hyphen, which the scanner joins into a token when it sits between two token
 /// characters (`cat's`, `cat-like`). Public so the host's context tokenizer (the sparkle-words
 /// genome's ±K neighbor-token walk) segments tokens like the scanner.
+#[inline]
 #[must_use]
-pub fn is_interior_joiner(c: char) -> bool {
+pub const fn is_interior_joiner(c: char) -> bool {
     c == '\'' || c == '\u{2019}' || c == '-'
 }
 
@@ -1573,6 +1608,7 @@ fn is_matchable_token(s: &str) -> bool {
 
 /// True if the character just LEFT of the token at `i` puts it in a code/path
 /// context.
+#[inline]
 fn left_suppresses(chars: &[char], i: usize) -> bool {
     if i == 0 {
         return false;
@@ -1591,6 +1627,7 @@ fn left_suppresses(chars: &[char], i: usize) -> bool {
 
 /// True if the character just RIGHT of the token ending at `j` puts it in a
 /// code/path context.
+#[inline]
 fn right_suppresses(chars: &[char], j: usize) -> bool {
     let n = chars.len();
     if j >= n {
@@ -1602,6 +1639,7 @@ fn right_suppresses(chars: &[char], j: usize) -> bool {
 }
 
 /// Strip a trailing English possessive (`'s` / `'`) from a token, if present.
+#[inline]
 fn strip_possessive(token: &str) -> Option<(&str, u8)> {
     for (variant, suf) in ["'s", "\u{2019}s", "'", "\u{2019}"].into_iter().enumerate() {
         if let Some(stem) = token.strip_suffix(suf)

@@ -179,13 +179,14 @@
 //! spent quota (`QUOTA_EXHAUSTED` with a `RetryInfo` delay, the CLI's
 //! `TerminalQuotaError` with its delay) draws `Access resets at <time>.`
 //! under the title (MEASURED 2026-10-21, [`fixtures::LIMIT_DIALOG_ACCOUNT`]),
-//! the same box all the same; [`limit_reset`] reads that time. Pressed by
-//! no role: `Stop` ends the turn on `✕ [API Error: An unknown error
-//! occurred.]`, which no longer says it was the quota, and `Keep trying`
-//! sends the request again (`retry_once`, bundle), into the quota unless its
-//! reset has passed — so a supervisor presses it only past the reset the
-//! dialog names (aterm-agent's `limit-retry@v1`), and the dialog that names
-//! none is a person's.
+//! the same box all the same; [`limit_reset`] reads that time and the zone
+//! the CLI drew it in. Pressed by no role: `Stop` ends the turn on `✕ [API
+//! Error: An unknown error occurred.]`, which no longer says it was the
+//! quota, and `Keep trying` sends the request again (`retry_once`, bundle),
+//! into the quota unless its reset has passed — so a supervisor presses it
+//! only past the reset the dialog names (aterm-agent's `limit-retry@v1`),
+//! and on the dialog that names none only on a long back-off ladder while a
+//! person is told.
 //!
 //! **THE TRUST DIALOG** (a first run in a folder, folder trust on) is a box
 //! no typing answers: a [`PromptKind::Trust`] box. Its Esc EXITS the program
@@ -298,6 +299,10 @@ struct Frame {
     status: Option<usize>,
     /// The live zone's first row: the status row, else the band's top.
     live: usize,
+    /// The live zone's `─` rule over the band ([`frame_at`]'s, as wide as
+    /// the band); `None` with the UI details hidden at the default approval
+    /// mode, which draws no rule ([`details_hidden_frame`]).
+    rule: Option<usize>,
     caret: usize,
     /// The caret's glyph ([`CARET`], [`CARET_YOLO`], [`CARET_SHELL`]).
     glyph: u8,
@@ -354,6 +359,7 @@ fn details_hidden_frame(rows: &[String]) -> Option<Frame> {
     Some(Frame {
         status: Some(status),
         live: status,
+        rule: None,
         caret,
         glyph: caret_glyph(&rows[caret])?,
         bottom,
@@ -391,6 +397,7 @@ fn frame_at(rows: &[String], top: usize) -> Option<Frame> {
     Some(Frame {
         status,
         live: status.unwrap_or(rule),
+        rule: Some(rule),
         caret,
         glyph: caret_glyph(&rows[caret])?,
         bottom,
@@ -440,6 +447,56 @@ pub fn caret_on(rows: &[String]) -> Option<char> {
         Some(CARET_SHELL) => None,
         Some(glyph) => Some(char::from(glyph)),
         None => Some(char::from(CARET)),
+    }
+}
+
+/// The row of the live zone's `─` rule ([`Frame`]): the plain rule over the
+/// approval mode and the composer's band, as wide as the band — Gemini CLI's
+/// top line, where aterm's glass draws the program's mark and the harness
+/// switch (presentation only: nothing reads a phase from it). `None` where
+/// no rule stands over the composer — the UI details hidden at the default
+/// approval mode (module header; a non-default mode brings the rule back,
+/// and it is found) — and where no composer stands (a box replaced the live
+/// zone). Never the band's `▄` row, which is the composer's own surface, a
+/// box's row, or a sent message's band: the rule is the one over the LAST
+/// band of its width that holds a caret.
+#[must_use]
+pub fn top_rule(rows: &[String]) -> Option<usize> {
+    frame(rows)?.rule
+}
+
+/// The most lines a paste is drawn as typed ([`folded_paste`]): the bundle's
+/// `LARGE_PASTE_LINE_THRESHOLD`.
+pub const PASTE_FOLD_LINES: usize = 5;
+
+/// The most UTF-16 code units a paste is drawn as typed ([`folded_paste`]):
+/// the bundle's `LARGE_PASTE_CHAR_THRESHOLD`, held to a JavaScript string's
+/// `length`.
+pub const PASTE_FOLD_UNITS: usize = 500;
+
+/// THE CHIP A LONG PASTE IS DRAWN AS: what the composer shows in place of
+/// `text` written into it as ONE paste (a plain `turn`). Gemini CLI 0.46.0
+/// folds a paste of more than [`PASTE_FOLD_LINES`] lines, or more than
+/// [`PASTE_FOLD_UNITS`] UTF-16 code units, into `[Pasted Text: <n> lines]`
+/// where its lines are past the bound and `[Pasted Text: <n> chars]` where
+/// only its length is, counted after `\r\n` and `\r` read as `\n`, and
+/// expands it again on submit (its text buffer's `insert` and
+/// `generatePastedTextId`, READ in the bundle). MEASURED: the harness's
+/// 538-character relaunch continuation drawn ` > [Pasted Text: 538 chars]`,
+/// the cursor past it ([`fixtures::FOLDED_PASTE`]). A second chip of the same
+/// text in one draft gains ` #2`; the harness types into an empty composer
+/// only. `None`: the composer draws the text itself.
+#[must_use]
+pub fn folded_paste(text: &str) -> Option<String> {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let lines = text.split('\n').count();
+    let units = text.encode_utf16().count();
+    if lines > PASTE_FOLD_LINES {
+        Some(format!("[Pasted Text: {lines} lines]"))
+    } else if units > PASTE_FOLD_UNITS {
+        Some(format!("[Pasted Text: {units} chars]"))
+    } else {
+        None
     }
 }
 
@@ -822,6 +879,26 @@ pub fn wall(rows: &[String]) -> Option<Wall> {
     })
 }
 
+/// Whether `w` is the error a turn ends on once a dialog's `2. Stop` answers
+/// it (module header): `✕ [API Error: An unknown error occurred.]`, which no
+/// longer says it was the quota — the usage-limit dialog's, or the no-access
+/// dialog's (measured on 0.46.0: [`fixtures::LIMIT_STOPPED`],
+/// [`fixtures::NARROW_NO_ACCESS_STOPPED`]). Which dialog it answered the
+/// screen does not say: a supervisor that read the dialog before it does.
+#[must_use]
+pub fn stopped_error(w: &Wall) -> bool {
+    matches!(
+        w.kind,
+        WallKind::ApiError {
+            code: None,
+            retryable: false,
+            ..
+        }
+    ) && w.placement == Placement::ErrorRow
+        && w.message
+            .contains(const { anchor_text("gemini.error.unknown") })
+}
+
 /// Whether `rows` are Gemini CLI's by their layout alone, for a session
 /// whose program name says nothing: its composer under the live zone's rule
 /// (or with the UI details hidden), or one of its boxes, named ([`prompt`]: a
@@ -1110,51 +1187,154 @@ pub fn esc(p: &PromptV2) -> Option<CancelEffect> {
     }
 }
 
-/// THE RESET THE USAGE-LIMIT DIALOG NAMES (module header): the time its
-/// `Access resets at <time>.` row says, under the title of the dialog
-/// [`prompt`] reads whole and over its options, less the zone it is named in
-/// — `5:06 AM` of `Access resets at 5:06 AM PDT.`
-/// ([`fixtures::LIMIT_DIALOG_ACCOUNT`]). READ in the 0.46.0 bundle
-/// (`getResetTimeMessage`): the CLI formats `now + retryDelayMs` with
-/// `Intl.DateTimeFormat("en-US", {hour, minute, timeZoneName: "short"})`, the
-/// process's own zone, so the zone's short name (`PDT`, `GMT+2`) is the
-/// machine's and is dropped, and the space before `AM` may be a no-break
-/// one. `None` on any other screen, on a dialog whose head is off the rows
-/// read, and on the dialog a key's per-day quota draws, which names no reset
-/// ([`fixtures::LIMIT_DIALOG`]).
+/// THE RESET THE USAGE-LIMIT DIALOG NAMES ([`limit_reset`]): its clock and
+/// the zone the CLI drew it in, `5:06 AM` and `PDT` of `Access resets at
+/// 5:06 AM PDT.` ([`fixtures::LIMIT_DIALOG_ACCOUNT`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitReset {
+    /// The clock: its words up to its `AM`/`PM` (en-US's twelve-hour
+    /// clock), else its first word, a no-break space read as a space.
+    pub clock: String,
+    /// The words after the clock as drawn (`PDT`, `GMT+5:30`, `UTC`): the
+    /// zone the clock is in. `None` where the row ends at the clock (a box
+    /// too narrow wraps the zone onto a row of its own).
+    pub zone: Option<String>,
+}
+
+impl LimitReset {
+    /// The zone's offset east of UTC in seconds ([`zone_offset_s`]): `None`
+    /// with no zone, or one no en-US short name spells.
+    #[must_use]
+    pub fn offset_s(&self) -> Option<i32> {
+        self.zone.as_deref().and_then(zone_offset_s)
+    }
+}
+
+impl std::fmt::Display for LimitReset {
+    /// As the dialog says it: `5:06 AM PDT`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.zone {
+            Some(zone) => write!(f, "{} {zone}", self.clock),
+            None => f.write_str(&self.clock),
+        }
+    }
+}
+
+/// THE OFFSET OF THE ZONE THE USAGE-LIMIT DIALOG NAMES ([`LimitReset::zone`]),
+/// seconds east of UTC. The CLI formats its reset with
+/// `Intl.DateTimeFormat("en-US", {hour: "numeric", minute: "2-digit",
+/// timeZoneName: "short"})` ([`limit_reset`]), in its own process's zone,
+/// which need not be the machine aterm runs on (`TZ` in its shell, an `ssh`
+/// to another host). MEASURED 2026-10-21 over every IANA zone, in January and
+/// in July (Node 26.3.0, ICU 78.3, CLDR 48, tz 2026a): en-US spells a zone by
+/// one of the US names below, each one offset wherever it is drawn (its
+/// daylight saving in the name: `PDT` is −7 h on every zone that draws it),
+/// by `UTC` or `GMT` (UTC itself), or as `GMT±H` / `GMT±H:MM` (`GMT+2`,
+/// `GMT+5:30`, `GMT-2:30`, `GMT+13:45`; `GMT+0` for a `TZ` the runtime does
+/// not know). So the name is the offset at the reset itself. `None` for any
+/// other word.
 #[must_use]
-pub fn limit_reset(rows: &[String]) -> Option<String> {
+pub fn zone_offset_s(zone: &str) -> Option<i32> {
+    /// The en-US short names of the measure, with their offsets in hours.
+    const NAMED: [(&str, i32); 17] = [
+        ("UTC", 0),
+        ("GMT", 0),
+        ("PST", -8),
+        ("PDT", -7),
+        ("MST", -7),
+        ("MDT", -6),
+        ("CST", -6),
+        ("CDT", -5),
+        ("EST", -5),
+        ("EDT", -4),
+        ("AKST", -9),
+        ("AKDT", -8),
+        ("HST", -10),
+        ("HAST", -10),
+        ("HADT", -9),
+        ("AST", -4),
+        ("ADT", -3),
+    ];
+    if let Some((_, hours)) = NAMED.iter().find(|(name, _)| *name == zone) {
+        return Some(hours * 3600);
+    }
+    let rest = zone.strip_prefix("GMT")?;
+    let (sign, rest) = match rest.strip_prefix('+') {
+        Some(r) => (1, r),
+        None => (-1, rest.strip_prefix('-')?),
+    };
+    let (hours, minutes) = rest.split_once(':').unwrap_or((rest, "00"));
+    let digits = |s: &str, len: std::ops::RangeInclusive<usize>| {
+        (len.contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<i32>().ok())
+            .flatten()
+    };
+    let (h, m) = (digits(hours, 1..=2)?, digits(minutes, 2..=2)?);
+    (h <= 14 && m < 60).then_some(sign * (h * 3600 + m * 60))
+}
+
+/// THE RESET THE USAGE-LIMIT DIALOG NAMES (module header): what its `Access
+/// resets at <time>.` row says, under the title of the dialog [`prompt`]
+/// reads whole and over its options — `5:06 AM` in `PDT` of `Access resets at
+/// 5:06 AM PDT.` ([`fixtures::LIMIT_DIALOG_ACCOUNT`]). READ in the 0.46.0
+/// bundle (`getResetTimeMessage`): the CLI formats `now + retryDelayMs` in
+/// its own process's zone, whose short name follows the clock
+/// ([`zone_offset_s`]), and the space before `AM` may be a no-break one.
+/// `None` on any other screen, on a dialog whose head is off the rows read,
+/// and on the dialog a key's per-day quota draws, which names no reset
+/// ([`fixtures::LIMIT_DIALOG`]). THE SENTENCE WRAPPED (a box narrower than
+/// it: `Access resets at 11:05 PM` over `PDT.`) is read on to its full stop,
+/// over the rows under it up to a blank one or the next line's `/` command —
+/// the zone the CLI drew is the one it is placed in, never the machine's for
+/// want of a row.
+#[must_use]
+pub fn limit_reset(rows: &[String]) -> Option<LimitReset> {
     let p = prompt(rows)?;
     if p.kind != PromptKind::UsageLimit || p.head_off_screen {
         return None;
     }
     let first_option = p.options.first().map_or(p.span.1, |o| o.row);
-    let head = const { anchor_text("gemini.usage.resets") };
-    let text = rows
-        .get(p.span.0 + 1..first_option.min(rows.len()))?
-        .iter()
-        .find_map(|r| {
-            let inner = r.trim().strip_prefix('│')?.strip_suffix('│')?;
-            crate::text::trim(inner)
-                .strip_prefix(head)
-                .map(str::to_string)
-        })?;
+    // The head's own words: a wrap right after them drops the space.
+    let head = const { anchor_text("gemini.usage.resets") }.trim_end();
+    let inner = |r: &String| -> Option<String> {
+        let inner = r.trim().strip_prefix('│')?.strip_suffix('│')?;
+        Some(crate::text::trim(inner).to_string())
+    };
+    let body = rows.get(p.span.0 + 1..first_option.min(rows.len()))?;
+    let at = body.iter().position(|r| {
+        inner(r).is_some_and(|t| {
+            t.strip_prefix(head)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+        })
+    })?;
+    let mut text = inner(&body[at])?
+        .strip_prefix(head)?
+        .trim_start()
+        .to_string();
+    for r in &body[at + 1..] {
+        if text.ends_with('.') {
+            break;
+        }
+        let Some(more) = inner(r).filter(|t| !t.is_empty() && !t.starts_with('/')) else {
+            break;
+        };
+        text.push(' ');
+        text.push_str(&more);
+    }
     let text = text.trim_end_matches('.');
-    let mut words: Vec<&str> = text
+    let words: Vec<&str> = text
         .split(|c: char| c.is_whitespace() || c == '\u{202f}' || c == '\u{a0}')
         .filter(|w| !w.is_empty())
         .collect();
-    let zone = |w: &str| {
-        let letters =
-            w.trim_end_matches(|c: char| c.is_ascii_digit() || c == '+' || c == '-' || c == ':');
-        (2..=5).contains(&letters.len())
-            && letters.bytes().all(|b| b.is_ascii_uppercase())
-            && !matches!(letters, "AM" | "PM")
-    };
-    if words.len() > 1 && words.last().is_some_and(|w| zone(w)) {
-        words.pop();
-    }
-    (!words.is_empty()).then(|| words.join(" "))
+    let clock_words = words
+        .iter()
+        .position(|w| w.eq_ignore_ascii_case("AM") || w.eq_ignore_ascii_case("PM"))
+        .map_or(1, |at| at + 1);
+    let (clock, zone) = words.split_at_checked(clock_words)?;
+    Some(LimitReset {
+        clock: clock.join(" "),
+        zone: (!zone.is_empty()).then(|| zone.join(" ")),
+    })
 }
 
 /// The box on `rows`, read whole ([`PromptV2`]): its title (an approval
@@ -1416,6 +1596,11 @@ pub mod fixtures {
     pub const PRE_BANNER: &str = include_str!("fixtures/gemini-0.46.0-pre-banner.txt");
     /// A typed, unsent draft: the status row blank.
     pub const DRAFT: &str = include_str!("fixtures/gemini-0.46.0-draft.txt");
+    /// A 538-character paste folded into the composer's chip, unsent
+    /// ([`super::folded_paste`]): ` > [Pasted Text: 538 chars]`, `Press
+    /// Ctrl+O to expand pasted text` on the status row (the forever lab's
+    /// relaunched worker, 2026-10-21).
+    pub const FOLDED_PASTE: &str = include_str!("fixtures/gemini-0.46.0-folded-paste.txt");
     /// A fresh composer with a `GEMINI.md` loaded: `1 GEMINI.md file` on the
     /// approval mode's row.
     pub const IDLE_CONTEXT: &str = include_str!("fixtures/gemini-0.46.0-idle-context.txt");

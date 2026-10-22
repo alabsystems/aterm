@@ -263,5 +263,12 @@ Generated Unicode segmentation, width, emoji-presentation, and compatibility
 tables derive from Unicode data. Unicode copyright and permission terms are in
 `UNICODE-LICENSE.txt`.
 
+`crates/aterm-grapheme/data/hyph-en-us.tex` is TeX's American English
+hyphenation patterns and exception list as the hyph-utf8 package publishes
+them (Copyright (C) 1990, 2004, 2005 Gerard D.C. Kuiken, with the patterns
+and exceptions of Donald E. Knuth's hyphen.tex), embedded unmodified. Its own
+notice, kept in the file, permits copying and distribution with or without
+modification provided the copyright notice and that notice are preserved.
+
 The public source snapshot contains no executable binary, no updater payload
 and no managed ALab tool package; PUBLICATION.md describes its boundary.

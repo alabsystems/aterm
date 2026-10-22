@@ -186,15 +186,18 @@ pub(crate) struct ClusterShapes {
 impl ClusterShapes {
     /// The memoized shape, and whether it was served from the previous
     /// generation (the caller re-inserts it to promote it).
+    #[inline]
     pub(crate) fn get(&self, cluster: &str) -> Option<(Option<ClusterShape>, bool)> {
         self.memo.get(cluster).map(|(&shape, prev)| (shape, prev))
     }
 
+    #[inline]
     pub(crate) fn insert(&mut self, cluster: &str, shape: Option<ClusterShape>) {
         self.memo.insert(cluster.into(), shape);
     }
 
     /// Store `run` under a fresh id; `None` once ids are exhausted.
+    #[inline]
     pub(crate) fn add_run(&mut self, run: ClusterRun) -> Option<u32> {
         let id = self.next_run;
         self.next_run = id.checked_add(1)?;
@@ -202,11 +205,13 @@ impl ClusterShapes {
         Some(id)
     }
 
+    #[inline]
     pub(crate) fn run(&self, id: u32) -> Option<&ClusterRun> {
         self.runs.get(&id)
     }
 
     /// Entries in the current generation (the cap trigger).
+    #[inline]
     pub(crate) fn cur_len(&self) -> usize {
         self.memo.cur_len()
     }

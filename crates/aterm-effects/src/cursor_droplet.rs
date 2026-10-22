@@ -155,6 +155,7 @@ impl CursorDroplet {
     /// Whether the host must keep arming the animation tick: only while the
     /// water is surging (typing, or a splash calming).
     #[must_use]
+    #[inline]
     pub fn is_active(&self) -> bool {
         self.surge > SETTLED_SURGE
     }

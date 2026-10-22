@@ -6,16 +6,25 @@
 //! moves the bridge's own state, through the bridge's own publish, collision,
 //! budget and urgent-service paths.
 //!
-//! OFF IS NOTHING. With `[fabric] log = "off"` (the default) [`Bridge::mirror`]
-//! is `None`: the `hello` carries no `log=`, no `log-take` or `log-landed` is
-//! ever sent, no `logpin`, `logkey` or `logfloor` is read or written (save the
-//! state dir's own reconciling of a pin a mirror left, by the first bridge
-//! after an unclean stop in an earlier boot, [`StateDir::reconcile_logpin`]:
-//! a dir no mirror ran in holds none), no `ev` body of the mirror's is
-//! published, and the loop's wait is what it was: judged before the round
-//! settles what the items before left owed ([`Bridge::mirror_then_round`]).
-//! So is a bridge whose endpoint did not acknowledge `log=turns`, and one
-//! whose mirror stopped.
+//! OFF IS NOTHING. With `[fabric] log = "off"` [`Bridge::mirror`] is `None`:
+//! the `hello` carries no `log=`, no `log-take` or `log-landed` is ever sent,
+//! no `logpin`, `logkey` or `logfloor` is read or written (save the state
+//! dir's own reconciling of a pin a mirror left, by the first bridge after an
+//! unclean stop in an earlier boot, [`StateDir::reconcile_logpin`]: a dir no
+//! mirror ran in holds none), no `ev` body of the mirror's is published, and
+//! the loop's wait is what it was: judged before the round settles what the
+//! items before left owed ([`Bridge::mirror_then_round`]). So is a bridge
+//! whose endpoint did not acknowledge `log=turns`, and one whose mirror
+//! stopped.
+//!
+//! AUTO, THE DEFAULT (owner decision D4, session log Phase 6 step 6E-3),
+//! FOLLOWS THE BROKER. Until an attach has judged the broker's `Hello`
+//! ([`Bridge::broker_retains`]) the `hello` says `log=auto`, which asks for
+//! nothing; an attach to a broker that retains this node's `ev` faces says
+//! the `hello` again with `log=turns`, and from its answer on the mirror runs
+//! as `turns` does ([`Bridge::mirror_attached`]). Over a broker that retains
+//! nothing it does not run: no take, no pin judged or written, and `link
+//! mirror unretained` (`fabric status mirror=unretained`).
 //!
 //! ON, it is ONE ROUND ITEM per pass of the loop (ruling Q10), at the point
 //! where the round's queued work is done: a take of at most
@@ -69,7 +78,7 @@ use std::time::{Duration, Instant};
 
 use super::{
     past_the_budget, read_back_rows, refused_for_good, Bridge, Opens, Then, DEADLINE_RETRY,
-    PIPELINE_WINDOW,
+    LINK_MIRROR_WAIT_LANE, PIPELINE_WINDOW,
 };
 use crate::ctl::Reply;
 use crate::mirror::{self, Bucket, LandedWord, LogMode, Pin, PinSlot};
@@ -116,10 +125,16 @@ impl Outcome {
     }
 }
 
-/// The mirror's state in a bridge whose `[fabric] log` is `"turns"`.
+/// The mirror's state in a bridge whose `[fabric] log` is `"turns"` or
+/// `"auto"`.
 pub(super) struct MirrorRun {
+    /// `Turns`, or `Auto` (on while the broker retains, step 6E-3).
+    mode: LogMode,
     /// The endpoint answered the hello's `log=turns`.
     acked: bool,
+    /// An `auto` mirror over a broker that retains nothing, said once a
+    /// change (`link mirror unretained`).
+    unretained: bool,
     /// Why it stopped for this bridge's life (ruling Q10, Q13), if it did.
     stopped: Option<String>,
     /// Work is owed: a take, a send or a landing.
@@ -165,6 +180,12 @@ pub(super) struct MirrorRun {
     recovered_deduped: u64,
     /// The most slots a take asks ([`mirror::BATCH_MAX`]; a test's one).
     batch: usize,
+    /// The broker's `oldest=` for this node's `ev` faces as last read (ruling
+    /// U41): it only rises, so a window it counts under the budget is.
+    oldest: u64,
+    /// The window budget holds the take: said once to the endpoint (`link
+    /// mirror budget`) until the mirror goes on (`link mirror on`).
+    waiting: bool,
 }
 
 impl MirrorRun {
@@ -184,7 +205,7 @@ impl MirrorRun {
         now: Instant,
         mint: impl FnOnce() -> Option<[u8; 16]>,
     ) -> Option<Box<MirrorRun>> {
-        (mode == LogMode::Turns).then(|| {
+        (mode != LogMode::Off).then(|| {
             let key = state
                 .logpin()
                 .ok()
@@ -193,7 +214,9 @@ impl MirrorRun {
                 .and_then(|p| p.key)
                 .or_else(mint);
             Box::new(MirrorRun {
+                mode,
                 acked: false,
+                unretained: false,
                 stopped: None,
                 owed: false,
                 retry_at: None,
@@ -216,6 +239,8 @@ impl MirrorRun {
                 recovered: 0,
                 recovered_deduped: 0,
                 batch: mirror::BATCH_MAX,
+                oldest: 0,
+                waiting: false,
             })
         })
     }
@@ -277,6 +302,25 @@ impl MirrorRun {
     #[cfg(test)]
     pub(super) fn set_total_for_tests(&mut self, total: u64) {
         self.pin.total = total;
+    }
+
+    /// The pin's window ledger and the `oldest=` it was last judged by.
+    #[cfg(test)]
+    pub(super) fn window(&self) -> (&[(u64, u64)], u64) {
+        (&self.pin.win, self.oldest)
+    }
+
+    /// A landed batch of `bytes` at `hi`, as a settle notes it (the budget's
+    /// tests).
+    #[cfg(test)]
+    pub(super) fn note_window_for_tests(&mut self, hi: u64, bytes: u64) {
+        self.pin.note_window(hi, bytes);
+    }
+
+    /// Whether the window budget holds the take.
+    #[cfg(test)]
+    pub(super) fn waiting(&self) -> bool {
+        self.waiting
     }
 
     /// Milliseconds since this run began, at `now` (the bridge's door): the
@@ -341,12 +385,83 @@ enum ReadBack {
 }
 
 impl Bridge {
-    /// The `hello`'s token: ` log=turns` when the mirror is on, nothing off.
+    /// The `hello`'s token: ` log=turns` when the mirror is asked for,
+    /// ` log=auto` from an `auto` mirror before an attach found a broker that
+    /// retains (step 6E-3), nothing off.
     pub(super) fn mirror_hello_token(&self) -> &'static str {
-        if self.mirror.is_some() {
-            " log=turns"
-        } else {
-            ""
+        match self.mirror.as_deref() {
+            None => "",
+            Some(_) if self.mirror_asks() => " log=turns",
+            Some(_) => " log=auto",
+        }
+    }
+
+    /// Whether the `hello` asks for the mirror: `turns`, or `auto` over a
+    /// broker the last attach found retaining.
+    fn mirror_asks(&self) -> bool {
+        self.mirror
+            .as_deref()
+            .is_some_and(|m| m.mode == LogMode::Turns || self.mirror_retained())
+    }
+
+    /// THE HELLO GATE (step 6E-3): whether the last attach found the broker
+    /// retaining this node's `ev` faces ([`Bridge::broker_retains`]), which
+    /// is what an `auto` mirror runs on.
+    fn mirror_retained(&self) -> bool {
+        self.broker_retains == Some(true)
+    }
+
+    /// AFTER EVERY ATTACH, an `auto` mirror follows the broker's retention
+    /// (session log Phase 6 step 6E-3). Over a broker that retains this
+    /// node's `ev` faces, a mirror the endpoint has not acknowledged is asked
+    /// for now (the `hello` again, `log=turns`, whose answer reads the pin and
+    /// says `link mirror on`), and one that waited out an unretaining broker
+    /// says `on` again. Over any other it does not run, said once a change:
+    /// a mirror the endpoint acknowledged is first withdrawn (the `hello`
+    /// again, `log=auto`), so the endpoint's recorded hello says what this
+    /// bridge asks for and its `fabric status` reads `bridge_log=auto`, then
+    /// `link mirror unretained` to an endpoint that reads it. Without the
+    /// withdrawal an endpoint that last recorded `log=turns` kept saying the
+    /// node mirrors (`bridge_log=turns mirror=unretained`), and kept its
+    /// sessions engaged for a take that never came.
+    pub(super) fn mirror_attached(&mut self) {
+        let Some(m) = self.mirror.as_deref() else {
+            return;
+        };
+        if m.mode != LogMode::Auto {
+            return;
+        }
+        let (acked, stopped, unretained) = (m.acked, m.stopped.is_some(), m.unretained);
+        if self.mirror_retained() {
+            if let Some(m) = self.mirror.as_deref_mut() {
+                m.unretained = false;
+            }
+            if !acked && !stopped {
+                self.introduce();
+            } else if unretained && !stopped {
+                let _ = self.ctl_request("link mirror on");
+            }
+            return;
+        }
+        if unretained {
+            return;
+        }
+        if let Some(m) = self.mirror.as_deref_mut() {
+            m.unretained = true;
+        }
+        eprintln!(
+            "aterm-link: mirror: the broker retains none of this node's `ev` faces, and [fabric] \
+             log is \"auto\": the session logs are not mirrored onto it (\"turns\" mirrors \
+             them anyway, up to a total)"
+        );
+        if acked {
+            // `mirror_asks` is false now, so this hello says `log=auto`, and
+            // its answer leaves the mirror unacknowledged until a retaining
+            // attach asks again.
+            self.introduce();
+        }
+        if self.endpoint_lane >= LINK_MIRROR_WAIT_LANE {
+            let _ = self.ctl_request("link mirror unretained");
         }
     }
 
@@ -366,14 +481,22 @@ impl Bridge {
     /// that does not, stop the mirror, kept as they are, and the stop says on
     /// stderr exactly what a person does ([`Bridge::mirror_pin_remedy`]).
     pub(super) fn mirror_hello_answered(&mut self, header: &str) {
+        let asked = self.mirror_asks();
         let Some(m) = self.mirror.as_deref_mut() else {
             return;
         };
+        // An `auto` hello asked for nothing: the attach that finds a
+        // retaining broker asks ([`Bridge::mirror_attached`]).
+        if !asked {
+            m.acked = false;
+            return;
+        }
         m.acked = header.split_whitespace().any(|t| t == "log=turns");
         if !m.acked {
             eprintln!(
-                "aterm-link: [fabric] log = \"turns\", but this aterm did not acknowledge \
-                 log=turns: it serves no session-log mirror, which stays off"
+                "aterm-link: [fabric] log = \"{}\", but this aterm did not acknowledge \
+                 log=turns: it serves no session-log mirror, which stays off",
+                m.mode.word()
             );
             return;
         }
@@ -614,12 +737,13 @@ impl Bridge {
     }
 
     /// Whether the mirror runs on this bridge: on, acknowledged by the
-    /// endpoint, and not stopped. A bridge whose mirror is not engaged runs
-    /// the loop it ran before the mirror ([`Bridge::mirror_then_round`]).
+    /// endpoint, not stopped, and, `auto`, over a broker that retains it. A
+    /// bridge whose mirror is not engaged runs the loop it ran before the
+    /// mirror ([`Bridge::mirror_then_round`]).
     pub(super) fn mirror_engaged(&self) -> bool {
-        self.mirror
-            .as_deref()
-            .is_some_and(|m| m.acked && m.stopped.is_none())
+        self.mirror.as_deref().is_some_and(|m| {
+            m.acked && m.stopped.is_none() && (m.mode == LogMode::Turns || self.mirror_retained())
+        })
     }
 
     /// TEST-ONLY: the node's total of mirrored bytes as an engaged mirror
@@ -723,15 +847,33 @@ impl Bridge {
         }) else {
             return;
         };
-        if total >= mirror::TOTAL_MAX_BYTES {
-            self.mirror_stop(
-                &format!(
-                    "the node mirrored its total of {} bytes with no retention in the broker",
-                    mirror::TOTAL_MAX_BYTES
-                ),
-                "link mirror capped reason=total",
-            );
-            return;
+        // ON A RETAINING BROKER, THE WINDOW BUDGET (session log Phase 6 step
+        // 6E-2, ruling U41): the broker gives the bulk stream up from its
+        // oldest end, so what this node may hold there is a share of the
+        // window, never a lifetime total. On any other broker, the total.
+        if self.broker_retains == Some(true) {
+            if !self.mirror_window_open() {
+                self.mirror_retry_in(DEADLINE_RETRY);
+                return;
+            }
+        } else {
+            // A broker that no longer retains has no window to wait on.
+            if self.mirror.as_deref().is_some_and(|m| m.waiting) {
+                if let Some(m) = self.mirror.as_deref_mut() {
+                    m.waiting = false;
+                }
+                let _ = self.ctl_request("link mirror on");
+            }
+            if total >= mirror::TOTAL_MAX_BYTES {
+                self.mirror_stop(
+                    &format!(
+                        "the node mirrored its total of {} bytes with no retention in the broker",
+                        mirror::TOTAL_MAX_BYTES
+                    ),
+                    "link mirror capped reason=total",
+                );
+                return;
+            }
         }
         if n == 0 {
             self.mirror_retry_in(BUSY_WAIT);
@@ -849,6 +991,62 @@ impl Bridge {
             m.clear_batch();
             m.retry_at = Some(now + DEADLINE_RETRY);
         }
+    }
+
+    /// THE WINDOW BUDGET (session log Phase 6 step 6E-2, ruling U41), on a
+    /// retaining broker: whether this node's landed bytes in the broker's
+    /// window are under [`mirror::NODE_WINDOW_BYTES`]. Judged first by the
+    /// `oldest=` last read, which only rises, so a window under the budget by
+    /// it is under it; only past it is `oldest=` asked again (a head query of
+    /// the node's `ev` faces, never refused), and the batches the cut passed
+    /// whole are forgotten. Past it still, the mirror waits, said once (`link
+    /// mirror budget` to an endpoint that reads it); under it again, `link
+    /// mirror on`, and the take goes on.
+    fn mirror_window_open(&mut self) -> bool {
+        let over = |m: &MirrorRun| m.pin.window_bytes(m.oldest) >= mirror::NODE_WINDOW_BYTES;
+        if self.mirror.as_deref().is_some_and(over) {
+            let faces = format!("/f/{}/pub/{}/*/ev", self.cfg.fleet, self.node);
+            let fx = self.fx.clone();
+            let Some(conn) = self.conn_now() else {
+                return false;
+            };
+            let started = fx.now();
+            let answer = conn.oldest(&faces);
+            let Ok((oldest, _)) = self.observe(started, answer, Some("read")) else {
+                return false;
+            };
+            if let (Some(m), Some(oldest)) = (self.mirror.as_deref_mut(), oldest) {
+                m.oldest = m.oldest.max(oldest);
+                m.pin.prune_window(m.oldest);
+            }
+        }
+        let Some(m) = self.mirror.as_deref_mut() else {
+            return false;
+        };
+        let window = m.pin.window_bytes(m.oldest);
+        let open = window < mirror::NODE_WINDOW_BYTES;
+        if open == !m.waiting {
+            return open;
+        }
+        m.waiting = !open;
+        let report = if open {
+            eprintln!("aterm-link: mirror: the broker's window has room again; the mirror goes on");
+            "link mirror on"
+        } else {
+            eprintln!(
+                "aterm-link: mirror: this node's {window} bytes in the broker's window (from \
+                 @{}) reach its budget of {}; the mirror waits for the broker's retention to \
+                 give the oldest of them up",
+                m.oldest,
+                mirror::NODE_WINDOW_BYTES
+            );
+            if self.endpoint_lane < LINK_MIRROR_WAIT_LANE {
+                return open;
+            }
+            "link mirror budget"
+        };
+        let _ = self.ctl_request(report);
+        open
     }
 
     fn mirror_retry_in(&mut self, wait: Duration) {
@@ -1385,6 +1583,23 @@ impl Bridge {
             .map(|(s, _)| s.body.len() as u64)
             .sum();
         m.pin.total = m.pin.total.saturating_add(bytes);
+        // The window ledger (ruling U41), on a retaining broker: the batch's
+        // bytes at the highest offset it landed at, which the broker's cut
+        // must pass to give it up. Over any other broker nothing is given up,
+        // and the total alone counts.
+        let retains = self.broker_retains == Some(true);
+        let hi = m
+            .outcome
+            .iter()
+            .filter_map(|o| match o {
+                Outcome::OnBus(off) | Outcome::Verified(off) => Some(*off),
+                _ => None,
+            })
+            .max()
+            .filter(|_| retains);
+        if let Some(hi) = hi {
+            m.pin.note_window(hi, bytes);
+        }
         m.clear_batch();
         m.recovered = 0;
         m.recovered_deduped = 0;
@@ -1421,9 +1636,12 @@ impl Bridge {
         let Some(m) = self.mirror.as_deref_mut() else {
             return;
         };
-        if m.pin.slots.is_empty() {
+        // The window ledger and `oldest=` name the old log's offsets too.
+        m.oldest = 0;
+        if m.pin.slots.is_empty() && m.pin.win.is_empty() {
             return;
         }
+        m.pin.win.clear();
         m.clear_batch();
         m.repin = false;
         m.owed = true;

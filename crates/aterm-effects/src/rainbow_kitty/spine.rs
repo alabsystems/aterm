@@ -277,6 +277,7 @@ impl Spine {
     /// Keys coalesced into one frame share its price. A key at
     /// [`FLOW_KEY_DISP`] or above extends the run, one under it breaks it; a
     /// frame within [`FLOW_FREEZE_S`] of a [`Spine::drive`] does neither.
+    #[inline]
     pub fn note_keys(&mut self, now: Instant, keys: u32, price: f32) {
         if keys == 0 {
             return;
@@ -312,6 +313,7 @@ impl Spine {
     /// restarted at `now`. A delete more than [`MEND_WINDOW_S`] after the
     /// previous one starts a fresh run. It also breaks the flow run (the
     /// high-water mark is kept).
+    #[inline]
     pub fn drain_delete(&mut self, now: Instant) {
         self.momentum.delete(now);
         self.run = 0;
@@ -329,6 +331,7 @@ impl Spine {
     /// One kill chord (`^W` / `^U` / `^K`, Alt-D, word backspace): un-earns like
     /// about two deletes. It is an edit, not a typo, so it drops any
     /// [`EraseMark`], and it breaks the flow run.
+    #[inline]
     pub fn drain_kill(&mut self, now: Instant) {
         self.momentum.kill(now);
         self.mark = None;
@@ -339,6 +342,7 @@ impl Spine {
     /// (clamped to 0..1; non-finite reads as 0). A held-key sing-along is maximal
     /// flow by definition, so it drives the metric through this one seam and
     /// every legibility cap holds as at earned full momentum.
+    #[inline]
     pub fn drive(&mut self, now: Instant, floor: f32) {
         let floor = if floor.is_finite() {
             floor.clamp(0.0, 1.0)
@@ -359,6 +363,7 @@ impl Spine {
     /// display follower, the resume memory, the flow run and the hot-resume
     /// door at `now`, keeping `phase` and `best` intact so the family's colour
     /// wheel does not jump and the session's high-water mark survives.
+    #[inline]
     pub fn hush(&mut self, now: Instant) {
         self.momentum.set_value(now, 0.0);
         self.disp = 0.0;

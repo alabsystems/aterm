@@ -24,14 +24,14 @@ impl Grid {
     /// The holder fence's span anchors.
     #[must_use]
     #[inline]
-    pub fn anchors(&self) -> &AnchorSet {
-        &self.storage.presentation.anchors
+    pub const fn anchors(&self) -> &AnchorSet {
+        &self.storage.cursor_state.presentation.anchors
     }
 
     /// The holder fence's span anchors, to place, move and free them.
     #[inline]
-    pub fn anchors_mut(&mut self) -> &mut AnchorSet {
-        &mut self.storage.presentation.anchors
+    pub const fn anchors_mut(&mut self) -> &mut AnchorSet {
+        &mut self.storage.cursor_state.presentation.anchors
     }
 
     /// Install a restored set (a checkpoint's): its rows were keyed under

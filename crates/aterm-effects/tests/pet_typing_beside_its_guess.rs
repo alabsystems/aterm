@@ -118,12 +118,12 @@ struct Knobs {
     /// protected chrome, as `pet_chrome` reserves them: the last
     /// [`CHIPS_COLS`] cells before the rule's last.
     chips: bool,
-    /// The harness on: its tint over the composer's top rule, the tool's
-    /// mark ` ▐▛███▜▌ claude ` written at its left and the lit switch
-    /// ` ✦ alab kitty · claude harness ● on ` at its right
-    /// (`collect_composer_border_brand_edits` repaints the rule's whole
-    /// run). `pet_chrome` reserves the mark and the switch as protected
-    /// chrome and leaves the tinted strokes the rule they are
+    /// The harness on: its tint over the composer's top rule, the CLI's
+    /// lockup `    claude ` (the icon's sprite over its two blank cells, and
+    /// the name) written at its left and the lit switch ` alab harness ●
+    /// on ` at its right (`claude_footer::compose_top` repaints the rule's
+    /// whole run). `pet_chrome` reserves the lockup and the switch as
+    /// protected chrome and leaves the tinted strokes the rule they are
     /// (`PetChrome::note_painted`). The composer's first line sits under
     /// that rule, and a 1.7-row body standing on it reaches into it.
     brand: bool,
@@ -150,12 +150,12 @@ impl Knobs {
 /// their gaps, as the owner's footer writes them at 120 columns.
 const CHIPS_COLS: u16 = 57;
 
-/// The harness's mark on the composer's top rule, ` ▐▛███▜▌ claude `, from
-/// the rule's third column, and its lit switch with the wordmark,
-/// ` ✦ alab kitty · claude harness ● on `, two columns short of the rule's
-/// end (`collect_composer_border_brand_edits`, `switch_face`).
-const BRAND_MARK_COLS: u16 = 16;
-const BRAND_SWITCH_COLS: u16 = 36;
+/// The CLI's lockup on the composer's top rule, `    claude ` (a pad, the
+/// icon's two cells, a pad, the name, a pad), from the rule's third column,
+/// and its lit switch, ` alab harness ● on `, two columns short of the
+/// rule's end (`claude_footer::compose_top`, `switch_face`).
+const BRAND_MARK_COLS: u16 = 11;
+const BRAND_SWITCH_COLS: u16 = 19;
 
 /// One present, as the pet drew it.
 #[derive(Clone, Copy, Debug)]
@@ -1103,7 +1103,7 @@ const STAND_REACH: f32 = 12.0;
 /// chips: walled off by them (the box between the bodies cutting their
 /// corner) it went in two flights, down to a seat it could reach and then
 /// up, and kept off them in the air it glided with no rise. With the
-/// harness's mark and switch on the upper rule (`Knobs::brand`), the cat
+/// harness's lockup and switch on the upper rule (`Knobs::brand`), the cat
 /// walks the first line and waits short of the switch, and gathers for the
 /// bound there without a step aside. And in Claude Code as a window shows it,
 /// every frame one closed DEC 2026 bracket, the hidden caret it finished at

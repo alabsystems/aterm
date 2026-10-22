@@ -126,6 +126,33 @@ impl Exception {
         }
     }
 
+    /// A LIMIT HELD UNREAD PAST ITS END ([`exception_for`]): its reset passed
+    /// [`FUTILE_AFTER`] ago (or its appearance, where its notice named
+    /// none), and this tab's conversation still cannot be read to say it is
+    /// the one the limit stopped (`limit-conversation-unread`, a host whose
+    /// read names no conversation, or a row such a host wrote): nothing is
+    /// typed on the limit's account, and nothing but that read or the
+    /// agent's own work lifts it. The loop goes on looking every five
+    /// minutes; the owner is told once, `Later`, as for a futile limit
+    /// (FOREVER: NEEDS YOU is loud and never blocking). Measured before (the
+    /// remembered-limit stage, 2026-10-21): two days past the reset the tab
+    /// was still looked at every five minutes, nothing typed and nothing
+    /// said.
+    #[must_use]
+    pub fn unread_limit() -> Self {
+        Self {
+            kind: ExceptionKind::Futile,
+            when: Urgency::Later,
+            why: "The limit has passed, but this tab's conversation can't be read, so nothing is typed."
+                .to_string(),
+            action: "Type keep going in this tab if its conversation is the one the limit stopped."
+                .to_string(),
+            clears: "the conversation read, or the agent working",
+            escalated: false,
+            notice: None,
+        }
+    }
+
     /// THE STALL NO READER NAMES (the canary's third rung,
     /// `wall_memory::Session::stuck_busy_note`): the screen has read busy on
     /// background work alone for hours while Claude's title says idle. Built
@@ -1153,6 +1180,15 @@ pub fn exception_for(
     }
     if let Some(told) = claude_limit_login(state, reading, cfg, now) {
         return told;
+    }
+    // A LIMIT HELD UNREAD past its reset by [`FUTILE_AFTER`]
+    // ([`TurnEndState::held_unread_from`]): the tab stands still on a read
+    // only a person can stand in for ([`Exception::unread_limit`]).
+    if state
+        .held_unread_from(reading)
+        .is_some_and(|from| now.saturating_duration_since(from) >= FUTILE_AFTER)
+    {
+        return Some(Exception::unread_limit());
     }
     let kind = reading.wall?;
     let attempts = state.wall_attempts(kind).unwrap_or(0);

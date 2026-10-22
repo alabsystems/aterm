@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (34x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the composer top rule with workspace on (`/effort workspace on` typed at 120 columns, then `ctl resize 40 34`), fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1), Opus 5.5 at medium effort; measured: `─` at columns 0..21, a space at 22, the word at 23..31, a space at 32 and one `─` at 33 (the tag right-aligned at every width, the word in fg #af87ff, not bold, the rule in #888888, the spaces in default ink); the answer rows above wrap at this width; the stand-in `workspace` replaces the vendor's top effort key throughout
+
+
+❯ /effort workspace on
+  ⎿ Workspace on (this session
+    only): dynamic workflows on
+    every task. Effort stays
+    medium.
+
+❯ /effort workspace off
+  ⎿  Workspace off. Effort stays
+     medium.
+
+❯ /model claude-sonnet-4-5
+  ⎿ Set model to Sonnet 4.5 and
+    saved as your default for new
+    sessions
+
+❯ /effort workspace on
+  ⎿ Workspace isn't available on
+    claude-sonnet-4-5. Valid
+    options are: low, medium,
+    high, xhigh, max, auto
+
+❯ /model default
+  ⎿ Set model to Opus 5.5
+    (default) and saved as your
+    default for new sessions
+
+⏺ Unknown command: /vim
+
+❯ /effort workspace on
+  ⎿ Workspace on (this session
+    only): dynamic workflows on
+    every task. Effort stays
+    medium.
+
+────────────────────── workspace ─
+❯
+──────────────────────────────────
+  ⏸ manual mode on · ? for shor…

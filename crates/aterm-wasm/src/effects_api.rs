@@ -115,13 +115,16 @@ macro_rules! bind {
             /// native `cursor_trail_style` spelling, read through the native table
             /// (`aterm_effects::cursor_glow::spellings`), aliases included (`rainbow kitty`,
             /// `nyan`, `lightning`, …); `off` draws nothing and an unknown spelling draws
-            /// lumen. `color` omitted follows the native colour law
-            /// (`aterm_effects::cursor_fx::automatic_glow_color`): laser, beam, comet and
-            /// sparkle keep their own hues (beam, comet and sparkle wear a live OSC 12), every
-            /// other style the live cursor colour; `accent` omitted = color brightened 1.5×;
-            /// `duration_ms` 30..=2000, `length` (cells) 1..=512, `intensity` 0..=1 (0 = off;
-            /// dims the aurora and every caret body), `radius` (cells) 0..=2, `ring` =
-            /// landing-ring ping.
+            /// lumen. `color` omitted follows the native colour law, run each frame by the
+            /// native window's own step (`aterm_effects::cursor_fx::follow_live_cursor`):
+            /// laser, beam, comet and sparkle keep their own hues (beam, comet and sparkle wear
+            /// a live OSC 12), every other style the live cursor colour; a `color` is a fixed
+            /// trail colour; [`Self::set_cursor_glow_color`] also takes the cursor's colour.
+            /// `accent` omitted = the colour the style draws brightened 1.5× (a style that
+            /// draws its own colours on a block, the rainbow kitty, fire, water and phaser,
+            /// keeps the accent of its automatic colour); `duration_ms` 30..=2000, `length`
+            /// (cells) 1..=512, `intensity` 0..=1 (0 = off; dims the aurora and every caret
+            /// body), `radius` (cells) 0..=2, `ring` = landing-ring ping.
             #[allow(clippy::too_many_arguments)]
             pub fn set_cursor_glow(
                 &mut self,
@@ -139,7 +142,7 @@ macro_rules! bind {
                 self.effects.set_cursor_glow(
                     enabled,
                     style,
-                    color,
+                    aterm_effects::cursor_fx::TrailColor::automatic_or_pinned(color),
                     accent,
                     u64::from(duration_ms),
                     length,
@@ -150,8 +153,20 @@ macro_rules! bind {
                 );
             }
 
+            /// Set only the cursor glow's trail colour, written as the native
+            /// `cursor_trail_color` is: `""` for each style's own colour, `"cursor"` for the
+            /// cursor's colour on every style (laser drops its violet; it follows OSC 12 and
+            /// OSC 112), or `"#RRGGBB"`. The other [`Self::set_cursor_glow`] settings stay.
+            /// Returns `false`, changing nothing, for any other value.
+            pub fn set_cursor_glow_color(&mut self, color: &str) -> bool {
+                self.note_host_visual_change();
+                self.effects.set_cursor_glow_color(color)
+            }
+
             /// Configure the opaque comet trail (native `cursor_trail_style = "comet"`).
-            /// `color` omitted follows the live cursor (OSC 12, else the theme cursor);
+            /// `color` omitted wears the colour the cursor glow draws, as the native comet
+            /// body does (laser's violet, comet's pale blue until OSC 12 pins the cursor, the
+            /// live cursor for a style with no hue of its own); a `color` stays fixed;
             /// `duration_ms` 30..=2000, `length` 1..=512. The native app runs one of trail or
             /// glow per style; here the embedder chooses.
             pub fn set_cursor_trail(

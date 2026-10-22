@@ -139,7 +139,8 @@ impl MetalWindowSurface {
         Ok(())
     }
 
-    pub(crate) fn async_acquire(&self) -> bool {
+    #[inline]
+    pub(crate) const fn async_acquire(&self) -> bool {
         self.worker.is_some()
     }
 
@@ -173,7 +174,8 @@ impl MetalWindowSurface {
         self.collect_acquire();
     }
 
-    pub(crate) fn take_completed_acquire_wait_ns(&mut self) -> Option<u64> {
+    #[inline]
+    pub(crate) const fn take_completed_acquire_wait_ns(&mut self) -> Option<u64> {
         self.completed_wait_ns.take()
     }
 
@@ -181,7 +183,8 @@ impl MetalWindowSurface {
     /// dequeue), published separately from
     /// [`Self::take_completed_acquire_wait_ns`] because the two legs have
     /// different causes (scheduling vs CoreAnimation).
-    pub(crate) fn take_completed_acquire_queue_ns(&mut self) -> Option<u64> {
+    #[inline]
+    pub(crate) const fn take_completed_acquire_queue_ns(&mut self) -> Option<u64> {
         self.completed_queue_ns.take()
     }
 
@@ -207,6 +210,7 @@ impl MetalWindowSurface {
 
     /// The config the swapchain currently holds.
     #[cfg(not(wgpu_arm))]
+    #[inline]
     pub(crate) const fn config(&self) -> &SwapchainConfig {
         &self.config
     }
@@ -398,7 +402,8 @@ pub(crate) enum AcquireRefusal {
 /// The occlusion hint is a parameter because the frontend owns the window
 /// (winit's `WindowEvent::Occluded`). `Occluded` parks until a stimulus;
 /// `Timeout` retries on a bound.
-pub(crate) fn surface_present_failure(
+#[inline]
+pub(crate) const fn surface_present_failure(
     refusal: &AcquireRefusal,
     occluded_hint: bool,
 ) -> SurfacePresentFailure {

@@ -83,6 +83,66 @@ fn a_needs_line_in_a_fence_or_named_as_a_thing_is_no_need() {
     }
 }
 
+/// A NEEDS YOU TOKEN A LINE'S START NAMES IS NO NEED ([`names_a_head`]; the
+/// review of b9/spawn-residuals, F1): aterm's own instruction (`put what only
+/// a person can give on a line starting NEEDS YOU: and carry on`), in every
+/// act it types and a worker's first prompt, read back where a screen
+/// cannot bound the message (agy) or quoted by a worker, on its row or
+/// wrapped at any word of it. Read as a head, the words after the token stood
+/// as a need nobody said; so did the top row of a reply cut there
+/// (`starting NEEDS YOU: and land the rest`) and the ack's bare token naming
+/// the line (`NEEDS YOU line is on the person's screen now`). NEGATIVE
+/// CONTROLS: the token said — at a line's start, after a sentence, under a
+/// row ending `start` or `starting` with no line's noun before it, opening
+/// the text after `Starting` in capitals, in the bare form before its need,
+/// joined on by `and` below the text's first row — is a need.
+#[test]
+fn a_needs_token_a_lines_start_names_is_no_need() {
+    for tail in [
+        "Put what only a person can give on a line starting NEEDS YOU: and carry on.",
+        "Never stop to ask: put what only a person can give on a line starting NEEDS YOU: and \
+         land the rest. Once it is all on remote main, defend that in a few lines starting \
+         Nothing left:",
+        "(Started by `s-1`. A line starting `NEEDS YOU:` reaches it and the person.)",
+        "I put it on a line beginning with NEEDS YOU: as the brief asks.",
+        "Lines starting **NEEDS YOU:** reach the person.",
+        "Put what only a person can give on a line starting\nNEEDS YOU: and carry on.",
+        "Put what only a person can give on a line\nstarting NEEDS YOU: and carry on.",
+        "Put what only a person can give on a line starting with\nNEEDS YOU: and carry on.",
+        // The top row of a reply cut there: the sentence began above it.
+        "starting NEEDS YOU: and land the rest. Once it is all on remote main, defend that",
+        "NEEDS YOU: and carry on with\neverything else.\n\nImplemented the parser.",
+        // An owner's rule naming the line, its article on the row above.
+        "Never force-push; a\nNEEDS YOU: line is for credentials only.",
+        // aterm's ack, wrapped onto a row of its own: the bare token naming
+        // the line.
+        "Your\nNEEDS YOU line is on the person's screen now. Do not wait for it: carry on.",
+    ] {
+        assert!(
+            needs_you(tail).is_empty(),
+            "{tail:?}: {:?}",
+            needs_you(tail)
+        );
+    }
+    for tail in [
+        "Landed the parser.\nNEEDS YOU: the release credential",
+        "Everything is on main. NEEDS YOU: the release credential",
+        "Here is what I need before I can start\nNEEDS YOU: the release credential",
+        "The deploy is starting\nNEEDS YOU: the release credential",
+        "Starting now. NEEDS YOU: the release credential",
+        "The deploy is starting; NEEDS YOU: the release credential",
+        "Starting NEEDS YOU: the release credential",
+        "NEEDS YOU the release credential",
+    ] {
+        assert_eq!(needs_you(tail), ["the release credential"], "{tail:?}");
+    }
+    // A small `and` after the token below the text's first row is a need.
+    assert_eq!(
+        needs_you("Implemented the parser.\nNEEDS YOU: and the release credential"),
+        ["and the release credential"]
+    );
+}
+
 /// A NEEDS YOU line in a quote, in ticks, inside a sentence or spelled
 /// `NEED YOU` is a need (the integration review of 12449ff581: each was
 /// lost, and a lost need lands with the need off the screen). NEGATIVE

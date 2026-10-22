@@ -26,28 +26,32 @@ impl Tile {
     }
 
     /// Tile width in texels.
+    #[inline]
     #[must_use]
-    pub fn width(&self) -> u32 {
+    pub const fn width(&self) -> u32 {
         self.w
     }
 
     /// Tile height in texels.
+    #[inline]
     #[must_use]
-    pub fn height(&self) -> u32 {
+    pub const fn height(&self) -> u32 {
         self.h
     }
 
     /// The straight-alpha RGBA8 texels, row-major, length `w*h*4`.
+    #[inline]
     #[must_use]
-    pub fn pixels(&self) -> &[u8] {
-        &self.px
+    pub const fn pixels(&self) -> &[u8] {
+        self.px.as_slice()
     }
 
     /// Mutable access to the straight-alpha RGBA8 texels, for callers that
     /// composite whole tiles (e.g. montage/gallery sheets) rather than blend
     /// per-pixel through [`Tile::over`].
-    pub fn pixels_mut(&mut self) -> &mut [u8] {
-        &mut self.px
+    #[inline]
+    pub const fn pixels_mut(&mut self) -> &mut [u8] {
+        self.px.as_mut_slice()
     }
 
     /// Source-over one pixel (straight alpha). `rgb` channels and `a` are in `[0,1]`.
@@ -55,6 +59,7 @@ impl Tile {
     // Unsupported however the bound is re-established. Safe by the Tile invariant
     // (px.len() == w*h*4, set in `new`) plus the leading x/y range guard.
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     pub fn over(&mut self, x: i32, y: i32, rgb: (f32, f32, f32), a: f32) {
         if x < 0 || y < 0 || x as u32 >= self.w || y as u32 >= self.h || a <= 0.0 {
             return;
@@ -86,7 +91,8 @@ impl Tile {
     /// fast path the scanline rasterizer ([`crate::vector::fill_path`]) uses for
     /// fully-covered pixel runs. Byte-identical to calling [`over`](Self::over) `len`
     /// times; when `a` is opaque it pattern-fills the RGBA quad directly (one 4-byte
-    /// `copy_from_slice` per pixel, no per-pixel blend). The run is clipped to the tile.
+    /// [`Tile::over_run`] (a 4-byte pattern fill when opaque). The run is clipped to the tile.
+    #[inline]
     pub(crate) fn over_run(&mut self, x: i32, y: i32, len: u32, rgb: (f32, f32, f32), a: f32) {
         if y < 0 || y as u32 >= self.h || a <= 0.0 || len == 0 {
             return;

@@ -29,10 +29,13 @@
 //!    (`--key` names another, e.g. a scratch roster key for a local proof), then the client's
 //!    whole stage of what was written ([`check_pack`]): the manifest verified under the
 //!    roster, the archive's digest and `tree_root`, the gate again on the staged tree;
-//! 8. only with `--upload`: the staging owner's `atpkg-<program>-<build>` release.
+//! 8. only with `--upload`: the staging owner's `atpkg-<program>-<build>` release, whose
+//!    notes ([`staging_notes`]) name the version, the source commit and the upstream base
+//!    the package's record names ([`upstream_line`]).
 //!
 //! [`verify_pinned`] is the same [`check_pack`] over a pack an index is about to pin
-//! (`channel::index`): an ALab pin is signed only over a pack that verifies.
+//! (`channel::index`): an ALab pin is signed only over a pack that verifies. The mirror's
+//! public release names the same base, read off the staged archive ([`staged_upstream`]).
 
 use std::path::{Path, PathBuf};
 
@@ -77,6 +80,9 @@ pub struct Package {
     pub count: u64,
     /// The compiler it was built with.
     pub compiler: CompilerRecord,
+    /// The upstream base its record names (`atpkg::alab::upstream_of`): none for a package
+    /// from before the field, or one whose field is malformed.
+    pub upstream: Option<atpkg::alab::Upstream>,
 }
 
 /// What a pack-package run is asked.
@@ -285,13 +291,82 @@ pub fn read_package(dir: &Path, tool: &str, triple: Triple) -> Result<Package> {
         binaries_sha256: field("binaries_sha256")?,
         id: field("id")?,
     };
+    let upstream = atpkg::alab::upstream_of(&root);
     Ok(Package {
         root,
         version,
         source,
         count,
         compiler,
+        upstream,
     })
+}
+
+/// The line a release page of `program`'s pack names its upstream base with
+/// (`atpkg::alab::Upstream::release_line`): none for a program ALab does not build, or a
+/// package whose record names no base.
+#[must_use]
+pub fn upstream_line(program: &str, upstream: Option<&atpkg::alab::Upstream>) -> Option<String> {
+    Some(upstream?.release_line(atpkg::alab::agent(program)?.upstream))
+}
+
+/// The staging release's notes for `pkg` packed as `program` for `triple`: the version
+/// and the source commit, then the upstream base when the package's record names one.
+#[must_use]
+pub fn staging_notes(program: &str, pkg: &Package, triple: Triple) -> String {
+    let notes = format!(
+        "atpkg pack of {program} {} ({triple}, source {}). Signed pkg manifest + tarball.",
+        pkg.version, pkg.source
+    );
+    match upstream_line(program, pkg.upstream.as_ref()) {
+        Some(line) => format!("{notes}\n\n{line}"),
+        None => notes,
+    }
+}
+
+/// The upstream base the verified pack `pkg` of `program` records, read off its archive in
+/// `dir` as a client stages it (`atpkg::verify_and_stage`: digest, extract, `tree_root`)
+/// into scratch, never off any release's text: none for a program ALab does not build, a
+/// pack with no archive for a target ALab builds it for, or a package that names no base
+/// (a vendor package, or one from before the field).
+///
+/// # Errors
+///
+/// A refusal when the archive does not stage.
+pub fn staged_upstream(
+    program: &str,
+    pkg: &atpkg::PkgManifest,
+    dir: &Path,
+) -> Result<Option<atpkg::alab::Upstream>> {
+    let Some(agent) = atpkg::alab::agent(program) else {
+        return Ok(None);
+    };
+    let Some(artifact) = pkg.artifacts.iter().find(|a| {
+        agent.serves(&a.target)
+            && a.kind == Kind::Binary.as_str()
+            && (a.protocol.is_empty() || a.protocol == "github-release")
+    }) else {
+        return Ok(None);
+    };
+    let scratch = Scratch::new("pack-upstream")?;
+    let build_dir = scratch
+        .path()
+        .join("store")
+        .join(program)
+        .join(pkg.build_number.to_string());
+    atpkg::verify_and_stage(
+        artifact,
+        &dir.join(&artifact.asset),
+        &build_dir,
+        &atpkg::install::StageHooks::NONE,
+    )
+    .map_err(|e| {
+        Error::refused(format!(
+            "{program}@{}'s {} does not stage as a client stages it: {e}",
+            pkg.build_number, artifact.asset
+        ))
+    })?;
+    Ok(atpkg::alab::upstream_of(&build_dir))
 }
 
 /// Whether the remote URL `url` names `owner/repo` on GitHub (https or ssh, with or without
@@ -803,10 +878,7 @@ pub fn pack_package_with(
             &row_doc.sha256,
             &[manifest.clone(), signature.clone()],
         )?;
-        let notes = format!(
-            "atpkg pack of {program} {} ({triple}, source {}). Signed pkg manifest + tarball.",
-            pkg.version, pkg.source
-        );
+        let notes = staging_notes(program, &pkg, triple);
         uploaded = upload::publish(
             ctx,
             def.repo,

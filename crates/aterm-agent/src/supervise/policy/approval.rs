@@ -148,13 +148,14 @@ pub const RULE_MODEL_CONFIRM: &str = "model-confirm@v1";
 /// continue automatically …` row, at every level, under
 /// [`ApprovalCtx::limit_wait`].
 pub const RULE_LIMIT_WAIT: &str = "limit-wait@v1";
-/// Gemini CLI's usage-limit dialog that names its reset ([`limit_retry`]):
-/// its `Keep trying`, once that reset (the end of the minute it names) and
-/// the program's grace have passed
-/// ([`ApprovalCtx::limit_retry`]), at every level, under
-/// [`ApprovalCtx::limit_wait`]. Before then the loop waits on the dialog
-/// (`approval_loop.rs`, `limit_retry_hold`): the analogue of Claude Code's
-/// wait row, whose program goes on by itself at the reset.
+/// Gemini CLI's usage-limit dialog ([`limit_retry`]): its `Keep trying`,
+/// once the reset it names (the end of the minute it names, in its zone) and
+/// the program's grace have passed, or, on one that names none, at the next
+/// rung of the loop's back-off ladder ([`ApprovalCtx::limit_retry`]), at
+/// every level, under [`ApprovalCtx::limit_wait`]. Before then the loop
+/// waits on the dialog (`approval_loop.rs`, `limit_retry_hold`): the
+/// analogue of Claude Code's wait row, whose program goes on by itself at
+/// the reset.
 pub const RULE_LIMIT_RETRY: &str = "limit-retry@v1";
 /// The usage-limit dialog's grant row ([`limit_reset`]): the one reset on
 /// offer, of a kind the step takes, or the first kind of the owner's list on
@@ -598,9 +599,10 @@ pub struct ApprovalCtx {
     /// ([`RULE_LIMIT_RETRY`], under [`Self::limit_wait`]): the reset its
     /// `Access resets at <time>.` row names ([`aterm_phase::gemini::limit_reset`])
     /// and the program's grace after it have passed, by the loop's clock, and
-    /// so has the loop's back-off from its last `Keep trying` (the loop's
-    /// `limit_retry_due`, `approval_loop.rs`). `false`: not yet, and the
-    /// dialog is waited on, never pressed and never a person's for that.
+    /// so has the loop's back-off from its last `Keep trying`; on a dialog
+    /// that names no reset, the rung of the back-off ladder it waits on (the
+    /// loop's `limit_retry_due`, `approval_loop.rs`). `false`: not yet, and
+    /// the dialog is waited on, never pressed for that.
     pub limit_retry: bool,
     /// The kinds of reset [`Self::limit_reset`] may spend, the owner's first
     /// first (`[harness] limit_reset_kinds`); empty, the dialog's one reset
@@ -1167,14 +1169,12 @@ pub fn keeps_trying_its_limit(program: Program) -> bool {
 
 /// Why a usage-limit dialog no rule here answers goes to a person: Gemini
 /// CLI's (`Usage limit reached for <model>.` over `1. Keep trying` and `2.
-/// Stop`, measured on 0.46.0) where it names no reset (a key's per-day
-/// quota) offers no wait — `Keep trying` sends the turn again into a quota
-/// whose reset nothing names, so pressed by a supervisor it would be pressed
-/// again at every return, and `Stop` ends the turn — and names its own
-/// `/stats model` (one that names its reset is [`limit_retry`]'s); any other
-/// program's is not one the reader vouches for. Short: an escalation's
-/// reason is cut after 120 cells, and the dialog's title is already its
-/// label.
+/// Stop`, measured on 0.46.0) where the reader does not vouch for the read
+/// (read whole, the dialog is [`limit_retry`]'s, a reset named or none) —
+/// `Keep trying` sends the turn again and `Stop` ends it — and names its own
+/// `/stats model`; any other program's is not one the reader vouches for.
+/// Short: an escalation's reason is cut after 120 cells, and the dialog's
+/// title is already its label.
 fn foreign_limit(program: Program) -> &'static str {
     match program {
         Program::Gemini => {
@@ -3861,29 +3861,52 @@ fn limit_wait(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision
     }
 }
 
+/// Why Gemini CLI's usage-limit dialog that names no reset (a key's per-day
+/// quota, [`limit_retry`]) is a person's to know of while its `Keep trying`
+/// goes on: the badge the loop raises for it (NEEDS YOU, never blocking) and
+/// the escalation of a decision made before its ladder's next try. `unplaced`:
+/// the reset the dialog drew, whose clock the loop cannot read — on the same
+/// ladder, said as what it is. One line, short of an attention's 120-cell
+/// reason.
+#[must_use]
+pub(crate) fn limit_no_reset_reason(unplaced: Option<&str>) -> String {
+    let retry = anchor("gemini.usage.retry");
+    match unplaced {
+        None => format!(
+            "Gemini CLI's usage limit names no reset: {retry} is tried on a back-off ladder; \
+             /stats model says which limit"
+        ),
+        Some(drawn) => format!(
+            "Gemini CLI's usage limit names a reset the loop cannot place ({}): {retry} is \
+             tried on a back-off ladder",
+            crate::harness::one_line(drawn, 24)
+        ),
+    }
+}
+
 /// GEMINI CLI'S USAGE-LIMIT DIALOG ([`RULE_LIMIT_RETRY`]; aterm-phase's
-/// "THE USAGE-LIMIT DIALOG IS A BOX, NOT A WALL"): a Google account's spent
-/// quota names its reset (`Access resets at 5:06 AM PDT.`,
-/// [`aterm_phase::gemini::limit_reset`]) over exactly `1. Keep trying` and
-/// `2. Stop`. Its `Keep trying` sends the turn's request again, so it is
-/// pressed only once that reset (the end of the minute it names) and the
-/// program's grace have passed
-/// ([`ApprovalCtx::limit_retry`], the loop's clock): the turn goes on where
-/// the quota stopped it, as Claude Code's own continuation does at its
-/// reset. Before then the dialog is the loop's to wait on (it holds the
-/// point, `approval_loop.rs`); a decision made there anyway says so and
-/// hands it over. Never `Stop` (it ends the turn on an error that no longer
-/// says it was the quota). The digit is guarded on the reset's own row, so a
-/// dialog drawn again with another reset is judged again. A dialog that
-/// names no reset (a key's per-day quota), or other options, is a person's
-/// ([`foreign_limit`]), and so is every one with `limit_wait` off.
+/// "THE USAGE-LIMIT DIALOG IS A BOX, NOT A WALL") over exactly `1. Keep
+/// trying` and `2. Stop`. Its `Keep trying` sends the turn's request again,
+/// so it is pressed only once the loop's clock says it is due
+/// ([`ApprovalCtx::limit_retry`]): past the reset a Google account's spent
+/// quota names (`Access resets at 5:06 AM PDT.`,
+/// [`aterm_phase::gemini::limit_reset`]: the end of the minute it names, in
+/// the zone it names, and the program's grace), or, on the dialog a key's
+/// per-day quota draws, which names none, at the next rung of the loop's
+/// back-off ladder, while the dialog stands as a person's to know of too
+/// (FOREVER: NEEDS YOU is loud, never blocking; `approval_loop.rs`,
+/// `limit_retry_hold`). The turn goes on where the quota stopped it, as
+/// Claude Code's own continuation does at its reset. Before the due the
+/// dialog is the loop's to wait on (it holds the point); a decision made
+/// there anyway says so and hands it over. Never `Stop` (it ends the turn on
+/// an error that no longer says it was the quota). The digit is guarded on
+/// the reset's own row — on a dialog that names none, its title's — so a
+/// dialog drawn again with another reset is judged again. A dialog with
+/// other options is a person's, and so is every one with `limit_wait` off.
 fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     if !ctx.limit_wait {
         return Decision::escalate("a usage-limit dialog (limit_wait is off)");
     }
-    let Some(reset) = aterm_phase::gemini::limit_reset(rows) else {
-        return Decision::escalate(foreign_limit(Program::Gemini));
-    };
     let labels: Vec<&str> = prompt.options.iter().map(|o| o.label.as_str()).collect();
     let retry = anchor("gemini.usage.retry");
     if labels != [retry, "Stop"] {
@@ -3892,22 +3915,40 @@ fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisio
             labels.join(" | ")
         ));
     }
+    let reset = aterm_phase::gemini::limit_reset(rows);
     if !ctx.limit_retry {
-        return Decision::escalate(format!(
-            "Gemini CLI's usage limit resets at {reset}: {retry} is pressed past it"
-        ));
+        return Decision::escalate(match &reset {
+            Some(reset) if crate::supervise::limit::parse_reset(&reset.clock).is_some() => {
+                format!("Gemini CLI's usage limit resets at {reset}: {retry} is pressed past it")
+            }
+            Some(reset) => limit_no_reset_reason(Some(&reset.to_string())),
+            None => limit_no_reset_reason(None),
+        });
     }
-    let head = anchor("gemini.usage.resets");
+    // The row the digit is guarded on: the reset's, under the title (the
+    // span's first row), else the title's own.
+    let (head, from, missing) = match &reset {
+        Some(_) => (
+            anchor("gemini.usage.resets"),
+            prompt.span.0 + 1,
+            "the usage-limit dialog's reset row is not on the screen",
+        ),
+        None => (
+            anchor("gemini.usage.title"),
+            prompt.span.0,
+            "the usage-limit dialog's title row is not on the screen",
+        ),
+    };
     let first_option = prompt.options[0].row;
     let Some(reset_row) = rows
         .iter()
         .enumerate()
         .take(first_option.min(rows.len()))
-        .skip(prompt.span.0 + 1)
+        .skip(from)
         .find(|(_, r)| r.contains(head))
         .map(|(k, _)| k)
     else {
-        return Decision::escalate("the usage-limit dialog's reset row is not on the screen");
+        return Decision::escalate(missing);
     };
     let choice = match (prompt.select, prompt.options[0].n) {
         (Select::Digits, Some(n)) => Choice::Digit(n),
@@ -3928,7 +3969,10 @@ fn limit_retry(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decisio
         rule_id: RULE_LIMIT_RETRY,
         choice,
         guard: row_guard(&rows[reset_row]),
-        subject: format!("{retry} (reset {reset})"),
+        subject: match &reset {
+            Some(reset) => format!("{retry} (reset {reset})"),
+            None => format!("{retry} (no reset named)"),
+        },
         unproven: None,
     }
 }

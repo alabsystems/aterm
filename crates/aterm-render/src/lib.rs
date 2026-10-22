@@ -710,6 +710,7 @@ pub enum FaceId {
 /// A [`FaceId::Procedural`] key from the chain's last-resort symbol tier
 /// ([`procedural::covers_symbol`]): its raster is `cell_span` cells wide, so the span is
 /// in its key.
+#[inline]
 fn is_synthetic_symbol_key(key: GlyphKey) -> bool {
     key.source == FaceId::Procedural
         && key.glyph_class == GlyphClass::Mono
@@ -720,6 +721,7 @@ fn is_synthetic_symbol_key(key: GlyphKey) -> bool {
 /// span carried by [`GlyphKey::cell_span`] by the fallback harmony pass. Kept as
 /// one predicate so key construction, span overrides, and the final raster pass
 /// cannot drift.
+#[inline]
 const fn harmonized_fallback_source(source: FaceId) -> bool {
     matches!(
         source,
@@ -730,6 +732,7 @@ const fn harmonized_fallback_source(source: FaceId) -> bool {
 /// Mono sources whose raster is fitted into the cell span its key carries
 /// ([`GlyphKey::cell_span`]): the harmonized fallback faces, and the display
 /// layer, which has its own fit ([`Renderer::fit_display_glyph`]).
+#[inline]
 const fn cell_fitted_source(source: FaceId) -> bool {
     harmonized_fallback_source(source) || matches!(source, FaceId::DisplayMix)
 }
@@ -771,19 +774,22 @@ impl StyleBits {
     pub const SUB: StyleBits = StyleBits(1 << 2);
 
     /// These bits without the script bit: the key a script raster is derived from.
+    #[inline]
     #[must_use]
-    pub fn without_script(self) -> StyleBits {
+    pub const fn without_script(self) -> StyleBits {
         StyleBits(self.0 & !Self::SUB.0)
     }
 
     /// Only the script bit.
+    #[inline]
     #[must_use]
-    pub fn script(self) -> StyleBits {
+    pub const fn script(self) -> StyleBits {
         StyleBits(self.0 & Self::SUB.0)
     }
 
     /// Whether every bit of `other` is set in `self`.
-    pub fn contains(self, other: StyleBits) -> bool {
+    #[inline]
+    pub const fn contains(self, other: StyleBits) -> bool {
         self.0 & other.0 == other.0
     }
 }
@@ -823,11 +829,13 @@ pub struct GlyphKey {
 
 impl GlyphKey {
     /// Quantize a pixel size into the key's 26.6 fixed-point form.
+    #[inline]
     pub fn quantize_px(px: f32) -> u32 {
         (px * 64.0).round() as u32
     }
 
     /// Key for a coverage (Mono) glyph of character `ch` from `source`.
+    #[inline]
     pub fn mono_char(source: FaceId, ch: char, style: StyleBits, px_q: u32) -> GlyphKey {
         GlyphKey {
             source,
@@ -845,7 +853,8 @@ impl GlyphKey {
 
     /// Key for a colour (Rgba) glyph of `ch` from the colour-emoji face; `style` is fixed
     /// REGULAR since the image carries its own colours.
-    pub fn rgba_char(source: FaceId, ch: char, px_q: u32) -> GlyphKey {
+    #[inline]
+    pub const fn rgba_char(source: FaceId, ch: char, px_q: u32) -> GlyphKey {
         GlyphKey {
             source,
             glyph_class: GlyphClass::Rgba,
@@ -858,7 +867,8 @@ impl GlyphKey {
 
     /// Key for a colour (RgbaGid) glyph by colour-font glyph id: a cluster shaped to one
     /// glyph.
-    pub fn rgba_gid(source: FaceId, gid: u16, px_q: u32) -> GlyphKey {
+    #[inline]
+    pub const fn rgba_gid(source: FaceId, gid: u16, px_q: u32) -> GlyphKey {
         GlyphKey {
             source,
             glyph_class: GlyphClass::RgbaGid,
@@ -870,7 +880,8 @@ impl GlyphKey {
     }
 
     /// Key for the colour composite of cluster run `run` ([`GlyphClass::RgbaCluster`]).
-    pub fn rgba_cluster(run: u32, px_q: u32) -> GlyphKey {
+    #[inline]
+    pub const fn rgba_cluster(run: u32, px_q: u32) -> GlyphKey {
         GlyphKey {
             source: FaceId::ColorEmoji,
             glyph_class: GlyphClass::RgbaCluster,
@@ -884,7 +895,8 @@ impl GlyphKey {
     /// Key for a coverage (MonoGid) glyph addressed by PRIMARY-FACE glyph id — a
     /// programming ligature (`=>`, `!=`, …) shaped from a cell run. The
     /// run's SGR `style` is part of the key so a bold/italic run ligates distinctly.
-    pub fn mono_gid(gid: u16, style: StyleBits, px_q: u32) -> GlyphKey {
+    #[inline]
+    pub const fn mono_gid(gid: u16, style: StyleBits, px_q: u32) -> GlyphKey {
         GlyphKey {
             source: FaceId::Primary,
             glyph_class: GlyphClass::MonoGid,
@@ -900,7 +912,8 @@ impl GlyphKey {
     /// The [`GlyphClass::MonoGid`] arm rasterizes the wide glyph once and returns this cell's
     /// tile ([`ligature_shaping::extract_cell_slice`]), so CPU and GPU place it identically.
     /// [`ligature_shaping::LIG_SLICE_MAX`] keeps the slice from overflowing.
-    pub fn mono_gid_slice(gid: u16, slice: u16, style: StyleBits, px_q: u32) -> GlyphKey {
+    #[inline]
+    pub const fn mono_gid_slice(gid: u16, slice: u16, style: StyleBits, px_q: u32) -> GlyphKey {
         GlyphKey {
             source: FaceId::Primary,
             glyph_class: GlyphClass::MonoGid,
@@ -914,7 +927,8 @@ impl GlyphKey {
     /// The character this key rasterizes, when `ch_or_id` is a code point: `None` for a glyph
     /// id ([`GlyphClass::RgbaGid`] / [`GlyphClass::MonoGid`]), a run id
     /// ([`GlyphClass::RgbaCluster`]), or a phase-carrying procedural shade key.
-    pub fn chr(&self) -> Option<char> {
+    #[inline]
+    pub const fn chr(&self) -> Option<char> {
         if matches!(
             self.glyph_class,
             GlyphClass::RgbaGid | GlyphClass::RgbaCluster | GlyphClass::MonoGid
@@ -1007,14 +1021,15 @@ pub const SUB_NUDGE_SHIFT: u32 = 24;
 /// Fold a [`Script::Sub`](aterm_core::terminal::Script::Sub) cell's sideways nudge into its
 /// glyph key, so each nudge is its own raster. A key with no script bit, or a zero nudge,
 /// passes through. Both backends key cells through [`Renderer::resolve_cell_key`].
+#[inline]
 #[must_use]
-pub fn sub_nudged(key: GlyphKey, script: aterm_core::terminal::Script) -> GlyphKey {
+pub const fn sub_nudged(key: GlyphKey, script: aterm_core::terminal::Script) -> GlyphKey {
     match script {
         aterm_core::terminal::Script::Sub { nudge }
-            if nudge != 0 && key.style.script() != StyleBits::REGULAR =>
+            if nudge != 0 && key.style.script().0 != StyleBits::REGULAR.0 =>
         {
             GlyphKey {
-                ch_or_id: key.ch_or_id | (u32::from(nudge.cast_unsigned()) << SUB_NUDGE_SHIFT),
+                ch_or_id: key.ch_or_id | ((nudge.cast_unsigned() as u32) << SUB_NUDGE_SHIFT),
                 ..key
             }
         }
@@ -1025,8 +1040,9 @@ pub fn sub_nudged(key: GlyphKey, script: aterm_core::terminal::Script) -> GlyphK
 /// The glyph key of `icon` at size `px_q` in a cell of weight `style` (only
 /// [`StyleBits::BOLD`] is read), spilling into its blank neighbours when `spill`. Both
 /// backends key a chrome row's icon cell through this ([`Renderer::chrome_icon_key`]).
+#[inline]
 #[must_use]
-pub fn band_icon_key(icon: BandIcon, style: StyleBits, spill: bool, px_q: u32) -> GlyphKey {
+pub const fn band_icon_key(icon: BandIcon, style: StyleBits, spill: bool, px_q: u32) -> GlyphKey {
     GlyphKey {
         source: FaceId::Procedural,
         glyph_class: GlyphClass::Mono,
@@ -1050,11 +1066,13 @@ pub fn band_icon_key(icon: BandIcon, style: StyleBits, spill: bool, px_q: u32) -
 /// framebuffer pixel (`pad + col * cell_w`, `grid_top + row * cell_h`) and must be computed
 /// identically at the CPU blit and the GPU quad emission (`gpu_matches_cpu`'s odd-pad shade
 /// fixture checks it).
+#[inline]
 #[must_use]
-pub fn shade_phase_key(key: GlyphKey, cell_px_x: usize, cell_px_y: usize) -> GlyphKey {
-    if key.source != FaceId::Procedural
-        || key.glyph_class != GlyphClass::Mono
-        || !(0x2591..=0x2593).contains(&key.ch_or_id)
+pub const fn shade_phase_key(key: GlyphKey, cell_px_x: usize, cell_px_y: usize) -> GlyphKey {
+    if !matches!(key.source, FaceId::Procedural)
+        || !matches!(key.glyph_class, GlyphClass::Mono)
+        || key.ch_or_id < 0x2591
+        || key.ch_or_id > 0x2593
     {
         return key;
     }
@@ -1096,6 +1114,7 @@ pub enum GlyphImage {
 impl GlyphImage {
     /// Stored bitmap bytes, used for the cache's image-payload budget. This
     /// excludes allocation overhead, spare vector capacity and map storage.
+    #[inline]
     #[must_use]
     pub fn byte_len(&self) -> usize {
         match self {
@@ -1103,36 +1122,42 @@ impl GlyphImage {
         }
     }
 
+    #[inline]
     pub fn width(&self) -> usize {
         match self {
             GlyphImage::Mono { width, .. } | GlyphImage::Rgba { width, .. } => *width,
         }
     }
 
+    #[inline]
     pub fn height(&self) -> usize {
         match self {
             GlyphImage::Mono { height, .. } | GlyphImage::Rgba { height, .. } => *height,
         }
     }
 
+    #[inline]
     pub fn xmin(&self) -> i32 {
         match self {
             GlyphImage::Mono { xmin, .. } | GlyphImage::Rgba { xmin, .. } => *xmin,
         }
     }
 
+    #[inline]
     pub fn ymin(&self) -> i32 {
         match self {
             GlyphImage::Mono { ymin, .. } | GlyphImage::Rgba { ymin, .. } => *ymin,
         }
     }
 
+    #[inline]
     pub fn advance(&self) -> f32 {
         match self {
             GlyphImage::Mono { advance, .. } | GlyphImage::Rgba { advance, .. } => *advance,
         }
     }
 
+    #[inline]
     #[must_use]
     /// The raw bitmap bytes (1 byte/texel for `Mono`, 4 for `Rgba`).
     pub fn bytes(&self) -> &[u8] {
@@ -1198,6 +1223,7 @@ struct ShapedRunCache {
 
 impl ShapedRunCache {
     /// Probe `cur` then `prev` for `(style, run)`; no allocation on a hit.
+    #[inline]
     fn get(&self, style: StyleBits, run: &str) -> Option<ShapedHit<'_>> {
         if let Some(v) = self.cur.get(&style).and_then(|m| m.get(run)) {
             return Some(ShapedHit::Cur(v));
@@ -1210,6 +1236,7 @@ impl ShapedRunCache {
 
     /// Insert (or promote) `(style, run) -> v` into the current generation; the caller builds
     /// the owned key only on a miss or promote.
+    #[inline]
     fn insert(&mut self, style: StyleBits, run: Box<str>, v: ShapedRunGlyphs) {
         self.cur.entry(style).or_default().entry(run).or_insert(v);
     }
@@ -1217,12 +1244,14 @@ impl ShapedRunCache {
     /// Distinct runs in the current generation, the cap trigger; O(styles), called once per
     /// frame. The resident total can reach about twice the cap plus one frame's inserts,
     /// since eviction runs once per frame at `render_core`'s top.
+    #[inline]
     fn cur_len(&self) -> usize {
         self.cur.values().map(|m| m.len()).sum()
     }
 
     /// Rotate at the cap: `cur` becomes `prev`, the old `prev` is dropped and its map
     /// recycled as `cur`. Demoted runs are still served from `prev` and promoted on use.
+    #[inline]
     fn rotate(&mut self) {
         std::mem::swap(&mut self.cur, &mut self.prev);
         self.cur.clear();
@@ -1230,6 +1259,7 @@ impl ShapedRunCache {
 
     /// Invalidate both generations: every font/size/feature change that could re-key a run
     /// calls this, so no stale-font run outlives a rebuild.
+    #[inline]
     fn clear(&mut self) {
         self.cur.clear();
         self.prev.clear();
@@ -1253,6 +1283,7 @@ struct TwoGenTextCache<V> {
 impl<V> TwoGenTextCache<V> {
     /// Probe `cur` then `prev`; the `bool` is `true` for a `prev` hit, which the caller
     /// promotes. No allocation on a hit.
+    #[inline]
     fn get(&self, key: &str) -> Option<(&V, bool)> {
         if let Some(v) = self.cur.get(key) {
             return Some((v, false));
@@ -1265,23 +1296,27 @@ impl<V> TwoGenTextCache<V> {
 
     /// Insert (or promote) `key -> v` into the current generation; the caller builds the
     /// owned key only on a miss or promote.
+    #[inline]
     fn insert(&mut self, key: Box<str>, v: V) {
         self.cur.entry(key).or_insert(v);
     }
 
     /// Keys in the current generation, the cap trigger. The resident total can reach about
     /// twice the cap plus one frame's inserts, since eviction runs once per frame.
+    #[inline]
     fn cur_len(&self) -> usize {
         self.cur.len()
     }
 
     /// Rotate at the cap: demote `cur` to `prev`, drop the old `prev`, recycle its map.
+    #[inline]
     fn rotate(&mut self) {
         std::mem::swap(&mut self.cur, &mut self.prev);
         self.cur.clear();
     }
 
     /// Invalidate both generations (font changes).
+    #[inline]
     fn clear(&mut self) {
         self.cur.clear();
         self.prev.clear();
@@ -1328,6 +1363,7 @@ enum AdmittedFontBlob {
 }
 
 impl AdmittedFontBlob {
+    #[inline]
     fn bytes(&self) -> &[u8] {
         match self {
             Self::Slice(bytes) => bytes,
@@ -1337,6 +1373,7 @@ impl AdmittedFontBlob {
 
     /// Whether this blob is file-backed (a font-file mapping or a face compiled into the
     /// executable) rather than anonymous heap.
+    #[inline]
     fn is_file_backed(&self) -> bool {
         matches!(self, Self::Face(bytes) if !bytes.is_heap())
     }
@@ -1543,6 +1580,7 @@ pub struct ChromeRowEdges {
 impl ChromeBleed {
     /// The `(left, right)` gutter tones of chrome row `r`: its [`Self::row_edges`] entry,
     /// else [`Self::color`]. Both backends read this.
+    #[inline]
     #[must_use]
     pub fn gutter_tones(&self, r: usize) -> (u32, u32) {
         self.row_edges
@@ -1570,6 +1608,7 @@ struct CellGeometryMemo {
 
 impl CellGeometryMemo {
     /// The geometry kept for the px whose bits are `key`.
+    #[inline]
     fn get(&self, key: u32) -> Option<CellGeometry> {
         self.slots
             .iter()
@@ -1579,6 +1618,7 @@ impl CellGeometryMemo {
     }
 
     /// This memo with `geometry` kept for `key`, over the oldest slot.
+    #[inline]
     fn with(mut self, key: u32, geometry: CellGeometry) -> Self {
         self.slots[self.next] = Some((key, geometry));
         self.next = (self.next + 1) % self.slots.len();
@@ -5921,6 +5961,7 @@ fn runtime_fallback_scan_candidates(ch: char, ctx: FallbackProbeCtx, out: &mut V
 /// `ty` compiler; the float-exactness half (outside `ty`'s integer Expr
 /// language) is carried by the dyadic-lattice sweep in the test above, per the
 /// box-drawing rounding-law precedent.
+#[inline]
 #[must_use]
 pub fn ct_pen_and_bearing(b: f64) -> (f64, i32) {
     let fl = b.floor();
@@ -5938,6 +5979,7 @@ pub fn ct_pen_and_bearing(b: f64) -> (f64, i32) {
 /// its antialiasing pad never clip) and `extent >= ink + 2*pad + 1`. Also
 /// `extent(ink, 2) == extent(ink, 1) + 2`, so the `font_thicken` box stays 1px per side
 /// larger.
+#[inline]
 #[must_use]
 pub fn ct_padded_extent(ink: f64, pad: f64) -> usize {
     (ink + 2.0 * pad).ceil() as usize + 1
@@ -5975,6 +6017,7 @@ pub const XHEIGHT_SCALE_MAX: f32 = 1.25;
 /// endpoint is the in-bounds scale MINIMIZING the advance error (the ratio is
 /// monotone). Degenerate metrics (non-positive / non-finite) yield `1.0` —
 /// the pre-W8 unscaled raster. Checked by `tests/fallback_harmony.rs`.
+#[inline]
 #[must_use]
 pub fn fallback_cjk_scale(cell2_px: f32, ideo_adv_px: f32) -> f32 {
     scale_clamped(cell2_px, ideo_adv_px, CJK_SCALE_MIN, CJK_SCALE_MAX)
@@ -5983,6 +6026,7 @@ pub fn fallback_cjk_scale(cell2_px: f32, ideo_adv_px: f32) -> f32 {
 /// The rasterization scale for a non-CJK fallback face: the primary/fallback x-height ratio
 /// (both at the same px), clamped to `[0.75, 1.25]`. Same totality and exactness law as
 /// [`fallback_cjk_scale`]; degenerate metrics yield `1.0`.
+#[inline]
 #[must_use]
 pub fn fallback_xheight_scale(primary_xh_px: f32, face_xh_px: f32) -> f32 {
     scale_clamped(
@@ -5995,6 +6039,7 @@ pub fn fallback_xheight_scale(primary_xh_px: f32, face_xh_px: f32) -> f32 {
 
 /// Shared clamp core: `target/actual` clamped to `[lo, hi]`, `1.0` on any degenerate input
 /// (non-positive or non-finite operands, or a non-finite ratio).
+#[inline]
 fn scale_clamped(target: f32, actual: f32, lo: f32, hi: f32) -> f32 {
     let usable = target.is_finite() && actual.is_finite() && target > 0.0 && actual > 0.0;
     if !usable {
@@ -6019,8 +6064,9 @@ fn scale_clamped(target: f32, actual: f32, lo: f32, hi: f32) -> f32 {
 /// pre-W8 left-bias (`off = 0`, whole gap on the right). The floor
 /// characterization `2*off <= gap <= 2*off+1` implies the balance law, and
 /// `tests/fallback_harmony.rs` proves the shipped fn satisfies it exhaustively.
+#[inline]
 #[must_use]
-pub fn wide_center_offset(box_w: i32, adv_px: i32) -> i32 {
+pub const fn wide_center_offset(box_w: i32, adv_px: i32) -> i32 {
     (box_w - adv_px).div_euclid(2)
 }
 
@@ -6031,6 +6077,7 @@ pub fn wide_center_offset(box_w: i32, adv_px: i32) -> i32 {
 /// coexist after a width-policy change); this serves non-cell callers such as
 /// [`Renderer::glyph_key`].
 #[doc(hidden)]
+#[inline]
 #[must_use]
 pub fn fallback_cell_count(
     ch: char,
@@ -6055,6 +6102,7 @@ pub fn fallback_cell_count(
 /// predicate (not the aliased raw bit), so looking at the next cell is sound for
 /// CJK, emoji, and East-Asian Ambiguous text alike.
 #[doc(hidden)]
+#[inline]
 #[must_use]
 pub fn materialized_cell_span(row: &[RenderCell], col: usize) -> u8 {
     if row.get(col + 1).is_some_and(|next| next.wide) {
@@ -6071,6 +6119,7 @@ pub fn materialized_cell_span(row: &[RenderCell], col: usize) -> u8 {
 /// keeps the mask in the row band (rounding fringes are clamped by [`clamp_to_row_band`]).
 /// Degenerate inputs return `1.0`.
 #[doc(hidden)]
+#[inline]
 #[must_use]
 pub fn fallback_fit_scale(
     box_w: usize,
@@ -6107,6 +6156,7 @@ pub enum FallbackFit {
 /// digits, the Mathematical Alphanumeric Symbols block), else
 /// [`FallbackFit::Symbol`].
 #[doc(hidden)]
+#[inline]
 #[must_use]
 pub fn fallback_fit_class(ch: char) -> FallbackFit {
     if ch.is_alphanumeric() {
@@ -6121,6 +6171,7 @@ pub fn fallback_fit_class(ch: char) -> FallbackFit {
 /// bearings are empty space, and fitting them would draw a wide-advance symbol at two thirds
 /// of its primary twin's size. Never enlarges; same degenerate-input contract.
 #[doc(hidden)]
+#[inline]
 #[must_use]
 pub fn fallback_ink_fit_scale(
     box_w: usize,
@@ -6203,6 +6254,7 @@ const SYNTHETIC_ITALIC_SHEAR: f32 = 0.2;
 /// of its half-height. For [`FallbackFit::Symbol`] only: a letter rests on the baseline by
 /// design ([`shrink_ymin_about_baseline`] is the [`FallbackFit::Text`] anchor).
 #[doc(hidden)]
+#[inline]
 #[must_use]
 pub fn shrink_ymin_about_ink_centre(
     ymin: i32,
@@ -6232,6 +6284,7 @@ pub fn shrink_ymin_about_ink_centre(
 /// and a descender descends by its scaled depth (rounding fringes are left to
 /// [`clamp_to_row_band`]).
 #[doc(hidden)]
+#[inline]
 #[must_use]
 pub fn shrink_ymin_about_baseline(ymin: i32, scale: f32) -> i32 {
     let y = (ymin as f32 * scale).round();
@@ -6260,6 +6313,7 @@ pub fn shrink_ymin_about_baseline(ymin: i32, scale: f32) -> i32 {
 ///
 /// The arithmetic lives in [`clamp_to_band`], shared verbatim with the column
 /// twin [`clamp_to_col_band`] — the axis is the only thing that differs.
+#[inline]
 #[must_use]
 pub fn clamp_to_row_band(top: i32, height: usize, band_h: usize) -> (usize, usize) {
     clamp_to_band(top, height, band_h)
@@ -6282,6 +6336,7 @@ pub fn clamp_to_row_band(top: i32, height: usize, band_h: usize) -> (usize, usiz
 /// `left + skip >= 0 && (left + skip) + new_width <= band_w`; and an in-band
 /// bitmap is untouched (`left >= 0 && left + width <= band_w ⇒ (0, width)`).
 /// Checked by `tests/fallback_harmony.rs`.
+#[inline]
 #[must_use]
 pub fn clamp_to_col_band(left: i32, width: usize, band_w: usize) -> (usize, usize) {
     clamp_to_band(left, width, band_w)
@@ -6487,6 +6542,7 @@ fn seat_ink_on_the_cell_floor(img: &mut GlyphImage, baseline: i32, cell_h: usize
 /// Shared core of the two band clamps (rows and columns): for an ink run at band-relative
 /// `pos` of length `len`, `(skip, keep)`, the leading elements to drop and the count to keep
 /// so the run lies inside `[0, band)`. Total; only ever trims.
+#[inline]
 fn clamp_to_band(pos: i32, len: usize, band: usize) -> (usize, usize) {
     // i64 so extreme i32 positions / huge lengths cannot overflow (total function).
     let (pos, len, band) = (pos as i64, len as i64, band as i64);
@@ -6666,14 +6722,15 @@ fn crop_mask_columns(
 /// primary's, smaller is better. Style mismatch dominates any weight distance (OS/2 weights
 /// span 1..=1000, so the 1000 italic penalty outranks the largest gap); among style-matched
 /// faces the closest weight wins.
+#[inline]
 #[must_use]
-pub fn fallback_weight_rank(
+pub const fn fallback_weight_rank(
     weight: u16,
     italic: bool,
     primary_weight: u16,
     primary_italic: bool,
 ) -> u32 {
-    let dw = (i32::from(weight) - i32::from(primary_weight)).unsigned_abs();
+    let dw = (weight as i32 - primary_weight as i32).unsigned_abs();
     dw + if italic != primary_italic { 1000 } else { 0 }
 }
 
@@ -7592,8 +7649,9 @@ mod macos_coretext {
 /// even when only the colour font covers it, matching iTerm2 and Ghostty, which gate on the
 /// default-presentation property. An explicit VS16 request goes to the unconditional
 /// [`Renderer::glyph_key_emoji`].
+#[inline]
 #[must_use]
-pub fn select_face(
+pub const fn select_face(
     procedural: bool,
     primary_has: bool,
     fallback_has: bool,
@@ -7666,6 +7724,7 @@ pub enum FacePick {
 /// `synthetic` never holds a bit the picked face supplies (slot 0 / injected ⇒ no BOLD; slot
 /// 1 ⇒ no ITALIC; slot 2 ⇒ empty) nor one the cell did not ask for (`synthetic ⊆ style`). A
 /// regular request is always `Primary`.
+#[inline]
 #[must_use]
 pub fn resolve_styled_face(style: StyleBits, injected_bold: bool, covers: [bool; 3]) -> FacePick {
     resolve_styled_face_lazy(style, injected_bold, |slot| covers[slot])
@@ -7676,6 +7735,7 @@ pub fn resolve_styled_face(style: StyleBits, injected_bold: bool, covers: [bool;
 /// a styled slot whether it covers a char materialises its deferred parse, so a bold cell
 /// probes slot 0 only, an italic cell slot 1 only, and a bold-italic cell stops at slot 2
 /// when a real bold-italic exists (`lazy_styled_face_probes_only_the_slots_it_needs`).
+#[inline]
 fn resolve_styled_face_lazy(
     style: StyleBits,
     injected_bold: bool,
@@ -7792,6 +7852,7 @@ pub struct PadSplit {
 ///
 /// Below the domain it is total and returns `cells == 1` with best-effort pads (the frame
 /// overflows and the present paths crop it, centred).
+#[inline]
 #[must_use]
 pub fn pad_split(win_px: usize, pad: usize, cell_px: usize) -> PadSplit {
     let cell = cell_px.max(1);
@@ -7811,8 +7872,9 @@ pub fn pad_split(win_px: usize, pad: usize, cell_px: usize) -> PadSplit {
 /// Arithmetic saturates at `usize::MAX`; callers that allocate must first use
 /// [`checked_frame_size_px`]. The top-only chrome band is included; host cropping
 /// is applied afterwards. Renderers and warm-launch window sizing share this law.
+#[inline]
 #[must_use]
-pub fn frame_size_px(
+pub const fn frame_size_px(
     rows: usize,
     cols: usize,
     cell_w: usize,
@@ -7862,8 +7924,9 @@ pub fn checked_frame_size_px(
 /// extent for `pad_split(dst_px, pad, cell).cells` it equals `pad_split(..).pad_lo - pad`
 /// (`tests/pad_absorption.rs`). Shared by the GPU blit (`content_off`) and
 /// [`place_frame_bands`].
+#[inline]
 #[must_use]
-pub fn band_offset(dst_px: usize, src_px: usize) -> i64 {
+pub const fn band_offset(dst_px: usize, src_px: usize) -> i64 {
     (dst_px as i64 - src_px as i64).div_euclid(2)
 }
 
@@ -7874,8 +7937,9 @@ pub fn band_offset(dst_px: usize, src_px: usize) -> i64 {
 /// titlebar. Elsewhere this is the centred [`band_offset`]; the horizontal axis is centred
 /// everywhere. Every vertical placement consumer ([`place_frame_bands`], the GPU blit's
 /// `content_off`, the GUI's pointer mapping, visible-crop alignment, `dims`) must use this.
+#[inline]
 #[must_use]
-pub fn band_offset_y(dst_px: usize, src_px: usize) -> i64 {
+pub const fn band_offset_y(dst_px: usize, src_px: usize) -> i64 {
     if cfg!(target_os = "linux") {
         0
     } else {
@@ -7906,6 +7970,7 @@ pub struct AxisPlacement {
 }
 
 impl AxisPlacement {
+    #[inline]
     fn at(origin: i64, surface: usize, frame: usize) -> Self {
         let surface_px = i64::try_from(surface).unwrap_or(i64::MAX);
         let frame_px = i64::try_from(frame).unwrap_or(i64::MAX);
@@ -7925,6 +7990,7 @@ impl AxisPlacement {
     }
 
     /// The frame pixel shown at surface pixel `surface_px`; `None` in a band.
+    #[inline]
     #[must_use]
     pub fn source(&self, surface_px: usize) -> Option<usize> {
         surface_px
@@ -7941,6 +8007,7 @@ impl AxisPlacement {
 /// `content_off`, the GUI's `dims` and the crop of a presented destination
 /// back to its frame all read it, so a pixel a capture takes from the glass
 /// is the pixel the present put there.
+#[inline]
 #[must_use]
 pub fn frame_placement(dst_w: usize, dst_h: usize, src_w: usize, src_h: usize) -> FramePlacement {
     FramePlacement {
@@ -7970,6 +8037,7 @@ impl FramePlacement {
     /// surface it was placed in: the `x.visible`×`y.visible` pixels at
     /// `(x.band_before, y.band_before)`. `None` when this is not a placement in
     /// that surface.
+    #[inline]
     #[must_use]
     pub fn visible_rect(&self, surface_w: usize, surface_h: usize) -> Option<PixelRect> {
         let spans = |axis: &AxisPlacement| {
@@ -8198,6 +8266,7 @@ impl FaceTarget {
 
     /// The target of styled slot `slot`: 0 bold, 1 italic, 2 bold italic
     /// (the renderer's slot order); anything else is the regular face.
+    #[inline]
     #[must_use]
     pub const fn for_slot(slot: usize) -> Self {
         match slot {
@@ -8211,6 +8280,7 @@ impl FaceTarget {
     /// How far `face` is from this target: its weight's distance from the
     /// wanted weight, and far more for the wrong slant. Zero is the face
     /// itself.
+    #[inline]
     #[must_use]
     pub fn distance(self, face: &aterm_font::Face<'_>) -> u32 {
         let slanted = face.is_italic() || face.is_oblique();
@@ -8220,6 +8290,7 @@ impl FaceTarget {
 
     /// Whether `face` draws this style: the same slant, and bold exactly when
     /// bold is wanted (a weight of 600 or more, or the face's bold flag).
+    #[inline]
     #[must_use]
     pub fn suits(self, face: &aterm_font::Face<'_>) -> bool {
         let slanted = face.is_italic() || face.is_oblique();
@@ -8842,6 +8913,7 @@ fn cell_w_from_advance(advance: f32) -> usize {
 
 /// Admit a cell width only when its metric fits the signed pixel coordinates
 /// used by paint. A float-to-int saturation is not a usable geometry.
+#[inline]
 fn checked_cell_w_from_advance(advance: f32) -> Option<usize> {
     if !advance.is_finite() {
         return None;
@@ -8861,6 +8933,7 @@ fn checked_cell_w_from_advance(advance: f32) -> Option<usize> {
 /// * the total leading `cell_h − (ascent − descent)` splits half above, half below the
 ///   glyph: `baseline = round(ascent + leading/2)`, so the gaps differ by at most 1px.
 ///   `baseline = round(ascent)` would put the whole lineGap below the descent.
+#[inline]
 #[must_use]
 pub fn cell_h_baseline(ascent: f32, descent: f32, line_gap: f32, scale: f32) -> (usize, i32) {
     let content = ascent - descent;
@@ -8874,6 +8947,7 @@ pub fn cell_h_baseline(ascent: f32, descent: f32, line_gap: f32, scale: f32) -> 
 /// The leading law admitted for live geometry and pure host projections.
 /// Keep the formula in `cell_h_baseline`; reject invalid inputs and saturated
 /// conversions here before a constructor or setter can retain the result.
+#[inline]
 fn checked_cell_h_baseline(
     ascent: f32,
     descent: f32,
@@ -8896,12 +8970,14 @@ fn checked_cell_h_baseline(
 }
 
 /// Pixel-size requests within this tolerance keep the active geometry.
+#[inline]
 fn font_px_unchanged(current: f32, requested: f32) -> bool {
     (requested - current).abs() < 0.01
 }
 
 /// Normalize a changed leading request; invalid or effectively unchanged
 /// requests retain the prior scale in both live setters and pure projections.
+#[inline]
 fn requested_line_height(current: f32, requested: f32) -> Option<f32> {
     if !requested.is_finite() {
         return None;
@@ -8915,6 +8991,7 @@ fn requested_line_height(current: f32, requested: f32) -> Option<f32> {
 }
 
 /// Project one measured instance through the shared geometry admission.
+#[inline]
 fn checked_cell_geometry(
     metrics: &variation::VariedMetricsPx,
     line_height: f32,
@@ -8945,6 +9022,7 @@ const LETTER_HINT_SLACK_PX: f32 = 1.0;
 /// unchanged when the letters fit inside it, else the letters' depth plus
 /// [`LETTER_HINT_SLACK_PX`]. A face whose line already holds its letters is never touched;
 /// Cascadia Mono PL at 16 px goes from a 3.75 px to a 5.75 px descent (a 9x21 cell).
+#[inline]
 fn letter_floored_descent(descent: f32, letter: f32, px: f32) -> f32 {
     let deepest = letter * px;
     if deepest < descent {
@@ -9578,8 +9656,9 @@ impl Renderer {
 
     /// Whether synthetic bold/italic (dilation / shear) is enabled: config
     /// `font_synthetic_style`. See [`Self::set_synthetic_styles`].
+    #[inline]
     #[must_use]
-    pub fn synthetic_styles(&self) -> bool {
+    pub const fn synthetic_styles(&self) -> bool {
         self.synthetic_styles
     }
 
@@ -10086,8 +10165,9 @@ impl Renderer {
     /// differently (a lazy fallback parse landing or giving up, a styled face retired, the
     /// runtime tier widened). A snapshot compares it across a draw ([`Self::render_input`]);
     /// the GPU backend's owned-frame snapshot reads it for the same comparison.
+    #[inline]
     #[must_use]
-    pub fn font_epoch(&self) -> u64 {
+    pub const fn font_epoch(&self) -> u64 {
         self.font_epoch
     }
 
@@ -10741,8 +10821,9 @@ impl Renderer {
 
     /// Whether this renderer's path-backed generation has crossed the
     /// worker-only seal boundary and can be published without later font I/O.
+    #[inline]
     #[must_use]
-    pub fn admitted_font_sources_sealed(&self) -> bool {
+    pub const fn admitted_font_sources_sealed(&self) -> bool {
         self.admitted_sources_sealed
     }
 
@@ -10810,6 +10891,7 @@ impl Renderer {
     /// name ([`DrawnFaces`]). `None` before the seal: an unsealed generation
     /// has not discovered its styled faces yet, and a guess would name the
     /// wrong ones.
+    #[inline]
     #[must_use]
     pub fn drawn_faces(&self) -> Option<&DrawnFaces> {
         self.drawn_faces.as_ref()
@@ -12066,14 +12148,16 @@ impl Renderer {
             .is_some_and(|gid| colour_drawable(&face, gid))
     }
 
-    pub fn cell_size(&self) -> (usize, usize) {
+    #[inline]
+    pub const fn cell_size(&self) -> (usize, usize) {
         (self.cell_w, self.cell_h)
     }
 
     /// The default fg/bg/cursor/selection theme frames paint with (the last
     /// [`set_theme`](Self::set_theme), else the constructor's).
+    #[inline]
     #[must_use]
-    pub fn theme(&self) -> Theme {
+    pub const fn theme(&self) -> Theme {
         self.theme
     }
 
@@ -12214,6 +12298,7 @@ impl Renderer {
 
     /// The resolved primary variation coords, `None` for an unvaried primary. The GPU wrapper
     /// compares this across [`Self::set_theme`] to see a dark-nudge re-rasterization.
+    #[inline]
     #[must_use]
     pub fn variation_coords(&self) -> Option<&[(u32, f32)]> {
         self.var_coords.as_deref()
@@ -12289,6 +12374,7 @@ impl Renderer {
 
     /// The last-applied variation requests ([`Self::set_font_variations`]), carried over by
     /// the GPU wrapper's rebuild so a zoom/theme rebuild keeps the user's instance.
+    #[inline]
     #[must_use]
     pub fn font_variation_requests(&self) -> &[(u32, f32)] {
         &self.cfg_font_variations
@@ -12296,8 +12382,9 @@ impl Renderer {
 
     /// The active `font_weight_dark_nudge` (0 = off). See
     /// [`Self::set_font_variations`].
+    #[inline]
     #[must_use]
-    pub fn font_weight_dark_nudge(&self) -> f32 {
+    pub const fn font_weight_dark_nudge(&self) -> f32 {
         self.font_weight_dark_nudge
     }
 
@@ -12534,8 +12621,9 @@ impl Renderer {
     }
 
     /// The current baseline adjustment (see [`Self::set_adjust_baseline`]).
+    #[inline]
     #[must_use]
-    pub fn adjust_baseline(&self) -> i32 {
+    pub const fn adjust_baseline(&self) -> i32 {
         self.baseline_adjust
     }
 
@@ -12544,6 +12632,7 @@ impl Renderer {
     /// ([`deco::resolve_deco_metrics`]). Derived on demand, so it never drifts from
     /// `cell_h`/`baseline`. The GPU renderer reads it off its wrapped CPU face, so both draw
     /// identical bands.
+    #[inline]
     #[must_use]
     pub fn deco_metrics(&self) -> deco::DecoMetrics {
         deco::resolve_deco_metrics(
@@ -12561,6 +12650,7 @@ impl Renderer {
     /// mixed DPI: chrome laid out for a window the shared renderer is not activated to (the tab
     /// strip aligning its cards to that window's seam underline) reads the bands it will be
     /// drawn with.
+    #[inline]
     #[must_use]
     pub fn deco_metrics_for(&self, px: f32) -> deco::DecoMetrics {
         let ((_, cell_h, baseline), px) = self.cell_geometry_and_px(px);
@@ -12593,6 +12683,7 @@ impl Renderer {
     /// underline coverage is zeroed within a 1px dilation of the cell's descender ink (ink
     /// strictly below the baseline, so letters resting on it never chop the line). Draw-time
     /// only.
+    #[inline]
     pub fn set_underline_skip_descenders(&mut self, on: bool) {
         self.underline_skip_descenders = on;
     }
@@ -12600,8 +12691,9 @@ impl Renderer {
     /// Whether descender ink-skip is on (see
     /// [`Self::set_underline_skip_descenders`]). The GPU renderer reads this
     /// off its wrapped CPU face (parity).
+    #[inline]
     #[must_use]
-    pub fn underline_skip_descenders(&self) -> bool {
+    pub const fn underline_skip_descenders(&self) -> bool {
         self.underline_skip_descenders
     }
 
@@ -13118,13 +13210,15 @@ impl Renderer {
     }
 
     /// The current line-height multiplier (see [`Self::set_line_height`]).
-    pub fn line_height(&self) -> f32 {
+    #[inline]
+    pub const fn line_height(&self) -> f32 {
         self.line_height_scale
     }
 
     /// Test/diagnostic: the number of cached glyph images, so a test can assert that a resize
     /// ([`set_px`](Self::set_px)) or a face swap drops the caches.
     #[doc(hidden)]
+    #[inline]
     #[must_use]
     pub fn glyph_cache_len(&self) -> usize {
         self.glyphs.len()
@@ -13133,6 +13227,7 @@ impl Renderer {
     /// Test/diagnostic: whether one exact raster key is resident (so frame tests can prove
     /// both span variants of a fallback scalar went through the draw path).
     #[doc(hidden)]
+    #[inline]
     #[must_use]
     pub fn glyph_cache_contains(&self, key: GlyphKey) -> bool {
         self.glyphs.contains_key(&key)
@@ -13141,12 +13236,14 @@ impl Renderer {
     /// Set the explicit selected-text foreground (theme `selectionForeground`), or
     /// `None` to restore the WCAG contrast-floor default. Applied at blit time like
     /// the theme, so no glyph-cache invalidation is needed.
+    #[inline]
     pub fn set_selection_fg(&mut self, fg: Option<u32>) {
         self.selection_fg = fg;
     }
 
     /// The host's selected-text foreground override.
-    pub fn selection_fg(&self) -> Option<u32> {
+    #[inline]
+    pub const fn selection_fg(&self) -> Option<u32> {
         self.selection_fg
     }
 
@@ -13158,6 +13255,7 @@ impl Renderer {
     /// fg == bg are always skipped: SGR 8 (conceal) resolves fg = bg and the
     /// floor must not reveal hidden text. Applied at blit time, so no
     /// glyph-cache invalidation is needed.
+    #[inline]
     pub fn set_minimum_contrast(&mut self, ratio: f32) {
         self.min_contrast = ratio;
     }
@@ -13165,8 +13263,9 @@ impl Renderer {
     /// The configured per-cell minimum contrast ratio (`<= 1.0` = off). The GPU
     /// renderer reads this off its wrapped CPU face so both paths floor
     /// per-cell fg identically (parity by construction).
+    #[inline]
     #[must_use]
-    pub fn minimum_contrast(&self) -> f32 {
+    pub const fn minimum_contrast(&self) -> f32 {
         self.min_contrast
     }
 
@@ -13176,6 +13275,7 @@ impl Renderer {
     /// wrapped CPU face, so CPU, GPU and both web builds floor identically.
     /// [`minimum_contrast`](Self::minimum_contrast) stays the raw configured value,
     /// so a rebuild never bakes the raise into the configuration.
+    #[inline]
     #[must_use]
     pub fn effective_minimum_contrast(&self) -> f32 {
         vibrancy::effective_minimum_contrast(self.min_contrast, self.bg_opacity)
@@ -13200,6 +13300,7 @@ impl Renderer {
     /// Appearance-only: the host must force a full repaint
     /// (no cell changes). A non-finite request fails safe to solid (M5: keeps
     /// NaN out of [`bg_transmittance`](Self::bg_transmittance)).
+    #[inline]
     pub fn set_background_opacity(&mut self, opacity: f32) {
         self.bg_opacity = if opacity.is_finite() {
             opacity.clamp(0.0, 1.0)
@@ -13213,8 +13314,9 @@ impl Renderer {
     /// renderer reads this off its wrapped CPU face (parity by construction).
     /// [`effective_minimum_contrast`](Self::effective_minimum_contrast) reads this to
     /// engage the WCAG-AA contrast floor while translucent.
+    #[inline]
     #[must_use]
-    pub fn background_opacity(&self) -> f32 {
+    pub const fn background_opacity(&self) -> f32 {
         self.bg_opacity
     }
 
@@ -13222,6 +13324,7 @@ impl Renderer {
     /// the fill is blended over the rendered cell so the glyph shows through (the block
     /// cut-out is skipped). Appearance-only: the host forces a full repaint. A non-finite
     /// request fails safe to opaque.
+    #[inline]
     pub fn set_cursor_opacity(&mut self, opacity: f32) {
         self.cursor_opacity = if opacity.is_finite() {
             opacity.clamp(0.0, 1.0)
@@ -13233,8 +13336,9 @@ impl Renderer {
     /// The configured cursor-fill opacity (see
     /// [`set_cursor_opacity`](Self::set_cursor_opacity)). The GPU renderer
     /// reads this off its wrapped CPU face (parity by construction).
+    #[inline]
     #[must_use]
-    pub fn cursor_opacity(&self) -> f32 {
+    pub const fn cursor_opacity(&self) -> f32 {
         self.cursor_opacity
     }
 
@@ -13251,13 +13355,15 @@ impl Renderer {
     /// Mark the pane focused (`false`) or unfocused (`true`). Unfocused, selected cells paint
     /// with the inactive selection bg (xterm `selectionInactiveBackground`). Appearance-only,
     /// applied at fill time.
+    #[inline]
     pub fn set_selection_inactive(&mut self, inactive: bool) {
         self.selection_inactive = inactive;
     }
 
     /// Whether the pane is currently treated as unfocused for selection theming.
+    #[inline]
     #[must_use]
-    pub fn selection_inactive(&self) -> bool {
+    pub const fn selection_inactive(&self) -> bool {
         self.selection_inactive
     }
 
@@ -13265,12 +13371,14 @@ impl Renderer {
     /// derive it from the active selection bg (see [`derive_inactive_selection_bg`]).
     /// Only consulted while [`set_selection_inactive`](Self::set_selection_inactive)
     /// is `true`. Applied at fill time, so no glyph-cache invalidation is needed.
+    #[inline]
     pub fn set_selection_inactive_bg(&mut self, bg: Option<u32>) {
         self.selection_inactive_bg = bg;
     }
 
     /// The host's inactive-selection background override, before theme derivation.
-    pub fn selection_inactive_bg(&self) -> Option<u32> {
+    #[inline]
+    pub const fn selection_inactive_bg(&self) -> Option<u32> {
         self.selection_inactive_bg
     }
 
@@ -13279,6 +13387,7 @@ impl Renderer {
     /// value derived from `theme.selection`/`theme.bg`). The SINGLE source of truth
     /// for the selection-band colour — both the CPU fill and the GPU encode read it,
     /// so focused/unfocused selection stays byte-identical across paths.
+    #[inline]
     #[must_use]
     pub fn effective_selection_bg(&self) -> u32 {
         if self.selection_inactive {
@@ -13321,7 +13430,8 @@ impl Renderer {
 
     /// The current interior padding (px per edge); `0` is no padding. See the `pad` field;
     /// the GPU mirror reads this to stay identical.
-    pub fn pad(&self) -> usize {
+    #[inline]
+    pub const fn pad(&self) -> usize {
         self.pad
     }
 
@@ -13356,13 +13466,15 @@ impl Renderer {
 
     /// The current top-only head band (px); `0` is no band. See the `head` field; the GPU
     /// mirror reads this to stay identical.
-    pub fn head(&self) -> usize {
+    #[inline]
+    pub const fn head(&self) -> usize {
         self.head
     }
 
     /// Set the top-only head band (px above the padded grid). The framebuffer height changes
     /// with it, so the per-window damage cache repaints in full (`render_input_cached`'s dims
     /// guard).
+    #[inline]
     pub fn set_head(&mut self, head_px: usize) {
         self.head = head_px;
     }
@@ -13370,6 +13482,7 @@ impl Renderer {
     /// The effective top interior pad (px): the [`Self::set_pad_top`] override if set, else
     /// `pad`. Only the grid's Y origin uses it; the frame size and the other edges stay on
     /// `pad`.
+    #[inline]
     pub fn pad_top(&self) -> usize {
         self.pad_top.unwrap_or(self.pad)
     }
@@ -13401,8 +13514,9 @@ impl Renderer {
 
     /// The host chrome band currently claiming the padding gutters, if any.
     /// The GPU mirror reads this so the two backends agree pixel for pixel.
+    #[inline]
     #[must_use]
-    pub fn chrome_bleed(&self) -> Option<ChromeBleed> {
+    pub const fn chrome_bleed(&self) -> Option<ChromeBleed> {
         self.chrome_bleed
     }
 
@@ -13412,6 +13526,7 @@ impl Renderer {
     /// presenters continue these rows' edge pixels through the window's remainder bands
     /// ([`place_frame_bands`]' `edge_rows`, the GPU blit's `chrome_y0..chrome_y1`), so a
     /// chrome band reaches the window edge on a window that is not a whole number of cells.
+    #[inline]
     #[must_use]
     pub fn chrome_extent_px(&self, frame_h: usize) -> std::ops::Range<usize> {
         self.chrome_bleed.map_or(0..0, |b| {
@@ -13434,6 +13549,7 @@ impl Renderer {
     /// tone is those cells' background ([`ChromeBleed::row_edges`] keeps that by contract).
     /// The damaged path re-clears each dirty band across its full width
     /// ([`Self::row_pixel_band`]) first, so no stale gutter survives.
+    #[inline]
     pub fn set_chrome_bleed(&mut self, bleed: Option<ChromeBleed>) {
         self.chrome_bleed = bleed.filter(|b| b.rows > b.first);
     }
@@ -13441,6 +13557,7 @@ impl Renderer {
     /// The grid content's Y-origin in window px: `pad_top + head` (X stays `pad`). With no
     /// `pad_top` override this is `pad + head`, and with `head == 0` it is `pad`. Every
     /// grid-space Y offset in the renderer goes through this.
+    #[inline]
     pub fn grid_top(&self) -> usize {
         self.pad_top.unwrap_or(self.pad) + self.head
     }
@@ -13448,34 +13565,40 @@ impl Renderer {
     /// Pixel size of a `rows`x`cols` grid including `2·pad` of interior padding and the
     /// top-only `head` band: this renderer's metrics through [`frame_size_px`], so a host that
     /// sizes a window without a live renderer cannot drift from it.
-    pub fn frame_size(&self, rows: usize, cols: usize) -> (usize, usize) {
+    #[inline]
+    pub const fn frame_size(&self, rows: usize, cols: usize) -> (usize, usize) {
         frame_size_px(rows, cols, self.cell_w, self.cell_h, self.pad, self.head)
     }
 
     /// Pixel dimensions admitted by the shared framebuffer storage limit.
+    #[inline]
     pub fn checked_frame_size(&self, rows: usize, cols: usize) -> Result<(usize, usize), String> {
         checked_frame_size_px(rows, cols, self.cell_w, self.cell_h, self.pad, self.head)
     }
 
     /// The font baseline (pixels from the cell top to the glyph baseline).
-    pub fn baseline(&self) -> i32 {
+    #[inline]
+    pub const fn baseline(&self) -> i32 {
         self.baseline
     }
 
     /// The pixel size this renderer rasterizes glyphs at.
-    pub fn px(&self) -> f32 {
+    #[inline]
+    pub const fn px(&self) -> f32 {
         self.px
     }
 
     /// Set the cursor blink phase: `false` skips drawing the cursor for the frame, but only
     /// for the `Blinking*` DECSCUSR styles. Defaults to `true`; a windowed frontend toggles it
     /// ~530ms.
+    #[inline]
     pub fn set_cursor_blink_phase(&mut self, on: bool) {
         self.cursor_blink_phase = on;
     }
 
     /// The current cursor blink phase (see [`Self::set_cursor_blink_phase`]).
-    pub fn cursor_blink_phase(&self) -> bool {
+    #[inline]
+    pub const fn cursor_blink_phase(&self) -> bool {
         self.cursor_blink_phase
     }
 
@@ -13483,12 +13606,14 @@ impl Renderer {
     /// host/effect override and the terminal's DECSCUSR style (`None` restores
     /// their normal precedence). The windowed frontend sets `Some(HollowBlock)`
     /// while unfocused, the standard terminal behavior.
+    #[inline]
     pub fn set_cursor_style_override(&mut self, style: Option<CursorStyle>) {
         self.cursor_style_override = style;
     }
 
     /// The active cursor style override (see [`Self::set_cursor_style_override`]).
-    pub fn cursor_style_override(&self) -> Option<CursorStyle> {
+    #[inline]
+    pub const fn cursor_style_override(&self) -> Option<CursorStyle> {
         self.cursor_style_override
     }
 
@@ -14116,7 +14241,8 @@ impl Renderer {
     }
 
     /// The current text-shaping config.
-    pub fn text_shaping(&self) -> &aterm_types::text_shaping::TextShapingConfig {
+    #[inline]
+    pub const fn text_shaping(&self) -> &aterm_types::text_shaping::TextShapingConfig {
         &self.shaping
     }
 
@@ -14124,14 +14250,16 @@ impl Renderer {
     /// [`TextBlending::LinearCorrected`]). Blend-time only, so no glyph or metric cache
     /// depends on it, but the host must invalidate its present/damage caches, as for a theme
     /// edit.
+    #[inline]
     pub fn set_text_blending(&mut self, mode: TextBlending) {
         self.text_blending = mode;
     }
 
     /// The active coverage blend mode (the GPU encode reads this off its wrapped
     /// CPU face so both backends remap identically).
+    #[inline]
     #[must_use]
-    pub fn text_blending(&self) -> TextBlending {
+    pub const fn text_blending(&self) -> TextBlending {
         self.text_blending
     }
 
@@ -14146,8 +14274,9 @@ impl Renderer {
     }
 
     /// The active macOS `font_thicken` flag.
+    #[inline]
     #[must_use]
-    pub fn font_thicken(&self) -> bool {
+    pub const fn font_thicken(&self) -> bool {
         self.font_thicken
     }
 
@@ -14169,8 +14298,9 @@ impl Renderer {
     }
 
     /// The gamma the stem-darkening LUT was built from (`1.0` = identity).
+    #[inline]
     #[must_use]
-    pub fn stem_gamma(&self) -> f32 {
+    pub const fn stem_gamma(&self) -> f32 {
         self.stem_gamma
     }
 
@@ -14228,8 +14358,9 @@ impl Renderer {
     /// fitting where nothing hints. macOS is `"off"` in the
     /// sense this key means it: CoreText applies its OWN grid discipline, not
     /// `font_hinting`'s.
+    #[inline]
     #[must_use]
-    pub fn font_hinting(&self) -> &'static str {
+    pub const fn font_hinting(&self) -> &'static str {
         #[cfg(any(all(unix, not(target_os = "macos")), windows))]
         {
             match self.hint_mode {
@@ -14280,6 +14411,7 @@ impl Renderer {
     /// / `"bgr"`) — the [`Self::set_font_subpixel`] round-trip, for change
     /// detection and diagnostics. Always `"off"` on the targets without the
     /// subpixel seam.
+    #[inline]
     #[must_use]
     pub fn font_subpixel(&self) -> &'static str {
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -14328,15 +14460,17 @@ impl Renderer {
     /// Whether the primary face advertises a `liga`/`calt` `GSUB` feature (probed
     /// once at construction). `false` means the font cannot ligate, so the planner
     /// short-circuits shaping to the per-cell path. Exposed for tests/diagnostics.
+    #[inline]
     #[must_use]
-    pub fn has_ligature_features(&self) -> bool {
+    pub const fn has_ligature_features(&self) -> bool {
         self.has_ligature_features
     }
 
     /// Whether ligatures are globally off (`LigatureMode::Disabled`). `CursorDisabled` is
     /// row-local and handled at the column level (the cursor's run is forced per-cell), so it
     /// does not disable globally.
-    fn ligatures_globally_off(&self) -> bool {
+    #[inline]
+    const fn ligatures_globally_off(&self) -> bool {
         matches!(
             self.shaping.ligature_mode,
             aterm_types::text_shaping::LigatureMode::Disabled
@@ -14603,14 +14737,16 @@ impl Renderer {
     /// `style`, shared so the GPU atlas keys it as the CPU does. The style bits route a styled
     /// run's gid to the real styled face at raster time (`rasterize`'s MonoGid arm re-derives
     /// the planner's [`FacePick`] via `run_face_pick`), so the key needs no face tag.
-    pub fn ligature_key(&self, gid: u16, style: StyleBits) -> GlyphKey {
+    #[inline]
+    pub const fn ligature_key(&self, gid: u16, style: StyleBits) -> GlyphKey {
         GlyphKey::mono_gid(gid, style, self.px_q)
     }
 
     /// The glyph key for cell `k` of a collapsed (Cascadia N:1) ligature drawing wide glyph
     /// `gid` at the run's SGR `style`. Its raster is that cell's tile of the wide glyph
     /// (`cell_w` wide, left bearing 0); the GPU atlas keys it as the CPU cache does.
-    pub fn ligature_slice_key(&self, gid: u16, k: u16, style: StyleBits) -> GlyphKey {
+    #[inline]
+    pub const fn ligature_slice_key(&self, gid: u16, k: u16, style: StyleBits) -> GlyphKey {
         GlyphKey::mono_gid_slice(gid, k, style, self.px_q)
     }
 
@@ -14618,6 +14754,7 @@ impl Renderer {
     /// cell under `LigatureMode::CursorDisabled`). The GPU planner calls this so its break set
     /// matches the CPU's. Fills the caller-owned `out` (cleared first) so the caller can reuse
     /// a persistent scratch instead of allocating a `Vec` per row per frame.
+    #[inline]
     pub fn ligature_break_cols_for_row_into(
         &self,
         input: &RenderInput,
@@ -14795,6 +14932,7 @@ impl Renderer {
     /// The rasterized image for `key`, cached. External rasterizers (the GPU
     /// atlas) consume the exact bytes the CPU blit path uses, so their output
     /// can match pixel-for-pixel without duplicating the font logic/fallback.
+    #[inline]
     pub fn glyph_image(&mut self, key: GlyphKey) -> &GlyphImage {
         &self.cached_glyph(key).img
     }
@@ -14820,6 +14958,7 @@ impl Renderer {
     /// (computed once when the entry is built, dropped with it). The CPU blit and the GPU quad
     /// loop read the same stored answer under the key each derives from `glyph_key(mark)`, so
     /// their mark stacks agree by construction.
+    #[inline]
     pub fn glyph_ink_box_cached(&mut self, key: GlyphKey) -> Option<(usize, i32)> {
         self.cached_glyph(key).ink
     }
@@ -16492,6 +16631,7 @@ impl Renderer {
     /// scissor's edge rules, so head-band effects and a sprite spilling below the grid
     /// present on the CPU partial-copy path. For a CPU presenter copying only dirty rows;
     /// empty (`y0 == y1`) for a row past the frame.
+    #[inline]
     pub fn row_pixel_band(&self, r: usize, rows: usize, h: usize) -> (usize, usize) {
         // One band rule for every consumer, the fx slicer included.
         fx_raster::band_px(r, rows, h, self.grid_top(), self.cell_h)
@@ -16500,6 +16640,7 @@ impl Renderer {
     /// Where this renderer's cell-row bands lie in window pixels: the
     /// geometry the shared damage seam ([`compute_dirty_rows`],
     /// [`scroll_shift_plan`]) maps the fx layers and occluders to rows with.
+    #[inline]
     #[must_use]
     pub fn row_bands(&self) -> RowBands {
         RowBands::new(self.grid_top(), self.cell_h)
@@ -16792,6 +16933,7 @@ impl Renderer {
 
     /// The `[y0, y1)` device-pixel span of grid row `r`'s band (`grid_top +
     /// r·cell_h` down, one cell tall), clamped to the frame height `h`.
+    #[inline]
     fn row_band_px(&self, r: usize, h: usize) -> (usize, usize) {
         let y0 = (self.grid_top() + r * self.cell_h).min(h);
         let y1 = (self.grid_top() + (r + 1) * self.cell_h).min(h);
@@ -17236,6 +17378,7 @@ struct CellPlace {
 /// `None` when none of it is. Every mixed-row fill goes through it, because
 /// [`Renderer::fill_rect`] clips to the frame, not the pane. Uniform callers pass
 /// `(0, usize::MAX)`, which returns the span unchanged (`w == 0` → `None`).
+#[inline]
 fn clip_span_to_run(x: usize, w: usize, lo: usize, hi: usize) -> Option<(usize, usize)> {
     let x0 = x.max(lo);
     let x1 = x.saturating_add(w).min(hi);
@@ -17378,6 +17521,7 @@ impl Renderer {
     /// diagnostic). `at_base` counts runs whose colour the band's base already carries.
     /// Read two-sided: a plain-text fixture shows `at_base > 0`, an all-SGR-background
     /// control `at_base == 0` with `total > 0`.
+    #[inline]
     #[must_use]
     pub fn last_bg_runs(&self) -> (u32, u32) {
         (self.bg_runs_total.get(), self.bg_runs_at_base.get())
@@ -17386,6 +17530,7 @@ impl Renderer {
     /// Background `fill_rect`s the last render emitted from the materialized prefix of
     /// [`Self::render_row_bg`] (the `bg_fills_emitted` diagnostic). With no wallpaper
     /// live, `emitted + at_base == total` against [`Self::last_bg_runs`]; see the field.
+    #[inline]
     #[must_use]
     pub fn last_bg_fills(&self) -> u32 {
         self.bg_fills_emitted.get()
@@ -18569,6 +18714,7 @@ impl Renderer {
     /// against under this renderer's geometry: the Grid origin `(pad,
     /// grid_top)` and the cell-row bands. The GPU renderer slices with the
     /// same one, so both draw the same slices.
+    #[inline]
     #[must_use]
     pub fn fx_frame(&self, w: usize, h: usize, rows: usize) -> FxFrame {
         FxFrame {
@@ -18635,6 +18781,7 @@ impl Renderer {
     /// whenever the stream changes, and the phase runner hands this the SAME
     /// dirty set its row iterator was built from. An empty `glow_under` is a
     /// no-op (byte-identical to the pre-glow_under path).
+    #[inline]
     fn draw_glow_under(
         &self,
         pixels: &mut [u32],
@@ -18747,6 +18894,7 @@ impl Renderer {
     /// row boundaries ([`GlowQuad`] invariant), so quads gate on `dirty[q.row]`;
     /// `compute_dirty_rows` marks every prev∪cur nova row dirty when the nova changes.
     /// Rasterized by [`Self::draw_flat_add`].
+    #[inline]
     fn draw_nova(
         &self,
         pixels: &mut [u32],
@@ -18774,6 +18922,7 @@ impl Renderer {
     /// contract. After the aurora, before the nova and rain. Rasterized by
     /// [`Self::draw_radial_add`]; [`compute_dirty_rows`] marks every prev∪cur glow-halo
     /// row dirty when the stream changes.
+    #[inline]
     fn draw_glow_halo(
         &self,
         pixels: &mut [u32],
@@ -18791,6 +18940,7 @@ impl Renderer {
     /// cursor. Single-row, grid-interior quads gated by `dirty[q.row]`;
     /// [`compute_dirty_rows`] marks every prev∪cur rain-halo row dirty when the rain
     /// changes. Rasterized by [`Self::draw_radial_add`].
+    #[inline]
     fn draw_rain_add(
         &self,
         pixels: &mut [u32],
@@ -19365,6 +19515,7 @@ impl Renderer {
     /// Blend a solid colour over a pixel rectangle at coverage `t` (0..=255), clipped to the
     /// frame: the translucent-cursor fill ([`blend`] carries the transmittance byte, so a
     /// cursor over a translucent default bg composites correctly).
+    #[inline]
     #[allow(clippy::too_many_arguments)]
     fn blend_rect(
         &self,
@@ -19392,6 +19543,7 @@ impl Renderer {
 
     /// Fill an arbitrary pixel rectangle with a solid colour, clipped to the
     /// frame.
+    #[inline]
     #[allow(clippy::too_many_arguments)]
     fn fill_rect(
         &self,
@@ -20089,7 +20241,7 @@ pub const HALO_IN_FIRE_ALPHA_FLOOR: u8 = 90;
 /// stamps and the GPU `glyph_halo` instance colour (the `fs_deco_over` `.a` operand).
 #[inline]
 #[must_use]
-pub fn fire_halo_alpha(strength: u8) -> u8 {
+pub const fn fire_halo_alpha(strength: u8) -> u8 {
     let floor = HALO_IN_FIRE_ALPHA_FLOOR as u32;
     let span = HALO_IN_FIRE_ALPHA as u32 - floor;
     (floor + strength as u32 * span / 255) as u8
@@ -20273,7 +20425,9 @@ fn blit_rgba_1x(
 /// Whether a cursor of `style` is drawn at this blink phase: `Hidden` never,
 /// the `Blinking*` styles only while the phase is on, steady styles always.
 /// Shared by the CPU and GPU renderers so their suppression rules agree.
-pub fn cursor_shown(style: CursorStyle, blink_phase: bool) -> bool {
+#[inline]
+#[must_use]
+pub const fn cursor_shown(style: CursorStyle, blink_phase: bool) -> bool {
     match style {
         CursorStyle::Hidden => false,
         CursorStyle::BlinkingBlock | CursorStyle::BlinkingUnderline | CursorStyle::BlinkingBar => {
@@ -20361,6 +20515,7 @@ pub fn for_each_cursor_rect(
 /// just `cc` when it is not ligated. Inclusive `(lo, hi)` with `lo <= cc <= hi`, checked
 /// over the full 2^9 × cc lattice by `tests/cursor_ink.rs::cursor_cutout_cols_exhaustive`.
 /// Shared with the GPU renderer.
+#[inline]
 #[must_use]
 pub fn cursor_cutout_cols(plan: &[ColumnGlyph], cc: usize) -> (usize, usize) {
     let ligated = |c: usize| matches!(plan.get(c), Some(ColumnGlyph::Ligated(_)));
@@ -20468,6 +20623,7 @@ fn pattern_rects_into(
 /// OS/2 metrics. `None` for a degenerate cell (`w == 0` / `cell_h == 0`). Separate from
 /// [`overline_rect`] because the bands do not share an ink: the overline has its own
 /// colour ([`RenderCell::overline_color`]), the strike none.
+#[inline]
 #[must_use]
 pub fn strike_rect(
     x0: usize,
@@ -20487,6 +20643,7 @@ pub fn strike_rect(
 /// The one pixel rect of a cell's overline band: hugging the cell top at the
 /// underline thickness. `None` for a degenerate cell (`w == 0` / `cell_h == 0`).
 /// See [`strike_rect`] for why the two bands are emitted apart.
+#[inline]
 #[must_use]
 pub fn overline_rect(
     x0: usize,
@@ -20505,6 +20662,7 @@ pub fn overline_rect(
 /// The emoji-cluster string for column `col` in a row's sparse cluster list
 /// (`RenderInput::clusters[row]`), sorted by column with one entry each, so a binary
 /// search keeps a fully dense row at O(cols·log cols). Rows almost never carry clusters.
+#[inline]
 fn cluster_for(row_clusters: &[(usize, Box<str>)], col: usize) -> Option<&str> {
     row_clusters
         .binary_search_by_key(&col, |(c, _)| *c)
@@ -20514,6 +20672,7 @@ fn cluster_for(row_clusters: &[(usize, Box<str>)], col: usize) -> Option<&str> {
 
 /// Find the combining marks for column `col` in a row's sparse combining list
 /// (sorted by column — see [`cluster_for`] for why binary search is used).
+#[inline]
 fn combining_for(row_combining: &[(usize, Box<[char]>)], col: usize) -> Option<&[char]> {
     row_combining
         .binary_search_by_key(&col, |(c, _)| *c)
@@ -20523,6 +20682,7 @@ fn combining_for(row_combining: &[(usize, Box<[char]>)], col: usize) -> Option<&
 
 /// Whether column `col` is covered by an inline image that hides its glyph (the
 /// image-vs-glyph precedence the GPU shares). Binary search, as in [`cluster_for`].
+#[inline]
 fn image_covers(row_images: &[(usize, aterm_core::grid::extra::ImageRef)], col: usize) -> bool {
     // Only an image over the text (z_index >= 0, the default) hides the glyph; a Kitty
     // `z < 0` image draws behind it, and the cell stays ligature-shapeable. Matches
@@ -20538,6 +20698,7 @@ fn image_covers(row_images: &[(usize, aterm_core::grid::extra::ImageRef)], col: 
 /// holds for the cached or incoming frame. The span arm matters: one pane of a composite
 /// row can be DECDHL while the row-level entry reads SingleWidth. Over-reporting costs a
 /// full repaint; under-reporting seams the glyph.
+#[inline]
 fn any_double_height(input: &RenderInput) -> bool {
     let is_dh =
         |ls: &LineSize| matches!(ls, LineSize::DoubleHeightTop | LineSize::DoubleHeightBottom);
@@ -20551,12 +20712,14 @@ fn any_double_height(input: &RenderInput) -> bool {
 /// Row `r`'s per-column DEC line-size runs, or an empty slice for a uniform row (a missing
 /// row and an empty list mean the same). Tolerant of a short `line_size_spans`, which
 /// producers that never compose leave empty.
+#[inline]
 fn row_spans(input: &RenderInput, r: usize) -> &[LineSizeSpan] {
     input.line_size_spans.get(r).map_or(&[][..], Vec::as_slice)
 }
 
 /// Row `r`'s per-pane live-default backgrounds, or an empty slice when the row carries
 /// none (short vectors tolerated, as in [`row_spans`]).
+#[inline]
 fn default_bg_spans(input: &RenderInput, r: usize) -> &[DefaultBgSpan] {
     input.default_bg_spans.get(r).map_or(&[][..], Vec::as_slice)
 }
@@ -20595,6 +20758,7 @@ pub const fn kitty_image_is_below_non_default_bg(z_index: i32) -> bool {
 /// Whether `col` carries a placement of Kitty's deepest tier. The sparse list is
 /// sorted by column (see [`cluster_for`]), so the background-cover pass stays
 /// logarithmic per cell.
+#[inline]
 fn image_below_non_default_bg_covers(
     row_images: &[(usize, aterm_core::grid::extra::ImageRef)],
     col: usize,
@@ -20628,6 +20792,7 @@ struct ImageEqMemo {
 impl ImageEqMemo {
     /// Payload equality: `Arc::ptr_eq` first (the steady, no-re-transmit case), then the
     /// memoized derived `ImageData` compare, once per distinct pointer pair.
+    #[inline]
     fn image_eq(
         &mut self,
         a: &std::sync::Arc<aterm_core::grid::extra::ImageData>,
@@ -20654,6 +20819,7 @@ impl ImageEqMemo {
     /// equality minus `ImageRef::kitty`, the placement tag (identity for delete
     /// selectors, not pixels: a placement re-put under a new serial draws the same
     /// frame). Pinned by the `image_eq_memo_matches_derived_row_equality` test.
+    #[inline]
     fn rows_eq(
         &mut self,
         a: &[(usize, aterm_core::grid::extra::ImageRef)],
@@ -20676,6 +20842,7 @@ impl ImageEqMemo {
 /// so neither is checked here. Equality is exact, so an unchanged row is safe to reuse.
 /// Image content lives in `images`, not the cells, so the image clause catches an image
 /// change with no cell edit; an image-free row compares two empty lists.
+#[inline]
 fn row_differs(a: &RenderInput, b: &RenderInput, r: usize, memo: &mut ImageEqMemo) -> bool {
     row_differs_shifted(a, r, b, r, memo)
 }
@@ -20724,6 +20891,7 @@ fn row_meta_differs(
 /// equal. So is the default-bg span clause: a pane's OSC 11 / DECSCNM change leaves the
 /// cells equal while the opacity rule, the deepest image tier and the cursor and trail
 /// fallbacks key on it. Images go through the caller's [`ImageEqMemo`].
+#[inline]
 fn row_differs_shifted(
     a: &RenderInput,
     ra: usize,
@@ -20818,6 +20986,7 @@ fn row_glyph_ink_may_differ(
 /// (Also the REACH PROBE: a bench or oracle asserts this is `true` on the frames
 /// it claims to price, so a fixture that silently never reaches the stamp path
 /// cannot be mistaken for one that does.)
+#[inline]
 #[must_use]
 pub fn row_revisions_comparable(prev_input: &RenderInput, input: &RenderInput) -> bool {
     prev_input.rows == input.rows
@@ -20825,6 +20994,7 @@ pub fn row_revisions_comparable(prev_input: &RenderInput, input: &RenderInput) -
         && row_stamps_usable(prev_input, input, input.rows)
 }
 
+#[inline]
 fn row_stamps_usable(prev_input: &RenderInput, input: &RenderInput, rows: usize) -> bool {
     prev_input.row_rev_lane != 0
         && prev_input.row_rev_lane == input.row_rev_lane
@@ -20845,6 +21015,7 @@ fn row_stamps_usable(prev_input: &RenderInput, input: &RenderInput, rows: usize)
 /// Update `dst` from `src` like [`RenderInput::clone_from`], but when
 /// [`row_revisions_comparable`] holds, skip copying `cells[r]`, `clusters[r]`,
 /// and `combining[r]` for rows whose non-zero `row_rev[r]` stamp is unchanged.
+#[inline]
 pub fn clone_input_stamped(dst: &mut RenderInput, src: &RenderInput) {
     clone_input_stamped_inner(dst, src, false);
 }
@@ -20853,6 +21024,7 @@ pub fn clone_input_stamped(dst: &mut RenderInput, src: &RenderInput) {
 /// effect-stream payloads when their compact damage metadata is valid, and also skipping
 /// `cells[r]`, `clusters[r]` and `combining[r]` copies for rows whose non-zero `row_rev[r]`
 /// stamp is unchanged under [`row_revisions_comparable`].
+#[inline]
 pub fn clone_damage_cache_from_stamped(dst: &mut RenderInput, src: &RenderInput) {
     clone_input_stamped_inner(dst, src, true);
 }
@@ -21163,6 +21335,7 @@ render_trust_island! {
 }
 
 /// Mark row `r` dirty if it is in range (a no-op for an out-of-range cursor row).
+#[inline]
 fn mark(dirty: &mut [bool], r: usize) {
     if let Some(slot) = dirty.get_mut(r) {
         *slot = true;
@@ -21175,6 +21348,7 @@ fn mark(dirty: &mut [bool], r: usize) {
 /// when its metadata is valid, so a valid `prev_damage` without trusted current metadata
 /// answers "changed" unless both are provably empty. A false "unchanged" strands light on
 /// the glass (a vanished glow would read `[] == []`); a false "changed" costs a row.
+#[inline]
 fn effect_stream_changed<T: PartialEq>(
     prev: &[T],
     current: &[T],
@@ -21195,6 +21369,7 @@ fn effect_stream_changed<T: PartialEq>(
 /// Mark prev∪current rows from compact metadata when possible; otherwise walk
 /// the exact payloads, preserving compatibility for producers that have not
 /// opted into the metadata contract.
+#[inline]
 fn mark_effect_stream_rows(
     dirty: &mut [bool],
     prev_damage: &EffectStreamDamage,
@@ -21220,6 +21395,7 @@ fn mark_effect_stream_rows(
 /// Mark a row whose selected-cell rendering changed, and the row above it: glyph and mark
 /// rasters may overshoot above their band (`row_scale` clips downward only), so
 /// repainting `r` alone would let the CPU touch pixels the GPU's row scissor preserves.
+#[inline]
 fn mark_selection_row(dirty: &mut [bool], r: usize) {
     mark(dirty, r);
     if r > 0 {
@@ -21320,8 +21496,9 @@ impl DirtyRows {
     /// layer) rows; the fx layers never refuse the blit and their bands are in
     /// the flagged set. `any_dirty` is `true` because a scroll always exposes at
     /// least one row (`|delta| < rows`).
+    #[inline]
     #[must_use]
-    pub(crate) fn rows_only() -> Self {
+    pub(crate) const fn rows_only() -> Self {
         Self {
             any_dirty: true,
             cursor_changed: false,
@@ -21347,8 +21524,9 @@ impl DirtyRows {
     /// True iff the frame is pixel-identical to the prior one: no dirty row, no
     /// cursor change, the same blink/override state, and unchanged overlays. This
     /// is exactly the CPU/GPU gate-hit condition.
+    #[inline]
     #[must_use]
-    pub fn is_gate_hit(&self) -> bool {
+    pub const fn is_gate_hit(&self) -> bool {
         !self.any_dirty
             && !self.cursor_changed
             && !self.blink_or_override_changed
@@ -21376,6 +21554,7 @@ impl DirtyRows {
 /// unfocused window's HollowBlock), so it remains highest precedence. The
 /// frame-carried host/effect override comes next without mutating terminal
 /// DECSCUSR, and the terminal style is the fallback.
+#[inline]
 #[must_use]
 pub fn effective_cursor_style(
     input: &RenderInput,
@@ -21389,6 +21568,7 @@ pub fn effective_cursor_style(
 /// Whether the cursor is painted for `input` at this blink phase and renderer override:
 /// the shown-test [`compute_dirty_rows`] and `draw_cursor` share (effective style, then
 /// DECTCEM, blink phase and an in-range position).
+#[inline]
 fn cursor_shown_in(
     input: &RenderInput,
     blink_phase: bool,
@@ -21609,6 +21789,7 @@ pub fn chrome_ring_runs(
 /// The cells of `ring` whose single underline, in the ring's colour, is the capsule's
 /// floor: all but the two holding its rounded ends. [`chrome_ring_runs`] leaves the floor
 /// there to the underline, so descender ink-skip carves it; the host stamps these cells.
+#[inline]
 #[must_use]
 pub fn chrome_ring_floor_cols(ring: &ChromeRing) -> std::ops::Range<usize> {
     let (start, end) = (usize::from(ring.start), usize::from(ring.end));
@@ -21632,6 +21813,7 @@ pub fn chrome_ring_floor_cols(ring: &ChromeRing) -> std::ops::Range<usize> {
 /// whose ink or decoration did not move with it is rebuilt (`Diff`) or refuses
 /// the plan (`Rigid`). A jittered decoration (`dy != 0`) spills into a
 /// neighbour's band and still refuses.
+#[inline]
 fn scroll_blittable_content(input: &RenderInput) -> bool {
     /// Whether this stream was absent from the frame. Not `payload.is_empty()`: for the
     /// cached previous frame [`RenderInput::clone_damage_cache_from`] drops these four
@@ -21671,6 +21853,7 @@ fn scroll_blittable_content(input: &RenderInput) -> bool {
 /// The shifted twin of [`row_differs_shifted`] for the two streams the row
 /// diff leaves to their own channel in [`compute_dirty_rows`]: equal cells
 /// with equal overlays rasterize to the same pixels a row apart.
+#[inline]
 fn row_overlays_differ_shifted(a: &RenderInput, ra: usize, b: &RenderInput, rb: usize) -> bool {
     let (ia, ib) = (sparse_row_slice(&a.ink, ra), sparse_row_slice(&b.ink, rb));
     if ia.len() != ib.len()
@@ -21686,6 +21869,7 @@ fn row_overlays_differ_shifted(a: &RenderInput, ra: usize, b: &RenderInput, rb: 
 
 /// The sparkle-word decorations on row `r`, in draw order, each with its row
 /// cleared (the field [`row_overlays_differ_shifted`] compares them without).
+#[inline]
 fn row_decorations(input: &RenderInput, r: usize) -> impl Iterator<Item = WordDecoration> + '_ {
     input
         .word_decorations
@@ -21722,6 +21906,7 @@ const OVERSHOOT_APRON_ROWS: usize = 2;
 /// Public because both backends consume it (the argument holds for the GPU's glyph
 /// placement too). This is [`RetainedRows::Rigid`]; see [`scroll_shift_plan`] for the
 /// CPU's policy on a streaming flood.
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn scroll_blit_plan(
     prev: &RenderInput,
@@ -21961,12 +22146,14 @@ pub fn scroll_shift_plan(
 /// A cell whose raster depends on absolute framebuffer Y-parity: the procedural shade
 /// dithers U+2591–2593 ([`shade_phase_key`]). A scroll blit by an odd pixel count would
 /// carry one to the wrong phase, so its row re-rasterizes instead.
-fn cell_is_y_phase_sensitive(ch: char) -> bool {
+#[inline]
+const fn cell_is_y_phase_sensitive(ch: char) -> bool {
     matches!(ch as u32, 0x2591..=0x2593)
 }
 
 /// Whether viewport row `r` of `input` carries any [`cell_is_y_phase_sensitive`]
 /// cell (a shade dither), i.e. cannot be blitted across an odd-pixel scroll.
+#[inline]
 fn row_has_y_phase_cell(input: &RenderInput, r: usize) -> bool {
     input
         .cells
@@ -22653,7 +22840,14 @@ impl Scale {
 /// next-row bg fill would erase but the GPU (all backgrounds before any glyph) would
 /// keep; clipping here makes both drop it. The last row's overshoot lands in the bottom
 /// pad on both paths, so it stays unclipped. Upward overshoot is kept everywhere.
-pub fn row_scale(line_size: LineSize, y0: usize, ch: usize, is_last_row: bool) -> (Scale, i32) {
+#[inline]
+#[must_use]
+pub const fn row_scale(
+    line_size: LineSize,
+    y0: usize,
+    ch: usize,
+    is_last_row: bool,
+) -> (Scale, i32) {
     let (y0, ch) = (y0 as i32, ch as i32);
     let band_clip_y1 = if is_last_row { i32::MAX } else { y0 + ch };
     match line_size {
@@ -22704,6 +22898,7 @@ pub fn row_scale(line_size: LineSize, y0: usize, ch: usize, is_last_row: bool) -
 /// two pixels above it, and both backends leave it out. A rail that lights
 /// only some cells (a glint rail) leaves the gutter column unlit and the
 /// segment stays. `None` (a row with no raster) is `false`.
+#[inline]
 #[must_use]
 pub fn chrome_rail_covers_gutters(m: Option<&ChromeRaster>) -> bool {
     m.is_some_and(|m| {
@@ -22720,6 +22915,7 @@ pub fn chrome_rail_covers_gutters(m: Option<&ChromeRaster>) -> bool {
 /// pixel; the words rise by what the rail and its clear row need beyond the foot room, never
 /// more than the head room. Returns `(lift, rail_h)` in device pixels; every other row gets
 /// `(0, rail_h)`. Both backends fit by this.
+#[inline]
 #[must_use]
 pub fn chrome_fit(m: &ChromeRaster, room: (usize, usize)) -> (usize, usize) {
     let rail_h = usize::from(m.rail_h);
@@ -22737,6 +22933,7 @@ pub fn chrome_fit(m: &ChromeRaster, room: (usize, usize)) -> (usize, usize) {
 /// clip moves up with them to `[y0, y0 + ch − lift)`, so a descender keeps every pixel and
 /// nothing overshoots into the row above. Every other row gets `placed` back. Both backends
 /// place glyphs by this.
+#[inline]
 #[must_use]
 pub fn chrome_lifted(
     input: &RenderInput,
@@ -22760,7 +22957,9 @@ pub fn chrome_lifted(
 
 /// The on-screen cell advance (px) for a row of `line_size` — doubled for any
 /// double-width/height row, single otherwise.
-pub fn row_cell_w(line_size: LineSize, cell_w: usize) -> usize {
+#[inline]
+#[must_use]
+pub const fn row_cell_w(line_size: LineSize, cell_w: usize) -> usize {
     if matches!(line_size, LineSize::SingleWidth) {
         cell_w
     } else {
@@ -22774,6 +22973,7 @@ pub fn row_cell_w(line_size: LineSize, cell_w: usize) -> usize {
 /// cannot bleed into its neighbour: the run's box is the clip. A uniform row takes the run
 /// `0..cols`, giving exactly `col * row_cell_w(..)` and a whole-grid clip; in a hot column
 /// loop gate on [`row_is_uniform`] and keep the hoisted form for that case.
+#[inline]
 #[must_use]
 pub fn cell_x_run(
     input: &RenderInput,
@@ -22796,6 +22996,7 @@ pub fn cell_x_run(
 /// Whether one DEC line size governs every column of `row`, so a column loop can hoist
 /// `row_cell_w` and use `col * rcw`. True for every single-pane frame and any split whose
 /// panes all sit on ordinary lines.
+#[inline]
 #[must_use]
 pub fn row_is_uniform(input: &RenderInput, row: usize) -> bool {
     input
@@ -22809,6 +23010,7 @@ pub fn row_is_uniform(input: &RenderInput, row: usize) -> bool {
 /// `baseline` the ascent; `ax/ay/gw/gh/xmin/ymin` the atlas slot; `aw/ah` the atlas size.
 /// `None` when the clip leaves nothing. Nearest sampling reproduces the CPU [`blit`]'s
 /// integer replicate and clip exactly.
+#[inline]
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn glyph_quad(
@@ -22860,6 +23062,7 @@ pub fn glyph_quad(
 /// Horizontal cell origin (the `cell_x`/`cell_left` for [`blit`] / [`glyph_quad`]) that
 /// centres a combining mark's ink in column `c`: cell advance `rcw`, ink `gw` px wide with
 /// left bearing `xmin`, under `scale`. Integer arithmetic shared by the CPU and GPU paths.
+#[inline]
 #[must_use]
 pub fn mark_cell_x(c: usize, rcw: usize, gw: usize, xmin: i32, scale: Scale) -> i32 {
     mark_cell_x_at((c * rcw) as i32, rcw, gw, xmin, scale)
@@ -22870,6 +23073,7 @@ pub fn mark_cell_x(c: usize, rcw: usize, gw: usize, xmin: i32, scale: Scale) -> 
 /// is a pure offset, so the result is in whatever space `cell_left` is in. `gw`/`xmin` are
 /// the reported raster box, not the ink: the column pad is nearly symmetric, so box and ink
 /// centring agree to within a pixel (the vertical rule, [`MarkStack`], needs the ink).
+#[inline]
 #[must_use]
 pub fn mark_cell_x_at(cell_left: i32, rcw: usize, gw: usize, xmin: i32, scale: Scale) -> i32 {
     let xs = scale.xs.max(1) as i32;
@@ -22880,6 +23084,7 @@ pub fn mark_cell_x_at(cell_left: i32, rcw: usize, gw: usize, xmin: i32, scale: S
 /// `cell_width` is the on-screen advance, already including a DEC run's scale.
 /// Sharing this rounded device-pixel shift keeps CPU and GPU placement identical;
 /// putting the nudge in the glyph bearing alone would be cancelled by centring.
+#[inline]
 #[must_use]
 pub fn mark_script_shift(script: aterm_core::terminal::Script, cell_width: usize) -> i32 {
     match script {
@@ -22945,6 +23150,7 @@ impl MarkStack {
     /// Device-pixel y offset for the cell's next mark, whose ink box ([`glyph_ink_box`]) is
     /// `ink_h` rows tall with its bottom edge `ink_ymin` rows above the baseline, in a cell
     /// `cell_h` rows tall with the baseline `baseline` rows down, under vertical scale `ys`.
+    #[inline]
     #[must_use]
     pub fn dy(
         &mut self,
@@ -23096,7 +23302,9 @@ fn ligature_run_boundaries_into(input: &RenderInput, r: usize, boundaries: &mut 
 /// The style bits for a cell: SGR 1 bold, SGR 3 italic, and the chrome-only
 /// vertical script ([`aterm_core::terminal::Script`]). Public so the GPU
 /// instance builder keys glyphs with the same style as the CPU.
-pub fn cell_style(cell: &RenderCell) -> StyleBits {
+#[inline]
+#[must_use]
+pub const fn cell_style(cell: &RenderCell) -> StyleBits {
     let mut bits = 0u8;
     if cell.bold {
         bits |= StyleBits::BOLD.0;
@@ -23134,6 +23342,7 @@ pub const SUB_CEILING: f32 = 0.42;
 /// fractional pixels, never rounded ([`resample_mask_placed`] carries the fraction, so small
 /// letters keep an even rhythm and one baseline). `y` is never above the ceiling. A pure
 /// function, so the CPU cache and the GPU atlas (which takes the CPU's raster) agree.
+#[inline]
 #[must_use]
 pub fn script_drop(
     (xmin, ymin, _, height): (i32, i32, usize, usize),
@@ -23462,6 +23671,7 @@ fn apply_synthetic_style(
 /// piecewise curve (not a bare `pow(2.2)`, which is visibly wrong near black
 /// where terminal text edges live). An 8-bit channel reads it from
 /// [`srgb8_to_linear`]'s table.
+#[inline]
 #[must_use]
 pub fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.040_45 {
@@ -23472,6 +23682,7 @@ pub fn srgb_to_linear(c: f32) -> f32 {
 }
 
 /// Inverse sRGB OETF — linear-light (0..1) → gamma-encoded channel (0..1).
+#[inline]
 #[must_use]
 pub fn linear_to_srgb(l: f32) -> f32 {
     if l <= 0.003_130_8 {
@@ -23567,6 +23778,7 @@ pub const TEXT_BLEND_EPS: f32 = 0.001;
 /// * `|fg_l - bg_l| < TEXT_BLEND_EPS` returns `a` bit-exactly.
 /// * `a = 0` and `a = 1` map near 0 and 1 (the exact byte endpoints are [`blend_text`]'s
 ///   early returns).
+#[inline]
 #[must_use]
 pub fn correct_alpha(fg_l: f32, bg_l: f32, a: f32) -> f32 {
     if (fg_l - bg_l).abs() < TEXT_BLEND_EPS {
@@ -23579,6 +23791,7 @@ pub fn correct_alpha(fg_l: f32, bg_l: f32, a: f32) -> f32 {
 /// Relative luminance (BT.709, the WCAG luminance the contrast floors compare) of a packed
 /// `0x00RRGGBB` sRGB pixel, via the per-byte LUT. The GPU twin is
 /// `dot(s2l(c.rgb), vec3(0.2126, 0.7152, 0.0722))`, same coefficients and add order.
+#[inline]
 #[must_use]
 pub fn linear_luminance(rgb: u32) -> f32 {
     let l = |sh: u32| SRGB_TO_LINEAR_LUT[((rgb >> sh) & 0xff) as usize];
@@ -23597,6 +23810,7 @@ pub fn linear_luminance(rgb: u32) -> f32 {
 ///
 /// `t == 0` returns `dst` and `t == 255` returns `fg` exactly in both modes, before any
 /// float math (`endpoint_exactness_both_modes` in `tests/text_blending.rs`).
+#[inline]
 #[must_use]
 pub fn blend_text(dst: u32, fg: u32, bg: u32, t: u8, corrected: bool) -> u32 {
     if t == 0 {
@@ -23693,6 +23907,7 @@ struct AlphaMemo {
 }
 
 impl AlphaMemo {
+    #[inline]
     fn new() -> Self {
         Self {
             key: None,
@@ -23706,6 +23921,7 @@ impl AlphaMemo {
     }
 
     /// Point this way at `(fg, bg)`, orphaning what it held, with no table work.
+    #[inline]
     fn rekey(&mut self, fg: u32, bg: u32) {
         self.key = Some((fg, bg));
         self.fg_px = fg & 0x00ff_ffff;
@@ -23781,6 +23997,7 @@ impl Default for AlphaMemoBank {
 impl AlphaMemoBank {
     /// The way holding `(fg, bg)`, claiming (and rekeying) one if absent. Called once per
     /// blit, never per texel.
+    #[inline]
     fn way_for(&mut self, fg: u32, bg: u32) -> &mut AlphaMemo {
         let want = Some((fg, bg));
         if let Some(i) = self.ways.iter().position(|way| way.key == want) {
@@ -23814,8 +24031,9 @@ pub const STEM_GAMMA_MAX: f32 = 3.0;
 
 /// Shared stem-gamma clamp policy: finite values clamp to
 /// `STEM_GAMMA_MIN..=STEM_GAMMA_MAX`; non-finite falls back to the identity `1.0`.
+#[inline]
 #[must_use]
-pub fn clamp_stem_gamma(gamma: f32) -> f32 {
+pub const fn clamp_stem_gamma(gamma: f32) -> f32 {
     if gamma.is_finite() {
         gamma.clamp(STEM_GAMMA_MIN, STEM_GAMMA_MAX)
     } else {
@@ -23843,6 +24061,7 @@ fn build_stem_lut(gamma: f32) -> [u8; 256] {
 
 /// Stem-darken a coverage bitmap in place through `lut` (the renderer's `stem_gamma` table
 /// from [`build_stem_lut`]). Endpoints are fixed, so a hard-edged glyph is unchanged.
+#[inline]
 fn stem_darken(cov: &mut [u8], lut: &[u8; 256]) {
     for c in cov.iter_mut() {
         *c = lut[*c as usize];
@@ -23851,6 +24070,7 @@ fn stem_darken(cov: &mut [u8], lut: &[u8; 256]) {
 
 /// A zero-sized colour glyph: the blit treats it as a no-op (like a space).
 /// Returned when a colour-emoji bitmap is missing or undecodable.
+#[inline]
 fn empty_rgba() -> GlyphImage {
     GlyphImage::Rgba {
         width: 0,
@@ -23863,8 +24083,10 @@ fn empty_rgba() -> GlyphImage {
 }
 
 /// Pack an `[r, g, b]` triple into the framebuffer's `0x00RRGGBB` format.
-pub fn rgb_to_u32([r, g, b]: [u8; 3]) -> u32 {
-    (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+#[inline]
+#[must_use]
+pub const fn rgb_to_u32([r, g, b]: [u8; 3]) -> u32 {
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
 /// W9: theme POLARITY — whether `bg` reads as a DARK background, the
@@ -23878,6 +24100,7 @@ pub fn rgb_to_u32([r, g, b]: [u8; 3]) -> u32 {
 /// called greys `#979797`..=`#BBBBBB` dark while the tab strip, toolbar and
 /// caption called them light, so text weight and effects sat on the opposite
 /// side from the chrome around them. The high byte of `bg` is ignored.
+#[inline]
 #[must_use]
 pub fn theme_is_dark(bg: u32) -> bool {
     let [_, r, g, b] = bg.to_be_bytes();
@@ -23922,6 +24145,7 @@ mod theme_polarity_tests {
 }
 
 /// WCAG contrast ratio (>= 1) between two `0x00RRGGBB` colours.
+#[inline]
 fn contrast_ratio(a: u32, b: u32) -> f32 {
     let (la, lb) = (linear_luminance(a), linear_luminance(b));
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
@@ -24052,6 +24276,8 @@ fn resolve_selection_colors(
 
 /// Floor a glyph's fg contrast against the selection background to 4.5:1 (xterm's
 /// minimumContrastRatio applied to the selection band), so selected text stays legible.
+#[inline]
+#[must_use]
 pub fn floor_selection_fg(fg: u32, selection_bg: u32) -> u32 {
     floor_fg_contrast(fg, selection_bg, 4.5)
 }
@@ -24073,6 +24299,7 @@ pub fn floor_selection_fg(fg: u32, selection_bg: u32) -> u32 {
 /// The pole is chosen by comparing the two contrasts (black wins iff
 /// `L(bg) >= sqrt(0.05·1.05) − 0.05 ≈ 0.1791`), not at `L(bg) > 0.5`: for
 /// `0.18 < L <= 0.5` that midpoint picks white although black contrasts more.
+#[inline]
 #[must_use]
 pub fn floor_fg_contrast(fg: u32, bg: u32, min: f32) -> u32 {
     if contrast_ratio(fg, bg) >= min {
@@ -24107,6 +24334,7 @@ pub fn floor_fg_contrast(fg: u32, bg: u32, min: f32) -> u32 {
 /// against its own cell bg. `min_contrast <= 1.0` is off and returns `fg` untouched. So is
 /// `fg == bg`: SGR 8 (conceal) resolves fg = bg upstream (`color_resolve.rs`), and flooring
 /// it would reveal hidden text.
+#[inline]
 #[must_use]
 pub fn floor_min_contrast_fg(fg: u32, bg: u32, min_contrast: f32) -> u32 {
     if min_contrast <= 1.0 || fg == bg {
@@ -24122,6 +24350,7 @@ pub fn floor_min_contrast_fg(fg: u32, bg: u32, min_contrast: f32) -> u32 {
 ///   the selection band painted.
 /// * Unselected: the host's per-cell minimum-contrast floor against the cell bg (off by
 ///   default).
+#[inline]
 #[must_use]
 pub fn effective_glyph_fg(
     selection_fg: Option<u32>,
@@ -24158,6 +24387,7 @@ pub struct DecoInks {
 /// channel outranks it (a program's chosen colour is not animated over). An explicit
 /// channel is never replaced by `selectionForeground` but still passes the floors, so a
 /// floored glyph never sits on an illegible rule.
+#[inline]
 #[must_use]
 pub fn deco_inks(
     cell: &RenderCell,
@@ -24188,6 +24418,7 @@ pub fn deco_inks(
 /// Unlike [`floor_min_contrast_fg`] there is no `fg == bg` exemption: a cursor equal to the
 /// cell bg is the worst case (that exemption only keeps SGR 8 text hidden). The block fill
 /// and its cut-out remap operand both use this value on both backends.
+#[inline]
 #[must_use]
 pub fn floor_cursor_fill(cursor: u32, cell_bg: u32, min_contrast: f32) -> u32 {
     if min_contrast <= 1.0 {
@@ -24215,12 +24446,15 @@ use sparse::SparseCell;
 impl SparseCell for InkCell {
     type V = [u8; 3];
     const NAME: &'static str = "ink";
+    #[inline]
     fn row(&self) -> u16 {
         self.row
     }
+    #[inline]
     fn col(&self) -> u16 {
         self.col
     }
+    #[inline]
     fn value(&self) -> [u8; 3] {
         self.color
     }
@@ -24229,12 +24463,15 @@ impl SparseCell for InkCell {
 impl SparseCell for CharFg {
     type V = u32;
     const NAME: &'static str = "char_fg";
+    #[inline]
     fn row(&self) -> u16 {
         self.row
     }
+    #[inline]
     fn col(&self) -> u16 {
         self.col
     }
+    #[inline]
     fn value(&self) -> u32 {
         self.fg
     }
@@ -24243,12 +24480,15 @@ impl SparseCell for CharFg {
 impl SparseCell for FireHaloCell {
     type V = u8;
     const NAME: &'static str = "fire_halo";
+    #[inline]
     fn row(&self) -> u16 {
         self.row
     }
+    #[inline]
     fn col(&self) -> u16 {
         self.col
     }
+    #[inline]
     fn value(&self) -> u8 {
         self.strength
     }
@@ -24258,6 +24498,7 @@ impl SparseCell for FireHaloCell {
 /// [`FireHaloCell`]): the stream is sorted by `(row, col)`, so two `partition_point`s bound
 /// it. Called once per row per pass; a row beyond `u16` carries no override and gets the
 /// empty slice. Shared by the CPU row passes and the GPU instance loops.
+#[inline]
 #[must_use]
 pub fn sparse_row_slice<T: SparseCell>(v: &[T], row: usize) -> &[T] {
     let Ok(row) = u16::try_from(row) else {
@@ -24277,6 +24518,7 @@ pub fn sparse_row_slice<T: SparseCell>(v: &[T], row: usize) -> &[T] {
 }
 
 /// [`sparse_row_slice`] over the Emberforge contrast-halo stream.
+#[inline]
 #[must_use]
 pub fn fire_halo_row_slice(fire_halo: &[FireHaloCell], row: u16) -> &[FireHaloCell] {
     sparse_row_slice(fire_halo, usize::from(row))
@@ -24293,8 +24535,9 @@ pub struct SparseRowWalk<'a, T> {
 }
 
 impl<'a, T: SparseCell> SparseRowWalk<'a, T> {
+    #[inline]
     #[must_use]
-    pub fn new(slice: &'a [T]) -> Self {
+    pub const fn new(slice: &'a [T]) -> Self {
         Self { slice, i: 0 }
     }
 
@@ -24640,6 +24883,7 @@ fn stamp_free_sprite(
 /// `selectionInactiveBackground`: the active selection blended halfway toward the theme bg,
 /// as xterm dims an unfocused band (default theme: `0x33415E` over `0x111318` gives
 /// `0x222A3B`). Pure, so the CPU fill and the GPU encode agree.
+#[inline]
 #[must_use]
 pub fn derive_inactive_selection_bg(active_selection: u32, theme_bg: u32) -> u32 {
     blend(theme_bg, active_selection, 128)
@@ -24647,6 +24891,7 @@ pub fn derive_inactive_selection_bg(active_selection: u32, theme_bg: u32) -> u32
 
 /// Blend `fg` over `bg` by coverage `t` (0..=255) per channel: the public entry so hosts
 /// (e.g. the drop-target wash) pre-blend quads with the CPU's integer math ([`blend`]).
+#[inline]
 #[must_use]
 pub fn blend_rgb(bg: u32, fg: u32, t: u8) -> u32 {
     blend(bg, fg, t)
@@ -24656,11 +24901,14 @@ pub fn blend_rgb(bg: u32, fg: u32, t: u8) -> u32 {
 /// `(c*a + 127) / 255`. The single rounding point for additive light: the host bakes the
 /// result into [`GlowQuad::color`], so both renderers add the same 8-bit value
 /// ([`add_sat`]).
+#[inline]
 #[must_use]
-pub fn premul_rgb(rgb: u32, a: u8) -> u32 {
+pub const fn premul_rgb(rgb: u32, a: u8) -> u32 {
     let a = a as u32;
-    let m = |c: u32| -> u32 { (c * a + 127) / 255 };
-    (m((rgb >> 16) & 0xff) << 16) | (m((rgb >> 8) & 0xff) << 8) | m(rgb & 0xff)
+    let r = (((rgb >> 16) & 0xff) * a + 127) / 255;
+    let g = (((rgb >> 8) & 0xff) * a + 127) / 255;
+    let b = ((rgb & 0xff) * a + 127) / 255;
+    (r << 16) | (g << 8) | b
 }
 
 /// The gradient law of a [`GlowQuad`] ([`GlowQuad::color2`]): the value column `i` of a
@@ -24681,9 +24929,10 @@ pub fn premul_rgb(rgb: u32, a: u8) -> u32 {
 /// `w − 1`; `w == 0` counts as `1`.
 #[must_use]
 #[inline]
-pub fn glow_lerp(c0: u32, c1: u32, i: u32, w: u32) -> u32 {
-    let w = w.max(1);
-    let m = 2 * i.min(w - 1) + 1;
+pub const fn glow_lerp(c0: u32, c1: u32, i: u32, w: u32) -> u32 {
+    let w = if w < 1 { 1 } else { w };
+    let i_clamped = if i < w - 1 { i } else { w - 1 };
+    let m = 2 * i_clamped + 1;
     (c0 * (2 * w - m) + c1 * m + w) / (2 * w)
 }
 
@@ -24691,21 +24940,29 @@ pub fn glow_lerp(c0: u32, c1: u32, i: u32, w: u32) -> u32 {
 /// dropped (it is zero on every premultiplied light colour).
 #[must_use]
 #[inline]
-pub fn glow_lerp_rgb(c0: u32, c1: u32, i: u32, w: u32) -> u32 {
-    let ch = |sh: u32| glow_lerp((c0 >> sh) & 0xff, (c1 >> sh) & 0xff, i, w);
-    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+pub const fn glow_lerp_rgb(c0: u32, c1: u32, i: u32, w: u32) -> u32 {
+    let r = glow_lerp((c0 >> 16) & 0xff, (c1 >> 16) & 0xff, i, w);
+    let g = glow_lerp((c0 >> 8) & 0xff, (c1 >> 8) & 0xff, i, w);
+    let b = glow_lerp(c0 & 0xff, c1 & 0xff, i, w);
+    (r << 16) | (g << 8) | b
 }
 
 /// Saturating per-channel add of a premultiplied light colour onto `dst`
 /// (`min(255, dst_c + premul_c)`): the integer twin of the GPU's `One`/`One` blend over the
 /// linear `Rgba8Unorm` target, bit-identical for 8-bit operands. Order-independent.
+#[inline]
 #[must_use]
-pub fn add_sat(dst: u32, premul: u32) -> u32 {
-    let a = |sh: u32| -> u32 { (((dst >> sh) & 0xff) + ((premul >> sh) & 0xff)).min(255) };
+pub const fn add_sat(dst: u32, premul: u32) -> u32 {
+    let r = ((dst >> 16) & 0xff) + ((premul >> 16) & 0xff);
+    let g = ((dst >> 8) & 0xff) + ((premul >> 8) & 0xff);
+    let b = (dst & 0xff) + (premul & 0xff);
+    let r = if r > 255 { 255 } else { r };
+    let g = if g > 255 { 255 } else { g };
+    let b = if b > 255 { 255 } else { b };
     // The top (transmittance) byte rides through untouched, as the GPU draws this stream
     // with `WriteMask::Color`; zeroing it would make glow-touched pixels opaque on surfaces
     // that turn transmittance into output alpha (canvas presents, RGBA/PNG captures).
-    (dst & 0xFF00_0000) | (a(16) << 16) | (a(8) << 8) | a(0)
+    (dst & 0xFF00_0000) | (r << 16) | (g << 8) | b
 }
 
 /// Source-over a premultiplied light colour `premul` onto `dst` at opacity `a` (0..=255),
@@ -24724,14 +24981,18 @@ pub fn add_sat(dst: u32, premul: u32) -> u32 {
 /// Well-formed operands cannot saturate: `premul_c <= a` ([`premul_rgb`]) and the
 /// destination term is at most `255 − a`; the `min` guards a malformed pair. The
 /// transmittance byte is carried through, as in `add_sat`.
+#[inline]
 #[must_use]
-pub fn over_premul(dst: u32, premul: u32, a: u8) -> u32 {
+pub const fn over_premul(dst: u32, premul: u32, a: u8) -> u32 {
     let inv = 255 - a as u32;
-    let ch = |sh: u32| -> u32 {
-        (((premul >> sh) & 0xff) + (((dst >> sh) & 0xff) * inv + 127) / 255).min(255)
-    };
+    let r = ((premul >> 16) & 0xff) + (((dst >> 16) & 0xff) * inv + 127) / 255;
+    let g = ((premul >> 8) & 0xff) + (((dst >> 8) & 0xff) * inv + 127) / 255;
+    let b = (premul & 0xff) + ((dst & 0xff) * inv + 127) / 255;
+    let r = if r > 255 { 255 } else { r };
+    let g = if g > 255 { 255 } else { g };
+    let b = if b > 255 { 255 } else { b };
     // Transmittance byte carried through — see [`add_sat`].
-    (dst & 0xFF00_0000) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+    (dst & 0xFF00_0000) | (r << 16) | (g << 8) | b
 }
 
 /// Source-over a straight colour `rgb` onto `dst` at coverage `a` (0..=255), per channel,
@@ -24741,14 +25002,16 @@ pub fn over_premul(dst: u32, premul: u32, a: u8) -> u32 {
 /// never an integer) and the float error is far below the half-LSB gap, so both land the
 /// same byte. The transmittance byte is carried through, as in [`add_sat`]. `a == 255`
 /// returns `rgb`, `a == 0` `dst`'s RGB exactly.
+#[inline]
 #[must_use]
-pub fn over_rgb(dst: u32, rgb: u32, a: u8) -> u32 {
+pub const fn over_rgb(dst: u32, rgb: u32, a: u8) -> u32 {
     let a = a as u32;
-    let ch = |sh: u32| -> u32 {
-        (((rgb >> sh) & 0xff) * a + ((dst >> sh) & 0xff) * (255 - a) + 127) / 255
-    };
+    let inv = 255 - a;
+    let r = (((rgb >> 16) & 0xff) * a + ((dst >> 16) & 0xff) * inv + 127) / 255;
+    let g = (((rgb >> 8) & 0xff) * a + ((dst >> 8) & 0xff) * inv + 127) / 255;
+    let b = ((rgb & 0xff) * a + (dst & 0xff) * inv + 127) / 255;
     // Transmittance byte carried through — see [`add_sat`].
-    (dst & 0xFF00_0000) | (ch(16) << 16) | (ch(8) << 8) | ch(0)
+    (dst & 0xFF00_0000) | (r << 16) | (g << 8) | b
 }
 
 /// Per-row Y term of the [`RainHalo`] elliptical falloff, `ny = (dy²·256)/ry²` (`>= 256`
@@ -24756,7 +25019,8 @@ pub fn over_rgb(dst: u32, rgb: u32, a: u8) -> u32 {
 /// [`halo_weight`] by `draw_radial_add` and the spill-band rasterizer
 /// ([`spill::SpillBand`]), so the in-frame ring and the exported spill stay continuous.
 #[inline]
-pub fn halo_row_ny(dy: i32, ry2: i32) -> i32 {
+#[must_use]
+pub const fn halo_row_ny(dy: i32, ry2: i32) -> i32 {
     (dy * dy * 256) / ry2
 }
 
@@ -24764,7 +25028,8 @@ pub fn halo_row_ny(dy: i32, ry2: i32) -> i32 {
 /// `nsq = (dx²·256)/rx² + ny`: the integer math the GPU `fs_rain_glow`/`fs_rain_glow_over`
 /// shaders mirror. `0` means write nothing; callers clamp the weight to 255.
 #[inline]
-pub fn halo_weight(dx: i32, ny: i32, rx2: i32) -> i32 {
+#[must_use]
+pub const fn halo_weight(dx: i32, ny: i32, rx2: i32) -> i32 {
     halo_weight_at(halo_col_nx(dx, rx2), ny)
 }
 
@@ -24773,14 +25038,16 @@ pub fn halo_weight(dx: i32, ny: i32, rx2: i32) -> i32 {
 /// this per column and pay a load per pixel instead (the divide is a fifth of the rainbow
 /// budget's claim walk). [`halo_weight`] is this composed with [`halo_weight_at`].
 #[inline]
-pub fn halo_col_nx(dx: i32, rx2: i32) -> i32 {
+#[must_use]
+pub const fn halo_col_nx(dx: i32, rx2: i32) -> i32 {
     (dx * dx * 256) / rx2
 }
 
 /// [`halo_weight`] with both axis terms already resolved — `((256 − nx − ny)²
 /// >> 8)`, clamped at `0`.
 #[inline]
-pub fn halo_weight_at(nx: i32, ny: i32) -> i32 {
+#[must_use]
+pub const fn halo_weight_at(nx: i32, ny: i32) -> i32 {
     let mut wt = 256 - (nx + ny);
     if wt < 0 {
         wt = 0;
@@ -24796,7 +25063,7 @@ pub fn halo_weight_at(nx: i32, ny: i32) -> i32 {
 /// [`RainHalo`] field; the GPU `fs_rain_glow_over` decodes it from the instance alpha.
 #[inline]
 #[must_use]
-pub fn halo_over_cap(color: u32) -> u8 {
+pub const fn halo_over_cap(color: u32) -> u8 {
     let cap = (color >> 24) as u8;
     if cap == 0 { 255 } else { cap }
 }
@@ -24843,8 +25110,9 @@ pub struct BeamClip {
 }
 impl BeamClip {
     /// Identity clip for a bare grid (tests/benches/demos): box == grid, origin 0.
+    #[inline]
     #[must_use]
-    pub fn grid(w_px: usize, h_px: usize, cell_h: usize) -> Self {
+    pub const fn grid(w_px: usize, h_px: usize, cell_h: usize) -> Self {
         Self {
             x0: 0,
             y0: 0,
@@ -25147,6 +25415,7 @@ impl BeamScratch {
 /// is structural. Vertices are window-absolute px; quads are clamped to `clip`'s effects box
 /// and split per cell row with bands anchored at `clip.origin_y` (above-grid bands tag row
 /// 0). Fewer than two vertices, or a zero thickness, is a no-op.
+#[inline]
 pub fn comet_beam(
     out: &mut Vec<GlowQuad>,
     clip: BeamClip,
@@ -25167,6 +25436,7 @@ pub fn comet_beam(
 /// corner overlap darkens once more, as it brightens once more in the additive
 /// beam. Quads composite in emission order (source-over does not commute), the
 /// order both presenters keep.
+#[inline]
 pub fn comet_beam_over(
     out: &mut Vec<GlowQuad>,
     clip: BeamClip,
@@ -25305,7 +25575,7 @@ pub const RIBBON_CORE_SHARE: f32 = 0.5;
 /// [`ribbon_profile`] is built from.
 #[inline]
 #[must_use]
-pub fn smoothstep01(x: f32) -> f32 {
+pub const fn smoothstep01(x: f32) -> f32 {
     let x = x.clamp(0.0, 1.0);
     x * x * (3.0 - 2.0 * x)
 }
@@ -25953,6 +26223,7 @@ pub const LASER_LAYERS: [(f32, f32, u32, f32, f32, usize); 3] = [
 /// This is the SINGLE definition of the comet's appearance, shared by the live
 /// cursor animator and the render demos so the look can never drift between them.
 /// Fewer than two samples is a no-op (the caller draws a lone-cell dot itself).
+#[inline]
 pub fn comet_glow_quads(
     out: &mut Vec<GlowQuad>,
     clip: BeamClip,
@@ -25966,6 +26237,7 @@ pub fn comet_glow_quads(
 
 /// Emit the phaser streak ([`PHASER_LAYERS`]: a near-cell-height band of spectrum under a
 /// tight halo), as [`comet_glow_quads`] does the comet.
+#[inline]
 pub fn phaser_streak_quads(
     out: &mut Vec<GlowQuad>,
     clip: BeamClip,
@@ -25987,6 +26259,7 @@ pub fn phaser_streak_quads(
 
 /// Emit the beam tube ([`BEAM_LAYERS`]: a solid luminous rod in a deep-space sleeve), as
 /// [`comet_glow_quads`] does the comet.
+#[inline]
 pub fn beam_glow_quads(
     out: &mut Vec<GlowQuad>,
     clip: BeamClip,
@@ -26064,6 +26337,7 @@ pub fn layered_beam_quads_with(
 /// [`layered_beam_quads_with`] on a per-call scratch: the body the
 /// convenience wrappers share (each call allocates its buffers; a per-frame
 /// caller holds a [`BeamScratch`] and calls the `_with` form instead).
+#[inline]
 fn layered_beam_quads(
     out: &mut Vec<GlowQuad>,
     clip: BeamClip,
@@ -26093,6 +26367,7 @@ fn layered_beam_quads(
 /// fully-empty (`t == 0`) and fully-covered (`t == 255`) cases are returned EXACT
 /// (no sRGB round-trip), so solid fills and the endpoint contract are
 /// bit-precise — only the antialiased fringe goes through the LUTs.
+#[inline]
 fn blend(bg: u32, fg: u32, t: u8) -> u32 {
     if t == 0 {
         // Keep `bg`'s transmittance byte: zero coverage adds nothing.
@@ -26121,6 +26396,8 @@ const IMAGE_MAX_DIMENSION: u32 = 4096;
 
 /// Decode an 8-bit PNG to packed RGBA8, `(rgba, width, height)`, through the one hardened
 /// decoder ([`aterm_png::decode_rgba8`]) under the inline-image cap `IMAGE_MAX_DIMENSION`.
+#[inline]
+#[must_use]
 pub fn decode_png_rgba8(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
     aterm_png::decode_rgba8(bytes, IMAGE_MAX_DIMENSION)
 }
@@ -26179,6 +26456,8 @@ pub fn decode_png_rgba8(bytes: &[u8]) -> Option<(Vec<u8>, usize, usize)> {
 /// covered cell's pixels match the CPU `blit_image_cell` 1:1 tile (the CPU/GPU
 /// inline-image parity gate). The crop and the scaling happen HERE, in the one
 /// shared decode, so neither renderer can drift from the other on them.
+#[inline]
+#[must_use]
 pub fn decode_image_to_footprint(
     bytes: &[u8],
     format: aterm_core::grid::extra::ImageFormat,
@@ -26303,6 +26582,7 @@ pub const MAX_PLACEMENT_RASTER_SIDE: usize = 16_384;
 /// itself while it is within [`MAX_PLACEMENT_RASTER_PX`] and
 /// [`MAX_PLACEMENT_RASTER_SIDE`], else the footprint scaled down uniformly
 /// (aspect kept, each side at least 1 px) until it is.
+#[inline]
 #[must_use]
 pub fn placement_raster_size(fp_w: usize, fp_h: usize) -> (usize, usize) {
     raster_size_at_most(fp_w, fp_h, MAX_PLACEMENT_RASTER_PX)
@@ -26311,6 +26591,7 @@ pub fn placement_raster_size(fp_w: usize, fp_h: usize) -> (usize, usize) {
 /// [`placement_raster_size`] held to at most `cap_px` pixels too (one frame's
 /// [`frame_raster_cap`]): that raster when it is within the cap, else the
 /// footprint scaled down uniformly to it. Never more pixels than either.
+#[inline]
 #[must_use]
 pub fn placement_raster_size_within(fp_w: usize, fp_h: usize, cap_px: usize) -> (usize, usize) {
     let full = placement_raster_size(fp_w, fp_h);
@@ -26393,6 +26674,7 @@ pub fn frame_raster_cap(demands: &mut [usize]) -> usize {
 /// `rows × cell_h`, plus the chrome band's lift
 /// ([`band_lift_px`](aterm_core::grid::extra::ImageData::band_lift_px)) — the
 /// box both renderers decode it for.
+#[inline]
 #[must_use]
 pub fn placement_footprint(
     image: &aterm_core::grid::extra::ImageData,
@@ -26407,6 +26689,7 @@ pub fn placement_footprint(
 /// The raster pixel a footprint pixel `f` (of `fp` along this axis) samples on a
 /// `raster`-px axis: the one under its centre, `⌊(f + ½) · raster / fp⌋`, as a GPU's nearest
 /// sampler picks. `f` itself when the raster is the footprint.
+#[inline]
 fn placement_raster_coord(f: usize, fp: usize, raster: usize) -> usize {
     let at = (2 * f as u64 + 1) * raster as u64 / (2 * fp.max(1) as u64);
     usize::try_from(at).unwrap_or(usize::MAX)
@@ -26436,6 +26719,7 @@ pub struct PlacementRaster {
 /// itself unless it passes [`MAX_PLACEMENT_RASTER_PX`] or
 /// [`MAX_PLACEMENT_RASTER_SIDE`] — and a footprint pixel `(x, y)` draws the
 /// raster pixel under its centre, scaled by `w / fp_w` and `h / fp_h`.
+#[inline]
 #[must_use]
 pub fn decode_placement(
     image: &aterm_core::grid::extra::ImageData,
@@ -26540,6 +26824,7 @@ fn place_rgba_at_origin(
 /// integer cross-multiplication decides which axis binds, so a source whose aspect equals
 /// the box's fits it exactly. Each side is at least 1.
 #[doc(hidden)]
+#[inline]
 #[must_use]
 pub fn aspect_fit_box(src_w: usize, src_h: usize, fp_w: usize, fp_h: usize) -> (usize, usize) {
     let (sw, sh) = (src_w as u64, src_h as u64);
@@ -26598,6 +26883,7 @@ fn fit_rgba_into_footprint(
 /// strike; otherwise it is `>=` every strike. The exhaustive strike lattice
 /// in `tests/emoji_resample.rs` checks it.
 #[doc(hidden)]
+#[inline]
 #[must_use]
 pub fn select_strike_ppem(strikes: &[u16], target: u16) -> Option<u16> {
     strikes
@@ -26618,6 +26904,7 @@ pub fn select_strike_ppem(strikes: &[u16], target: u16) -> Option<u16> {
 /// exhaustive lattice in `tests/emoji_resample.rs` (`ty`'s expression language has no `*`,
 /// so there is no derived model).
 #[doc(hidden)]
+#[inline]
 #[must_use]
 pub fn area_overlap(d: usize, s: usize, src: usize, dst: usize) -> u64 {
     let (d, s, src, dst) = (d as u64, s as u64, src as u64, dst as u64);
@@ -26745,6 +27032,7 @@ fn colour_cluster_decision(
 
 /// Whether the colour face draws `gid` from COLR paint alone (no bitmap
 /// strike) — a glyph [`colr::rasterize_colr_run`] can place at any origin.
+#[inline]
 fn colr_only(face: &aterm_font::Face<'_>, gid: aterm_font::GlyphId) -> bool {
     face.is_color_glyph(gid) && face.glyph_raster_image(gid, u16::MAX).is_none()
 }
@@ -26756,6 +27044,7 @@ fn colr_only(face: &aterm_font::Face<'_>, gid: aterm_font::GlyphId) -> bool {
 ///    rasterizer downscales regardless.
 ///  - COLR: a COLR-only font (Twemoji, COLRv1 Noto) has no strike at all;
 ///    without this arm every emoji on it fell to mono.
+#[inline]
 fn colour_drawable(face: &aterm_font::Face<'_>, gid: aterm_font::GlyphId) -> bool {
     gid.0 != 0 && (face.glyph_raster_image(gid, u16::MAX).is_some() || face.is_color_glyph(gid))
 }
@@ -26953,6 +27242,7 @@ impl<'a> PremulRows<'a> {
     }
 
     /// The texels of the row in slot `i` (from [`Self::load`]).
+    #[inline]
     fn row(&self, i: usize) -> &[f32] {
         &self.slots[i].1
     }
@@ -27037,9 +27327,11 @@ fn area_row_premul(
 // so the trait and inherent `render_input` names cannot collide. The trait sees only the
 // engine-built `RenderInput`, never a `Terminal`.
 impl Rasterizer for Renderer {
+    #[inline]
     fn cell_size(&self) -> (usize, usize) {
         Renderer::cell_size(self)
     }
+    #[inline]
     fn render_input(&mut self, input: &RenderInput) -> Frame {
         Renderer::render_input(self, input)
     }
@@ -27047,9 +27339,11 @@ impl Rasterizer for Renderer {
     // version returns a `RenderView` borrowing a per-window `WindowCpu`'s damage cache,
     // which the window-free trait signature cannot thread. The trait default is
     // byte-identical; the CPU hot path calls the inherent method directly.
+    #[inline]
     fn set_cursor_blink_phase(&mut self, on: bool) {
         Renderer::set_cursor_blink_phase(self, on)
     }
+    #[inline]
     fn set_cursor_style_override(&mut self, style: Option<CursorStyle>) {
         Renderer::set_cursor_style_override(self, style)
     }

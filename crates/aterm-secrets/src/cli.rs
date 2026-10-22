@@ -28,7 +28,8 @@ admin (a machine in [admins]):
                                          only where that if-absent entry is not the machine's own;
                                          set again, an entry keeps its anchor unless --no-with)
   aterm secrets unset <name> [--for <host>...]
-  aterm secrets password [show|set|new|off]   the join password a joining machine types
+  aterm secrets password [show|set|new|open|off]   the join password a joining machine
+                                         types, or open: every machine that asks is let in
   aterm secrets requests                 machines asking to join
   aterm secrets approve <code>... | --all | <age1...> --name <host>
   aterm secrets revoke <host> [--drop-sections]
@@ -156,6 +157,7 @@ enum Password {
     Show,
     Set,
     New,
+    Open,
     Off,
 }
 
@@ -456,10 +458,11 @@ fn parse(words: &[String]) -> Result<Command, String> {
                     "show" => Password::Show,
                     "set" => Password::Set,
                     "new" => Password::New,
+                    "open" => Password::Open,
                     "off" => Password::Off,
-                    _ => return Err("password takes show, set, new or off".into()),
+                    _ => return Err("password takes show, set, new, open or off".into()),
                 },
-                _ => return Err("password takes show, set, new or off".into()),
+                _ => return Err("password takes show, set, new, open or off".into()),
             };
             Ok(Command::Password(action))
         }
@@ -585,6 +588,20 @@ mod unix {
     use std::process::ExitCode;
     use std::time::Duration;
     use zeroize::Zeroize;
+
+    /// What an open vault means, said where one is made or shown.
+    const OPEN_VAULT: &str = "this vault is open: every machine that reaches its server and asks to join is let in within seconds, with no password and no code, and reads [everyone]'s entries, except a machine you let go (aterm secrets password set closes it)";
+
+    /// What a publish that let a machine go from an open vault says.
+    const KEPT_OUT: &str = "the vault stays open, but not to a machine you let go: its key is a `code-only` line in [join], so whatever it asks, it is let back in only by its code (aterm secrets approve)";
+
+    /// What marks a request whose key a `code-only` line names, where requests are listed.
+    const CODE_ONLY_MARK: &str =
+        "  (code only: a machine let go, or one that asked before the vault opened)";
+
+    /// What opening a vault says of admins on older builds, which cannot read its lines.
+    const OLDER_ADMINS: &str =
+        "an admin Mac on an aterm older than open vaults cannot open this vault until it updates";
 
     pub(super) fn run(command: Command) -> crate::Result<ExitCode> {
         let paths = Paths::live()?;
@@ -724,6 +741,19 @@ mod unix {
         }
         if done.first_long_chain {
             print!("{}", LONG_CHAIN_NOTE);
+        }
+        if done.kept_out {
+            println!("{KEPT_OUT}");
+        }
+        if !done.held.is_empty() {
+            println!(
+                "{} machines asked before the vault opened, and join only by code (one may be a machine let go before); approve each you know with aterm secrets approve <code>:",
+                done.held.len()
+            );
+            for request in &done.held {
+                let when = request.at.map(ago).unwrap_or_default();
+                println!("  {}  code {}  {when}", request.host, request.code);
+            }
         }
         if done.password_renewed {
             println!(
@@ -1107,7 +1137,7 @@ mod unix {
                 Some(piped) => Some(piped.clone()),
                 None if !interactive => None,
                 None => ask_hidden(
-                    "Join password (an admin Mac shows it: aterm secrets password; Enter to be approved by code instead): ",
+                    "Join password (an admin Mac shows it: aterm secrets password; Enter joins without one: an open vault lets this Mac in, another approves it by code): ",
                 )
                 .filter(|typed| !typed.as_slice().trim_ascii().is_empty()),
             };
@@ -1528,6 +1558,10 @@ mod unix {
                     out.flush()?;
                     Ok(ExitCode::SUCCESS)
                 }
+                None if admin.doc.open() => {
+                    eprintln!("{OPEN_VAULT}");
+                    Ok(ExitCode::FAILURE)
+                }
                 None => {
                     eprintln!(
                         "this vault has no join password (aterm secrets password new makes one); joining machines wait for approval by code"
@@ -1535,6 +1569,40 @@ mod unix {
                     Ok(ExitCode::FAILURE)
                 }
             },
+            Password::Open => {
+                if admin.doc.open() {
+                    println!("{OPEN_VAULT}");
+                    return Ok(ExitCode::SUCCESS);
+                }
+                // Those already waiting are a person's to judge: one may be a machine let go
+                // while the vault was closed, its approved request still queued. Not let in
+                // here, each joins only by code (the publish names them).
+                let waiting = client::requests(paths, Some(&doc))?;
+                if !waiting.is_empty() && interactive() {
+                    eprintln!("these machines asked to join before the vault opened:");
+                    for request in &waiting {
+                        let when = request.at.map(ago).unwrap_or_default();
+                        eprintln!("  {}  code {}  {when}", request.host, request.code);
+                    }
+                    let question = format!(
+                        "Let these {} in now? Any you do not know may be a machine you let go. Each reads every [everyone] secret. [y/N] ",
+                        waiting.len()
+                    );
+                    if yes(ask(&question)) {
+                        for request in &waiting {
+                            let host = client::free_name(&doc, &request.host);
+                            doc.add_machine(&host, &request.recipient)
+                                .map_err(text_error)?;
+                        }
+                    }
+                }
+                doc.set_open(true).map_err(text_error)?;
+                let done = client::admin_publish(paths, &admin, &doc)?;
+                let code = published("opened the vault", &done);
+                println!("{OPEN_VAULT}");
+                eprintln!("note: {OLDER_ADMINS}");
+                Ok(code)
+            }
             Password::New => {
                 let password = join::generate()?;
                 doc.set_join_password(Some(password.as_slice()))
@@ -1568,6 +1636,14 @@ mod unix {
                 Ok(published("set the join password", &done))
             }
             Password::Off => {
+                if admin.doc.open() {
+                    doc.set_open(false).map_err(text_error)?;
+                    let done = client::admin_publish(paths, &admin, &doc)?;
+                    return Ok(published(
+                        "closed the vault (joining machines now wait for approval by code)",
+                        &done,
+                    ));
+                }
                 if admin.doc.join_password().is_none() {
                     println!("this vault has no join password");
                     return Ok(ExitCode::SUCCESS);
@@ -1585,6 +1661,10 @@ mod unix {
     fn requests(paths: &Paths) -> crate::Result<ExitCode> {
         let admin = client::admin_open(paths).ok();
         let pending = client::requests(paths, admin.as_ref().map(|a| &a.doc))?;
+        let code_only = admin
+            .as_ref()
+            .map(|a| a.doc.code_only())
+            .unwrap_or_default();
         if pending.is_empty() {
             println!("no machines are asking to join");
         }
@@ -1595,8 +1675,13 @@ mod unix {
             } else {
                 ""
             };
+            let held = if code_only.contains(&request.recipient) {
+                CODE_ONLY_MARK
+            } else {
+                ""
+            };
             println!(
-                "{}  code {}  {}  {when}{proof}",
+                "{}  code {}  {}  {when}{proof}{held}",
                 request.host, request.code, request.recipient
             );
         }
@@ -1623,9 +1708,15 @@ mod unix {
                     "approve --all asks for a yes at a terminal; approve each code instead",
                 ));
             }
+            let code_only = doc.code_only();
             for request in &pending {
+                let held = if code_only.contains(&request.recipient) {
+                    CODE_ONLY_MARK
+                } else {
+                    ""
+                };
                 eprintln!(
-                    "  {}  code {}  {}",
+                    "  {}  code {}  {}{held}",
                     request.host, request.code, request.recipient
                 );
             }
@@ -2044,6 +2135,10 @@ mod tests {
         assert_eq!(
             parse(&words("password off")),
             Ok(Command::Password(Password::Off))
+        );
+        assert_eq!(
+            parse(&words("password open")),
+            Ok(Command::Password(Password::Open))
         );
         assert!(parse(&words("password hunter2-hunter2")).is_err());
         let error = parse(&words("password set hunter2-hunter2")).expect_err("refused");

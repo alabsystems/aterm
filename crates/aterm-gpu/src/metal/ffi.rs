@@ -96,6 +96,7 @@ impl Obj {
     ///
     /// # Safety
     /// `id` must be a +1 reference the caller is handing over, or null.
+    #[inline]
     pub(crate) const unsafe fn from_owned(id: Id) -> Option<Self> {
         if id.is_null() { None } else { Some(Self(id)) }
     }
@@ -104,6 +105,7 @@ impl Obj {
     ///
     /// # Safety
     /// `id` must be a live object pointer, or null.
+    #[inline]
     pub(crate) unsafe fn retain(id: Id) -> Option<Self> {
         if id.is_null() {
             return None;
@@ -120,6 +122,7 @@ impl Obj {
 
     /// A second +1 handle to the same object (`objc_retain`). Not a `Clone`
     /// impl, so every retain is visible at the call site.
+    #[inline]
     pub(crate) fn clone_retained(&self) -> Self {
         // SAFETY: `self.0` is non-null and live by construction (this holder
         // owns a +1 reference); `objc_retain` is thread-safe.
@@ -149,6 +152,7 @@ impl Drop for Obj {
 pub(crate) struct AutoreleasePool(*mut c_void);
 
 impl AutoreleasePool {
+    #[inline]
     pub(crate) fn new() -> Self {
         // SAFETY: push/pop are the documented runtime entry points and are
         // balanced by `Drop`; the token is opaque and only handed back to pop.
@@ -238,6 +242,7 @@ impl PixelFormat {
     /// Bytes one texel occupies in a linear (buffer) layout; readback row
     /// strides derive from it (a wrong stride copies silently with Metal
     /// validation off).
+    #[inline]
     pub(crate) const fn bytes_per_texel(self) -> usize {
         match self {
             Self::R8Unorm => 1,
@@ -249,6 +254,7 @@ impl PixelFormat {
     /// Recover a format from an `MTLPixelFormat` raw value (e.g. `-pixelFormat`
     /// off a live texture). `None` for formats not modelled here, whose row
     /// stride cannot be checked.
+    #[inline]
     pub(crate) const fn from_raw(raw: usize) -> Option<Self> {
         match raw {
             10 => Some(Self::R8Unorm),
@@ -1135,6 +1141,7 @@ pub(crate) unsafe fn buffer_u32s(buf: &Obj, count: usize) -> Vec<u32> {
 /// # Safety
 /// `buf` must be a shared-storage `MTLBuffer` of at least `bytes.len()` bytes,
 /// not concurrently in use by the GPU.
+#[inline]
 pub(crate) unsafe fn buffer_write(buf: &Obj, bytes: &[u8]) {
     // SAFETY: as `buffer_u32s`, plus the caller's exclusivity guarantee.
     unsafe {
@@ -1318,7 +1325,8 @@ unsafe impl Encode for MtlViewport {
 impl MtlViewport {
     /// The whole of a `width` x `height` attachment, depth `0..1`, as the wgpu
     /// `present_to_view` sets before its blit.
-    pub(crate) fn full_2d(width: usize, height: usize) -> Self {
+    #[inline]
+    pub(crate) const fn full_2d(width: usize, height: usize) -> Self {
         Self {
             origin_x: 0.0,
             origin_y: 0.0,
@@ -1448,6 +1456,7 @@ pub(crate) fn texture_view(tex: &Obj, format: PixelFormat) -> Option<Obj> {
 
 /// Read `-[MTLTexture pixelFormat]` as its raw value, so `draw_and_read` can
 /// validate a row stride against the destination it was handed.
+#[inline]
 pub(crate) fn texture_pixel_format_raw(tex: &Obj) -> usize {
     // SAFETY: `-pixelFormat` is an `NSUInteger` getter on a live `MTLTexture`.
     unsafe {
@@ -1457,6 +1466,7 @@ pub(crate) fn texture_pixel_format_raw(tex: &Obj) -> usize {
 }
 
 /// `-[MTLTexture width]`.
+#[inline]
 pub(crate) fn texture_width(tex: &Obj) -> usize {
     // SAFETY: `-width` is an `NSUInteger` getter on a live `MTLTexture`.
     unsafe {
@@ -1466,6 +1476,7 @@ pub(crate) fn texture_width(tex: &Obj) -> usize {
 }
 
 /// `-[MTLTexture height]`.
+#[inline]
 pub(crate) fn texture_height(tex: &Obj) -> usize {
     // SAFETY: `-height` is an `NSUInteger` getter on a live `MTLTexture`.
     unsafe {
@@ -1477,6 +1488,7 @@ pub(crate) fn texture_height(tex: &Obj) -> usize {
 /// `-[MTLTexture usage]`, the `MTLTextureUsage` bitmask. The encoder refuses a
 /// render pass onto a texture without [`TEXTURE_USAGE_RENDER_TARGET`], which
 /// otherwise completes silently without the validation layer.
+#[inline]
 pub(crate) fn texture_usage(tex: &Obj) -> usize {
     // SAFETY: `-usage` is an `NSUInteger` getter on a live `MTLTexture`.
     unsafe {
@@ -1486,6 +1498,7 @@ pub(crate) fn texture_usage(tex: &Obj) -> usize {
 }
 
 /// `-[MTLBuffer length]`, in bytes.
+#[inline]
 pub(crate) fn buffer_length(buf: &Obj) -> usize {
     // SAFETY: `-length` is an `NSUInteger` getter on a live `MTLBuffer`.
     unsafe {

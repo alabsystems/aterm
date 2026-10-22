@@ -228,7 +228,8 @@ fn a_take_over_under_a_committing_update_answers_busy_at_once() {
 }
 
 /// A GATEWAY CARD DOES NOT OPEN UNDER A HOLD: while any session is held,
-/// `open menu|palette|tab-menu|overview|connections|autopilot-menu` answers
+/// `open menu|palette|tab-menu|overview|connections|autopilot-menu|fact-menu`
+/// (a fact's menu named by its fact too: `open fact-menu path`) answers
 /// `ERR halted` as `invoke` does, since each card is `invoke`'s rows behind a
 /// key; closing one and every other target stay answerable. CONTROL: with no
 /// hold standing, nothing is refused.
@@ -243,6 +244,7 @@ fn a_gateway_card_does_not_open_under_a_hold() {
         "overview",
         "connections",
         "autopilot-menu",
+        "fact-menu",
     ];
     for target in gateways {
         assert!(
@@ -259,6 +261,11 @@ fn a_gateway_card_does_not_open_under_a_hold() {
             "{target} close stays answerable"
         );
     }
+    assert!(
+        open_halt_refusal(&store, "open", "fact-menu path")
+            .is_some_and(|refusal| refusal.starts_with("ERR halted ")),
+        "a fact's menu named by its fact"
+    );
     for other in ["prefs", "about", "update", "", "app settings"] {
         assert!(
             open_halt_refusal(&store, "open", other).is_none(),

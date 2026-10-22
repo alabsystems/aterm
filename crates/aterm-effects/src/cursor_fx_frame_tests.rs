@@ -97,6 +97,7 @@ impl Session {
                 .color
                 .map_or(TrailColor::Automatic, TrailColor::Pinned),
             knobs.accent.is_some(),
+            None,
         );
         Self {
             fx: CursorFx::default(),

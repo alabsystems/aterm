@@ -41,6 +41,7 @@
 mod emoji_presentation;
 mod grapheme_iter;
 mod grid;
+mod hyphenate;
 mod line_break;
 mod position;
 mod props;
@@ -56,8 +57,10 @@ pub use grid::{
     GridColumns, GridGrapheme, GridGraphemes, GridStep, grid_graphemes, grid_graphemes_with,
     str_grid_columns, str_grid_columns_with,
 };
+pub use hyphenate::hyphen_points;
 pub use line_break::{
-    BreakKind, LineBreak, Piece, is_break_space, line_breaks, pieces, word_breaks,
+    BreakKind, LineBreak, Piece, TokenKind, break_inside, break_into_line, is_break_space,
+    line_breaks, never_starts_a_line, pieces, token_kind, word_breaks,
 };
 pub use position::{byte_to_column, byte_to_column_with, column_to_char_index};
 pub use props::{

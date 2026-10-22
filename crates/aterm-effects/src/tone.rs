@@ -57,7 +57,7 @@ impl Tone {
 
     /// The model output index (softmax slot) of this tone.
     #[inline]
-    pub fn index(self) -> usize {
+    pub const fn index(self) -> usize {
         match self {
             Tone::Calm => 0,
             Tone::Excited => 1,
@@ -70,13 +70,17 @@ impl Tone {
     /// Inverse of [`Tone::index`]; out-of-range folds to the neutral
     /// [`Tone::Technical`] rather than panicking on an audio-adjacent path.
     #[inline]
-    pub fn from_index(i: usize) -> Tone {
-        *Tone::ALL.get(i).unwrap_or(&Tone::Technical)
+    pub const fn from_index(i: usize) -> Tone {
+        if i < Tone::ALL.len() {
+            Tone::ALL[i]
+        } else {
+            Tone::Technical
+        }
     }
 
     /// Corpus label string (the TSV files' first column).
     #[inline]
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Tone::Calm => "calm",
             Tone::Excited => "excited",
@@ -182,6 +186,7 @@ pub struct ToneScratch {
 }
 
 impl Default for ToneScratch {
+    #[inline]
     fn default() -> Self {
         Self {
             sum: [0.0; EMBED],
@@ -484,6 +489,7 @@ pub const HOLDOUT_TSV: &str = include_str!("../data/tone_holdout.tsv");
 
 /// Parse one corpus/holdout TSV line (shared by the trainer and the
 /// conformance tests). Blank lines and `#` comments yield `None`.
+#[inline]
 pub fn parse_corpus_line(line: &str) -> Option<(Tone, &str, &str)> {
     let line = line.trim_end_matches('\r');
     if line.is_empty() || line.starts_with('#') {

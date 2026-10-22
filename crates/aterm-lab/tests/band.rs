@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use aterm_uds::spawnfd::Stdio;
 
-/// A hang detector, never a latency budget: launchd restarts a KeepAlive job
-/// at most every 10 s.
+/// A hang detector, never a latency budget: the job's KeepAlive restart, which
+/// removes it, comes its `ThrottleInterval` (1 s) after the program ends.
 const HANG: Duration = Duration::from_secs(60);
 
 /// `PRIO_DARWIN_ROLE_UI_FOCAL`, the role the job's program must start at.

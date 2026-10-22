@@ -331,7 +331,8 @@ fn the_build_policy_is_the_images_source_by_its_banner_build() {
 /// THE FIRST FRAME (§3.8, §8): a Claude Code whose image is published and
 /// whose fence is cut is decorated on the first frame that shows its card,
 /// with no footer facts — no registry row is waited on — for ONE timeline
-/// lock a pane a frame; settled, it costs no clock read and no allocation.
+/// lock a pane a frame; settled (held, its window out of focus: a focused
+/// card flows on), it costs no clock read and no allocation.
 /// The dev card probe (on here, as in every §8 run) takes one lock more a
 /// pane, to record the pass, and none with the probe off. CONTROL: the same
 /// image with another group in front (not current) draws nothing, for the
@@ -369,6 +370,9 @@ fn a_drawer_with_no_facts_is_decorated_on_its_first_frame() {
     frame(&mut app, wid);
     set_now(Some(t0 + Duration::from_millis(EPISODE_MS + 1)));
     frame(&mut app, wid);
+    // Settled: held, its window out of focus (a focused card flows on,
+    // `settled_glass`).
+    hold(&mut app, wid);
     for i in 0..6u64 {
         set_now(Some(t0 + Duration::from_millis(EPISODE_MS + 100 + i)));
         let probe = i < 3;

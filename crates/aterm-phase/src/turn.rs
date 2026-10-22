@@ -11,6 +11,12 @@ use crate::phase::{
 };
 use crate::prompt::parse_prompt;
 
+/// The glyphs a transcript row opens with at column 0: a person's message
+/// (`❯`) and something said (`⏺`, `●`). Under the launch card, the first
+/// such row ends what the card's own notices may hold ([`fresh`],
+/// `crate::notice::update_notice_scan`).
+pub(crate) const SAID: [char; 3] = ['❯', '⏺', '●'];
+
 /// No turn yet: Claude Code's launch card (`Claude Code v<version>`, anchor
 /// `launch.banner`) above the composer and, between it and the composer's
 /// frame, no user message (`❯`) and nothing said (`⏺`, `●`) — the screen
@@ -36,7 +42,7 @@ pub fn fresh(rows: &[String]) -> bool {
     };
     let mut said = rows[card + 1..frame.top]
         .iter()
-        .filter(|r| r.starts_with(['❯', '⏺', '●']));
+        .filter(|r| r.starts_with(SAID));
     match said.next() {
         None => true,
         Some(row) => crate::text::trim_end(row) == "❯ /clear" && said.next().is_none(),
@@ -195,6 +201,20 @@ fn banner_version(after: &str) -> Option<&str> {
 ///  ▝▝   ▝▝     ~/aterm
 /// ```
 ///
+/// A NARROW pane's card is four rows (2.1.295 to 2.1.304, MEASURED: the
+/// `*-34col`, `*-36col`, `*-40col` and `*-narrow-*` captures): the banner
+/// ALONE on its row at the text column, over the mascot beside the model,
+/// the billing and the working directory — on 2.1.304 from 31 columns
+/// (the plain mascot; 33 with the wand) up to where the model row and its
+/// billing fit on one row (`claude-2.1.304-update-notice-narrow-*`):
+///
+/// ```text
+///              Claude Code v2.1.304
+///  ▐▛███▛█▄╱✦  Opus 5.5 with xhigh effort
+/// ▝▜██████▘    API Usage Billing
+///  ▝▝   ▝▝     /private/tmp/at.r3cj/proj
+/// ```
+///
 /// Columns are CHAR indices into the rows as passed: one char per cell on
 /// the window's live text, so there a char index is the cell's column.
 /// Measured on the three-row cards in `src/fixtures` (2.1.280 to 2.1.302,
@@ -205,19 +225,26 @@ fn banner_version(after: &str) -> Option<&str> {
 pub struct CardPlace {
     /// The banner row's index in the rows: the card's top row.
     pub top: usize,
-    /// How many rows the card spans from [`top`](Self::top): 3.
+    /// How many rows the card spans from [`top`](Self::top): 3; 4 on the
+    /// narrow card.
     pub rows: usize,
+    /// How many rows under [`top`](Self::top) the mascot's top row is: 0
+    /// where the banner row starts with the mascot (the three-row card), 1
+    /// where the banner stands alone over it (the narrow card).
+    pub mascot_row: usize,
     /// The column every card row's text begins at (11; 13 on the workspace
     /// card).
     pub text_col: usize,
     /// The column just past the mascot: past its rightmost glyph — a block
-    /// or one it holds ([`is_held`]) — on any of the three rows (9: the model
+    /// or one it holds ([`is_held`]) — on any of its three rows (9: the model
     /// row's `▝▜██████▀` is the widest; 11 on the workspace card, past the
     /// wand's `✦`).
     pub mascot_end: usize,
     /// The column just past each card row's text, its trailing blanks
     /// trimmed: the banner's (31 for `Claude Code v2.1.300`, 33 on the
-    /// workspace card), the model row's and the working directory's.
+    /// workspace card), the model row's and the working directory's — on
+    /// the narrow card the banner's, the model's and the widest of the
+    /// billing's and the working directory's.
     ///
     /// A CHAR count, so a row whose last glyph is WIDE (a CJK name in the
     /// working directory, an emoji) ends one cell short: the wide glyph's
@@ -225,6 +252,57 @@ pub struct CardPlace {
     /// trimmed with the rest. The GUI caller, which knows the cells, adds 1
     /// to `ends[k]` when the cell at `ends[k] - 1` holds a wide glyph.
     pub ends: [usize; 3],
+}
+
+impl CardPlace {
+    /// The mascot's WAND cell, `(column, row)`: its last column on its top
+    /// row, `mascot_end − 1` on `top + mascot_row` — the workspace card's
+    /// `✦` (column 10; on the banner row, or under it on the narrow card),
+    /// the plain card's right edge; `None` where no mascot was read.
+    /// Claude's ripple starts there ([`wand_flare`]).
+    #[must_use]
+    pub fn wand(&self) -> Option<(usize, usize)> {
+        Some((
+            self.mascot_end.checked_sub(1)?,
+            self.top.checked_add(self.mascot_row)?,
+        ))
+    }
+}
+
+/// The wand's flare on a dark theme, `rgb(255,252,235)`: 2.1.304's mascot
+/// ripple inks its wand's `✦` this colour on frames 0 and 1 of each 3072 ms
+/// cycle, as the cycle's ring is born there (decoded from the 2.1.304
+/// bundle; MEASURED on the wire, lab M3: `ESC[38;2;255;252;235m✦`). Only
+/// the fullscreen renderer's mascot with the key on shimmers, so only
+/// there does the wand flare; it settles to `#ffcc68` on blur.
+pub const WAND_FLARE_DARK: [u8; 3] = [255, 252, 235];
+
+/// The wand's flare on a light theme, `rgb(224,40,8)` (MEASURED, lab M3:
+/// `ESC[38;2;224;40;8m✦`), [`WAND_FLARE_DARK`]'s twin. Claude picks one by
+/// its OWN theme setting, not the terminal's ground: its dark theme on the
+/// Aterm Day ground still flares dark, and its `auto` theme draws its first
+/// frame before the ground's OSC 11 reply comes. So either flare reads as
+/// one on either ground.
+pub const WAND_FLARE_LIGHT: [u8; 3] = [224, 40, 8];
+
+/// How far a channel may sit off a flare colour and still read as the flare
+/// (a colour profile's or a truecolor-to-palette rounding's drift).
+pub const WAND_FLARE_TOLERANCE: u8 = 6;
+
+/// Whether a cell holding `ch` in the colour `rgb` (the program's own
+/// foreground, before any contrast floor) is Claude's wand FLARING: the
+/// workspace wand's `✦` (U+2726) in either flare colour, within
+/// [`WAND_FLARE_TOLERANCE`]. A host reads the wand's cell ([`CardPlace::wand`])
+/// to phase its own shimmer to Claude's; any other glyph, or the wand in its
+/// resting colours, is no flare.
+#[must_use]
+pub fn wand_flare(ch: char, rgb: [u8; 3]) -> bool {
+    let near = |want: [u8; 3]| {
+        rgb.iter()
+            .zip(want)
+            .all(|(&c, w)| c.abs_diff(w) <= WAND_FLARE_TOLERANCE)
+    };
+    ch == '\u{2726}' && (near(WAND_FLARE_DARK) || near(WAND_FLARE_LIGHT))
 }
 
 /// What a reader's banner says about the build that drew it, declared beside
@@ -291,31 +369,38 @@ pub const LAUNCH_CARD_ROWS: usize = CARD_ROWS;
 /// tool output's column (its mascot right of column 1: at 3 under a message,
 /// at 6 or beyond in a tool's output).
 ///
+/// The NARROW layout (measured at 34 and 36 columns, 2.1.295 to 2.1.300; at
+/// 34 to 60 on 2.1.302's workspace card, whose longer model row splits
+/// sooner; on 2.1.304 from 31 columns, 33 with the wand: [`CardPlace`]) is
+/// placed by its EXACT shape ([`narrow_card`]): the banner and its version
+/// alone on their row, indented by spaces to the text column, then three
+/// rows each with the mascot's glyphs before that column and text at it —
+/// the first starting with the mascot's top ([`MASCOT_TOP`]) — then a blank
+/// row, the logo's bottom margin, which every capture draws. Below 31
+/// columns (33 with the wand) the vendor wraps the banner itself
+/// (`Claude Code` / `v2.1.304`) and the card grows to six rows and more:
+/// no row holds the banner whole, so nothing is placed.
+///
 /// A newest card this cannot place yields `None`, never an older card above
 /// it, which a finished process drew (the inline renderer relaunched in the
 /// same tab keeps its predecessor's card on the screen):
 ///
-/// * the NARROW layout (measured at 34 and 36 columns, 2.1.295 to 2.1.300;
-///   at 34 to 60 on 2.1.302's workspace card, whose longer model row splits
-///   sooner): the banner alone on its row at the text column, over FOUR
-///   rows — the mascot beside the model, the billing and the working
-///   directory. It is refused: the decoration is laid out for the three-row
-///   card. A row that holds NOTHING but the banner and its version,
-///   indented by spaces alone to the narrow card's column
-///   ([`NARROW_BANNER_COLS`]), is read as this layout whatever follows it —
-///   cut by the screen's bottom edge, over a blank row, over a bare mascot
-///   or over rows laid out otherwise — so a narrow card whose rows under the
-///   banner did not draw as measured is still a refusal, never a pass to the
-///   older card above. The workspace card's narrow banner sits at column 13
-///   ([`NARROW_HELD_COL`]), where a narrow card QUOTED in a message puts its
-///   banner too: there the bare row is this layout unless the row under it
-///   is text that does not start with the mascot — a quote's next row — so
-///   cut by the screen's bottom edge, over a blank row or over the mascot it
-///   is refused as well. The same bare row at another indent is passed over:
-///   a message's line at column 2, a narrow card quoted in a message
-///   (column 13, its quoted mascot under it) or in a tool's output (column
-///   16), whose banner row loses its `⎿` once it is not the output's first
-///   line;
+/// * a narrow banner whose rows did not draw as measured: a row that holds
+///   NOTHING but the banner and its version, indented by spaces alone to
+///   the narrow card's column ([`NARROW_BANNER_COLS`]), is read as the
+///   narrow layout whatever follows it — cut by the screen's bottom edge,
+///   over a blank row, over a bare mascot or over rows laid out otherwise —
+///   so a narrow card whose rows under the banner did not draw as measured
+///   is a refusal, never a pass to the older card above. The workspace
+///   card's narrow banner sits at column 13 ([`NARROW_HELD_COL`]), where a
+///   narrow card QUOTED in a message puts its banner too: there the bare row
+///   is this layout unless the row under it is text that does not start
+///   with the mascot — a quote's next row — so cut by the screen's bottom
+///   edge, over a blank row or over the mascot it is refused as well. The
+///   same bare row at another indent is passed over: a message's line at
+///   column 2, a narrow card quoted in a message (column 13, its quoted
+///   mascot under it) or in a tool's output (column 16), whose banner row
+///   loses its `⎿` once it is not the output's first line;
 /// * a card cut by the screen's bottom edge, and one whose rows under the
 ///   banner are laid out otherwise (a vendor redesign): the card goes bare,
 ///   never wrong.
@@ -328,6 +413,15 @@ pub fn launch_card_place(rows: &[String]) -> Option<CardPlace> {
 
 /// The three-row card's height ([`CardPlace::rows`]).
 const CARD_ROWS: usize = 3;
+
+/// The narrow card's height ([`CardPlace::rows`]): the banner alone, then
+/// the mascot's three rows.
+const NARROW_ROWS: usize = 4;
+
+/// How many rows from the banner's a narrow card's reading reads: its four
+/// and the blank row under them ([`narrow_card`]); the wide card's reads its
+/// three ([`CARD_ROWS`]).
+const READ_ROWS: usize = NARROW_ROWS + 1;
 
 /// [`launch_card_place`], with where its scan stopped: the newest row that
 /// draws a card's banner, in either layout — `None` when no row does. The
@@ -348,7 +442,7 @@ pub fn launch_card_scan(rows: &[String]) -> (Option<usize>, Option<CardPlace>) {
     };
     let place = match layout {
         BannerRow::Wide { text_col } => wide_card(rows, top, text_col),
-        BannerRow::Narrow => None,
+        BannerRow::Narrow { text_col } => narrow_card(rows, top, text_col),
     };
     (Some(top), place)
 }
@@ -359,6 +453,7 @@ fn wide_card(rows: &[String], top: usize, text_col: usize) -> Option<CardPlace> 
     let mut place = CardPlace {
         top,
         rows: CARD_ROWS,
+        mascot_row: 0,
         text_col,
         mascot_end: 0,
         ends: [0; 3],
@@ -371,28 +466,90 @@ fn wide_card(rows: &[String], top: usize, text_col: usize) -> Option<CardPlace> 
     Some(place)
 }
 
+/// The NARROW card whose banner is row `top`, its text at `text_col`
+/// ([`CardPlace`]), read by its exact shape: the banner row holds the
+/// banner and its version and nothing else, indented by spaces alone; each
+/// of the three rows under it is a card row ([`card_row`]: the mascot's
+/// glyphs before `text_col`, text at it), the first starting with the
+/// mascot's top ([`MASCOT_TOP`]); and the row under them is blank — the
+/// logo's bottom margin, drawn under every measured card. `None` for
+/// anything else: a row missing (the screen's bottom edge), a fifth row of
+/// the card's text (a vendor's wrap this was not measured on), a banner row
+/// with words after its version (a message's).
+fn narrow_card(rows: &[String], top: usize, text_col: usize) -> Option<CardPlace> {
+    let banner = const { crate::anchors::anchor_text("launch.banner") };
+    let row = rows.get(top)?;
+    let at = crate::text::find(row, banner)?;
+    let after = crate::text::trim_end(&row[at + banner.len()..]);
+    if !row[..at].chars().all(|c| c == ' ')
+        || row[..at].chars().count() != text_col
+        || banner_version(after)?.len() != after.len()
+    {
+        return None;
+    }
+    if !rows.get(top + 1)?.starts_with(MASCOT_TOP) || !crate::text::blank(rows.get(top + 4)?) {
+        return None;
+    }
+    let mut mascot_end = 0;
+    let mut ends = [crate::text::trim_end(row).chars().count(), 0, 0];
+    for k in 1..NARROW_ROWS {
+        let (m, end) = card_row(&rows[top + k], text_col)?;
+        mascot_end = mascot_end.max(m);
+        let slot = &mut ends[k.min(2)];
+        *slot = (*slot).max(end);
+    }
+    Some(CardPlace {
+        top,
+        rows: NARROW_ROWS,
+        mascot_row: 1,
+        text_col,
+        mascot_end,
+        ends,
+    })
+}
+
 /// Whether [`launch_card_scan`] reads `rows` as it read the rows they were
 /// before the rows `changed` names changed (ascending indices; the count of
 /// rows the same) — known without a scan. `banner` is that reading's banner
 /// row. The reading is a function of the banner's row and the rows under it
-/// alone: the place, of the card's three rows; whether a newer banner sits
-/// lower, of each lower row and the row under it (a banner's test reads the
-/// row under it). So it holds while none of the card's three rows changed
-/// and no row below the banner's that changed — nor the row over one — now
-/// draws a banner; with no banner, while no changed row (nor the row over
-/// one) draws one. A row above the banner's never moves it, and the rows
-/// that did not change are not read: a keystroke in the composer under the
-/// card costs a banner test of its own rows. Never panics, on any rows and
-/// indices.
+/// alone: the place, of the card's rows — the banner's layout, of its row
+/// and the row under it; the wide card's three rows; the narrow card's four
+/// and the blank row under them ([`READ_ROWS`]);
+/// whether a newer banner sits lower, of each lower row and the row under it
+/// (a banner's test reads the row under it). So it holds while none of the
+/// rows the place reads changed and no row below the banner's that changed
+/// — nor the row over one — now draws a banner; with no banner, while no
+/// changed row (nor the row over one) draws one. A row above the banner's
+/// never moves it, and the rows that did not change are not read: a
+/// keystroke in the composer under the card costs a banner test of its own
+/// rows. Never panics, on any rows and indices.
 #[must_use]
 pub fn launch_card_unmoved(rows: &[String], banner: Option<usize>, changed: &[usize]) -> bool {
     let anchor = const { crate::anchors::anchor_text("launch.banner") };
-    if let Some(top) = banner
-        && changed
-            .iter()
-            .any(|&j| (top..top.saturating_add(CARD_ROWS)).contains(&j))
-    {
-        return false;
+    if let Some(top) = banner {
+        // The banner's layout is a function of its row and the row under it;
+        // with both unchanged it is the reading's, and it names the rows the
+        // place reads: the wide card's three, the narrow card's five — and
+        // five for a row no banner reads on (a caller's card HELD through
+        // the vendor's entrance, its words standing where none is placed).
+        let moved = |span: usize| {
+            changed
+                .iter()
+                .any(|&j| (top..top.saturating_add(span)).contains(&j))
+        };
+        if moved(2) {
+            return false;
+        }
+        let span = match rows
+            .get(top)
+            .and_then(|row| banner_row(row, rows.get(top + 1), anchor))
+        {
+            Some(BannerRow::Wide { .. }) => CARD_ROWS,
+            Some(BannerRow::Narrow { .. }) | None => READ_ROWS,
+        };
+        if moved(span) {
+            return false;
+        }
     }
     let below = |i: usize| banner.is_none_or(|top| i > top);
     let draws = |i: usize| {
@@ -412,10 +569,11 @@ pub fn launch_card_unmoved(rows: &[String], banner: Option<usize>, changed: &[us
 /// numeric parts), for a caller holding a [`CardPlace`] (the harness card
 /// matching the card to the running build without a composer). `None` when
 /// the row at `place.top` is not a card's banner row as `place` describes
-/// it — it must start with the mascot's top ([`MASCOT_TOP`]) and hold the
-/// banner at `place.text_col` (a char count), so a place read from other
-/// rows, or a person's `❯ … Claude Code v2.1.284?` that came to sit at
-/// `place.top`, names no build — or when the banner's version does not
+/// it — it must start with the mascot's top ([`MASCOT_TOP`]), or on the
+/// narrow card ([`CardPlace::mascot_row`] 1) be spaces alone up to it, and
+/// hold the banner at `place.text_col` (a char count), so a place read from
+/// other rows, or a person's `❯ … Claude Code v2.1.284?` that came to sit
+/// at `place.top`, names no build — or when the banner's version does not
 /// parse. [`launch_card_place`] itself does not need the version to place a
 /// card.
 ///
@@ -426,36 +584,61 @@ pub fn launch_card_unmoved(rows: &[String], banner: Option<usize>, changed: &[us
 pub fn launch_card_version<'a>(rows: &'a [String], place: &CardPlace) -> Option<&'a str> {
     let banner = const { crate::anchors::anchor_text("launch.banner") };
     let row = rows.get(place.top)?;
-    if !row.starts_with(MASCOT_TOP) {
-        return None;
-    }
     let at = crate::text::find(row, banner)?;
-    if row[..at].chars().count() != place.text_col {
+    let opens = match place.mascot_row {
+        0 => row.starts_with(MASCOT_TOP),
+        _ => row[..at].chars().all(|c| c == ' '),
+    };
+    if !opens || row[..at].chars().count() != place.text_col {
         return None;
     }
     banner_version(&row[at + banner.len()..])
 }
 
-/// The card's WORDS at `place` on `rows`: each of its three rows' text from
-/// the text column on, trailing blanks trimmed — the banner and its version,
-/// the model and billing, the working directory. What a caller that placed
-/// the card keeps beside the place, to know the card again on rows that do
-/// not place it ([`launch_card_held`]). The mascot's columns are not read for
-/// a pose: through the vendor's entrance they hold any of its poses, its
-/// dust (`·`, `~`) or nothing at all. `None` when a row is missing, when a
-/// row holds a letter or a digit of any script before the text column (a
-/// row that NAMES the card, a person's or a message's, or a box's words
-/// drawn over the mascot), when a row has no text AT the text column, or
-/// when the top row's words do not open with the banner. Never panics, on
-/// any rows and place.
+/// A card's words, row by row ([`launch_card_words`]): the three-row
+/// card's three, the narrow card's four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CardWords<'a> {
+    rows: [&'a str; NARROW_ROWS],
+    len: usize,
+}
+
+impl<'a> CardWords<'a> {
+    /// The words, the banner row's first.
+    #[must_use]
+    pub fn as_slice(&self) -> &[&'a str] {
+        &self.rows[..self.len]
+    }
+}
+
+/// The card's WORDS at `place` on `rows`: each of its rows' text from the
+/// text column on, trailing blanks trimmed — the banner and its version,
+/// the model and billing, the working directory (the narrow card's model
+/// and billing on rows of their own). What a caller that placed the card
+/// keeps beside the place, to know the card again on rows that do not
+/// place it ([`launch_card_held`], [`launch_card_scrolled`]). The mascot's
+/// columns are not read for a pose: through the vendor's entrance they hold
+/// any of its poses, its dust (`·`, `~`) or nothing at all. `None` when a
+/// row is missing, when a row holds a letter or a digit of any script
+/// before the text column (a row that NAMES the card, a person's or a
+/// message's, or a box's words drawn over the mascot), when a row has no
+/// text AT the text column, when the top row's words do not open with the
+/// banner, or for a place of neither layout's height. Never panics, on any
+/// rows and place.
 #[must_use]
-pub fn launch_card_words<'a>(rows: &'a [String], place: &CardPlace) -> Option<[&'a str; 3]> {
+pub fn launch_card_words<'a>(rows: &'a [String], place: &CardPlace) -> Option<CardWords<'a>> {
     let banner = const { crate::anchors::anchor_text("launch.banner") };
-    let mut words = [""; CARD_ROWS];
-    for (k, w) in words.iter_mut().enumerate() {
+    if !matches!(place.rows, CARD_ROWS | NARROW_ROWS) {
+        return None;
+    }
+    let mut words = CardWords {
+        rows: [""; NARROW_ROWS],
+        len: place.rows,
+    };
+    for (k, w) in words.rows[..place.rows].iter_mut().enumerate() {
         *w = card_words(rows.get(place.top.checked_add(k)?)?, place.text_col)?;
     }
-    words[0].starts_with(banner).then_some(words)
+    words.rows[0].starts_with(banner).then_some(words)
 }
 
 /// One card row's words at `text_col` ([`launch_card_words`]): before it,
@@ -493,24 +676,102 @@ fn card_words(row: &str, text_col: usize) -> Option<&str> {
 /// It is let go on the frame its banner really leaves: scrolled or cleared
 /// (other words, or none, at its rows), overwritten (a box, a person's
 /// words: a letter left of the text column, or other words), the program's
-/// exit (its screen goes with it), the narrow layout (the row under the
-/// banner holds the model alone, without its billing), and a NEWER card
-/// below it, placed or not — a relaunch's — which the scan decides, never an
-/// older card held above it ([`CardPlace`]'s contract). An older card the
-/// scan places above the kept one is no reason to let it go: the kept card
-/// is newer. A resize is the caller's: the place was read on the old grid,
-/// so a caller lets the card go when the grid moves. Never panics, on any
-/// rows, scan and place.
+/// exit (its screen goes with it), the other layout (the row under the
+/// banner holds the model alone, without its billing, or the other way
+/// round), and a NEWER card below it, placed or not — a relaunch's — which
+/// the scan decides, never an older card held above it ([`CardPlace`]'s
+/// contract). An older card the scan places above the kept one is no reason
+/// to let it go: the kept card is newer. A resize is the caller's: the place
+/// was read on the old grid, so a caller lets the card go when the grid
+/// moves. Never panics, on any rows, scan and place.
 #[must_use]
 pub fn launch_card_held(
     rows: &[String],
     scan: (Option<usize>, Option<CardPlace>),
     kept: &CardPlace,
-    words: [&str; 3],
+    words: &[&str],
 ) -> bool {
     let (banner, place) = scan;
     banner.is_none_or(|b| b < kept.top || (b == kept.top && place.is_none()))
-        && launch_card_words(rows, kept) == Some(words)
+        && launch_card_words(rows, kept).is_some_and(|w| w.as_slice() == words)
+}
+
+/// THE CARD SCROLLED: where the card a caller kept — its place on the rows
+/// before these and its words there ([`launch_card_words`]; or a scrolled
+/// card's, which this returned, and its words) — still shows on `rows`
+/// with its top cut by the screen's top edge: its LAST rows, one or more,
+/// at the screen's first, as a `CardPlace` of those rows (`top` 0, `rows`
+/// how many show, [`CardPlace::mascot_row`] 0). Claude Code scrolls its
+/// transcript up under the card as a conversation grows (the fullscreen
+/// renderer, and the inline one's screen): from the frame the banner row
+/// leaves until the card's last row does, the update notice under it is
+/// still on screen (`claude-2.1.304-update-notice-scrolled-*`: the model
+/// and working-directory rows at rows 0 and 1, then the working
+/// directory's alone at row 0), and a caller drawing over that notice
+/// anchors it on what is left of the card.
+///
+/// Read by the card's EXACT rows: `scan` (this rows' [`launch_card_scan`])
+/// finds no banner anywhere; each row shown is a card row at the kept text
+/// column ([`card_row`]: the mascot's glyphs before it, text at it) whose
+/// mascot starts where the card's own does — at column 0 or 1, never at a
+/// message's indent (a card quoted under `⏺` sits at column 2 and beyond)
+/// — and whose words are the kept card's own row's, in order; and the row
+/// under the last shown is blank, the logo's bottom margin. A card scrolled
+/// wholly off, rows that are not the kept card's, a kept card no caller
+/// placed (none: a resize, a pane laid anew) and a banner anywhere on the
+/// screen — a newer card's, or the card scrolled back — read `None`. Never
+/// panics, on any rows, scan, place and words.
+#[must_use]
+pub fn launch_card_scrolled(
+    rows: &[String],
+    scan: (Option<usize>, Option<CardPlace>),
+    kept: &CardPlace,
+    words: &[&str],
+) -> Option<CardPlace> {
+    if scan.0.is_some() || words.len() != kept.rows || kept.rows > NARROW_ROWS {
+        return None;
+    }
+    let shown = kept.rows.min(rows.len().saturating_sub(1));
+    'cut: for v in (1..=shown).rev() {
+        let first = kept.rows - v;
+        let mut place = CardPlace {
+            top: 0,
+            rows: v,
+            mascot_row: 0,
+            text_col: kept.text_col,
+            mascot_end: 0,
+            ends: [0; 3],
+        };
+        for (i, row) in rows[..v].iter().enumerate() {
+            let at_edge = row.chars().take(2).any(|c| c != ' ');
+            let Some((mascot_end, end)) = card_row(row, kept.text_col).filter(|_| at_edge) else {
+                continue 'cut;
+            };
+            if card_words(row, kept.text_col) != Some(words[first + i]) {
+                continue 'cut;
+            }
+            place.mascot_end = place.mascot_end.max(mascot_end);
+            let slot = &mut place.ends[i.min(2)];
+            *slot = (*slot).max(end);
+        }
+        if crate::text::blank(&rows[v]) {
+            return Some(place);
+        }
+    }
+    None
+}
+
+/// Whether [`launch_card_scrolled`] reads `rows` as it read the rows they
+/// were before the rows `changed` names changed (ascending; the count of
+/// rows the same), when it found the scrolled card `cut` there — known
+/// without a read: the reading is a function of the rows it shows and the
+/// blank row under them, and of whether any row draws a banner. So it
+/// holds while no changed row is one of `cut`'s or the row under them, and
+/// no changed row (nor the row over one) now draws a banner
+/// ([`launch_card_unmoved`]). Never panics, on any rows, place and indices.
+#[must_use]
+pub fn launch_card_scrolled_unmoved(rows: &[String], cut: &CardPlace, changed: &[usize]) -> bool {
+    changed.iter().all(|&j| j > cut.rows) && launch_card_unmoved(rows, None, changed)
 }
 
 /// The mascot's top row as the card draws it from column 0 at rest: a
@@ -579,8 +840,9 @@ enum BannerRow {
     /// ([`NARROW_BANNER_COLS`], or [`NARROW_HELD_COL`] unless a quote's next
     /// row is under it) — the row holds nothing after the banner's
     /// version — or, with text after the version, over a row that starts
-    /// with the mascot and has its text at the banner's column.
-    Narrow,
+    /// with the mascot and has its text at the banner's column — its text at
+    /// `text_col` ([`narrow_card`] places it where it draws as measured).
+    Narrow { text_col: usize },
 }
 
 /// Whether `row` draws a card's banner, and in which layout: `None` for a
@@ -629,7 +891,7 @@ fn banner_row(row: &str, next: Option<&String>, banner: &str) -> Option<BannerRo
         && banner_version(after).is_some_and(|v| v.len() == after.len());
     let confirmed =
         next.is_some_and(|n| n.starts_with(MASCOT_TOP) && card_row(n, text_col).is_some());
-    (bare || confirmed).then_some(BannerRow::Narrow)
+    (bare || confirmed).then_some(BannerRow::Narrow { text_col })
 }
 
 /// One card row read against the text column: before `text_col`, nothing
@@ -1746,7 +2008,9 @@ mod tests {
     /// narrow pane's four-row card (the `*-34col`, `*-36col` and
     /// `*-40col` captures: main's 2.1.300 survey at 40 columns draws its
     /// banner on a row of its own too, and the `*-narrow-*` ones: the
-    /// workspace card's longer model row splits at 60) is refused.
+    /// workspace card's longer model row splits at 60, 2.1.304's at 50 and
+    /// down to 33, the plain mascot's at 31) is placed four rows tall on its
+    /// banner row, the mascot one row under it.
     #[test]
     fn every_recorded_card_is_placed_or_refused_by_its_layout() {
         let banner = crate::anchors::anchor_text("launch.banner");
@@ -1770,7 +2034,25 @@ mod tests {
                 .any(|narrow| name.ends_with(narrow))
                 || name.contains("-narrow-")
             {
-                assert_eq!(place, None, "{name}: the narrow card");
+                let top = rows.iter().rposition(|r| r.contains(banner)).unwrap();
+                let (text_col, mascot_end) = if name.contains("-workspace-") {
+                    (13, 11)
+                } else {
+                    (11, 9)
+                };
+                let place = place.unwrap_or_else(|| panic!("{name}: the narrow card"));
+                assert_eq!(
+                    (
+                        place.top,
+                        place.rows,
+                        place.mascot_row,
+                        place.text_col,
+                        place.mascot_end,
+                        place.ends[0]
+                    ),
+                    (top, 4, 1, text_col, mascot_end, text_col + 20),
+                    "{name}: the narrow card"
+                );
                 narrow += 1;
                 continue;
             }
@@ -1865,6 +2147,7 @@ mod tests {
                 Some(CardPlace {
                     top,
                     rows: 3,
+                    mascot_row: 0,
                     text_col: 11,
                     mascot_end: 9,
                     ends,
@@ -1887,6 +2170,7 @@ mod tests {
                 Some(CardPlace {
                     top,
                     rows: 3,
+                    mascot_row: 0,
                     text_col: 13,
                     mascot_end: 11,
                     ends: [33, 59, 38],
@@ -1894,6 +2178,54 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// THE WAND FLARES IN CLAUDE'S TWO INKS ([`wand_flare`]): the wand's `✦`
+    /// in the dark flare colour or the light one, a few levels off either
+    /// way, is the flare; a channel past the tolerance is not, nor the wand
+    /// in another colour, nor any other glyph in the flare colour (the
+    /// wand's `╱`, a block of the mascot, a `*`). NEGATIVE CONTROLS, the
+    /// colours MEASURED on the real 2.1.304 (lab M1–M3): every other step of
+    /// the dark wand's cycle (`ffe18d` … `ffeca0`, its orange flicker
+    /// `f08048`…`fdc364`), its resting `#ffcc68`, the workspace body's
+    /// `#af87ff` and `#8700ff`, the wand's `╱` `#d0a264` and `#a76e27`, and
+    /// the plain mascot's `#d77757`. The plain card's wand cell is its
+    /// mascot's right edge, which never holds a `✦`.
+    #[test]
+    fn the_wand_flares_in_claudes_two_inks() {
+        let off = |c: [u8; 3], by: i16| c.map(|v| (i16::from(v) + by).clamp(0, 255) as u8);
+        for ink in [WAND_FLARE_DARK, WAND_FLARE_LIGHT] {
+            assert!(wand_flare('\u{2726}', ink), "{ink:?}");
+            let t = i16::from(WAND_FLARE_TOLERANCE);
+            assert!(
+                wand_flare('\u{2726}', off(ink, -t)),
+                "{ink:?} within tolerance"
+            );
+            let mut far = ink;
+            far[1] = far[1].wrapping_sub(WAND_FLARE_TOLERANCE + 1);
+            assert!(!wand_flare('\u{2726}', far), "{ink:?}: a channel past it");
+            for ch in ['\u{2571}', '\u{2588}', '*'] {
+                assert!(!wand_flare(ch, ink), "{ch:?} in {ink:?}");
+            }
+        }
+        let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
+        for measured in [
+            0xffe18d, 0xffd77b, 0xffcc68, 0xf08048, 0xfdc364, 0xffd476, 0xffdc84, 0xffe492,
+            0xffeca0, 0xaf87ff, 0x8700ff, 0xd0a264, 0xa76e27, 0xd77757,
+        ] {
+            assert!(
+                !wand_flare('\u{2726}', rgb(measured)),
+                "{measured:06x} is no flare"
+            );
+        }
+        assert!(
+            wand_flare('\u{2726}', rgb(0xfffceb)),
+            "the measured dark flare"
+        );
+        let plain = measured("claude-2.1.302-launch-144col.txt");
+        let place = launch_card_place(&plain).expect("the plain card");
+        assert_eq!(place.wand(), Some((8, 0)), "the mascot's right edge");
+        assert_ne!(plain[0].chars().nth(8), Some('\u{2726}'));
     }
 
     /// THE WORKSPACE CARD (2.1.302, `--effort workspace`): the mascot raises
@@ -1912,6 +2244,12 @@ mod tests {
         );
         let place = launch_card_place(&card).expect("the workspace card");
         assert_eq!((place.top, place.text_col), (0, 13));
+        assert_eq!(place.wand(), Some((10, 0)), "the wand's cell");
+        assert_eq!(
+            card[0].chars().nth(10),
+            Some('\u{2726}'),
+            "the wand's `✦` is where the place says"
+        );
         assert_eq!(launch_card_version(&card, &place), Some("2.1.302"));
         assert_eq!(
             launch_card(&card),
@@ -1956,17 +2294,23 @@ mod tests {
     /// [`launch_card_held`] holds it, else the scan's, with its words.
     fn follow(
         rows: &[String],
-        kept: Option<&(CardPlace, [String; 3])>,
-    ) -> Option<(CardPlace, [String; 3])> {
+        kept: Option<&(CardPlace, Vec<String>)>,
+    ) -> Option<(CardPlace, Vec<String>)> {
         let scan = launch_card_scan(rows);
-        if let Some((place, words)) = kept
-            && launch_card_held(rows, scan, place, words.each_ref().map(String::as_str))
-        {
-            return kept.cloned();
+        if let Some((place, words)) = kept {
+            let words: Vec<&str> = words.iter().map(String::as_str).collect();
+            if launch_card_held(rows, scan, place, &words) {
+                return kept.cloned();
+            }
         }
         let place = scan.1?;
         let words = launch_card_words(rows, &place).expect("a placed card's words");
-        Some((place, words.map(str::to_owned)))
+        Some((place, owned(&words)))
+    }
+
+    /// A card's words, owned.
+    fn owned(words: &CardWords<'_>) -> Vec<String> {
+        words.as_slice().iter().map(|w| (*w).to_owned()).collect()
     }
 
     /// THE ENTRANCE HOLDS THE CARD IT PLACED: over the measured jump
@@ -2107,7 +2451,7 @@ mod tests {
                 with(&blank(), 0, &["$ claude", "$ "]),
                 None,
             ),
-            ("the narrow layout", narrow, None),
+            ("the narrow layout, the scan's card", narrow, Some(1)),
             ("a newer narrow banner below", newer_narrow, None),
             ("a newer card below", newer_wide, Some(10)),
             ("scrolled standing", up(&stand, 1), Some(0)),
@@ -2121,17 +2465,32 @@ mod tests {
     /// workspace card's NARROW layout draws a card's shape one row under its
     /// banner — the mascot down the left of three rows of text at column 13:
     /// the model, the billing, the working directory — and at that place
-    /// there are no card's words. CONTROLS: each of those rows reads as a
-    /// card row's words on its own (no letter left of column 13, text at
-    /// it), so the banner is what refuses them; the wide card at rest reads
-    /// its words at its own place. Mutation-checked: a `launch_card_words`
-    /// that does not ask for the banner reads the narrow card's three rows.
+    /// there are no card's words; at the narrow card's own place its four
+    /// rows are its words. CONTROLS: each of those rows reads as a card
+    /// row's words on its own (no letter left of column 13, text at it), so
+    /// the banner is what refuses them; the wide card at rest reads its
+    /// words at its own place. Mutation-checked: a `launch_card_words` that
+    /// does not ask for the banner reads the narrow card's three rows.
     #[test]
     fn a_cards_words_open_with_its_banner() {
         let narrow = measured("claude-2.1.302-launch-workspace-narrow-60col.txt");
         let rest = jump("5-rest");
         let wide = launch_card_place(&rest).expect("the card at rest");
-        assert_eq!(launch_card_place(&narrow), None, "the narrow layout");
+        let own = launch_card_place(&narrow).expect("the narrow card");
+        assert_eq!((own.rows, own.mascot_row), (4, 1));
+        assert_eq!(
+            launch_card_words(&narrow, &own).map(|w| owned(&w)),
+            Some(
+                [
+                    "Claude Code v2.1.302",
+                    "Opus 5.5 with xhigh effort",
+                    "API Usage Billing",
+                    "/private/tmp/at.tPwT/proj",
+                ]
+                .map(str::to_owned)
+                .to_vec()
+            ),
+        );
         let under = CardPlace { top: 1, ..wide };
         let words: Vec<_> = (1..4).map(|k| card_words(&narrow[k], 13)).collect();
         assert_eq!(
@@ -2145,31 +2504,36 @@ mod tests {
         );
         assert_eq!(launch_card_words(&narrow, &under), None, "{narrow:#?}");
         assert_eq!(
-            launch_card_words(&rest, &wide),
-            Some([
-                "Claude Code v2.1.302",
-                "Opus 5.5 with xhigh effort \u{b7} API Usage Billing",
-                "/private/tmp/at.TOxX/proj",
-            ]),
+            launch_card_words(&rest, &wide).map(|w| owned(&w)),
+            Some(
+                [
+                    "Claude Code v2.1.302",
+                    "Opus 5.5 with xhigh effort \u{b7} API Usage Billing",
+                    "/private/tmp/at.TOxX/proj",
+                ]
+                .map(str::to_owned)
+                .to_vec()
+            ),
             "CONTROL: the card's own words"
         );
     }
 
     /// The workspace card's NARROW layout (34 to 60 columns: the banner
-    /// alone at column 13, the wand on the mascot row under it) is refused,
-    /// alone and under an older card — never passed over for the older card,
-    /// which a finished process drew — and so is its banner when the rows
-    /// under it did not draw as measured: cut by the screen's bottom edge,
-    /// over a blank row, over the mascot without its text. A narrow card
-    /// QUOTED in a message, its banner at the same column 13 with its
-    /// mascot indented under it, is still passed over for the live card.
-    /// CONTROLS (mutation-checked): reading the mascot row under the banner
-    /// as blocks alone passes the whole narrow card over; reading column 13
-    /// like any quote's column passes the cut banner over and places the
-    /// older card; reading it like the classic narrow column refuses the
-    /// quote.
+    /// alone at column 13, the wand on the mascot row under it) is PLACED by
+    /// its exact shape, alone and under an older card — never passed over
+    /// for the older card, which a finished process drew — and its banner
+    /// is refused, still never passed over, when the rows under it did not
+    /// draw as measured: cut by the screen's bottom edge, over a blank row,
+    /// over the mascot without its text, over its three rows with a fourth
+    /// of text under them (no blank margin). A narrow card QUOTED in a
+    /// message, its banner at the same column 13 with its mascot indented
+    /// under it, is still passed over for the live card. CONTROLS
+    /// (mutation-checked): reading the mascot row under the banner as blocks
+    /// alone passes the whole narrow card over; reading column 13 like any
+    /// quote's column passes the cut banner over and places the older card;
+    /// reading it like the classic narrow column refuses the quote.
     #[test]
-    fn the_workspace_narrow_card_is_refused_never_passed_over() {
+    fn the_workspace_narrow_card_is_placed_never_passed_over() {
         let under_a_card = |newest: &[String]| {
             let mut both = card_rows();
             both.extend(rows(&["", "\u{276F} exit", ""]));
@@ -2183,20 +2547,35 @@ mod tests {
             "claude-2.1.302-launch-workspace-narrow-34col.txt",
         ] {
             let narrow = measured(name);
-            assert_eq!(launch_card_scan(&narrow), (Some(0), None), "{name}");
+            let place = launch_card_place(&narrow).expect("the narrow card");
+            assert_eq!(
+                (
+                    place.top,
+                    place.rows,
+                    place.mascot_row,
+                    place.text_col,
+                    place.mascot_end
+                ),
+                (0, 4, 1, 13, 11),
+                "{name}"
+            );
+            assert_eq!(place.wand(), Some((10, 1)), "{name}: the wand's cell");
             let (at, both) = under_a_card(&narrow);
             assert_eq!(
                 launch_card_scan(&both),
-                (Some(at), None),
+                (Some(at), Some(CardPlace { top: at, ..place })),
                 "{name}: {both:#?}"
             );
             // Its banner over rows that did not draw as measured: refused,
             // never a pass to the older card above.
             let mascot_alone: String = narrow[1].chars().take(11).collect();
+            let mut no_margin = narrow[1..4].to_vec();
+            no_margin.push(narrow[3].clone());
             for (what, tail) in [
                 ("cut under its banner", vec![]),
                 ("over a blank row", vec![String::new()]),
                 ("over the mascot without its text", vec![mascot_alone]),
+                ("over a fourth row of text", no_margin),
             ] {
                 let mut newest = vec![narrow[0].clone()];
                 newest.extend(tail);
@@ -2229,6 +2608,88 @@ mod tests {
         // 26 columns wrap the banner itself: no row holds it, nothing placed.
         let wrapped = measured("claude-2.1.302-launch-workspace-narrow-26col.txt");
         assert_eq!(launch_card_scan(&wrapped), (None, None));
+    }
+
+    /// THE NARROW CARD, MEASURED on 2.1.304 (the
+    /// `claude-2.1.304-update-notice-narrow-*` captures): with the wand at 50,
+    /// 34 and 33 columns on the fullscreen renderer and at 50 and 33 on the
+    /// inline one, the plain mascot at 50 and 31, the card is placed four
+    /// rows tall on its banner's row — the banner alone at the text column,
+    /// the mascot from the row under it, its wand there — and names its
+    /// build. One column narrower (32 with the wand, 30 without) the vendor
+    /// wraps the banner itself and nothing is placed. NEGATIVE CONTROLS on
+    /// the 50-column capture, each placing nothing: words after the
+    /// banner's version, the mascot's top row a column in, the model a
+    /// column off the text column, a fifth row of the card's text where its
+    /// blank margin was, the billing's text gone from its row.
+    #[test]
+    fn the_narrow_card_is_placed_by_its_measured_shape() {
+        let capture = |name: &str| measured(&format!("claude-2.1.304-update-notice-{name}.txt"));
+        for (name, top, text_col, mascot_end) in [
+            ("narrow-workspace-fullscreen-50col", 1, 13, 11),
+            ("narrow-workspace-fullscreen-34col", 1, 13, 11),
+            ("narrow-workspace-fullscreen-33col", 1, 13, 11),
+            ("narrow-workspace-inline-50col", 0, 13, 11),
+            ("narrow-workspace-inline-33col", 0, 13, 11),
+            ("narrow-xhigh-fullscreen-50col", 1, 11, 9),
+            ("narrow-xhigh-fullscreen-31col", 1, 11, 9),
+        ] {
+            let screen = capture(name);
+            let place = launch_card_place(&screen).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(
+                (
+                    place.top,
+                    place.rows,
+                    place.mascot_row,
+                    place.text_col,
+                    place.mascot_end
+                ),
+                (top, 4, 1, text_col, mascot_end),
+                "{name}"
+            );
+            assert_eq!(launch_card_version(&screen, &place), Some("2.1.304"));
+            assert_eq!(place.wand(), Some((mascot_end - 1, top + 1)), "{name}");
+        }
+        for name in [
+            "narrow-workspace-fullscreen-32col",
+            "narrow-xhigh-fullscreen-30col",
+        ] {
+            assert_eq!(launch_card_scan(&capture(name)), (None, None), "{name}");
+        }
+        let screen = capture("narrow-workspace-fullscreen-50col");
+        assert!(
+            crate::text::blank(&screen[5]),
+            "CONTROL: the margin under the card: {screen:#?}"
+        );
+        let edited = |at: usize, row: String| {
+            let mut s = screen.clone();
+            s[at] = row;
+            s
+        };
+        for (why, rows) in [
+            (
+                "words after the version",
+                edited(1, format!("{} is out", screen[1])),
+            ),
+            (
+                "the mascot's top row a column in",
+                edited(2, format!(" {}", screen[2])),
+            ),
+            (
+                "the model a column off",
+                edited(2, screen[2].replacen("  Opus", "   Opus", 1)),
+            ),
+            (
+                "a fifth row of the card's text",
+                edited(5, screen[4].clone()),
+            ),
+            (
+                "the billing's text gone",
+                edited(3, screen[3].chars().take(10).collect()),
+            ),
+        ] {
+            assert_eq!(launch_card_place(&rows), None, "{why}: {rows:#?}");
+        }
     }
 
     /// The mascot's columns admit what it HOLDS, never words: a row that
@@ -2353,19 +2814,19 @@ mod tests {
         }
     }
 
-    /// The narrow pane's four-row card is refused, alone and as the newest
-    /// card under a three-row one (which a finished process drew) — and so
-    /// is a narrow banner whose rows under it did not draw as measured: cut
-    /// by the screen's bottom edge, over a blank row, over the mascot alone,
-    /// over a row without the mascot. None of them falls back to the older
-    /// card above. A bare banner row at any column but the narrow card's (a
-    /// message's line, a narrow card quoted in a tool's output) is passed
-    /// over for the card above; at the column a narrow card quoted in a
-    /// message shares with the workspace narrow card (13), only when a
-    /// quote's next row is under it. CONTROL (mutation-checked): reading
-    /// column 13 like a quote's column alone fails here.
+    /// The narrow pane's four-row card is placed, alone and as the newest
+    /// card under a three-row one (which a finished process drew) — and a
+    /// narrow banner whose rows under it did not draw as measured is
+    /// refused: cut by the screen's bottom edge, over a blank row, over the
+    /// mascot alone, over a row without the mascot. None of them falls back
+    /// to the older card above. A bare banner row at any column but the
+    /// narrow card's (a message's line, a narrow card quoted in a tool's
+    /// output) is passed over for the card above; at the column a narrow
+    /// card quoted in a message shares with the workspace narrow card (13),
+    /// only when a quote's next row is under it. CONTROL (mutation-checked):
+    /// reading column 13 like a quote's column alone fails here.
     #[test]
-    fn the_narrow_card_is_refused() {
+    fn a_narrow_banner_is_its_card_or_refused() {
         let narrow = measured("claude-2.1.300-prose-opens-with-limit-words-34col.txt");
         let banner = narrow[0].clone();
         assert_eq!(
@@ -2378,8 +2839,18 @@ mod tests {
             r.extend(rows(tail));
             r
         };
+        let whole = launch_card_place(&narrow).expect("the whole narrow card");
+        assert_eq!((whole.top, whole.rows, whole.text_col), (0, 4, 11));
+        let mut both = card_rows();
+        both.extend(rows(&["", "❯ exit", ""]));
+        let at = both.len();
+        both.extend(narrow.iter().cloned());
+        assert_eq!(
+            launch_card_place(&both),
+            Some(CardPlace { top: at, ..whole }),
+            "the newest card, under an older one: {both:#?}"
+        );
         for (what, newest) in [
-            ("the whole narrow card", narrow.clone()),
             ("cut to its banner row", narrow[..1].to_vec()),
             ("over one blank row", over(&[""])),
             (
@@ -2678,14 +3149,27 @@ mod tests {
             "most rewrites keep the reading: {kept} kept, {moved} moved"
         );
         assert!(newer_below > 0 && own_rows > 0, "{newer_below} {own_rows}");
-        // A newer card below the old one moves it; words under it do not.
+        // A newer card below the old one moves it; words under the rows a
+        // card's reading reads do not — the wide card's three, the narrow
+        // card's four and its margin (a row written there is read again).
         let mut screen = card_rows();
         screen.extend(rows(&["", "", "", ""]));
         let reading = launch_card_scan(&screen);
         assert_eq!(reading.0, Some(0));
         let mut words = screen.clone();
-        words[4] = "\u{276F} keep going".into();
-        assert!(launch_card_unmoved(&words, reading.0, &[4]));
+        words[3] = "\u{276F} keep going".into();
+        assert!(launch_card_unmoved(&words, reading.0, &[3]));
+        words[2] = "\u{276F} keep going".into();
+        assert!(!launch_card_unmoved(&words, reading.0, &[2, 3]));
+        let narrow = measured("claude-2.1.304-update-notice-narrow-workspace-fullscreen-50col.txt");
+        let at = launch_card_scan(&narrow);
+        assert_eq!(at.0, Some(1), "CONTROL: the narrow card's banner");
+        let mut words = narrow.clone();
+        words[6] = "\u{276F} keep going".into();
+        assert!(launch_card_unmoved(&words, at.0, &[6]));
+        words[5] = "\u{276F} keep going".into();
+        assert!(!launch_card_unmoved(&words, at.0, &[5, 6]), "its margin");
+        assert_eq!(launch_card_scan(&words), (Some(1), None), "read again");
         let mut newer = screen.clone();
         newer[4..].clone_from_slice(&card_rows()[..3]);
         assert!(!launch_card_unmoved(&newer, reading.0, &[4, 5, 6]));

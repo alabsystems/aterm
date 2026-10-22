@@ -55,6 +55,7 @@ impl MaterializedRow {
 
     /// Iterate this row's populated extras as `(col, extra)`, in arbitrary
     /// order (callers needing column order sort, as with `CellExtras::iter`).
+    #[inline]
     pub fn extras_iter(&self) -> impl Iterator<Item = (u16, &CellExtra)> + '_ {
         self.extras.iter().map(|(&col, extra)| (col, extra))
     }
@@ -63,7 +64,7 @@ impl MaterializedRow {
     /// (mirrors `Row::is_wrapped` for materialized history rows).
     #[must_use]
     #[inline]
-    pub(crate) fn is_wrapped(&self) -> bool {
+    pub(crate) const fn is_wrapped(&self) -> bool {
         self.wrapped
     }
 
@@ -90,6 +91,7 @@ impl MaterializedRow {
     /// How many columns the row's text spans: [`len`](Self::len) less a
     /// painted early-wrap hole, which is no text (`Row::written_len`).
     #[must_use]
+    #[inline]
     pub(crate) fn written_len(&self) -> u16 {
         let len = self.len();
         if self.hole {
@@ -102,6 +104,7 @@ impl MaterializedRow {
     /// Whether this row has no occupied columns.
     #[cfg(test)]
     #[must_use]
+    #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -111,6 +114,7 @@ impl MaterializedRow {
     /// extras, so a trailing coloured blank (a status bar, an EL-filled row) is
     /// kept, as on the live row.
     #[must_use]
+    #[inline]
     #[allow(clippy::cast_possible_truncation)] // cells.len() bounded by terminal width (≤ u16::MAX)
     pub(crate) fn len(&self) -> u16 {
         self.cells
@@ -138,8 +142,8 @@ impl MaterializedRow {
 /// as an early-wrap hole would? Only the row after can say whether one wrapped
 /// there; `fill_row_cells` marks a row rebuilt from a line by the same rule.
 #[inline]
-pub(crate) fn leaves_wrap_hole(filled: u16, cols: u16) -> bool {
-    u32::from(filled) + 1 == u32::from(cols)
+pub(crate) const fn leaves_wrap_hole(filled: u16, cols: u16) -> bool {
+    (filled as u32) + 1 == (cols as u32)
 }
 
 /// Materialize a scrollback [`Line`] into a [`MaterializedRow`], restoring

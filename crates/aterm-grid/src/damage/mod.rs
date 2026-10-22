@@ -102,7 +102,7 @@ impl Damage {
     /// Check if the entire screen is damaged.
     #[must_use]
     #[inline]
-    pub fn is_full(&self) -> bool {
+    pub const fn is_full(&self) -> bool {
         matches!(self, Damage::Full)
     }
 
@@ -110,7 +110,7 @@ impl Damage {
     /// callers re-stamp unconditionally. See [`DamageTracker::mark_seq`].
     #[must_use]
     #[inline]
-    pub(crate) fn mark_seq(&self) -> Option<u64> {
+    pub(crate) const fn mark_seq(&self) -> Option<u64> {
         match self {
             Damage::Full => None,
             Damage::Partial(tracker) => Some(tracker.mark_seq),
@@ -129,6 +129,7 @@ impl Damage {
 
     /// Get damaged row bounds for a row (returns column range if damaged).
     #[must_use]
+    #[inline]
     pub fn row_damage_bounds(&self, row: u16, cols: u16) -> Option<(u16, u16)> {
         match self {
             Damage::Full => Some((0, cols)),
@@ -146,6 +147,7 @@ impl Damage {
 
     /// Reset damage tracking (call after render), reusing allocations when the
     /// row count is unchanged.
+    #[inline]
     pub(crate) fn reset(&mut self, rows: u16) {
         match self {
             Damage::Partial(tracker) => tracker.clear(rows),
@@ -155,6 +157,7 @@ impl Damage {
 
     /// Iterate over damaged rows: all rows for `Full`, bitset scan for
     /// `Partial`.
+    #[inline]
     pub fn damaged_rows(&self, rows: u16) -> DamagedRowIterator<'_> {
         match self {
             Damage::Full => DamagedRowIterator::Full {
@@ -169,6 +172,7 @@ impl Damage {
 
     /// Iterate over damaged rows with their column range [left, right) (the
     /// primary renderer API).
+    #[inline]
     pub fn iter_bounds(&self, rows: u16, cols: u16) -> DamageBoundsIterator<'_> {
         DamageBoundsIterator::new(self, self.damaged_rows(rows), cols)
     }

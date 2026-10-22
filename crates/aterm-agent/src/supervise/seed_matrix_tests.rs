@@ -4978,6 +4978,248 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                 person_on_screen: false,
             });
         }
+        // Cruise's done check meets a full context in its own turn, or a 529 cuts it and the
+        // wall's retry meets one: the `/compact`'s continuation types the check again. No row
+        // names that wall, so a successor reads it off the check's point and the `/compact`
+        // after it. A person's turn between (met by a 529 too) leaves the plain continuation.
+        // The report names an irreversible act, so the check carries the reversible clause,
+        // as a successor's continuation types it for a check it did not type
+        // (`compact_owed_text`).
+        let check = crate::supervise::policy::turn_end::DONE_CHECK;
+        let claim = "⏺ All done: committed and pushed. Should I delete the old release branch?";
+        let h1 = with(&w0, &turn(None, &[claim], 0, T0 + 2 * MIN));
+        let after = compacted("⏺ Running the suite.");
+        let kept = &after[5..after.len() - 4];
+        let full_context = [
+            "⏺ Running the suite.",
+            "  ⎿  Context limit reached · /compact or /clear to continue",
+        ];
+        for (api, person) in [(false, false), (true, false), (true, true)] {
+            let mut beats = vec![
+                start(),
+                beat(
+                    At::Start(2 * MIN),
+                    "the worker's done report",
+                    Ev::Point(cc(&h1, &[], "")),
+                ),
+                taken(0, &h1, check),
+            ];
+            // The act whose turn meets the full context: the check, or the wall's retry.
+            let (k, act, mut h) = if api {
+                (
+                    1,
+                    retry.as_str(),
+                    with(&h1, &api_turn(Some(check), 5 * MIN, 0)),
+                )
+            } else {
+                (0, check, h1.clone())
+            };
+            if api {
+                beats.push(beat(
+                    At::Act(0, 5 * MIN),
+                    "the check's turn meets a 529",
+                    Ev::Point(cc(&h, &[], "")),
+                ));
+            }
+            if person {
+                let said = "please also look at the docs";
+                let cut = h.clone();
+                h = with(&cut, &api_turn(Some(said), 4 * MIN, 0));
+                beats.extend([
+                    beat(At::Act(0, 5 * MIN + 20), "a person's keystroke", Ev::Key),
+                    beat(
+                        At::Act(0, 5 * MIN + 25),
+                        "a person's turn runs",
+                        Ev::Busy(live(&cut, said)),
+                    ),
+                    beat(
+                        At::Act(0, 9 * MIN + 30),
+                        "the person's turn meets a 529",
+                        Ev::Point(cc(&h, &[], "")),
+                    ),
+                ]);
+            }
+            if api {
+                beats.push(taken(1, &h, act));
+            }
+            let full = with(&h, &turn(Some(act), &full_context, 4 * MIN, 0));
+            let again = if person { "keep going" } else { check };
+            let answered = with(
+                kept,
+                &turn(
+                    Some(again),
+                    &["⏺ All done: verified again, every suite passes."],
+                    3 * MIN,
+                    0,
+                ),
+            );
+            beats.extend([
+                beat(
+                    At::Act(k, 4 * MIN),
+                    "the act's turn meets a full context",
+                    Ev::Point(cc(&full, &[], "")),
+                ),
+                beat(
+                    At::Act(k + 1, 2),
+                    "the /compact runs",
+                    Ev::Busy(compacting(&full)),
+                ),
+                beat(
+                    At::Act(k + 1, 40),
+                    "the /compact's answer",
+                    Ev::Point(after.clone()),
+                ),
+                taken(k + 2, kept, again),
+                beat(
+                    At::Act(k + 2, 3 * MIN),
+                    "the continuation's turn ends: done again",
+                    Ev::Point(cc(&answered, &[], "")),
+                ),
+                taken(k + 3, &answered, check),
+            ]);
+            let name = match (api, person) {
+                (false, _) => "the done check's turn meets a full context",
+                (true, false) => "API 529 cuts the done check, its retry meets a full context",
+                (true, true) => {
+                    "API 529 cuts the done check, a person's turn meets one too, its retry \
+                     meets a full context"
+                }
+            };
+            out.push(Scenario {
+                name: format!("{name}{window}"),
+                t0: T0,
+                policy: default_policy(),
+                host: None,
+                beats,
+                tail_s: 3 * HOUR,
+                take,
+                person_on_screen: false,
+            });
+        }
+        // Land's instruction meets a full context in its own turn, or a 529 cuts it and the
+        // wall's retry meets one, or the continuation's own turn meets one again: the
+        // `/compact`'s continuation types the instruction again, and its clean defense lands
+        // the task. No row names that wall: a successor reads it off the act's point and the
+        // `/compact` after it, and the act by its row's rule (`compact_owed_text`).
+        let answer = crate::supervise::policy::turn_end::LAND_ANSWER;
+        for (api, twice, asked) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut beats = vec![
+                start(),
+                beat(
+                    At::Start(2 * MIN),
+                    "the worker's progress",
+                    Ev::Point(p0.clone()),
+                ),
+                taken(0, &w0, land),
+            ];
+            let (mut k, act, h) = if api {
+                let cut = with(&w0, &api_turn(Some(land), 5 * MIN, 0));
+                beats.extend([
+                    beat(
+                        At::Act(0, 5 * MIN),
+                        "the act's turn meets a 529",
+                        Ev::Point(cc(&cut, &[], "")),
+                    ),
+                    taken(1, &cut, &retry),
+                ]);
+                (1, retry.as_str(), cut)
+            } else if asked {
+                let q = "⏺ Stage 3 is in. Should I merge the parser branch into main now?";
+                let h = with(&w0, &turn(Some(land), &[q], 4 * MIN, 0));
+                beats.extend([
+                    beat(
+                        At::Act(0, 4 * MIN),
+                        "the instruction's turn ends: a question",
+                        Ev::Point(cc(&h, &[], "")),
+                    ),
+                    taken(1, &h, answer),
+                ]);
+                (1, answer, h)
+            } else {
+                (0, land, w0.clone())
+            };
+            let land = if asked { answer } else { land };
+            let full = with(&h, &turn(Some(act), &full_context, 4 * MIN, 0));
+            beats.extend([
+                beat(
+                    At::Act(k, 4 * MIN),
+                    "the act's turn meets a full context",
+                    Ev::Point(cc(&full, &[], "")),
+                ),
+                beat(
+                    At::Act(k + 1, 2),
+                    "the /compact runs",
+                    Ev::Busy(compacting(&full)),
+                ),
+                beat(
+                    At::Act(k + 1, 40),
+                    "the /compact's answer",
+                    Ev::Point(after.clone()),
+                ),
+                taken(k + 2, kept, land),
+            ]);
+            let mut kept = kept.to_vec();
+            if twice {
+                let full = with(&kept, &turn(Some(land), &full_context, 3 * MIN, 0));
+                let after = compacted("⏺ Running the suite once more.");
+                kept = after[5..after.len() - 4].to_vec();
+                beats.extend([
+                    beat(
+                        At::Act(k + 2, 3 * MIN),
+                        "the continuation's turn meets a full context",
+                        Ev::Point(cc(&full, &[], "")),
+                    ),
+                    beat(
+                        At::Act(k + 3, 2),
+                        "the /compact runs",
+                        Ev::Busy(compacting(&full)),
+                    ),
+                    beat(
+                        At::Act(k + 3, 40),
+                        "the /compact's answer",
+                        Ev::Point(after),
+                    ),
+                    taken(k + 4, &kept, land),
+                ]);
+                k += 2;
+            }
+            let answered = with(&kept, &turn(Some(land), &defense, 3 * MIN, 0));
+            beats.extend([
+                beat(
+                    At::Act(k + 2, 3 * MIN),
+                    "the continuation's turn ends: a clean defense",
+                    Ev::Point(cc(&answered, &[], "")),
+                ),
+                beat(
+                    At::Act(k + 2, 3 * MIN + 90),
+                    "(a handoff instant)",
+                    Ev::Mark,
+                ),
+            ]);
+            let name = match (api, twice, asked) {
+                (true, ..) => "API 529 cuts Land's instruction, its retry meets a full context",
+                (_, true, _) => {
+                    "Land's instruction meets a full context, its continuation meets one again"
+                }
+                (_, _, true) => "Land's answer meets a full context",
+                _ => "Land's instruction meets a full context",
+            };
+            out.push(Scenario {
+                name: format!("{name}, defended{window}"),
+                t0: T0,
+                policy: land_policy(),
+                host: None,
+                beats,
+                tail_s: 3 * HOUR,
+                take,
+                person_on_screen: false,
+            });
+        }
     }
     out
 }

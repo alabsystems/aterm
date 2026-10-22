@@ -114,6 +114,8 @@ pub(crate) struct CommonViewState {
     pub(crate) pressed: Option<UiKey>,
     pub(crate) focus_visible: bool,
     pub(crate) presentation_revision: u64,
+    /// Authorization identity for one review; independent of paints and focus.
+    pub(crate) review_revision: u64,
     /// THE VIEW'S CONTENT REVISION: the runtime moves it on every access
     /// that can change the view's state or what it renders from — an event
     /// it dispatches, a host's mutable access, a projection it publishes
@@ -132,6 +134,7 @@ impl Default for CommonViewState {
             pressed: None,
             focus_visible: false,
             presentation_revision: 1,
+            review_revision: 0,
             content_epoch: 0,
         }
     }
@@ -2484,6 +2487,10 @@ pub(crate) enum AppEffect {
     },
     InvalidateOwnPresentation,
     RepaintSelf(DamageRegion),
+    /// The shared model changed; every attached view needs a fresh presentation.
+    RepaintInstance(DamageRegion),
+    /// Consume this shared review before any subsequently queued action runs.
+    RetireReview,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2749,6 +2756,14 @@ impl UpdateCx<'_> {
     pub(crate) fn repaint(&mut self, damage: DamageRegion) {
         self.effects.push(AppEffect::RepaintSelf(damage));
     }
+
+    pub(crate) fn repaint_instance(&mut self, damage: DamageRegion) {
+        self.effects.push(AppEffect::RepaintInstance(damage));
+    }
+
+    pub(crate) fn retire_review(&mut self) {
+        self.effects.push(AppEffect::RetireReview);
+    }
 }
 
 #[derive(Debug)]
@@ -2896,6 +2911,13 @@ impl NativeRuntime {
         }
     }
 
+    pub(crate) fn take_system_state_cancel(&mut self, instance: AppInstanceId) -> bool {
+        match self.instances.get_mut(&instance) {
+            Some(NativeApp::SystemState(state)) => state.take_queued_cancel(),
+            _ => false,
+        }
+    }
+
     pub(crate) fn app(&self, instance: AppInstanceId) -> Option<&NativeApp> {
         self.instances.get(&instance)
     }
@@ -2962,18 +2984,54 @@ impl NativeRuntime {
         &mut self,
         request: crate::workstation_setup::Request,
     ) -> bool {
-        self.update_system_state(|state| state.offer(request))
+        let accepted = self.update_system_state(|state| state.offer(request));
+        if accepted {
+            self.retire_system_state_review();
+        }
+        accepted
     }
 
     pub(crate) fn publish_system_state(
         &mut self,
         status: crate::system_state::SetupStatus,
     ) -> bool {
-        self.update_system_state(|state| state.publish(status))
+        let mut replaced = false;
+        let changed = self.update_system_state(|state| {
+            let before = state.reviewed_plan();
+            let changed = state.publish(status);
+            replaced = state.reviewed_plan() != before;
+            changed
+        });
+        if replaced {
+            self.retire_system_state_review();
+        }
+        changed
     }
 
     pub(crate) fn accept_system_state_apply(&mut self, plan: aterm_types::macos_setup::Plan) {
-        self.update_system_state(|state| state.apply_accepted(plan));
+        if self.update_system_state(|state| state.apply_accepted(plan)) {
+            self.retire_system_state_review();
+        }
+    }
+
+    pub(crate) fn retire_native_review(&mut self, view: ViewId) {
+        if let Some(state) = self.views.get_mut(&view) {
+            let common = state.common_mut();
+            common.review_revision = common.review_revision.saturating_add(1);
+        }
+    }
+
+    fn retire_system_state_review(&mut self) {
+        let views = self
+            .views
+            .iter()
+            .filter_map(|(view, state)| {
+                matches!(state, AppViewState::SystemState(_)).then_some(*view)
+            })
+            .collect::<Vec<_>>();
+        for view in views {
+            self.retire_native_review(view);
+        }
     }
 
     /// Removing an already-dispatched action changes no visible controls.
@@ -5937,15 +5995,23 @@ impl EditorApp {
         }
     }
 
-    /// Whether the editor's existing file can accept its current changes.
+    /// Whether this editor view can save its current changes without
+    /// interrupting a prompt that owns its input.
     /// Shared by its toolbar, command metadata and the native File menu.
-    pub(crate) fn can_save(&self) -> bool {
+    pub(crate) fn can_save(&self, view: &EditorViewState) -> bool {
         let config_valid = !self.config_editor
             || self
                 .config_analysis
                 .as_ref()
                 .is_some_and(|analysis| !analysis.has_errors());
-        self.dirty && !self.checkpoint_pending && !self.disk_conflict && config_valid
+        self.dirty
+            && !self.checkpoint_pending
+            && !self.disk_conflict
+            && config_valid
+            && view
+                .buffer
+                .as_ref()
+                .is_some_and(|buffer| !buffer.minibuffer_active())
     }
 
     /// Line-start index for `snapshot`, built once per document revision.
@@ -6332,7 +6398,7 @@ impl NativeAppModel for EditorApp {
                 "editor/save-button" => (
                     "Save buffer (Cmd-S or C-x C-s)",
                     "editor/save",
-                    self.can_save(),
+                    self.can_save(view),
                 ),
                 "editor/undo-button" => (
                     "Undo (Cmd-Z or C-/)",
@@ -6347,7 +6413,9 @@ impl NativeAppModel for EditorApp {
                 "editor/find-button" => (
                     "Find: incremental search (C-s)",
                     "editor/find",
-                    buffer_ready,
+                    view.buffer
+                        .as_ref()
+                        .is_some_and(crate::native_editor::EditorBufferView::can_start_search),
                 ),
                 "editor/goto-line-button" => {
                     ("Go to line (M-g g)", "editor/goto-line", buffer_ready)
@@ -6944,7 +7012,7 @@ impl NativeAppModel for EditorApp {
                     }
                     .to_string(),
                 ),
-                enabled: self.can_save(),
+                enabled: self.can_save(view),
             },
             Command {
                 id: ActionId::new("editor/undo"),
@@ -6964,7 +7032,10 @@ impl NativeAppModel for EditorApp {
                 // Windows spends `C-s` on Save, so isearch is `M-s` there (emacs's
                 // search-map prefix, free in this keymap); elsewhere it is `C-s`.
                 shortcut: Some(if cfg!(windows) { "M-s" } else { "C-s" }.to_string()),
-                enabled: buffer_ready,
+                enabled: view
+                    .buffer
+                    .as_ref()
+                    .is_some_and(crate::native_editor::EditorBufferView::can_start_search),
             },
             Command {
                 id: ActionId::new("editor/goto-line"),
@@ -7310,7 +7381,18 @@ mod markdown_reader_tests {
             .unwrap();
         let view = ViewId::from_stored(7);
         runtime
-            .attach_view(view, instance, AppViewState::Editor(Box::default()))
+            .attach_view(
+                view,
+                instance,
+                AppViewState::Editor(Box::new(EditorViewState {
+                    buffer: Some(crate::native_editor::EditorBufferView::new(
+                        document,
+                        crate::document_store::DocumentViewId(7),
+                        documents.snapshot(document).unwrap().seq,
+                    )),
+                    ..EditorViewState::default()
+                })),
+            )
             .unwrap();
         assert!(runtime.enable_config_editor(document, "theme = \"Default\"\n", 7));
         assert!(runtime.begin_config_host_analysis(document, 7, 3));

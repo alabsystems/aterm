@@ -210,6 +210,210 @@ fn configured_find_keys_navigate_the_editor_before_and_after_search_is_accepted(
 }
 
 #[test]
+fn routed_find_keys_keep_their_window_when_frontmost_has_changed() {
+    use crate::app_search::SearchEdit;
+    use crate::keybinding::Keybindings;
+    use crate::native_app::AppViewState;
+    use aterm_window::event::{ElementState, KeyEvent};
+    use aterm_window::keyboard::{
+        Key as WinitKey, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
+    };
+
+    fn press(app: &mut App, wid: WindowId, code: KeyCode, key: WinitKey, mods: ModifiersState) {
+        app.windows.get_mut(&wid).unwrap().mods = mods;
+        for state in [ElementState::Pressed, ElementState::Released] {
+            app.on_key(
+                wid,
+                KeyEvent::synthetic_for_test(
+                    PhysicalKey::Code(code),
+                    key.clone(),
+                    None,
+                    KeyLocation::Standard,
+                    state,
+                    false,
+                ),
+            );
+        }
+    }
+
+    let dir = aterm_tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("find.md");
+    let source = "α needle β needle";
+    fs::write(&path, source).unwrap();
+    let matches: Vec<_> = source
+        .match_indices("needle")
+        .map(|(at, text)| at..at + text.len())
+        .collect();
+    for kind in [
+        None,
+        Some(AppKind::Editor),
+        Some(AppKind::Settings),
+        Some(AppKind::Markdown),
+    ] {
+        for configured in [true, false] {
+            if !configured && !cfg!(target_os = "macos") {
+                continue;
+            }
+            let mut app = App::headless_for_test();
+            let (a, b) = (WindowId(0), WindowId(1));
+            crate::term_lock(&app.front_terminal(a).unwrap().term).process(source.as_bytes());
+            match kind {
+                Some(AppKind::Settings) => assert!(app.open_settings_tab(SettingsRoute::Home)),
+                Some(kind) => {
+                    app.open_document_tab(kind, &file_uri(&path)).unwrap();
+                }
+                None => {}
+            }
+            let editor = app
+                .active_native_view(a)
+                .and_then(|(instance, view)| {
+                    app.native_runtime
+                        .document_id(instance)
+                        .map(|document| (view, document))
+                })
+                .filter(|_| kind == Some(AppKind::Editor));
+            let original =
+                editor.map(|(_, document)| app.document_store.snapshot(document).unwrap());
+            app.install_window_state(b, crate::stub_session(99), 38, 132);
+            crate::term_lock(&app.front_terminal(b).unwrap().term).process(b"other other");
+            app.find_requested();
+            app.search_edit_in(b, SearchEdit::Insert("other".to_string()));
+            let other_search = |app: &App| {
+                let search = app.windows[&b].search.as_ref().unwrap();
+                (search.query.clone(), search.current)
+            };
+            let other_before = other_search(&app);
+            app.keybindings = Keybindings::resolved(Some(
+                &[
+                    ("f2".to_string(), "find".to_string()),
+                    ("f3".to_string(), "find_next".to_string()),
+                    ("shift+f3".to_string(), "find_prev".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ));
+            let (code, key, mods) = if configured {
+                (
+                    KeyCode::F2,
+                    WinitKey::Named(NamedKey::F2),
+                    ModifiersState::empty(),
+                )
+            } else {
+                (
+                    KeyCode::KeyF,
+                    WinitKey::Character(SmolStr::new("f")),
+                    ModifiersState::SUPER,
+                )
+            };
+            // A tab-spawn replay still carries A even after B becomes frontmost.
+            press(&mut app, a, code, key, mods);
+            match kind {
+                None => assert!(app.windows[&a].search.is_some()),
+                Some(AppKind::Editor) => assert!(matches!(
+                    app.native_runtime.view_state(editor.unwrap().0),
+                    Some(AppViewState::Editor(state)) if state.buffer.as_ref().is_some_and(
+                        |buffer| matches!(buffer.minibuffer, amacs::editor::Minibuffer::Search { .. })
+                    )
+                )),
+                Some(AppKind::Settings) => assert!(matches!(
+                    app.native_runtime.view_state(app.active_native_view(a).unwrap().1),
+                    Some(AppViewState::Settings(state)) if state.common.last_focus.as_ref()
+                        .is_some_and(|key| key.as_str() == "settings/search")
+                )),
+                _ => assert!(!app.can_find(a)),
+            }
+            assert_eq!(other_search(&app), other_before);
+
+            if matches!(kind, None | Some(AppKind::Editor)) {
+                if kind.is_none() {
+                    app.search_edit_in(a, SearchEdit::Insert("needle".to_string()));
+                } else {
+                    assert_eq!(
+                        app.input(a, InputEvent::Text("needle".to_string()), Source::Human),
+                        InputOutcome::Ok
+                    );
+                }
+                let selected = |app: &App| {
+                    if let Some((view, _)) = editor {
+                        let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view)
+                        else {
+                            panic!("editor");
+                        };
+                        state
+                            .buffer
+                            .as_ref()
+                            .unwrap()
+                            .primary_selection()
+                            .range()
+                            .start
+                    } else {
+                        app.windows[&a].search.as_ref().unwrap().current
+                    }
+                };
+                let first = selected(&app);
+                for accepted in [false, true] {
+                    if accepted {
+                        if kind.is_none() {
+                            app.search_accept_in(a);
+                        } else {
+                            press(
+                                &mut app,
+                                a,
+                                KeyCode::Enter,
+                                WinitKey::Named(NamedKey::Enter),
+                                ModifiersState::empty(),
+                            );
+                        }
+                    }
+                    press(
+                        &mut app,
+                        a,
+                        KeyCode::F3,
+                        WinitKey::Named(NamedKey::F3),
+                        ModifiersState::empty(),
+                    );
+                    assert_ne!(selected(&app), first, "{kind:?}, accepted={accepted}");
+                    if editor.is_some() {
+                        assert_eq!(selected(&app), matches[1].start);
+                    }
+                    press(
+                        &mut app,
+                        a,
+                        KeyCode::F3,
+                        WinitKey::Named(NamedKey::F3),
+                        ModifiersState::SHIFT,
+                    );
+                    assert_eq!(selected(&app), first);
+                    assert_eq!(other_search(&app), other_before);
+                }
+            } else {
+                press(
+                    &mut app,
+                    a,
+                    KeyCode::F3,
+                    WinitKey::Named(NamedKey::F3),
+                    ModifiersState::empty(),
+                );
+                press(
+                    &mut app,
+                    a,
+                    KeyCode::F3,
+                    WinitKey::Named(NamedKey::F3),
+                    ModifiersState::SHIFT,
+                );
+            }
+            assert_eq!(other_search(&app), other_before);
+            assert_eq!(app.frontmost_window, Some(b));
+            if let Some((_, document)) = editor {
+                let after = app.document_store.snapshot(document).unwrap();
+                assert_eq!(after.seq, original.as_ref().unwrap().seq);
+                assert_eq!(after.text, original.as_ref().unwrap().text);
+            }
+        }
+    }
+}
+
+#[test]
 fn picker_path_opens_only_the_exact_local_document_grant() {
     let dir = std::env::temp_dir().join(format!(
         "aterm-native-picker-{}-{:?}",

@@ -12,12 +12,14 @@
 use std::sync::{Arc, mpsc};
 
 /// `pending` covers a published result the caller has not taken yet.
+#[inline]
 pub(crate) const fn request_allowed(pending: bool, closed: bool) -> bool {
     !pending && !closed
 }
 
 /// The caller must additionally own a completed result. Epochs identify the
 /// complete surface configuration/loss domain, not merely its pixel dimensions.
+#[inline]
 pub(crate) const fn result_is_current(
     request_generation: u64,
     current_generation: u64,
@@ -97,6 +99,7 @@ impl<I: Send + 'static, O: Send + 'static, R: Send + 'static> AcquireWorker<I, O
         })
     }
 
+    #[inline]
     pub(crate) const fn is_pending(&self) -> bool {
         self.pending_generation.is_some()
     }

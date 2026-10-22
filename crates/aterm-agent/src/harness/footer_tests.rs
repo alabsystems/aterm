@@ -1906,6 +1906,18 @@ fn git_head_follows_a_worktree_file_and_climbs_to_the_top() {
     std::fs::create_dir_all(&wt).unwrap();
     std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_git.display())).unwrap();
     assert_eq!(git_head(&wt), Some("feature".to_owned()));
+    // The root is where the climb found `.git`: the repository's top from
+    // a directory deep in it, a worktree's own (its `.git` file's), never
+    // the directory read from.
+    assert_eq!(
+        read_git_head(&main.join("crates/deep")),
+        GitHeadRead::Found("main".into(), main.clone())
+    );
+    std::fs::create_dir_all(wt.join("src")).unwrap();
+    assert_eq!(
+        read_git_head(&wt.join("src")),
+        GitHeadRead::Found("feature".into(), wt.clone())
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1962,7 +1974,7 @@ fn read_git_head_opens_nothing_under_a_file_provider_domain() {
         let (root, home, repo) = repo_under("ordinary", place, "main");
         assert_eq!(
             read_git_head_in(Some(&home), &repo),
-            GitHeadRead::Found("main".into()),
+            GitHeadRead::Found("main".into(), repo.clone()),
             "{place}"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -2023,7 +2035,10 @@ fn only_an_eperm_refusal_reads_as_denied() {
     let repo = root.join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-    assert_eq!(read_git_head(&repo), GitHeadRead::Found("main".into()));
+    assert_eq!(
+        read_git_head(&repo),
+        GitHeadRead::Found("main".into(), repo.clone())
+    );
     std::fs::set_permissions(repo.join(".git"), std::fs::Permissions::from_mode(0o000)).unwrap();
     let locked = read_git_head(&repo);
     std::fs::set_permissions(repo.join(".git"), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2118,10 +2133,7 @@ fn the_account_stands_after_the_model_and_before_the_path() {
     );
     assert_eq!(
         segments(&facts)[2],
-        Segment {
-            mark: ACCOUNT_MARK,
-            text: "work-2".into()
-        },
+        Segment::plain(ACCOUNT_MARK, "work-2"),
         "the label, whole"
     );
     // With the model alone, and with nothing else at all.
@@ -2241,6 +2253,11 @@ fn the_folded_facts_are_this_sessions_transcript() {
         ..FooterCache::default()
     };
     assert_eq!(read(&mut short).usage, None, "a prefix is not shown");
+    assert_eq!(
+        (short.traffic(), short.traffic_generation()),
+        (None, None),
+        "nor graphed"
+    );
     let mut reads = 1;
     let caught = loop {
         reads += 1;
@@ -2257,6 +2274,34 @@ fn the_folded_facts_are_this_sessions_transcript() {
             .map(|m| m.output),
         Some(5 + 40),
         "the whole session once caught up"
+    );
+    // THE TRAFFIC is every file's rows, graphed once caught up: 11:00 and
+    // 13:00 are 121 minutes, so two-minute buckets; each row's prompt is
+    // its input and cache reads.
+    let traffic = short.traffic().expect("graphed once caught up");
+    assert_eq!(traffic.width_s, 2 * crate::harness::usage::SERIES_BASE_S);
+    assert_eq!(traffic.totals, (43 * 1_000, 2 + 40_000 + 5 + 40));
+    let graphed = traffic
+        .buckets
+        .iter()
+        .fold((0, 0), |(i, o), &(bi, bo)| (i + bi, o + bo));
+    assert_eq!(graphed, traffic.totals, "every row was stamped");
+    assert_eq!((traffic.unread, traffic.runtime_s), (0, None));
+    // Its generation holds while nothing moved, and moves with a row.
+    let generation = short.traffic_generation();
+    read(&mut short);
+    assert_eq!(short.traffic_generation(), generation);
+    append(&mine, &row("m3", "claude-haiku-4-5", 1, during));
+    read(&mut short);
+    assert_ne!(short.traffic_generation(), generation);
+    // The directories beside the facts: the session's cwd, outside any
+    // repository.
+    assert_eq!(
+        short.dirs(),
+        Some(&FactDirs {
+            cwd: PathBuf::from("/w/repo"),
+            repo_root: None
+        })
     );
 
     std::fs::remove_dir_all(root).unwrap();
@@ -3108,10 +3153,7 @@ fn native_footer_text_preserves_combining_and_joined_graphemes_when_set_and_elid
         "x\u{0301}\u{0323}@example.com",
         "使用者👩‍💻@example.com",
     ] {
-        let set = set_facts(&[Segment {
-            mark: ACCOUNT_MARK,
-            text: email.into(),
-        }]);
+        let set = set_facts(&[Segment::plain(ACCOUNT_MARK, email)]);
         let mut actual = String::new();
         for glyph in set.glyphs.iter().filter(|glyph| !glyph.mark) {
             assert!(glyph.cell + glyph.cols <= set.cells);
@@ -3139,10 +3181,7 @@ fn native_footer_text_preserves_combining_and_joined_graphemes_when_set_and_elid
         ("123456e\u{0301}x@example.com", "123456e\u{0301}…"),
         ("12345👩‍💻x@example.com", "12345👩‍💻…"),
     ] {
-        let mut account = [Segment {
-            mark: ACCOUNT_MARK,
-            text: email.into(),
-        }];
+        let mut account = [Segment::plain(ACCOUNT_MARK, email)];
         assert!(shorten_subscription_account(&mut account, 8));
         assert_eq!(account[0].text, expected);
         assert_eq!(text_width(&account[0].text), 8);
@@ -3548,13 +3587,7 @@ fn the_account_costs_only_the_tokens() {
                         // Beside a model it would not have fitted.
                         if let Some(at) = kept.iter().position(|s| s.mark == MODEL_MARK) {
                             let mut with = kept.clone();
-                            with.insert(
-                                at + 1,
-                                Segment {
-                                    mark: ACCOUNT_MARK,
-                                    text: label.into(),
-                                },
-                            );
+                            with.insert(at + 1, Segment::plain(ACCOUNT_MARK, label));
                             let with = RuleFit {
                                 segments: with,
                                 ..fit.clone()
@@ -3598,6 +3631,7 @@ fn subscription_account_and_weekly_outlast_workspace_details_without_overflow() 
             email: Some("owner@example.com".into()),
             plan: Some("Max 5x".into()),
             weekly: Some("weekly 29% left".into()),
+            weekly_reset: None,
         }),
         ..narrow_rule_facts()
     };
@@ -3647,6 +3681,7 @@ fn subscription_chip_budget_keeps_account_and_weekly_beside_real_gui_faces() {
                 email: Some(email.into()),
                 plan: Some("Max 5x".into()),
                 weekly: Some("weekly 29% left".into()),
+                weekly_reset: None,
             }),
             ..narrow_rule_facts()
         };
@@ -3702,6 +3737,7 @@ fn subscription_keeps_a_standing_limit_and_controls_before_secondary_facts() {
             email: Some("owner@example.com".into()),
             plan: Some("Max 5x".into()),
             weekly: Some("weekly 0% left".into()),
+            weekly_reset: None,
         }),
         ..narrow_rule_walled()
     };
@@ -4682,4 +4718,1402 @@ fn a_footer_read_tells_the_step_tap_what_it_found() {
     over.set_floor(0, None);
     assert_eq!(read(&mut over), vec![StepEvent::Bind { len }]);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A screen of a composer (top rule, caret, bottom rule) over `rest`, and
+/// its bottom rule's row.
+fn under_rule(rest: &[&str]) -> (Vec<String>, usize) {
+    let rule = "─".repeat(90);
+    let mut rows = vec![
+        "⏺ Both are running.".to_owned(),
+        "  ⏺ main".to_owned(),
+        String::new(),
+        rule.clone(),
+        "❯ ".to_owned(),
+        rule,
+    ];
+    rows.extend(rest.iter().map(|r| (*r).to_owned()));
+    let bottom = aterm_phase::phase::composer_bottom(&rows).expect("the frame");
+    assert_eq!(bottom, 5);
+    (rows, bottom)
+}
+
+fn kinds(
+    panel: &aterm_phase::agents_panel::AgentsPanel,
+) -> Vec<(u16, aterm_phase::agents_panel::RowKind)> {
+    panel.rows().iter().map(|r| (r.row, r.kind)).collect()
+}
+
+/// The agents panel's one locator, on MEASURED screens of older builds —
+/// the live worker of 2026-09-12 (footer, blank, `main`, an agent), the
+/// wait_bg pair (a workflow straight under the footer, once under the
+/// transient `paste again to expand`), the /goal screen (a workflow, then
+/// the `⧉` artifact bar it stops at) — and on 2.1.304 shapes BUILT FROM ITS
+/// BUNDLE'S GRAMMAR (its main and agent rows are measured too:
+/// [`the_measured_2_1_304_panel_and_pill_are_found`]; these shapes are
+/// not): the selected row, a nested agent, `↓ N more`, the lone blank slot
+/// before a workflow.
+#[test]
+fn the_agents_panel_is_found_under_the_footer() {
+    use aterm_phase::agents_panel::RowKind::{Agent, Main, More, Workflow};
+    let (rows, bottom) = under_rule(&[
+        "  ⏵⏵ auto mode on · 1 shell · ← for agents · ↓ to manage                                                                      /rc active",
+        "",
+        "  ⏺ main",
+        "  ◯ general-purpose  Searching the report's consumers in tests                                                  4m 28s · ↓ 115.4k tokens",
+    ]);
+    let panel = agents_panel_under(&rows, bottom).expect("the 2026-09-12 panel");
+    assert_eq!(kinds(&panel), [(8, Main), (9, Agent)]);
+
+    let fixture = |name: &str| -> Vec<String> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../aterm-phase/src/fixtures")
+            .join(name);
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    for name in [
+        "wait_bg.out",
+        "wait_bg2.out",
+        "claude-goal-active-suggestion.txt",
+    ] {
+        let rows = fixture(name);
+        let bottom = aterm_phase::phase::composer_bottom(&rows).expect(name);
+        let panel = agents_panel_under(&rows, bottom).expect(name);
+        let top = usize::from(panel.top().unwrap());
+        assert_eq!(kinds(&panel).len(), 1, "{name}");
+        assert_eq!(panel.rows()[0].kind, Workflow, "{name}");
+        assert!(top > bottom + 1 && top <= bottom + 3, "{name}");
+    }
+
+    let shape = |slot: &str| {
+        under_rule(&[
+            "  ⏵⏵ bypass permissions on · 14 shells · ← for agents · ↓ to manage",
+            "",
+            "  ⏺ main                                                    ↑ 2 more",
+            "  ◯ general-purpose  Searching the report's consumers   4m 28s · ↓ 115.4k tokens",
+            "❯ ◯ Explore  Reading the footer readers   12s · ↑ 900 tokens",
+            "  └ ◯ Explore  Reading one file   1m 0s · ↓ 1.0k tokens",
+            slot,
+            "  ◯ nightly-sweep  ▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  1/4 · 3m02s · ↓ 12.4k tokens",
+            "  ⧉  aterm Wrapper Brief · canvas",
+            "  ◯ general-purpose  After the artifact bar   4m 28s · ↓ 115.4k tokens",
+        ])
+    };
+    let (rows, bottom) = shape("  ↓ 3 more");
+    let panel = agents_panel_under(&rows, bottom).unwrap();
+    assert_eq!(
+        kinds(&panel),
+        [
+            (8, Main),
+            (9, Agent),
+            (10, Agent),
+            (11, Agent),
+            (12, More),
+            (13, Workflow)
+        ]
+    );
+    assert!(panel.rows()[2].pointer.is_some());
+    assert_eq!(panel.rows()[3].depth, 1);
+    let (rows, bottom) = shape(" ");
+    let panel = agents_panel_under(&rows, bottom).unwrap();
+    assert_eq!(
+        kinds(&panel),
+        [
+            (8, Main),
+            (9, Agent),
+            (10, Agent),
+            (11, Agent),
+            (13, Workflow)
+        ]
+    );
+    // At most PANEL_ROWS_MAX rows.
+    let many: Vec<String> = (0..20)
+        .map(|n| format!("  ◯ worker-{n}  Working   {n}s · ↓ 1.0k tokens"))
+        .collect();
+    let mut rest = vec!["  ? for shortcuts", "", "  ⏺ main"];
+    rest.extend(many.iter().map(String::as_str));
+    let (rows, bottom) = under_rule(&rest);
+    let panel = agents_panel_under(&rows, bottom).unwrap();
+    assert_eq!(
+        panel.rows().len(),
+        aterm_phase::agents_panel::PANEL_ROWS_MAX
+    );
+}
+
+/// Negative controls: no footer row under the rule; a task row first (no
+/// `main`, no workflow); two blanks; a panel-shaped row ABOVE the frame
+/// (the transcript's `⏺ main` in `under_rule`) with nothing under the
+/// footer; a list under the rule longer than the footer's rows.
+#[test]
+fn the_agents_panel_is_read_nowhere_else() {
+    let main = "  ⏺ main";
+    let agent = "  ◯ general-purpose  Searching   4m 28s · ↓ 115.4k tokens";
+    for rest in [
+        vec!["", main, agent],
+        vec!["  ? for shortcuts", "", agent],
+        vec!["  ? for shortcuts", "", "", main, agent],
+        vec!["  ? for shortcuts", ""],
+        vec!["  ? for shortcuts"],
+        vec![
+            "  /agents        Manage agent configurations",
+            "  /artifacts     Open an artifact",
+            "  /bashes        List shells",
+            "  /clear         Clear the conversation",
+            "  /compact       Compact the conversation",
+            main,
+            agent,
+        ],
+        vec![main, agent],
+    ] {
+        let (rows, bottom) = under_rule(&rest);
+        assert_eq!(agents_panel_under(&rows, bottom), None, "{rest:#?}");
+    }
+    // A footer row that wraps once is passed.
+    let (rows, bottom) = under_rule(&[
+        "  ⏵⏵ auto mode on · 3 shells · 2 monitors · ← for agents",
+        "  ↓ to manage                                     /rc active",
+        "",
+        main,
+        agent,
+    ]);
+    assert_eq!(
+        agents_panel_under(&rows, bottom).map(|p| p.rows().len()),
+        Some(2)
+    );
+}
+
+/// The panel under a MANUAL- or PLAN-MODE footer: their pill opens with
+/// `⏸`, the glyph of a paused workflow's bullet, so the footer row reads as
+/// a panel row too (`  ⏸ manual mode on · …` a paused workflow named
+/// `manual mode on · …`) — and the locator, which takes no panel row for
+/// the footer, found no panel in those modes (the owner's `YOLO off`). The
+/// footer slot is the footer's whatever the reader makes of it: a mode row,
+/// a cut pill, any row opening with a pill glyph. The measured rows are the
+/// 2.1.283 and 2.1.301 manual and plan footers (`aterm-phase` fixtures).
+/// NEGATIVE CONTROL: a panel's own row straight under the rule is still no
+/// footer, and a paused workflow's row that is no pill is read as one.
+#[test]
+fn the_panel_is_found_under_a_manual_or_plan_mode_footer() {
+    let main = "  ⏺ main";
+    let agent = "  ◯ general-purpose  Searching   4m 28s · ↓ 115.4k tokens";
+    for footer in [
+        "  ⏸ manual mode on · ? for shortcuts · ← for agents",
+        "  ⏸ plan mode on (shift+tab to cycle) · ← for agents",
+        "  ⏸ manual mode on · ? for shortcuts · ← for agents  ◉ xhigh · /effort",
+        "  ⏸ manual mo",
+    ] {
+        assert!(
+            aterm_phase::agents_panel::parse_row(footer, aterm_phase::agents_panel::one_cell)
+                .is_some(),
+            "the precondition: {footer:?} reads as a panel row"
+        );
+        let (rows, bottom) = under_rule(&[footer, "", main, agent]);
+        let panel = agents_panel_under(&rows, bottom).unwrap_or_else(|| panic!("{footer:?}"));
+        assert_eq!(panel.rows().len(), 2, "{footer:?}");
+    }
+    let (rows, bottom) = under_rule(&[main, agent]);
+    assert_eq!(agents_panel_under(&rows, bottom), None);
+    let paused = "  ⏸ nightly-sweep  paused · usage limit resets at 3pm";
+    let (rows, bottom) = under_rule(&["  ⏵⏵ auto mode on · ← for agents", "", main, paused]);
+    assert_eq!(
+        agents_panel_under(&rows, bottom).map(|p| kinds(&p)),
+        Some(vec![
+            (8, aterm_phase::agents_panel::RowKind::Main),
+            (9, aterm_phase::agents_panel::RowKind::Workflow)
+        ])
+    );
+}
+
+/// The cut-pill test needs no allocation now; its verdicts stand.
+#[test]
+fn a_cut_pill_is_still_read_without_joining_it() {
+    for row in [
+        "  ⏵⏵ bypass permissi",
+        "  ⏵⏵ bypass permissions on",
+        "  ⏵",
+        "  ⏸ plan mo",
+    ] {
+        assert!(is_cut_pill(row), "{row}");
+    }
+    for row in [
+        "  ⏵⏵ bypass permissions onward",
+        "  ⏵⏵ bypass perm1",
+        "  ",
+        "⏵⏵ bypass",
+        "  ⏸ auto mode",
+    ] {
+        assert!(!is_cut_pill(row), "{row}");
+    }
+}
+
+/// The YOLO label's finder: Claude's bypass pill reads `YOLO on`, the
+/// manual-mode pill `YOLO off`, at the mode row's start (the measured 2.1.283
+/// rows, and the `14 shells` row the owner's screen showed); the run of left
+/// items packs left behind the label up to the first two blanks, and the
+/// glass→grid map sends each glass column of it to Claude's own cell.
+#[test]
+fn the_bypass_and_manual_pills_are_found_to_relabel() {
+    let (rows, bottom) =
+        under_rule(&["  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"]);
+    let r = relabel_under(&rows, bottom).expect("the bypass pill");
+    assert_eq!(
+        (r.row, r.start, r.words, r.end, r.label),
+        (bottom + 1, 2, 5, 26, YOLO_ON)
+    );
+    assert_eq!(r.run_end, rows[bottom + 1].chars().count());
+    assert_eq!((r.shift(), r.label_end()), (17, 9));
+
+    let row = "  ⏵⏵ bypass permissions on · 14 shells · ← for agents · ↓ to manage                    /rc active";
+    let (rows, bottom) = under_rule(&[row]);
+    let r = relabel_under(&rows, bottom).unwrap();
+    let shells = row
+        .find("14 shells")
+        .map(|b| row[..b].chars().count())
+        .unwrap();
+    assert_eq!(
+        r.run_end,
+        row.find("manage")
+            .map(|b| row[..b].chars().count() + 6)
+            .unwrap()
+    );
+    let at = shells - r.shift();
+    assert_eq!(
+        r.grid_col(at),
+        shells,
+        "the glass's `14 shells` is Claude's"
+    );
+    for col in r.start..r.label_end() {
+        assert_eq!(r.grid_col(col), col, "the label is over Claude's pill");
+    }
+    for col in r.run_end - r.shift()..r.run_end {
+        assert_eq!(
+            r.grid_col(col),
+            r.start,
+            "a blank the run left: the pill's cell"
+        );
+    }
+    let notice = row.find("/rc").map(|b| row[..b].chars().count()).unwrap();
+    assert_eq!(r.grid_col(notice), notice, "the right-hand notice stays");
+    assert_eq!(r.grid_col(0), 0);
+
+    let (rows, bottom) = under_rule(&["  ⏸ manual mode on · ? for shortcuts · ← for agents"]);
+    let r = relabel_under(&rows, bottom).expect("the manual pill");
+    assert_eq!((r.start, r.end, r.label, r.shift()), (2, 18, YOLO_OFF, 8));
+    // A pill alone on its row: no run, the blanks at the label's end.
+    let (rows, bottom) = under_rule(&["  ⏵⏵ bypass permissions on"]);
+    let r = relabel_under(&rows, bottom).unwrap();
+    assert_eq!(r.run_end, r.end);
+    assert_eq!(r.grid_col(r.label_end()), r.start);
+}
+
+/// Negative controls: the other modes keep Claude's pill; a cut pill, a
+/// pill's words mid-row or run on into a word, a quoted pill above the
+/// frame over Claude's own auto row, a row under a blank, and agy's footer
+/// are never relabelled.
+#[test]
+fn no_other_pill_or_row_is_relabelled() {
+    for footer in [
+        "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+        "  ⏸ plan mode on (shift+tab to cycle)",
+        "  ⏵⏵ accept edits on · 1 shell",
+        "  ⏵⏵ bypass permissi",
+        "  ⏵⏵ bypass permissions only",
+        "  ? for shortcuts · ⏵⏵ bypass permissions on",
+        "  esc to interrupt",
+        "? for shortcuts                                         Gemini 4 Argon · medium",
+    ] {
+        let (rows, bottom) = under_rule(&[footer]);
+        assert_eq!(relabel_under(&rows, bottom), None, "{footer}");
+    }
+    let (mut rows, bottom) = under_rule(&["  ⏵⏵ auto mode on", "", "  ⏵⏵ bypass permissions on"]);
+    rows[0] = "  ⏵⏵ bypass permissions on".into();
+    assert_eq!(relabel_under(&rows, bottom), None);
+}
+
+/// MEASURED on 2.1.304 (the lab, 2026-10-19): the panel under the footer at
+/// rest, and while it holds the keys — the footer row then a hint
+/// (`↑/↓ to select`, `Enter to view · x to stop`) the locator passes like
+/// any transient one — with the selected row's `❯` in column 0; and the
+/// bypass pill the glass relabels, its `(shift+tab to cycle)` packed
+/// behind the label.
+#[test]
+fn the_measured_2_1_304_panel_and_pill_are_found() {
+    use aterm_phase::agents_panel::RowKind::{Agent, Main};
+    let fixture = |name: &str| -> Vec<String> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../aterm-phase/src/fixtures")
+            .join(format!("claude-2.1.304-{name}.txt"));
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(str::to_owned)
+            .collect()
+    };
+    for (name, pointed) in [
+        ("agents-panel", None),
+        ("agents-panel-later", None),
+        ("agents-panel-main-selected", Some(0)),
+        ("agents-panel-agent-selected", Some(1)),
+    ] {
+        let rows = fixture(name);
+        let bottom = aterm_phase::phase::composer_bottom(&rows).expect(name);
+        let panel = agents_panel_under(&rows, bottom).expect(name);
+        let b = u16::try_from(bottom).unwrap();
+        assert_eq!(kinds(&panel), [(b + 3, Main), (b + 4, Agent)], "{name}");
+        let at = panel.rows().iter().position(|r| r.pointer.is_some());
+        assert_eq!(at, pointed, "{name}");
+        let r = relabel_under(&rows, bottom);
+        assert_eq!(
+            r.is_some(),
+            pointed.is_none(),
+            "{name}: the pill row or a hint"
+        );
+    }
+    let rows = fixture("footer-bypass-idle-144col");
+    let bottom = aterm_phase::phase::composer_bottom(&rows).unwrap();
+    let r = relabel_under(&rows, bottom).expect("the measured bypass pill");
+    assert_eq!((r.start, r.end, r.label), (2, 26, YOLO_ON));
+    assert_eq!(r.run_end, rows[bottom + 1].trim_end().chars().count());
+    assert_eq!(
+        agents_panel_under(&rows, bottom),
+        None,
+        "no agents, no panel"
+    );
+}
+
+/// A MEASURED 2.1.304 screen (`aterm-phase`'s fixtures), its header line
+/// left out.
+fn measured_2_1_304(name: &str) -> Vec<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../aterm-phase/src/fixtures")
+        .join(format!("claude-2.1.304-{name}.txt"));
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .lines()
+        .skip(1)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// VIM INSERT'S INDICATOR BEFORE THE PILL (MEASURED on 2.1.304: `  -- INSERT
+/// -- ⏵⏵ auto mode on (shift+tab to cycle)`, the pill at column 15): the
+/// mode row is found under the composer, its pill names auto mode for the
+/// footer, the lights and the panel's locator alike, and the row says vim
+/// INSERT — on each of the three measured INSERT screens (at launch, after
+/// the NORMAL keys that ran as motions, and under Claude's refusal). The
+/// lead is the indicator and its one cell exactly. NEGATIVE CONTROLS: vim
+/// NORMAL's screen reads the same mode with no indicator; VISUAL's (drawn
+/// the same way, unmeasured), the indicator with no gap, and one after the
+/// pill are no INSERT lead, and only the first two keep the pill unread.
+#[test]
+fn the_pill_after_vim_inserts_indicator_is_read_as_its_mode() {
+    for name in [
+        "top-vim-insert-120col",
+        "top-vim-normal-typed-120col",
+        "top-refused-needs-workflows-vim-insert-120col",
+    ] {
+        let rows = measured_2_1_304(name);
+        let bottom = aterm_phase::phase::composer_bottom(&rows).expect(name);
+        let at = mode_row(&rows).expect(name);
+        assert_eq!(at, bottom + 1, "{name}: the mode row under the rule");
+        let row = &rows[at];
+        assert!(row.starts_with("  -- INSERT -- \u{23F5}\u{23F5}"), "{name}");
+        assert!(is_mode_row(row) && vim_insert(row), "{name}: {row:?}");
+        assert_eq!(pill_indicator(row), Some("mode.auto"), "{name}");
+        assert!(opens_with_pill_glyph(row), "{name}");
+        assert_eq!(live_repl_row(&rows), Some(at), "{name}");
+        let screen = crate::harness::lights::read_screen(&rows).expect(name);
+        assert_eq!(
+            (screen.mode, screen.pill, screen.vim_insert),
+            (Some(crate::harness::lights::Mode::Auto), true, true),
+            "{name}: the lights"
+        );
+    }
+    let rows = measured_2_1_304("top-vim-normal-120col");
+    let at = mode_row(&rows).expect("NORMAL's mode row");
+    assert!(!vim_insert(&rows[at]), "CONTROL: NORMAL draws no indicator");
+    assert_eq!(pill_indicator(&rows[at]), Some("mode.auto"));
+    let screen = crate::harness::lights::read_screen(&rows).unwrap();
+    assert_eq!(
+        (screen.mode, screen.vim_insert),
+        (Some(crate::harness::lights::Mode::Auto), false)
+    );
+    for (row, pill) in [
+        ("  -- VISUAL -- \u{23F5}\u{23F5} auto mode on", false),
+        ("  -- INSERT --\u{23F5}\u{23F5} auto mode on", false),
+        ("   -- INSERT -- \u{23F5}\u{23F5} auto mode on", false),
+        ("  \u{23F5}\u{23F5} auto mode on -- INSERT -- ", true),
+    ] {
+        assert!(!vim_insert(row), "{row:?}");
+        assert_eq!(pill_indicator(row).is_some(), pill, "{row:?}");
+        assert_eq!(opens_with_pill_glyph(row), pill, "{row:?}");
+    }
+    // A cut pill after the indicator is still a cut pill, and no other row.
+    assert!(is_cut_pill("  -- INSERT -- \u{23F5}\u{23F5} bypass permi"));
+    assert!(!is_cut_pill("  -- INSERT -- "));
+}
+
+/// THE YOLO LABEL AFTER VIM INSERT'S INDICATOR: the bypass pill at column 15
+/// reads `YOLO on`, the manual one `YOLO off`; the glass→grid map leaves the
+/// indicator's columns and the label's where they are, sends the packed run
+/// `shift` columns right to Claude's own cells and the blanks it left to the
+/// pill's first cell. NEGATIVE CONTROL: the measured INSERT screen's auto
+/// pill keeps Claude's words; the same row without the indicator is the
+/// column-2 relabel, as before.
+#[test]
+fn the_yolo_relabel_maps_the_pill_after_vim_inserts_indicator() {
+    let row = "  -- INSERT -- \u{23F5}\u{23F5} bypass permissions on (shift+tab to cycle) \u{B7} \u{2190} for agents";
+    let (rows, bottom) = under_rule(&[row]);
+    let r = relabel_under(&rows, bottom).expect("the bypass pill after the indicator");
+    assert_eq!(
+        (r.row, r.start, r.words, r.end, r.label),
+        (bottom + 1, 15, 18, 39, YOLO_ON)
+    );
+    assert_eq!(r.run_end, row.chars().count());
+    assert_eq!((r.shift(), r.label_end()), (17, 22));
+    for col in 0..r.label_end() {
+        assert_eq!(r.grid_col(col), col, "the indicator and the label");
+    }
+    let agents = col_of_chars(row, "\u{2190} for agents");
+    assert_eq!(
+        r.grid_col(agents - r.shift()),
+        agents,
+        "the glass's `← for agents` is Claude's"
+    );
+    for col in r.run_end - r.shift()..r.run_end {
+        assert_eq!(r.grid_col(col), r.start, "a blank the run left");
+    }
+    let (rows, bottom) =
+        under_rule(&["  -- INSERT -- \u{23F8} manual mode on \u{B7} ? for shortcuts"]);
+    let r = relabel_under(&rows, bottom).expect("the manual pill after the indicator");
+    assert_eq!((r.start, r.end, r.label, r.shift()), (15, 31, YOLO_OFF, 8));
+    let measured = measured_2_1_304("top-vim-insert-120col");
+    let bottom = aterm_phase::phase::composer_bottom(&measured).unwrap();
+    assert_eq!(
+        relabel_under(&measured, bottom),
+        None,
+        "CONTROL: auto stays"
+    );
+    let (rows, bottom) = under_rule(&[&row.replacen("-- INSERT -- ", "", 1)]);
+    let r = relabel_under(&rows, bottom).expect("CONTROL: the plain row");
+    assert_eq!((r.start, r.words, r.end), (2, 5, 26));
+}
+
+/// The column `needle` starts at in `row`, in chars (one cell each here).
+fn col_of_chars(row: &str, needle: &str) -> usize {
+    row[..row.find(needle).expect("the needle")].chars().count()
+}
+
+/// The top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]) as the vendor writes it at
+/// the head of a sentence, built at run time: the key keeps one spelling.
+fn capital_key() -> String {
+    let mut chars = CLAUDE_TOP_EFFORT_KEY.chars();
+    let first = chars.next().expect("a key");
+    format!("{}{}", first.to_ascii_uppercase(), chars.as_str())
+}
+
+/// An answer, then an `/effort` command row, then (when `text`) its result:
+/// the transcript's newest rows, read since the process's start.
+fn effort_after_answer(text: Option<&str>) -> TailFacts {
+    let start = crate::harness::upgrade_models::parse_utc("2026-10-19T10:00:00Z");
+    let answer = answer_at("claude-opus-5-5", "2026-10-19T10:00:10.000Z", Some("high"));
+    let command = command_at("effort", "2026-10-19T10:00:20.000Z");
+    let mut rows = vec![answer, command];
+    if let Some(text) = text {
+        rows.push(result_at("2026-10-19T10:00:20.000Z", text));
+    }
+    let rows: Vec<&str> = rows.iter().map(String::as_str).collect();
+    tail_facts(body(&rows).as_bytes(), start)
+}
+
+/// `/effort <key> off` answers `<Key> off. Effort stays xhigh.` (the 2.1.304
+/// bundle's `D()`): the effort is the level that stays and the key is off.
+/// Negative control: with no result under the command the effort is unread,
+/// as before, and nothing is said of the key.
+#[test]
+fn a_top_effort_off_result_keeps_the_effort_and_names_the_key() {
+    let key = capital_key();
+    let facts = effort_after_answer(Some(&format!("{key} off. Effort stays xhigh.")));
+    assert_eq!(facts.effort, Said::Is("xhigh".into()));
+    assert_eq!(facts.top, Some(false));
+    assert_eq!(facts.model.shown(), Some("Opus 5.5"), "the model stands");
+    // Negative control: the command alone.
+    let bare = effort_after_answer(None);
+    assert_eq!(bare.effort, Said::Unread);
+    assert_eq!(bare.top, None);
+}
+
+/// `/effort <key> on` answers `<Key> on (this session only): … Effort stays
+/// xhigh.`: the effort stays and the key is on; a level that stays `auto`
+/// is unread, the key still on.
+#[test]
+fn a_top_effort_on_result_keeps_the_effort() {
+    let key = capital_key();
+    let on = |stays: &str| {
+        effort_after_answer(Some(&format!(
+            "{key} on (this session only): dynamic workflows on every task. Effort stays {stays}."
+        )))
+    };
+    let facts = on("xhigh");
+    assert_eq!(
+        (facts.effort, facts.top),
+        (Said::Is("xhigh".into()), Some(true))
+    );
+    let auto = on("auto");
+    assert_eq!((auto.effort, auto.top), (Said::Unread, Some(true)));
+    // Negative control: the key in lower case reads the same (the vendor
+    // capitalises it), and another word in its place is no key.
+    let lower = effort_after_answer(Some(&format!(
+        "{CLAUDE_TOP_EFFORT_KEY} off. Effort stays max."
+    )));
+    assert_eq!(
+        (lower.effort, lower.top),
+        (Said::Is("max".into()), Some(false))
+    );
+    let other = effort_after_answer(Some("Workspace off. Effort stays max."));
+    assert_eq!((other.effort, other.top), (Said::Unread, None));
+}
+
+/// A level result ends with ` · <Key> off` where setting the level turned
+/// the key off, and `/effort`'s current-level line with ` · <Key> on` while
+/// it is on (the 2.1.304 bundle). Negative control: with no suffix the key
+/// is unsaid; a suffix naming something else, or the key run into a word,
+/// says nothing.
+#[test]
+fn a_level_result_suffix_names_the_key() {
+    let key = capital_key();
+    let set = effort_after_answer(Some(&format!(
+        "Set effort level to high (this session only): Comprehensive implementation \u{b7} {key} off"
+    )));
+    assert_eq!(
+        (set.effort, set.top),
+        (Said::Is("high".into()), Some(false))
+    );
+    let current = effort_after_answer(Some(&format!(
+        "Current effort level: xhigh (Extended reasoning with thorough analysis) \u{b7} {key} on"
+    )));
+    assert_eq!(
+        (current.effort, current.top),
+        (Said::Is("xhigh".into()), Some(true))
+    );
+    let auto = effort_after_answer(Some(&format!("Effort level set to auto \u{b7} {key} off")));
+    assert_eq!((auto.effort, auto.top), (Said::Unread, Some(false)));
+    // Negative controls.
+    let plain = effort_after_answer(Some("Set effort level to low (this session only): Quick"));
+    assert_eq!((plain.effort, plain.top), (Said::Is("low".into()), None));
+    for tail in [
+        "Fast mode off".to_owned(),
+        format!("{key} online"),
+        format!("{key}s off"),
+    ] {
+        let said = effort_after_answer(Some(&format!(
+            "Set effort level to low (this session only): Quick \u{b7} {tail}"
+        )));
+        assert_eq!(said.top, None, "{tail:?}");
+    }
+}
+
+/// A refused key (`<Key> needs dynamic workflows enabled …`, `<Key> isn't
+/// available on <model>. …`) answers its `/effort` row and decides nothing:
+/// the older answer's effort stands. Negative control: a result this build
+/// does not read leaves the effort unread, as before.
+#[test]
+fn a_refused_key_answers_its_command_and_decides_nothing() {
+    let key = capital_key();
+    for refusal in [
+        format!(
+            "{key} needs dynamic workflows enabled (see /config). Valid options are: low, medium, high, xhigh, max, auto"
+        ),
+        format!(
+            "{key} isn't available on claude-haiku-4-5. Valid options are: low, medium, high, auto"
+        ),
+    ] {
+        let facts = effort_after_answer(Some(&refusal));
+        assert_eq!(facts.effort, Said::Is("high".into()), "{refusal:?}");
+        assert_eq!(facts.top, None, "{refusal:?}");
+    }
+    let unknown = effort_after_answer(Some("Effort is now something new"));
+    assert_eq!((unknown.effort, unknown.top), (Said::Unread, None));
+}
+
+/// The key's state rides over newer rows that settle model and effort: an
+/// answer after `/effort <key> off` decides both, and the process still
+/// reads the key off (its carry and its own facts keep it). Negative
+/// control: another process reading the same file starts afresh, and the
+/// answer settles its scan before the key's row.
+#[cfg(unix)]
+#[test]
+fn the_key_state_rides_over_a_settled_newer_read() {
+    const S: &str = "00000000-0000-4000-8000-000000001019";
+    let proc = Proc::new("top-rides", "2026-10-19T10:00:00Z");
+    proc.register(S);
+    let key = capital_key();
+    let rows = [
+        answer_at("claude-opus-5-5", "2026-10-19T10:00:10.000Z", Some("xhigh")),
+        command_at("effort", "2026-10-19T10:00:20.000Z"),
+        result_at(
+            "2026-10-19T10:00:20.000Z",
+            &format!("{key} off. Effort stays xhigh."),
+        ),
+    ];
+    let mut cache = TailCache::default();
+    let launch = LaunchFacts::default();
+    proc.write(S, &[&rows[0], &rows[1], &rows[2]]);
+    proc.at("2026-10-19T10:00:30Z");
+    assert_eq!(proc.read(&launch, &mut cache).top_effort, Some(false));
+    let newer = answer_at("claude-opus-5-5", "2026-10-19T10:01:00.000Z", Some("xhigh"));
+    proc.write(S, &[&rows[0], &rows[1], &rows[2], &newer]);
+    proc.at("2026-10-19T10:01:10Z");
+    let facts = proc.read(&launch, &mut cache);
+    assert_eq!(facts.effort.as_deref(), Some("xhigh"));
+    assert_eq!(facts.top_effort, Some(false), "rides over the settled read");
+    // Negative control: another process (pid) with the same floor.
+    let entry = session_of_pid(&proc.claude, 4242, Some(proc.start)).expect("registry");
+    let other = facts_for_entry_at(
+        &proc.claude,
+        4343,
+        Some(proc.start),
+        &entry,
+        &launch,
+        &mut cache,
+        UNIX_EPOCH + std::time::Duration::from_secs(proc.start + 80),
+    );
+    assert_eq!(other.effort.as_deref(), Some("xhigh"));
+    assert_eq!(other.top_effort, None, "a new process drops it");
+}
+
+/// [`drawn_cells`] takes the cells under a fact's glyphs as drawn: two
+/// glyphs in cells 4 and 5 drawn three quarters of a cell right lie over
+/// 4.75..6.75, so cells 5 and 6 (middles 5.5 and 6.5), not 4 and 5; drawn
+/// three quarters left, 3.25..5.25, cells 3 and 4; a wide glyph's two cells
+/// move with it; a middle exactly on an ink's left edge is under it, one on
+/// its right edge is not. NEGATIVE CONTROL: with no nudge the run is the
+/// glyphs' own cells, and a span no glyph stands in takes none.
+#[test]
+fn drawn_cells_follow_the_glyphs_nudges() {
+    let glyph = |cell: usize, cols: usize, nudge: i8| SetGlyph {
+        ch: 'a',
+        cell,
+        cols,
+        nudge,
+        mark: false,
+        tail: false,
+        quiet: false,
+    };
+    let set = |glyphs: Vec<SetGlyph>| SetFacts {
+        cells: 12,
+        glyphs,
+        ..SetFacts::default()
+    };
+    let span = |from: u16, to: u16| FactSpan {
+        kind: FactKind::Path,
+        cells: (from, to),
+        restores: FactMask::default(),
+    };
+    let quarter = NUDGES_PER_CELL / 4;
+    let right = set(vec![glyph(4, 1, 3 * quarter), glyph(5, 1, 3 * quarter)]);
+    assert_eq!(drawn_cells(&right, &span(4, 6)), 5..7);
+    let left = set(vec![glyph(4, 1, -3 * quarter), glyph(5, 1, -3 * quarter)]);
+    assert_eq!(drawn_cells(&left, &span(4, 6)), 3..5);
+    let wide = set(vec![glyph(4, 2, 3 * quarter)]);
+    assert_eq!(drawn_cells(&wide, &span(4, 6)), 5..7);
+    let half = set(vec![glyph(4, 1, 2 * quarter)]);
+    assert_eq!(drawn_cells(&half, &span(4, 5)), 4..5, "4.5..5.5: cell 4");
+    // CONTROL: unmoved, the glyphs' own cells; an empty span, none.
+    let still = set(vec![glyph(4, 1, 0), glyph(5, 1, 0)]);
+    assert_eq!(drawn_cells(&still, &span(4, 6)), 4..6);
+    assert_eq!(drawn_cells(&still, &span(8, 10)), 0..0);
+}
+
+/// [`fact_spans`] splits `◆ Opus 5.5 xhigh` by its glyphs: the mark and the
+/// model's glyphs are the model, the effort's five its own, then the path,
+/// the branch and the usage; the account is no fact. Negative controls: the
+/// model-alone rung has no effort span, an effort with no model is all
+/// effort, and a both-hidden stub has no split and restores both.
+#[test]
+fn fact_spans_split_model_and_effort_by_their_glyphs() {
+    let facts = FooterFacts {
+        account: Some("work-2".into()),
+        ..narrow_rule_tokens()
+    };
+    let segs = segments(&facts);
+    let set = set_facts(&segs);
+    let spans = fact_spans(&set, &segs);
+    let kinds: Vec<FactKind> = spans.iter().flatten().map(|s| s.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            FactKind::Model,
+            FactKind::Effort,
+            FactKind::Path,
+            FactKind::Branch,
+            FactKind::Usage
+        ]
+    );
+    let span = |kind: FactKind| {
+        spans
+            .iter()
+            .flatten()
+            .find(|s| s.kind == kind)
+            .copied()
+            .expect("a span")
+    };
+    let glyphs_in = |span: FactSpan| -> String {
+        set.glyphs
+            .iter()
+            .filter(|g| {
+                g.cell >= usize::from(span.cells.0) && g.cell + g.cols <= usize::from(span.cells.1)
+            })
+            .map(|g| g.ch)
+            .collect()
+    };
+    let effort = span(FactKind::Effort);
+    assert_eq!(effort.cells.1 - effort.cells.0, 5, "{effort:?}");
+    assert_eq!(glyphs_in(effort), "xhigh");
+    assert_eq!(glyphs_in(span(FactKind::Model)), "\u{25C6}Opus5.5");
+    assert_eq!(glyphs_in(span(FactKind::Branch)), "\u{2387}main");
+    assert!(spans.iter().flatten().all(|s| s.restores.is_empty()));
+    // In reading order, none overlapping, inside the set line.
+    let cells: Vec<(u16, u16)> = spans.iter().flatten().map(|s| s.cells).collect();
+    assert!(cells.windows(2).all(|w| w[0].1 <= w[1].0), "{cells:?}");
+    assert!(usize::from(cells.last().unwrap().1) <= set.cells);
+    // Negative controls.
+    let alone = model_alone(&facts).expect("a model");
+    let alone_spans = fact_spans(&set_facts(std::slice::from_ref(&alone)), &[alone]);
+    assert_eq!(
+        alone_spans
+            .iter()
+            .flatten()
+            .map(|s| s.kind)
+            .collect::<Vec<_>>(),
+        [FactKind::Model]
+    );
+    let effort_only = FooterFacts {
+        effort: Some("xhigh".into()),
+        ..FooterFacts::default()
+    };
+    let segs = segments(&effort_only);
+    let only = fact_spans(&set_facts(&segs), &segs);
+    let only: Vec<FactSpan> = only.iter().flatten().copied().collect();
+    assert_eq!(only.len(), 1);
+    let cells = u16::try_from(set_facts(&segs).cells).unwrap();
+    assert_eq!(
+        (only[0].kind, only[0].cells),
+        (FactKind::Effort, (0, cells))
+    );
+    let both = FooterFacts {
+        off: FactMask::MODEL.union(FactMask::EFFORT),
+        ..narrow_rule_facts()
+    };
+    let segs = segments(&both);
+    assert_eq!(
+        (segs[0].text.as_str(), segs[0].split),
+        ("Opus 5.5 off xhigh off", Some("Opus 5.5 off ".len()))
+    );
+    // Each stub shows its own fact again.
+    let stubs = fact_spans(&set_facts(&segs), &segs);
+    let (model, effort) = (stubs[0].expect("its model"), stubs[1].expect("its effort"));
+    assert_eq!(
+        (model.kind, model.restores, effort.kind, effort.restores),
+        (
+            FactKind::Model,
+            FactMask::MODEL,
+            FactKind::Effort,
+            FactMask::EFFORT
+        )
+    );
+    assert!(model.cells.1 <= effort.cells.0, "{model:?} {effort:?}");
+}
+
+/// THE CONTEXT FACT (main's `◐ ctx`) is a clickable fact as the path and
+/// the branch are: [`fact_spans`] gives it its own span, after the branch
+/// and before the usage, over its mark and its words; hidden
+/// ([`FactMask::CONTEXT`]) it is its stub, `ctx 84% left off`, quiet but its
+/// mark, a span that restores it; and with a subscription shown it is the
+/// first fact the ladder gives up (`subscription_ladder`, the order main
+/// gave it). NEGATIVE CONTROL: with no context, no span is the context's
+/// and no rung differs by it.
+#[test]
+fn the_context_fact_is_a_span_its_stub_restores_and_it_goes_first() {
+    let facts = FooterFacts {
+        context: Some("ctx 84% left".into()),
+        ..narrow_rule_tokens()
+    };
+    let segs = segments(&facts);
+    let set = set_facts(&segs);
+    let spans = fact_spans(&set, &segs);
+    let kinds: Vec<FactKind> = spans.iter().flatten().map(|s| s.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            FactKind::Model,
+            FactKind::Effort,
+            FactKind::Path,
+            FactKind::Branch,
+            FactKind::Context,
+            FactKind::Usage
+        ]
+    );
+    let context = spans
+        .iter()
+        .flatten()
+        .find(|s| s.kind == FactKind::Context)
+        .copied()
+        .expect("the context's span");
+    let glyphs: String = set
+        .glyphs
+        .iter()
+        .filter(|g| {
+            g.cell >= usize::from(context.cells.0)
+                && g.cell + g.cols <= usize::from(context.cells.1)
+        })
+        .map(|g| g.ch)
+        .collect();
+    assert_eq!(glyphs, "\u{25D0}ctx84%left");
+    assert!(context.restores.is_empty(), "shown, no stub");
+    // Hidden: its stub.
+    let hidden = FooterFacts {
+        off: FactMask::CONTEXT,
+        ..facts.clone()
+    };
+    let segs = segments(&hidden);
+    let stub = segs
+        .iter()
+        .find(|s| s.mark == CONTEXT_MARK)
+        .expect("the context's stub");
+    assert_eq!(
+        (stub.text.as_str(), stub.quiet),
+        ("ctx 84% left off", (true, false))
+    );
+    let spans = fact_spans(&set_facts(&segs), &segs);
+    let stub = spans
+        .iter()
+        .flatten()
+        .find(|s| s.kind == FactKind::Context)
+        .expect("the stub's span");
+    assert_eq!(stub.restores, FactMask::CONTEXT, "a stub that restores it");
+    // With a subscription shown, the context goes first.
+    let subscribed = FooterFacts {
+        subscription: Some(crate::harness::profile::SubscriptionDisplay {
+            email: Some("person@example.com".into()),
+            plan: Some("Max".into()),
+            weekly: Some("weekly 29% left".into()),
+            weekly_reset: None,
+        }),
+        ..facts.clone()
+    };
+    let ladder = facts_ladder(&subscribed);
+    let without: Vec<Segment> = ladder[0]
+        .iter()
+        .filter(|s| s.mark != CONTEXT_MARK)
+        .cloned()
+        .collect();
+    assert!(ladder[0].iter().any(|s| s.mark == CONTEXT_MARK));
+    assert_eq!(ladder[1], without, "the context goes first");
+    // CONTROL: no context, no span and no rung for it.
+    let none = FooterFacts {
+        context: None,
+        ..subscribed
+    };
+    let segs = segments(&none);
+    assert!(
+        fact_spans(&set_facts(&segs), &segs)
+            .iter()
+            .flatten()
+            .all(|s| s.kind != FactKind::Context)
+    );
+    let ladder = facts_ladder(&none);
+    assert!(
+        ladder[1].len() < ladder[0].len() && ladder[1].iter().all(|s| s.mark != USAGE_MARK),
+        "CONTROL: the usage goes first: {:?}",
+        ladder[1]
+    );
+}
+
+/// `rooms 20..=200` of [`narrow_rule_walled`] with an account as the lights
+/// cases of `testdata/footer-fit-sweep.txt` see them, one line per run of
+/// rooms that fit alike.
+fn fit_sweep(facts: &FooterFacts) -> String {
+    let lights = [
+        None,
+        Some(LightsWidth {
+            chips: 4,
+            title: 22,
+            lean: [18, 14, 0, 0],
+            short: 9,
+            reason: false,
+        }),
+        Some(LightsWidth {
+            chips: 4,
+            title: 22,
+            lean: [0; LEAN_FORMS],
+            short: 9,
+            reason: true,
+        }),
+    ];
+    let mut out = String::new();
+    for (i, lights) in lights.iter().enumerate() {
+        let shown = |room: usize| {
+            let fit = fit_rule(facts, room, *lights);
+            format!(
+                "{}|{:?}|{}",
+                rung_texts(&fit).join("/"),
+                fit.title,
+                fit.chips
+            )
+        };
+        let mut from = 20;
+        let mut last = shown(20);
+        for room in 21..=201 {
+            let now = (room <= 200).then(|| shown(room));
+            if now.as_ref() != Some(&last) {
+                out.push_str(&format!("{i} {from}..={} {last}\n", room - 1));
+                if let Some(now) = now {
+                    (from, last) = (room, now);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A hidden fact reads its value and [`OFF_STUB`] after it, all its glyphs
+/// quiet (the window draws them in the rule's own gray) — the owner's ask
+/// (2026-10-19): "show greyed out text and say off", as the top rule's key
+/// does — and the stubs give way first:
+/// the whole facts with them, then without them, then as before. The model
+/// hidden gives no model-alone rung. Negative control: with nothing hidden
+/// every room from 20 to 200 fits exactly as the ladder did before hidden
+/// facts (`testdata/footer-fit-sweep.txt`), and the stubbed ladder is the
+/// bare one.
+#[test]
+fn a_hidden_fact_reads_off_in_rule_gray_and_gives_way_first() {
+    let shown = |facts: &FooterFacts| -> Vec<String> {
+        segments(facts)
+            .iter()
+            .map(|s| format!("{} {}", s.mark, s.text))
+            .collect()
+    };
+    let hide = |off: FactMask| FooterFacts {
+        off,
+        ..narrow_rule_facts()
+    };
+    assert_eq!(
+        shown(&hide(FactMask::MODEL)),
+        [
+            "\u{25C6} Opus 5.5 off xhigh",
+            "\u{2302} ~/src/github.com/aterm",
+            "\u{2387} main"
+        ]
+    );
+    assert_eq!(
+        shown(&hide(FactMask::EFFORT))[0],
+        "\u{25C6} Opus 5.5 xhigh off"
+    );
+    assert_eq!(
+        shown(&hide(FactMask::MODEL.union(FactMask::EFFORT)))[0],
+        "\u{25C6} Opus 5.5 off xhigh off"
+    );
+    assert_eq!(
+        shown(&hide(FactMask::PATH.union(FactMask::BRANCH)))[1..],
+        ["\u{2302} ~/src/github.com/aterm off", "\u{2387} main off"]
+    );
+    // The stub's glyphs are quiet, the values beside them are not.
+    let quiet = |off: FactMask| -> (String, String) {
+        let set = set_facts(&segments(&hide(off)));
+        let pick = |q: bool| {
+            set.glyphs
+                .iter()
+                .filter(|g| !g.mark && g.quiet == q)
+                .map(|g| g.ch)
+                .collect()
+        };
+        (pick(true), pick(false))
+    };
+    assert_eq!(
+        quiet(FactMask::MODEL),
+        (
+            "Opus5.5off".into(),
+            "xhigh~/src/github.com/atermmain".into()
+        )
+    );
+    assert_eq!(
+        quiet(FactMask::EFFORT),
+        (
+            "xhighoff".into(),
+            "Opus5.5~/src/github.com/atermmain".into()
+        )
+    );
+    assert_eq!(
+        quiet(FactMask::BRANCH),
+        (
+            "mainoff".into(),
+            "Opus5.5xhigh~/src/github.com/aterm".into()
+        )
+    );
+    // A hidden fact the facts lack is no stub.
+    let no_branch = FooterFacts {
+        branch: None,
+        off: FactMask::BRANCH,
+        ..narrow_rule_facts()
+    };
+    assert!(!shown(&no_branch).iter().any(|s| s.contains(OFF_STUB)));
+    // The stubs give way first: the first narrower rung is the whole facts
+    // without them, the usage still whole.
+    let tokens = FooterFacts {
+        off: FactMask::PATH,
+        ..narrow_rule_tokens()
+    };
+    let walk = walk_down(&tokens);
+    assert!(
+        walk[0].contains(&"\u{2302} ~/src/github.com/aterm off".to_owned()),
+        "{walk:?}"
+    );
+    assert_eq!(
+        walk[1],
+        [
+            "\u{25C6} Opus 5.5 xhigh",
+            "\u{2387} main",
+            "\u{03A3} 7h52m \u{2191}48M \u{2193}310k"
+        ],
+        "{walk:?}"
+    );
+    assert!(walk[2..].iter().flatten().all(|s| !s.contains(OFF_STUB)));
+    // With the model hidden, the narrowest rung keeps no model.
+    let no_model = hide(FactMask::MODEL);
+    assert_eq!(model_alone(&no_model), None);
+    assert_eq!(walk_down(&no_model).last().map(Vec::len), Some(0));
+    // Negative control: nothing hidden, as before.
+    let facts = FooterFacts {
+        account: Some("work-2".into()),
+        ..narrow_rule_walled()
+    };
+    let golden: String = include_str!("testdata/footer-fit-sweep.txt")
+        .lines()
+        .skip(1)
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let swept = fit_sweep(&facts);
+    assert!(swept == golden, "the sweep moved:\n{swept}");
+    assert_eq!(plain_ladder(&facts), bare_ladder(&facts));
+    assert_ne!(
+        plain_ladder(&hide(FactMask::PATH)),
+        bare_ladder(&hide(FactMask::PATH))
+    );
+}
+
+/// The launch fixtures' top rules with the stand-in `workspace` (as wide as
+/// the key) replaced by the key: the tag is found at the key's columns, at
+/// every width measured. Negative controls: the stand-in itself, the plain
+/// bottom rule, the key run into a path, and the key not at the rule's end
+/// are none.
+#[test]
+fn top_rule_tag_finds_the_key_alone() {
+    let fixtures = [
+        include_str!("../../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-61col.txt"),
+        include_str!(
+            "../../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-narrow-26col.txt"
+        ),
+        include_str!(
+            "../../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-narrow-34col.txt"
+        ),
+        include_str!("../../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-80col.txt"),
+        include_str!(
+            "../../../aterm-phase/src/fixtures/claude-2.1.302-launch-workspace-144col.txt"
+        ),
+    ];
+    assert_eq!(
+        CLAUDE_TOP_EFFORT_KEY.len(),
+        "workspace".len(),
+        "the stand-in"
+    );
+    for text in fixtures {
+        let rows: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
+        let (top, bottom) = aterm_phase::phase::composer_rules(&rows).expect("a composer");
+        let stand_in = &rows[top];
+        assert_eq!(top_rule_tag(stand_in), None, "{stand_in:?}");
+        assert_eq!(top_rule_tag(&rows[bottom]), None, "a plain rule");
+        let row = stand_in.replace(" workspace ", &format!(" {CLAUDE_TOP_EFFORT_KEY} "));
+        let at = row
+            .chars()
+            .collect::<Vec<_>>()
+            .windows(CLAUDE_TOP_EFFORT_KEY.len())
+            .position(|w| w.iter().copied().eq(CLAUDE_TOP_EFFORT_KEY.chars()))
+            .expect("the key");
+        assert_eq!(
+            top_rule_tag(&row),
+            Some((at, at + CLAUDE_TOP_EFFORT_KEY.len())),
+            "{row:?}"
+        );
+        // Negative controls on the same row.
+        let path = stand_in.replace(" workspace ", &format!(" /{CLAUDE_TOP_EFFORT_KEY} "));
+        assert_eq!(top_rule_tag(&path), None, "{path:?}");
+    }
+    let rule = "\u{2500}".repeat(40);
+    let beside = format!("{rule} fast mode  {CLAUDE_TOP_EFFORT_KEY} \u{2500}");
+    assert_eq!(
+        top_rule_tag(&beside),
+        Some((52, 61)),
+        "beside another label"
+    );
+    let inside = format!("{rule} {CLAUDE_TOP_EFFORT_KEY} {rule}");
+    assert_eq!(top_rule_tag(&inside), None, "not the rule's end");
+    let not_a_rule = format!("  {CLAUDE_TOP_EFFORT_KEY} \u{2500}");
+    assert_eq!(top_rule_tag(&not_a_rule), None);
+}
+
+/// [`top_effort_answer`] reads the newest `⎿` row above the top rule, its
+/// wrapped rows joined back. Negative controls: a `⎿` above a newer `❯` echo
+/// is not read, a newest `⎿` that is no key answer hides an older one, and
+/// one past eight rows is out of reach.
+#[test]
+fn top_effort_answer_reads_the_newest_answer_only() {
+    let key = capital_key();
+    let rule = "\u{2500}".repeat(40);
+    let screen = |above: &[String]| -> Vec<String> {
+        let mut rows: Vec<String> = above.to_vec();
+        rows.push(String::new());
+        rows.push(rule.clone());
+        rows.push("\u{276F} ".into());
+        rows.push(rule.clone());
+        rows
+    };
+    let answer = |text: &str| format!("  \u{23BF}  {text}");
+    let echo = format!("\u{276F} /effort {CLAUDE_TOP_EFFORT_KEY} off");
+    let read = |rows: &[String]| {
+        let (top, _) = aterm_phase::phase::composer_rules(rows).expect("a composer");
+        top_effort_answer(rows, top)
+    };
+    let off = answer(&format!("{key} off. Effort stays xhigh."));
+    assert_eq!(
+        read(&screen(&[echo.clone(), off.clone()])),
+        Some(TopAnswer::Off)
+    );
+    let on = answer(&format!(
+        "{key} on (this session only): dynamic workflows on every task. Effort stays xhigh."
+    ));
+    assert_eq!(
+        read(&screen(&[echo.clone(), on.clone()])),
+        Some(TopAnswer::On)
+    );
+    // Wrapped at a narrow pane: the anchor runs across the break.
+    let wrapped = [
+        echo.clone(),
+        answer(&format!("{key} off. Effort")),
+        "     stays xhigh.".into(),
+    ];
+    assert_eq!(read(&screen(&wrapped)), Some(TopAnswer::Off));
+    let needs = answer(&format!(
+        "{key} needs dynamic workflows enabled (see /config)."
+    ));
+    assert_eq!(
+        read(&screen(&[echo.clone(), needs])),
+        Some(TopAnswer::NeedsWorkflows)
+    );
+    let unavailable = answer(&format!("{key} isn't available on claude-haiku-4-5."));
+    assert_eq!(
+        read(&screen(&[echo.clone(), unavailable])),
+        Some(TopAnswer::Unavailable)
+    );
+    // The newest of two.
+    assert_eq!(
+        read(&screen(&[
+            echo.clone(),
+            on.clone(),
+            echo.clone(),
+            off.clone()
+        ])),
+        Some(TopAnswer::Off)
+    );
+    // Negative controls.
+    assert_eq!(
+        read(&screen(&[off.clone(), echo.clone()])),
+        None,
+        "under an echo"
+    );
+    let level = answer("Set effort level to high (this session only): Deep");
+    assert_eq!(
+        read(&screen(&[on.clone(), level])),
+        None,
+        "the newest is another"
+    );
+    let mut far = vec![echo.clone(), off.clone()];
+    far.extend(std::iter::repeat_n("  plain transcript".to_owned(), 8));
+    assert_eq!(read(&screen(&far)), None, "out of reach");
+}
+
+/// A measured 2.1.304 screen (`aterm-phase`'s fixtures, the stand-in
+/// `workspace` as wide as the key) with the stand-in replaced by the key, its
+/// header line dropped; `cut` keeps only the rows above it and draws the
+/// composer under them, as a screen whose newest answer is that row's.
+fn measured(text: &str, cut: Option<usize>) -> Vec<String> {
+    let key = capital_key();
+    let mut rows: Vec<String> = text
+        .lines()
+        .skip(1)
+        .map(|l| {
+            l.replace("Workspace", &key)
+                .replace("workspace", CLAUDE_TOP_EFFORT_KEY)
+        })
+        .collect();
+    if let Some(cut) = cut {
+        let width = rows[cut..]
+            .iter()
+            .find(|r| aterm_phase::phase::is_rule(r))
+            .map_or(40, |r| r.chars().count());
+        let rule = "\u{2500}".repeat(width);
+        rows.truncate(cut);
+        rows.extend([String::new(), rule.clone(), "\u{276F} ".into(), rule]);
+    }
+    rows
+}
+
+/// THE MEASURED ANSWERS, AT EVERY WIDTH (2.1.304): each screen's newest
+/// answer to `/effort <key> on|off` is read — wrapped at 26, 34 and 80
+/// columns with a one-blank gutter, far above the composer in the
+/// fullscreen renderer's short transcript, and the two refusals, the
+/// unavailable one naming the model's ID at a narrow width too.
+/// NEGATIVE CONTROLS: the stand-in left in (no key's head) reads nothing,
+/// and so does a screen whose newest result is a `/model` answer.
+#[test]
+fn top_effort_reply_reads_every_measured_answer() {
+    use aterm_phase::phase::composer_rules;
+    let fx = |name: &str| -> &'static str {
+        match name {
+            "on-26" => {
+                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.304-top-on-26col.txt")
+            }
+            "on-34" => {
+                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.304-top-on-34col.txt")
+            }
+            "on-61" => {
+                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.304-top-on-61col.txt")
+            }
+            "on-80" => {
+                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.304-top-on-80col.txt")
+            }
+            "on-120" => {
+                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.304-top-on-120col.txt")
+            }
+            "off-120" => {
+                include_str!("../../../aterm-phase/src/fixtures/claude-2.1.304-top-off-120col.txt")
+            }
+            "unavailable" => include_str!(
+                "../../../aterm-phase/src/fixtures/claude-2.1.304-top-refused-unavailable-120col.txt"
+            ),
+            "needs" => include_str!(
+                "../../../aterm-phase/src/fixtures/claude-2.1.304-top-refused-needs-workflows-120col.txt"
+            ),
+            _ => unreachable!("{name}"),
+        }
+    };
+    let read = |rows: &[String]| {
+        let (top, _) = composer_rules(rows).expect("a composer");
+        top_effort_reply(rows, top)
+    };
+    let said = |answer: TopAnswer| TopReply {
+        answer,
+        model: None,
+    };
+    for name in ["on-26", "on-34", "on-61", "on-80", "on-120"] {
+        assert_eq!(
+            read(&measured(fx(name), None)),
+            Some(said(TopAnswer::On)),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        read(&measured(fx("off-120"), None)),
+        Some(said(TopAnswer::Off)),
+        "far above the fullscreen composer"
+    );
+    assert_eq!(
+        read(&measured(fx("needs"), None)),
+        Some(said(TopAnswer::NeedsWorkflows))
+    );
+    let unavailable = Some(TopReply {
+        answer: TopAnswer::Unavailable,
+        model: Some("claude-sonnet-4-5".into()),
+    });
+    assert_eq!(read(&measured(fx("unavailable"), None)), unavailable);
+    // The unavailable refusal as 34 and 80 columns wrapped it (its block
+    // ends at row 23 and row 27 of the files), read as the newest answer.
+    for (name, cut) in [("on-34", 22), ("on-80", 26)] {
+        let rows = measured(fx(name), Some(cut));
+        assert_eq!(read(&rows), unavailable, "{name} cut at {cut}");
+    }
+    // NEGATIVE CONTROLS.
+    let stand_in: Vec<String> = fx("on-34").lines().skip(1).map(str::to_owned).collect();
+    let (top, _) = composer_rules(&stand_in).expect("a composer");
+    assert_eq!(top_effort_reply(&stand_in, top), None, "no key's head");
+    // The 26-column screen cut under its `/model default` answer.
+    let model = measured(fx("on-26"), Some(26));
+    assert_eq!(read(&model), None, "a /model answer");
+}
+
+/// No new anchor spells the key: each is a suffix the reader puts after the
+/// key's head ([`past_key`]), so `aterm_primer`'s const is its one spelling.
+#[test]
+fn no_anchor_spells_the_key() {
+    for id in [
+        "effort.top_on",
+        "effort.top_off",
+        "effort.stays",
+        "effort.top_needs",
+        "effort.top_unavailable",
+        "effort.key_on",
+        "effort.key_off",
+        "effort.hint_tail",
+    ] {
+        let text = aterm_phase::anchor(id);
+        assert!(
+            !text.to_ascii_lowercase().contains(CLAUDE_TOP_EFFORT_KEY),
+            "{id}: {text:?}"
+        );
+        assert!(!text.is_empty(), "{id}");
+    }
+}
+
+/// THE EFFORT SPLIT AND A STUB'S GREY SURVIVE CLUSTERS AND MARKS: a
+/// segment's text set grapheme by grapheme ([`set_facts`]: an emoji cluster
+/// one glyph, a combining mark on its base, not a glyph of its own) still
+/// marks each glyph past [`Segment::split`] as the effort's and each of a
+/// hidden head's as quiet, by its byte in the text — so a click on the
+/// effort ([`fact_spans`]) lands there after a multi-byte head. CONTROL: the
+/// mark and the space after it are neither.
+#[test]
+fn the_effort_split_survives_clusters_and_marks() {
+    for head in ["Opu\u{301}s 5.5 ", "\u{1F469}\u{200D}\u{1F4BB} 5.5 "] {
+        let text = format!("{head}xhigh");
+        let set = set_facts(&[Segment {
+            mark: MODEL_MARK,
+            text: text.clone(),
+            split: Some(head.len()),
+            quiet: (true, false),
+        }]);
+        let spelled = |pick: &dyn Fn(&SetGlyph) -> bool| -> String {
+            set.glyphs
+                .iter()
+                .filter(|g| !g.mark && pick(g))
+                .map(|g| g.ch)
+                .collect()
+        };
+        assert_eq!(spelled(&|g| g.tail), "xhigh", "{text:?}: the effort");
+        assert_eq!(spelled(&|g| g.tail && g.quiet), "", "{text:?}: shown");
+        let lead: String = head.chars().filter(|c| !c.is_whitespace()).collect();
+        let lead: String = aterm_grapheme::split_graphemes(&lead)
+            .map(|c| c.text.chars().next().unwrap_or(' '))
+            .collect();
+        assert_eq!(spelled(&|g| !g.tail && g.quiet), lead, "{text:?}: the stub");
+        let mark = set.glyphs.first().expect("the mark");
+        assert!(
+            mark.mark && !mark.tail && !mark.quiet,
+            "{text:?}: CONTROL, the mark"
+        );
+    }
 }

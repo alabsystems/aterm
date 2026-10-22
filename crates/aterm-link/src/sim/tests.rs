@@ -1850,6 +1850,7 @@ fn write_every_torn_kind(st: &crate::state::StateDir) {
             inc: 1,
             total,
             key: Some([7; 16]),
+            win: Vec::new(),
             slots: Vec::new(),
         };
         st.set_logpin(&mirror.render()).expect("the mirror's pin");

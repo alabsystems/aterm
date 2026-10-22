@@ -125,7 +125,8 @@ pub(crate) struct ColdTier {
 impl ColdTier {
     /// Create a new cold tier.
     #[must_use]
-    pub(crate) fn new() -> Self {
+    #[inline]
+    pub(crate) const fn new() -> Self {
         Self {
             pages: VecDeque::new(),
             line_count: 0,
@@ -142,7 +143,7 @@ impl ColdTier {
     /// Get the total number of lines.
     #[must_use]
     #[inline]
-    pub(crate) fn line_count(&self) -> usize {
+    pub(crate) const fn line_count(&self) -> usize {
         self.line_count
     }
 
@@ -620,7 +621,8 @@ impl ColdTier {
 
     /// Get total compressed size (for stats).
     #[must_use]
-    pub(crate) fn compressed_size(&self) -> usize {
+    #[inline]
+    pub(crate) const fn compressed_size(&self) -> usize {
         self.bytes_used
     }
 

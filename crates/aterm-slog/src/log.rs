@@ -941,8 +941,10 @@ pub struct Log {
     fence_ms: u64,
     /// THE MIRROR (phase 4, `mirror.rs`): where this log's bus-class records
     /// stand on the bus. `None` until the first take, which a bridge makes
-    /// only while `[fabric] log = "turns"`: with the mirror off nothing is
-    /// ever held here, and the carry writes no byte of it.
+    /// only while its mirror runs (`[fabric] log = "turns"`, or the default
+    /// `"auto"` over a broker that retains it, Phase 6 step 6E-3): with the
+    /// mirror off nothing is ever held here, and the carry writes no byte of
+    /// it.
     mirror: Option<Box<mirror::Mirror>>,
 }
 

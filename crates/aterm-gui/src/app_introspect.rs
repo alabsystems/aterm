@@ -7975,6 +7975,8 @@ impl App {
             },
             // The Autopilot menu's live rows, by the tab menu's rule.
             AuxTarget::AutopilotMenu => self.autopilot_menu_controls(),
+            // A fact's menu, the same card hung from a fact (`crate::fact_menu`).
+            AuxTarget::FactMenu => self.fact_menu_controls(),
             // Every session of the instance (Owner-gated at the dispatch): the
             // OPEN card's rows only.
             AuxTarget::Overview => match self.front().and_then(|ws| ws.overview()) {

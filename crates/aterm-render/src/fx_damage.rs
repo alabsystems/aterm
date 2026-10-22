@@ -41,6 +41,7 @@ pub struct RowBands {
 
 impl RowBands {
     /// The bands of a grid whose top edge is `grid_top` with `cell_h`-tall rows.
+    #[inline]
     #[must_use]
     pub const fn new(grid_top: usize, cell_h: usize) -> Self {
         Self { grid_top, cell_h }
@@ -49,7 +50,8 @@ impl RowBands {
     /// The band of a `rows`-row grid holding window pixel row `y` (`rows > 0`):
     /// row 0 also holds every pixel above the grid, the last row every pixel
     /// below it.
-    fn band_of(self, y: i128, rows: usize) -> usize {
+    #[inline]
+    const fn band_of(self, y: i128, rows: usize) -> usize {
         // Widen before subtracting: RowBands is public and usize origins
         // can exceed the positive i64 range even when dirty holds five rows.
         let top = self.grid_top as i128;
@@ -57,11 +59,18 @@ impl RowBands {
             return 0;
         }
         // `y - top` is non-negative; past `usize` it is past every band.
-        let r = usize::try_from((y - top) / self.cell_h.max(1) as i128).unwrap_or(usize::MAX);
-        r.min(rows - 1)
+        let pitch = if self.cell_h > 1 { self.cell_h } else { 1 } as i128;
+        let q = (y - top) / pitch;
+        let r = if q > usize::MAX as i128 {
+            usize::MAX
+        } else {
+            q as usize
+        };
+        if r < rows - 1 { r } else { rows - 1 }
     }
 
     /// Mark every band the window pixel rows `[y0, y1)` reach.
+    #[inline]
     pub(crate) fn mark_span(self, dirty: &mut [bool], y0: i128, y1: i128) {
         let rows = dirty.len();
         if rows == 0 || y0 >= y1 {
@@ -80,6 +89,7 @@ impl RowBands {
     /// (and their full width), never the head or the padding above or below
     /// them, so light there keeps drawing. An empty `rows` gives an empty
     /// span.
+    #[inline]
     #[must_use]
     pub fn rows_px(self, rows: Range<usize>) -> (i32, i32) {
         if rows.start >= rows.end {
@@ -97,6 +107,7 @@ impl RowBands {
 /// The window pixel rows `[y0, y1)` `layer` may write: its extent, moved to
 /// window space (`grid_top` down for a Grid layer). `None` when it writes
 /// nothing.
+#[inline]
 fn window_rows(layer: &FxLayer, bands: RowBands) -> Option<(i128, i128)> {
     let e = layer.extent();
     if e.is_empty() {
@@ -110,6 +121,7 @@ fn window_rows(layer: &FxLayer, bands: RowBands) -> Option<(i128, i128)> {
 }
 
 /// Mark the bands `layer` may write.
+#[inline]
 fn mark_layer(dirty: &mut [bool], bands: RowBands, layer: &FxLayer) {
     if let Some((y0, y1)) = window_rows(layer, bands) {
         bands.mark_span(dirty, y0, y1);
@@ -119,6 +131,7 @@ fn mark_layer(dirty: &mut [bool], bands: RowBands, layer: &FxLayer) {
 /// The index in `other` of `list[i]`'s counterpart: the k-th layer of its id
 /// in `other`, when `list[i]` is the k-th of that id in `list`. Ids are the
 /// host's stable names; a repeated id pairs in order. O(n), allocation-free.
+#[inline]
 fn counterpart(list: &[FxLayer], i: usize, other: &[FxLayer]) -> Option<usize> {
     let id = list[i].id;
     let k = list[..i].iter().filter(|l| l.id == id).count();

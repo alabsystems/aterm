@@ -842,18 +842,19 @@ impl TapeSink {
             state.remedy = Remedy::Refused;
             return;
         };
-        if Redactor::shapes(&text) != text {
-            state.failed = Some(format!(
-                "a {} record whose tape line the shapes would change",
-                record.kind()
-            ));
-            state.remedy = Remedy::Refused;
-            return;
-        }
+        // The size first: a line no tape can hold is refused without the shapes reading it.
         let size = u64::try_from(text.len()).unwrap_or(u64::MAX);
         if state.written.saturating_add(size) > TAPE_MAX {
             state.failed = Some(format!(
                 "the tape would be over {TAPE_MAX} bytes, the most a replay reads"
+            ));
+            state.remedy = Remedy::Refused;
+            return;
+        }
+        if Redactor::shapes(&text) != text {
+            state.failed = Some(format!(
+                "a {} record whose tape line the shapes would change",
+                record.kind()
             ));
             state.remedy = Remedy::Refused;
             return;

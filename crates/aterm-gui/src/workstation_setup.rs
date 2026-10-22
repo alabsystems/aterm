@@ -30,6 +30,7 @@ pub struct SetupAnswer {
     pub decision: WorkstationSetupDecision,
     pub password: Option<aterm_secrets::SecretBytes>,
     pub receipt: Option<crate::InitialSetupApplyReceipt>,
+    pub cancel_receipt: Option<crate::InitialSetupCancelReceipt>,
 }
 
 impl From<WorkstationSetupDecision> for SetupAnswer {
@@ -38,6 +39,7 @@ impl From<WorkstationSetupDecision> for SetupAnswer {
             decision,
             password: None,
             receipt: None,
+            cancel_receipt: None,
         }
     }
 }
@@ -160,6 +162,10 @@ impl Request {
     pub(crate) fn pending(&self) -> bool {
         self.reply.lock().is_ok_and(|reply| reply.is_some())
     }
+
+    pub(crate) fn same_offer(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.reply, &other.reply)
+    }
 }
 
 const COUNTDOWN: Duration = Duration::from_secs(30);
@@ -266,6 +272,10 @@ impl PermissionGate {
     fn accepted(&mut self) {
         // The receipt establishes durable admission, but the cached snapshot
         // can still describe the previous plan. Only a new read releases it.
+        self.await_fresh_status();
+    }
+
+    fn await_fresh_status(&mut self) {
         self.hold = PermissionHold::FreshStatus;
     }
 
@@ -290,12 +300,9 @@ pub(crate) struct Host {
     startup: Option<fn() -> bool>,
     startup_retry: Option<Instant>,
     request: Option<Request>,
-    owner: Option<crate::WindowId>,
     unified: bool,
     permissions: PermissionGate,
     proxy_registered: bool,
-    #[cfg(target_os = "macos")]
-    sheet: Option<native::Sheet>,
 }
 
 impl Host {
@@ -319,11 +326,8 @@ impl Host {
             startup,
             startup_retry: None,
             request: None,
-            owner: None,
             permissions: PermissionGate::default(),
             proxy_registered: false,
-            #[cfg(target_os = "macos")]
-            sheet: None,
         }
     }
 
@@ -339,9 +343,6 @@ impl Host {
         if let Some(request) = self.request.take() {
             request.finish(decision);
         }
-        self.owner = None;
-        #[cfg(target_os = "macos")]
-        self.sheet.take();
     }
 
     pub(crate) fn deadline(&self, now: Instant) -> Option<Instant> {
@@ -427,7 +428,8 @@ fn start_preview() -> bool {
                 // its inert answer so it exercises the production UI lifecycle.
                 receipt.accept();
             }
-            if let Some(root) = aterm_types::dirs::state_dir() {
+            let cancel_receipt = answer.cancel_receipt.take();
+            let saved = if let Some(root) = aterm_types::dirs::state_dir() {
                 let word = match answer.decision {
                     WorkstationSetupDecision::Begin(plan) => {
                         format!("begin\nselection_bits={}\n", plan.selection.bits())
@@ -436,11 +438,18 @@ fn start_preview() -> bool {
                     WorkstationSetupDecision::Unavailable => "unavailable\n".to_owned(),
                 };
                 let result = format!("{word}elapsed_ms={}\n", started.elapsed().as_millis());
-                if let Err(error) =
-                    std::fs::write(root.join("workstation-setup-preview-result"), result)
-                {
-                    aterm_log::warn!("Mac setup preview could not write its result: {error}");
+                match std::fs::write(root.join("workstation-setup-preview-result"), result) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        aterm_log::warn!("Mac setup preview could not write its result: {error}");
+                        false
+                    }
                 }
+            } else {
+                false
+            };
+            if saved && let Some(receipt) = cancel_receipt {
+                receipt.complete();
             }
         },
     )
@@ -467,16 +476,6 @@ pub(crate) fn eligible_launch_command(
     admitted_handoff: bool,
 ) -> bool {
     commandless || (relaunch && admitted_handoff)
-}
-
-fn countdown_has_window(
-    owner: Option<crate::WindowId>,
-    mut live: impl Iterator<Item = crate::WindowId>,
-) -> bool {
-    match owner {
-        Some(owner) => live.any(|window| window == owner),
-        None => live.next().is_some(),
-    }
 }
 
 impl App {
@@ -508,6 +507,10 @@ impl App {
         self.workstation_setup.permissions.accepted();
     }
 
+    pub(crate) fn recheck_initial_setup_permissions(&mut self) {
+        self.workstation_setup.permissions.await_fresh_status();
+    }
+
     pub(crate) fn observe_initial_setup_permissions(
         &mut self,
         policy: Option<crate::InitialSetupPermissionPolicy>,
@@ -516,13 +519,11 @@ impl App {
     }
 
     pub(crate) fn tick_workstation_setup(&mut self, now: Instant) {
-        if (self.workstation_setup.pending() || self.workstation_setup.owner.is_some())
-            && !countdown_has_window(
-                self.workstation_setup.owner,
-                self.windows
-                    .iter()
-                    .filter_map(|(wid, window)| window.os_window.as_ref().map(|_| *wid)),
-            )
+        if self.workstation_setup.pending()
+            && !self
+                .windows
+                .values()
+                .any(|window| window.os_window.is_some())
         {
             self.workstation_setup
                 .finish(WorkstationSetupDecision::Unavailable);
@@ -552,193 +553,8 @@ impl App {
             self.workstation_setup.request = None;
         }
     }
-
-    /// Optional attention notice; first launch opens the full tab directly.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn show_system_state_notice(&mut self) {
-        if self.workstation_setup.sheet.is_some() {
-            return;
-        }
-        let Some(proxy) = self.proxy.clone() else {
-            return;
-        };
-        let Some((wid, parent)) = self.windows.iter().find_map(|(wid, window)| {
-            if !crate::os_window_focused(window) {
-                return None;
-            }
-            let native = window.os_window.as_ref()?;
-            // SAFETY: a live window, retained on the application main thread.
-            unsafe { aterm_objc::Obj::retain(crate::platform::ns_window_of(native)) }
-                .map(|parent| (*wid, parent))
-        }) else {
-            return;
-        };
-        match native::Sheet::show(parent, proxy) {
-            Ok(sheet) => {
-                self.workstation_setup.owner = Some(wid);
-                self.workstation_setup.sheet = Some(sheet);
-            }
-            Err(error) => aterm_log::warn!("System State notice could not open: {error}"),
-        }
-    }
 }
 
-#[cfg(target_os = "macos")]
-mod native {
-    use crate::{
-        Wake,
-        appkit::{self, MainThread},
-    };
-    use aterm_objc::{CGSize, Id, Obj, RcBlock, Sel, class, sel};
-    use aterm_window::event_loop::EventLoopProxy;
-
-    pub(super) struct Sheet {
-        parent: Obj,
-        panel: Obj,
-        _alert: Obj,
-    }
-
-    /// The existing flying kitty and rainbow palette, rendered once as the
-    /// native alert's compact icon. The art stays sharp on Retina displays.
-    fn brand_image() -> Option<Obj> {
-        use aterm_effects::cat_baker::{ResolvedFills, bake_variant};
-        use aterm_effects::cat_glyphs_gen::CatGlyphId;
-
-        const SIZE: usize = 192;
-        const CAT_X: usize = 72;
-        let cat = bake_variant(
-            CatGlyphId::SpecStretch,
-            &ResolvedFills::from_indices(8, 4, false),
-            120,
-            77,
-        );
-        let mut pixels = vec![0u8; SIZE * SIZE * 4];
-        for stripe in 0..7 {
-            let color = aterm_effects::spectrum::spectrum_stop(stripe);
-            let color = [(color >> 16) as u8, (color >> 8) as u8, color as u8, 255];
-            for y in 81 + stripe * 5..86 + stripe * 5 {
-                for x in 4..CAT_X {
-                    pixels[(y * SIZE + x) * 4..(y * SIZE + x + 1) * 4].copy_from_slice(&color);
-                }
-            }
-        }
-        // Exclude the baker's reserved catch-light strip; only the authored
-        // kitty belongs in a standalone image.
-        for y in 0..cat.height() as usize {
-            let source = y * cat.width() as usize * 4;
-            let target = ((y + 55) * SIZE + CAT_X) * 4;
-            pixels[target..target + 120 * 4]
-                .copy_from_slice(&cat.pixels()[source..source + 120 * 4]);
-        }
-        let mut png = Vec::new();
-        {
-            let mut encoder = aterm_png::Encoder::new(&mut png, SIZE as u32, SIZE as u32);
-            encoder.set_color(aterm_png::ColorType::Rgba);
-            encoder.set_depth(aterm_png::BitDepth::Eight);
-            encoder
-                .write_header()
-                .ok()?
-                .write_image_data(&pixels)
-                .ok()?;
-        }
-        // SAFETY: NSData copies these bytes; NSImage owns its decoded content.
-        // All objects are created and used only on the application main thread.
-        unsafe {
-            let data_with: unsafe extern "C-unwind" fn(
-                Id,
-                Sel,
-                *const std::ffi::c_void,
-                usize,
-            ) -> Id = aterm_objc::checked_msg();
-            let data = data_with(
-                class(c"NSData").as_id(),
-                sel!(dataWithBytes:length:),
-                png.as_ptr().cast(),
-                png.len(),
-            );
-            if data.is_null() {
-                return None;
-            }
-            let image = Obj::from_owned(appkit::send_id_id(
-                appkit::send_id(class(c"NSImage").as_id(), sel!(alloc)),
-                sel!(initWithData:),
-                data,
-            ))?;
-            appkit::send_v_size(
-                image.id(),
-                sel!(setSize:),
-                CGSize {
-                    width: 64.0,
-                    height: 64.0,
-                },
-            );
-            Some(image)
-        }
-    }
-
-    impl Sheet {
-        pub(super) fn show(parent: Obj, proxy: EventLoopProxy<Wake>) -> Result<Self, &'static str> {
-            let mtm = MainThread::new().ok_or("no main thread")?;
-            appkit::existing_application(mtm).ok_or("no AppKit application")?;
-            let title =
-                appkit::nsstring("aterm · ALab\nSystem State").ok_or("could not create title")?;
-            let body = appkit::nsstring("Review your Mac setup and anything that needs attention.")
-                .ok_or("could not create text")?;
-            let open = appkit::nsstring("Open System State").ok_or("could not create button")?;
-            // SAFETY: a retained native alert, on the application main thread.
-            unsafe {
-                if !appkit::send_id(parent.id(), sel!(attachedSheet)).is_null() {
-                    return Err("the window already has a sheet");
-                }
-                let alert = Obj::from_owned(appkit::send_id(class(c"NSAlert").as_id(), sel!(new)))
-                    .ok_or("could not create alert")?;
-                appkit::send_v_id(alert.id(), sel!(setMessageText:), title.id());
-                appkit::send_v_id(alert.id(), sel!(setInformativeText:), body.id());
-                if let Some(icon) = brand_image() {
-                    appkit::send_v_id(alert.id(), sel!(setIcon:), icon.id());
-                }
-                let _ = appkit::send_id_id(alert.id(), sel!(addButtonWithTitle:), open.id());
-                let panel = Obj::retain(appkit::send_id(alert.id(), sel!(window)))
-                    .ok_or("could not create panel")?;
-                let handler = RcBlock::new1(move |response: isize| {
-                    if response == appkit::consts::NS_ALERT_FIRST_BUTTON_RETURN {
-                        let _ = proxy.send_event(Wake::OpenSystemState);
-                    }
-                })
-                .ok_or("could not create handler")?;
-                let begin: unsafe extern "C-unwind" fn(Id, Sel, Id, aterm_objc::BlockPtr) =
-                    aterm_objc::checked_msg();
-                begin(
-                    alert.id(),
-                    sel!(beginSheetModalForWindow:completionHandler:),
-                    parent.id(),
-                    handler.as_block_ptr(),
-                );
-                Ok(Self {
-                    parent,
-                    panel,
-                    _alert: alert,
-                })
-            }
-        }
-    }
-
-    impl Drop for Sheet {
-        fn drop(&mut self) {
-            // SAFETY: end only this retained panel, on its main thread.
-            unsafe {
-                if appkit::send_id(self.panel.id(), sel!(sheetParent)) == self.parent.id() {
-                    appkit::send_v_id_isize(
-                        self.parent.id(),
-                        sel!(endSheet:returnCode:),
-                        self.panel.id(),
-                        appkit::consts::NS_ALERT_SECOND_BUTTON_RETURN,
-                    );
-                }
-            }
-        }
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,34 +798,22 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_sheet_owner_releases_the_worker_while_the_app_lives() {
-        let first = crate::WindowId(0);
-        let other = crate::WindowId(1);
-        assert!(!countdown_has_window(Some(first), [other].into_iter()));
-        assert!(countdown_has_window(
-            Some(first),
-            [other, first].into_iter()
-        ));
-        assert!(countdown_has_window(None, [other].into_iter()));
-        assert!(!countdown_has_window(None, [].into_iter()));
-        for owner in [None, Some(crate::WindowId(0))] {
-            let (send, receive) = mpsc::channel();
-            let mut app = App::headless_for_test();
-            app.workstation_setup
-                .offer(Request::new(Selection::all(), send));
-            app.workstation_setup.owner = owner;
-            // Covers closing before the first sheet opens and after it has an
-            // owner. A retained parent cannot keep a closed native window live.
-            app.tick_workstation_setup(Instant::now());
-            assert_eq!(
-                receive
-                    .recv_timeout(Duration::from_secs(60))
-                    .unwrap()
-                    .decision,
-                WorkstationSetupDecision::Unavailable
-            );
-            assert!(!app.workstation_setup.pending());
-        }
+    fn losing_the_last_window_releases_the_worker_while_the_app_lives() {
+        let (send, receive) = mpsc::channel();
+        let mut app = App::headless_for_test();
+        app.workstation_setup
+            .offer(Request::new(Selection::all(), send));
+        // Headless test windows have no OS window: the offer cannot be
+        // answered, so the worker is released instead of parked.
+        app.tick_workstation_setup(Instant::now());
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(60))
+                .unwrap()
+                .decision,
+            WorkstationSetupDecision::Unavailable
+        );
+        assert!(!app.workstation_setup.pending());
     }
 
     #[test]

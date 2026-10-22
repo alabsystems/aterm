@@ -327,12 +327,16 @@ thread_local! {
     static CARD_LAYOUTS: Cell<usize> = const { Cell::new(0) };
     /// Launch cards parsed off a pane's text (`claude_card::read_card`).
     static CARD_READS: Cell<usize> = const { Cell::new(0) };
+    /// Update notices scanned for under a placed card
+    /// (`claude_footer::PaneTextCache::update_notice`), as against a scan
+    /// kept from the last rebuild of the pane's text.
+    static CARD_NOTICE_READS: Cell<usize> = const { Cell::new(0) };
     /// Sessions' Autopilot reads (`App::session_autopilot`: one metadata
     /// lock each).
     static AUTOPILOT_READS: Cell<usize> = const { Cell::new(0) };
-    /// Harness card lines whose ink was laid (`HarnessCard::line_ink_into`,
-    /// from `claude_card::make_line`), as against a line kept from the last
-    /// frame.
+    /// Harness card lines and banners whose ink was laid
+    /// (`HarnessCard::line_ink_into`, from `claude_card::ink_words`), as
+    /// against a line or a banner kept from the last frame.
     static CARD_LINE_INKS: Cell<usize> = const { Cell::new(0) };
     /// Session timeline locks the footer's splice took
     /// (`App::splice_claude_footer`, the harness card's leaf beside it): the
@@ -405,6 +409,10 @@ thread_local! {
     /// Chip blocks fitted and laid (`App::claude_lights_block`), as against
     /// a pane's block kept from a frame whose fit key was the same.
     static FOOTER_BLOCK_FITS: Cell<usize> = const { Cell::new(0) };
+    /// The traffic published beside a session's facts read for its card
+    /// (`App::fact_menu_rows`): at the card's open and its wakes, never by a
+    /// frame or a shut card.
+    static TRAFFIC_SIDE_READS: Cell<usize> = const { Cell::new(0) };
     /// Autopilot chip titles built (`claude_lights::autopilot_title`): one
     /// where a reading starts or its inputs moved, none while nobody reads.
     static AUTOPILOT_TITLES_BUILT: Cell<usize> = const { Cell::new(0) };
@@ -412,6 +420,13 @@ thread_local! {
     /// rebuild's (`claude_footer::PaneTextCache::rows_as`), as against rows
     /// the engine's revisions vouch unchanged.
     static FOOTER_ROWS_COMPARED: Cell<usize> = const { Cell::new(0) };
+    /// Composer top rules read off the frame for their plain run
+    /// (`claude_footer::PaneTextCache::top_run`), as against a reading kept
+    /// with the pane's rows.
+    static FOOTER_TOP_READS: Cell<usize> = const { Cell::new(0) };
+    /// Composer top rules composed (`claude_footer::compose_top`), as
+    /// against a composition kept from a frame whose inputs were the same.
+    static FOOTER_TOPS_COMPOSED: Cell<usize> = const { Cell::new(0) };
 }
 
 pub(crate) fn harness_clock_read() {
@@ -440,6 +455,13 @@ pub(crate) fn card_read() {
 }
 pub(crate) fn take_card_reads() -> usize {
     take(&CARD_READS)
+}
+
+pub(crate) fn card_notice_read() {
+    bump(&CARD_NOTICE_READS);
+}
+pub(crate) fn take_card_notice_reads() -> usize {
+    take(&CARD_NOTICE_READS)
 }
 
 pub(crate) fn autopilot_read() {
@@ -526,6 +548,20 @@ pub(crate) fn take_footer_card_reads() -> usize {
     take(&FOOTER_CARD_READS)
 }
 
+pub(crate) fn footer_top_read() {
+    bump(&FOOTER_TOP_READS);
+}
+pub(crate) fn take_footer_top_reads() -> usize {
+    take(&FOOTER_TOP_READS)
+}
+
+pub(crate) fn footer_top_composed() {
+    bump(&FOOTER_TOPS_COMPOSED);
+}
+pub(crate) fn take_footer_tops_composed() -> usize {
+    take(&FOOTER_TOPS_COMPOSED)
+}
+
 pub(crate) fn footer_rule_composed() {
     bump(&FOOTER_RULES_COMPOSED);
 }
@@ -582,6 +618,14 @@ pub(crate) fn take_input_slices() -> (usize, usize) {
 pub(crate) fn footer_block_fitted() {
     bump(&FOOTER_BLOCK_FITS);
 }
+
+pub(crate) fn traffic_side_read() {
+    bump(&TRAFFIC_SIDE_READS);
+}
+#[cfg(unix)]
+pub(crate) fn take_traffic_side_reads() -> usize {
+    take(&TRAFFIC_SIDE_READS)
+}
 pub(crate) fn autopilot_title_built() {
     bump(&AUTOPILOT_TITLES_BUILT);
 }
@@ -597,6 +641,64 @@ pub(crate) fn footer_row_compared() {
 }
 pub(crate) fn take_footer_rows_compared() -> usize {
     take(&FOOTER_ROWS_COMPARED)
+}
+
+thread_local! {
+    /// Agents panels located and their cells read off a frame
+    /// (`claude_panel::read_panel`): at most once per rebuild of a Claude
+    /// Code pane's text, and only where the panel's gate holds.
+    static PANEL_READS: Cell<usize> = const { Cell::new(0) };
+    /// Folds and retimes of a panel's dots (`claude_panel`): a reading that
+    /// moved, or a dot's next turn come due — never a frame at rest.
+    static PANEL_FOLDS: Cell<usize> = const { Cell::new(0) };
+    /// A panel's look made anew (its ink, halos and slabs), as against one
+    /// kept from a frame of the same key and put on the glass as it is.
+    static PANEL_LOOKS: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) fn panel_read() {
+    bump(&PANEL_READS);
+}
+pub(crate) fn take_panel_reads() -> usize {
+    take(&PANEL_READS)
+}
+
+pub(crate) fn panel_folded() {
+    bump(&PANEL_FOLDS);
+}
+pub(crate) fn take_panel_folds() -> usize {
+    take(&PANEL_FOLDS)
+}
+
+pub(crate) fn panel_look_made() {
+    bump(&PANEL_LOOKS);
+}
+pub(crate) fn take_panel_looks() -> usize {
+    take(&PANEL_LOOKS)
+}
+
+thread_local! {
+    /// Footer wakes armed (`claude_lights::wake_after`): one sleeping lane
+    /// thread each, posting one wake.
+    static FOOTER_WAKES_ARMED: Cell<usize> = const { Cell::new(0) };
+    /// Claude's mode pill read for its relabel (`claude_footer::read_pane`).
+    static PILL_RELABEL_READS: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) fn pill_relabel_read() {
+    bump(&PILL_RELABEL_READS);
+}
+#[cfg(unix)]
+pub(crate) fn take_pill_relabel_reads() -> usize {
+    take(&PILL_RELABEL_READS)
+}
+
+pub(crate) fn footer_wake_armed() {
+    bump(&FOOTER_WAKES_ARMED);
+}
+#[cfg(unix)]
+pub(crate) fn take_footer_wakes_armed() -> usize {
+    take(&FOOTER_WAKES_ARMED)
 }
 
 // ---------------------------------------------------------------------------

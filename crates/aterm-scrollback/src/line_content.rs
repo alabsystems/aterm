@@ -47,7 +47,7 @@ impl InlineBuf {
     }
 
     #[inline]
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.len as usize
     }
 }
@@ -66,6 +66,7 @@ pub(crate) enum LineContent {
 }
 
 impl Default for LineContent {
+    #[inline]
     fn default() -> Self {
         Self::Inline(InlineBuf::from_slice(&[]))
     }
@@ -74,6 +75,7 @@ impl Default for LineContent {
 impl LineContent {
     /// Create from bytes.
     #[must_use]
+    #[inline]
     pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
         if bytes.len() <= INLINE_SIZE {
             Self::Inline(InlineBuf::from_slice(bytes))
@@ -91,6 +93,7 @@ impl LineContent {
     /// the byte budget) at the exact-fit size `from_bytes` produces; it is a
     /// no-op when the caller sized the buffer exactly.
     #[must_use]
+    #[inline]
     pub(crate) fn from_vec(mut bytes: Vec<u8>) -> Self {
         if bytes.len() <= INLINE_SIZE {
             Self::Inline(InlineBuf::from_slice(&bytes))

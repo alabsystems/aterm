@@ -1309,14 +1309,12 @@ fn first_run_doctor_eligible(args: &[OsString], interactive: bool, env: DoctorSt
 /// from the shell that opened it, or from its update predecessor.
 #[cfg(any(target_os = "macos", test))]
 fn first_run_window_eligible(args: &[OsString], env: DoctorStartupEnv) -> bool {
-    first_run_doctor_eligible(
-        args,
-        true,
-        DoctorStartupEnv {
-            nested: false,
-            ..env
-        },
-    )
+    if env.isolated || env.outside_person_scope {
+        return false;
+    }
+    let args = strip_mode_flags(args);
+    let args = strip_flags(&args, &[NO_REROUTE_FLAG]);
+    aterm_gui::initial_setup_window_args(&args)
 }
 
 /// A running-window successor does not execute its carried command. Its launch
@@ -1385,7 +1383,7 @@ fn apply_first_run_doctor_in_session() {
         return;
     }
     let prepared = prepare_first_run_doctor(|plan| setup_terminal::countdown(plan).into(), false);
-    if let PreparedSetup::Pending { choice, .. } = &prepared {
+    if let PreparedSetup::Pending { choice, .. } = &prepared.setup {
         setup_terminal::saving_choice(matches!(choice, SetupChoice::Cancel));
     }
     if sender.send(prepared).is_err() {
@@ -1402,46 +1400,84 @@ fn apply_first_run_doctor_in_session() {
 fn prepare_first_run_doctor(
     countdown: impl FnMut(aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer,
     retry: bool,
-) -> PreparedSetup<aterm_cli::macos_doctor::AutomaticSetupClaim> {
+) -> PreparedFirstRun<
+    aterm_cli::macos_doctor::AutomaticSetupClaim,
+    SetupDecisions<
+        Option<aterm_cli::macos_doctor::InitialSetupAuthorization>,
+        aterm_cli::macos_doctor::InitialSetupCancellation,
+    >,
+> {
     let mut host = LiveSetupStartup {
         countdown,
         receipt: None,
+        cancel_receipt: None,
+        authorization: None,
+        cancellation: aterm_cli::macos_doctor::InitialSetupCancellation::default(),
         last_failure: None,
+        observation: None,
     };
-    match prepare_setup(&mut host, retry) {
+    let setup = match prepare_setup(&mut host, retry) {
         Ok(prepared) => prepared,
         Err(why) => {
             aterm_log::warn!("first-run macOS doctor could not start: {why}");
             aterm_gui::report_workstation_setup_failure();
             PreparedSetup::Unavailable
         }
+    };
+    PreparedFirstRun {
+        setup,
+        decisions: SetupDecisions {
+            authorization: host.authorization,
+            cancellation: host.cancellation,
+        },
     }
 }
 
 /// The startup coordinator reads only aterm's state until an offer authorizes
 /// setup. Its host separates those reads and UI decisions from OS mutations.
 #[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SetupAdmission {
+    revision: u64,
+    completed: bool,
+}
+
+#[cfg(any(target_os = "macos", test))]
 trait SetupStartup {
     type Claim;
 
+    fn bind_authorization(&mut self) -> Result<u64, String>;
+    fn revision(&mut self) -> Result<u64, String>;
     fn claim(&mut self) -> Result<Option<Self::Claim>, String>;
     fn finished(&mut self) -> Result<bool, String>;
+    fn admission(&mut self) -> Result<Option<SetupAdmission>, String>;
     fn initial(&mut self) -> Result<aterm_types::macos_setup::Plan, String>;
     fn offer(
         &mut self,
         initial: aterm_types::macos_setup::Plan,
     ) -> aterm_gui::WorkstationSetupDecision;
-    fn authorize(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<(), String>;
+    fn validate(&mut self, _: &aterm_types::macos_setup::Plan) -> Result<(), String> {
+        Ok(())
+    }
+    fn authorize(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<Option<u64>, String>;
+    fn authorization_pending(&self) -> bool;
     fn cancel(&mut self) -> Result<(), String>;
     fn backoff(&mut self);
     fn report_failure(&mut self, why: &str);
+    fn report_rejection(&mut self, why: &str) {
+        self.report_failure(why);
+    }
 }
 
 #[cfg(target_os = "macos")]
 struct LiveSetupStartup<F> {
     countdown: F,
     receipt: Option<aterm_gui::InitialSetupApplyReceipt>,
+    cancel_receipt: Option<aterm_gui::InitialSetupCancelReceipt>,
+    authorization: Option<aterm_cli::macos_doctor::InitialSetupAuthorization>,
+    cancellation: aterm_cli::macos_doctor::InitialSetupCancellation,
     last_failure: Option<String>,
+    observation: Option<aterm_cli::macos_doctor::InitialSetupObservation>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1450,15 +1486,39 @@ impl<F: FnMut(aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer> SetupSt
 {
     type Claim = aterm_cli::macos_doctor::AutomaticSetupClaim;
 
+    fn bind_authorization(&mut self) -> Result<u64, String> {
+        let authorization = aterm_cli::macos_doctor::InitialSetupAuthorization::capture()?;
+        let revision = authorization.revision();
+        self.authorization = Some(authorization);
+        Ok(revision)
+    }
+
+    fn revision(&mut self) -> Result<u64, String> {
+        self.observation = aterm_cli::macos_doctor::initial_setup_observation().ok();
+        aterm_cli::macos_doctor::initial_setup_revision()
+    }
+
     fn claim(&mut self) -> Result<Option<Self::Claim>, String> {
+        self.observation = aterm_cli::macos_doctor::initial_setup_observation().ok();
         aterm_cli::macos_doctor::claim_automatic_setup()
     }
 
     fn finished(&mut self) -> Result<bool, String> {
+        self.observation = aterm_cli::macos_doctor::initial_setup_observation().ok();
         aterm_cli::macos_doctor::initial_setup_finished()
     }
 
+    fn admission(&mut self) -> Result<Option<SetupAdmission>, String> {
+        aterm_cli::macos_doctor::initial_setup_admission().map(|admission| {
+            admission.map(|admission| SetupAdmission {
+                revision: admission.revision,
+                completed: admission.completed,
+            })
+        })
+    }
+
     fn initial(&mut self) -> Result<aterm_types::macos_setup::Plan, String> {
+        self.observation = aterm_cli::macos_doctor::initial_setup_observation().ok();
         aterm_cli::macos_doctor::automatic_plan()
     }
 
@@ -1468,21 +1528,45 @@ impl<F: FnMut(aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer> SetupSt
     ) -> aterm_gui::WorkstationSetupDecision {
         let mut answer = (self.countdown)(initial);
         self.receipt = answer.receipt.take();
+        self.cancel_receipt = answer.cancel_receipt.take();
         answer.decision
     }
 
-    fn authorize(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<(), String> {
-        if aterm_cli::macos_doctor::authorize_initial_setup(plan)?
-            && let Some(receipt) = self.receipt.take()
-        {
-            receipt.accept();
+    fn validate(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<(), String> {
+        self.observation = aterm_cli::macos_doctor::initial_setup_observation().ok();
+        aterm_cli::macos_doctor::validate_initial_setup_plan(plan)
+    }
+
+    fn authorize(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<Option<u64>, String> {
+        let authorization = self
+            .authorization
+            .as_mut()
+            .ok_or("the startup review has no bound authorization")?;
+        let observed = authorization.persist_observed(plan);
+        self.observation = observed.observation;
+        let revision = observed.result?;
+        if revision.is_some() {
+            clear_initial_setup_rows();
+            if let Some(receipt) = self.receipt.take() {
+                receipt.accept();
+            }
         }
         aterm_gui::publish_initial_setup_status(initial_setup_status());
-        Ok(())
+        Ok(revision)
+    }
+
+    fn authorization_pending(&self) -> bool {
+        self.authorization
+            .as_ref()
+            .is_some_and(aterm_cli::macos_doctor::InitialSetupAuthorization::pending)
     }
 
     fn cancel(&mut self) -> Result<(), String> {
-        persist_setup_cancellation()
+        persist_setup_cancellation(&mut self.cancellation, &mut self.observation)?;
+        if let Some(receipt) = self.cancel_receipt.take() {
+            receipt.complete();
+        }
+        Ok(())
     }
 
     fn backoff(&mut self) {
@@ -1490,8 +1574,14 @@ impl<F: FnMut(aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer> SetupSt
     }
 
     fn report_failure(&mut self, why: &str) {
-        initial_setup_error(why.into());
+        initial_setup_error(why.into(), self.observation.clone());
         report_first_run_doctor_failure(&mut self.last_failure, why);
+    }
+
+    fn report_rejection(&mut self, why: &str) {
+        initial_setup_error(why.into(), self.observation.clone());
+        aterm_log::warn!("initial setup review was not accepted: {why}");
+        aterm_gui::report_workstation_setup_failure();
     }
 }
 
@@ -1499,12 +1589,22 @@ impl<F: FnMut(aterm_types::macos_setup::Plan) -> aterm_gui::SetupAnswer> SetupSt
 /// an older retry can hold that claim while waiting for our busy slot to clear.
 #[cfg(target_os = "macos")]
 struct LiveSetupCancellation {
+    cancellation: aterm_cli::macos_doctor::InitialSetupCancellation,
     last_failure: Option<String>,
+    observation: Option<aterm_cli::macos_doctor::InitialSetupObservation>,
 }
 
 #[cfg(target_os = "macos")]
 impl SetupStartup for LiveSetupCancellation {
     type Claim = ();
+
+    fn bind_authorization(&mut self) -> Result<u64, String> {
+        Err("cancellation has no startup review".into())
+    }
+
+    fn revision(&mut self) -> Result<u64, String> {
+        Err("cancellation has its own retained identity".into())
+    }
 
     fn claim(&mut self) -> Result<Option<Self::Claim>, String> {
         Ok(Some(()))
@@ -1512,6 +1612,10 @@ impl SetupStartup for LiveSetupCancellation {
 
     fn finished(&mut self) -> Result<bool, String> {
         aterm_cli::macos_doctor::initial_setup_finished()
+    }
+
+    fn admission(&mut self) -> Result<Option<SetupAdmission>, String> {
+        Err("cancellation never resumes an admitted plan".into())
     }
 
     fn initial(&mut self) -> Result<aterm_types::macos_setup::Plan, String> {
@@ -1522,12 +1626,16 @@ impl SetupStartup for LiveSetupCancellation {
         aterm_gui::WorkstationSetupDecision::Unavailable
     }
 
-    fn authorize(&mut self, _: &aterm_types::macos_setup::Plan) -> Result<(), String> {
+    fn authorize(&mut self, _: &aterm_types::macos_setup::Plan) -> Result<Option<u64>, String> {
         Err("cancellation cannot authorize setup".into())
     }
 
+    fn authorization_pending(&self) -> bool {
+        false
+    }
+
     fn cancel(&mut self) -> Result<(), String> {
-        persist_setup_cancellation()
+        persist_setup_cancellation(&mut self.cancellation, &mut self.observation)
     }
 
     fn backoff(&mut self) {
@@ -1535,7 +1643,7 @@ impl SetupStartup for LiveSetupCancellation {
     }
 
     fn report_failure(&mut self, why: &str) {
-        initial_setup_error(why.into());
+        initial_setup_error(why.into(), self.observation.clone());
         report_first_run_doctor_failure(&mut self.last_failure, why);
     }
 }
@@ -1544,6 +1652,7 @@ impl SetupStartup for LiveSetupCancellation {
 enum PreparedSetup<C> {
     Authorized {
         claim: C,
+        revision: u64,
     },
     Finished,
     Unavailable,
@@ -1552,6 +1661,20 @@ enum PreparedSetup<C> {
         choice: SetupChoice,
         why: String,
     },
+}
+
+/// A tty decision can outlive its input surface. Move both operation identities
+/// with it so a later worker cannot bind the accepted choice to a different run.
+#[cfg(any(target_os = "macos", test))]
+struct PreparedFirstRun<C, D> {
+    setup: PreparedSetup<C>,
+    decisions: D,
+}
+
+#[cfg(any(target_os = "macos", test))]
+struct SetupDecisions<A, C> {
+    authorization: A,
+    cancellation: C,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1590,6 +1713,20 @@ fn prepare_setup<H: SetupStartup>(
     retry: bool,
 ) -> Result<PreparedSetup<H::Claim>, String> {
     use aterm_gui::WorkstationSetupDecision;
+    // This callback belongs to the run present at launch. A released claim
+    // lets manual Apply repair state; its newer run must keep its worker and
+    // retained password rather than receive another automatic authorization.
+    let revision = host.bind_authorization().inspect_err(|why| {
+        if retry {
+            host.report_failure(why);
+        }
+    })?;
+    enum BeforeOffer {
+        Initial(aterm_types::macos_setup::Plan),
+        Resume(u64),
+        Finished,
+        Superseded,
+    }
     loop {
         let Some(claim) = retry_setup_step(host, retry, H::claim)? else {
             if !retry {
@@ -1601,10 +1738,42 @@ fn prepare_setup<H: SetupStartup>(
             host.backoff();
             continue;
         };
-        if retry_setup_step(host, retry, H::finished)? {
-            return Ok(PreparedSetup::Finished);
-        }
-        let initial = retry_setup_step(host, retry, H::initial)?;
+        let ready = (|| {
+            if host.revision()? != revision {
+                return Ok(BeforeOffer::Superseded);
+            }
+            if host.finished()? {
+                return Ok(BeforeOffer::Finished);
+            }
+            if let Some(admission) = host.admission()? {
+                if admission.revision != revision {
+                    return Ok(BeforeOffer::Superseded);
+                }
+                return Ok(if admission.completed {
+                    BeforeOffer::Finished
+                } else {
+                    BeforeOffer::Resume(admission.revision)
+                });
+            }
+            host.initial().map(BeforeOffer::Initial)
+        })();
+        let initial = match ready {
+            Ok(BeforeOffer::Initial(initial)) => initial,
+            Ok(BeforeOffer::Resume(revision)) => {
+                return Ok(PreparedSetup::Authorized { claim, revision });
+            }
+            Ok(BeforeOffer::Finished) => return Ok(PreparedSetup::Finished),
+            Ok(BeforeOffer::Superseded) => return Ok(PreparedSetup::Unavailable),
+            Err(why) => {
+                drop(claim);
+                if !retry {
+                    return Err(why);
+                }
+                host.report_failure(&why);
+                host.backoff();
+                continue;
+            }
+        };
         match host.offer(initial) {
             WorkstationSetupDecision::Begin(selection) => {
                 return Ok(finish_setup_choice(
@@ -1641,32 +1810,47 @@ fn finish_setup_choice<H: SetupStartup>(
     choice: SetupChoice,
     retry: bool,
 ) -> PreparedSetup<H::Claim> {
+    if let SetupChoice::Begin(plan) = &choice
+        && let Err(why) = host.validate(plan)
+    {
+        host.report_rejection(&why);
+        return PreparedSetup::Unavailable;
+    }
     loop {
         let result = (|| {
             match &choice {
-                SetupChoice::Begin(plan) => {
-                    if host.finished()? {
-                        return Ok(true);
-                    }
-                    host.authorize(plan)?;
-                    // An empty checklist completes without entering the engine.
-                    host.finished()
-                }
+                SetupChoice::Begin(plan) => host.authorize(plan),
                 SetupChoice::Cancel => {
                     // The idempotent backend preserves an already completed
                     // decision; explicit Cancel must still clear stale errors.
                     host.cancel()?;
-                    Ok(true)
+                    Ok(None)
                 }
             }
         })();
         match result {
-            Ok(true) => return PreparedSetup::Finished,
-            Ok(false) => {
-                let SetupChoice::Begin(_) = choice else {
+            Ok(None) => {
+                return match choice {
+                    SetupChoice::Begin(_) => PreparedSetup::Unavailable,
+                    SetupChoice::Cancel => PreparedSetup::Finished,
+                };
+            }
+            Ok(Some(revision)) => {
+                let SetupChoice::Begin(plan) = choice else {
                     unreachable!("cancellation finishes without authorizing setup")
                 };
-                return PreparedSetup::Authorized { claim };
+                // Empty authorization already durably commits completion.
+                return if plan.selection.is_empty() {
+                    PreparedSetup::Finished
+                } else {
+                    PreparedSetup::Authorized { claim, revision }
+                };
+            }
+            Err(why)
+                if matches!(choice, SetupChoice::Begin(_)) && !host.authorization_pending() =>
+            {
+                host.report_rejection(&why);
+                return PreparedSetup::Unavailable;
             }
             Err(why) if retry => {
                 host.report_failure(&why);
@@ -1674,6 +1858,21 @@ fn finish_setup_choice<H: SetupStartup>(
             }
             Err(why) => return PreparedSetup::Pending { claim, choice, why },
         }
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn resume_prepared_setup<H: SetupStartup, D>(
+    prepared: PreparedFirstRun<H::Claim, D>,
+    make_host: impl FnOnce(D) -> H,
+) -> PreparedSetup<H::Claim> {
+    match prepared.setup {
+        PreparedSetup::Pending { claim, choice, why } => {
+            let mut host = make_host(prepared.decisions);
+            host.report_failure(&why);
+            finish_setup_choice(&mut host, claim, choice, true)
+        }
+        other => other,
     }
 }
 
@@ -1689,46 +1888,32 @@ fn retain_setup_cancellation<H: SetupStartup<Claim = ()>, B>(host: &mut H, busy:
 
 #[cfg(target_os = "macos")]
 fn run_prepared_setup(
-    prepared: PreparedSetup<aterm_cli::macos_doctor::AutomaticSetupClaim>,
+    prepared: PreparedFirstRun<
+        aterm_cli::macos_doctor::AutomaticSetupClaim,
+        SetupDecisions<
+            Option<aterm_cli::macos_doctor::InitialSetupAuthorization>,
+            aterm_cli::macos_doctor::InitialSetupCancellation,
+        >,
+    >,
     password: Option<aterm_secrets::SecretBytes>,
 ) {
-    let prepared = match prepared {
-        PreparedSetup::Pending { claim, choice, why } => {
-            let mut host = LiveSetupStartup {
-                // A retained choice can never return to its input surface.
-                countdown: |_| aterm_gui::WorkstationSetupDecision::Unavailable.into(),
-                receipt: None,
-                last_failure: None,
-            };
-            host.report_failure(&why);
-            finish_setup_choice(&mut host, claim, choice, true)
-        }
-        other => other,
-    };
+    let prepared = resume_prepared_setup(prepared, |decisions| LiveSetupStartup {
+        // A retained choice can never return to its input surface.
+        countdown: |_| aterm_gui::WorkstationSetupDecision::Unavailable.into(),
+        receipt: None,
+        cancel_receipt: None,
+        authorization: decisions.authorization,
+        cancellation: decisions.cancellation,
+        last_failure: None,
+        observation: None,
+    });
     match prepared {
-        PreparedSetup::Authorized { claim } => {
+        PreparedSetup::Authorized { claim, revision } => {
             let busy = wait_for_initial_setup_slot();
-            // Cancel may have committed while this approved run waited for a
-            // previous operation's busy slot. Keep its choice and password
-            // through read failures; permission guidance also needs this fence.
-            let mut host = LiveSetupStartup {
-                countdown: |_| aterm_gui::WorkstationSetupDecision::Unavailable.into(),
-                receipt: None,
-                last_failure: None,
-            };
-            let Ok(finished) = retry_setup_step(&mut host, true, |host| host.finished()) else {
-                unreachable!("a background completion read keeps retrying")
-            };
-            if finished {
-                drop(claim);
-                drop(busy);
-                aterm_gui::report_workstation_setup_finished();
-                return;
-            }
             // The current durable snapshot, including its revision, controls
             // native permission guidance; no queued one-way grant survives it.
             aterm_gui::publish_initial_setup_status(initial_setup_status());
-            run_first_run_doctor(claim, password, busy);
+            run_first_run_doctor(claim, revision, password, busy);
         }
         PreparedSetup::Finished => {
             aterm_gui::publish_initial_setup_status(initial_setup_status());
@@ -1747,6 +1932,7 @@ fn run_prepared_setup(
 #[cfg(target_os = "macos")]
 fn run_first_run_doctor(
     claim: aterm_cli::macos_doctor::AutomaticSetupClaim,
+    revision: u64,
     password: Option<aterm_secrets::SecretBytes>,
     busy: InitialSetupBusy,
 ) {
@@ -1761,12 +1947,14 @@ fn run_first_run_doctor(
     }
     run_setup_retry(
         &mut LiveSetupRetry {
+            revision,
             password,
             last_failure: None,
             success_reported: false,
         },
         claim,
         busy,
+        revision,
     );
 }
 
@@ -1784,7 +1972,6 @@ trait SetupRetryHost {
     fn apply(&mut self) -> Result<(), String>;
     fn backoff(&mut self);
     fn failure(&mut self, why: &str);
-    fn initial_failure(&mut self, why: &str);
     fn completed(&mut self);
 }
 
@@ -1795,22 +1982,12 @@ fn release_setup_pass<C, B>(claim: &mut Option<C>, busy: &mut Option<B>) {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn run_setup_retry<H: SetupRetryHost>(host: &mut H, claim: H::Claim, busy: H::Busy) {
+fn run_setup_retry<H: SetupRetryHost>(host: &mut H, claim: H::Claim, busy: H::Busy, revision: u64) {
     // Release the file claim before advertising an idle UI on every return.
     let mut busy = Some(busy);
     let mut claim = Some(claim);
-    // The first revision is read while our claim still protects the accepted
-    // password. A later Apply, including the same plan with a new password,
-    // retires this retry worker before it can touch the machine again.
-    let revision = match host.revision() {
-        Ok(revision) => revision,
-        Err(why) => {
-            // Without this fence we cannot safely carry a password into a
-            // later run. Release the claim so Apply can repair its state.
-            host.initial_failure(&why);
-            return;
-        }
-    };
+    // This identity came from authorization under profile.lock. The automatic
+    // claim alone cannot fence legacy doctor operations while we wait for Busy.
     loop {
         match host.finished() {
             Ok(true) => {
@@ -1886,6 +2063,7 @@ fn run_setup_retry<H: SetupRetryHost>(host: &mut H, claim: H::Claim, busy: H::Bu
 
 #[cfg(target_os = "macos")]
 struct LiveSetupRetry {
+    revision: u64,
     password: Option<aterm_secrets::SecretBytes>,
     last_failure: Option<String>,
     success_reported: bool,
@@ -1909,10 +2087,19 @@ impl SetupRetryHost for LiveSetupRetry {
         wait_for_initial_setup_slot()
     }
     fn apply(&mut self) -> Result<(), String> {
-        if let Some(report) = aterm_cli::macos_doctor::apply_initial_setup(self.password.as_ref())?
+        // A new pass can change what Check observed. Its current outcome
+        // replaces that observation, including failures before a report exists.
+        clear_initial_setup_rows();
+        let observed = aterm_cli::macos_doctor::apply_initial_setup_observed(
+            self.revision,
+            self.password.as_ref(),
+        );
+        if let Some(report) = observed
+            .result
+            .inspect_err(|why| initial_setup_error(why.clone(), observed.observation.clone()))?
         {
             let text = report.to_text();
-            remember_initial_setup_rows(&report);
+            remember_initial_setup_rows(&report, None, observed.observation);
             if report.needs_attention() {
                 self.failure(&text);
             } else if !self.success_reported {
@@ -1928,13 +2115,6 @@ impl SetupRetryHost for LiveSetupRetry {
     fn failure(&mut self, why: &str) {
         report_first_run_doctor_failure(&mut self.last_failure, why);
     }
-    fn initial_failure(&mut self, why: &str) {
-        initial_setup_error(why.into());
-        aterm_log::warn!(
-            "initial setup could not start: {why}; use Apply in System State to retry"
-        );
-        aterm_gui::report_workstation_setup_failure();
-    }
     fn completed(&mut self) {
         aterm_gui::report_workstation_setup_finished();
     }
@@ -1942,7 +2122,10 @@ impl SetupRetryHost for LiveSetupRetry {
 
 #[cfg(test)]
 mod setup_retry_tests {
-    use super::{SetupRetryHost, SetupStartup, retain_setup_cancellation, run_setup_retry};
+    use super::{
+        PreparedFirstRun, PreparedSetup, SetupChoice, SetupDecisions, SetupRetryHost, SetupStartup,
+        finish_setup_choice, resume_prepared_setup, retain_setup_cancellation, run_setup_retry,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -1965,11 +2148,20 @@ mod setup_retry_tests {
         struct CancelHost(Rc<RefCell<CancelState>>);
         impl SetupStartup for CancelHost {
             type Claim = ();
+            fn bind_authorization(&mut self) -> Result<u64, String> {
+                panic!("Cancel has no authorization to bind")
+            }
+            fn revision(&mut self) -> Result<u64, String> {
+                panic!("Cancel owns a separate retained identity")
+            }
             fn claim(&mut self) -> Result<Option<()>, String> {
                 panic!("Cancel does not take automatic.lock")
             }
             fn finished(&mut self) -> Result<bool, String> {
                 Ok(self.0.borrow().cancelled)
+            }
+            fn admission(&mut self) -> Result<Option<super::SetupAdmission>, String> {
+                panic!("Cancel cannot resume setup")
             }
             fn initial(&mut self) -> Result<aterm_types::macos_setup::Plan, String> {
                 panic!("Cancel does not read a checklist")
@@ -1980,8 +2172,14 @@ mod setup_retry_tests {
             ) -> aterm_gui::WorkstationSetupDecision {
                 panic!("never repeat an accepted Cancel")
             }
-            fn authorize(&mut self, _: &aterm_types::macos_setup::Plan) -> Result<(), String> {
+            fn authorize(
+                &mut self,
+                _: &aterm_types::macos_setup::Plan,
+            ) -> Result<Option<u64>, String> {
                 panic!("Cancel cannot authorize setup")
+            }
+            fn authorization_pending(&self) -> bool {
+                false
             }
             fn cancel(&mut self) -> Result<(), String> {
                 let mut state = self.0.borrow_mut();
@@ -2026,6 +2224,107 @@ mod setup_retry_tests {
         }
     }
 
+    #[test]
+    fn authorization_fence_retains_the_cancel_ticket_across_a_tty_handoff() {
+        #[derive(Default)]
+        struct Ticket(Option<u64>);
+        struct State {
+            revision: u64,
+            fail_write: bool,
+            stopped: Vec<u64>,
+        }
+        struct CancelHost {
+            state: Rc<RefCell<State>>,
+            ticket: Ticket,
+        }
+        impl SetupStartup for CancelHost {
+            type Claim = ();
+            fn bind_authorization(&mut self) -> Result<u64, String> {
+                panic!("a retained Cancel never binds an authorization")
+            }
+            fn revision(&mut self) -> Result<u64, String> {
+                panic!("a retained Cancel never recaptures its identity")
+            }
+            fn claim(&mut self) -> Result<Option<()>, String> {
+                panic!("a retained Cancel already owns its claim")
+            }
+            fn finished(&mut self) -> Result<bool, String> {
+                panic!("Cancel must persist its own bound decision")
+            }
+            fn admission(&mut self) -> Result<Option<super::SetupAdmission>, String> {
+                panic!("Cancel cannot resume setup")
+            }
+            fn initial(&mut self) -> Result<aterm_types::macos_setup::Plan, String> {
+                panic!("the tty is no longer an input surface")
+            }
+            fn offer(
+                &mut self,
+                _: aterm_types::macos_setup::Plan,
+            ) -> aterm_gui::WorkstationSetupDecision {
+                panic!("never offer again after tty input has ended")
+            }
+            fn authorize(
+                &mut self,
+                _: &aterm_types::macos_setup::Plan,
+            ) -> Result<Option<u64>, String> {
+                panic!("Cancel cannot authorize setup")
+            }
+            fn authorization_pending(&self) -> bool {
+                false
+            }
+            fn cancel(&mut self) -> Result<(), String> {
+                let mut state = self.state.borrow_mut();
+                let revision = *self.ticket.0.get_or_insert(state.revision);
+                if std::mem::take(&mut state.fail_write) {
+                    return Err("injected cancellation write failure".into());
+                }
+                if revision == state.revision {
+                    state.stopped.push(revision);
+                }
+                Ok(())
+            }
+            fn backoff(&mut self) {
+                panic!("the retained ticket supersedes without another write failure")
+            }
+            fn report_failure(&mut self, _: &str) {}
+        }
+        for replace_ticket in [false, true] {
+            let state = Rc::new(RefCell::new(State {
+                revision: 1,
+                fail_write: true,
+                stopped: Vec::new(),
+            }));
+            let mut host = CancelHost {
+                state: Rc::clone(&state),
+                ticket: Ticket::default(),
+            };
+            let setup = finish_setup_choice(&mut host, (), SetupChoice::Cancel, false);
+            assert!(matches!(setup, PreparedSetup::Pending { .. }));
+            let mut prepared = PreparedFirstRun {
+                setup,
+                decisions: SetupDecisions {
+                    authorization: (),
+                    cancellation: host.ticket,
+                },
+            };
+            state.borrow_mut().revision = 2;
+            if replace_ticket {
+                // Negative control: recreating the host with a fresh ticket
+                // would redirect the old keystroke to the replacement run.
+                prepared.decisions.cancellation = Ticket::default();
+            }
+            let prepared = resume_prepared_setup(prepared, |decisions| CancelHost {
+                state: Rc::clone(&state),
+                ticket: decisions.cancellation,
+            });
+            assert!(matches!(prepared, PreparedSetup::Finished));
+            assert_eq!(
+                state.borrow().stopped,
+                if replace_ticket { vec![2] } else { vec![] }
+            );
+        }
+    }
+
     struct State {
         claimed: bool,
         busy: bool,
@@ -2066,7 +2365,6 @@ mod setup_retry_tests {
         completions: usize,
         backoffs: usize,
         failures: usize,
-        initial_failures: usize,
     }
 
     fn fixture() -> (Fake, Lease, Lease) {
@@ -2089,7 +2387,6 @@ mod setup_retry_tests {
                 completions: 0,
                 backoffs: 0,
                 failures: 0,
-                initial_failures: 0,
             },
             Lease {
                 kind: "claim",
@@ -2107,7 +2404,7 @@ mod setup_retry_tests {
         type Busy = Lease;
 
         fn revision(&mut self) -> Result<u64, String> {
-            if self.initial_error {
+            if std::mem::take(&mut self.initial_error) {
                 Err("the initial revision could not be read".into())
             } else {
                 Ok(self.state.borrow().revision)
@@ -2171,9 +2468,6 @@ mod setup_retry_tests {
         fn failure(&mut self, _: &str) {
             self.failures += 1;
         }
-        fn initial_failure(&mut self, _: &str) {
-            self.initial_failures += 1;
-        }
         fn completed(&mut self) {
             assert!(
                 self.cancel_during_busy,
@@ -2188,7 +2482,7 @@ mod setup_retry_tests {
         let (mut host, claim, busy) = fixture();
         host.finished_error = true;
         host.cancel_during_busy = true;
-        run_setup_retry(&mut host, claim, busy);
+        run_setup_retry(&mut host, claim, busy, 1);
         let state = host.state.borrow();
         assert!(
             state.applied.is_empty(),
@@ -2204,7 +2498,7 @@ mod setup_retry_tests {
     fn pending_setup_releases_claim_and_busy_before_a_same_plan_rerun_retires_it() {
         let (mut host, claim, busy) = fixture();
         host.restart_during_backoff = true;
-        run_setup_retry(&mut host, claim, busy);
+        run_setup_retry(&mut host, claim, busy, 1);
         let state = host.state.borrow();
         assert_eq!(state.applied, [1]);
         assert_eq!(state.drops, ["claim", "busy"]);
@@ -2217,7 +2511,7 @@ mod setup_retry_tests {
         let (mut host, claim, busy) = fixture();
         host.finished_error = true;
         host.restart_during_claim = true;
-        run_setup_retry(&mut host, claim, busy);
+        run_setup_retry(&mut host, claim, busy, 1);
         let state = host.state.borrow();
         assert!(state.applied.is_empty());
         assert_eq!(state.drops, ["claim", "busy", "claim"]);
@@ -2226,16 +2520,31 @@ mod setup_retry_tests {
     }
 
     #[test]
-    fn an_initial_revision_error_releases_both_resources_without_waiting_or_applying() {
+    fn a_revision_read_error_releases_resources_before_retrying_the_admitted_run() {
         let (mut host, claim, busy) = fixture();
         host.initial_error = true;
-        run_setup_retry(&mut host, claim, busy);
+        host.restart_during_backoff = true;
+        run_setup_retry(&mut host, claim, busy, 1);
         let state = host.state.borrow();
         assert!(state.applied.is_empty());
         assert_eq!(state.drops, ["claim", "busy"]);
         assert!(!state.claimed && !state.busy);
-        assert_eq!(host.initial_failures, 1);
-        assert_eq!(host.backoffs, 0);
+        assert_eq!(host.failures, 1);
+        assert_eq!(host.backoffs, 1);
+    }
+
+    #[test]
+    fn authorization_fence_does_not_adopt_a_run_replaced_before_retry_entry() {
+        let (mut host, claim, busy) = fixture();
+        // The claim/retained password were issued for revision 1. A legacy
+        // Restore and Apply can replace that run without automatic.lock.
+        host.state.borrow_mut().revision = 2;
+        host.restart_during_backoff = true;
+        run_setup_retry(&mut host, claim, busy, 1);
+        assert!(
+            host.state.borrow().applied.is_empty(),
+            "a late baseline read must not adopt revision 2 with revision 1's password"
+        );
     }
 }
 
@@ -2253,27 +2562,58 @@ fn report_first_run_doctor_failure(last_failure: &mut Option<String>, text: &str
 static INITIAL_SETUP_BUSY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(target_os = "macos")]
-static INITIAL_SETUP_ROWS: std::sync::Mutex<Vec<aterm_gui::SetupStatusRow>> =
-    std::sync::Mutex::new(Vec::new());
+static INITIAL_SETUP_ROWS: std::sync::Mutex<InitialSetupRows> =
+    std::sync::Mutex::new(InitialSetupRows {
+        observation: None,
+        rows: Vec::new(),
+        check: None,
+    });
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct InitialSetupRows {
+    observation: Option<aterm_cli::macos_doctor::InitialSetupObservation>,
+    rows: Vec<aterm_gui::SetupStatusRow>,
+    check: Option<aterm_gui::SetupCheck>,
+}
 
 #[cfg(target_os = "macos")]
 fn clear_initial_setup_rows() {
     if let Ok(mut last) = INITIAL_SETUP_ROWS.lock() {
-        last.clear();
+        *last = InitialSetupRows::default();
     }
     aterm_gui::publish_initial_setup_status(initial_setup_status());
 }
 
 #[cfg(target_os = "macos")]
-fn persist_setup_cancellation() -> Result<(), String> {
-    aterm_cli::macos_doctor::cancel_automatic_setup()?;
-    clear_initial_setup_rows();
-    aterm_log::info!("first-run macOS doctor: cancelled by the owner");
+fn persist_setup_cancellation(
+    cancellation: &mut aterm_cli::macos_doctor::InitialSetupCancellation,
+    observation: &mut Option<aterm_cli::macos_doctor::InitialSetupObservation>,
+) -> Result<(), String> {
+    let observed = cancellation.persist_observed();
+    *observation = observed.observation;
+    if observed.result? {
+        clear_initial_setup_rows();
+        aterm_log::info!("first-run macOS doctor: Cancel choice saved");
+    } else {
+        aterm_gui::publish_initial_setup_status(initial_setup_status());
+    }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-struct InitialSetupBusy;
+struct InitialSetupBusy {
+    observation: Option<aterm_cli::macos_doctor::InitialSetupObservation>,
+}
+
+#[cfg(target_os = "macos")]
+impl InitialSetupBusy {
+    fn new() -> Self {
+        Self {
+            observation: aterm_cli::macos_doctor::initial_setup_observation().ok(),
+        }
+    }
+}
 
 #[cfg(target_os = "macos")]
 fn wait_for_initial_setup_slot() -> InitialSetupBusy {
@@ -2288,7 +2628,7 @@ fn wait_for_initial_setup_slot() -> InitialSetupBusy {
     {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
-    InitialSetupBusy
+    InitialSetupBusy::new()
 }
 
 #[cfg(target_os = "macos")]
@@ -2301,81 +2641,152 @@ impl Drop for InitialSetupBusy {
 
 #[cfg(target_os = "macos")]
 fn initial_setup_status() -> aterm_gui::SetupStatus {
-    let (plan, finished, permissions, mut rows) =
-        match aterm_cli::macos_doctor::initial_setup_snapshot() {
-            Ok(snapshot) => (
-                Some(snapshot.plan),
-                snapshot.finished,
-                Some(aterm_gui::InitialSetupPermissionPolicy {
-                    revision: snapshot.revision,
-                    allowed: snapshot.permissions_allowed,
-                }),
-                snapshot
-                    .rows
-                    .into_iter()
-                    .map(|row| aterm_gui::SetupStatusRow {
-                        name: row.name,
-                        status: row.status,
-                        detail: row.detail,
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-            Err(error) => (
-                None,
-                false,
-                None,
-                vec![aterm_gui::SetupStatusRow {
-                    name: "Setup state".into(),
-                    status: match error {
-                        aterm_cli::macos_doctor::InitialSetupSnapshotError::Updating => "pending",
-                        aterm_cli::macos_doctor::InitialSetupSnapshotError::Read(_) => "error",
-                    }
-                    .into(),
-                    detail: error.to_string(),
-                }],
-            ),
-        };
-    if let Ok(last) = INITIAL_SETUP_ROWS.lock() {
-        rows.extend(last.iter().cloned());
+    let snapshot = aterm_cli::macos_doctor::initial_setup_snapshot();
+    let busy = INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire);
+    match INITIAL_SETUP_ROWS.lock() {
+        Ok(last) => initial_setup_status_with(snapshot, busy, &last),
+        Err(_) => initial_setup_status_with(snapshot, busy, &InitialSetupRows::default()),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn initial_setup_status_with(
+    snapshot: Result<
+        aterm_cli::macos_doctor::InitialSetupSnapshot,
+        aterm_cli::macos_doctor::InitialSetupSnapshotError,
+    >,
+    busy: bool,
+    last: &InitialSetupRows,
+) -> aterm_gui::SetupStatus {
+    let (plan, finished, permissions, mut rows, observation) = match snapshot {
+        Ok(snapshot) => (
+            Some(snapshot.plan),
+            snapshot.finished,
+            Some(aterm_gui::InitialSetupPermissionPolicy {
+                revision: snapshot.revision,
+                allowed: snapshot.permissions_allowed,
+            }),
+            snapshot
+                .rows
+                .into_iter()
+                .map(|row| aterm_gui::SetupStatusRow {
+                    name: row.name,
+                    status: row.status,
+                    detail: row.detail,
+                })
+                .collect::<Vec<_>>(),
+            Some(snapshot.observation),
+        ),
+        Err(error) => (
+            None,
+            false,
+            None,
+            vec![aterm_gui::SetupStatusRow {
+                name: "Setup state".into(),
+                status: match error {
+                    aterm_cli::macos_doctor::InitialSetupSnapshotError::Updating => "pending",
+                    aterm_cli::macos_doctor::InitialSetupSnapshotError::Read(_) => "error",
+                }
+                .into(),
+                detail: error.to_string(),
+            }],
+            None,
+        ),
+    };
+    let check = if last.observation.is_some() && last.observation == observation {
+        rows.extend(last.rows.iter().cloned());
+        last.check.clone()
+    } else {
+        // Filter without evicting: this snapshot may precede a newer result
+        // already published in the cache. Its own next snapshot can show it.
+        None
+    };
     aterm_gui::SetupStatus {
         plan,
         permissions,
-        busy: INITIAL_SETUP_BUSY.load(std::sync::atomic::Ordering::Acquire),
+        busy,
         finished,
         rows,
+        check,
     }
 }
 
 #[cfg(target_os = "macos")]
-fn remember_initial_setup_rows(report: &aterm_cli::macos_doctor::Report) {
+fn remember_initial_setup_rows(
+    report: &aterm_cli::macos_doctor::Report,
+    checked_plan: Option<&aterm_types::macos_setup::Plan>,
+    observation: Option<aterm_cli::macos_doctor::InitialSetupObservation>,
+) {
     let checked = report.action == aterm_cli::macos_doctor::Action::Check;
-    if let Ok(mut last) = INITIAL_SETUP_ROWS.lock() {
-        *last = report
-            .rows
-            .iter()
-            .map(|row| aterm_gui::SetupStatusRow {
-                name: if checked {
-                    format!("Check: {}", row.name)
-                } else {
-                    row.name.clone()
-                },
-                status: row.status.clone(),
-                detail: row.detail.clone(),
-            })
-            .collect();
-    }
-    aterm_gui::publish_initial_setup_status(initial_setup_status());
+    let rows = report
+        .rows
+        .iter()
+        .map(|row| aterm_gui::SetupStatusRow {
+            name: if checked {
+                format!("Check: {}", row.name)
+            } else {
+                row.name.clone()
+            },
+            status: row.status.clone(),
+            detail: row.detail.clone(),
+        })
+        .collect();
+    publish_initial_setup_rows(rows, checked_plan, observation);
 }
 
 #[cfg(target_os = "macos")]
-fn initial_setup_error(detail: String) {
-    if let Ok(mut last) = INITIAL_SETUP_ROWS.lock() {
-        *last = vec![aterm_gui::SetupStatusRow {
-            name: "Setup".into(),
+fn initial_setup_error(
+    detail: String,
+    observation: Option<aterm_cli::macos_doctor::InitialSetupObservation>,
+) {
+    publish_initial_setup_error(detail, None, observation);
+}
+
+#[cfg(target_os = "macos")]
+fn publish_initial_setup_error(
+    detail: String,
+    checked_plan: Option<&aterm_types::macos_setup::Plan>,
+    observation: Option<aterm_cli::macos_doctor::InitialSetupObservation>,
+) {
+    publish_initial_setup_rows(
+        vec![aterm_gui::SetupStatusRow {
+            name: if checked_plan.is_some() {
+                "Check"
+            } else {
+                "Setup"
+            }
+            .into(),
             status: "failed".into(),
             detail,
-        }];
+        }],
+        checked_plan,
+        observation,
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn publish_initial_setup_rows(
+    rows: Vec<aterm_gui::SetupStatusRow>,
+    checked_plan: Option<&aterm_types::macos_setup::Plan>,
+    observation: Option<aterm_cli::macos_doctor::InitialSetupObservation>,
+) {
+    if let Ok(mut last) = INITIAL_SETUP_ROWS.lock() {
+        *last = if let Some(plan) = checked_plan {
+            InitialSetupRows {
+                observation,
+                check: Some(aterm_gui::SetupCheck {
+                    plan: plan.clone(),
+                    rows,
+                }),
+                ..InitialSetupRows::default()
+            }
+        } else {
+            InitialSetupRows {
+                observation,
+                rows,
+                check: None,
+            }
+        };
     }
     aterm_gui::publish_initial_setup_status(initial_setup_status());
 }
@@ -2398,17 +2809,19 @@ fn spawn_initial_setup_operation(
         return false;
     }
     if let Ok(mut last) = INITIAL_SETUP_ROWS.lock() {
-        last.clear();
+        *last = InitialSetupRows::default();
     }
     match std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
-            run(InitialSetupBusy);
+            // File observation belongs on the worker, never the UI thread.
+            run(InitialSetupBusy::new());
         }) {
         Ok(_) => true,
         Err(why) => {
             INITIAL_SETUP_BUSY.store(false, std::sync::atomic::Ordering::Release);
-            initial_setup_error(format!("Setup worker could not start: {why}"));
+            aterm_log::warn!("Setup worker could not start: {why}");
+            initial_setup_error(format!("Setup worker could not start: {why}"), None);
             false
         }
     }
@@ -2421,56 +2834,540 @@ fn restart_initial_setup(
     receipt: aterm_gui::InitialSetupApplyReceipt,
 ) -> bool {
     spawn_initial_setup_operation("aterm-setup-apply", move |busy| {
-        let claim = match aterm_cli::macos_doctor::claim_initial_setup_rerun() {
-            Ok(Some(claim)) => claim,
-            Ok(None) => {
-                initial_setup_error("Another setup is running. Try again when it finishes.".into());
-                return;
-            }
-            Err(why) => {
-                initial_setup_error(why);
-                return;
-            }
+        let mut host = LiveSetupRestart {
+            restart: aterm_cli::macos_doctor::InitialSetupRestart::default(),
+            observation: busy.observation.clone(),
         };
-        if let Err(why) = aterm_cli::macos_doctor::restart_initial_setup(&plan) {
-            initial_setup_error(why);
+        run_setup_restart(&mut host, &plan, password, receipt, busy);
+    })
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+trait SetupRestartHost {
+    type Claim;
+    type Busy;
+    type Password;
+    type Receipt;
+
+    fn claim(&mut self) -> Result<Option<Self::Claim>, String>;
+    fn persist(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<Option<u64>, String>;
+    fn pending(&self) -> bool;
+    fn backoff(&mut self);
+    fn admitted(
+        &mut self,
+        revision: u64,
+        claim: Self::Claim,
+        busy: Self::Busy,
+        password: Self::Password,
+        receipt: Self::Receipt,
+    );
+    fn failure(&mut self, why: &str);
+}
+
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn run_setup_restart<H: SetupRestartHost>(
+    host: &mut H,
+    plan: &aterm_types::macos_setup::Plan,
+    password: H::Password,
+    receipt: H::Receipt,
+    busy: H::Busy,
+) {
+    let claim = match host.claim() {
+        Ok(Some(claim)) => claim,
+        Ok(None) => {
+            host.failure("Another setup is running. Try again when it finishes.");
             return;
         }
+        Err(why) => {
+            host.failure(&why);
+            return;
+        }
+    };
+    loop {
+        match host.persist(plan) {
+            Ok(Some(revision)) => {
+                host.admitted(revision, claim, busy, password, receipt);
+                return;
+            }
+            Ok(None) => return,
+            Err(why) => {
+                host.failure(&why);
+                if !host.pending() {
+                    return;
+                }
+                // Only the owned final admission is retryable. Keep its
+                // original claim, reviewed input and UI receipt until resolved.
+                host.backoff();
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct LiveSetupRestart {
+    restart: aterm_cli::macos_doctor::InitialSetupRestart,
+    observation: Option<aterm_cli::macos_doctor::InitialSetupObservation>,
+}
+
+#[cfg(target_os = "macos")]
+impl SetupRestartHost for LiveSetupRestart {
+    type Claim = aterm_cli::macos_doctor::AutomaticSetupClaim;
+    type Busy = InitialSetupBusy;
+    type Password = Option<aterm_secrets::SecretBytes>;
+    type Receipt = aterm_gui::InitialSetupApplyReceipt;
+
+    fn claim(&mut self) -> Result<Option<Self::Claim>, String> {
+        aterm_cli::macos_doctor::claim_initial_setup_rerun()
+    }
+
+    fn persist(&mut self, plan: &aterm_types::macos_setup::Plan) -> Result<Option<u64>, String> {
+        let observed = self.restart.persist_observed(plan);
+        self.observation = observed.observation;
+        observed.result
+    }
+
+    fn pending(&self) -> bool {
+        self.restart.pending()
+    }
+
+    fn backoff(&mut self) {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+
+    fn admitted(
+        &mut self,
+        revision: u64,
+        claim: Self::Claim,
+        busy: Self::Busy,
+        password: Self::Password,
+        receipt: Self::Receipt,
+    ) {
+        clear_initial_setup_rows();
         receipt.accept();
         aterm_gui::publish_initial_setup_status(initial_setup_status());
-        run_first_run_doctor(claim, password, busy);
-    })
+        run_first_run_doctor(claim, revision, password, busy);
+    }
+
+    fn failure(&mut self, why: &str) {
+        initial_setup_error(why.into(), self.observation.clone());
+    }
+}
+
+// Unix: its password is an `aterm_secrets` one, a unix-only dependency.
+#[cfg(all(test, unix))]
+mod setup_restart_tests {
+    use super::{SetupRestartHost, run_setup_restart};
+    use aterm_types::macos_setup::{Plan, Selection};
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    #[derive(Default)]
+    struct State {
+        alive: Vec<&'static str>,
+        drops: Vec<&'static str>,
+        accepted: usize,
+        refused: usize,
+    }
+
+    struct Lease {
+        name: &'static str,
+        state: Rc<RefCell<State>>,
+    }
+
+    impl Lease {
+        fn new(name: &'static str, state: &Rc<RefCell<State>>) -> Self {
+            state.borrow_mut().alive.push(name);
+            Self {
+                name,
+                state: Rc::clone(state),
+            }
+        }
+    }
+
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            let mut state = self.state.borrow_mut();
+            state.alive.retain(|name| *name != self.name);
+            state.drops.push(self.name);
+        }
+    }
+
+    struct Password {
+        secret: aterm_secrets::SecretBytes,
+        _lease: Lease,
+    }
+
+    struct Receipt {
+        lease: Lease,
+        accepted: bool,
+    }
+
+    impl Drop for Receipt {
+        fn drop(&mut self) {
+            if !self.accepted {
+                self.lease.state.borrow_mut().refused += 1;
+            }
+        }
+    }
+
+    struct Host {
+        state: Rc<RefCell<State>>,
+        outcomes: VecDeque<Admission>,
+        pending: bool,
+        plans: Vec<Plan>,
+        claims: usize,
+        backoffs: usize,
+        dispatches: Vec<u64>,
+        failures: Vec<String>,
+    }
+
+    enum Admission {
+        Pending(&'static str),
+        Rejected(&'static str),
+        Admitted(u64),
+        Superseded,
+    }
+
+    impl SetupRestartHost for Host {
+        type Claim = Lease;
+        type Busy = Lease;
+        type Password = Password;
+        type Receipt = Receipt;
+
+        fn claim(&mut self) -> Result<Option<Self::Claim>, String> {
+            self.claims += 1;
+            assert_eq!(self.claims, 1, "retain the original automatic claim");
+            Ok(Some(Lease::new("claim", &self.state)))
+        }
+
+        fn persist(&mut self, plan: &Plan) -> Result<Option<u64>, String> {
+            assert_eq!(self.state.borrow().alive.len(), 4);
+            self.plans.push(plan.clone());
+            let outcome = self
+                .outcomes
+                .pop_front()
+                .expect("scripted admission attempt");
+            self.pending = matches!(outcome, Admission::Pending(_));
+            match outcome {
+                Admission::Pending(why) | Admission::Rejected(why) => Err(why.into()),
+                Admission::Admitted(revision) => Ok(Some(revision)),
+                Admission::Superseded => Ok(None),
+            }
+        }
+
+        fn pending(&self) -> bool {
+            self.pending
+        }
+
+        fn backoff(&mut self) {
+            assert!(self.pending);
+            assert_eq!(self.state.borrow().alive.len(), 4);
+            assert_eq!(self.state.borrow().accepted, 0);
+            assert_eq!(self.state.borrow().refused, 0);
+            self.backoffs += 1;
+        }
+
+        fn admitted(
+            &mut self,
+            revision: u64,
+            claim: Self::Claim,
+            busy: Self::Busy,
+            password: Self::Password,
+            mut receipt: Self::Receipt,
+        ) {
+            assert_eq!(self.state.borrow().alive.len(), 4);
+            assert_eq!(password.secret.as_slice(), b"retained password");
+            self.dispatches.push(revision);
+            receipt.accepted = true;
+            self.state.borrow_mut().accepted += 1;
+            drop(claim);
+            drop(busy);
+            drop(password);
+            drop(receipt);
+        }
+
+        fn failure(&mut self, why: &str) {
+            self.failures.push(why.into());
+        }
+    }
+
+    fn run(plan: &Plan, outcomes: Vec<Admission>) -> Host {
+        let state = Rc::new(RefCell::new(State::default()));
+        let password = Password {
+            secret: aterm_secrets::SecretBytes::from(b"retained password".as_slice()),
+            _lease: Lease::new("password", &state),
+        };
+        let receipt = Receipt {
+            lease: Lease::new("receipt", &state),
+            accepted: false,
+        };
+        let busy = Lease::new("busy", &state);
+        let mut host = Host {
+            state,
+            outcomes: outcomes.into(),
+            pending: false,
+            plans: Vec::new(),
+            claims: 0,
+            backoffs: 0,
+            dispatches: Vec::new(),
+            failures: Vec::new(),
+        };
+        run_setup_restart(&mut host, plan, password, receipt, busy);
+        assert!(host.state.borrow().alive.is_empty());
+        assert_eq!(host.state.borrow().drops[0], "claim");
+        host
+    }
+
+    #[test]
+    fn manual_final_admission_retains_the_original_choice_until_confirmation() {
+        let plan = Plan {
+            vault_url: "https://vault.example/reviewed".into(),
+            ..Plan::default()
+        };
+        let host = run(
+            &plan,
+            vec![
+                Admission::Pending("published final admission could not flush"),
+                Admission::Pending("the same final admission is still unconfirmed"),
+                Admission::Admitted(8),
+            ],
+        );
+        assert_eq!(host.dispatches, [8]);
+        assert_eq!(host.plans, vec![plan; 3]);
+        assert_eq!(host.claims, 1);
+        assert_eq!(host.backoffs, 2);
+        assert_eq!(host.failures.len(), 2);
+        assert_eq!(host.state.borrow().accepted, 1);
+        assert_eq!(host.state.borrow().refused, 0);
+    }
+
+    #[test]
+    fn rejected_manual_admission_does_not_accept_an_older_same_plan() {
+        let host = run(
+            &Plan::default(),
+            vec![Admission::Rejected("pre-final write refused")],
+        );
+        assert!(host.dispatches.is_empty());
+        assert_eq!(host.plans.len(), 1);
+        assert_eq!(host.backoffs, 0);
+        assert_eq!(host.state.borrow().accepted, 0);
+        assert_eq!(host.state.borrow().refused, 1);
+    }
+
+    #[test]
+    fn a_superseded_manual_attempt_never_dispatches_or_accepts_its_receipt() {
+        for pending in [false, true] {
+            let mut outcomes = Vec::new();
+            if pending {
+                outcomes.push(Admission::Pending("the final admission needs confirmation"));
+            }
+            // A new run can have the same plan with a different password.
+            // Its publication identity supersedes the original attempt.
+            outcomes.push(Admission::Superseded);
+            let host = run(&Plan::default(), outcomes);
+            assert!(host.dispatches.is_empty());
+            assert_eq!(host.plans.len(), 1 + usize::from(pending));
+            assert_eq!(host.failures.len(), usize::from(pending));
+            assert_eq!(host.backoffs, usize::from(pending));
+            assert_eq!(host.state.borrow().accepted, 0);
+            assert_eq!(host.state.borrow().refused, 1);
+        }
+    }
+
+    #[test]
+    fn a_confirmed_empty_manual_plan_acknowledges_its_exact_revision() {
+        let plan = Plan {
+            selection: Selection::none(),
+            ..Plan::default()
+        };
+        let host = run(
+            &plan,
+            vec![
+                Admission::Pending("empty admission was published before its flush failed"),
+                Admission::Admitted(12),
+            ],
+        );
+        assert_eq!(host.dispatches, [12]);
+        assert_eq!(host.plans, [plan.clone(), plan]);
+        assert_eq!(host.backoffs, 1);
+        assert_eq!(host.state.borrow().accepted, 1);
+        assert_eq!(host.state.borrow().refused, 0);
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn check_initial_setup(plan: aterm_types::macos_setup::Plan) -> bool {
     spawn_initial_setup_operation("aterm-setup-check", move |_busy| {
-        match aterm_cli::macos_doctor::check_initial_setup(&plan) {
-            Ok(report) => remember_initial_setup_rows(&report),
-            Err(why) => initial_setup_error(why),
+        let observed = aterm_cli::macos_doctor::check_initial_setup_observed(&plan);
+        match observed.result {
+            Ok(report) => remember_initial_setup_rows(&report, Some(&plan), observed.observation),
+            Err(why) => publish_initial_setup_error(why, Some(&plan), observed.observation),
         }
     })
 }
 
 #[cfg(target_os = "macos")]
 fn restore_initial_setup() -> bool {
-    spawn_initial_setup_operation(
-        "aterm-setup-restore",
-        |_busy| match aterm_cli::macos_doctor::run(aterm_cli::macos_doctor::Action::Restore) {
-            Ok(report) => remember_initial_setup_rows(&report),
-            Err(why) => initial_setup_error(why),
-        },
-    )
+    spawn_initial_setup_operation("aterm-setup-restore", |_busy| {
+        let observed =
+            aterm_cli::macos_doctor::run_observed(aterm_cli::macos_doctor::Action::Restore);
+        match observed.result {
+            Ok(report) => remember_initial_setup_rows(&report, None, observed.observation),
+            Err(why) => initial_setup_error(why, observed.observation),
+        }
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn cancel_initial_setup() -> bool {
-    spawn_initial_setup_operation("aterm-setup-cancel", |busy| {
-        let mut host = LiveSetupCancellation { last_failure: None };
+fn cancel_initial_setup(receipt: aterm_gui::InitialSetupCancelReceipt) -> bool {
+    spawn_initial_setup_operation("aterm-setup-cancel", move |busy| {
+        let mut host = LiveSetupCancellation {
+            cancellation: aterm_cli::macos_doctor::InitialSetupCancellation::default(),
+            last_failure: None,
+            observation: busy.observation.clone(),
+        };
         let busy = retain_setup_cancellation(&mut host, busy);
+        receipt.complete();
         aterm_gui::report_workstation_setup_finished();
         drop(busy);
     })
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod initial_setup_result_tests {
+    use super::*;
+    use aterm_cli::macos_doctor::{
+        InitialSetupObservation, InitialSetupSnapshot, InitialSetupSnapshotError,
+        initial_setup_snapshot_at,
+    };
+    use aterm_types::macos_setup::Plan;
+    use std::path::Path;
+
+    fn publish_decision(root: &Path, state: &str) {
+        let next = root.join("decision.next");
+        std::fs::write(
+            &next,
+            format!(r#"{{"profile":"macos-workstation-v1","state":"{state}"}}"#),
+        )
+        .unwrap();
+        std::fs::rename(next, root.join("first-run.json")).unwrap();
+    }
+
+    fn snapshot(root: &Path) -> InitialSetupSnapshot {
+        initial_setup_snapshot_at(root, Plan::default()).unwrap()
+    }
+
+    fn cached(observation: Option<InitialSetupObservation>, checked: bool) -> InitialSetupRows {
+        let row = aterm_gui::SetupStatusRow {
+            name: "Earlier result".into(),
+            status: "blocked".into(),
+            detail: "approval code OLD42".into(),
+        };
+        if checked {
+            InitialSetupRows {
+                observation,
+                check: Some(aterm_gui::SetupCheck {
+                    plan: Plan::default(),
+                    rows: vec![row],
+                }),
+                ..InitialSetupRows::default()
+            }
+        } else {
+            InitialSetupRows {
+                observation,
+                rows: vec![row],
+                ..InitialSetupRows::default()
+            }
+        }
+    }
+
+    fn has_old_result(status: &aterm_gui::SetupStatus) -> bool {
+        status
+            .rows
+            .iter()
+            .chain(status.check.iter().flat_map(|check| check.rows.iter()))
+            .any(|row| row.detail.contains("OLD42"))
+    }
+
+    #[test]
+    fn cached_setup_results_follow_the_exact_record_publication() {
+        for checked in [false, true] {
+            let root = aterm_tempfile::tempdir().unwrap();
+            publish_decision(root.path(), "pending");
+            let origin = snapshot(root.path());
+            let last = cached(Some(origin.observation.clone()), checked);
+            let status = initial_setup_status_with(Ok(snapshot(root.path())), false, &last);
+            assert!(
+                has_old_result(&status),
+                "an unchanged poll keeps its result"
+            );
+
+            // External Restore does not advance the legacy run's revision.
+            publish_decision(root.path(), "restored");
+            let stopped = snapshot(root.path());
+            assert_eq!(stopped.revision, origin.revision);
+            let status = initial_setup_status_with(Ok(stopped), false, &last);
+            assert!(!has_old_result(&status));
+            assert!(status.finished);
+            assert!(!status.permissions.unwrap().allowed);
+
+            // A delayed publisher must retain its original context, even if a
+            // newer state is already visible when it finishes publishing.
+            let delayed = cached(Some(origin.observation), checked);
+            assert!(!has_old_result(&initial_setup_status_with(
+                Ok(snapshot(root.path())),
+                false,
+                &delayed,
+            )));
+        }
+    }
+
+    #[test]
+    fn a_stale_snapshot_cannot_evict_a_newer_setup_result() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        publish_decision(root.path(), "pending");
+        let old = snapshot(root.path());
+        publish_decision(root.path(), "restored");
+        let current = snapshot(root.path());
+        let last = cached(Some(current.observation), false);
+
+        // The slow reader collected the old state before the worker published
+        // this result. It can filter that result, but must not delete it.
+        assert!(!has_old_result(&initial_setup_status_with(
+            Ok(old),
+            false,
+            &last,
+        )));
+        assert!(has_old_result(&initial_setup_status_with(
+            Ok(snapshot(root.path())),
+            false,
+            &last,
+        )));
+    }
+
+    #[test]
+    fn unknown_setup_state_never_borrows_an_old_results_context() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        publish_decision(root.path(), "pending");
+        let last = cached(Some(snapshot(root.path()).observation), true);
+        for error in [
+            InitialSetupSnapshotError::Updating,
+            InitialSetupSnapshotError::Read("current records cannot be read".into()),
+        ] {
+            let status = initial_setup_status_with(Err(error), true, &last);
+            assert!(!has_old_result(&status));
+            assert!(status.permissions.is_none());
+            assert!(status.busy);
+            assert_eq!(status.rows.len(), 1);
+        }
+        let unbound = cached(None, false);
+        assert!(!has_old_result(&initial_setup_status_with(
+            Ok(snapshot(root.path())),
+            false,
+            &unbound,
+        )));
+    }
 }
 
 /// The windowed sibling's argv for a window the policy decided to spawn:
@@ -3836,11 +4733,12 @@ mod tests {
 
     mod setup_startup {
         use super::super::{
-            PreparedSetup, SetupChoice, SetupStartup, finish_setup_choice, prepare_setup,
+            PreparedFirstRun, PreparedSetup, SetupAdmission, SetupChoice, SetupDecisions,
+            SetupStartup, finish_setup_choice, prepare_setup, resume_prepared_setup,
         };
         use aterm_gui::WorkstationSetupDecision::{self, Begin, Cancel, Unavailable};
         use aterm_types::macos_setup::{Plan, Selection};
-        use std::cell::Cell;
+        use std::cell::{Cell, RefCell};
         use std::collections::VecDeque;
         use std::rc::Rc;
 
@@ -3861,24 +4759,44 @@ mod tests {
 
         #[derive(Default)]
         struct Host {
+            revisions: VecDeque<Result<u64, &'static str>>,
             claims: VecDeque<Result<bool, &'static str>>,
             finished: VecDeque<Result<bool, &'static str>>,
+            known_admissions: VecDeque<Result<Option<SetupAdmission>, &'static str>>,
             offers: VecDeque<WorkstationSetupDecision>,
             initial: VecDeque<Result<Plan, &'static str>>,
             authorizations: VecDeque<Result<(), &'static str>>,
+            admissions: VecDeque<Option<u64>>,
             cancellations: VecDeque<Result<(), &'static str>>,
             offered: Vec<Plan>,
             authorized: Vec<Plan>,
             active: Rc<Cell<usize>>,
             held_during_backoff: Vec<usize>,
             failures: Vec<String>,
+            bind_calls: usize,
             claim_calls: usize,
             offer_calls: usize,
             cancel_calls: usize,
+            invalid_plan: bool,
+            pending_authorization: bool,
+            terminal_authorization_error: bool,
         }
 
         impl SetupStartup for Host {
             type Claim = Claim;
+
+            fn bind_authorization(&mut self) -> Result<u64, String> {
+                self.bind_calls += 1;
+                assert_eq!(self.bind_calls, 1, "capture the startup review once");
+                self.revision()
+            }
+
+            fn revision(&mut self) -> Result<u64, String> {
+                self.revisions
+                    .pop_front()
+                    .unwrap_or(Ok(0))
+                    .map_err(str::to_owned)
+            }
 
             fn claim(&mut self) -> Result<Option<Claim>, String> {
                 self.claim_calls += 1;
@@ -3902,6 +4820,14 @@ mod tests {
                     .map_err(str::to_owned)
             }
 
+            fn admission(&mut self) -> Result<Option<SetupAdmission>, String> {
+                assert_eq!(self.active.get(), 1, "admission is read under our claim");
+                self.known_admissions
+                    .pop_front()
+                    .unwrap_or(Ok(None))
+                    .map_err(str::to_owned)
+            }
+
             fn initial(&mut self) -> Result<Plan, String> {
                 self.initial
                     .pop_front()
@@ -3916,13 +4842,25 @@ mod tests {
                 self.offers.pop_front().expect("unexpected offer")
             }
 
-            fn authorize(&mut self, plan: &Plan) -> Result<(), String> {
+            fn authorize(&mut self, plan: &Plan) -> Result<Option<u64>, String> {
                 assert_eq!(self.active.get(), 1, "authorization keeps the setup claim");
                 self.authorized.push(plan.clone());
-                self.authorizations
-                    .pop_front()
-                    .unwrap_or(Ok(()))
-                    .map_err(str::to_owned)
+                let result = self.authorizations.pop_front().unwrap_or(Ok(()));
+                self.pending_authorization = result.is_err() && !self.terminal_authorization_error;
+                result.map_err(str::to_owned)?;
+                Ok(self.admissions.pop_front().unwrap_or(Some(1)))
+            }
+
+            fn authorization_pending(&self) -> bool {
+                self.pending_authorization
+            }
+
+            fn validate(&mut self, _: &Plan) -> Result<(), String> {
+                if self.invalid_plan {
+                    Err("the selected vault URL is invalid".into())
+                } else {
+                    Ok(())
+                }
             }
 
             fn cancel(&mut self) -> Result<(), String> {
@@ -3962,6 +4900,554 @@ mod tests {
             assert_eq!(host.active.get(), 0);
         }
 
+        fn assert_pre_offer_failure_releases_claim(initial_read: bool) {
+            let selected = plan(Selection::from_bits(1).unwrap());
+            let mut host = Host {
+                claims: [Ok(true), Ok(true)].into(),
+                finished: if initial_read {
+                    [Ok(false), Ok(false), Ok(false)].into()
+                } else {
+                    [
+                        Err("pre-offer completion read failed"),
+                        Ok(false),
+                        Ok(false),
+                    ]
+                    .into()
+                },
+                initial: if initial_read {
+                    [Err("pre-offer plan read failed"), Ok(selected.clone())].into()
+                } else {
+                    [Ok(selected.clone())].into()
+                },
+                offers: [Begin(selected.clone())].into(),
+                ..Host::default()
+            };
+            let result = prepare_setup(&mut host, true).unwrap();
+            assert!(matches!(result, PreparedSetup::Authorized { .. }));
+            assert_eq!(
+                host.held_during_backoff,
+                [0],
+                "before a decision, manual repair must be able to claim setup"
+            );
+            assert_eq!(host.claim_calls, 2, "reload only under a fresh claim");
+            assert_eq!(host.offered.as_slice(), std::slice::from_ref(&selected));
+            assert_eq!(host.authorized, [selected]);
+            assert_eq!(host.active.get(), 1, "the admitted worker keeps its claim");
+            drop(result);
+            assert_eq!(host.active.get(), 0);
+        }
+
+        #[test]
+        fn pre_offer_failure_releases_claim_after_a_plan_read_error() {
+            assert_pre_offer_failure_releases_claim(true);
+        }
+
+        #[test]
+        fn pre_offer_failure_releases_claim_after_a_completion_read_error() {
+            assert_pre_offer_failure_releases_claim(false);
+        }
+
+        #[test]
+        fn a_new_manual_run_during_startup_backoff_prevents_another_offer() {
+            for unavailable_offer in [false, true] {
+                let mut host = Host {
+                    revisions: [Ok(7), Ok(7), Ok(8)].into(),
+                    claims: [Ok(true), Ok(true)].into(),
+                    finished: [Ok(false), Ok(false)].into(),
+                    initial: if unavailable_offer {
+                        [Ok(Plan::default())].into()
+                    } else {
+                        [Err("initial source unreadable")].into()
+                    },
+                    offers: if unavailable_offer {
+                        [Unavailable].into()
+                    } else {
+                        VecDeque::new()
+                    },
+                    ..Host::default()
+                };
+                assert!(matches!(
+                    prepare_setup(&mut host, true).unwrap(),
+                    PreparedSetup::Unavailable
+                ));
+                assert_eq!(host.held_during_backoff, [0]);
+                assert_eq!(host.claim_calls, 2);
+                assert_eq!(host.offer_calls, usize::from(unavailable_offer));
+                assert!(
+                    host.authorized.is_empty(),
+                    "never replace the manual worker's password"
+                );
+                assert!(host.revisions.is_empty());
+                assert_eq!(host.active.get(), 0);
+            }
+        }
+
+        #[test]
+        fn an_admitted_pending_run_resumes_without_another_offer() {
+            let selected = Plan {
+                selection: Selection::from_bits(1 << 10).unwrap(),
+                vault_url: "http://saved.local/v1/team".into(),
+            };
+            let mut host = Host {
+                revisions: [Ok(7), Ok(7)].into(),
+                claims: [Ok(true)].into(),
+                finished: [Ok(false), Ok(false)].into(),
+                known_admissions: [Ok(Some(SetupAdmission {
+                    revision: 7,
+                    completed: false,
+                }))]
+                .into(),
+                initial: [Ok(selected.clone())].into(),
+                // Keep the original route finite: its unwanted offer returns
+                // Begin, which would mint another run and retire its password.
+                offers: [Begin(selected.clone())].into(),
+                ..Host::default()
+            };
+            let result = prepare_setup(&mut host, true).unwrap();
+            assert_eq!(
+                host.offer_calls, 0,
+                "an admitted choice needs no second countdown"
+            );
+            assert!(
+                host.authorized.is_empty(),
+                "keep the live worker's admitted revision"
+            );
+            assert!(matches!(
+                result,
+                PreparedSetup::Authorized { revision: 7, .. }
+            ));
+            assert_eq!(host.initial, [Ok(selected)]);
+            assert_eq!(host.active.get(), 1);
+            drop(result);
+            assert_eq!(host.active.get(), 0);
+        }
+
+        #[test]
+        fn startup_admission_read_errors_never_fall_through_to_an_offer() {
+            for retry in [false, true] {
+                let mut host = Host {
+                    revisions: [Ok(7), Ok(7), Ok(7)].into(),
+                    claims: [Ok(true), Ok(true)].into(),
+                    finished: [Ok(false), Ok(false)].into(),
+                    known_admissions: [
+                        Err("admission snapshot changed"),
+                        Ok(Some(SetupAdmission {
+                            revision: 7,
+                            completed: false,
+                        })),
+                    ]
+                    .into(),
+                    ..Host::default()
+                };
+                match prepare_setup(&mut host, retry) {
+                    Ok(result) => {
+                        assert!(retry);
+                        assert!(matches!(
+                            result,
+                            PreparedSetup::Authorized { revision: 7, .. }
+                        ));
+                        assert_eq!(host.claim_calls, 2);
+                        assert_eq!(host.held_during_backoff, [0]);
+                        drop(result);
+                    }
+                    Err(why) => {
+                        assert!(!retry);
+                        assert_eq!(why, "admission snapshot changed");
+                        assert_eq!(host.claim_calls, 1);
+                        assert!(host.held_during_backoff.is_empty());
+                    }
+                }
+                assert_eq!(host.offer_calls, 0);
+                assert!(host.authorized.is_empty());
+                assert_eq!(host.active.get(), 0);
+            }
+        }
+
+        #[test]
+        fn startup_admission_confirmation_cannot_adopt_a_newer_run() {
+            for (revision, completed) in [(8, false), (8, true), (7, true)] {
+                let mut host = Host {
+                    revisions: [Ok(7), Ok(7)].into(),
+                    claims: [Ok(true)].into(),
+                    finished: [Ok(false)].into(),
+                    known_admissions: [Ok(Some(SetupAdmission {
+                        revision,
+                        completed,
+                    }))]
+                    .into(),
+                    ..Host::default()
+                };
+                let result = prepare_setup(&mut host, true).unwrap();
+                if revision == 7 {
+                    assert!(matches!(result, PreparedSetup::Finished));
+                } else {
+                    assert!(matches!(result, PreparedSetup::Unavailable));
+                }
+                assert_eq!(host.offer_calls, 0);
+                assert!(host.authorized.is_empty());
+                assert_eq!(host.active.get(), 0);
+            }
+        }
+
+        struct AuthorizationTicket {
+            publication: u64,
+            target: Option<u64>,
+            pending: bool,
+        }
+
+        impl AuthorizationTicket {
+            fn bind(publication: u64) -> Self {
+                Self {
+                    publication,
+                    target: None,
+                    pending: true,
+                }
+            }
+        }
+
+        #[derive(Default)]
+        struct ReviewState {
+            publication: u64,
+            revision: u64,
+            finished: bool,
+            binds: usize,
+            claims: usize,
+            offers: usize,
+            writes: usize,
+            accepted: usize,
+            backoffs: usize,
+            failures: usize,
+        }
+
+        struct ReviewHost {
+            state: Rc<RefCell<ReviewState>>,
+            active: Rc<Cell<usize>>,
+            authorization: Option<AuthorizationTicket>,
+            selected: Plan,
+            replace_during_offer: bool,
+            fail_publication: bool,
+            fail_confirmations: usize,
+        }
+
+        impl SetupStartup for ReviewHost {
+            type Claim = Claim;
+
+            fn bind_authorization(&mut self) -> Result<u64, String> {
+                let mut state = self.state.borrow_mut();
+                state.binds += 1;
+                assert_eq!(state.binds, 1);
+                self.authorization = Some(AuthorizationTicket::bind(state.publication));
+                Ok(state.revision)
+            }
+
+            fn revision(&mut self) -> Result<u64, String> {
+                Ok(self.state.borrow().revision)
+            }
+
+            fn claim(&mut self) -> Result<Option<Self::Claim>, String> {
+                assert_eq!(self.active.get(), 0);
+                self.active.set(1);
+                self.state.borrow_mut().claims += 1;
+                Ok(Some(Claim(Rc::clone(&self.active))))
+            }
+
+            fn finished(&mut self) -> Result<bool, String> {
+                assert_eq!(
+                    self.state.borrow().offers,
+                    0,
+                    "no Plan-only completion shortcut"
+                );
+                Ok(self.state.borrow().finished)
+            }
+
+            fn admission(&mut self) -> Result<Option<SetupAdmission>, String> {
+                assert_eq!(self.state.borrow().offers, 0);
+                Ok(None)
+            }
+
+            fn initial(&mut self) -> Result<Plan, String> {
+                Ok(self.selected.clone())
+            }
+
+            fn offer(&mut self, selected: Plan) -> WorkstationSetupDecision {
+                let mut state = self.state.borrow_mut();
+                state.offers += 1;
+                if self.replace_during_offer {
+                    state.revision += 1;
+                    state.publication += 1;
+                }
+                Begin(selected)
+            }
+
+            fn authorize(&mut self, selected: &Plan) -> Result<Option<u64>, String> {
+                assert_eq!(selected, &self.selected);
+                assert_eq!(self.active.get(), 1);
+                let ticket = self.authorization.as_mut().expect("carry the bound review");
+                let mut state = self.state.borrow_mut();
+                if ticket.publication != state.publication {
+                    ticket.pending = false;
+                    return Ok(None);
+                }
+                if ticket.target.is_none() {
+                    if state.finished {
+                        ticket.pending = false;
+                        return Ok(None);
+                    }
+                    state.revision += 1;
+                    state.publication += 1;
+                    state.writes += 1;
+                    ticket.publication = state.publication;
+                    ticket.target = Some(state.revision);
+                    state.finished = selected.selection.is_empty();
+                    if std::mem::take(&mut self.fail_publication) {
+                        return Err("owned admission published before its flush failed".into());
+                    }
+                } else if self.fail_confirmations > 0 {
+                    self.fail_confirmations -= 1;
+                    return Err("owned admission observation is not durable yet".into());
+                }
+                ticket.pending = false;
+                state.accepted += 1;
+                Ok(ticket.target)
+            }
+
+            fn authorization_pending(&self) -> bool {
+                self.authorization
+                    .as_ref()
+                    .is_some_and(|ticket| ticket.pending)
+            }
+
+            fn cancel(&mut self) -> Result<(), String> {
+                panic!("this fixture has an accepted Apply")
+            }
+
+            fn backoff(&mut self) {
+                assert_eq!(self.active.get(), 1);
+                let mut state = self.state.borrow_mut();
+                assert_eq!(state.accepted, 0);
+                state.backoffs += 1;
+            }
+
+            fn report_failure(&mut self, _: &str) {
+                self.state.borrow_mut().failures += 1;
+            }
+        }
+
+        fn review_host(selected: Plan) -> ReviewHost {
+            ReviewHost {
+                state: Rc::new(RefCell::new(ReviewState::default())),
+                active: Rc::new(Cell::new(0)),
+                authorization: None,
+                selected,
+                replace_during_offer: false,
+                fail_publication: false,
+                fail_confirmations: 0,
+            }
+        }
+
+        #[test]
+        fn a_changed_offer_is_rejected_without_acknowledging_or_reauthorizing_it() {
+            for changed in [false, true] {
+                let mut host = review_host(Plan::default());
+                host.replace_during_offer = changed;
+                let prepared = prepare_setup(&mut host, true).unwrap();
+                assert_eq!(matches!(prepared, PreparedSetup::Unavailable), changed);
+                assert_eq!(
+                    matches!(prepared, PreparedSetup::Authorized { .. }),
+                    !changed
+                );
+                let state = host.state.borrow();
+                assert_eq!(state.binds, 1);
+                assert_eq!(state.claims, 1);
+                assert_eq!(state.offers, 1);
+                assert_eq!(state.writes, usize::from(!changed));
+                assert_eq!(state.accepted, usize::from(!changed));
+                assert_eq!(state.backoffs, 0);
+                drop(state);
+                drop(prepared);
+                assert_eq!(host.active.get(), 0);
+            }
+        }
+
+        #[test]
+        fn an_owned_empty_admission_is_confirmed_without_a_later_completion_shortcut() {
+            let mut host = review_host(plan(Selection::none()));
+            host.fail_publication = true;
+            host.fail_confirmations = 1;
+            assert!(matches!(
+                prepare_setup(&mut host, true).unwrap(),
+                PreparedSetup::Finished
+            ));
+            let state = host.state.borrow();
+            assert_eq!(state.binds, 1);
+            assert_eq!(state.claims, 1);
+            assert_eq!(state.offers, 1);
+            assert_eq!(state.writes, 1);
+            assert_eq!(state.revision, 1);
+            assert_eq!(state.accepted, 1);
+            assert_eq!(state.backoffs, 2);
+            assert_eq!(state.failures, 2);
+            assert_eq!(host.active.get(), 0);
+        }
+
+        #[test]
+        fn tty_handoff_preserves_own_authorization_when_a_same_plan_empty_run_replaces_it() {
+            for (replacement, completed, fresh_ticket) in [
+                (false, false, false),
+                (true, false, false),
+                (true, false, true),
+                (true, true, false),
+                (true, true, true),
+            ] {
+                let mut host = review_host(plan(Selection::none()));
+                host.fail_publication = true;
+                let setup = prepare_setup(&mut host, false).unwrap();
+                assert!(matches!(setup, PreparedSetup::Pending { .. }));
+                let mut decisions = SetupDecisions {
+                    authorization: host.authorization.take(),
+                    cancellation: (),
+                };
+                if replacement {
+                    let mut state = host.state.borrow_mut();
+                    state.revision += 1;
+                    state.publication += 1;
+                    // A failed restart can leave a staged, unadmitted empty
+                    // run. A fully admitted empty replacement is finished.
+                    state.finished = completed;
+                    if fresh_ticket {
+                        // Negative control: rebinding would redirect the old
+                        // tty choice to the newer staged same-plan run.
+                        decisions.authorization =
+                            Some(AuthorizationTicket::bind(state.publication));
+                    }
+                }
+                let state = Rc::clone(&host.state);
+                let active = Rc::clone(&host.active);
+                let selected = host.selected.clone();
+                let prepared =
+                    resume_prepared_setup(PreparedFirstRun { setup, decisions }, |decisions| {
+                        ReviewHost {
+                            state: Rc::clone(&state),
+                            active: Rc::clone(&active),
+                            authorization: decisions.authorization,
+                            selected,
+                            replace_during_offer: false,
+                            fail_publication: false,
+                            fail_confirmations: 0,
+                        }
+                    });
+                let rewritten = fresh_ticket && !completed;
+                let accepted = !replacement || rewritten;
+                assert_eq!(matches!(prepared, PreparedSetup::Finished), accepted);
+                assert_eq!(matches!(prepared, PreparedSetup::Unavailable), !accepted);
+                let state = state.borrow();
+                assert_eq!(state.binds, 1);
+                assert_eq!(state.claims, 1);
+                assert_eq!(state.offers, 1);
+                assert_eq!(state.writes, 1 + usize::from(rewritten));
+                assert_eq!(state.accepted, usize::from(accepted));
+                assert_eq!(
+                    state.revision,
+                    1 + u64::from(replacement) + u64::from(rewritten)
+                );
+                assert_eq!(active.get(), 0);
+            }
+        }
+
+        #[test]
+        fn an_unadmitted_pending_run_remains_reviewable_through_same_revision_recovery() {
+            let selected = plan(Selection::from_bits(1).unwrap());
+            for recover_read in [false, true] {
+                let mut host = Host {
+                    revisions: [Ok(7), Ok(7), Ok(7)].into(),
+                    claims: [Ok(true), Ok(true)].into(),
+                    finished: [Ok(false), Ok(false), Ok(false)].into(),
+                    initial: if recover_read {
+                        [Err("temporary source read"), Ok(selected.clone())].into()
+                    } else {
+                        [Ok(selected.clone())].into()
+                    },
+                    offers: [Begin(selected.clone())].into(),
+                    admissions: [Some(8)].into(),
+                    ..Host::default()
+                };
+                let result = prepare_setup(&mut host, true).unwrap();
+                assert!(matches!(
+                    result,
+                    PreparedSetup::Authorized { revision: 8, .. }
+                ));
+                assert_eq!(host.offered.as_slice(), std::slice::from_ref(&selected));
+                assert_eq!(host.authorized.as_slice(), std::slice::from_ref(&selected));
+                assert_eq!(host.claim_calls, if recover_read { 2 } else { 1 });
+                assert_eq!(
+                    host.held_during_backoff,
+                    if recover_read { vec![0] } else { Vec::new() }
+                );
+                drop(result);
+                assert_eq!(host.active.get(), 0);
+            }
+        }
+
+        #[test]
+        fn an_unreadable_startup_identity_cannot_be_adopted_after_a_manual_repair() {
+            for retry in [false, true] {
+                let mut host = Host {
+                    revisions: [Err("startup identity unreadable"), Ok(8)].into(),
+                    ..Host::default()
+                };
+                assert_eq!(
+                    prepare_setup(&mut host, retry).err().as_deref(),
+                    Some("startup identity unreadable")
+                );
+                assert_eq!(host.revisions, [Ok(8)]);
+                assert_eq!(host.claim_calls, 0);
+                assert_eq!(host.offer_calls, 0);
+                assert!(host.held_during_backoff.is_empty());
+                assert_eq!(host.failures.len(), usize::from(retry));
+            }
+        }
+
+        #[test]
+        fn authorization_fence_returns_invalid_review_without_retry_or_authorization() {
+            let mut host = Host {
+                claims: [Ok(true)].into(),
+                finished: [Ok(false), Ok(false), Ok(false)].into(),
+                offers: [Begin(Plan::default())].into(),
+                invalid_plan: true,
+                ..Host::default()
+            };
+            assert!(matches!(
+                prepare_setup(&mut host, true).unwrap(),
+                PreparedSetup::Unavailable
+            ));
+            assert!(host.authorized.is_empty());
+            assert!(host.held_during_backoff.is_empty());
+            assert_eq!(host.active.get(), 0);
+            assert_eq!(host.failures, ["the selected vault URL is invalid"]);
+        }
+
+        #[test]
+        fn authorization_fence_hands_off_the_committed_revision_before_any_later_read() {
+            let mut host = Host {
+                claims: [Ok(true)].into(),
+                finished: [Ok(false), Err("completion read failed"), Ok(false)].into(),
+                offers: [Begin(Plan::default())].into(),
+                admissions: [Some(7)].into(),
+                ..Host::default()
+            };
+            let prepared = prepare_setup(&mut host, false).unwrap();
+            assert!(matches!(
+                prepared,
+                PreparedSetup::Authorized { revision: 7, .. }
+            ));
+            assert_eq!(host.authorized, [Plan::default()]);
+            assert!(host.held_during_backoff.is_empty());
+            assert!(host.failures.is_empty());
+            assert_eq!(host.finished, [Err("completion read failed"), Ok(false)]);
+            drop(prepared);
+            assert_eq!(host.active.get(), 0);
+        }
+
         #[test]
         fn a_waiting_window_retries_a_failed_marker_read_then_takes_over() {
             let mut host = Host {
@@ -3988,11 +5474,12 @@ mod tests {
         }
 
         #[test]
-        fn begin_keeps_its_claim_and_decision_while_marker_reads_recover() {
+        fn begin_keeps_its_claim_and_decision_while_its_owned_write_recovers() {
             let mut host = Host {
                 claims: [Ok(true)].into(),
-                finished: [Ok(false), Err("temporary read-back"), Ok(false), Ok(false)].into(),
+                finished: [Ok(false)].into(),
                 offers: [Begin(Plan::default())].into(),
+                authorizations: [Err("owned authorization write failed"), Ok(())].into(),
                 ..Host::default()
             };
             assert!(matches!(
@@ -4002,7 +5489,34 @@ mod tests {
             assert_eq!(host.offer_calls, 1, "never repeat an accepted offer");
             assert_eq!(host.claim_calls, 1);
             assert_eq!(host.held_during_backoff, [1]);
-            assert_eq!(host.failures, ["temporary read-back"]);
+            assert_eq!(host.failures, ["owned authorization write failed"]);
+        }
+
+        #[test]
+        fn an_unbound_authorization_failure_releases_the_choice_without_retry() {
+            for retry in [false, true] {
+                let mut host = Host {
+                    claims: [Ok(true)].into(),
+                    finished: [Ok(false)].into(),
+                    offers: [Begin(Plan::default())].into(),
+                    authorizations: [Err("the failed publication could not be pinned")].into(),
+                    terminal_authorization_error: true,
+                    ..Host::default()
+                };
+                assert!(matches!(
+                    prepare_setup(&mut host, retry).unwrap(),
+                    PreparedSetup::Unavailable
+                ));
+                assert_eq!(host.claim_calls, 1);
+                assert_eq!(host.offer_calls, 1);
+                assert_eq!(host.authorized, [Plan::default()]);
+                assert_eq!(
+                    host.failures,
+                    ["the failed publication could not be pinned"]
+                );
+                assert!(host.held_during_backoff.is_empty());
+                assert_eq!(host.active.get(), 0);
+            }
         }
 
         #[test]
@@ -4085,12 +5599,6 @@ mod tests {
                     ..Host::default()
                 },
                 Host {
-                    claims: [Ok(true)].into(),
-                    finished: [Ok(false), Ok(true)].into(),
-                    offers: [Begin(Plan::default())].into(),
-                    ..Host::default()
-                },
-                Host {
                     claims: [Ok(true), Ok(false)].into(),
                     finished: [Ok(false), Ok(true)].into(),
                     offers: [Unavailable].into(),
@@ -4157,7 +5665,7 @@ mod tests {
             let saved = plan(Selection::from_bits(1).unwrap());
             let selected = plan(Selection::from_bits(2).unwrap());
             let mut host = Host {
-                claims: [Ok(true)].into(),
+                claims: [Ok(true), Ok(true)].into(),
                 finished: [Ok(false), Ok(false), Ok(false), Ok(false)].into(),
                 initial: [Err("selection read failed"), Ok(saved.clone())].into(),
                 offers: [Begin(selected.clone())].into(),
@@ -4165,7 +5673,7 @@ mod tests {
                 ..Host::default()
             };
             let result = prepare_setup(&mut host, true).unwrap();
-            let PreparedSetup::Authorized { claim } = &result else {
+            let PreparedSetup::Authorized { claim, .. } = &result else {
                 panic!("the worker must inherit the authorized run")
             };
             assert!(
@@ -4174,8 +5682,8 @@ mod tests {
             );
             assert_eq!(host.offered, [saved]);
             assert_eq!(host.authorized, [selected.clone(), selected]);
-            assert_eq!(host.claim_calls, 1);
-            assert_eq!(host.held_during_backoff, [1, 1]);
+            assert_eq!(host.claim_calls, 2);
+            assert_eq!(host.held_during_backoff, [0, 1]);
             drop(result);
             assert_eq!(host.active.get(), 0);
         }
@@ -4243,7 +5751,7 @@ mod tests {
                         assert_eq!(host.cancel_calls, 3);
                     }
                     SetupChoice::Begin(_) => {
-                        let PreparedSetup::Authorized { claim } = &result else {
+                        let PreparedSetup::Authorized { claim, .. } = &result else {
                             panic!("the worker must inherit the authorized run")
                         };
                         assert!(Rc::ptr_eq(&claim.0, &host.active));
@@ -4331,6 +5839,42 @@ mod tests {
             true,
             DoctorStartupEnv::default(),
         ));
+    }
+
+    #[test]
+    fn ordinary_window_options_keep_the_unified_setup_offer() {
+        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+        for args in [
+            osv(&["--gpu"]),
+            osv(&["--cpu"]),
+            osv(&["--font-px", "24", "--font", "Menlo", "--scale", "2"]),
+            osv(&["--columns", "120", "--lines", "40", "-d", "/tmp"]),
+            osv(&[
+                "--shell",
+                "zsh",
+                "--shell-integration",
+                "--no-shell-integration",
+            ]),
+        ] {
+            assert!(
+                first_run_window_eligible(&args, DoctorStartupEnv::default()),
+                "ordinary window options must retain the setup surface: {args:?}",
+            );
+        }
+        for args in [
+            osv(&["--gpu", "-e", "zsh"]),
+            osv(&["--cpu", "--headless"]),
+            osv(&["--font", "Menlo", "--control-sock", "/tmp/private"]),
+            osv(&["--columns", "120", "--diagnose"]),
+            osv(&["--gpu", "--containment", "user"]),
+            osv(&["--gpu", "--bogus"]),
+            osv(&["--font-px"]),
+        ] {
+            assert!(
+                !first_run_window_eligible(&args, DoctorStartupEnv::default()),
+                "ordinary options cannot erase a scope/command refusal: {args:?}",
+            );
+        }
     }
 
     #[test]

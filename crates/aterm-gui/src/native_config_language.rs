@@ -931,15 +931,17 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     // `[fabric] log` (session log phase 4), which `aterm-link serve` reads
-    // (`aterm_link::fabric::log_from_config`): "off" (the default, D4 open)
-    // or "turns", the bus mirror of the session logs.
+    // (`aterm_link::fabric::log_from_config`): "auto" (the default, D4,
+    // session log Phase 6 step 6E-3: the bus mirror of the session logs once
+    // the broker retains the node's `ev` faces), "off" (the opt-out) or
+    // "turns" (over any broker, up to a total where it retains nothing).
     manual(
         "fabric.log",
         "Mirror the session logs' turns onto the fabric",
         ConfigSchemaKind::Scalar(EditKind::Enum {
-            options: &["off", "turns"],
+            options: &["auto", "off", "turns"],
         }),
-        &["fabric", "log", "session", "turns", "mirror", "bus"],
+        &["fabric", "log", "session", "turns", "mirror", "bus", "auto"],
         true,
     ),
     // `[fabric] command`: a command line (split on whitespace) or an argv
@@ -1282,15 +1284,16 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     // The `[claude_footer]` table (owner, 2026-09-30): what the Claude Code
     // footer writes into the rule under Claude's input box, (`card`,
-    // 2026-10-15) the harness card on Claude's launch card, and (`acts`,
-    // 2026-10-16) the act ticker beside the Autopilot chip. All default on;
+    // 2026-10-15) the harness card on Claude's launch card, (`acts`,
+    // 2026-10-16) the act ticker beside the Autopilot chip, and (`agents`,
+    // 2026-10-19) the agents panel's rainbow and dots. All default on;
     // written by hand (no Settings row).
     manual(
         "claude_footer",
         "Claude Code footer",
         ConfigSchemaKind::Table,
         &[
-            "claude", "footer", "usage", "tokens", "card", "harness", "acts",
+            "claude", "footer", "usage", "tokens", "card", "harness", "acts", "agents",
         ],
         false,
     ),
@@ -1328,6 +1331,22 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
             "harness",
             "autopilot",
             "approved",
+        ],
+        true,
+    ),
+    manual(
+        "claude_footer.agents",
+        "Light Claude Code's agents panel and its dots",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[
+            "claude",
+            "footer",
+            "agents",
+            "subagents",
+            "panel",
+            "rainbow",
+            "stuck",
+            "harness",
         ],
         true,
     ),
@@ -2511,6 +2530,7 @@ fn manual_default_shown(key: &str) -> Option<String> {
         "claude_footer.usage" => config.claude_footer_usage().to_string(),
         "claude_footer.card" => config.claude_footer_card().to_string(),
         "claude_footer.acts" => config.claude_footer_acts().to_string(),
+        "claude_footer.agents" => config.claude_footer_agents().to_string(),
         "reroute.strict" => atpkg::config::parse_reroute("").strict().to_string(),
         #[cfg(unix)]
         "fabric.hold_on_bridge_lost" => {
@@ -6380,8 +6400,11 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         "claude_footer.acts" => {
             " · default true: right of the Autopilot chip, what the harness just did shows for 3 s in the chip's ink (`✓ approved`, `↻ kept going`, `? answered`, `⧗ resumed`, `⤓ landing`, `⤓ nudged`, `✗ declined`), at most once every 15 s, with no animation; false withholds it, and the chip's title still lists the last three acts with their times · serious mode withholds it too · read live"
         }
+        "claude_footer.agents" => {
+            " · default true: while the harness's theme is on a Claude Code session (its composer border drawn), the agents panel under the footer wears the theme's rainbow — each row's name in its stripe at Claude's own lightness, a workflow's bar along the whole palette — and each agent's dot tells its work: hue = which agent, brightness and glow = how much work, saturation = how fresh, full hue with a dim steady glow = in its own tool call (inside that call's timeout plus 30 s, read from its transcript), a grey breath = stuck (no work for 150 s with nothing of its own in flight), a still amber ring = awaiting approval, Claude's own green or red = done or failed — glass only; false leaves the panel as Claude drew it · serious mode keeps the colours and drops the glow · read live"
+        }
         "claude_footer.card" => {
-            " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by aterm harness <version> · autopilot ∞ cruise` — glass only; false leaves the card bare · read live"
+            " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by aterm harness <version> · autopilot ∞ cruise`, and under Autopilot off the same card in white (`· autopilot ○ off`) — glass only; false leaves the card bare · read live"
         }
         "keeper.enabled" => {
             " · read at launch; on, every terminal is registered with this build's PTY keeper (`aterm keeper start` runs one) and a launch after a crash or kill reattaches the shells it held · macOS only"

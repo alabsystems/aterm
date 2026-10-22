@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (50x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the update notice at 50 columns, fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1) (launched at 50 columns, `lastReleaseNotesSeen` seeded to 2.1.290): one row of top air, the card, a blank row, the bold summary wrapped onto two rows at column 2, the dim details row on one row (47 cells with its indent; it wraps from 46 columns down, measured by `ctl resize` at 49, 48, 47, 46 and 44)
+
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.IbLp/proj
+
+  Updated to latest. Got 66 features, 424
+  bugfixes, and 126 other changes.
+  code.claude.com/docs/en/changelog for details
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+──────────────────────────────────────────────────
+❯
+──────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

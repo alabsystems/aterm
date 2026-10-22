@@ -1009,7 +1009,9 @@ fn chain_keys(envelope: &Envelope) -> Vec<[u8; 32]> {
 
 /// Whether the last apply wrote everything (none failed, and none was cut short with writes
 /// pending) and every file the manifest says the vault wrote still holds what it wrote. A
-/// file deleted or edited by hand is rewritten at the next fetch of the same version.
+/// file deleted or edited by hand is rewritten at the next fetch of the same version (an `if-
+/// absent` one rewritten is left the machine's own), which the subscriber makes once per
+/// version ([`repair_due`]).
 fn files_intact(paths: &Paths, state: &State) -> bool {
     !state.failed
         && state.pending.is_empty()
@@ -1155,8 +1157,9 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
 
 /// The subscriber (`aterm secrets watch`): long-poll the source and apply every new version,
 /// for ever; ask again every hour while waiting for approval; and on an admin of a vault with
-/// a join password, approve every request that proves it (§7). Errors back off from 5 s to
-/// 5 min and are logged once each. `log` gets one line per event (names and counts only).
+/// a join password, approve every request that proves it, or of an open vault, every request
+/// from a machine not in it (§7). Errors back off from 5 s to 5 min and are logged once each.
+/// `log` gets one line per event (names and counts only).
 pub fn watch(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
@@ -1186,11 +1189,64 @@ fn nap(stop: &AtomicBool, total: Duration) {
     }
 }
 
+/// The subscriber's first pause after a pass that left an entry failed ([`pause_after`]).
+const FIRST_RETRY: Duration = Duration::from_secs(5);
+
+/// The longest the subscriber waits between passes that fail, either way.
+const LONGEST_RETRY: Duration = Duration::from_secs(300);
+
+/// How long the subscriber waits after a pass that ended in `outcome` from `source`. A source
+/// that answers a long-poll at once with nothing new (one that does not hold, or a stale
+/// copy) is asked again only after a pause. A pass that applied a version at once asks again
+/// (a long-poll), unless an entry failed: such a pass leaves the next one no long-poll (it
+/// fetches and applies again, to retry the entry), so it waits `failing`, which doubles to
+/// [`LONGEST_RETRY`] while entries keep failing; any other pass starts it again at
+/// [`FIRST_RETRY`].
+fn pause_after(source: &Source, outcome: &SyncOutcome, failing: &mut Duration) -> Duration {
+    let pause = match (source, outcome) {
+        (Source::Path(_), _) => Duration::from_secs(60),
+        (_, SyncOutcome::NotIn) => Duration::from_secs(30),
+        (_, SyncOutcome::Unchanged { .. }) => Duration::from_secs(10),
+        (_, SyncOutcome::Applied { report, .. }) if report.failed.is_empty() => Duration::ZERO,
+        (_, SyncOutcome::Applied { .. }) => {
+            let pause = *failing;
+            *failing = failing.saturating_mul(2).min(LONGEST_RETRY);
+            return pause;
+        }
+    };
+    *failing = FIRST_RETRY;
+    pause
+}
+
+/// Whether the subscriber's next pass is to fetch and apply the version this machine holds
+/// again, instead of long-polling for a newer one: it is in, its last apply wrote everything,
+/// and a file the manifest says the vault wrote no longer holds it (deleted or edited by hand,
+/// or, for an ` if-absent` entry, rewritten by a program, which the apply then leaves the
+/// machine's own), so [`materialization_ready`] says not ready until an apply. Once per
+/// version (`repaired`), so a program that keeps rewriting a file is not fought on every pass.
+fn repair_due(paths: &Paths, repaired: &mut Option<u64>) -> bool {
+    let Ok(state) = load_state(paths) else {
+        return false;
+    };
+    let due = state.membership == Stored::In
+        && !state.failed
+        && state.pending.is_empty()
+        && *repaired != Some(state.seq)
+        && !files_intact(paths, &state);
+    if due {
+        *repaired = Some(state.seq);
+    }
+    due
+}
+
 /// The subscriber's passes. Returns when this program was replaced on disk (an update), so
 /// launchd or systemd starts the new build: a job keeps the image it started with.
 fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
     let mut backoff = Duration::from_secs(5);
+    let mut failing = FIRST_RETRY;
+    let mut repaired = None;
     let mut last_error = String::new();
+    let mut last_applied = String::new();
     let program = program_stamp();
     loop {
         if program.is_some() && program_stamp() != program {
@@ -1202,8 +1258,10 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
             let config = config
                 .ok_or_else(|| Error::new("no vault configured; waiting for aterm secrets join"))?;
             let wait = match config.source {
-                Source::Url(_) => Some(Duration::from_secs(55)),
-                Source::Path(_) => None,
+                Source::Url(_) if !repair_due(paths, &mut repaired) => {
+                    Some(Duration::from_secs(55))
+                }
+                Source::Url(_) | Source::Path(_) => None,
             };
             sync(paths, wait).map(|outcome| (config, outcome))
         });
@@ -1212,14 +1270,25 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
                 backoff = Duration::from_secs(5);
                 last_error.clear();
                 match &outcome {
-                    SyncOutcome::Applied { seq, report } => log(&format!(
-                        "applied seq {seq}: {} written, {} unchanged, {} removed, {} moved aside, {} failed",
-                        report.written.len(),
-                        report.unchanged.len(),
-                        report.removed.len(),
-                        report.moved_aside.len(),
-                        report.failed.len()
-                    )),
+                    SyncOutcome::Applied { seq, report } => {
+                        let line = format!(
+                            "applied seq {seq}: {} written, {} unchanged, {} removed, {} moved aside, {} failed",
+                            report.written.len(),
+                            report.unchanged.len(),
+                            report.removed.len(),
+                            report.moved_aside.len(),
+                            report.failed.len()
+                        );
+                        // A retry of a failing entry that ends the same way says nothing new.
+                        if line != last_applied {
+                            log(&line);
+                        }
+                        last_applied = if report.failed.is_empty() {
+                            String::new()
+                        } else {
+                            line
+                        };
+                    }
                     SyncOutcome::Unchanged { .. } => {}
                     SyncOutcome::NotIn => {
                         if load_state(paths).is_ok_and(|s| s.membership == Stored::Revoked) {
@@ -1228,14 +1297,7 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
                     }
                 }
                 ask_again_if_due(paths, &config, log);
-                // A source that answers a long-poll at once with nothing new (one that does
-                // not hold, or a stale copy) is asked again only after a pause.
-                let pause = match (&config.source, &outcome) {
-                    (Source::Path(_), _) => Duration::from_secs(60),
-                    (_, SyncOutcome::NotIn) => Duration::from_secs(30),
-                    (_, SyncOutcome::Unchanged { .. }) => Duration::from_secs(10),
-                    (_, SyncOutcome::Applied { .. }) => Duration::ZERO,
-                };
+                let pause = pause_after(&config.source, &outcome, &mut failing);
                 std::thread::sleep(pause.saturating_sub(started.elapsed()));
             }
             Err(error) => {
@@ -1245,7 +1307,7 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
                     last_error = text;
                 }
                 std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_secs(300));
+                backoff = (backoff * 2).min(LONGEST_RETRY);
             }
         }
     }
@@ -1266,48 +1328,72 @@ fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
     }
 }
 
-/// Whether this machine opens the admin locker of the envelope it last verified, and that
-/// vault holds a join password. Local files only.
-fn admin_here_with_password(paths: &Paths) -> bool {
-    let Ok(Some(identity)) = read_identity(paths) else {
-        return false;
-    };
-    let Ok(Some(cached)) = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE) else {
-        return false;
-    };
-    let Ok(envelope) = envelope::parse(cached.as_slice()) else {
-        return false;
-    };
-    let Some(locker) = envelope.admin_locker() else {
-        return false;
-    };
-    let Ok(plain) = age::decrypt(std::slice::from_ref(&identity), locker.armored.as_bytes()) else {
-        return false;
-    };
-    parse_admin(&plain).is_ok_and(|opened| opened.doc.join_password().is_some())
+/// What an admin's subscriber approves on a vault, by what its `[join]` says: requests that
+/// prove the join password, or on an open vault every request from a machine not in it whose
+/// key no `code-only` line names. A vault with neither has nothing approved but by a person,
+/// by code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    /// `password = …`: requests whose proof matches it.
+    Password,
+    /// `open = yes`: requests from machines not in the vault, but for a `code-only` key.
+    Open,
+}
+
+impl Approval {
+    /// What `doc` has approved without a person, if anything.
+    pub fn of(doc: &Document) -> Option<Approval> {
+        if doc.open() {
+            return Some(Approval::Open);
+        }
+        doc.join_password().map(|_| Approval::Password)
+    }
+
+    /// Whether the approver reads `request` at all: every one on an open vault, only one that
+    /// carries a proof on a vault with a password.
+    fn reads(self, request: &Request) -> bool {
+        match self {
+            Approval::Password => request.proof.is_some(),
+            Approval::Open => true,
+        }
+    }
+}
+
+/// What this machine's subscriber approves, when it opens the admin locker of the envelope it
+/// last verified and that vault has a join password or is open. Local files only.
+fn admin_here_approving(paths: &Paths) -> Option<Approval> {
+    let identity = read_identity(paths).ok()??;
+    let cached = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE).ok()??;
+    let envelope = envelope::parse(cached.as_slice()).ok()?;
+    let locker = envelope.admin_locker()?;
+    let plain = age::decrypt(std::slice::from_ref(&identity), locker.armored.as_bytes()).ok()?;
+    parse_admin(&plain)
+        .ok()
+        .and_then(|opened| Approval::of(&opened.doc))
 }
 
 /// The approver half of an admin's subscriber: while this machine is an admin of a vault with
-/// a join password, read the join queue every 2 s and approve what proves the password. What
-/// [`auto_approve`] judged stays [`Settled`] until the vault's version changes, so a queue
-/// that holds only requests already judged (refused, or approved and still queued for days)
-/// costs one GET a pass, never another admin open and key derivation.
+/// a join password or an open one, read the join queue every 2 s and approve what proves the
+/// password, or (open) what comes from a machine not in the vault. What [`auto_approve`]
+/// judged stays [`Settled`] until the vault's version changes, so a queue that holds only
+/// requests already judged (refused, left to a person, or approved and still queued for days)
+/// costs one GET a pass, never another admin open, key derivation or publish.
 fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) {
     let mut settled = Settled::default();
     let mut checked: Option<(u64, Instant)> = None;
-    let mut enabled = false;
+    let mut approval = None;
     while !stop.load(Ordering::Relaxed) {
         let seq = load_state(paths).map(|state| state.seq).unwrap_or(0);
         if checked
             .is_none_or(|(at_seq, at)| at_seq != seq || at.elapsed() >= Duration::from_secs(300))
         {
-            enabled = admin_here_with_password(paths);
+            approval = admin_here_approving(paths);
             checked = Some((seq, Instant::now()));
         }
-        if !enabled {
+        let Some(approval) = approval else {
             nap(stop, Duration::from_secs(30));
             continue;
-        }
+        };
         let pending = match requests(paths, None) {
             Ok(pending) => pending,
             Err(_) => {
@@ -1315,19 +1401,20 @@ fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) 
                 continue;
             }
         };
-        if settled.due(seq, &pending) {
+        let by = match approval {
+            Approval::Password => "by the join password",
+            Approval::Open => "as the vault is open",
+        };
+        if settled.due(seq, &pending, approval) {
             match auto_approve(paths) {
                 Ok(done) => {
                     if !done.approved.is_empty() {
-                        log(&format!(
-                            "approved {} by the join password",
-                            done.approved.join(", ")
-                        ));
+                        log(&format!("approved {} {by}", done.approved.join(", ")));
                     }
                     settled.settle(done.judged);
                 }
                 Err(error) => {
-                    log(&format!("approving by the join password failed: {error}"));
+                    log(&format!("approving {by} failed: {error}"));
                     nap(stop, Duration::from_secs(30));
                 }
             }
@@ -1336,26 +1423,26 @@ fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) 
     }
 }
 
-/// A proof-carrying join request as [`auto_approve`] read it. A machine that asks again under
-/// the same key with another proof (its person mistyped the password and ran join again) is
-/// another request.
+/// A join request as [`auto_approve`] read it. A machine that asks again under the same key
+/// with another proof (its person mistyped the password and ran join again), or another
+/// name, is another request.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Judged {
     /// The machine's key.
     pub recipient: String,
     /// The name it asked for.
     pub host: String,
-    /// Its proof of the join password.
-    pub proof: String,
+    /// Its proof of the join password, if it sent one.
+    pub proof: Option<String>,
 }
 
 impl Judged {
-    fn of(request: &Request) -> Option<Judged> {
-        request.proof.as_ref().map(|proof| Judged {
+    fn of(request: &Request) -> Judged {
+        Judged {
             recipient: request.recipient.clone(),
             host: request.host.clone(),
-            proof: proof.clone(),
-        })
+            proof: request.proof.clone(),
+        }
     }
 }
 
@@ -1368,18 +1455,20 @@ pub struct Settled {
 }
 
 impl Settled {
-    /// Whether a pass that holds vault version `seq` and lists `listed` runs [`auto_approve`]:
-    /// some listed request carries a proof not judged at that version. A new version forgets
-    /// every judgment, since it may carry a new password or have let a machine go.
-    pub fn due(&mut self, seq: u64, listed: &[Request]) -> bool {
+    /// Whether a pass that holds vault version `seq`, whose vault approves by `approval`, and
+    /// lists `listed` runs [`auto_approve`]: some listed request the approver reads (one with
+    /// a proof; on an open vault, any) was not judged at that version. A new version forgets
+    /// every judgment, since it may carry a new password, open or close the vault, or have
+    /// let a machine go.
+    pub fn due(&mut self, seq: u64, listed: &[Request], approval: Approval) -> bool {
         if seq != self.seq {
             self.judged.clear();
             self.seq = seq;
         }
         listed
             .iter()
-            .filter_map(Judged::of)
-            .any(|request| !self.judged.contains(&request))
+            .filter(|request| approval.reads(request))
+            .any(|request| !self.judged.contains(&Judged::of(request)))
     }
 
     /// Remember what an [`auto_approve`] judged, at the version the last [`Settled::due`] held.
@@ -1395,44 +1484,68 @@ pub struct AutoApproved {
     pub approved: Vec<String>,
     /// The keys whose proof did not match the password.
     pub refused: Vec<String>,
-    /// Every proof-carrying request it read and judged: approved, refused, or already a
-    /// machine of the vault.
+    /// On an open vault, the keys its `code-only` lines name that are asking (a machine it let
+    /// go, or one that asked before it opened): left to a person, who approves one by its code.
+    pub code_only: Vec<String>,
+    /// Every request it read and judged: approved, refused, left to a person, or already a
+    /// machine of the vault. On a vault with a password it reads only proof-carrying ones.
     pub judged: Vec<Judged>,
     /// The version published, when any machine was added.
     pub seq: Option<u64>,
 }
 
-/// Approve every queued request whose proof matches the vault's join password, in one
-/// publish. Nothing happens on a vault without a password.
+/// Approve, in one publish, every queued request whose proof matches the vault's join
+/// password; on an open vault, every queued request from a key not in `[machines]`, with or
+/// without a proof, but for a key a `code-only` line names; each named by [`free_name`]. Only
+/// requests whose line is valid and whose code matches its key are read ([`requests`]).
+/// Nothing happens on a vault with neither.
 pub fn auto_approve(paths: &Paths) -> crate::Result<AutoApproved> {
     let admin = admin_open(paths)?;
     let mut done = AutoApproved::default();
-    let Some(password) = admin.doc.join_password() else {
+    let Some(approval) = Approval::of(&admin.doc) else {
         return Ok(done);
     };
-    let key = join::Key::derive(&admin.config.name, password.as_slice());
+    let name = &admin.config.name;
+    let key = admin
+        .doc
+        .join_password()
+        .filter(|_| approval == Approval::Password)
+        .map(|password| join::Key::derive(name, password.as_slice()));
     let members: Vec<String> = admin
         .doc
         .machines()
         .into_iter()
         .map(|machine| machine.recipient)
         .collect();
+    let code_only = admin.doc.code_only();
     let mut doc = admin.doc.clone();
     // Members' requests are read too: an approved request stays queued for days, and the
     // approver settles it only once it is judged.
     for request in requests(paths, None)? {
-        let Some(judged) = Judged::of(&request) else {
+        if !approval.reads(&request) {
             continue;
-        };
+        }
+        let judged = Judged::of(&request);
         if !members.contains(&request.recipient) {
-            let name = &admin.config.name;
-            if key.verify(name, &request.recipient, &request.host, &judged.proof) {
+            let admitted = match approval {
+                Approval::Open => !code_only.contains(&request.recipient),
+                Approval::Password => {
+                    key.as_ref()
+                        .zip(request.proof.as_ref())
+                        .is_some_and(|(key, proof)| {
+                            key.verify(name, &request.recipient, &request.host, proof)
+                        })
+                }
+            };
+            if admitted {
                 let host = free_name(&doc, &request.host);
                 doc.add_machine(&host, &request.recipient)
                     .map_err(|e| Error::new(e.to_string()))?;
                 done.approved.push(host);
-            } else {
+            } else if approval == Approval::Password {
                 done.refused.push(request.recipient.clone());
+            } else {
+                done.code_only.push(request.recipient.clone());
             }
         }
         done.judged.push(judged);
@@ -2074,6 +2187,15 @@ pub struct Published {
     /// Whether it carries a new join password: this text let a machine go or dropped an
     /// admin, and kept the password either may have known.
     pub password_renewed: bool,
+    /// Whether this text let a machine go from an open vault. Its key is now a `code-only`
+    /// line, so the request it joined with, which the server keeps queued for days, or any it
+    /// makes under that key, does not let it straight back in.
+    pub kept_out: bool,
+    /// When this text opened the vault: the requests already waiting, each key now on a
+    /// `code-only` line, so a machine let go before (while the vault was closed, or by an
+    /// aterm that wrote no such line) is not let straight back in. A person approves each
+    /// they know by its code.
+    pub held: Vec<Request>,
     /// Why this machine's own sync after the publish failed, if it did. The publish stands.
     pub local: Option<String>,
 }
@@ -2124,7 +2246,9 @@ fn alab_release(
 /// one of this text and the join password is the same, the published text carries a new
 /// one: the machine let go may have joined with it, and its queued request, or one it makes
 /// under a new key, would otherwise be approved again. So too when an admin of that version
-/// is not an admin of this text: it read the password in the admin locker.
+/// is not an admin of this text: it read the password in the admin locker. On an open vault,
+/// a machine let go leaves its key on a `code-only` line, and a text that opens the vault
+/// puts every request already waiting on one ([`code_only_for`]).
 pub fn admin_publish(paths: &Paths, admin: &Admin, doc: &Document) -> crate::Result<Published> {
     publish_as(paths, admin, doc, false)
 }
@@ -2165,6 +2289,8 @@ fn publish_as(
     let renewed = renew_join_password(&admin.doc, doc)?;
     let password_renewed = renewed.is_some();
     let doc = renewed.as_ref().unwrap_or(doc);
+    let (recorded, kept_out, held) = code_only_for(paths, &admin.doc, doc)?;
+    let doc = recorded.as_ref().unwrap_or(doc);
     let (bytes, release, pairs) = if rotate {
         // The old key's endorsement of the new one joins the chain; every link before it
         // stays, so a machine pinned to any key the vault had still follows.
@@ -2193,8 +2319,67 @@ fn publish_as(
         alab_release: release,
         first_long_chain: pairs >= 2 && admin.opened_pairs < 2,
         password_renewed,
+        kept_out,
+        held,
         local,
     })
+}
+
+/// The keys of `old`'s machines that `doc` lets go: their lines deleted, or their keys
+/// replaced.
+fn let_go(old: &Document, doc: &Document) -> Vec<String> {
+    let kept: Vec<String> = doc.machines().into_iter().map(|m| m.recipient).collect();
+    old.machines()
+        .into_iter()
+        .map(|machine| machine.recipient)
+        .filter(|recipient| !kept.contains(recipient))
+        .collect()
+}
+
+/// What `doc`, published over `old`, leaves to approval by code when it is open: a
+/// `code-only` line for each key of `old`'s machines it lets go, and, when it opens the vault,
+/// for each key whose request is already waiting and is not one of its machines. The server
+/// keeps an approved request queued for days, so either would otherwise be let straight
+/// (back) in: the machine let go now, and one let go before, while the vault was closed or by
+/// an aterm that wrote no such line, which the waiting requests cannot be told apart from
+/// (`aterm secrets password open` asks a person about them first). Nothing on a vault `doc`
+/// leaves closed, so a fleet that never opens one keeps a text every aterm reads. Returns the
+/// text, when it changes; whether it let a machine go; and the waiting requests it held.
+fn code_only_for(
+    paths: &Paths,
+    old: &Document,
+    doc: &Document,
+) -> crate::Result<(Option<Document>, bool, Vec<Request>)> {
+    if !doc.open() {
+        return Ok((None, false, Vec::new()));
+    }
+    let named = doc.code_only();
+    let gone: Vec<String> = let_go(old, doc)
+        .into_iter()
+        .filter(|key| !named.contains(key))
+        .collect();
+    let waiting: Vec<Request> = if old.open() {
+        Vec::new()
+    } else {
+        requests(paths, Some(doc))?
+            .into_iter()
+            .filter(|request| {
+                !named.contains(&request.recipient) && !gone.contains(&request.recipient)
+            })
+            .collect()
+    };
+    if gone.is_empty() && waiting.is_empty() {
+        return Ok((None, false, Vec::new()));
+    }
+    let mut held = doc.clone();
+    for key in gone
+        .iter()
+        .chain(waiting.iter().map(|request| &request.recipient))
+    {
+        held.add_code_only(key)
+            .map_err(|error| Error::new(error.to_string()))?;
+    }
+    Ok((Some(held), !gone.is_empty(), waiting))
 }
 
 /// `doc` with a new join password, when it lets a machine of `old` go (revoked, or its key
@@ -2203,11 +2388,7 @@ fn publish_as(
 /// one. An admin read the password in the admin locker: one removed from `[admins]` stays a
 /// machine, and could mint keys whose proofs the approver admits.
 fn renew_join_password(old: &Document, doc: &Document) -> crate::Result<Option<Document>> {
-    let kept: Vec<String> = doc.machines().into_iter().map(|m| m.recipient).collect();
-    let let_go = old
-        .machines()
-        .iter()
-        .any(|machine| !kept.contains(&machine.recipient));
+    let let_go = !let_go(old, doc).is_empty();
     let admins = recipients_of(&doc.admins(), doc)?;
     let demoted = recipients_of(&old.admins(), old)?
         .iter()
@@ -2429,7 +2610,9 @@ pub fn admitted_since(base: &Document, current: &Document) -> Vec<text::Machine>
 /// `base`) every machine of `current` (the version the save goes on top of) whose key neither
 /// holds: one the approver or another admin admitted while the person edited. Published over
 /// `current` without it, the text would let that machine go and renew the join password it
-/// was let in with. A machine the person deleted was in `base`, so it stays deleted. Returns
+/// was let in with. A machine the person deleted was in `base`, so it stays deleted. So too
+/// every `code-only` line `current` added that `edited` lacks, unless `edited` makes that key
+/// a machine: without it the approver would let in the machine another admin let go. Returns
 /// the names put back.
 pub fn keep_admitted(
     base: &Document,
@@ -2450,6 +2633,15 @@ pub fn keep_admitted(
             .add_machine(&name, &machine.recipient)
             .map_err(|e| Error::new(e.to_string()))?;
         kept.push(name);
+    }
+    let before = base.code_only();
+    let members: Vec<String> = edited.machines().into_iter().map(|m| m.recipient).collect();
+    for key in current.code_only() {
+        if !before.contains(&key) && !members.contains(&key) {
+            edited
+                .add_code_only(&key)
+                .map_err(|e| Error::new(e.to_string()))?;
+        }
     }
     Ok(kept)
 }
@@ -2562,6 +2754,35 @@ impl Scratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pass_that_leaves_an_entry_failed_backs_off_and_a_clean_one_starts_again() {
+        let url = Source::Url("http://127.0.0.1:7484/v1/alab".to_string());
+        let applied = |failed: usize| SyncOutcome::Applied {
+            seq: 2,
+            report: crate::materialize::Report {
+                failed: (0..failed)
+                    .map(|n| (format!("entry{n}"), "is a symlink".to_string()))
+                    .collect(),
+                ..Default::default()
+            },
+        };
+        let mut failing = FIRST_RETRY;
+        let pauses: Vec<u64> = (0..8)
+            .map(|_| pause_after(&url, &applied(1), &mut failing).as_secs())
+            .collect();
+        assert_eq!(pauses, [5, 10, 20, 40, 80, 160, 300, 300]);
+        // A clean pass long-polls at once and starts the retries again; so does any other.
+        assert_eq!(pause_after(&url, &applied(0), &mut failing), Duration::ZERO);
+        assert_eq!(pause_after(&url, &applied(2), &mut failing), FIRST_RETRY);
+        pause_after(&url, &applied(2), &mut failing);
+        let unchanged = SyncOutcome::Unchanged { seq: 2 };
+        assert_eq!(pause_after(&url, &unchanged, &mut failing).as_secs(), 10);
+        assert_eq!(pause_after(&url, &applied(1), &mut failing), FIRST_RETRY);
+        // A path source is read once a minute whatever the pass did.
+        let path = Source::Path(PathBuf::from("/tmp/vault"));
+        assert_eq!(pause_after(&path, &applied(1), &mut failing).as_secs(), 60);
+    }
 
     /// A server for `store` at `addr` (port 0: any free one).
     fn serve(store: &Path, addr: &str) -> crate::server::Running {
@@ -2895,6 +3116,62 @@ mod tests {
                 Some(source_identity(&new_config))
             );
         }
+    }
+
+    #[test]
+    fn the_subscriber_repairs_a_changed_file_once_per_version_so_readiness_returns() {
+        let root = aterm_tempfile::tempdir().expect("tempdir");
+        let source = root.path().join("team.vault");
+        let admin = Paths::for_home(&root.path().join("admin"));
+        create(&admin, source.to_str().unwrap(), None, Some("admin")).unwrap();
+        let opened = admin_open(&admin).unwrap();
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "token", b"inert-token")
+            .unwrap();
+        doc.set_entry_with(
+            &Audience::Everyone,
+            "~/.config/tool/config",
+            b"[tool]\n",
+            true,
+            None,
+        )
+        .unwrap();
+        admin_publish(&admin, &opened, &doc).unwrap();
+        sync(&admin, None).unwrap();
+        assert!(materialization_ready(&admin).unwrap());
+        let mut repaired = None;
+        assert!(!repair_due(&admin, &mut repaired), "nothing to repair");
+
+        // A program rewrites the if-absent file the vault filled, and a person deletes the
+        // token: not ready, and the next pass applies the same version again, once.
+        let config = materialize::target_path(&admin.home, "~/.config/tool/config").unwrap();
+        fsx::write_atomic(&config, b"[tool]\nhelper = local\n", 0o600).unwrap();
+        let token = materialize::target_path(&admin.home, "token").unwrap();
+        std::fs::remove_file(&token).unwrap();
+        assert!(!materialization_ready(&admin).unwrap());
+        assert!(repair_due(&admin, &mut repaired));
+        assert!(
+            !repair_due(&admin, &mut repaired),
+            "once per version, whatever the files hold"
+        );
+        sync(&admin, None).unwrap();
+        assert!(materialization_ready(&admin).unwrap());
+        assert_eq!(std::fs::read(&token).unwrap(), b"inert-token");
+        assert_eq!(
+            std::fs::read(&config).unwrap(),
+            b"[tool]\nhelper = local\n",
+            "the rewritten if-absent file is the machine's own"
+        );
+
+        // A newer version may be repaired again.
+        std::fs::remove_file(&token).unwrap();
+        let opened = admin_open(&admin).unwrap();
+        let mut doc = opened.doc.clone();
+        doc.set_entry(&Audience::Everyone, "note", b"inert-note")
+            .unwrap();
+        admin_publish(&admin, &opened, &doc).unwrap();
+        std::fs::remove_file(&token).unwrap();
+        assert!(repair_due(&admin, &mut repaired));
     }
 
     #[test]

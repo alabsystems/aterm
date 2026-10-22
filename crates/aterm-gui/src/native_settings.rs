@@ -99,7 +99,8 @@ pub(crate) enum SettingsRoute {
     /// the coding-agent harness's own page — its switches, the default
     /// Autopilot, each session's Autopilot, what the harness did and the
     /// effective `[harness]` table. Reached from the Autopilot menu's
-    /// `Harness settings…`, View ▸ Coding Agent Harness… (`MenuAction::HarnessSettings`), the
+    /// `Harness settings…`, the Autopilot chip under the master switch off,
+    /// View ▸ Coding Agent Harness… (`MenuAction::HarnessSettings`), the
     /// palette and `aterm ctl open app settings /harness`. A SPECIAL page
     /// (`harness_page`) over the host's [`HarnessState`]; it places
     /// [`Section::Harness`]'s registry rows itself, which stay owned by that
@@ -300,6 +301,11 @@ struct PendingConfig {
     follows: Vec<OperationId>,
     /// What the write is: what its landing says it did.
     kind: WriteKind,
+    /// What each key its rows show other than its expectation showed when
+    /// the write was made ([`SettingsViewState::shown_before`]), for the
+    /// words its landing says, whichever of its result and its snapshot
+    /// comes in first.
+    shown_before: BTreeMap<String, Option<String>>,
 }
 
 /// WHAT A WRITE IS, for the words its landing or its refusal says: a change
@@ -1925,6 +1931,9 @@ pub(crate) struct SettingsViewState {
     /// against ([`SettingsApp::submit_config`]), so a default that follows
     /// other settings is the one this file resolves to.
     config_text: Arc<str>,
+    /// The rows a retired spelling in that text still authors
+    /// ([`prefs::retired_authored_keys`]): as changed as a key the file names.
+    retired_authored: BTreeSet<&'static str>,
     /// Compact macOS windows collapse the persistent sidebar into a native
     /// category sheet. This is view-local presentation state, never config.
     compact_navigation: bool,
@@ -2381,6 +2390,7 @@ impl SettingsViewState {
             result_page_limit: Cell::new(None),
             snapshot_revision: 1,
             config_text: Arc::from(""),
+            retired_authored: BTreeSet::new(),
             compact_navigation: false,
             presented_width: Cell::new(None),
             presented_plain_dock: Cell::new(false),
@@ -2519,6 +2529,7 @@ impl SettingsViewState {
         state.disk_faults = Arc::clone(&snapshot.disk_faults);
         state.snapshot_revision = snapshot.revision;
         state.config_text = Arc::clone(&snapshot.text);
+        state.retired_authored = prefs::retired_authored_keys(&snapshot.text);
         Ok(state)
     }
 
@@ -2608,6 +2619,7 @@ impl SettingsViewState {
         }
         self.snapshot_revision = snapshot.revision;
         self.config_text = Arc::clone(&snapshot.text);
+        self.retired_authored = prefs::retired_authored_keys(&snapshot.text);
         self.field_inputs = retained_inputs;
         self.editing_field = active_edit.filter(|key| self.field_inputs.contains_key(key));
         if let Some(label) = draft_conflicts.first() {
@@ -3368,10 +3380,33 @@ impl SettingsViewState {
         )
     }
 
-    /// Is the row's key written in aterm.toml? What "Changed" says, what
-    /// Modified lists, and when a row offers Reset.
+    /// Is the row's key written in aterm.toml, or authored there by a
+    /// retired spelling it replaced (`cursor_trail = false` holds the cursor
+    /// style Off)? What "Changed" says, what Modified lists, and when a row
+    /// offers Reset.
     fn is_explicit(&self, key: &str) -> bool {
-        self.raw_values.contains_key(key)
+        self.raw_values.contains_key(key) || self.retired_authored.contains(key)
+    }
+
+    /// WHAT THE ROWS `patch` WRITES SHOW NOW, where that is not the value
+    /// the patch expects their keys to hold: a row a retired spelling
+    /// authors shows the value that spelling folds to (the style a
+    /// `cursor_trail = false` holds Off), so the words for a write over it
+    /// name what changed on screen ([`change_words`]). Read before the write
+    /// is laid over the rows.
+    fn shown_before(&self, patch: &ConfigPatch) -> BTreeMap<String, Option<String>> {
+        patch
+            .edits
+            .iter()
+            .filter_map(|edit| {
+                let ExpectedConfigValue::Exact(expected) = &edit.expected;
+                let field = self.field_by_key(&edit.key)?;
+                (self.retired_authored.contains(edit.key.as_str())
+                    && *expected == self.raw_value(&edit.key)
+                    && field.seed != *expected)
+                    .then(|| (edit.key.clone(), field.seed.clone()))
+            })
+            .collect()
     }
 
     /// Refuse a value typed into `key`'s row: say why under the row, and say
@@ -3507,6 +3542,7 @@ impl SettingsViewState {
         operation: OperationId,
         patch: ConfigPatch,
         follows: Vec<OperationId>,
+        shown_before: BTreeMap<String, Option<String>>,
     ) {
         let submitted = patch
             .edits
@@ -3526,6 +3562,7 @@ impl SettingsViewState {
                 submitted,
                 follows,
                 kind: WriteKind::Change,
+                shown_before,
             }),
         );
     }
@@ -3550,6 +3587,28 @@ impl SettingsViewState {
             })
             .map(|(operation, _)| *operation)
             .collect()
+    }
+
+    /// aterm.toml as it will read once the page's writes on their way have
+    /// landed: the snapshot's text with each one's values written over it,
+    /// oldest first, as the config lane runs them. A write the writer
+    /// refuses is left out, as the lane would refuse it.
+    fn projected_config_text(&self) -> std::borrow::Cow<'_, str> {
+        let mut text = std::borrow::Cow::Borrowed(&*self.config_text);
+        for pending in self.pending.values() {
+            let edits: Vec<(&str, Option<String>)> = pending
+                .shown_edits()
+                .into_iter()
+                .map(|(key, value)| (key, value.map(str::to_string)))
+                .collect();
+            if edits.is_empty() {
+                continue;
+            }
+            if let Ok(next) = prefs::apply_prefs_edits(&text, &edits) {
+                text = std::borrow::Cow::Owned(next);
+            }
+        }
+        text
     }
 
     /// SHOW A WRITE THE MOMENT IT IS MADE: lay `edits` (a request just booked
@@ -4766,24 +4825,41 @@ impl SettingsApp {
     /// the page's own projection, status words and Undo offer say what the
     /// file will hold. A patch that then changes nothing the file holds is
     /// not sent at all: `None`, and the caller closes what it opened without
-    /// claiming a change (no "Applying…", no "reset to").
+    /// claiming a change (no "Applying…", no "reset to"). What "changes
+    /// nothing" means is the writer's own answer
+    /// ([`crate::native_config_service::planned_write`], on the file with the
+    /// page's writes still on their way), never a guess from the edited keys
+    /// alone: a write of a key can change others (a retired spelling the key
+    /// replaced leaves the file). Where the page's own view of a key and that
+    /// answer disagree (a write landed before its snapshot came in), the
+    /// patch goes, and the service judges it.
     fn submit_config(
         view: &mut SettingsViewState,
         cx: &mut UpdateCx<'_>,
         mut patch: ConfigPatch,
     ) -> Option<OperationId> {
+        let base = view.projected_config_text();
         let edits = patch
             .edits
             .iter()
             .map(|edit| (edit.key.as_str(), edit.value.clone()))
             .collect::<Vec<_>>();
-        let elide = prefs::unset_equivalent_edits(&view.config_text, &edits, &view.assets.themes);
+        let elide = prefs::unset_equivalent_edits(&base, &edits, &view.assets.themes);
         for (edit, elide) in patch.edits.iter_mut().zip(elide) {
             if elide {
                 edit.value = None;
             }
         }
-        if patch.edits.iter().all(edit_changes_nothing) {
+        let edits = patch
+            .edits
+            .iter()
+            .map(|edit| (edit.key.as_str(), edit.value.clone()))
+            .collect::<Vec<_>>();
+        let writes_nothing = matches!(
+            crate::native_config_service::planned_write(&base, &edits, &view.assets.themes),
+            Ok(None)
+        );
+        if writes_nothing && patch.edits.iter().all(edit_changes_nothing) {
             return None;
         }
         Some(Self::send_config(view, cx, patch))
@@ -4815,7 +4891,8 @@ impl SettingsApp {
             .collect();
         // Its Undo, offered at once: it puts back what the write expected,
         // once the write lands, named before the values move.
-        let words = change_words(view, &patch);
+        let shown_before = view.shown_before(&patch);
+        let words = change_words(view, &patch, &shown_before);
         let restores = patch
             .edits
             .iter()
@@ -4837,7 +4914,7 @@ impl SettingsApp {
             reapplies: edits.clone(),
         });
         view.next_undo_seated = false;
-        view.pend_config(operation, patch, follows);
+        view.pend_config(operation, patch, follows, shown_before);
         view.lay_over(&edits);
         operation
     }
@@ -5814,17 +5891,8 @@ impl SettingsApp {
             }
             view.field_errors.remove(key);
             if key == SPARKLE_WORDS_KEY || key == KEYWORD_KITTIES_KEY {
-                let show_authored = view.route == SettingsRoute::Modified && view.search.is_empty();
-                let current_words = if show_authored {
-                    top_authored_toy_value(view, SPARKLE_WORDS_KEY)
-                } else {
-                    top_projected_toy_value(view, SPARKLE_WORDS_KEY)
-                };
-                let current_kitties = if show_authored {
-                    top_authored_toy_value(view, KEYWORD_KITTIES_KEY)
-                } else {
-                    top_projected_toy_value(view, KEYWORD_KITTIES_KEY)
-                };
+                let current_words = top_effect_shown(view, None, SPARKLE_WORDS_KEY);
+                let current_kitties = top_effect_shown(view, None, KEYWORD_KITTIES_KEY);
                 let desired = match invocation.value.as_ref() {
                     Some(SemanticInput::Bool(value)) => *value,
                     _ if key == SPARKLE_WORDS_KEY => !current_words,
@@ -5864,12 +5932,7 @@ impl SettingsApp {
                 return self.commit_top_effect_edits(view, target, desired, edits, cx);
             }
             if key == prefs::EDIT_TRAIL_SOUNDS {
-                let show_authored = view.route == SettingsRoute::Modified && view.search.is_empty();
-                let current = if show_authored {
-                    top_authored_music_value(view)
-                } else {
-                    top_projected_music_value(view)
-                };
+                let current = top_effect_shown(view, None, key);
                 let desired = match invocation.value.as_ref() {
                     Some(SemanticInput::Bool(value)) => *value,
                     _ => !current,
@@ -6884,14 +6947,13 @@ impl SettingsApp {
             ConfigPatchOutcome::Applied { revision, undo } => {
                 self.config_revision = self.config_revision.max(revision);
                 // Named before the values move.
-                let words = match &pending {
-                    PendingAction::Config(request) => Some(
-                        request
-                            .kind
-                            .landing_words(change_words(view, &request.patch)),
-                    ),
-                    _ => None,
-                };
+                let words =
+                    match &pending {
+                        PendingAction::Config(request) => Some(request.kind.landing_words(
+                            change_words(view, &request.patch, &request.shown_before),
+                        )),
+                        _ => None,
+                    };
                 if let PendingAction::Undo(offer) = &pending {
                     if let Some((_, landed)) = view.style_trial_undo.as_mut() {
                         *landed = Some(revision);
@@ -8534,10 +8596,6 @@ struct ChangeWords {
     rows: usize,
 }
 
-/// Name what `patch` changes: one or two rows by name and new value, more by
-/// count. What a key held before is what the patch expected it to hold, so
-/// the words do not depend on whether the new snapshot reached the view
-/// before the patch's result did.
 /// Whether `edit` writes what its key already holds: a removal of an absent
 /// key, or a value that reads as the expected one does
 /// ([`crate::native_config_service::written_value`]: a slider's `12.0` is
@@ -8554,14 +8612,26 @@ fn edit_changes_nothing(edit: &ConfigEdit) -> bool {
     }
 }
 
-fn change_words(view: &SettingsViewState, patch: &ConfigPatch) -> ChangeWords {
+/// Name what `patch` changes: one or two rows by name and new value, more by
+/// count. What a key held before is what the patch expected it to hold, or
+/// what its row showed where that differs (`shown_before`, read when the
+/// write was made), so the words do not depend on whether the new snapshot
+/// reached the view before the patch's result did.
+fn change_words(
+    view: &SettingsViewState,
+    patch: &ConfigPatch,
+    shown_before: &BTreeMap<String, Option<String>>,
+) -> ChangeWords {
     let row_of = |key: &str| -> String { key.to_string() };
     let before = |key: &str| {
         patch.edits.iter().find(|edit| edit.key == key).map_or_else(
             || view.raw_value(key),
             |edit| {
                 let ExpectedConfigValue::Exact(value) = &edit.expected;
-                value.clone()
+                shown_before
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| value.clone())
             },
         )
     };
@@ -8659,14 +8729,43 @@ fn change_words(view: &SettingsViewState, patch: &ConfigPatch) -> ChangeWords {
     let mut status = Vec::new();
     let mut undone = Vec::new();
     let mut redone = Vec::new();
+    // A Top effect switch reads its value with what holds it off folded in
+    // ([`top_effect_shown_by`]), so its words are what it shows before and
+    // after, never its key alone.
+    let shown_words = |row: &str, raw: &dyn Fn(&str) -> Option<String>| {
+        matches!(
+            row,
+            SPARKLE_WORDS_KEY | KEYWORD_KITTIES_KEY | prefs::EDIT_TRAIL_SOUNDS
+        )
+        .then(|| {
+            let flag = |key: &str, fallback: bool| {
+                raw(key)
+                    .and_then(|value| value.trim().parse::<bool>().ok())
+                    .unwrap_or(fallback)
+            };
+            if top_effect_shown_by(row, top_effects_show_authored(view), &flag) {
+                "On".to_string()
+            } else {
+                "Off".to_string()
+            }
+        })
+    };
     for row in &rows {
         let name = row_name(view, row);
-        let was = row_words(view, row, &before);
-        let now = row_words(view, row, &after);
+        let was = shown_words(row, &before).unwrap_or_else(|| row_words(view, row, &before));
+        let now = shown_words(row, &after).unwrap_or_else(|| row_words(view, row, &after));
         let switch = view
             .field_by_key(row)
             .is_some_and(|field| matches!(field.kind, EditKind::Bool));
-        status.push(if switch {
+        status.push(if switch && was == now {
+            // The file changed but the switch reads as it did (a Reset that
+            // leaves it held Off): said so, never "turned on".
+            if after(row).is_none() {
+                format!("{name} reset to its default")
+            } else {
+                format!("{name} saved")
+            }
+        } else if switch {
             format!("{name} turned {}", now.to_lowercase())
         } else if row == prefs::EDIT_WALLPAPER && after(row).is_none() {
             // The Remove button's own words, kept once the change saves.
@@ -10748,6 +10847,51 @@ fn semantic_value_for_field(
     }
 }
 
+/// A value typed for `field` on `aterm ctl settings set`, as the writer
+/// takes it: a choice's or a switch's words as its row shows them ("Reduce",
+/// "Match macOS", "On") are the option they name. `Err` where `field` is a
+/// choice and no option takes the value: the refusal, naming every option
+/// with the words its row says for it, as a number's refusal names its
+/// range.
+pub(crate) fn control_input_value(field: &EditField, value: &str) -> Result<String, String> {
+    match field.kind {
+        EditKind::Bool => Ok(match value.trim().to_ascii_lowercase().as_str() {
+            "on" => "true".to_string(),
+            "off" => "false".to_string(),
+            _ => value.to_string(),
+        }),
+        EditKind::Enum { options } => {
+            let token = choice_token_for_words(field, value).unwrap_or_else(|| value.to_string());
+            if prefs::typed_toml_item(field.key, &token).is_ok() {
+                return Ok(token);
+            }
+            let listed = options
+                .iter()
+                .map(|option| {
+                    let mut words = vec![setting_choice_label(field.key, option)];
+                    let segment = segment_label(field.key, option);
+                    if !words.contains(&segment) && segmented_choices(field, option).is_some() {
+                        words.push(segment);
+                    }
+                    words.retain(|word| !word.eq_ignore_ascii_case(option));
+                    if words.is_empty() {
+                        (*option).to_string()
+                    } else {
+                        format!("{option} ({})", words.join(", "))
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "invalid value for {}: {:?}; it must be one of: {listed}",
+                field.key,
+                value.trim()
+            ))
+        }
+        _ => Ok(value.to_string()),
+    }
+}
+
 /// The option of choice `field` whose shown words are `words` ("Auto",
 /// "Auto (default)", "Rainbow kitty"), where `words` is not an option's token
 /// already.
@@ -11067,13 +11211,27 @@ pub(crate) fn listed_cursor_style_values() -> impl Iterator<Item = &'static str>
     prefs::CURSOR_TRAIL_STYLES.iter().copied()
 }
 
-/// The name a `cursor_trail_style` value goes by: its row's name in the
-/// engine's spelling table, through any alias; else the value in sentence
-/// case.
-fn cursor_style_name(value: &str) -> String {
+/// The name a `cursor_trail_style` value goes by: the style it draws, by its
+/// row's name in the engine's spelling table (through any alias). A spelling
+/// aterm does not know draws the default style
+/// ([`crate::app_config::resolve_trail_style`]), so it is named as that
+/// style, with the spelling it stands in for: `Rainbow kitty (unknown
+/// "comett")`, never a sentence-cased "Comett" no list has.
+pub(crate) fn cursor_style_name(value: &str) -> String {
     let value = value.trim();
-    aterm_effects::cursor_glow::spellings::label(value)
-        .map_or_else(|| sentence_case_token(value), str::to_string)
+    if let Some(label) = aterm_effects::cursor_glow::spellings::label(value) {
+        return label.to_string();
+    }
+    let resolved = crate::app_config::resolve_trail_style(value);
+    let drawn = resolved
+        .canonical
+        .and_then(aterm_effects::cursor_glow::spellings::label)
+        .unwrap_or(prefs::DEFAULT_CURSOR_TRAIL_STYLE);
+    if value.is_empty() {
+        drawn.to_string()
+    } else {
+        format!("{drawn} (unknown \"{value}\")")
+    }
 }
 
 /// One row of the Cursor Styles list.
@@ -12928,14 +13086,17 @@ fn renderer_preview_spec_for_key_with_font(
     } else {
         PreviewCursorStyle::Bar
     };
-    // A reset previews the platform's default style (Off on Windows).
-    let trail_style_value = style_candidate.clone().unwrap_or_else(|| {
-        field_text(
-            state,
-            prefs::EDIT_CURSOR_TRAIL_STYLE,
-            crate::app_config::default_cursor_trail_style(),
-        )
-    });
+    // A reset previews the platform's default style (Off on Windows); the
+    // saved style draws as aterm.toml spells it (an old `classic mono` in
+    // the cursor's colour, as the terminal draws it).
+    // A row of the saved style previews it as saved, its spelling's colour
+    // included: pressing it keeps what draws.
+    let spelled = spelled_trail_value(state);
+    let canonical = |raw: &str| crate::app_config::resolve_trail_style(raw).canonical;
+    let trail_style_value = style_candidate
+        .clone()
+        .filter(|candidate| canonical(candidate) != canonical(&spelled))
+        .unwrap_or(spelled);
     let resolved_trail = crate::app_config::resolve_trail_style(&trail_style_value);
     let trail_color =
         prefs::trail_color_setting(Some(&field_text(state, prefs::EDIT_CURSOR_TRAIL_COLOR, "")));
@@ -14762,10 +14923,12 @@ fn status_line_height() -> f32 {
 /// as they need, each whole — never cut to one line, which at 2× text
 /// read "Color theme was not saved…" and hid why — broken where every line
 /// of aterm's chrome breaks ([`wrap_to_box`]: between words, between CJK
-/// characters, a path at its folders), and inside a word only where it is
-/// wider than the box, with a hyphen that says it goes on. Wrapped by the
-/// terminal's own rule it broke a path inside a folder's name
-/// ("…/labs/r1" / "3d-p4/cfg/aterm").
+/// characters, a path before its folders' `/`s, so a line ends in no
+/// separator), and inside a word only where it is wider than the box, at a
+/// syllable with a hyphen that says it goes on. Wrapped by the terminal's
+/// own rule it broke a path inside a folder's name ("…/labs/r1" /
+/// "3d-p4/cfg/aterm"); broken after its `/`s it ended a line in the path's
+/// leading `/` ("… was not saved: /" / "private/tmp/…").
 fn status_word_lines(text: &str, width: f32) -> Vec<String> {
     wrap_to_box(text, width.max(1.0), &status_words_width)
         .into_iter()
@@ -17606,11 +17769,15 @@ fn wrapped_copy_lines(text: &str, px: f32, available_width: f32) -> Vec<String> 
 /// ([`crate::tray_raster::ui_text_wrap_ranges`]), each without its trailing
 /// space — except A PARAGRAPH WITH A WORD WIDER THAN THE BOX, which takes the
 /// rule every label keeps for one ([`wrap_to_box`]): a path broken at its
-/// folders, a word broken with a hyphen, its last line never a lone letter.
+/// folders, a word at a syllable with a hyphen ("Mes-" / "sages."), never a
+/// lone letter.
 /// The walk breaks only at white space, and broke such a word wherever the
 /// box ended, with no mark: a note at 2× in a 22-column card painted
 /// "Messages" and then "." alone on the next line. East Asian text breaks
-/// between its characters, as the walk breaks it.
+/// between its characters, as the walk breaks it. So does A PARAGRAPH THE
+/// WALK LEAVES A LINE OF ONE LETTER IN, which the label's rule fills with a
+/// syllable of the word after it ([`is_a_lone_letter`]): a Security note
+/// at 2× text in a 22-column card painted "A" alone, then "program's".
 fn copy_paragraph_lines(paragraph: &str, px: f32, width: f32) -> Vec<String> {
     use crate::tray_raster::{LinesRule, kept_lines};
     use crate::widget::TextFace;
@@ -17623,10 +17790,17 @@ fn copy_paragraph_lines(paragraph: &str, px: f32, width: f32) -> Vec<String> {
         if wider {
             return wrap_to_box(paragraph, width, &measure);
         }
-        crate::tray_raster::ui_text_wrap_ranges(paragraph, px, width)
+        let walked: Vec<String> = crate::tray_raster::ui_text_wrap_ranges(paragraph, px, width)
             .into_iter()
             .map(|range| paragraph[range].trim_end().to_string())
-            .collect()
+            .collect();
+        let lone = walked
+            .split_last()
+            .is_some_and(|(_, before)| before.iter().any(|line| is_a_lone_letter(line)));
+        if lone {
+            return wrap_to_box(paragraph, width, &measure);
+        }
+        walked
     })
 }
 
@@ -19068,11 +19242,13 @@ fn top_effect_apply_feedback(escaped_serious_mode: bool) -> String {
 }
 
 fn top_authored_toy_value(state: &SettingsViewState, key: &str) -> bool {
-    field_bool(state, SPARKLE_MASTER_KEY, true) && field_bool(state, key, true)
+    top_effect_shown_by(key, true, &|key, fallback| field_bool(state, key, fallback))
 }
 
 fn top_projected_toy_value(state: &SettingsViewState, key: &str) -> bool {
-    !field_bool(state, prefs::EDIT_SERIOUS_MODE, false) && top_authored_toy_value(state, key)
+    top_effect_shown_by(key, false, &|key, fallback| {
+        field_bool(state, key, fallback)
+    })
 }
 
 fn top_authored_trail_value(state: &SettingsViewState) -> String {
@@ -19084,6 +19260,24 @@ fn top_authored_trail_value(state: &SettingsViewState) -> String {
     )
 }
 
+/// The style the cursor draws ([`top_authored_trail_value`], by its row's
+/// name), except where aterm.toml spells it as the one alias that draws
+/// otherwise than its row: an old `classic mono` is Classic in the cursor's
+/// colour, which the list's `classic` alone does not say (the writer keeps
+/// that spelling too). What draws the saved style (its preview) and what
+/// describes its colours (their note, their Reset words) read this.
+fn spelled_trail_value(state: &SettingsViewState) -> String {
+    let drawn = top_authored_trail_value(state);
+    let canonical = |raw: &str| crate::app_config::resolve_trail_style(raw).canonical;
+    state
+        .raw_value(prefs::EDIT_CURSOR_TRAIL_STYLE)
+        .filter(|raw| {
+            aterm_effects::cursor_glow::GlowStyle::style_names_classic_mono(raw.trim())
+                && canonical(raw) == canonical(&drawn)
+        })
+        .map_or(drawn, |raw| raw.trim().to_string())
+}
+
 fn top_projected_trail_value(state: &SettingsViewState) -> String {
     if !field_bool(state, prefs::EDIT_SERIOUS_MODE, false) {
         top_authored_trail_value(state)
@@ -19093,11 +19287,15 @@ fn top_projected_trail_value(state: &SettingsViewState) -> String {
 }
 
 fn top_projected_music_value(state: &SettingsViewState) -> bool {
-    !field_bool(state, prefs::EDIT_SERIOUS_MODE, false) && top_authored_music_value(state)
+    top_effect_shown_by(prefs::EDIT_TRAIL_SOUNDS, false, &|key, fallback| {
+        field_bool(state, key, fallback)
+    })
 }
 
 fn top_authored_music_value(state: &SettingsViewState) -> bool {
-    field_bool(state, prefs::EDIT_TRAIL_SOUNDS, true)
+    top_effect_shown_by(prefs::EDIT_TRAIL_SOUNDS, true, &|key, fallback| {
+        field_bool(state, key, fallback)
+    })
 }
 
 /// What the Music effects switch's status line says, where its voices are
@@ -19136,18 +19334,40 @@ impl MusicStatus {
         }
     }
 
-    /// The one painted line, short enough to stay whole at 2x text on the
-    /// narrow host in every platform's face; the status group carries
-    /// [`Self::full`]. "Audio unavailable", the line a host with no audio
-    /// output paints on Home and Sound, needed 181.3 pt of the column's 126
-    /// at 2x in the Linux lane's face (2026-10-21), and "Some sounds paused"
-    /// was cut on macOS too (its "Some paused" still needed 145.2).
-    fn visual(self) -> &'static str {
+    /// WHAT THE STATUS PAINTS, most words first: [`Self::full`] without its
+    /// leading "On." (the switch beside it says that), then shorter forms,
+    /// each still naming its cause in the setting's own words ("Paused:
+    /// System Reduce Motion"). The row paints the first that its room holds
+    /// on two lines ([`top_music_suppression_node`]); the status group
+    /// carries the full sentence. One fixed "Some off" for every width named
+    /// neither the cause nor the voices.
+    fn forms(self) -> Vec<String> {
+        let full = self.full();
+        let sentence = full
+            .strip_prefix("On. ")
+            .map_or_else(|| full.clone(), str::to_string);
+        let sentence = sentence.trim_end_matches('.').to_string();
         match self {
-            Self::NoOutput { .. } => "No audio",
-            Self::VolumeZero => "Volume 0",
-            Self::TypingNotesOff => "Notes off",
-            Self::MotionPaused(_) => "Some off",
+            Self::NoOutput { .. } => vec![
+                sentence,
+                "No audio output on this platform".to_string(),
+                "No audio output".to_string(),
+            ],
+            Self::VolumeZero => vec![
+                sentence,
+                "Silent: Sound volume is 0".to_string(),
+                "Sound volume 0".to_string(),
+            ],
+            Self::TypingNotesOff => vec![
+                sentence,
+                "Typing notes off: no cursor trail".to_string(),
+                "Notes off: no trail".to_string(),
+            ],
+            Self::MotionPaused(reduction) => vec![
+                sentence,
+                format!("{} pauses some sounds", reduction.cause()),
+                format!("Paused: {}", reduction.cause()),
+            ],
         }
     }
 }
@@ -19234,8 +19454,29 @@ fn top_music_suppression_reason_for_output(
 const TYPING_NOTES_OFF: &str =
     "On. Typing notes are silent while the cursor trail is off; other sounds still play.";
 
-fn top_music_suppression_node(status: MusicStatus) -> UiNode {
-    UiNode::new(
+/// The Music effects status, `text_width` wide, and its height: the first of
+/// [`MusicStatus::forms`] whose words stay whole on at most two lines of
+/// that room, measured in the face it paints in, as a row's note is; where
+/// none does (a 126pt column at 2x text, a word to a line), the one on the
+/// fewest lines, whole on as many as it takes, its cause still named. The
+/// status group carries the full sentence for accessibility; its lines paint
+/// only.
+fn top_music_suppression_node(status: MusicStatus, text_width: f32) -> (UiNode, f32) {
+    let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
+    let forms = status.forms();
+    let laid: Vec<Vec<String>> = forms
+        .iter()
+        .map(|form| wrapped_copy_lines(form, px, text_width))
+        .collect();
+    let lines = laid
+        .iter()
+        .find(|lines| lines.len() <= 2)
+        .or_else(|| laid.iter().min_by_key(|lines| lines.len()))
+        .cloned()
+        .unwrap_or_default();
+    let line_height = page_subtitle_height();
+    let height = line_height * lines.len().max(1) as f32;
+    let node = UiNode::new(
         "settings/top/music-effects/suppression",
         UiContent::Group(GroupSpec {
             label: Some(status.full()),
@@ -19244,26 +19485,38 @@ fn top_music_suppression_node(status: MusicStatus) -> UiNode {
         }),
     )
     .layout(
-        Layout::default()
+        Layout::column()
             .width(Length::Fill)
-            .height(Length::Fixed(page_subtitle_height())),
+            .height(Length::Fixed(height)),
     )
-    .children(vec![
-        UiNode::new(
-            "settings/top/music-effects/suppression/visual",
-            UiContent::Text(TextSpec {
-                // The status group carries the complete explanation for
-                // accessibility. Keep its single renderer line concise so
-                // every known runtime reason remains whole at 2x text on the
-                // narrow native Settings host.
-                text: status.visual().to_string(),
-                role: SemanticRole::Status,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-        .paint_only(),
-    ])
+    .children(
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let key = if index == 0 {
+                    "settings/top/music-effects/suppression/visual".to_string()
+                } else {
+                    format!("settings/top/music-effects/suppression/visual/line-{index}")
+                };
+                UiNode::new(
+                    key,
+                    UiContent::Text(TextSpec {
+                        text: line,
+                        role: SemanticRole::Status,
+                        style: StyleRef::Quiet,
+                    }),
+                )
+                .layout(
+                    Layout::default()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(line_height)),
+                )
+                .paint_only()
+            })
+            .collect(),
+    );
+    (node, height)
 }
 
 /// The Top Playful effects card's status while `[sparkle_words] enabled =
@@ -19982,6 +20235,7 @@ fn theme_slot_row(
                     badge: false,
                     swatches,
                     chip: None,
+                    chevron_row: None,
                 },
                 ActionId::new(action.clone()),
             )
@@ -20086,6 +20340,7 @@ fn theme_preview_side_row(
                     badge: false,
                     swatches: Vec::new(),
                     chip: None,
+                    chevron_row: None,
                 },
                 ActionId::new(THEME_PREVIEW_SIDE_ACTION),
             )
@@ -20636,7 +20891,8 @@ fn top_card_row(
     }
     // The ordinary form (the Sound page's) paints the row's note, as every
     // page's row does; the direct form leaves it to its control.
-    let note = (!direct).then(|| prefs::footnote_of(key)).flatten();
+    let note = (!direct).then(|| row_footnote(state, key)).flatten();
+    let note = note.as_deref();
     let detail = row_second_line(&placement, timing, note, text_width);
     let row = with_row_detail(row, key, &detail, stacked);
     let height = top_row_height(&row, row_width);
@@ -20671,10 +20927,7 @@ fn music_effects_rows(
         top,
     );
     match (music, top_music_suppression_reason(state, cx.motion)) {
-        (Some(music), Some(reason)) => vec![
-            music,
-            (top_music_suppression_node(reason), page_subtitle_height()),
-        ],
+        (Some(music), Some(reason)) => vec![music, top_music_suppression_node(reason, text_width)],
         (music, _) => music.into_iter().collect(),
     }
 }
@@ -21780,15 +22033,18 @@ fn cursor_style_tuning_card(
         .collect::<Vec<_>>();
     // Each row's note as every page draws them ([`prefs::row_notes`]): a
     // row's own inside it, one several share once after the last of them.
+    let notes: Vec<Option<std::borrow::Cow<'static, str>>> =
+        shown.iter().map(|key| row_footnote(state, key)).collect();
     let keys: Vec<(&str, Option<prefs::RowNote<'_>>)> = shown
         .iter()
         .copied()
-        .zip(prefs::row_notes(&shown))
+        .zip(prefs::shared_row_notes(notes.iter().map(Option::as_deref)))
         .collect();
     // The box places its rows' facts alike ([`place_box_facts`]); a colour
     // row's open picker goes under it, one stop with it.
     let mut finished = page_finished_rows(state, &keys, width, text_width, None);
     place_box_facts(&mut finished);
+    agree_box_default_marks(&mut finished);
     let rows = finished
         .iter()
         .flat_map(|finished| {
@@ -21858,6 +22114,7 @@ fn cursor_style_link_row(state: &SettingsViewState, text_width: f32) -> (UiNode,
         badge: false,
         swatches: Vec::new(),
         chip: None,
+        chevron_row: None,
     };
     // THE ROW RULE: the button beside the label where the label's words are
     // whole in what it leaves them, on two lines at most ([`wrap_to_box`]),
@@ -22193,6 +22450,7 @@ fn page_box_setting_rows(
 ) -> Vec<(UiNode, f32)> {
     let mut finished = page_finished_rows(state, rows, width, text_width, shared_reason);
     place_box_facts(&mut finished);
+    agree_box_default_marks(&mut finished);
     finished
         .iter()
         .flat_map(|row| finished_row_stops(row, room))
@@ -24806,7 +25064,11 @@ fn settings_fields_page(
             .iter()
             .map(|(_, _, field)| field.key)
             .collect();
-        let notes = prefs::row_notes(&group_keys);
+        let owned_notes: Vec<Option<std::borrow::Cow<'static, str>>> = group_keys
+            .iter()
+            .map(|key| row_footnote(state, key))
+            .collect();
+        let notes = prefs::shared_row_notes(owned_notes.iter().map(Option::as_deref));
         // Why its rows are idle, where all of them share one reason, under
         // the caption on every screen of the box.
         let shared = (!modified_only)
@@ -24900,6 +25162,7 @@ fn settings_fields_page(
         for offset in placed {
             finished[offset].facts_below = Some(below);
         }
+        agree_box_default_marks(&mut finished);
         let mut finished = finished.into_iter();
         for (position, (_, _, field)) in fields.iter().enumerate().take(cursor).skip(start) {
             let finished = finished.next().expect("a finished row per field");
@@ -26065,6 +26328,148 @@ fn fallback_trail_note() -> EffectDisclosure {
 }
 
 /// The note of an effect Serious Mode suppresses.
+/// Whether Top effect switches here show what aterm.toml says (Modified with
+/// no search) rather than what draws (Serious Mode, and for the keyword toys
+/// the word effects' master, folded in). Their press reads the same.
+fn top_effects_show_authored(state: &SettingsViewState) -> bool {
+    state.route == SettingsRoute::Modified && state.search.trim().is_empty()
+}
+
+/// THE ONE VALUE A TOP EFFECT SWITCH SHOWS (Music effects, Sparkle words,
+/// Keyword kitties), from the switches `flag` reads (a key and its default):
+/// its own key, with the keyword toys' word effects master folded in, and
+/// Serious Mode too where the page shows what draws (`show_authored` false;
+/// Modified lists what aterm.toml says). The row, its press
+/// ([`SettingsApp::commit_top_effect_edits`]), its note and the words a
+/// change of it is named in all read this.
+fn top_effect_shown_by(key: &str, show_authored: bool, flag: &dyn Fn(&str, bool) -> bool) -> bool {
+    let master = key == prefs::EDIT_TRAIL_SOUNDS || flag(SPARKLE_MASTER_KEY, true);
+    let serious = !show_authored && flag(prefs::EDIT_SERIOUS_MODE, false);
+    flag(key, true) && master && !serious
+}
+
+/// [`top_effect_shown_by`] on this page, with `patch` over it.
+fn top_effect_shown(state: &SettingsViewState, patch: Option<&ConfigPatch>, key: &str) -> bool {
+    top_effect_shown_by(key, top_effects_show_authored(state), &|key, fallback| {
+        candidate_setting_bool(state, patch, key, fallback)
+    })
+}
+
+/// WHY A TOP EFFECT ROW READS OFF WHILE ITS OWN VALUE IS ON, in the words
+/// its notes give the reason: all word effects switched off in aterm.toml
+/// (the keyword toys), or Serious Mode where the page shows what draws
+/// ([`top_effect_shown`]). The cursor style is held the same way: its saved
+/// style (`patch` aside) draws a trail, and Serious Mode shows it Off.
+/// `None` where the row reads what its own key says.
+fn top_effect_held_off_reason(
+    state: &SettingsViewState,
+    patch: Option<&ConfigPatch>,
+    key: &str,
+) -> Option<&'static str> {
+    if key == prefs::EDIT_CURSOR_TRAIL_STYLE {
+        return (!top_effects_show_authored(state)
+            && candidate_setting_bool(state, patch, prefs::EDIT_SERIOUS_MODE, false)
+            && crate::app_config::resolve_trail_style(&top_authored_trail_value(state))
+                .style
+                .is_some())
+        .then_some("Serious Mode hides playful effects");
+    }
+    if !matches!(
+        key,
+        SPARKLE_WORDS_KEY | KEYWORD_KITTIES_KEY | prefs::EDIT_TRAIL_SOUNDS
+    ) || !candidate_setting_bool(state, patch, key, true)
+        || top_effect_shown(state, patch, key)
+    {
+        return None;
+    }
+    Some(
+        if key != prefs::EDIT_TRAIL_SOUNDS
+            && !candidate_setting_bool(state, patch, SPARKLE_MASTER_KEY, true)
+        {
+            "all word effects are switched off in aterm.toml"
+        } else if key == prefs::EDIT_TRAIL_SOUNDS {
+            "Serious Mode silences sound"
+        } else {
+            "Serious Mode hides playful effects"
+        },
+    )
+}
+
+/// A WRITE OF A TOP EFFECT'S OWN KEY THAT LEAVES ITS SWITCH OFF (a Reset of
+/// Keyword kitties while all word effects are off, or under Serious Mode):
+/// the switch still reads Off, so the change says that and why, in the
+/// switch's words, never that it turned on or is "inactive". `None` where
+/// the switch reads what its key says.
+fn still_off_note(
+    state: &SettingsViewState,
+    patch: Option<&ConfigPatch>,
+    key: &str,
+) -> Option<EffectDisclosure> {
+    let reason = top_effect_held_off_reason(state, patch, key)?;
+    Some(EffectDisclosure::new(
+        EffectNoteKind::Inactive,
+        format!("Still Off because {reason}"),
+        if reason.starts_with("Serious") {
+            "Serious Mode"
+        } else {
+            "Word effects off in aterm.toml"
+        },
+        format!("Still Off: {reason}"),
+    ))
+}
+
+/// Whether pressing a Top effect switch here leaves Serious Mode: it turns
+/// the switch on ([`top_effect_shown`] Off), and Serious Mode holds; the
+/// press then turns Serious Mode off and keeps the other effects off
+/// ([`preserve_suppressed_top_effect_siblings`]).
+fn top_effect_press_leaves_serious_mode(
+    state: &SettingsViewState,
+    patch: Option<&ConfigPatch>,
+    key: &str,
+    motion: crate::native_app::ViewMotionCx,
+) -> bool {
+    serious_mode_active(state, patch, motion)
+        && !patch_edits_key(patch, key)
+        && !top_effect_shown(state, patch, key)
+}
+
+/// A TOP EFFECT SWITCH UNDER SERIOUS MODE SAYS WHAT ITS PRESS DOES: one that
+/// reads Off turns on and turns Serious Mode off ([`SettingsApp::commit_top_effect_edits`]),
+/// so its note says so, on every page it shows on and whatever aterm.toml
+/// saves for it; one that reads On (Modified, which lists what aterm.toml
+/// says) is saved but held back, and its press turns it off. `None` outside
+/// Serious Mode, or for a patch that writes the switch itself.
+fn top_effect_serious_note(
+    state: &SettingsViewState,
+    patch: Option<&ConfigPatch>,
+    key: &str,
+    motion: crate::native_app::ViewMotionCx,
+) -> Option<EffectDisclosure> {
+    if !serious_mode_active(state, patch, motion) || patch_edits_key(patch, key) {
+        return None;
+    }
+    let (holds, visual) = if key == prefs::EDIT_TRAIL_SOUNDS {
+        ("silences sound", "Off: Serious Mode silences sound")
+    } else {
+        (
+            "hides playful effects",
+            "Off: Serious Mode hides playful effects",
+        )
+    };
+    Some(
+        if top_effect_press_leaves_serious_mode(state, patch, key, motion) {
+            EffectDisclosure::new(
+                EffectNoteKind::Constraint,
+                format!("Off while Serious Mode {holds}; turning this on turns Serious Mode off"),
+                "Serious Mode",
+                visual,
+            )
+        } else {
+            serious_mode_note()
+        },
+    )
+}
+
 fn serious_mode_note() -> EffectDisclosure {
     EffectDisclosure::new(
         EffectNoteKind::Inactive,
@@ -27048,11 +27453,16 @@ fn parent_or_motion_inactivity(
     // the streak's note (its status line says which), and this window's focus
     // is not a gate of a setting every window plays.
     if key == prefs::EDIT_TRAIL_SOUNDS {
+        if patch_edits_key(patch, key)
+            && let Some(note) = still_off_note(state, patch, key)
+        {
+            return Some(note);
+        }
+        if let Some(note) = top_effect_serious_note(state, patch, key, motion) {
+            return Some(note);
+        }
         if !candidate_setting_bool(state, patch, key, true) {
             return None;
-        }
-        if serious_mode_active(state, patch, motion) {
-            return Some(serious_mode_note());
         }
         return voices_motion_note(
             &aterm_effects::sound_policy::Voice::ALL,
@@ -27274,40 +27684,40 @@ fn parent_or_motion_inactivity(
         return None;
     }
     // THE TWO KEYWORD TOYS SHOW A COMBINED VALUE: their switch reads the
-    // master folded in (`top_authored_toy_value`, Serious Mode too off
-    // Modified), and pressing it lifts what holds it off
-    // (`reduce_action`'s toy arm), so it is Off, not idle. Said as a live
-    // constraint, never "saved but inactive": the patch that turns it on
-    // takes the gate away. A patch that writes the leaf alone and keeps the
-    // gate is the one that changes nothing, and keeps the Inactive note.
-    if (key == SPARKLE_WORDS_KEY || key == KEYWORD_KITTIES_KEY)
-        && patch.is_none_or(|patch| patch.edits.iter().all(|edit| edit.key != key))
-    {
+    // master folded in ([`top_effect_shown`], Serious Mode too off Modified),
+    // and pressing it lifts what holds it off (`reduce_action`'s toy arm), so
+    // it is Off, not idle. Said as a live constraint, never "saved but
+    // inactive": the patch that turns it on takes the gate away. A patch that
+    // writes the leaf alone and keeps the gate changes nothing the switch
+    // shows: it says the switch is still Off, and why, in the switch's words.
+    if key == SPARKLE_WORDS_KEY || key == KEYWORD_KITTIES_KEY {
+        if patch_edits_key(patch, key) {
+            return still_off_note(state, patch, key);
+        }
         let other = if key == SPARKLE_WORDS_KEY {
             "Keyword kitties"
         } else {
             "Sparkle words"
         };
         if !candidate_setting_bool(state, patch, SPARKLE_MASTER_KEY, true) {
+            // Under Serious Mode too, turning it on also turns that off.
+            let serious = top_effect_press_leaves_serious_mode(state, patch, key, motion);
             return Some(EffectDisclosure::new(
                 EffectNoteKind::Constraint,
-                format!(
-                    "Off because all word effects are switched off in aterm.toml; turning this on switches them back on for it, and {other} stays off"
-                ),
+                if serious {
+                    format!(
+                        "Off because all word effects are switched off in aterm.toml and Serious Mode hides playful effects; turning this on switches them back on for it and turns Serious Mode off, and {other} stays off"
+                    )
+                } else {
+                    format!(
+                        "Off because all word effects are switched off in aterm.toml; turning this on switches them back on for it, and {other} stays off"
+                    )
+                },
                 "Word effects off in aterm.toml",
                 "Off: all word effects are switched off in aterm.toml",
             ));
         }
-        let shows_combined =
-            !(state.route == SettingsRoute::Modified && state.search.trim().is_empty());
-        if shows_combined && serious_mode_active(state, patch, motion) {
-            return Some(EffectDisclosure::new(
-                EffectNoteKind::Constraint,
-                "Off while Serious Mode hides playful effects; turning this on turns Serious Mode off",
-                "Serious Mode",
-                "Off: Serious Mode hides playful effects",
-            ));
-        }
+        return top_effect_serious_note(state, patch, key, motion);
     }
     if key.starts_with("sparkle_words.") && !native_compatibility_only_key(key) {
         // The master has no row of its own, so the note says where it was
@@ -31389,6 +31799,7 @@ fn segmented_choice_node(
                     badge: false,
                     swatches: Vec::new(),
                     chip: None,
+                    chevron_row: None,
                 },
                 ActionId::new(action),
             )
@@ -31428,6 +31839,26 @@ fn segmented_choice_node(
     .segmented()
 }
 
+/// A row's note on this page: [`prefs::footnote_of`], except the trail
+/// colours' one, which says what they do for the saved cursor style
+/// ([`prefs::trail_color_note`]: Classic's shifting colours, a style that
+/// draws its own colours on a block, Laser's violet), as their placeholders
+/// and Reset words already do.
+fn row_footnote(state: &SettingsViewState, key: &str) -> Option<std::borrow::Cow<'static, str>> {
+    if matches!(
+        key,
+        prefs::EDIT_CURSOR_TRAIL_COLOR | prefs::EDIT_CURSOR_TRAIL_ACCENT
+    ) {
+        return Some(std::borrow::Cow::Owned(prefs::trail_color_note(
+            &spelled_trail_value(state),
+            configured_cursor_is_block(state),
+            // The colour law's pin, as the rows' placeholders read it.
+            state.is_explicit(prefs::EDIT_CURSOR_COLOR),
+        )));
+    }
+    prefs::footnote_of(key).map(std::borrow::Cow::Borrowed)
+}
+
 /// What Reset returns `key` to in `state`, in the words its control shows:
 /// [`default_value_label`], except for the knobs whose default is the cursor
 /// style's — the style aterm.toml names, as the row's own placeholder reads
@@ -31440,12 +31871,9 @@ fn modified_default_words(state: &SettingsViewState, key: &str) -> Option<String
     match key {
         prefs::EDIT_CURSOR_TRAIL_COLOR | prefs::EDIT_CURSOR_TRAIL_ACCENT => {
             // As aterm.toml spells it: an old `classic mono` says a colour.
-            let spelled = state
-                .raw_value(prefs::EDIT_CURSOR_TRAIL_STYLE)
-                .unwrap_or_else(|| top_authored_trail_value(state));
             Some(prefs::trail_color_default_words(
                 key,
-                &spelled,
+                &spelled_trail_value(state),
                 prefs::trail_color_setting(
                     state.raw_value(prefs::EDIT_CURSOR_TRAIL_COLOR).as_deref(),
                 ),
@@ -32240,6 +32668,60 @@ fn place_box_facts(rows: &mut [FinishedRow]) {
     let below = !rows.iter().all(FinishedRow::facts_fit_inline);
     for row in rows {
         row.facts_below = Some(below);
+    }
+}
+
+/// A BOX'S UNSET FIELDS MARK THEIR DEFAULTS ALIKE. Each field fits its
+/// placeholder to its own room ([`fit_row_field_placeholder`]), and one too
+/// narrow for its " (default)" paints its default without it; so where any
+/// field of the box had to, every field of the box paints its default
+/// without the mark, never "Shifting colors (default)" beside a bare
+/// "Brighter cursor color" for two settings equally unset. The quiet tint
+/// still marks each as unset, and each field's value keeps its whole words.
+fn agree_box_default_marks(rows: &mut [FinishedRow]) {
+    let dropped = rows
+        .iter()
+        .any(|row| row_default_marks(&row.row).contains(&false));
+    if dropped {
+        for row in rows {
+            drop_row_default_marks(&mut row.row);
+        }
+    }
+}
+
+/// Whether each unset text field in `node` (one whose value names its
+/// default, "… (default)") paints that mark.
+fn row_default_marks(node: &UiNode) -> Vec<bool> {
+    let mut marks = Vec::new();
+    if let UiContent::TextField(field) = &node.content
+        && let SemanticValue::Text(value) = &field.value
+        && value.ends_with(" (default)")
+        && field.spec.input.is_none()
+    {
+        marks.push(
+            field
+                .spec
+                .placeholder
+                .as_deref()
+                .is_some_and(|painted| painted.ends_with(" (default)")),
+        );
+    }
+    for child in &node.children {
+        marks.extend(row_default_marks(child));
+    }
+    marks
+}
+
+/// Paint every unset text field's default in `node` without its mark.
+fn drop_row_default_marks(node: &mut UiNode) {
+    if let UiContent::TextField(field) = &mut node.content
+        && let Some(painted) = field.spec.placeholder.as_mut()
+        && let Some(plain) = painted.strip_suffix(" (default)")
+    {
+        *painted = plain.to_string();
+    }
+    for child in &mut node.children {
+        drop_row_default_marks(child);
     }
 }
 
@@ -33587,6 +34069,173 @@ const CHANGED_WORD: &str = "Changed";
 /// ([`TextFieldSpec::trailing_hint`]).
 const UNSAVED_HINT: &str = "Unsaved";
 
+/// THE VALUE A ROW SHOWS, as its control holds it: the field's value, with
+/// the folds a row draws over it — the cursor style and the two keyword toys
+/// and Music effects as Serious Mode and the word effects' master leave them
+/// (Off while held), except on Modified (`modified_only`), which lists what
+/// aterm.toml says. An unset value reads as its default, "(default)" after
+/// it. The row, the words a change is named in and `aterm ctl settings`'s
+/// answer all read it.
+fn row_shown_value(state: &SettingsViewState, field: &EditField, modified_only: bool) -> String {
+    if field.key == prefs::EDIT_CURSOR_TRAIL_STYLE {
+        if modified_only {
+            top_authored_trail_value(state)
+        } else {
+            // Unset, the row shows the default it draws as every other
+            // choice row does ("Block (default)").
+            let projected = top_projected_trail_value(state);
+            if !state.is_explicit(prefs::EDIT_CURSOR_TRAIL_STYLE)
+                && projected.eq_ignore_ascii_case(crate::app_config::default_cursor_trail_style())
+            {
+                format!("{projected} (default)")
+            } else {
+                projected
+            }
+        }
+    } else if field.key == SPARKLE_WORDS_KEY || field.key == KEYWORD_KITTIES_KEY {
+        if modified_only {
+            top_authored_toy_value(state, field.key).to_string()
+        } else {
+            top_projected_toy_value(state, field.key).to_string()
+        }
+    } else if field.key == prefs::EDIT_TRAIL_SOUNDS {
+        if modified_only {
+            top_authored_music_value(state).to_string()
+        } else {
+            top_projected_music_value(state).to_string()
+        }
+    } else {
+        SettingsState::display_value(field).to_string()
+    }
+}
+
+/// WHAT A SETTING READS AS NOW, in the words its Settings row's control says
+/// and where it comes from: `<words> (default)` where aterm's own default is
+/// in force, `<words> (from theme <Name>)` where the theme in use sets it,
+/// `<words> (automatic)` where the platform chooses it (the font size). A
+/// switch says On or Off; a choice its picker's words, or its segment's
+/// where the row draws segments; a slider its readout; a font row the face
+/// it draws; a text row the value its empty field stands for, never the
+/// input hint after " — ". Words that already name the default ("Default",
+/// "platform default") take no mark. `aterm ctl settings unset` answers it
+/// after "now", on the side of a light/dark theme pair `system_dark` shows,
+/// naming the automatic font from `font_families` (the list Settings' font
+/// pickers were last given) as the font row does. `None` for a key no row
+/// edits.
+pub(crate) fn effective_value_words(
+    snapshot: &crate::native_config_service::ConfigSnapshot,
+    key: &str,
+    system_dark: bool,
+    font_families: Option<Arc<aterm_render::font_catalog::MonospaceFamilies>>,
+) -> Option<String> {
+    let mut state = SettingsViewState::from_snapshot(snapshot).ok()?;
+    if let Some(families) = font_families {
+        state.replace_font_families(families);
+    }
+    state.presented_motion.set(crate::native_app::ViewMotionCx {
+        system_dark,
+        ..state.presented_motion.get()
+    });
+    let fields = state.theme_seeded_fields(&snapshot.config, &Arc::clone(&state.assets.themes));
+    state.set_fields(fields);
+    state.row_value_words(key)
+}
+
+impl SettingsViewState {
+    /// [`effective_value_words`] for `key` in this view.
+    fn row_value_words(&self, key: &str) -> Option<String> {
+        let field = self.field_by_key(key)?;
+        // A Top effect row Serious Mode or the word effects' master holds Off
+        // reads Off, which is not its key's value: the key's own value is
+        // said, then what holds the row Off ("On (default); Off while Serious
+        // Mode silences sound"), never "Off (default)" for a key whose
+        // default is On.
+        let held = top_effect_held_off_reason(self, None, key);
+        let shown = match held {
+            Some(_) if key == prefs::EDIT_CURSOR_TRAIL_STYLE => top_authored_trail_value(self),
+            Some(_) => SettingsState::display_value(field).to_string(),
+            None => row_shown_value(self, field, false),
+        };
+        let shown = shown.trim();
+        // The value without the note on where it comes from.
+        let theme = (!self.is_explicit(key))
+            .then(|| self.theme_fallback_for(key))
+            .flatten()
+            .map(|(_, label)| label);
+        let bare = theme
+            .as_ref()
+            .and_then(|label| shown.strip_suffix(&format!(" (from theme {label})")))
+            .or_else(|| shown.strip_suffix(" (default)"))
+            .unwrap_or(shown)
+            .trim();
+        let automatic = bare.ends_with(" (automatic)");
+        let bare = bare.strip_suffix(" (automatic)").unwrap_or(bare).trim();
+        let words = match field.kind {
+            EditKind::Bool => if bare.parse::<bool>().unwrap_or(false) {
+                "On"
+            } else {
+                "Off"
+            }
+            .to_string(),
+            // The face the row names; its theme is said once, below.
+            _ if font_picker_key(key) && field.seed.is_none() => {
+                let label = font_automatic_label(self, key);
+                theme
+                    .as_ref()
+                    .and_then(|theme| label.strip_suffix(&format!(" (from theme {theme})")))
+                    .map_or_else(|| label.clone(), str::to_string)
+            }
+            EditKind::Enum { .. } => {
+                let token = unset_choice_value(field, bare);
+                if segmented_choices(field, shown).is_some() {
+                    segment_label(key, token)
+                } else {
+                    setting_choice_label(key, token)
+                }
+            }
+            EditKind::Theme => theme_value_words(&self.assets.themes, field.seed.as_deref()),
+            EditKind::Float | EditKind::Integer
+                if let Some((numeric, readout)) = numeric_slider_value_for_state(self, field) =>
+            {
+                slider_readout(key, numeric, readout)
+            }
+            _ => match field_placeholder(self, field) {
+                (_, Some(path)) if field.seed.is_none() => path,
+                _ => bare
+                    .split_once(" \u{2014} ")
+                    .map_or(bare, |(value, _hint)| value)
+                    .trim()
+                    .to_string(),
+            },
+        };
+        // A key whose unset value has no words of its own (the style kept
+        // beside an Off) holds none.
+        let words = if words.trim().is_empty() {
+            "none".to_string()
+        } else {
+            words
+        };
+        // An unset font row that names the face it draws ("Automatic (SF
+        // Mono)") already says where its value comes from.
+        let sourced = font_picker_key(key) && words.starts_with("Automatic (");
+        let value = if self.is_explicit(key) || sourced {
+            words
+        } else if let Some(label) = theme {
+            format!("{words} (from theme {label})")
+        } else if automatic {
+            format!("{words} (automatic)")
+        } else if words.to_ascii_lowercase().ends_with("default") {
+            words
+        } else {
+            format!("{words} (default)")
+        };
+        Some(match held {
+            Some(reason) => format!("{value}; Off while {reason}"),
+            None => value,
+        })
+    }
+}
+
 fn setting_row_parts(
     state: &SettingsViewState,
     index: usize,
@@ -33618,36 +34267,7 @@ fn setting_row_parts_in(
         SettingsAvailability::for_state(state),
         state.presented_motion.get(),
     );
-    let value = if field.key == prefs::EDIT_CURSOR_TRAIL_STYLE {
-        if modified_only {
-            top_authored_trail_value(state)
-        } else {
-            // Unset, the row shows the default it draws as every other
-            // choice row does ("Block (default)").
-            let projected = top_projected_trail_value(state);
-            if !state.is_explicit(prefs::EDIT_CURSOR_TRAIL_STYLE)
-                && projected.eq_ignore_ascii_case(crate::app_config::default_cursor_trail_style())
-            {
-                format!("{projected} (default)")
-            } else {
-                projected
-            }
-        }
-    } else if field.key == SPARKLE_WORDS_KEY || field.key == KEYWORD_KITTIES_KEY {
-        if modified_only {
-            top_authored_toy_value(state, field.key).to_string()
-        } else {
-            top_projected_toy_value(state, field.key).to_string()
-        }
-    } else if field.key == prefs::EDIT_TRAIL_SOUNDS {
-        if modified_only {
-            top_authored_music_value(state).to_string()
-        } else {
-            top_projected_music_value(state).to_string()
-        }
-    } else {
-        SettingsState::display_value(field).to_string()
-    };
+    let value = row_shown_value(state, field, modified_only);
     let first_token_is = |key: &str, word: &str| {
         field.key == key
             && value
@@ -33776,7 +34396,7 @@ fn setting_row_parts_in(
             }
         })
         .into_iter()
-        .chain(prefs::footnote_of(field.key).map(str::to_string))
+        .chain(row_footnote(state, field.key).map(std::borrow::Cow::into_owned))
         .chain((has_draft && field_error.is_none()).then(|| {
             "Unsaved draft; focus and press Return to save, or use Discard Draft in Modified"
                 .to_string()
@@ -33861,6 +34481,7 @@ fn setting_row_parts_in(
                         badge: false,
                         swatches: Vec::new(),
                         chip: None,
+                        chevron_row: None,
                     },
                     ActionId::new(format!("settings/font-picker/{}", field.key)),
                 )
@@ -33908,6 +34529,7 @@ fn setting_row_parts_in(
                     badge: false,
                     swatches: Vec::new(),
                     chip: None,
+                    chevron_row: None,
                 },
                 action,
             )
@@ -34400,13 +35022,27 @@ fn fit_row_field_placeholder(row: &mut UiNode, text_width: f32) {
                                 .is_some_and(|rest| rest.starts_with(char::is_whitespace))
                         })
                     };
-                    if cut_inside_a_word {
-                        let px = crate::native_ui::native_type_px(
-                            crate::type_scale::TypeStep::Secondary,
-                        )
-                        .get();
-                        let room = crate::native_ui::field_placeholder_room(width, swatch);
-                        let measure = |line: &str| crate::tray_raster::ui_text_width(line, px);
+                    let px =
+                        crate::native_ui::native_type_px(crate::type_scale::TypeStep::Secondary)
+                            .get();
+                    let room = crate::native_ui::field_placeholder_room(width, swatch);
+                    let measure = |line: &str| crate::tray_raster::ui_text_width(line, px);
+                    // A COLOUR FIELD WHOSE WORDS ARE NOT WHOLE BESIDE ITS
+                    // CHIP, not one of them on a line of its own, shows its
+                    // colour alone, as a button that wears the colour it
+                    // names does ([`choice_words`]): the chip is what the
+                    // row is about, and the row's absent Reset says the
+                    // colour is the default. Its words went on lines beside
+                    // the chip and a word wider than what the chip left was
+                    // broken and cut: "Theme default" painted "The-" /
+                    // "me…" at 2× text in a 22-column window. The field's
+                    // value still says the words.
+                    let words_beside_chip = plain
+                        .split_whitespace()
+                        .all(|word| measure(word) <= room + crate::native_ui::TEXT_FIT_SLACK);
+                    if cut_inside_a_word && swatch && !path && !words_beside_chip {
+                        placeholder.clear();
+                    } else if cut_inside_a_word {
                         let lines = if path {
                             path_placeholder_lines(placeholder, room, &measure)
                         } else {
@@ -34519,7 +35155,9 @@ fn numeric_slider_value(field: &EditField) -> Option<(f64, String)> {
         return Some((effective, compact_f64(effective)));
     }
     if (range.min..=range.max).contains(&configured) {
-        return Some((configured, token.to_string()));
+        // The number as aterm spells one (`prefs::written_number`): a
+        // placeholder's "1.0" and a saved "1" read the same.
+        return Some((configured, compact_f64(configured)));
     }
 
     // Font size is the one bounded numeric whose resolver rejects a bad config
@@ -35496,9 +36134,10 @@ const MAX_METADATA_VALUE_LINES: usize = 64;
 /// every place a line of it may break ([`aterm_grapheme::pieces`], the one
 /// cut every wrap of aterm's chrome lays its lines from): its words (joined
 /// by a space); between CJK characters, kinsoku kept (joined by nothing);
-/// and inside a word after a `/` (a path wraps at its folders instead of
-/// losing its end) or a `-` (`aarch64-` / `apple-darwin`), as a setting's
-/// name breaks ([`row_name_lines`]). A fact separator (` · `) stays with the
+/// inside a word of prose after a `-` or a `/` (`built-` / `in`); and inside
+/// a path before each folder's `/` (a path wraps at its folders instead of
+/// losing its end, and no line ends in a separator), as a setting's name
+/// breaks ([`row_name_lines`]). A fact separator (` · `) stays with the
 /// piece before it, so no line starts with one.
 fn line_pieces(text: &str) -> Vec<(&str, &str)> {
     let separator = FACT_SEPARATOR.trim();
@@ -35521,16 +36160,21 @@ fn line_pieces(text: &str) -> Vec<(&str, &str)> {
 /// `text`'s lines in a box `width` wide, each as full as the box holds,
 /// measured by `measure` (the face and size the lines paint in): broken
 /// between its pieces ([`line_pieces`]), and inside a piece only where the
-/// piece alone is wider than the box — at the box's own width, so no line
-/// paints past it, each line a piece breaks ending in a hyphen that says the
-/// word goes on ("Architec-" / "ture"). Nothing is cut and nothing is
+/// piece alone is wider than the box, where a typesetter would break it
+/// ([`aterm_grapheme::break_inside`]) — a word at its syllables, each line
+/// it breaks ending in a hyphen that says the word goes on ("Archi-" /
+/// "tecture"); an identifier (a path's folder, a host, a version, a hash)
+/// at its own joints with no mark (`alab` / `.systems`); and only where
+/// neither fits at a character (a word with its hyphen, an identifier with
+/// none) — so no line paints past the box. Nothing is cut and nothing is
 /// dropped.
 fn wrap_to_box(text: &str, width: f32, measure: &dyn Fn(&str) -> f32) -> Vec<String> {
     wrap_to_box_marked(text, width, measure, "-")
 }
 
-/// [`wrap_to_box`] whose lines inside a piece end in `mark` — none for a
-/// code identifier, where a hyphen would read as one of its characters.
+/// [`wrap_to_box`] whose syllable breaks end in `mark` — none for code (a
+/// commit, a build, an aterm.toml key), which breaks as an identifier
+/// wherever it is broken, even where a part of it reads as a word.
 fn wrap_to_box_marked(
     text: &str,
     width: f32,
@@ -35571,56 +36215,71 @@ fn wrap_to_box_from(
             line = candidate;
             continue;
         }
+        let mut start = at(piece);
+        let end = start + piece.len();
         if !line.is_empty() {
+            // A piece no whole line holds fills this line first where a
+            // typesetter would ([`aterm_grapheme::break_into_line`]): a
+            // word with the syllables that fit there ("a trans-" /
+            // "lucent", where on a line of its own it left "a" alone before
+            // it), an identifier at a joint where its rest is then whole.
+            // So does a word of prose after A LINE OF ONE LETTER, which
+            // holds a syllable of it: a note at 2× text in a 22-column card
+            // painted "A" alone on a line, "A program's" too wide for one
+            // ("A pro-" / "gram's colors").
+            let after_a_lone_letter = is_a_lone_letter(&line)
+                && aterm_grapheme::token_kind(piece.split_whitespace().next().unwrap_or(piece))
+                    == aterm_grapheme::TokenKind::Word;
+            if (!fits(piece) || after_a_lone_letter)
+                && let Some((rest, part)) = aterm_grapheme::break_into_line(
+                    text,
+                    start..end,
+                    mark,
+                    &|part| fits(&format!("{line}{joiner}{part}")),
+                    &fits,
+                )
+            {
+                line.push_str(joiner);
+                line.push_str(&part);
+                start = rest;
+            }
             lines.push((line_at, std::mem::take(&mut line)));
         }
-        if fits(piece) {
-            line = piece.to_string();
-            line_at = at(piece);
+        if fits(&text[start..end]) {
+            line = text[start..end].to_string();
+            line_at = start;
             continue;
         }
-        // A piece wider than the whole box breaks inside itself, grapheme
-        // by grapheme, at the box's width, its mark included — and leaves
-        // its last line three graphemes where the line before can spare
-        // them, never a lone letter ("hardene-" / "d,").
-        let graphemes = piece.graphemes().collect::<Vec<_>>();
-        let mut chunks: Vec<Vec<&str>> = vec![Vec::new()];
-        for (index, grapheme) in graphemes.iter().enumerate() {
-            let last = index + 1 == graphemes.len();
-            let chunk = chunks.last_mut().expect("one chunk");
-            let candidate = format!(
-                "{}{grapheme}{}",
-                chunk.concat(),
-                if last { "" } else { mark }
-            );
-            if chunk.is_empty() || fits(&candidate) {
-                chunk.push(grapheme);
-            } else {
-                chunks.push(vec![grapheme]);
-            }
-        }
-        if let [.., before, tail] = chunks.as_mut_slice() {
-            while tail.len() < 3 && before.len() > 3 {
-                let moved = before.pop().expect("more than three");
-                tail.insert(0, moved);
-                if !fits(&tail.concat()) {
-                    before.push(tail.remove(0));
-                    break;
-                }
-            }
-        }
-        let tail = chunks.pop().expect("one chunk");
-        lines.extend(chunks.into_iter().map(|chunk| {
-            let start = chunk.first().map_or(at(piece), |grapheme| at(grapheme));
-            (start, format!("{}{mark}", chunk.concat()))
-        }));
-        line_at = tail.first().map_or(at(piece), |grapheme| at(grapheme));
-        line = tail.concat();
+        // A piece wider than the whole box breaks inside itself where a
+        // typesetter would ([`aterm_grapheme::break_inside`]): a word at its
+        // syllables, with the mark; an identifier (a path's folder, a host,
+        // a version, a hash) at its own joints, with none; and only where
+        // neither fits at a character, never a lone letter. Broken wherever
+        // the box ended it read "Brightn-" / "ess", "alab.syst-" / "ems"
+        // and "0.11.0+g205-" / "65c325".
+        let mut broken = aterm_grapheme::break_inside(text, start..end, mark, &fits);
+        let (tail_at, tail) = broken.pop().unwrap_or((start, String::new()));
+        lines.extend(broken);
+        line_at = tail_at;
+        line = tail;
     }
     if !line.is_empty() || lines.is_empty() {
         lines.push((line_at, line));
     }
     lines
+}
+
+/// Whether `line` is one letter alone ("A", "I"), a hole in a paragraph a
+/// typesetter fills with a syllable of the word after it ([`wrap_to_box`]).
+/// East Asian text, whose every character is a word, has no such line.
+fn is_a_lone_letter(line: &str) -> bool {
+    let mut graphemes = line.trim().graphemes();
+    matches!(
+        (graphemes.next(), graphemes.next()),
+        (Some(one), None) if one.chars().all(|c| {
+            c.is_alphabetic() && !crate::tray_raster::is_east_asian(c)
+        })
+    )
 }
 
 /// Whether every piece of `text` ([`line_pieces`]) is whole in a box `width`
@@ -35708,9 +36367,14 @@ impl FactColumns {
 /// wide, never cut: whole where it fits; a non-code value wrapped at its own
 /// " · " separators where each part it joins is whole on a line, else at its
 /// pieces ([`wrap_to_box`]) — the About compiler row once painted "release ·
-/// tr…", chopping `trust_verify` in half (2026-08 settings audit); a code
-/// identifier (a commit, a build) on as many lines as its characters take,
-/// with no hyphen to read as one of them. A code value used to keep its two
+/// tr…", chopping `trust_verify` in half (2026-08 settings audit) — its
+/// identifiers (a version, a host, a path, a signature) broken at their own
+/// joints with no hyphen put in them, whatever the fact's name
+/// ([`aterm_grapheme::break_inside`] reads the text: "0.11.0" /
+/// "+g20565c325", "alab" / ".systems", where a hyphen made "alab.syst-" /
+/// "ems"); a code identifier (a commit, a build, in the code face) on as
+/// many lines as its characters take, with no hyphen to read as one of
+/// them. A code value used to keep its two
 /// ends and lose its middle, and a phone-width column at 2× text painted
 /// the build number "179…328" and the commit "6e8…73a".
 fn metadata_value_lines(label: &str, value: &str, value_width: f32) -> Vec<String> {
@@ -36963,16 +37627,38 @@ fn painted_words(visual: &str) -> String {
 }
 
 /// [`button_words`] for a button that wears what `spec` does beside its
-/// words (a trailing arrow, a chip, a badge), whose room it takes.
+/// words (a trailing arrow, a chip, a badge), whose room it takes. Where no
+/// form is whole, each form WITHOUT ITS TRAILING "…", whole, before a word
+/// of one is broken: the ellipsis only says the button asks for more (its
+/// name says what it does), and glued to the word before it, it made that
+/// word too wide — a 22-column window at 2× text broke a word that fits
+/// whole, Choose… painting "Choo-" / "se…" where "Choose" fits.
 fn button_words_in(spec: &ButtonSpec, full: &str, short: &[&str], width: f32) -> (String, usize) {
-    whole_button_words_in(spec, full, short, width).unwrap_or_else(|| {
-        // A word of every form wider than the button: the shortest form with
-        // that word broken by a hyphen ([`wrap_to_box`]), never cut.
-        let shortest = short.last().copied().unwrap_or(full);
-        let room = crate::native_ui::text_button_label_room(spec, width);
-        let lines = wrap_to_box(shortest, room, &crate::native_ui::native_button_label_width);
-        (lines.join("\n"), lines.len())
-    })
+    fn bare(form: &str) -> Option<&str> {
+        form.strip_suffix('\u{2026}')
+            .map(str::trim_end)
+            .filter(|bare| !bare.is_empty())
+    }
+    let bare_short: Vec<&str> = short.iter().filter_map(|form| bare(form)).collect();
+    let without_ellipsis = || {
+        let (full, short) = match bare(full) {
+            Some(full) => (full, &bare_short[..]),
+            None => bare_short
+                .split_first()
+                .map(|(first, rest)| (*first, rest))?,
+        };
+        whole_button_words_in(spec, full, short, width)
+    };
+    whole_button_words_in(spec, full, short, width)
+        .or_else(without_ellipsis)
+        .unwrap_or_else(|| {
+            // A word of every form wider than the button: the shortest form with
+            // that word broken by a hyphen ([`wrap_to_box`]), never cut.
+            let shortest = short.last().copied().unwrap_or(full);
+            let room = crate::native_ui::text_button_label_room(spec, width);
+            let lines = wrap_to_box(shortest, room, &crate::native_ui::native_button_label_width);
+            (lines.join("\n"), lines.len())
+        })
 }
 
 /// [`button_words`], or `None` where no form of the label is whole in a
@@ -39446,7 +40132,7 @@ impl MessagesLead {
         lead.stacked = lead.title_x() + MESSAGES_CHEVRON_END > content_width * 0.6;
         if lead.stacked {
             let beside = content_width - lead.mark - lead.gap - MESSAGES_CHEVRON_END;
-            let under = content_width - lead.gap - MESSAGES_CHEVRON_END;
+            let under = messages_stacked_width(content_width, lead);
             if whens.iter().any(|when| width(when) > beside + 0.01) {
                 lead.when_lines = whens
                     .iter()
@@ -39490,6 +40176,22 @@ thread_local! {
 /// The room a head keeps clear at its end for the disclosure's chevron.
 const MESSAGES_CHEVRON_END: f32 = 36.0;
 
+/// The end a stacked head's lines under its first row keep, as the open
+/// entry's body keeps it.
+const MESSAGES_STACKED_END: f32 = 12.0;
+
+/// HOW WIDE A STACKED HEAD'S LINES UNDER ITS FIRST ROW ARE (its title, and
+/// its `when` where that is too wide beside the mark): the row from the gap
+/// they start after to its 12pt end. The chevron stands on the first row,
+/// beside the mark and `when` ([`crate::native_ui::ButtonSpec::chevron_row`]),
+/// so these lines run past where it is. Keeping its 36pt end on every line
+/// (the chevron drawn once, at the head's middle) cost "Antigravity" its
+/// line in a 22-column window at 2× text: "Antigrav-" / "ity CLI is" /
+/// "not…", the title cut to the head's lines.
+fn messages_stacked_width(content_width: f32, lead: MessagesLead) -> f32 {
+    (content_width - lead.gap - MESSAGES_STACKED_END).max(24.0)
+}
+
 /// AN ENTRY'S TITLE AS ITS HEAD PAINTS IT, and whether that cut it: on one
 /// line, fitted to the title's column (ruling 262); stacked, on the head's
 /// title lines across the row, the last cut only where the title needs more
@@ -39506,7 +40208,7 @@ fn messages_head_title(
         let cut = shown != entry.title;
         return (vec![shown], cut);
     }
-    let under = (content_width - lead.gap - MESSAGES_CHEVRON_END).max(24.0);
+    let under = messages_stacked_width(content_width, lead);
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
     let mut lines = wrap_to_box_from(
         &entry.title,
@@ -39567,6 +40269,10 @@ fn messages_head_node(
             Control::new(
                 ButtonSpec {
                     description: Some(messages_description(entry, now_unix_ms)),
+                    // A stacked head's chevron on its first row, beside the
+                    // mark and `when`: the title's lines under it run to the
+                    // row's end ([`messages_stacked_width`]).
+                    chevron_row: lead.stacked.then(|| row_h.round() as u16),
                     ..ButtonSpec::new(entry.title.clone()).visual_label(String::new())
                 },
                 ActionId::new(title_key),
@@ -39624,11 +40330,12 @@ fn messages_head_node(
     .paint_only();
     let when = clock.when(entry.at_unix_ms);
     let visual = if lead.stacked {
-        // The mark and `when` over the title, which has the row less the
-        // chevron's end: `when` beside the mark where the log's words fit
-        // there, else on its own lines under it, whole.
+        // The mark and `when` over the title, which has the row to its end
+        // (the chevron stands on the first row): `when` beside the mark
+        // where the log's words fit there, else on its own lines under it,
+        // whole.
         let line_h = messages_line_height();
-        let under = (content_width - lead.gap - MESSAGES_CHEVRON_END).max(24.0);
+        let under = messages_stacked_width(content_width, lead);
         let pad = Insets {
             top: 0.0,
             right: 0.0,
@@ -41838,7 +42545,9 @@ fn registry_switch_row(
         |timing| format!("{}{FACT_SEPARATOR}{timing}", field.label),
     );
     // The row's note, then why it is held back; never the config key.
-    let mut description = prefs::footnote_of(key).unwrap_or_default().to_string();
+    let mut description = row_footnote(state, key)
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or_default();
     for note in &effect.notes {
         semantic_label.push_str(FACT_SEPARATOR);
         semantic_label.push_str(&note.semantic);

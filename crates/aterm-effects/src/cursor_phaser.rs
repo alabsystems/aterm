@@ -50,6 +50,7 @@ const BASE_DARK_THEME: u32 = 0x00FF_FFFF;
 /// ([`crate::cursor_beam::LIGHT_EMITTER_CONTRAST`]), so it reads as the
 /// emitter rather than a drab near-black. The host still floors it against
 /// the cell it sits on.
+#[inline]
 fn light_emitter_fill(hue: f32, e: f32) -> u32 {
     let clean = hsv2rgb(crate::color_math::light_spectrum_hue(hue), 1.0, 1.0);
     crate::color_math::floor_contrast_keeping_hue(

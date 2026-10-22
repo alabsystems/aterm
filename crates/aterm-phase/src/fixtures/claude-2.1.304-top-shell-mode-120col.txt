@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · `!` then `ls` typed into the empty composer, fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1): shell mode draws the caret as `!` + U+00A0 in place of `❯` + U+00A0, both composer rules and the caret in fg #fd5db1, and the row under the bottom rule reads `! for shell mode` (#fd5db1) in place of the mode pill
+  Updated to latest. Got 66 features, 424 bugfixes, and 126 other changes.
+  code.claude.com/docs/en/changelog for details
+
+
+❯ /effort workspace on
+  ⎿  Workspace on (this session only): dynamic workflows on every task. Effort stays medium.
+
+❯ /effort workspace off
+  ⎿  Workspace off. Effort stays medium.
+
+❯ /model
+  ⎿  Kept model as Opus 5.5 (default)
+
+❯ /effort
+  ⎿  Cancelled
+
+❯ /model haiku
+  ⎿  Set model to Haiku 5.5 and saved as your default for new sessions
+
+❯ /effort workspace on
+  ⎿  Workspace on (this session only): dynamic workflows on every task. Effort stays medium.
+
+❯ /effort workspace off
+  ⎿  Workspace off. Effort stays medium.
+
+❯ /model claude-sonnet-4-5
+  ⎿  Set model to Sonnet 4.5 and saved as your default for new sessions
+
+❯ /effort workspace on
+  ⎿  Workspace isn't available on claude-sonnet-4-5. Valid options are: low, medium, high, xhigh, max, auto
+
+❯ /model default
+  ⎿  Set model to Opus 5.5 (default) and saved as your default for new sessions
+
+⏺ Unknown command: /vim
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+! ls
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ! for shell mode

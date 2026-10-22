@@ -12,16 +12,15 @@
 //! action presses forward through Claude's cycle to the nearest of them, never
 //! away from one.
 //!
-//! THE OVERRIDE, FOR A MARK THAT IS NOT A LIGHT (owner, 2026-10-15: "I need
-//! some visual indicator that the claude code session is being wrapped and a
-//! way to toggle on and off to show the improvement";
+//! THE OVERRIDE, FOR ONE MARK THAT IS NOT A LIGHT (owner, 2026-10-15: "I
+//! need some visual indicator that the claude code session is being wrapped
+//! and a way to toggle on and off to show the improvement";
 //! `docs/DESIGN-harness-autopilot-2026-10-15.md` §2.3). The host draws the
 //! session's Autopilot chip beside the light AT REST, whenever its footer
-//! draws and a harness host exists; no settings button stands beside it
-//! (owner, 2026-10-20: "remove the harness settings button in the UX"). It is
-//! aterm's own state, read from nothing Claude Code draws, so it is the
-//! host's chip and never a [`Light`]; the permission-mode light STAYS
-//! DEVIATIONS ONLY.
+//! draws and a harness host exists (the `⚙` once beside it is gone: owner,
+//! 2026-10-19, "remove the settings button in the harness"). It is aterm's
+//! own state, read from nothing Claude Code draws, so it is the host's chip
+//! and never a [`Light`]; the permission-mode light STAYS DEVIATIONS ONLY.
 //!
 //! aterm keeps no copy of the vendor's setting that could disagree with it: the
 //! light is read from the mode pill (`footer::PILLS`) and toggled by shift+tab;
@@ -146,6 +145,36 @@ impl Mode {
         }
     }
 
+    /// The mode's word where Claude's pill reads aterm's words on the glass
+    /// (`relabelled`: the host relabelled the pill this frame, drawing
+    /// [`footer::YOLO_ON`] over the bypass pill and [`footer::YOLO_OFF`] over
+    /// manual mode's, under its relabel gate and only where the glass took
+    /// it): the light beside the pill names the state as the pill does, so
+    /// one state has one name on screen. Bypass and manual take the pill's
+    /// label there; every other mode, and every pill left as Claude drew it,
+    /// its own [`Self::word`].
+    #[must_use]
+    pub fn word_on_glass(self, relabelled: bool) -> &'static str {
+        match self {
+            Mode::Bypass if relabelled => footer::YOLO_ON,
+            Mode::Manual if relabelled => footer::YOLO_OFF,
+            _ => self.word(),
+        }
+    }
+
+    /// How a title names the mode as a place (`stopped in plan mode`): the
+    /// word and ` mode`, but a relabelled pill's label alone (`stopped in
+    /// YOLO off`), which is a state already ([`Self::word_on_glass`]).
+    #[must_use]
+    pub fn named_on_glass(self, relabelled: bool) -> std::borrow::Cow<'static, str> {
+        let word = self.word_on_glass(relabelled);
+        if word == self.word() {
+            format!("{word} mode").into()
+        } else {
+            word.into()
+        }
+    }
+
     /// The pill glyph Claude draws before the mode, from the vendor's table
     /// (`footer::PILLS`): `⏸` for plan and manual, `⏵⏵` for the rest.
     #[must_use]
@@ -182,6 +211,11 @@ pub struct Screen {
     pub pill: bool,
     /// Claude is mid-turn (`aterm_phase::phase::busy_signal`, hard).
     pub busy: bool,
+    /// The pill stands after vim INSERT's indicator (`footer::vim_insert`:
+    /// `  -- INSERT -- ⏵⏵ auto mode on …`, MEASURED on 2.1.304): the pill
+    /// names its mode as on any mode row, and the composer takes keys
+    /// through vim.
+    pub vim_insert: bool,
 }
 
 /// Read `rows` (one pane, top to bottom). `None` without a composer frame.
@@ -193,7 +227,14 @@ pub fn read_screen(rows: &[String]) -> Option<Screen> {
     // working`, `esc to interrupt`, …); a background monitor alone (`soft`) is
     // not a turn.
     let busy = aterm_phase::phase::busy_signal(rows).is_some_and(|b| !b.soft);
-    Some(Screen { mode, pill, busy })
+    let vim_insert =
+        footer::pill_row_under(rows, bottom).is_some_and(|r| footer::vim_insert(&rows[r]));
+    Some(Screen {
+        mode,
+        pill,
+        busy,
+        vim_insert,
+    })
 }
 
 /// What the lights show of `rows`: [`read`] of [`read_screen`], without the
@@ -356,6 +397,31 @@ mod tests {
             assert_eq!(s.mode, Some(mode), "{row:?}");
             let r = read(Some(&s));
             assert_eq!(deviates(Light::Mode, &r), !mode.is_expected(), "{row:?}");
+        }
+    }
+
+    /// THE LIGHT NAMES THE STATE AS THE PILL DOES (review C8): under the
+    /// relabel's gate bypass reads `YOLO on` and manual `YOLO off`, the pill's
+    /// own labels, and a title names them as states (`YOLO off`, no `mode`
+    /// after it). NEGATIVE CONTROL: outside the gate, and for every other mode
+    /// inside it, the light keeps Claude's word.
+    #[test]
+    fn the_lights_word_follows_the_pill_relabel_and_only_under_its_gate() {
+        assert_eq!(Mode::Bypass.word_on_glass(true), footer::YOLO_ON);
+        assert_eq!(Mode::Manual.word_on_glass(true), footer::YOLO_OFF);
+        assert_eq!(Mode::Manual.named_on_glass(true), "YOLO off");
+        assert_eq!(Mode::Bypass.word_on_glass(false), "bypass");
+        assert_eq!(Mode::Manual.word_on_glass(false), "manual");
+        assert_eq!(Mode::Manual.named_on_glass(false), "manual mode");
+        for mode in [Mode::Auto, Mode::AcceptEdits, Mode::DontAsk, Mode::Plan] {
+            for relabelled in [true, false] {
+                assert_eq!(mode.word_on_glass(relabelled), mode.word(), "{mode:?}");
+                assert_eq!(
+                    mode.named_on_glass(relabelled),
+                    format!("{} mode", mode.word()),
+                    "{mode:?}"
+                );
+            }
         }
     }
 

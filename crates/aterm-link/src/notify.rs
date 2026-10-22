@@ -1446,7 +1446,17 @@ impl Notifier {
             let key = sel.key();
             let mut from = self.start_offset(&mut conn, &sel)?;
             loop {
-                let (rows, (next, head)) = conn.fetch(from, &filter, PAGE)?;
+                // A retaining broker refuses a cursor below what the selector
+                // still keeps: the scan reads on from there and says so.
+                let ((rows, (next, head)), floor) =
+                    transport::fetch_kept(&mut conn, from, &filter, PAGE)?;
+                if let Some(floor) = floor {
+                    eprintln!(
+                        "aterm-link notify: {}: the broker's retention gave up the records \
+                         below @{floor} (from @{from}); reading on from there",
+                        sel.label()
+                    );
+                }
                 // The page's own mark: how far the broker was durable when it
                 // read it. A broker new enough to serve ordered always says;
                 // one that did not would be paged, never withheld.
@@ -1663,14 +1673,28 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, root: &Path, tx: &mpsc::SyncSende
                 backoff.attached(Instant::now());
                 let mut closed = false;
                 loop {
-                    let (rows, (next, head)) = match conn.fetch(from, &filter, PAGE) {
-                        Ok(page) => page,
-                        Err(e) => {
-                            eprintln!("aterm-link notify: {} catch-up ended: {e}", sel.label());
-                            closed = true;
-                            break;
-                        }
-                    };
+                    // A cursor below what the broker's retention keeps reads on
+                    // from its floor, said: refused, it would be refused again
+                    // at every redial.
+                    let (rows, (next, head)) =
+                        match transport::fetch_kept(&mut conn, from, &filter, PAGE) {
+                            Ok((page, floor)) => {
+                                if let Some(floor) = floor {
+                                    eprintln!(
+                                        "aterm-link notify: {}: the broker's retention gave up \
+                                         the records below @{floor} (from @{from}); reading on \
+                                         from there",
+                                        sel.label()
+                                    );
+                                }
+                                page
+                            }
+                            Err(e) => {
+                                eprintln!("aterm-link notify: {} catch-up ended: {e}", sel.label());
+                                closed = true;
+                                break;
+                            }
+                        };
                     for (off, subject, body) in rows {
                         if tx.send(Notice::Record(idx, off, subject, body)).is_err() {
                             return; // the executor is gone
@@ -2657,6 +2681,54 @@ mod tests {
         // Before the dir goes, while their names still reach the acceptors.
         server_a.shutdown();
         server_b.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A CURSOR BELOW A RETAINING BROKER'S FLOOR READS ON FROM IT** (session
+    /// log Phase 6 step 6E-2). Three escalations at offsets 0, 1 and 2, the log
+    /// then cut below 1; a first run from the start reads from 0, below what the
+    /// broker keeps. The two it kept fire and the catch-up ends well, never a
+    /// refusal each run repeats for ever. NEGATIVE CONTROL, run: the plain
+    /// `fetch` the scan made before is refused `retained-from=1`, and the
+    /// catch-up with it.
+    #[cfg(unix)]
+    #[test]
+    fn a_catch_up_below_the_retained_floor_reads_on_from_it() {
+        let dir = scratch("kept");
+        let base = PathBuf::from(&dir);
+        std::fs::create_dir_all(&base).expect("scratch");
+        let broker = crate::test_broker(base.join("b.log")).unwrap();
+        let sock = base.join("b.sock");
+        let mut server = broker.serve(&sock).unwrap();
+        let (mut conn, _) = transport::connect(&sock.to_string_lossy(), ACK_DEADLINE).unwrap();
+        for (seq, sid) in [(1, "s-a"), (2, "s-b"), (3, "s-c")] {
+            let subject = format!("/f/f1/pub/n-a/{sid}/presence");
+            let (off, _) = conn
+                .publish(7, seq, &subject, b"v=1 t=1 attention=help")
+                .unwrap();
+            assert_eq!(off, seq - 1);
+        }
+        broker.retain_before(1).expect("the cut");
+        let fired = base.join("fired");
+        let mut c = cfg(&dir);
+        c.broker = sock.to_string_lossy().into_owned();
+        c.since = Since::Start;
+        c.limit = 10;
+        c.exec = format!(
+            "printf '%s\\n' \"$ATERM_NOTIFY_OFFSET\" >> {}",
+            fired.display()
+        );
+        Notifier::new(c)
+            .expect("open")
+            .catch_up()
+            .expect("the catch-up reads on from the floor");
+        let offsets = std::fs::read_to_string(&fired).unwrap_or_default();
+        assert_eq!(
+            offsets.lines().collect::<Vec<_>>(),
+            ["1", "2"],
+            "the escalations the broker kept fire"
+        );
+        server.shutdown();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

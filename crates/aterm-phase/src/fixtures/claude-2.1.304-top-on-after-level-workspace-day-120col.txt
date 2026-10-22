@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a session launched with `--effort workspace` on the Aterm Day (light) ground, fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1), Claude's theme `dark`, after `/effort high` (answered `Set effort level to high (saved as your default for new sessions): …`, with no key suffix), `/effort workspace on` (answered `… Effort stays high.`) and `/effort auto` (answered `Effort level set to auto`): the ` workspace ` tag stayed on the top rule through both level changes; the stand-in `workspace` replaces the vendor's top effort key throughout
+
+ ▐▛███▛█▄╱✦  Claude Code v2.1.304
+▝▜██████▘    Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝     /private/tmp/at.WvqS/proj
+
+
+❯ /effort high
+  ⎿  Set effort level to high (saved as your default for new sessions): Comprehensive implementation with extensive
+     testing and documentation
+
+❯ /effort workspace on
+  ⎿  Workspace on (this session only): dynamic workflows on every task. Effort stays high.
+
+❯ /effort auto
+  ⎿  Effort level set to auto
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── workspace ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)

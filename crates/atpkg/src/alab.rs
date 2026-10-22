@@ -66,6 +66,9 @@ pub struct AlabAgent {
     pub targets: &'static [&'static str],
     /// The product's own name, for the lines that say where a build came from.
     pub product: &'static str,
+    /// The upstream repository the product is built from, as a release page names it
+    /// ([`Upstream::release_line`]).
+    pub upstream: &'static str,
 }
 
 impl AlabAgent {
@@ -82,6 +85,7 @@ pub const ALAB_AGENTS: &[AlabAgent] = &[AlabAgent {
     repo: "codex-alab",
     targets: &["aarch64-apple-darwin"],
     product: "codex-alab",
+    upstream: "openai/codex",
 }];
 
 /// The row for `program`, or `None` for a program ALab does not build.
@@ -214,18 +218,26 @@ fn alab_root_of_exe(exe: &Path) -> Option<PathBuf> {
 }
 
 /// The upstream Codex an ALab build is based on, as its [`ALAB_BUILD_JSON`] records it:
-/// `"upstream": {"release": "rust-v0.163.0", "commit": "<40 hex>", "commit_date": "…"}`,
-/// the values `alab/package.sh` computes for `CODEX_ALAB_UPSTREAM_VERSION` (the newest
-/// stable upstream tag whose branch point the build has merged) and
-/// `CODEX_ALAB_UPSTREAM_COMMIT` (the upstream commit it merged last). Read off the record,
-/// never by running the binary; a package from before the field, or one whose field does
-/// not hold both facts in that shape, has none. `commit_date` is optional and not said.
+/// `"upstream": {"release": "rust-v0.163.0", "commits_since_release": 241, "commit": "<40
+/// hex>", "commit_date": "2026-10-20T13:50:13Z"}`, the values `alab/package.sh` computes for
+/// `CODEX_ALAB_UPSTREAM_VERSION` (the newest stable upstream tag whose branch point the build
+/// has merged), `CODEX_ALAB_UPSTREAM_COMMIT` (the upstream commit it merged last), the
+/// commits upstream's main carries from that branch point to it, and that commit's UTC
+/// committer date. Read off the record, never by running the binary; a package from before
+/// the field, or one whose field does not hold the release and the commit in that shape, has
+/// none. The count and the date are optional (packages from 2026-10-21 carry no count), but
+/// either one present in another shape makes the whole field none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Upstream {
     /// The upstream release tag, verbatim (`rust-v0.163.0`).
     pub release: String,
     /// The upstream commit merged, 40 lowercase hex digits.
     pub commit: String,
+    /// How many commits upstream's main carries from the release's branch point to
+    /// `commit`, when the record says.
+    pub since: Option<u64>,
+    /// The UTC day `commit` was committed (`2026-10-20`), when the record says.
+    pub day: Option<String>,
 }
 
 impl Upstream {
@@ -239,14 +251,36 @@ impl Upstream {
             &self.commit[..UPSTREAM_SHORT_COMMIT]
         )
     }
+
+    /// The line a release page names the base with, as codex-alab's `alab/package.sh
+    /// --upstream-base` prints it for the source release: `Based on upstream openai/codex
+    /// rust-v0.163.0 + 241 commits (0123456789ab, 2026-10-20)`, `repo` the upstream
+    /// ([`AlabAgent::upstream`]). The count and the day are said only when the record holds
+    /// them.
+    #[must_use]
+    pub fn release_line(&self, repo: &str) -> String {
+        let since = self.since.map_or_else(String::new, |n| {
+            format!(" + {n} {}", if n == 1 { "commit" } else { "commits" })
+        });
+        let day = self
+            .day
+            .as_ref()
+            .map_or_else(String::new, |day| format!(", {day}"));
+        format!(
+            "Based on upstream {repo} {}{since} ({}{day})",
+            self.release,
+            &self.commit[..UPSTREAM_SHORT_COMMIT]
+        )
+    }
 }
 
 /// How many digits of the upstream commit [`Upstream::words`] says.
 const UPSTREAM_SHORT_COMMIT: usize = 12;
 
 /// One `alab-build.json`'s [`Upstream`]: `None` unless `upstream` is an object whose
-/// `release` is a short printable name and whose `commit` is a full 40-digit hex sha. Never
-/// a partial answer from a malformed record.
+/// `release` is a short printable name and whose `commit` is a full 40-digit hex sha, and
+/// whose `commits_since_release` (a count) and `commit_date` (`YYYY-MM-DDTHH:MM:SSZ`) are
+/// each absent or in that shape. Never a partial answer from a malformed record.
 #[must_use]
 pub fn parse_upstream(text: &str) -> Option<Upstream> {
     let v: aterm_json::Value = aterm_json::from_str(text).ok()?;
@@ -256,10 +290,34 @@ pub fn parse_upstream(text: &str) -> Option<Upstream> {
     let printable = |s: &str| s.chars().all(|c| c.is_ascii_graphic());
     let release_ok = !release.is_empty() && release.len() <= 128 && printable(release);
     let commit_ok = commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit());
+    let since = match upstream.get("commits_since_release") {
+        None => None,
+        Some(n) => Some(n.as_u64()?),
+    };
+    let day = match upstream.get("commit_date") {
+        None => None,
+        Some(date) => Some(utc_day(date.as_str()?)?),
+    };
     (release_ok && commit_ok).then(|| Upstream {
         release: release.to_string(),
         commit: commit.to_ascii_lowercase(),
+        since,
+        day,
     })
+}
+
+/// The day of a UTC time as `alab/package.sh` records one (`2026-10-20T13:50:13Z`), or
+/// `None` for any other shape.
+fn utc_day(time: &str) -> Option<String> {
+    let shaped = time.len() == 20
+        && time.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            10 => b == b'T',
+            13 | 16 => b == b':',
+            19 => b == b'Z',
+            _ => b.is_ascii_digit(),
+        });
+    shaped.then(|| time[..10].to_string())
 }
 
 /// The [`Upstream`] the ALab package at `root` records ([`is_alab_package`], its record

@@ -3,11 +3,12 @@
 
 //! THE BUS MIRROR, GUI HALF (`docs/DESIGN-session-log-2026-10-15.md` §5.5,
 //! session log phase 4): the two bridge-only verbs a bridge mirrors the
-//! session logs with, and what this process keeps for them. Built and OFF:
-//! a bridge sends `log-take` only when `[fabric] log = "turns"` and its
-//! `hello … log=turns` was acknowledged, and both verbs are refused unless
-//! the owning bridge's RECORDED hello said so; with the default no log is
-//! engaged (`aterm_slog::Log::mirror_landed` stays `None`), no record, carry
+//! session logs with, and what this process keeps for them. A bridge sends
+//! `log-take` only when its `hello … log=turns` was acknowledged (`[fabric]
+//! log = "turns"`, or the default `"auto"` once it has attached to a broker
+//! that retains its node's `ev` faces, session log Phase 6 step 6E-3), and
+//! both verbs are refused unless the owning bridge's RECORDED hello said so;
+//! while no bridge has asked no log is engaged (`aterm_slog::Log::mirror_landed` stays `None`), no record, carry
 //! byte or reply changes, and no lock of the mirror's own is taken: each
 //! path a default instance reaches (`fabric status`, a recorded `hello`, a
 //! replaced bus log, an update's draw, its Commit's reading, its stand-down)
@@ -17,7 +18,9 @@
 //!
 //! - **While the node mirrors** ([`Shared::served`]: a recorded `hello …
 //!   log=turns`, sticky across the bridge's restarts until a recorded hello
-//!   without it; a seamless predecessor's manifest seeds it) EVERY log is
+//!   without `log=`, or an `auto` bridge's `link mirror unretained`; an
+//!   `auto` hello leaves it as it was; a seamless predecessor's manifest
+//!   seeds it) EVERY log is
 //!   engaged, lazily under its own lock — at a take, at its export, at its
 //!   close ([`sync`]) — so a session whose whole life falls where no take
 //!   runs (a broker outage, the bridge's restart backoff, before the first
@@ -95,7 +98,9 @@ const MIRROR_OFF: &str = "ERR mirror off: the bridge's recorded hello did not sa
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
     /// The node mirrors: a recorded `hello … log=turns` set it (sticky across
-    /// the bridge's restarts), a recorded hello without it cleared it.
+    /// the bridge's restarts), a recorded hello without `log=` or an `auto`
+    /// bridge's `link mirror unretained` cleared it
+    /// (`fabric::bridge_mirror_word`).
     served: AtomicBool,
     /// Bumped each time the bus log is replaced (`link log` `forgot=1`).
     generation: AtomicU64,
@@ -528,7 +533,9 @@ impl StoreMirror {
     /// session's tail or tombstone held while the owning bridge's recorded
     /// hello does not ask for the mirror (` mirror=unserved tails=<k>
     /// tombstones=<j>`), and nothing otherwise — with no lock, the link's
-    /// included, while nothing is retained.
+    /// included, while nothing is retained. Under an `auto` hello the line
+    /// already says `mirror=` (`bridge_log=auto mirror=<state>`, session log
+    /// Phase 6 step 6E-3), so it says ` tails=<k> tombstones=<j>` alone.
     pub(crate) fn unserved_facts(&self) -> String {
         if !self.shared.cursors() || crate::fabric::bridge_mirrors_logs() {
             return String::new();
@@ -537,8 +544,13 @@ impl StoreMirror {
         if r.tails.is_empty() && r.tombstones.is_empty() {
             return String::new();
         }
+        let lead = if crate::fabric::fabric_mirror_facts().is_empty() {
+            " mirror=unserved"
+        } else {
+            ""
+        };
         format!(
-            " mirror=unserved tails={} tombstones={}",
+            "{lead} tails={} tombstones={}",
             r.tails.len(),
             r.tombstones.len()
         )

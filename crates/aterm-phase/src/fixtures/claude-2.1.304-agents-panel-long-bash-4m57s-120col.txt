@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab), bypass mode (`--dangerously-skip-permissions`), fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1) · the same panel 4 m 57 s in, 3 s before the call's `sleep 300` ends (its tool_result was written at 300.26 s, and the agent finished at 5 m 0 s, its row gone): `long probe` alone, its tokens still `↓ 6.2k`; `bg probe` finished at 3 m 20 s (its background sleep's end) and left the panel
+❯ toolstart
+
+⏺ Agent(long probe)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Agent(quick probe)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Agent(bg probe)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Tool call done.
+
+✻ Waiting for 3 background agents to finish
+
+⏺ Agent "bg probe" is waiting on its own background work · 0s
+
+⏺ Tool call done.
+
+✻ Waiting for 2 background agents to finish
+
+⏺ Agent "quick probe" finished · 2s
+
+⏺ Tool call done.
+
+✻ Waiting for 1 background agent to finish
+
+⏺ Agent "bg probe" finished · 3m 20s
+
+⏺ Tool call done.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ↓ to manage
+
+  ⏺ main
+  ◯ general-purpose  long probe                                                                 4m 57s · ↓ 6.2k tokens
+
+

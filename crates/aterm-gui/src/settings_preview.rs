@@ -335,12 +335,24 @@ impl CursorPreviewSpec {
     /// changing the broad style without also changing its raw
     /// token must not accidentally retain the default rainbow-pet semantics.
     ///
-    /// The trail's name as the Cursor Styles list says it: the style's row's.
+    /// The trail's name as the Cursor Styles list says it: the row of the
+    /// style it draws (a spelling aterm does not know draws the default, and
+    /// goes by its name: [`Self::unknown_trail_spelling`] says which).
     pub(crate) fn trail_style_label(&self) -> String {
+        let resolved = self.resolved_trail_style();
         crate::native_settings::setting_choice_label(
             crate::prefs::EDIT_CURSOR_TRAIL_STYLE,
-            self.effective_trail_style_raw(),
+            resolved
+                .canonical
+                .unwrap_or_else(|| self.effective_trail_style_raw()),
         )
+    }
+
+    /// The style spelling aterm.toml names where aterm does not know it: the
+    /// trail draws the default style instead.
+    pub(crate) fn unknown_trail_spelling(&self) -> Option<&str> {
+        let raw = self.effective_trail_style_raw();
+        (self.resolved_trail_style().unknown && !raw.is_empty()).then_some(raw)
     }
 
     /// AUTHORED, not resolved: this is the text the badge shows and the cache
@@ -1654,7 +1666,15 @@ impl SettingsPreviewSpec {
             }
             PreviewScene::CursorMotion => {
                 let trail = if spec.cursor.trail_enabled && spec.cursor.has_resolved_trail() {
-                    format!("{} trail", spec.cursor.trail_style_label())
+                    // What draws, by its name; an unknown spelling is said
+                    // as what it is, never as a style.
+                    match spec.cursor.unknown_trail_spelling() {
+                        Some(raw) => format!(
+                            "{} trail, since aterm.toml's \"{raw}\" is not a style",
+                            spec.cursor.trail_style_label()
+                        ),
+                        None => format!("{} trail", spec.cursor.trail_style_label()),
+                    }
                 } else if spec.cursor.trail_enabled && spec.cursor.momentum_glow {
                     // The typing glow is light on a dark ground and warm ink
                     // on a light one (`aterm_effects::cursor_momentum`): a
@@ -3101,8 +3121,10 @@ impl SettingsPreviewSpec {
         } else if key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE
             && raw.trim() == self.cursor.effective_trail_style_raw()
         {
-            // The style's name, as its row on Cursor Styles says it.
-            self.cursor.trail_style_label()
+            // The style's name, as its row on Cursor Styles says it, with an
+            // unknown spelling it stands in for ("Rainbow kitty (unknown
+            // "comett")").
+            crate::native_settings::cursor_style_name(raw)
         } else if key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE {
             crate::native_settings::setting_choice_label(key, raw)
         } else if key == crate::prefs::EDIT_MOTION {
@@ -4676,6 +4698,7 @@ impl CursorScene {
             self.cursor.cursor_color_pinned,
             self.cursor.color,
             self.cursor.accent.is_some(),
+            None,
         );
         let frame = fx.tick(
             &CursorFxInput {
@@ -8721,13 +8744,42 @@ mod tests {
         assert_eq!(
             cursor.effective_trail_style_raw(),
             "phasr",
-            "the badge keeps the authored spelling"
+            "the cache keys on the authored spelling"
         );
+        // Every word for it names the style it draws, and the spelling as
+        // what it is, never a sentence-cased "Phasr".
+        assert_eq!(cursor.trail_style_label(), "Rainbow kitty");
+        assert_eq!(cursor.unknown_trail_spelling(), Some("phasr"));
 
-        let spec = SettingsPreviewSpec::cursor(cursor).with_phase(900);
+        let spec = SettingsPreviewSpec::cursor(cursor.clone()).with_phase(900);
         assert_ne!(spec.animation(), PreviewAnimation::None);
         assert!(!spec.audit_value().contains("fails closed"));
         assert!(has_effect_light(&played(&spec, Theme::default())));
+        let spoken = spec.semantic_value();
+        assert!(
+            spoken.contains("Rainbow kitty trail, since aterm.toml's \"phasr\" is not a style"),
+            "{spoken}"
+        );
+        assert!(!spoken.contains("Phasr"), "{spoken}");
+        let focused = SettingsPreviewSpec::cursor(cursor)
+            .with_phase(900)
+            .with_focus(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, "phasr");
+        assert_eq!(
+            focused.candidate_badge(),
+            "Style: Rainbow kitty (unknown \"phasr\")"
+        );
+
+        // Negative control: a known alias goes by its own row's name.
+        for (alias, name) in [("comet", "Comet"), ("rainbow dog pet", "Rainbow dog")] {
+            let known = rainbow_cursor(alias);
+            let known = CursorPreviewSpec {
+                trail_style: PreviewTrailStyle::parse(alias),
+                trail_style_raw: Arc::from(alias),
+                ..known
+            };
+            assert_eq!(known.trail_style_label(), name, "{alias}");
+            assert_eq!(known.unknown_trail_spelling(), None, "{alias}");
+        }
     }
 
     /// A malformed or missing pack is no trail, never Lumen or another

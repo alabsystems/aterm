@@ -58,7 +58,7 @@ impl Drop for SecretsSheet {
 const TITLE: &str = "Connect secrets vault";
 
 fn informative() -> String {
-    "Connect this Mac to your secrets vault. Leave the password blank for approval from another Mac.".to_owned()
+    "Connect this Mac to your secrets vault. Leave the password blank to join an open vault at once, or to wait for approval from another Mac.".to_owned()
 }
 
 impl App {

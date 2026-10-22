@@ -217,6 +217,7 @@ pub enum CelebrationGesture {
 impl CelebrationGesture {
     /// The canonical riff-bar gesture: bar index plus the held character's
     /// song signature.
+    #[inline]
     #[must_use]
     pub fn riff_bar(bar: u16, sig: u32) -> Self {
         Self::RiffBar { bar, sig }
@@ -224,6 +225,7 @@ impl CelebrationGesture {
 
     /// Build the outro gesture for a run in `sig`'s key — the stable
     /// constructor, like [`Self::riff_bar`].
+    #[inline]
     #[must_use]
     pub fn outro(sig: u32) -> Self {
         Self::Outro { sig }
@@ -389,6 +391,7 @@ impl SoundVoice {
     /// row and the introspection token. Lowercase with spaces, the
     /// `cursor_trail_style` convention. `Of(RainbowKitty)` answers as the
     /// music box.
+    #[inline]
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
@@ -414,6 +417,7 @@ impl SoundVoice {
     /// Resolve a spelling (canonical [`SoundVoice::name`] or a
     /// [`SoundVoice::ALIASES`] entry, trimmed, ASCII-case-insensitive) to its
     /// voice; `None` otherwise. Never yields `Of(RainbowKitty)`.
+    #[inline]
     #[must_use]
     pub fn parse(token: &str) -> Option<Self> {
         let token = token.trim();
@@ -1635,6 +1639,7 @@ const SONG_STEPS: u32 = SONG_CODED_STEPS + 1;
 /// spent on [`SONG_INTERVALS`], the degree wrapped into the pentatonic
 /// window `0..=4` (a wrap is itself a move — a compound leap, never a
 /// repeat).
+#[inline]
 fn song_coded_degree(sig: u32, index: u32) -> i32 {
     debug_assert!(index < SONG_CODED_STEPS);
     let mut code = u64::from(sig);
@@ -1650,6 +1655,7 @@ fn song_coded_degree(sig: u32, index: u32) -> i32 {
 
 /// The walk degree (`0..=4`) at verse-note `ordinal`, cycling every
 /// [`SONG_STEPS`] notes with the bridge at index 16.
+#[inline]
 fn song_degree(sig: u32, ordinal: u32) -> i32 {
     let index = ordinal % SONG_STEPS;
     if index < SONG_CODED_STEPS {
@@ -1669,6 +1675,7 @@ fn song_degree(sig: u32, ordinal: u32) -> i32 {
 /// Axis 2, the root the celebration transposes to: `sig % 5 - 2`, inside one
 /// pentatonic octave (-2..=2), so no character moves the riff into a register
 /// that reads as a different instrument.
+#[inline]
 fn celebration_root(sig: u32) -> i32 {
     (sig % 5) as i32 - 2
 }
@@ -1681,6 +1688,7 @@ fn celebration_root(sig: u32) -> i32 {
 /// {0, 2, 4}; rotation by 4 is realised octave-folded as −1, so the combined
 /// root+mode offset stays in −3..=4.
 const MODE_ROTATIONS: [i32; 3] = [0, 2, -1];
+#[inline]
 fn celebration_mode(sig: u32) -> i32 {
     MODE_ROTATIONS[(sig % 3) as usize]
 }
@@ -1700,6 +1708,7 @@ const CELEBRATION_VERSE: [bool; CELEBRATION_PHRASE_BARS] =
 /// Register shelf lifting the walk's `0..=4` window into each verse family's
 /// tessitura: the A-family sits just over the hook's shelf, the C-family keeps
 /// the lift into bars 4/5.
+#[inline]
 fn verse_register(idx: usize) -> i32 {
     if idx == 4 || idx == 5 { 4 } else { 1 }
 }
@@ -1707,6 +1716,7 @@ fn verse_register(idx: usize) -> i32 {
 /// The walk ordinal of the first sounding slot of verse bar `idx` (`None` for
 /// chorus bars). Sounding verse slots are numbered consecutively across the
 /// form, counted from the authored `REST` pattern.
+#[inline]
 fn verse_ordinal_base(idx: usize) -> Option<u32> {
     if !CELEBRATION_VERSE[idx] {
         return None;
@@ -1726,6 +1736,7 @@ fn verse_ordinal_base(idx: usize) -> Option<u32> {
 /// swing, span and bass-carrier laws) and replace each sounding degree with
 /// the signature's walk. Root and mode are folded in by `design_celebration`
 /// at pitch time.
+#[inline]
 fn celebration_bar_degrees(sig: u32, idx: usize) -> [i32; 8] {
     let mut row = CELEBRATION_PHRASE[idx];
     let Some(base) = verse_ordinal_base(idx) else {
@@ -1744,6 +1755,7 @@ fn celebration_bar_degrees(sig: u32, idx: usize) -> [i32; 8] {
 
 /// The swung pre-delay of eighth-grid slot `slot`. Slot 0 is exactly 0.0, so
 /// every bar speaks in its first post-cue synth buffer.
+#[inline]
 fn celebration_slot_delay(slot: usize) -> f32 {
     let swing = if slot.is_multiple_of(2) {
         0.0
@@ -1756,12 +1768,14 @@ fn celebration_slot_delay(slot: usize) -> f32 {
 /// Pitch-panned stereo: notes move across the field with their register
 /// rather than ping-ponging per eighth. Degree 4 sits at the event's pan;
 /// `spawn` narrows and clamps afterwards.
+#[inline]
 fn celebration_sway(pan: f32, deg: i32) -> f32 {
     pan + 0.06 * (deg - 4) as f32
 }
 
 /// The riff's pulse lead on `hz`: the [`CELEBRATION_LEAD_DUTY`] pulse, its
 /// square octave `shimmer`, and `third` (the bass, or silence).
+#[inline]
 fn celebration_lead(hz: f32, shimmer: f32, third: Partial) -> [Partial; 3] {
     [
         Partial {
@@ -1787,6 +1801,7 @@ fn celebration_lead(hz: f32, shimmer: f32, third: Partial) -> [Partial; 3] {
 /// How many eighth-grid slots the note at `i` owns: itself plus the `REST` slots
 /// that follow, bounded by `limit` (the turnaround bar caps this at 6 so the
 /// sustained note cannot ring under the sixteenth fill).
+#[inline]
 fn celebration_span(phrase: &[i32; 8], i: usize, limit: usize) -> usize {
     let mut span = 1usize;
     while i + span < limit && phrase[i + span] == REST {
@@ -2328,6 +2343,7 @@ pub(crate) const MIN_GAP: f32 = 0.045;
 /// Applied at palette dispatch only; gestures designed before it (Kill,
 /// Glide, Sweep, Land, Bonk, the riff) are untouched. Kill's swoosh band is
 /// style-tinted ([`kill_swoosh_band`]), so it keeps ~3 dB of spread.
+#[inline]
 fn palette_trim(voice: SoundVoice, style: GlowStyle) -> f32 {
     match voice {
         SoundVoice::Mech => 0.68,
@@ -2362,6 +2378,7 @@ fn palette_trim(voice: SoundVoice, style: GlowStyle) -> f32 {
 /// the speaking voice. The match is exhaustive, so a new voice must choose a
 /// tint. `Style` resolves the look's table; a standalone style voice takes
 /// its own style's tint (`Of(Water)` under Lumen falls through water).
+#[inline]
 fn kill_swoosh_band(voice: SoundVoice, style: GlowStyle) -> (f32, f32) {
     match voice {
         // The music box uses the default swoosh (§10.4).
@@ -2486,18 +2503,21 @@ impl TrailSynth {
     }
 
     /// Number of live voices (test/diagnostic hook).
+    #[inline]
     pub fn live_voices(&self) -> usize {
         self.voices.iter().filter(|v| v.on).count()
     }
 
     /// Voice steals since construction (diagnostic). Nonzero means the voice
     /// pool ran dry and a live tail was cut.
+    #[inline]
     #[must_use]
     pub fn steals(&self) -> u32 {
         self.steals
     }
 
     /// Diagnostic: (bed energy, bed level) — demo/tuning hook.
+    #[inline]
     pub fn debug_bed(&self) -> (f32, f32) {
         (self.bed.energy, self.bed.level)
     }
@@ -2535,6 +2555,7 @@ impl TrailSynth {
     /// §10.2's handback holds `song_key` until the next word boundary
     /// (`rainbow_kitty_v2`'s `v2_hand_back_key`). A v1 trail event arriving
     /// first snaps instead ([`Self::push_meta`]).
+    #[inline]
     fn release_song_key(&mut self) {
         if self.v2_latched {
             self.v2_key_pending = self.song_key != 0;
@@ -2924,6 +2945,7 @@ impl TrailSynth {
     /// walk in the band for every palette and song key, and keeps consecutive
     /// roots within an octave.
     /// At position 0 with no song key it equals `bass_octave(anchor) * 2`.
+    #[inline]
     fn space_root_hz(&self, anchor: f32, step: u8) -> f32 {
         let deg = i32::from(SONG_BASS[usize::from(step)]) + i32::from(self.song_key);
         bass_octave(self.melody_hz(anchor, deg)) * 2.0
@@ -2931,6 +2953,7 @@ impl TrailSynth {
 
     /// Hand the playhead to the next phrase of the form (answer after hook,
     /// bridge after answer, hook after the half-cadence); never a rewind.
+    #[inline]
     fn open_next_phrase(&mut self) {
         self.phrase_idx = (self.phrase_idx + 1) % (SONG_FORM.len() as u8 - 1);
         self.theme_pos = SONG_FORM[usize::from(self.phrase_idx)];
@@ -2941,6 +2964,7 @@ impl TrailSynth {
     /// [`Tone::Technical`]/[`Tone::Calm`] this equals [`penta`] bit for bit.
     /// The bonk calls [`penta`] directly: its clash is anchored to the
     /// untransposed lattice.
+    #[inline]
     fn melody_hz(&self, base: f32, degree: i32) -> f32 {
         let (table, transpose) = tone_tables(self.tone);
         let oct = degree.div_euclid(5);
@@ -2964,6 +2988,7 @@ impl TrailSynth {
     /// A `deferred` (pre-delayed) newcomer takes a slot now and its lane at
     /// its onset ([`Self::lane_onset_steal`]): a voice at `t < 0` has not
     /// sounded yet, so it must not evict one that has.
+    #[inline]
     fn claim_lane(&mut self, lane: u8, deferred: bool) -> Option<usize> {
         if lane == LANE_NONE {
             return Some(self.claim());
@@ -3019,12 +3044,14 @@ impl TrailSynth {
     /// called by [`Self::render`] on the first sounding sample of slot `vi`.
     /// Returns `true` when the newcomer was dropped by the age guard and must
     /// be switched off unheard.
+    #[inline]
     fn lane_onset_steal(&mut self, vi: usize) -> bool {
         let lane = self.voices[vi].lane;
         !self.lane_make_room(lane, vi)
     }
 
     /// Claim a voice slot: first free, else steal the quietest.
+    #[inline]
     fn claim(&mut self) -> usize {
         let mut best = 0;
         let mut best_w = f32::MAX;
@@ -3045,6 +3072,7 @@ impl TrailSynth {
 
     /// Spawn one voice from a prototype: applies pan narrowing + equal-power
     /// law, resets runtime state, randomizes oscillator phases.
+    #[inline]
     fn spawn(&mut self, proto: Voice, gain: f32, pan: f32) -> Option<usize> {
         // Draw order (tremolo phase, then the three partials) is pinned by the
         // golden streams.
@@ -3834,6 +3862,7 @@ impl TrailSynth {
     /// [`Self::design_erase_poof`] and still inside its pre-delay. The damp
     /// burns through the pre-delay, so it dies unheard; a shimmer already
     /// sounding is left to ring rather than clicked off.
+    #[inline]
     fn damp_pending_shimmer(&mut self) {
         for v in &mut self.voices {
             if v.on && v.shimmer && v.t < 0.0 && v.damp <= 0.0 {
@@ -4042,6 +4071,7 @@ impl TrailSynth {
     /// Separate from [`Self::design_celebration`] because the key outlives the
     /// bar (released with the sing duck in `render`). Derived from the same
     /// `sig` the riff transposes by, so typing and riff always agree.
+    #[inline]
     fn latch_song_key(&mut self, sig: u32) {
         // The whole shift: root plus mode rotation, the same two axes the riff
         // applies. −3..=4 by construction (`celebration_root` is
@@ -4578,6 +4608,7 @@ impl TrailSynth {
     /// the kind and the smoothed gain for the user volume. Both engines (v1's
     /// trail arm and `push_v2`) call this; the `ev.bed` gate stays at each
     /// call site.
+    #[inline]
     pub(super) fn kick_bed(&mut self, kind: SoundKind, gain: f32) {
         self.bed.energy = (self.bed.energy + bed_kick(kind)).min(1.0);
         self.bed.gain += (gain - self.bed.gain) * 0.3;
@@ -4628,6 +4659,7 @@ impl TrailSynth {
     /// One stereo sample of the continuous bed texture: the shared LFO
     /// prologue here, the per-style body on the palette
     /// ([`Palette::bed_sample`]).
+    #[inline]
     fn bed_sample(&mut self, dt: f32) -> (f32, f32) {
         let lvl = self.bed.level * self.bed.gain;
         // Shared slow LFOs (used as undulation / vibrato per style).
@@ -4668,6 +4700,7 @@ trait Palette {
 
     /// Spawn one stochastic bed grain and re-arm `s.bed.timer`. The default
     /// suits purely tonal beds: no grain, fixed re-arm.
+    #[inline]
     fn bed_grain(&self, s: &mut TrailSynth, _level: f32, _gain: f32) {
         s.bed.timer = 0.25; // styles with purely tonal beds
     }
@@ -4676,6 +4709,7 @@ trait Palette {
     /// caller has advanced the shared LFOs (`u1`/`u2`) and folded level × gain
     /// into `lvl`. The default is exact zeros: a keyboard or typewriter has
     /// no weather.
+    #[inline]
     fn bed_sample(
         &self,
         _s: &mut TrailSynth,
@@ -4693,6 +4727,7 @@ trait Palette {
     /// [`TrailSynth::design_cursor`], sings here).
     ///
     /// Default: the Lumen mid register, also right for unpitched palettes.
+    #[inline]
     fn anchor_hz(&self) -> f32 {
         CURSOR_ANCHOR_HZ
     }
@@ -4703,6 +4738,7 @@ trait Palette {
 /// [`SoundVoice::Of`] aliases into the style table; the sound-only voices
 /// bind their own palettes. The rainbow kitty look, `Of(RainbowKitty)` and
 /// [`SoundVoice::RainbowKittyV2`] all resolve to the music box.
+#[inline]
 fn palette_for(voice: SoundVoice, style: GlowStyle) -> &'static dyn Palette {
     match voice {
         SoundVoice::Mech => &MechPalette,

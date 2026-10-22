@@ -37,6 +37,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use super::flight::{FileFlight, FlightFold, FlightTable, Flyer};
 use super::steps::StepFold;
 use super::usage::{LimitNoticeRow, MAX_LINE_BYTES, ModelSpend, TranscriptUsage, model_short};
 
@@ -262,6 +263,9 @@ pub struct TranscriptCursor {
     /// Found rewritten after its ids were released: frozen, its totals
     /// standing, counted unread from then on.
     rewritten: bool,
+    /// A subagent's calls in flight ([`super::flight`]), fed the same lines
+    /// as `fold`; `None` for the main transcript.
+    flight: Option<FlightFold>,
 }
 
 impl TranscriptCursor {
@@ -282,6 +286,25 @@ impl TranscriptCursor {
             readable: true,
             released: false,
             rewritten: false,
+            flight: None,
+        }
+    }
+
+    /// A subagent's cursor: [`Self::new`], its calls in flight folded too.
+    fn subagent(path: impl Into<PathBuf>) -> Self {
+        Self {
+            flight: Some(FlightFold::new()),
+            ..Self::new(path)
+        }
+    }
+
+    /// What its calls in flight say ([`FileFlight::Unknown`] for the main
+    /// transcript, a file that could not be read at its last look, or one
+    /// found rewritten after its ids were released).
+    fn file_flight(&self) -> FileFlight {
+        match &self.flight {
+            Some(fold) if self.readable && !self.rewritten => fold.flight(),
+            _ => FileFlight::Unknown,
         }
     }
 
@@ -330,7 +353,10 @@ impl TranscriptCursor {
     }
 
     fn restart(&mut self) {
-        self.fold = TranscriptUsage::new();
+        if let Some(flight) = self.flight.as_mut() {
+            flight.restart();
+        }
+        self.fold = TranscriptUsage::following(&self.fold);
         self.offset = 0;
         self.boundary = None;
         self.pending = Vec::new();
@@ -473,17 +499,26 @@ impl TranscriptCursor {
             end += nl as u64 + 1;
             if self.overflow {
                 self.fold.note_long_line();
+                if let Some(flight) = self.flight.as_mut() {
+                    flight.long_line();
+                }
                 if let Some(tap) = tap.as_deref_mut() {
                     tap.long_line(end);
                 }
                 self.overflow = false;
             } else if self.pending.is_empty() {
                 self.fold.fold_bytes(line);
+                if let Some(flight) = self.flight.as_mut() {
+                    flight.fold_bytes(line);
+                }
                 if let Some(tap) = tap.as_deref_mut() {
                     tap.push(line, end);
                 }
             } else if self.pending.len().saturating_add(line.len()) > MAX_LINE_BYTES {
                 self.fold.note_long_line();
+                if let Some(flight) = self.flight.as_mut() {
+                    flight.long_line();
+                }
                 if let Some(tap) = tap.as_deref_mut() {
                     tap.long_line(end);
                 }
@@ -491,6 +526,9 @@ impl TranscriptCursor {
                 self.pending.extend_from_slice(line);
                 let whole = std::mem::take(&mut self.pending);
                 self.fold.fold_bytes(&whole);
+                if let Some(flight) = self.flight.as_mut() {
+                    flight.fold_bytes(&whole);
+                }
                 if let Some(tap) = tap.as_deref_mut() {
                     tap.push(&whole, end);
                 }
@@ -566,6 +604,97 @@ pub struct SessionUsage {
     /// The most directory entries one walk looks at
     /// ([`MAX_SUBAGENT_ENTRIES`]; a test sets it low).
     walk_max: usize,
+    /// What each followed agent's `meta.json` names it ([`AgentMeta`]): read
+    /// once, when its file is admitted, and again only while it is missing
+    /// (at most [`META_TRIES`] times, each when the file moved).
+    metas: BTreeMap<PathBuf, AgentMeta>,
+    /// Each workflow run's script ([`RunMeta`]), keyed by its run id.
+    runs: BTreeMap<String, RunMeta>,
+    /// Moved with every meta or script learned: [`Self::flight_generation`].
+    learned: u64,
+    /// Every `meta.json` opened and every scripts listing (the tests' meter).
+    #[cfg(test)]
+    meta_reads: u64,
+}
+
+/// The most times an agent's `meta.json` or a run's script is looked for.
+pub const META_TRIES: u8 = 4;
+
+/// The most bytes of an agent's `meta.json` read (measured: 200 bytes).
+const META_CAP: u64 = 16 * 1024;
+
+/// What a subagent's `meta.json` names it, as its panel row's name and
+/// activity would read it ([`Flyer::agent`]); `None` until read.
+#[derive(Debug, Clone, Default)]
+struct AgentMeta {
+    flyer: Option<Flyer>,
+    tries: u8,
+}
+
+/// A workflow run's script, `<session>/workflows/scripts/<slug>-<run>.js`:
+/// its slug and its mtime (the run's start, within 8 ms of the run's own
+/// `startTime`, measured); `None` until found.
+#[derive(Debug, Clone, Default)]
+struct RunMeta {
+    found: Option<(String, i64)>,
+    tries: u8,
+}
+
+/// The workflow run a subagent file under `subagents` belongs to:
+/// `workflows/<run>/…`.
+fn run_of<'a>(subagents: &Path, path: &'a Path) -> Option<&'a str> {
+    let mut parts = path.strip_prefix(subagents).ok()?.components();
+    if parts.next()?.as_os_str() != "workflows" {
+        return None;
+    }
+    let run = parts.next()?.as_os_str().to_str()?;
+    parts.next().is_some().then_some(run)
+}
+
+/// An agent's `meta.json` beside its transcript (`agent-<id>.jsonl` →
+/// `agent-<id>.meta.json`), read into what its panel row would say:
+/// `name ?? agentType`, and `description`. `None` when absent or unreadable.
+fn read_meta(path: &Path) -> Option<Flyer> {
+    let stem = path.file_stem()?.to_str()?;
+    let meta = path.with_file_name(format!("{stem}.meta.json"));
+    let text = super::footer::read_small(&meta, META_CAP)?;
+    let value: aterm_json::Value = aterm_json::from_str(&text).ok()?;
+    let word = |key: &str| {
+        value
+            .get(key)
+            .and_then(aterm_json::Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+    };
+    let name = word("name").or_else(|| word("agentType"))?;
+    Some(Flyer::agent(
+        name,
+        word("description"),
+        0,
+        FileFlight::Unknown,
+    ))
+}
+
+/// The script of workflow run `run` in `scripts`: its slug and its mtime
+/// (unix ms). `None` when there is none, or more than one.
+fn find_script(scripts: &Path, run: &str) -> Option<(String, i64)> {
+    let suffix = format!("-{run}.js");
+    let mut found = None;
+    for entry in std::fs::read_dir(scripts).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(slug) = name.to_str().and_then(|n| n.strip_suffix(suffix.as_str())) else {
+            continue;
+        };
+        if found.is_some() || slug.is_empty() {
+            return None;
+        }
+        let mtime = entry.metadata().ok()?.modified().ok()?;
+        let ms = mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis();
+        found = Some((slug.to_owned(), i64::try_from(ms).ok()?));
+    }
+    found
 }
 
 /// Advance one subagent cursor within the budget `left`: a file read to its
@@ -610,6 +739,11 @@ impl SessionUsage {
             progressed: false,
             cap: MAX_SUBAGENT_FILES,
             walk_max: MAX_SUBAGENT_ENTRIES,
+            metas: BTreeMap::new(),
+            runs: BTreeMap::new(),
+            learned: 0,
+            #[cfg(test)]
+            meta_reads: 0,
         }
     }
 
@@ -740,12 +874,13 @@ impl SessionUsage {
                     caught_up = false;
                     continue;
                 }
-                let mut cursor = TranscriptCursor::new(&path);
+                let mut cursor = TranscriptCursor::subagent(&path);
                 if !advance_subagent(&mut cursor, &mut left, &mut caught_up, &mut unread) {
                     continue;
                 }
                 self.subagents.insert(path, cursor);
             }
+            self.learn(&dir);
         }
         self.progressed = left < budget;
         self.caught_up = caught_up;
@@ -755,6 +890,130 @@ impl SessionUsage {
             walk_cut,
             spent: budget - left,
         }
+    }
+
+    /// Look for what names each followed agent and workflow run
+    /// ([`AgentMeta`], [`RunMeta`]) that is not yet known and has tries left:
+    /// one small read per agent, one listing of the scripts per run — a run
+    /// once a pass however many of its agents' files are followed, so a run
+    /// of many agents spends one of its tries a pass, as a lone agent does.
+    /// A key already known is found without making one.
+    fn learn(&mut self, subagents: &Path) {
+        let scripts = subagents
+            .parent()
+            .map(|session| session.join("workflows").join("scripts"));
+        let mut looked: Vec<&str> = Vec::new();
+        for path in self.subagents.keys() {
+            match run_of(subagents, path) {
+                Some(run) => {
+                    if looked.contains(&run) {
+                        continue;
+                    }
+                    if !self.runs.contains_key(run) {
+                        self.runs.insert(run.to_owned(), RunMeta::default());
+                    }
+                    let Some(meta) = self.runs.get_mut(run) else {
+                        continue;
+                    };
+                    if meta.found.is_some() || meta.tries >= META_TRIES {
+                        continue;
+                    }
+                    looked.push(run);
+                    meta.tries += 1;
+                    #[cfg(test)]
+                    {
+                        self.meta_reads += 1;
+                    }
+                    meta.found = scripts.as_deref().and_then(|dir| find_script(dir, run));
+                    if meta.found.is_some() {
+                        self.learned = self.learned.wrapping_add(1);
+                    }
+                }
+                None => {
+                    if !self.metas.contains_key(path) {
+                        self.metas.insert(path.clone(), AgentMeta::default());
+                    }
+                    let Some(meta) = self.metas.get_mut(path) else {
+                        continue;
+                    };
+                    if meta.flyer.is_some() || meta.tries >= META_TRIES {
+                        continue;
+                    }
+                    meta.tries += 1;
+                    #[cfg(test)]
+                    {
+                        self.meta_reads += 1;
+                    }
+                    meta.flyer = read_meta(path);
+                    if meta.flyer.is_some() {
+                        self.learned = self.learned.wrapping_add(1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The session's agents and workflow runs as last read
+    /// ([`super::flight`]): each agent its meta names and whose start is
+    /// read, with what its file says; each run whose script is found, with
+    /// its agents' flights combined ([`super::flight::combine`]).
+    #[must_use]
+    pub fn flights(&self) -> FlightTable {
+        let mut flyers = Vec::new();
+        let Some(dir) = self.subagent_dir() else {
+            return FlightTable { flyers };
+        };
+        let mut runs: BTreeMap<&str, Vec<FileFlight>> = BTreeMap::new();
+        for (path, cursor) in &self.subagents {
+            if let Some(run) = run_of(&dir, path) {
+                runs.entry(run).or_default().push(cursor.file_flight());
+                continue;
+            }
+            let (Some(flyer), Some(start)) = (
+                self.metas.get(path).and_then(|m| m.flyer.as_ref()),
+                cursor.flight.as_ref().and_then(FlightFold::start_ms),
+            ) else {
+                continue;
+            };
+            flyers.push(Flyer {
+                start_ms: start,
+                flight: cursor.file_flight(),
+                ..flyer.clone()
+            });
+        }
+        for (run, flights) in runs {
+            if let Some((slug, start)) = self.runs.get(run).and_then(|r| r.found.as_ref()) {
+                flyers.push(Flyer::workflow(
+                    slug,
+                    *start,
+                    super::flight::combine(flights),
+                ));
+            }
+        }
+        FlightTable { flyers }
+    }
+
+    /// What moves whenever [`Self::flights`] would: every subagent file's
+    /// [`FlightFold::generation`] and readability, and what was learned of
+    /// their names.
+    #[must_use]
+    pub fn flight_generation(&self) -> u64 {
+        self.subagents
+            .values()
+            .fold(self.learned, |sum, cursor| {
+                let fold = cursor.flight.as_ref().map_or(0, FlightFold::generation);
+                let state = u64::from(cursor.readable) | u64::from(cursor.rewritten) << 1;
+                sum.wrapping_mul(31)
+                    .wrapping_add(fold.wrapping_mul(4) | state)
+            })
+            .wrapping_add(self.subagents.len() as u64)
+    }
+
+    /// Every `meta.json` read and scripts listing looked at, over the
+    /// session's life.
+    #[cfg(test)]
+    pub(crate) fn meta_reads(&self) -> u64 {
+        self.meta_reads
     }
 
     /// Subagent transcripts in the totals, whole: followed, readable at the
@@ -804,6 +1063,113 @@ impl SessionUsage {
             all.absorb(cursor.fold());
         }
         all
+    }
+
+    /// Every file's [`TranscriptUsage::generation`] summed: it moves whenever
+    /// what [`Self::traffic`] draws from does.
+    #[must_use]
+    pub fn traffic_generation(&self) -> u64 {
+        std::iter::once(&self.main)
+            .chain(self.subagents.values())
+            .fold(0u64, |sum, cursor| {
+                sum.wrapping_add(cursor.fold().generation())
+            })
+    }
+
+    /// The session's traffic over time ([`TrafficView`]): the series of the
+    /// transcript and every subagent file merged, as [`Self::total_fold`]
+    /// sums their spend, and the main chain's working time (subagents' turns
+    /// run inside it, [`Self::busy_ms`]).
+    #[must_use]
+    pub fn traffic(&self) -> TrafficView {
+        let mut series = super::usage::TokenSeries::default();
+        let mut unread = 0u64;
+        let mut totals = (0u64, 0u64);
+        for cursor in std::iter::once(&self.main).chain(self.subagents.values()) {
+            let fold = cursor.fold();
+            series.absorb(fold.series());
+            unread = unread.saturating_add(fold.unstamped());
+            for spend in fold.per_model().values() {
+                let tokens = spend.tokens();
+                totals = (
+                    totals.0.saturating_add(tokens.prompt()),
+                    totals.1.saturating_add(tokens.output),
+                );
+            }
+        }
+        let spans = self.main.fold().busy_spans();
+        let busy = spans
+            .iter()
+            .skip(spans.len().saturating_sub(TRAFFIC_BUSY_SPANS))
+            .map(|&(start, end)| {
+                (
+                    start.div_euclid(1000),
+                    end.saturating_add(999).div_euclid(1000),
+                )
+            })
+            .collect();
+        let busy_ms = self.busy_ms();
+        TrafficView {
+            start_s: series.start_s(),
+            width_s: series.width_s(),
+            buckets: series.buckets().iter().copied().collect(),
+            busy,
+            runtime_s: (busy_ms > 0).then_some(busy_ms / 1000),
+            unread: usize::try_from(unread).unwrap_or(usize::MAX),
+            totals,
+        }
+    }
+}
+
+/// The newest working spans a [`TrafficView`] carries.
+pub const TRAFFIC_BUSY_SPANS: usize = 512;
+
+/// A session's tokens over time, for the footer's traffic card: the merged
+/// [`super::usage::TokenSeries`] of its files, flat, with the turns Claude
+/// worked through. Built on the resolver thread ([`SessionUsage::traffic`])
+/// and shared read-only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrafficView {
+    /// Unix seconds of the first bucket's start.
+    pub start_s: i64,
+    /// Each bucket's width in seconds ([`super::usage::SERIES_BASE_S`]·2ᵏ;
+    /// 0 with no traffic).
+    pub width_s: i64,
+    /// `(in, out)` tokens per bucket, oldest first: in is the prompt (input,
+    /// cache writes and reads, the `Σ ↑`), out the output (the `Σ ↓`).
+    pub buckets: Box<[(u64, u64)]>,
+    /// The newest [`TRAFFIC_BUSY_SPANS`] spans Claude was working, `[start,
+    /// end)` in unix seconds (outward to whole seconds), in time order.
+    pub busy: Box<[(i64, i64)]>,
+    /// The working time in seconds ([`SessionUsage::busy_ms`]), once a turn
+    /// ended.
+    pub runtime_s: Option<u64>,
+    /// Summed rows not graphed: their row carried no `timestamp`
+    /// ([`super::usage::TranscriptUsage::unstamped`]).
+    pub unread: usize,
+    /// Every file's tokens, `(in, out)`, graphed or not.
+    pub totals: (u64, u64),
+}
+
+impl TrafficView {
+    /// Whether no row was graphed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buckets.iter().all(|&(i, o)| i == 0 && o == 0)
+    }
+
+    /// The buckets spread over `n` columns of `from_s..to_s` (unix seconds),
+    /// exactly as the series it was taken from spreads them
+    /// ([`super::usage::TokenSeries::columns`]). Pure.
+    #[must_use]
+    pub fn columns(&self, from_s: i64, to_s: i64, n: usize) -> Vec<(u64, u64)> {
+        super::usage::spread_columns(
+            self.start_s.checked_div(self.width_s).unwrap_or(0),
+            self.width_s,
+            self.buckets.iter().copied(),
+            (from_s, to_s),
+            n,
+        )
     }
 }
 

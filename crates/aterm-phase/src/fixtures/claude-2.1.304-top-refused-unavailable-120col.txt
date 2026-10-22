@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · `/effort workspace on` run after `/model claude-sonnet-4-5`, fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1): Claude refuses with `⎿  Workspace isn't available on claude-sonnet-4-5. Valid options are: low, medium, high, xhigh, max, auto` (the model's id, not its display name; a `<local-command-stdout>` user row), no tag on the top rule; the model switch had dropped auto mode (`⏸ manual mode on · ? for shortcuts`); Haiku 5.5 and Opus 5.5 took the key in the same lab; the stand-in `workspace` replaces the vendor's top effort key throughout
+
+ ▐▛███▛█   Claude Code v2.1.304
+▝▜██████▀  Sonnet 4.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.JhpC/proj
+
+  Updated to latest. Got 66 features, 424 bugfixes, and 126 other changes.
+  code.claude.com/docs/en/changelog for details
+
+
+❯ /effort workspace on
+  ⎿  Workspace on (this session only): dynamic workflows on every task. Effort stays medium.
+
+❯ /effort workspace off
+  ⎿  Workspace off. Effort stays medium.
+
+❯ /model
+  ⎿  Kept model as Opus 5.5 (default)
+
+❯ /effort
+  ⎿  Cancelled
+
+❯ /model haiku
+  ⎿  Set model to Haiku 5.5 and saved as your default for new sessions
+
+❯ /effort workspace on
+  ⎿  Workspace on (this session only): dynamic workflows on every task. Effort stays medium.
+
+❯ /effort workspace off
+  ⎿  Workspace off. Effort stays medium.
+
+❯ /model claude-sonnet-4-5
+  ⎿  Set model to Sonnet 4.5 and saved as your default for new sessions
+
+❯ /effort workspace on
+  ⎿  Workspace isn't available on claude-sonnet-4-5. Valid options are: low, medium, high, xhigh, max, auto
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts

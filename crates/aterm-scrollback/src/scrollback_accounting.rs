@@ -30,7 +30,8 @@ impl Scrollback {
     /// are not counted again when the budget evicts them. `set_line_limit`
     /// truncation is intentional and not counted.
     #[must_use]
-    pub fn pressure_evicted_lines(&self) -> u64 {
+    #[inline]
+    pub const fn pressure_evicted_lines(&self) -> u64 {
         self.pressure_evicted_lines
     }
 
@@ -45,7 +46,8 @@ impl Scrollback {
     /// footprint rows (one per history line); it never decreases and
     /// [`clear`](Self::clear) does not reset it.
     #[must_use]
-    pub fn image_rows_dropped_by_compression(&self) -> u64 {
+    #[inline]
+    pub const fn image_rows_dropped_by_compression(&self) -> u64 {
         self.image_rows_dropped_by_compression
     }
 
@@ -54,6 +56,7 @@ impl Scrollback {
     /// Saturating: each operand is bytes this process holds, so the true sum
     /// fits; saturation only discharges the strict L0 gate's unconstrained-input
     /// overflow counterexamples.
+    #[inline]
     pub(crate) fn sync_accounting(&mut self) {
         self.bytes_used = self
             .hot

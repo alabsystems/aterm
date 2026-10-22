@@ -5036,11 +5036,12 @@ fn meta_status(
     // The foreground program's own working directory, read from the OS (its timeline lock is a
     // leaf after the store's): an agent's folder-trust dialog asks for exactly this folder,
     // and a shell with no OSC 7 reports no `cwd=`.
-    let (pgid, worker) = {
+    let (pgid, worker, trusted_cwd) = {
         let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         (
             timeline.agent().program_pgid,
             timeline.task().and_then(|t| t.agent),
+            timeline.task().and_then(|t| t.trusted_cwd.clone()),
         )
     };
     let agent_cwd = {
@@ -5068,8 +5069,9 @@ fn meta_status(
     // only off a reply that names it), the instant a timed Cruise lands
     // (`land_at=`, unix seconds, `-` while unset), and who set the pair and when
     // (`autopilot_by=`, `autopilot_since=`; [`autopilot_by_fields`]).
-    // `worker=` is the agent's word, `-` for none: the task record's, which
-    // the window harness's trust rules read. Beside `supervisor=`, `supervisor_proven=<0|1>`: whether the live
+    // `worker=` is the agent's word, `-` for none, and `trusted_cwd=` the
+    // folder: both the task record's, which the window harness's trust
+    // rules read. Beside `supervisor=`, `supervisor_proven=<0|1>`: whether the live
     // claim is a proven self-claim ([`crate::self_claim`]).
     format!(
         "OK title={} user_title={} description={} icon={} role={} attention={} cwd={} state={state} \
@@ -5090,7 +5092,7 @@ fn meta_status(
         u8::from(meta.supervisor_proven(crate::metrics::now_us())),
         opt(meta.questions.as_deref()),
         opt(agent_cwd.as_deref()),
-        opt(meta.trusted_cwd.as_deref()),
+        opt(trusted_cwd.as_deref()),
         worker.map_or("-", aterm_phase::Program::name),
         opt(meta.autopilot.as_deref()),
         crate::autopilot::land_at_field(meta.land_at),

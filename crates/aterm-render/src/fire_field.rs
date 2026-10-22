@@ -78,7 +78,7 @@ const FIRE_IDX_MAX: i32 = 850;
 /// bit-for-bit.
 #[inline]
 #[must_use]
-pub fn fire_hash(x: u32, y: u32, seed: u32) -> u32 {
+pub const fn fire_hash(x: u32, y: u32, seed: u32) -> u32 {
     let mut h = x
         .wrapping_mul(FIRE_P0)
         .wrapping_add(y.wrapping_mul(FIRE_P1))
@@ -94,7 +94,7 @@ pub fn fire_hash(x: u32, y: u32, seed: u32) -> u32 {
 /// Fixed-point smoothstep: `t` in `0..=255` → `t²(3·256 − 2t) >> 16`, C¹ at lattice lines.
 #[inline]
 #[must_use]
-pub fn fire_fade(t: i32) -> i32 {
+pub const fn fire_fade(t: i32) -> i32 {
     (t * t * (768 - 2 * t)) >> 16
 }
 
@@ -103,7 +103,7 @@ pub fn fire_fade(t: i32) -> i32 {
 /// 1×/2×/4×); X is spatial and unmasked.
 #[inline]
 #[must_use]
-pub fn fire_vnoise(x: u32, y: u32, ymask: u32, seed: u32) -> i32 {
+pub const fn fire_vnoise(x: u32, y: u32, ymask: u32, seed: u32) -> i32 {
     let ix = x >> 8;
     let iy0 = (y >> 8) & ymask;
     let iy1 = (iy0 + 1) & ymask;
@@ -166,19 +166,28 @@ pub struct FirePrecomp {
 /// Compute the patch-constant terms of the field once per FirePatch.
 #[inline]
 #[must_use]
-pub fn fire_precomp(p: &FireFieldParams) -> FirePrecomp {
-    let ch = p.cell_h.max(2);
+pub const fn fire_precomp(p: &FireFieldParams) -> FirePrecomp {
+    let ch = if p.cell_h > 2 { p.cell_h } else { 2 };
     let ts = (300 + p.temp * 2) as u32;
     let tr = p.phase.wrapping_mul(ts) >> 10;
     let rs = (350 + p.temp) as u32;
     let offr = p.phase.wrapping_mul(rs) >> 10;
+    let peak = if p.peak_h < 1 {
+        1
+    } else if p.peak_h > 2048 {
+        2048
+    } else {
+        p.peak_h
+    };
+    let q_ch = ch / 4;
+    let aa = (if q_ch > 3 { q_ch } else { 3 }) * 256;
     FirePrecomp {
         ch,
         chu: ch as u32,
-        peak: p.peak_h.clamp(1, 2048),
+        peak,
         tr,
         tr2: tr.wrapping_mul(2).wrapping_add(37199),
-        aa: (ch / 4).max(3) * 256,
+        aa,
         offr,
     }
 }
@@ -202,7 +211,7 @@ struct FireOctave {
 
 impl FireOctave {
     #[inline]
-    fn new(y: u32, ymask: u32, seed: u32, x0: u32) -> Self {
+    const fn new(y: u32, ymask: u32, seed: u32, x0: u32) -> Self {
         let iy0 = (y >> 8) & ymask;
         let iy1 = (iy0 + 1) & ymask;
         let uy = fire_fade((y & 255) as i32);
@@ -223,7 +232,7 @@ impl FireOctave {
     /// Sample at fp8 `x` (`>=` the previous call's); equal to
     /// `fire_vnoise(x, y, ymask, seed)`.
     #[inline]
-    fn sample(&mut self, x: u32) -> i32 {
+    const fn sample(&mut self, x: u32) -> i32 {
         let ix = x >> 8;
         while self.cur_ix < ix {
             self.n00 = self.n10;
@@ -264,8 +273,9 @@ pub struct FireRow<'a> {
 impl<'a> FireRow<'a> {
     /// Set up the scanline at `py` with first sample column `x_start` (device px), priming
     /// the row-constant terms and octave caches.
+    #[inline]
     #[must_use]
-    pub fn new(py: i32, x_start: i32, p: &'a FireFieldParams, pc: &'a FirePrecomp) -> Self {
+    pub const fn new(py: i32, x_start: i32, p: &'a FireFieldParams, pc: &'a FirePrecomp) -> Self {
         // v: height above the root. Below it the envelope mirrors 5x-compressed, an ember
         // bed that dissolves into the glyph row instead of a hard horizontal cut; it draws
         // in the under-ink fire slot, so glyphs still paint over it.
@@ -274,7 +284,8 @@ impl<'a> FireRow<'a> {
         let vv = v * 256;
         // vn: rise fraction of the envelope (fp8, capped at 2×). The shear drifts lean/4 px
         // at full rise.
-        let vn = ((v * 256) / pc.peak).min(512);
+        let vn_raw = (v * 256) / pc.peak;
+        let vn = if vn_raw < 512 { vn_raw } else { 512 };
         let shear = p.lean * vn / 4;
         // The first sheared fp8 x, where each octave primes its cache.
         let xq = (x_start * 256 + shear + (1 << 22)) as u32;
@@ -283,10 +294,11 @@ impl<'a> FireRow<'a> {
         // wide), sampled at v − phase·rise so pockets change as they rise.
         let sy = ((vv as u32) * 2) / (3 * pc.chu);
         let by = sy.wrapping_sub(pc.offr);
+        let root_raw = (v * 1536) / pc.ch;
         Self {
             p,
             pc,
-            root: ((v * 1536) / pc.ch).min(256),
+            root: if root_raw < 256 { root_raw } else { 256 },
             vv,
             shear,
             n0: FireOctave::new(pc.tr, 0x3FFF, FIRE_SEED_R0, sx),
@@ -308,8 +320,9 @@ impl<'a> FireRow<'a> {
     }
 
     /// Sample the field at device column `px` (non-decreasing).
+    #[inline]
     #[must_use]
-    pub fn core(&mut self, px: i32) -> FireCore {
+    pub const fn core(&mut self, px: i32) -> FireCore {
         let p = self.p;
         let pc = self.pc;
 
@@ -337,9 +350,17 @@ impl<'a> FireRow<'a> {
             return FIRE_DEAD;
         }
         // Silhouette AA: coverage ramps over ~cell_h/4 px inside the edge.
-        let edge = ((d * 256) / pc.aa).min(256);
+        let edge_raw = (d * 256) / pc.aa;
+        let edge = if edge_raw < 256 { edge_raw } else { 256 };
         // RIM: 256 at the outline, fading to 0 by 2·aa inside — the sheath band.
-        let rim = ((2 * pc.aa - d) * 256 / pc.aa).clamp(0, 256);
+        let rim_raw = (2 * pc.aa - d) * 256 / pc.aa;
+        let rim = if rim_raw < 0 {
+            0
+        } else if rim_raw > 256 {
+            256
+        } else {
+            rim_raw
+        };
         // q: relative height inside the local tongue (0 root → 255 tip).
         let q = (vv * 256) / hcol;
 
@@ -354,7 +375,14 @@ impl<'a> FireRow<'a> {
         // Palette index: heat falls root → tip, reaches whiter when hot, modulated by the
         // body turbulence.
         let heat = ((256 - q) * (112 + ((p.temp * 120) >> 8))) >> 6;
-        let idx = ((heat * (150 + ((body * 212) >> 8))) >> 8).clamp(0, FIRE_IDX_MAX);
+        let idx_raw = (heat * (150 + ((body * 212) >> 8))) >> 8;
+        let idx = if idx_raw < 0 {
+            0
+        } else if idx_raw > FIRE_IDX_MAX {
+            FIRE_IDX_MAX
+        } else {
+            idx_raw
+        };
 
         // Root lift over cell_h/6 px, slightly cooling the extreme root (an amber fuel
         // line, not a white strip).
@@ -401,35 +429,46 @@ const FIRE_PAL_OVER: [[i32; 3]; 5] = [
 
 /// Piecewise-linear palette fetch: `idx 0..=1023` across 4 segments of 256.
 #[inline]
-fn fire_pal(pal: &[[i32; 3]; 5], idx: i32) -> (i32, i32, i32) {
-    let seg = ((idx >> 8).clamp(0, 3)) as usize;
+const fn fire_pal(pal: &[[i32; 3]; 5], idx: i32) -> (i32, i32, i32) {
+    let seg_raw = idx >> 8;
+    let seg = if seg_raw < 0 {
+        0
+    } else if seg_raw > 3 {
+        3
+    } else {
+        seg_raw as usize
+    };
     let f = idx - ((seg as i32) << 8);
     let a = pal[seg];
     let b = pal[seg + 1];
-    let mix = |x: i32, y: i32| (x * (256 - f) + y * f) >> 8;
-    (mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2]))
+    #[inline]
+    const fn mix(x: i32, y: i32, f: i32) -> i32 {
+        (x * (256 - f) + y * f) >> 8
+    }
+    (mix(a[0], b[0], f), mix(a[1], b[1], f), mix(a[2], b[2], f))
 }
 
 /// The [`FireMode::Add`](crate::render_api::FireMode::Add) coverage law: silhouette AA ×
 /// temp density × interior pockets × root lift, capped. `0..=cov_cap`.
 #[inline]
 #[must_use]
-pub fn fire_cov_add(c: &FireCore, p: &FireFieldParams) -> i32 {
+pub const fn fire_cov_add(c: &FireCore, p: &FireFieldParams) -> i32 {
     let dens = 150 + ((p.temp * 106) >> 8);
     let bodyc = 110 + ((c.body * 146) >> 8);
-    ((((((c.edge * dens) >> 8) * bodyc) >> 8) * c.root) >> 8).min(p.cov_cap)
+    let cov = (((((c.edge * dens) >> 8) * bodyc) >> 8) * c.root) >> 8;
+    if cov < p.cov_cap { cov } else { p.cov_cap }
 }
 
 /// The [`FireMode::Over`](crate::render_api::FireMode::Over) alpha law: the Add shaping
 /// with a gentler interior grain, rim pooling and a root→tip fade. `0..=cov_cap`.
 #[inline]
 #[must_use]
-pub fn fire_alpha_over(c: &FireCore, p: &FireFieldParams) -> i32 {
+pub const fn fire_alpha_over(c: &FireCore, p: &FireFieldParams) -> i32 {
     let bodyc = 130 + ((c.body * 166) >> 8);
     let tipf = 120 + (((256 - c.q) * 136) >> 8);
     let pool = 256 + ((c.rim * 96) >> 8);
     let a = (((((((c.edge * bodyc) >> 8) * c.root) >> 8) * tipf) >> 8) * pool) >> 8;
-    a.min(p.cov_cap)
+    if a < p.cov_cap { a } else { p.cov_cap }
 }
 
 /// Top-edge fade `0..=255`: `0` at the grid top (`py == top_fade_y`), smoothstepping to
@@ -437,9 +476,16 @@ pub fn fire_alpha_over(c: &FireCore, p: &FireFieldParams) -> i32 {
 /// the edge. Rows lower down get `255`, no effect.
 #[inline]
 #[must_use]
-pub fn fire_top_fade(py: i32, p: &FireFieldParams) -> i32 {
-    let fade_px = (p.cell_h * 2).max(2);
-    let t = (((py - p.top_fade_y) * 255) / fade_px).clamp(0, 255);
+pub const fn fire_top_fade(py: i32, p: &FireFieldParams) -> i32 {
+    let fade_px = if p.cell_h * 2 > 2 { p.cell_h * 2 } else { 2 };
+    let t_raw = ((py - p.top_fade_y) * 255) / fade_px;
+    let t = if t_raw < 0 {
+        0
+    } else if t_raw > 255 {
+        255
+    } else {
+        t_raw
+    };
     fire_fade(t)
 }
 
@@ -449,7 +495,7 @@ pub fn fire_top_fade(py: i32, p: &FireFieldParams) -> i32 {
 /// is the row's [`fire_top_fade`]; `tf == 255` skips the multiply, which is exact.
 #[inline]
 #[must_use]
-pub fn fire_shade_add(c: &FireCore, p: &FireFieldParams, tf: i32) -> u32 {
+pub const fn fire_shade_add(c: &FireCore, p: &FireFieldParams, tf: i32) -> u32 {
     let cov0 = fire_cov_add(c, p);
     let cov = if tf == 255 { cov0 } else { (cov0 * tf) / 255 };
     if cov <= 0 {
@@ -458,8 +504,11 @@ pub fn fire_shade_add(c: &FireCore, p: &FireFieldParams, tf: i32) -> u32 {
     // Rim cooling: the outline drops toward deep red while the core stays hot.
     let idx = (c.idx * (256 - ((c.rim * 112) >> 8))) >> 8;
     let (r, g, b) = fire_pal(&FIRE_PAL_ADD, idx);
-    let m = |ch: i32| ((ch * cov + 127) / 255) as u32;
-    (m(r) << 16) | (m(g) << 8) | m(b)
+    #[inline]
+    const fn m(ch: i32, cov: i32) -> u32 {
+        ((ch * cov + 127) / 255) as u32
+    }
+    (m(r, cov) << 16) | (m(g, cov) << 8) | m(b, cov)
 }
 
 /// [`FireMode::Over`](crate::render_api::FireMode::Over) emission for one [`FireRow`]
@@ -467,7 +516,7 @@ pub fn fire_shade_add(c: &FireCore, p: &FireFieldParams, tf: i32) -> u32 {
 /// `(0, 0)` outside. `tf` is the row's top fade, as for [`fire_shade_add`].
 #[inline]
 #[must_use]
-pub fn fire_shade_over(c: &FireCore, p: &FireFieldParams, tf: i32) -> (u32, u8) {
+pub const fn fire_shade_over(c: &FireCore, p: &FireFieldParams, tf: i32) -> (u32, u8) {
     let a0 = fire_alpha_over(c, p);
     let a = if tf == 255 { a0 } else { (a0 * tf) / 255 };
     if a <= 0 {
@@ -476,9 +525,10 @@ pub fn fire_shade_over(c: &FireCore, p: &FireFieldParams, tf: i32) -> (u32, u8) 
     // Rim darkening: ink pools at the outline, a red-brown contour around amber.
     let idx = (c.idx * (256 - ((c.rim * 128) >> 8))) >> 8;
     let (r, g, b) = fire_pal(&FIRE_PAL_OVER, idx);
+    let a_clamped = if a > 255 { 255 } else { a };
     (
         ((r as u32) << 16) | ((g as u32) << 8) | (b as u32),
-        a.clamp(0, 255) as u8,
+        a_clamped as u8,
     )
 }
 

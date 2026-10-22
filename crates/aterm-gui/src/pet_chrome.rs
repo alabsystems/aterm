@@ -112,15 +112,17 @@ impl PetChrome {
     /// that carry the host's words and marks, as [`PetChrome::note`] notes a
     /// write. A rule's stroke (`─`) is a rule, whoever paints it: the harness
     /// repaints the composer's whole upper rule in its tint
-    /// (`claude_footer::collect_composer_border_brand_edits`), the same
+    /// (`claude_footer::compose_top`), the same
     /// strokes over the same cells as the program's own rule, which the pet
     /// reads as ink. Noted whole, the rule was protected from end to end, a
     /// cat on the composer's first line (its 1.7-row body reaches into the
     /// rule) was refused at every column, and it waited off the line up to
     /// fifty columns behind the caret and bounded back at every line
     /// (2026-10-20, real Claude Code 2.1.305 with the harness on, windowed).
-    /// The tool's mark and the switch on that rule, the chips and facts on
-    /// the lower one, the card's line, stay protected.
+    /// The lockup on that rule (its pads, the icon's two blank cells under
+    /// the CLI's sprite, and the CLI's name), the key's mark and the switch,
+    /// the chips and facts on the lower one, the card's line, stay
+    /// protected: the cat never sits on the CLI's icon.
     pub(crate) fn note_painted(&mut self, row: usize, col: usize, cells: &[RenderCell]) {
         let mut run: Option<usize> = None;
         for (i, cell) in cells.iter().enumerate() {

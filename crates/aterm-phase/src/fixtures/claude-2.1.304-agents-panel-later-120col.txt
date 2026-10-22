@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-19, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · the same agents panel about 4.5 minutes later, the agent still in its Bash `sleep 600`: the elapsed time moved with the wall clock (read every 5 s: `30s`, `1m 0s`, … `3m 45s`) while the token count stayed `↓ 6.2k tokens`; the stand-in `workspace` replaces the vendor's top effort key throughout
+
+
+⏺ Unknown command: /vim
+
+❯ /effort workspace on
+  ⎿  Workspace on (this session only): dynamic workflows on every task. Effort stays medium.
+
+❯ /fast
+  ⎿  Fast mode OFF
+
+❯ toolstart
+
+⏺ Agent(bling probe)
+  ⎿  Initializing…
+  ⎿  Error: Auto mode could not evaluate this action and is blocking it for safety — run with --debug for details. This
+     is not a judgment that the action is unsafe. This is usually transient — wait briefly and try this action again
+     as-is; don't rewrite it. If it keeps failing, continue with other tasks that don't require this action and come
+     back to it later. Note: reading files, searching code, and other read-only operations do not require the classifier
+     and can still be used.
+
+⏺ Tool call done.
+
+✻ Cogitated for 0s · done 7:58 PM
+
+❯ toolstart
+
+⏺ Agent(bling probe)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Tool call done.
+
+✻ Waiting for 1 background agent to finish
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────── workspace ─
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ↓ to manage
+
+  ⏺ main
+  ◯ general-purpose  bling probe                                                                4m 46s · ↓ 6.2k tokens

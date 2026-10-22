@@ -14,6 +14,7 @@
 
 /// Lowercase, drop strippable diacritics, and apply the special-case folds.
 /// The result is the canonical surface used for every lexicon lookup.
+#[inline]
 #[must_use]
 pub fn fold(s: &str) -> String {
     let mut out = String::new();
@@ -24,6 +25,7 @@ pub fn fold(s: &str) -> String {
 /// [`fold`] into a caller-provided buffer (cleared first), so a per-token scanner reuses one
 /// allocation. Public so the host's context tokenizer (the sparkle-words genome's ±K
 /// neighbor-token walk) folds through the scanner's own function.
+#[inline]
 pub fn fold_into(s: &str, out: &mut String) {
     out.clear();
     // Reserves `s.len()` (capped); the saturating form keeps `len + additional` provably in range
@@ -53,8 +55,9 @@ pub fn fold_into(s: &str, out: &mut String) {
 
 /// The base letter of a lowercase precomposed accented Latin (Latin-1, Extended-A) or monotonic
 /// Greek letter, or `None`. Cyrillic is left alone: its accented letters are distinct phonemes.
+#[inline]
 #[must_use]
-fn base_letter(c: char) -> Option<char> {
+const fn base_letter(c: char) -> Option<char> {
     // Every pattern below is non-ASCII; the ASCII letters are results.
     if c.is_ascii() {
         return None;
@@ -98,6 +101,7 @@ fn base_letter(c: char) -> Option<char> {
 /// The scanner's marks-required gate keys on this: a surface that loses essential marks (Vietnamese
 /// `đm` → `dm`) matches only a token that itself folds marks away (`đm`, `ĐM`, decomposed `d` +
 /// stroke), never the bare skeleton (`dm` in `dmg`).
+#[inline]
 #[must_use]
 pub fn has_foldable_marks(s: &str) -> bool {
     s.chars().any(|c| {
@@ -140,8 +144,9 @@ macro_rules! strippable_mark_ranges {
 /// stripping is safe: Latin, Greek, Cyrillic, Arabic harakat, Hebrew niqqud.
 /// Deliberately excludes Indic / Thai / SE-Asian spacing marks (category Mc),
 /// which are part of the syllable.
+#[inline]
 #[must_use]
-fn is_strippable_mark(c: char) -> bool {
+const fn is_strippable_mark(c: char) -> bool {
     // ASCII cannot be a combining mark, and the table says so: its lowest range
     // starts at U+0300 (the build checks it, below the tables). Terminal text
     // is overwhelmingly ASCII and this runs per character of every folded
@@ -179,8 +184,9 @@ macro_rules! no_space_script_ranges {
 /// user surface as spaced vs no-space with the SAME predicate the scanner
 /// uses (a spaced entry containing a CJK surface silently never matches, so
 /// the resolver emits it as a `cjk = true` entry instead).
+#[inline]
 #[must_use]
-pub fn is_no_space_script(c: char) -> bool {
+pub const fn is_no_space_script(c: char) -> bool {
     // No ASCII scalar is in a no-space script — the table's lowest range starts
     // at U+0E00 (Thai; the build checks it). This predicate opens
     // `is_token_char`, so it is the FIRST thing every scanned character meets.
@@ -195,6 +201,7 @@ pub fn is_no_space_script(c: char) -> bool {
 ///
 /// Public so the host's context tokenizer (the sparkle-words genome's ±K neighbor-token walk)
 /// uses the scanner's own predicate.
+#[inline]
 #[must_use]
 pub fn is_token_char(c: char) -> bool {
     // For ASCII the three range predicates are false (their lowest ranges are U+0E00, U+0300 and
@@ -221,7 +228,8 @@ macro_rules! kept_mark_ranges {
 
 /// A spacing/combining mark we KEEP (Indic / Thai etc.) — these are part of the
 /// token but are not stripped by `fold`.
-fn is_kept_mark(c: char) -> bool {
+#[inline]
+const fn is_kept_mark(c: char) -> bool {
     // The lowest range is U+0900.
     if c.is_ascii() {
         return false;
@@ -259,8 +267,9 @@ const _: () = {
 /// must never move the pet), and it has to draw the code/prose line exactly
 /// where the screen scanner draws it. A re-implemented look-alike set would
 /// drift, and the two would disagree about the same word on the same row.
+#[inline]
 #[must_use]
-pub fn is_code_adjacent_punct(c: char) -> bool {
+pub const fn is_code_adjacent_punct(c: char) -> bool {
     matches!(
         c,
         '/' | '\\'

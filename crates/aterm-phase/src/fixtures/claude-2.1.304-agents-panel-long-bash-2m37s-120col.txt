@@ -1,0 +1,41 @@
+# claude-code 2.1.304 · MEASURED 2026-10-20, `aterm ctl text` of a private headless aterm (120x40, aterm 0.107.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab), bypass mode (`--dangerously-skip-permissions`), fullscreen renderer (CLAUDE_CODE_NO_FLICKER=1) · the same panel 2 m 37 s in: `long probe` is inside its 300 s Bash call (its tool_use row written, no tool_result yet), its tokens unmoved since the call (`↓ 6.2k`), past the fold's 150 s stuck rule though the call has 4 m 3 s of its own timeout left; `bg probe` still at `0s`
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.19iX/proj
+
+
+❯ toolstart
+
+⏺ Agent(long probe)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Agent(quick probe)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Agent(bg probe)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Tool call done.
+
+✻ Waiting for 3 background agents to finish
+
+⏺ Agent "bg probe" is waiting on its own background work · 0s
+
+⏺ Tool call done.
+
+✻ Waiting for 2 background agents to finish
+
+⏺ Agent "quick probe" finished · 2s
+
+⏺ Tool call done.
+
+✻ Waiting for 1 background agent to finish
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on · 1 shell · ↓ to manage
+
+  ⏺ main
+  ◯ general-purpose  long probe                                                                 2m 37s · ↓ 6.2k tokens
+  ◯ general-purpose  bg probe                                                                       0s · ↓ 7.2k tokens
+
