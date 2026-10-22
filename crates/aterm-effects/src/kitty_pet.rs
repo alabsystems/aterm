@@ -2068,68 +2068,76 @@ impl PetFrame {
     /// is animating, and byte-stable (so it settles) once nothing is.
     #[must_use]
     #[inline]
-    pub fn fp(&self) -> u64 {
+    pub const fn fp(&self) -> u64 {
         // Keyed on presence, not the composed alpha: the arrival multiply can
         // truncate a faint body to 0 while its ghosts are live.
         if self.lane_alpha == 0 {
             return 0;
         }
-        let q = |v: f32, s: f32| ((v * s) as i64) as u64;
-        let mut h = aterm_hash::FNV64_OFFSET;
-        for value in [
-            u64::from(self.alpha),
-            u64::from(self.lane_alpha),
-            self.action as u64,
-            self.pose as u64,
-            q(self.col, 64.0),
-            q(self.row, 64.0),
-            q(self.lift, 256.0),
-            u64::from(self.facing_left),
-            u64::from(self.under_ink),
-            q(self.scale_x, 256.0),
-            q(self.scale_y, 256.0),
-            q(self.purr, 64.0),
-        ] {
-            h = aterm_hash::fnv_mix_u64(h, value);
+        const fn q(v: f32, s: f32) -> u64 {
+            ((v * s) as i64) as u64
         }
+        let mut h = aterm_hash::FNV64_OFFSET;
+        h = aterm_hash::fnv_mix_u64(h, self.alpha as u64);
+        h = aterm_hash::fnv_mix_u64(h, self.lane_alpha as u64);
+        h = aterm_hash::fnv_mix_u64(h, self.action as u64);
+        h = aterm_hash::fnv_mix_u64(h, self.pose as u64);
+        h = aterm_hash::fnv_mix_u64(h, q(self.col, 64.0));
+        h = aterm_hash::fnv_mix_u64(h, q(self.row, 64.0));
+        h = aterm_hash::fnv_mix_u64(h, q(self.lift, 256.0));
+        h = aterm_hash::fnv_mix_u64(h, self.facing_left as u64);
+        h = aterm_hash::fnv_mix_u64(h, self.under_ink as u64);
+        h = aterm_hash::fnv_mix_u64(h, q(self.scale_x, 256.0));
+        h = aterm_hash::fnv_mix_u64(h, q(self.scale_y, 256.0));
+        h = aterm_hash::fnv_mix_u64(h, q(self.purr, 64.0));
         // Motes animate while the body may be still, so they must move the
         // fingerprint.
-        for m in self.motes.iter().flatten() {
-            for value in [
-                m.kind as u64,
-                q(m.col, 64.0),
-                q(m.row, 64.0),
-                q(m.scale, 64.0),
-                q(m.rot, 64.0),
-                u64::from(m.alpha),
-                m.rgb.map_or(u64::MAX, u64::from),
-            ] {
-                h = aterm_hash::fnv_mix_u64(h, value);
+        let mut i = 0;
+        while i < self.motes.len() {
+            if let Some(m) = self.motes[i] {
+                h = aterm_hash::fnv_mix_u64(h, m.kind as u64);
+                h = aterm_hash::fnv_mix_u64(h, q(m.col, 64.0));
+                h = aterm_hash::fnv_mix_u64(h, q(m.row, 64.0));
+                h = aterm_hash::fnv_mix_u64(h, q(m.scale, 64.0));
+                h = aterm_hash::fnv_mix_u64(h, q(m.rot, 64.0));
+                h = aterm_hash::fnv_mix_u64(h, m.alpha as u64);
+                h = aterm_hash::fnv_mix_u64(
+                    h,
+                    match m.rgb {
+                        Some(rgb) => rgb as u64,
+                        None => u64::MAX,
+                    },
+                );
             }
+            i += 1;
         }
         // Departing bodies fold in too: a ghost may be the only change on
         // glass.
-        for d in self.departures.iter().flatten() {
-            for value in [
-                d.pose as u64,
-                q(d.col, 64.0),
-                q(d.row, 64.0),
-                q(d.lift, 256.0),
-                q(d.scale_x, 256.0),
-                q(d.scale_y, 256.0),
-                u64::from(d.facing_left),
-                u64::from(d.alpha),
-                u64::from(d.coat),
-                u64::from(d.iris),
-                u64::from(d.under_ink),
-                u64::from(d.own_glass),
-                u64::from(d.glass),
-                d.colors.map_or(u64::MAX, |c| {
-                    u64::from(c.accent) << 8 | u64::from(c.background)
-                }),
-            ] {
-                h = aterm_hash::fnv_mix_u64(h, value);
+        let mut j = 0;
+        while j < self.departures.len() {
+            if let Some(d) = self.departures[j] {
+                h = aterm_hash::fnv_mix_u64(h, d.pose as u64);
+                h = aterm_hash::fnv_mix_u64(h, q(d.col, 64.0));
+                h = aterm_hash::fnv_mix_u64(h, q(d.row, 64.0));
+                h = aterm_hash::fnv_mix_u64(h, q(d.lift, 256.0));
+                h = aterm_hash::fnv_mix_u64(h, q(d.scale_x, 256.0));
+                h = aterm_hash::fnv_mix_u64(h, q(d.scale_y, 256.0));
+                h = aterm_hash::fnv_mix_u64(h, d.facing_left as u64);
+                h = aterm_hash::fnv_mix_u64(h, d.alpha as u64);
+                h = aterm_hash::fnv_mix_u64(h, d.coat as u64);
+                h = aterm_hash::fnv_mix_u64(h, d.iris as u64);
+                h = aterm_hash::fnv_mix_u64(h, d.under_ink as u64);
+                h = aterm_hash::fnv_mix_u64(h, d.own_glass as u64);
+                h = aterm_hash::fnv_mix_u64(h, d.glass as u64);
+                h = aterm_hash::fnv_mix_u64(
+                    h,
+                    match d.colors {
+                        Some(c) => (c.accent as u64) << 8 | (c.background as u64),
+                        None => u64::MAX,
+                    },
+                );
             }
+            j += 1;
         }
         h
     }
@@ -3561,7 +3569,7 @@ impl PetBrain {
     /// Crouch behind the word the hide walk reached: the held crouch of
     /// [`HIDE_DWELL`].
     #[inline]
-    fn begin_hide(&mut self) {
+    const fn begin_hide(&mut self) {
         self.hide_to = None;
         self.hiding = true;
         self.hide_t = HIDE_DWELL;
@@ -3862,15 +3870,16 @@ impl PetBrain {
     /// the cat comes to a stand there, and it hops over when the caret
     /// arrives. The fresh-sighting seed is the same lead-free rule.
     #[inline]
-    fn update_wall(&mut self, caret_col: u16, cols: u16, width: f32) -> bool {
-        if f32::from(cols) - width <= 0.0 {
+    const fn update_wall(&mut self, caret_col: u16, cols: u16, width: f32) -> bool {
+        let cols_f = cols as f32;
+        if cols_f - width <= 0.0 {
             return false; // grid narrower than the cat: no sides to keep
         }
-        let edge = f32::from(caret_col) + STATION_LEAD + self.standoff() + width;
+        let edge = caret_col as f32 + STATION_LEAD + self.standoff() + width;
         let was = self.wall_side;
-        if !was && edge > f32::from(cols) {
+        if !was && edge > cols_f {
             self.wall_side = true;
-        } else if was && edge < f32::from(cols) - WALL_RETURN_MARGIN {
+        } else if was && edge < cols_f - WALL_RETURN_MARGIN {
             self.wall_side = false;
         }
         was != self.wall_side
@@ -4738,7 +4747,7 @@ impl PetBrain {
     ///
     /// Anything else (a real row jump, a click, a scroll) keeps its literal
     /// delta.
-    fn caret_delta(
+    const fn caret_delta(
         prev: (u16, u16),
         now: (u16, u16),
         cols: u16,
@@ -4746,9 +4755,9 @@ impl PetBrain {
         home: bool,
         scrolled: bool,
     ) -> (f32, f32, bool) {
-        let dr = f32::from(now.0) - f32::from(prev.0);
-        let dc = f32::from(now.1) - f32::from(prev.1);
-        let w = f32::from(cols);
+        let dr = now.0 as f32 - prev.0 as f32;
+        let dc = now.1 as f32 - prev.1 as f32;
+        let w = cols as f32;
         let bar = wrap_bar(w);
         if dr.abs() == 1.0 && dc.signum() != dr.signum() && dc.abs() >= bar {
             (0.0, dc + dr * w, true)
@@ -9917,20 +9926,18 @@ impl PetBrain {
     /// is walked to before the seat is taken; other trips end the seat).
     /// Vacuously true with no seat commanded.
     #[inline]
-    fn trick_settle_posed(&self) -> bool {
+    const fn trick_settle_posed(&self) -> bool {
         let Some(trick) = self.trick_settle else {
             return true;
         };
-        let pose = if trick == Trick::Sleep {
-            PetAction::Sleep
-        } else if trick == Trick::Down {
-            PetAction::Loaf
-        } else {
-            PetAction::Sit
+        let pose = match trick {
+            Trick::Sleep => PetAction::Sleep,
+            Trick::Down => PetAction::Loaf,
+            _ => PetAction::Sit,
         };
-        self.action == pose
-            || self.action == PetAction::Walk
-            || matches!(self.resume, Some((held, _)) if held == pose)
+        self.action as u8 == pose as u8
+            || matches!(self.action, PetAction::Walk)
+            || matches!(self.resume, Some((held, _)) if held as u8 == pose as u8)
     }
 
     /// A one-shot trick has finished: the cat is back in a settled, non-notice
@@ -10534,7 +10541,7 @@ impl PetBrain {
     /// The perk taken in place: no quiet reset, and a perk already up restarts
     /// its hold.
     #[inline]
-    fn perk_in_place(&mut self) {
+    const fn perk_in_place(&mut self) {
         self.set_action(PetAction::Perk);
         self.speed = 0.0;
     }
@@ -10996,7 +11003,7 @@ impl PetBrain {
 
     /// A fresh [`Departure::id`].
     #[inline]
-    fn next_departure_id(&mut self) -> u32 {
+    const fn next_departure_id(&mut self) -> u32 {
         self.departure_serial = self.departure_serial.wrapping_add(1);
         self.departure_serial
     }
@@ -11070,8 +11077,8 @@ impl PetBrain {
     }
 
     #[inline]
-    fn set_action(&mut self, a: PetAction) {
-        if a != self.action {
+    const fn set_action(&mut self, a: PetAction) {
+        if a as u8 != self.action as u8 {
             self.action = a;
             self.mote_mark = 0;
         }
@@ -11081,8 +11088,8 @@ impl PetBrain {
     /// Change action without resetting the hold clock — for the continuous
     /// states (walk/run/leap) whose `action_t` is not a one-shot timer.
     #[inline]
-    fn set_action_keep(&mut self, a: PetAction) {
-        if a != self.action {
+    const fn set_action_keep(&mut self, a: PetAction) {
+        if a as u8 != self.action as u8 {
             self.action = a;
             self.action_t = 0.0;
             self.mote_mark = 0;
@@ -11856,13 +11863,14 @@ impl PetBrain {
     /// that travels over letters ([`Self::veil_over_letters`]): the row its
     /// feet are on.
     #[inline]
-    fn path_box((x0, x1, y0, y1): (i32, i32, i32, i32), cell_h: u16) -> (i32, i32, i32, i32) {
+    const fn path_box((x0, x1, y0, y1): (i32, i32, i32, i32), cell_h: u16) -> (i32, i32, i32, i32) {
         if cell_h == 0 || y1 <= y0 {
             return (x0, x1, y0, y1);
         }
-        let ch = i32::from(cell_h);
+        let ch = cell_h as i32;
         let feet_row_top = (y1 - 1).div_euclid(ch) * ch;
-        (x0, x1, y0.max(feet_row_top), y1)
+        let top = if y0 > feet_row_top { y0 } else { feet_row_top };
+        (x0, x1, top, y1)
     }
 
     /// The share `0..=1` of a drawn body's box (grid pixels, right/bottom
@@ -11924,7 +11932,7 @@ impl PetBrain {
     /// second — so an adopted look in one hands over when the ramp ends
     /// ([`AdoptedLook`]).
     #[inline]
-    fn mid_stride(pose: PetGlyphId) -> bool {
+    const fn mid_stride(pose: PetGlyphId) -> bool {
         Self::is_leg_pose(pose)
             || matches!(
                 pose,
@@ -12055,7 +12063,7 @@ impl PetBrain {
     /// settle first, it stood for a single frame between the run and the
     /// swipe at a star.
     #[inline]
-    fn arriving(&self) -> bool {
+    const fn arriving(&self) -> bool {
         matches!(
             self.action,
             PetAction::Walk | PetAction::Run | PetAction::Land
@@ -12065,10 +12073,22 @@ impl PetBrain {
     /// Whether `pose` is a leg's art: the walk's, the amble's or the run's
     /// cycle.
     #[inline]
-    fn is_leg_pose(pose: PetGlyphId) -> bool {
-        Self::CYCLE_WALK.contains(&pose)
-            || Self::CYCLE_LWALK.contains(&pose)
-            || Self::CYCLE_RUN.contains(&pose)
+    const fn is_leg_pose(pose: PetGlyphId) -> bool {
+        matches!(
+            pose,
+            PetGlyphId::PetWalk0
+                | PetGlyphId::PetWalk1
+                | PetGlyphId::PetWalk2
+                | PetGlyphId::PetWalk3
+                | PetGlyphId::PetLwalk0
+                | PetGlyphId::PetLwalk1
+                | PetGlyphId::PetLwalk2
+                | PetGlyphId::PetLwalk3
+                | PetGlyphId::PetRun0
+                | PetGlyphId::PetRun1
+                | PetGlyphId::PetRun2
+                | PetGlyphId::PetRun3
+        )
     }
 
     #[inline]
@@ -12766,7 +12786,7 @@ impl PetBrain {
     /// no tail; the swing is offered only when the look can hold it
     /// ([`LOOK_DUR_LONG`]).
     #[inline]
-    fn sit_tail_edges(&self, beat: i64, swing_fits: bool) -> &'static [f32] {
+    const fn sit_tail_edges(&self, beat: i64, swing_fits: bool) -> &'static [f32] {
         if self.sit_front && !self.sit_yawn() && self.beat_deal(beat, 3) == 0 {
             return &[];
         }
@@ -12908,8 +12928,13 @@ struct Soonest(Option<f32>);
 
 impl Soonest {
     #[inline]
-    fn at(&mut self, t: f32) {
-        if t > 0.0 && self.0.is_none_or(|best| t < best) {
+    const fn at(&mut self, t: f32) {
+        if t > 0.0
+            && match self.0 {
+                None => true,
+                Some(best) => t < best,
+            }
+        {
             self.0 = Some(t);
         }
     }

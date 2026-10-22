@@ -310,23 +310,26 @@ pub const PINNED_PKG_ROOTKEY: &str = if PKG_TRUST_ANCHORS.is_empty() {
 /// A property of the build. The machine's switch is `[packages] enabled` in aterm.toml
 /// ("Automatic updates"), which gates the automatic lanes (the window's loop, a terminal
 /// session's pass, the head watch), never a verb a person typed.
+#[inline]
 #[must_use]
-pub fn enabled() -> bool {
+pub const fn enabled() -> bool {
     !PKG_TRUST_ANCHORS.is_empty()
 }
 
 /// Effective CLI posture: the shared admission predicate for the CLI and aterm's native
 /// Packages surface. The anchor lives in reviewed source; no environment variable can arm
 /// an unpinned build.
+#[inline]
 #[must_use]
-pub fn manager_enabled() -> bool {
+pub const fn manager_enabled() -> bool {
     manager_enabled_with(PKG_TRUST_ANCHORS)
 }
 
 /// Pure core of [`manager_enabled`]: armed iff the keyset is non-empty. It takes the list,
 /// not a head key, so a present head cannot stand in for an empty list.
+#[inline]
 #[must_use]
-pub fn manager_enabled_with(pinned: &[&str]) -> bool {
+pub const fn manager_enabled_with(pinned: &[&str]) -> bool {
     !pinned.is_empty()
 }
 

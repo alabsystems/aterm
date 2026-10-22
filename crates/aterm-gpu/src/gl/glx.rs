@@ -1342,7 +1342,8 @@ mod tests {
             assert!(what.contains("GL_UNKNOWN_CONTEXT_RESET"), "{what}");
             let err = surface
                 .present(&dev)
-                .expect_err("the drilled present fails");
+                .expect_err("the drilled present fails")
+                .to_string();
             assert!(
                 err.contains("present: the context was reset (GL_UNKNOWN_CONTEXT_RESET)"),
                 "{which}: {err}"
@@ -1403,10 +1404,19 @@ mod tests {
         glx.destroy_window(surface.glx_window().expect("a GLX surface"));
         desk.sync();
         let mut seen = Vec::new();
-        for _ in 0..3 {
+        for n in 1..=3 {
             let posted = surface.present(&dev);
             seen.push((posted.is_ok(), dev.shared().lost()));
             if let Err(e) = posted {
+                assert_eq!(
+                    e.kind,
+                    if n < 3 {
+                        crate::SurfacePresentFailure::Unavailable
+                    } else {
+                        crate::SurfacePresentFailure::Validation
+                    },
+                    "only pre-threshold binds ask the frontend to retry"
+                );
                 println!("present: {e}");
             }
         }

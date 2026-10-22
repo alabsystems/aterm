@@ -11,6 +11,7 @@ pub struct XorShift(u64);
 impl XorShift {
     /// A generator seeded with `seed`. Zero is xorshift's one fixed point, so it
     /// is replaced by a fixed odd constant.
+    #[inline]
     #[must_use]
     pub const fn new(seed: u64) -> Self {
         Self(if seed == 0 {
@@ -21,7 +22,8 @@ impl XorShift {
     }
 
     /// The next 64 bits.
-    pub fn next_u64(&mut self) -> u64 {
+    #[inline]
+    pub const fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
         x ^= x >> 7;
@@ -35,7 +37,8 @@ impl XorShift {
     /// # Panics
     ///
     /// When `n` is zero.
-    pub fn below(&mut self, n: u64) -> u64 {
+    #[inline]
+    pub const fn below(&mut self, n: u64) -> u64 {
         self.next_u64() % n
     }
 
@@ -44,6 +47,7 @@ impl XorShift {
     /// # Panics
     ///
     /// When `n` is zero.
+    #[inline]
     pub fn index(&mut self, n: usize) -> usize {
         let n = u64::try_from(n).unwrap_or(u64::MAX);
         usize::try_from(self.below(n)).unwrap_or(usize::MAX)
@@ -54,6 +58,7 @@ impl XorShift {
     /// # Panics
     ///
     /// When `hi <= lo`.
+    #[inline]
     pub fn range(&mut self, lo: usize, hi: usize) -> usize {
         lo + self.index(hi - lo)
     }
@@ -63,6 +68,7 @@ impl XorShift {
     /// # Panics
     ///
     /// When `from` is empty.
+    #[inline]
     pub fn pick<'a, T>(&mut self, from: &'a [T]) -> &'a T {
         &from[self.index(from.len())]
     }

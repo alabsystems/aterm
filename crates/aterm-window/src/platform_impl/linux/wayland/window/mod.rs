@@ -520,6 +520,25 @@ impl Window {
             .unwrap_or_default()
     }
 
+    /// The compositor's `tiled_*` states without `maximized`: an edge tile.
+    #[inline]
+    pub fn is_tiled(&self) -> bool {
+        self.window_state.lock().unwrap().last_configure.as_ref().is_some_and(|last_configure| {
+            last_configure.is_tiled() && !last_configure.is_maximized()
+        })
+    }
+
+    /// The compositor's `fullscreen` state, as [`Self::fullscreen`] reads it.
+    #[inline]
+    pub fn is_shown_fullscreen(&self) -> bool {
+        self.window_state
+            .lock()
+            .unwrap()
+            .last_configure
+            .as_ref()
+            .is_some_and(|last_configure| last_configure.is_fullscreen())
+    }
+
     #[inline]
     pub fn set_maximized(&self, maximized: bool) {
         // SAFETY: the window's live toplevel.

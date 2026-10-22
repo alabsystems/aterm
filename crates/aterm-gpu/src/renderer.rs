@@ -1913,8 +1913,8 @@ pub struct TrayScrim {
     pub top: u32,
 }
 
-/// Why an on-screen present did not acquire a drawable. Reconfigured/timeout
-/// failures get a bounded delayed retry; an occluded or validation-failed
+/// Why an on-screen present did not acquire a drawable. Reconfigured, timeout
+/// and temporarily unavailable surfaces get a bounded delayed retry; an occluded or validation-failed
 /// surface parks until an external stimulus requests a frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurfacePresentFailure {
@@ -1924,6 +1924,8 @@ pub enum SurfacePresentFailure {
     Reconfigured,
     /// Drawable acquisition timed out; retrying later may succeed.
     Timeout,
+    /// The surface could not bind temporarily; a bounded retry may recover it.
+    Unavailable,
     /// The platform reports that the surface is not currently visible.
     Occluded,
     /// The surface transaction was rejected as invalid.

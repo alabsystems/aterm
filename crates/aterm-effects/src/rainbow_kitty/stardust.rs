@@ -177,7 +177,7 @@ pub const FIELD_TAU_MS: f32 = 250.0;
 /// whose row the hand has left, and the end of the reduced-motion fade.
 #[inline]
 #[must_use]
-pub fn field_fade_life_s() -> f32 {
+pub const fn field_fade_life_s() -> f32 {
     half_life_life_s(FIELD_HOLD_MS / 1000.0, FIELD_TAU_MS / 1000.0)
 }
 
@@ -254,7 +254,7 @@ pub const CELL_1X_CH: f32 = 14.0;
 /// fixture's `ch` 18.
 #[inline]
 #[must_use]
-pub fn px_scale(ch: f32) -> f32 {
+pub const fn px_scale(ch: f32) -> f32 {
     ch / CELL_1X_CH
 }
 
@@ -263,8 +263,9 @@ pub fn px_scale(ch: f32) -> f32 {
 /// pixel. Exact at 1× and 2×.
 #[inline]
 #[must_use]
-pub fn px_at(ch: f32, at_1x: i32) -> i32 {
-    ((at_1x as f32 * px_scale(ch)) as i32).max(1)
+pub const fn px_at(ch: f32, at_1x: i32) -> i32 {
+    let scaled = (at_1x as f32 * px_scale(ch)) as i32;
+    if scaled > 1 { scaled } else { 1 }
 }
 
 /// Lower bound of the seeded arm-size scintillation rate, Hz (§5.5, D12).
@@ -364,7 +365,7 @@ pub const STUB_LEN_PX: i32 = 2;
 /// [`STUB_LEN_PX`] at cell height `ch` ([`px_at`]).
 #[inline]
 #[must_use]
-pub fn stub_len_px(ch: f32) -> i32 {
+pub const fn stub_len_px(ch: f32) -> i32 {
     px_at(ch, STUB_LEN_PX)
 }
 
@@ -408,7 +409,7 @@ pub const M2_HALO_R_MIN_PX: f32 = 6.0;
 /// [`M2_HALO_R_MIN_PX`] at cell height `ch` ([`px_scale`]).
 #[inline]
 #[must_use]
-pub fn m2_halo_r_min_px(ch: f32) -> f32 {
+pub const fn m2_halo_r_min_px(ch: f32) -> f32 {
     M2_HALO_R_MIN_PX * px_scale(ch)
 }
 
@@ -420,7 +421,7 @@ pub const M2_DISC_SHOULDER_PX: i32 = 1;
 /// [`M2_DISC_SHOULDER_PX`] at cell height `ch` ([`px_at`]).
 #[inline]
 #[must_use]
-pub fn m2_disc_shoulder_px(ch: f32) -> i32 {
+pub const fn m2_disc_shoulder_px(ch: f32) -> i32 {
     px_at(ch, M2_DISC_SHOULDER_PX)
 }
 
@@ -629,7 +630,7 @@ pub const SKY_LIFT_PX_PER_S: f32 = -3.0;
 /// [`SKY_LIFT_PX_PER_S`] at cell height `ch` ([`px_scale`]).
 #[inline]
 #[must_use]
-pub fn sky_lift_px_per_s(ch: f32) -> f32 {
+pub const fn sky_lift_px_per_s(ch: f32) -> f32 {
     SKY_LIFT_PX_PER_S * px_scale(ch)
 }
 
@@ -683,7 +684,7 @@ pub const EXHAUST_SHARE_CW: f32 = 4.0 * STREAM_SHARE_CW;
 /// [`STREAM_SHARE_CW`]. Zero for a stroll, non-finite input, or no cell.
 #[inline]
 #[must_use]
-pub fn stream_px_per_s(cw: f32, ioi_ms: f32) -> f32 {
+pub const fn stream_px_per_s(cw: f32, ioi_ms: f32) -> f32 {
     stream_px_per_s_with_share(STREAM_SHARE_CW, cw, ioi_ms)
 }
 
@@ -692,7 +693,7 @@ pub fn stream_px_per_s(cw: f32, ioi_ms: f32) -> f32 {
 /// clamped. Zero for a stroll, non-finite input, or no cell.
 #[inline]
 #[must_use]
-fn stream_px_per_s_with_share(share: f32, cw: f32, ioi_ms: f32) -> f32 {
+const fn stream_px_per_s_with_share(share: f32, cw: f32, ioi_ms: f32) -> f32 {
     if !(share.is_finite() && cw.is_finite() && ioi_ms.is_finite()) || cw <= 0.0 || share <= 0.0 {
         return 0.0;
     }
@@ -706,7 +707,7 @@ fn stream_px_per_s_with_share(share: f32, cw: f32, ioi_ms: f32) -> f32 {
 /// `v₀ · τ · STREAM_SPENT`.
 #[inline]
 #[must_use]
-pub fn stream_travel_px(px_per_s: f32) -> f32 {
+pub const fn stream_travel_px(px_per_s: f32) -> f32 {
     px_per_s / 1000.0 * STREAM_TAU_MS * STREAM_SPENT
 }
 
@@ -926,7 +927,7 @@ impl StarClass {
     /// This class's coverage request `c` in `lane` (§5.2's two tables).
     #[inline]
     #[must_use]
-    pub fn cov(self, lane: StarLane) -> f32 {
+    pub const fn cov(self, lane: StarLane) -> f32 {
         match (self, lane.is_sky()) {
             (Self::M1, true) => M1_COV_SKY,
             (Self::M1, false) => M1_COV_TRANSIENT,
@@ -943,7 +944,7 @@ impl StarClass {
     /// (§5.5), so a grain visibly opens.
     #[inline]
     #[must_use]
-    pub fn arm_ratio(self) -> f32 {
+    pub const fn arm_ratio(self) -> f32 {
         match self {
             Self::M1 => STAR_ARM_HERO,
             Self::M2 => STAR_ARM_STD,
@@ -956,7 +957,7 @@ impl StarClass {
     /// smaller apparent disc does, and a hero never looks resized.
     #[inline]
     #[must_use]
-    pub fn arm_floor(self) -> f32 {
+    pub const fn arm_floor(self) -> f32 {
         match self {
             Self::M1 => 0.88,
             Self::M2 | Self::M3 => 0.55,
@@ -968,7 +969,7 @@ impl StarClass {
     /// needs a stated floor ([`M2_ARM_MIN_PX`]), scaled by the cell ([`px_at`]).
     #[inline]
     #[must_use]
-    pub fn arm_min_px(self, ch: f32) -> i32 {
+    pub const fn arm_min_px(self, ch: f32) -> i32 {
         match self {
             Self::M2 => px_at(ch, M2_ARM_MIN_PX),
             Self::M1 | Self::M3 => 1,
@@ -979,7 +980,7 @@ impl StarClass {
     /// `0.85 + 0.15·e`, m2 `0.70 + 0.30·e`, m3 `env` at full depth.
     #[inline]
     #[must_use]
-    pub fn core_floor(self) -> f32 {
+    pub const fn core_floor(self) -> f32 {
         match self {
             Self::M1 => 0.85,
             Self::M2 => 0.70,
@@ -1076,7 +1077,7 @@ impl StarLane {
     /// the exhaust never chime, and meteor-lane stars ride the rain instead.
     #[inline]
     #[must_use]
-    pub fn may_chime(self) -> bool {
+    pub const fn may_chime(self) -> bool {
         matches!(self, Self::Strike | Self::Field)
     }
 
@@ -1086,7 +1087,7 @@ impl StarLane {
     /// shorter than any class life on the lane.
     #[inline]
     #[must_use]
-    pub fn throw_ms(self) -> Option<f32> {
+    pub const fn throw_ms(self) -> Option<f32> {
         match self {
             Self::Erase => Some(ERASE_THROW_MS),
             Self::Exhaust => Some(EXHAUST_THROW_MS),
@@ -1100,7 +1101,7 @@ impl StarLane {
     /// laws, each named by the population that needs it.
     #[inline]
     #[must_use]
-    fn motion(self) -> Motion {
+    const fn motion(self) -> Motion {
         match self {
             // A sky m1/m2 lifts; a sky m3 and every field star are pinned,
             // which the zero `v0` expresses without a fourth law.
@@ -1150,7 +1151,7 @@ impl Motion {
     /// at its window (a class that dies sooner stops short on the same ray), a
     /// drift or lift at death. [`Star::rest`] is the position here.
     #[inline]
-    fn end_ms(self, life_ms: f32) -> f32 {
+    const fn end_ms(self, life_ms: f32) -> f32 {
         match self {
             Self::Throw(window_ms) => window_ms,
             Self::Lift | Self::Drag => life_ms,
@@ -1310,7 +1311,7 @@ impl Star {
     /// This star's whole life in seconds (§5.6).
     #[inline]
     #[must_use]
-    pub fn life_s(&self) -> f32 {
+    pub const fn life_s(&self) -> f32 {
         self.class.life_s(self.lane)
     }
 

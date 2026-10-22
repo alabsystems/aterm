@@ -1775,7 +1775,7 @@ mod tests {
                             .unwrap();
                     }
                     _ => {
-                        aterm_machines::port::write_atomic(
+                        crate::macos_doctor::write_atomic(
                             &root.path().join("first-run.json"),
                             b"invalid decision",
                             0o600,

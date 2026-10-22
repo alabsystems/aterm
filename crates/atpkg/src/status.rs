@@ -377,6 +377,7 @@ pub fn stamp_pass_end_recorded(
 /// Whether `status`'s last recorded full pass ended `failed` only because its index came
 /// from the cache ([`Status::stale_index_only_pass_seq`] naming the current
 /// [`Status::pass_seq`]). Pure.
+#[inline]
 #[must_use]
 pub fn stale_index_only_end(status: &Status) -> bool {
     status.pass_seq > 0
@@ -410,6 +411,7 @@ pub fn pass_seq(layout: &Layout) -> u64 {
 
 impl Status {
     /// The names `program`'s `build` was refused a shim, when its landing recorded any.
+    #[inline]
     #[must_use]
     pub fn refused_for(&self, program: &str, build: u64) -> Option<&RefusedShims> {
         self.refused_shims
@@ -612,6 +614,7 @@ fn read_disk(layout: &Layout) -> io::Result<Option<Status>> {
 
 /// Compatibility projection: absent or malformed diagnostics yield `None`.
 /// Interactive surfaces which can show an error should use [`read_checked`].
+#[inline]
 #[must_use]
 pub fn read(layout: &Layout) -> Option<Status> {
     read_checked(layout).ok().flatten()

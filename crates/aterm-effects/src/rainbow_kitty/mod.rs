@@ -121,7 +121,7 @@ impl Dir {
     /// The direction of a cell-space delta, by the dominant axis (D15's rule).
     #[inline]
     #[must_use]
-    pub fn of(dcol: i32, drow: i32) -> Self {
+    pub const fn of(dcol: i32, drow: i32) -> Self {
         if dcol.abs() >= drow.abs() {
             if dcol > 0 { Self::Right } else { Self::Left }
         } else if drow < 0 {
@@ -135,7 +135,7 @@ impl Dir {
     /// left / down — the host's existing convention, unchanged.
     #[inline]
     #[must_use]
-    pub fn sign(self) -> i8 {
+    pub const fn sign(self) -> i8 {
         match self {
             Self::Right | Self::Up => 1,
             Self::Left | Self::Down => -1,
@@ -145,7 +145,7 @@ impl Dir {
     /// True where D15 sends the flight to `ribbon_beam_v`.
     #[inline]
     #[must_use]
-    pub fn is_vertical(self) -> bool {
+    pub const fn is_vertical(self) -> bool {
         matches!(self, Self::Up | Self::Down)
     }
 }
@@ -179,7 +179,7 @@ impl Licence {
     /// tells the two apart.
     #[inline]
     #[must_use]
-    pub fn is_echo(self) -> bool {
+    pub const fn is_echo(self) -> bool {
         matches!(self, Self::Typed | Self::Insert)
     }
 
@@ -187,7 +187,7 @@ impl Licence {
     /// licences that earn a wake, a scrub, a meteor cue and the nav tick.
     #[inline]
     #[must_use]
-    pub fn is_keyed_nav(self) -> bool {
+    pub const fn is_keyed_nav(self) -> bool {
         matches!(self, Self::Nav | Self::Synthetic)
     }
 }
@@ -350,7 +350,7 @@ impl Config {
     /// vocabularies meet.
     #[inline]
     #[must_use]
-    pub fn from_glow(cfg: &GlowConfig, reduced_motion: bool) -> Self {
+    pub const fn from_glow(cfg: &GlowConfig, reduced_motion: bool) -> Self {
         Self {
             dark_theme: cfg.dark_theme,
             intensity: cfg.intensity,
@@ -597,7 +597,7 @@ impl Cadence {
     /// An empty fold at `now`.
     #[inline]
     #[must_use]
-    pub(crate) fn at(now: Instant) -> Self {
+    pub(crate) const fn at(now: Instant) -> Self {
         Self {
             now,
             best: None,
@@ -607,7 +607,7 @@ impl Cadence {
 
     /// Per-frame motion is live.
     #[inline]
-    pub(crate) fn brisk(&mut self) {
+    pub(crate) const fn brisk(&mut self) {
         self.brisk = true;
     }
 

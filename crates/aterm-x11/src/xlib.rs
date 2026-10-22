@@ -114,6 +114,7 @@ pub mod xkb_event {
     pub const NEW_KEYBOARD_NOTIFY: c_int = 0;
     pub const MAP_NOTIFY: c_int = 1;
     pub const STATE_NOTIFY: c_int = 2;
+    pub const BELL_NOTIFY: c_int = 8;
 }
 
 /// XIM styles (`X11/Xlib.h`).
@@ -527,6 +528,27 @@ pub struct XkbStateNotifyEvent {
     pub req_minor: c_char,
 }
 
+/// `XkbBellNotifyEvent`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct XkbBellNotifyEvent {
+    pub type_: c_int,
+    pub serial: c_ulong,
+    pub send_event: Bool,
+    pub display: *mut Display,
+    pub time: Time,
+    pub xkb_type: c_int,
+    pub device: c_int,
+    pub percent: c_int,
+    pub pitch: c_int,
+    pub duration: c_int,
+    pub bell_class: c_int,
+    pub bell_id: c_int,
+    pub name: Atom,
+    pub window: Window,
+    pub event_only: Bool,
+}
+
 /// `XkbStateRec`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -862,6 +884,7 @@ aterm_dl::table! {
             unsafe extern "C" fn(*mut Display, c_uint, c_ulong, c_ulong) -> Bool;
         XkbSetDetectableAutoRepeat = c"XkbSetDetectableAutoRepeat":
             unsafe extern "C" fn(*mut Display, Bool, *mut Bool) -> Bool;
+        XkbBell = c"XkbBell": unsafe extern "C" fn(*mut Display, Window, c_int, Atom) -> Bool;
         XSupportsLocale = c"XSupportsLocale": unsafe extern "C" fn() -> Bool;
         XSetLocaleModifiers = c"XSetLocaleModifiers":
             unsafe extern "C" fn(*const c_char) -> *mut c_char;

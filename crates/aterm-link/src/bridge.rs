@@ -6266,12 +6266,7 @@ impl Bridge {
             }
         };
         let subject = format!("{prefix}/ack");
-        let mut receipt = Body::new(self.fx.wall_ms());
-        receipt.re = Some(r.off);
-        receipt.from = Some(r.sid.clone());
-        receipt.verdict = Some(r.verdict.clone());
-        receipt.text = format!("marked {} by the recipient", r.verdict);
-        let encoded = receipt.encode();
+        let encoded = receipt_body(self.fx.wall_ms(), &r.sid, r.off, &r.verdict).encode();
         let pinned = self.state.receipt_pin(&r.sid, r.rid)?;
         // NEGATIVE CONTROL (`crate::sim`): the receipt's pin forgotten.
         #[cfg(test)]
@@ -7184,11 +7179,7 @@ impl Bridge {
                         "/f/{}/in/{}/{}/{}/expired",
                         self.cfg.fleet, self.node, d.sid, self.node
                     );
-                    let mut verdict = Body::new(now);
-                    verdict.re = Some(d.off);
-                    verdict.dl = Some(d.dl);
-                    verdict.text = format!("no reply within {}", span_of(d.dl));
-                    let encoded = verdict.encode();
+                    let encoded = expired_body(now, d.off, d.dl).encode();
                     match self.publish_own_off(&subject, &encoded) {
                         Ok(at) => {
                             self.remember_expired(d.off, &d.sid);
@@ -9966,14 +9957,7 @@ impl Bridge {
                     Route::Exact(subject) => (subject, Some(post.kind.clone())),
                     _ => unreachable!("matched above"),
                 };
-                let mut body = Body::new(self.fx.wall_ms());
-                body.kind = in_body.clone();
-                body.from = Some(post.sid.clone());
-                body.re = post.re;
-                body.dl = post.dl;
-                body.via = post.via.clone();
-                body.text = String::from_utf8_lossy(&post.body).into_owned();
-                let encoded = body.encode();
+                let encoded = post_body(self.fx.wall_ms(), &post, in_body.clone()).encode();
                 // A POST OPENS A SUBJECT ONLY ABOVE ITS RESERVE
                 // ([`Bridge::budget_allows`]): a topic, a sid and a
                 // principal are each any name a session chooses, and the
@@ -13893,6 +13877,67 @@ impl Route {
     }
 }
 
+/// The body [`Bridge::drain_post`] publishes for a session's `post`: the
+/// node-attested `from=<sid>`, the post's `re=`, `dl=` and `via=`, its words in
+/// `text=`, and `kind=` only on a broadcast (`in_body`), whose subject's last
+/// segment is the topic. A directed post's kind is its subject's last segment,
+/// so a session's `post to=<asker> kind=ack re=<off>` is
+///
+/// ```text
+/// v=1 t=<ms> from=<sid> [via=<chain>] re=<off> [dl=<ms>] text=<pct>
+/// ```
+///
+/// on `<asker's lane>/ack`: an `ack` with NO `verdict=`, which settles the ask
+/// as an `answer` does ([`ANSWER_KINDS`]). ONE BUILDER, so the tests hold these
+/// bytes to astream's reading of an `ack` as well
+/// (`astream_wire::V1Receipt::decode("ack", …)` with no verdict).
+fn post_body(t_ms: u64, post: &QueuedPost, in_body: Option<String>) -> Body {
+    let mut body = Body::new(t_ms);
+    body.kind = in_body;
+    body.from = Some(post.sid.clone());
+    body.re = post.re;
+    body.dl = post.dl;
+    body.via = post.via.clone();
+    body.text = String::from_utf8_lossy(&post.body).into_owned();
+    body
+}
+
+/// The body of the receipt (R8) the bridge publishes on `<asker's lane>/ack`
+/// when its session `sid` ran `inbox seen … <verdict>` on the ask at `off`:
+///
+/// ```text
+/// v=1 t=<ms> from=<sid> re=<off> verdict=<verdict> text=marked%20<verdict>%20by%20the%20recipient
+/// ```
+///
+/// ONE BUILDER, so the bytes [`Bridge::send_receipt`] publishes are the bytes
+/// the tests hold to astream's reading of a receipt
+/// (`astream_wire::V1Receipt::decode("ack", …)`); this crate still reads them
+/// back with its own lossless [`Body::decode`].
+fn receipt_body(t_ms: u64, sid: &str, off: u64, verdict: &str) -> Body {
+    let mut receipt = Body::new(t_ms);
+    receipt.re = Some(off);
+    receipt.from = Some(sid.to_string());
+    receipt.verdict = Some(verdict.to_string());
+    receipt.text = format!("marked {verdict} by the recipient");
+    receipt
+}
+
+/// The body of the `expired` verdict the asker's bridge publishes on
+/// `<asker's lane>/expired` when the ask at `off` went unanswered past its
+/// deadline: `v=1 t=<ms> re=<off> dl=<dl> text=no%20reply%20within%20<span>`,
+/// `dl=` the RELATIVE deadline the ask carried, echoed, never an instant.
+///
+/// ONE BUILDER, as [`receipt_body`] is: [`Bridge::expire_deadlines`]
+/// publishes these bytes, and the tests read them with
+/// `astream_wire::V1Receipt::decode("expired", …)`.
+fn expired_body(t_ms: u64, off: u64, dl: u64) -> Body {
+    let mut verdict = Body::new(t_ms);
+    verdict.re = Some(off);
+    verdict.dl = Some(dl);
+    verdict.text = format!("no reply within {}", span_of(dl));
+    verdict
+}
+
 /// A deadline in words for an `expired` body: whole seconds as `30 s`, anything
 /// else exactly, as `1500 ms` — never rounded to a span the asker did not wait.
 fn span_of(ms: u64) -> String {
@@ -14532,6 +14577,133 @@ fn spawn_event_reader(push: Ctl, mailbox: Arc<Mailbox>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R8, HELD TO ASTREAM'S READING. Every body this bridge publishes on an
+    /// asker's `ack` or `expired` lane decodes with astream's receipt view
+    /// under the kind its subject names, field for field: the receipt
+    /// ([`receipt_body`], which [`Bridge::send_receipt`] publishes), a
+    /// session's own `post kind=ack` ([`post_body`], which
+    /// [`Bridge::drain_post`] publishes, with no verdict) and the `expired`
+    /// verdict ([`expired_body`], which [`Bridge::expire_deadlines`]
+    /// publishes): `re=`, the verdict or its absence, the RELATIVE `dl=`, and
+    /// `t=` as the sender's clock. This crate keeps its own lossless
+    /// [`Body::decode`], and reads the same bytes back with it.
+    ///
+    /// THE VERDICT WORDS ARE ONE LIST, BOTH WAYS: this crate's
+    /// [`crate::body::VERDICTS`] and astream's `ReceiptVerdict::ALL` (the words
+    /// its view reads) are the same set, so a verdict astream adds or drops
+    /// fails here, as one this crate adds or drops does.
+    ///
+    /// What it does not pin is how the view reads bytes this bridge never
+    /// writes (a CRLF ending, a field given twice): astream's own tests hold
+    /// that. NEGATIVE CONTROL: each body with its `re=` removed is refused, so
+    /// the view is not taking anything.
+    #[test]
+    fn receipt_and_expired_bodies_are_what_astream_reads() {
+        use astream_wire::{Offset, ReceiptError, ReceiptVerdict, V1Receipt};
+        use std::collections::BTreeSet;
+        const T: u64 = 1_700_000_000_999;
+        let aterm_words: BTreeSet<&str> = crate::body::VERDICTS.into_iter().collect();
+        let astream_words: BTreeSet<&str> =
+            ReceiptVerdict::ALL.iter().map(|v| v.as_str()).collect();
+        assert_eq!(
+            aterm_words.len(),
+            crate::body::VERDICTS.len(),
+            "no word twice"
+        );
+        assert_eq!(
+            aterm_words, astream_words,
+            "aterm's verdict words are astream's, both ways"
+        );
+        for verdict in ReceiptVerdict::ALL {
+            let word = verdict.as_str();
+            let wire = receipt_body(T, "s-host", 41, word).encode();
+            let line = String::from_utf8_lossy(&wire).into_owned();
+            assert_eq!(
+                V1Receipt::decode("ack", &wire),
+                Ok(V1Receipt::Ack {
+                    re: Offset(41),
+                    verdict: Some(verdict),
+                    sender_t_ms: Some(T),
+                }),
+                "{line}"
+            );
+            let (ours, _) = Body::decode(&wire);
+            assert_eq!(
+                (ours.re, ours.verdict.as_deref(), ours.from.as_deref()),
+                (Some(41), Some(word), Some("s-host")),
+                "{line}"
+            );
+        }
+        // A session's own `post to=<asker> kind=ack re=41`: directed, so the
+        // kind is the subject's and not in the body; with and without the
+        // `dl=` and `via=` a post may carry, which the view skips on an `ack`.
+        let posted = |dl: Option<u64>, via: Option<&str>| QueuedPost {
+            sid: "s-b".into(),
+            id: 1,
+            to: "s-a".into(),
+            kind: "ack".into(),
+            re: Some(41),
+            dl,
+            via: via.map(str::to_string),
+            key: None,
+            body: b"got it".to_vec(),
+        };
+        for post in [posted(None, None), posted(Some(30_000), Some("h-x"))] {
+            let wire = post_body(T, &post, None).encode();
+            let line = String::from_utf8_lossy(&wire).into_owned();
+            assert_eq!(
+                V1Receipt::decode(&post.kind, &wire),
+                Ok(V1Receipt::Ack {
+                    re: Offset(41),
+                    verdict: None,
+                    sender_t_ms: Some(T),
+                }),
+                "{line}"
+            );
+            let (ours, _) = Body::decode(&wire);
+            assert_eq!(
+                (ours.re, ours.verdict, ours.kind, ours.text.as_str()),
+                (Some(41), None, None, "got it"),
+                "{line}"
+            );
+        }
+        for (dl, span) in [(240_000, "240 s"), (1_500, "1500 ms")] {
+            let wire = expired_body(T, 7, dl).encode();
+            let line = String::from_utf8_lossy(&wire).into_owned();
+            assert_eq!(
+                V1Receipt::decode("expired", &wire),
+                Ok(V1Receipt::Expired {
+                    re: Offset(7),
+                    dl_ms: dl,
+                    sender_t_ms: Some(T),
+                }),
+                "{line}"
+            );
+            let (ours, _) = Body::decode(&wire);
+            let text = format!("no reply within {span}");
+            assert_eq!(
+                (ours.re, ours.dl, ours.text.as_str()),
+                (Some(7), Some(dl), text.as_str()),
+                "{line}"
+            );
+        }
+        // The negative control.
+        let mut receipt = receipt_body(T, "s-host", 41, "handled");
+        receipt.re = None;
+        let mut post = posted(None, None);
+        post.re = None;
+        let unanswering = post_body(T, &post, None);
+        let mut expired = expired_body(T, 7, 240_000);
+        expired.re = None;
+        for (kind, body) in [("ack", receipt), ("ack", unanswering), ("expired", expired)] {
+            assert_eq!(
+                V1Receipt::decode(kind, &body.encode()),
+                Err(ReceiptError::MissingOrDuplicateField("re")),
+                "{kind}"
+            );
+        }
+    }
 
     #[test]
     fn replay_scheduler_refines_shared_budget_and_rotation() {
@@ -17129,9 +17301,7 @@ mod tests {
             earlier_log: false,
         };
         if receipt {
-            body.re = Some(owed.off);
-            body.verdict = Some(owed.verdict.clone());
-            body.text = "marked handled by the recipient".into();
+            body = receipt_body(1, "s-host", owed.off, &owed.verdict);
         } else {
             *lane.outbox.lock().unwrap() =
                 Some("post sid=s-host id=1 to=h-a kind=note len=5\nretry".into());

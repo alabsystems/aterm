@@ -2165,8 +2165,14 @@ impl AppRt for AppRtLinux {
     /// config [`WindowTheme`] → [`aterm_window::window::Theme`] via [`window_theme_to_winit`]
     /// and hand it to [`Window::set_theme`]. On Wayland this themes the client-side
     /// decorations (titlebar/border); on X11 it sets the `_GTK_THEME_VARIANT` hint.
-    /// `Auto` resets to the OS preference. This is the real, buildable Linux analogue
-    /// of the macOS `NSAppearance` override.
+    /// The App never passes `Auto` here: `App::chrome_theme_for_apprt`
+    /// resolves it to the terminal theme's side, so the title bar matches the
+    /// terminal under it, the Windows caption's rule; that side follows an OS flip
+    /// wherever the theme is a `dark:…,light:…` pair. `Auto` itself would take the
+    /// X11 hint away (the window manager's default, the desktop's). GNOME 46's mutter
+    /// draws X11 frames in the desktop's colour scheme whatever the hint says; window
+    /// managers that read it (mutter before GNOME 44, Metacity) follow it. This is the
+    /// real, buildable Linux analogue of the macOS `NSAppearance` override.
     fn window_set_appearance(&self, window: &Window, theme: WindowTheme) {
         window.set_theme(window_theme_to_winit(theme));
     }

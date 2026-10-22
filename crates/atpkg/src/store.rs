@@ -117,12 +117,14 @@ impl Layout {
     }
 
     /// `store/<program>/<build>/` — the versioned, immutable extracted tree.
+    #[inline]
     #[must_use]
     pub fn build_dir(&self, program: &str, build: u64) -> PathBuf {
         aterm_toolchain::layout::build_dir(&self.prefix, program, build)
     }
 
     /// `bin/` — the only directory placed on the child `PATH` (shims into `current`).
+    #[inline]
     #[must_use]
     pub fn bin_dir(&self) -> PathBuf {
         self.prefix.join("bin")
@@ -132,6 +134,7 @@ impl Layout {
     /// put first only on the PATH aterm hands its own children, and by the rc hook inside an
     /// aterm session ([`crate::hooks`]). Never `bin/`, so [`shim_allowed`]'s deny-list keeps
     /// its meaning for the managed `bin/`.
+    #[inline]
     #[must_use]
     pub fn reroute_dir(&self) -> PathBuf {
         crate::reroute::dir(self)
@@ -144,6 +147,7 @@ impl Layout {
     /// ([`crate::activate::reconcile_agents`]), so `claude`/`codex` run the managed copy
     /// ahead of a vendor's native install or a brew cask. Every other managed tool stays in
     /// `bin/`, appended last, so [`shim_allowed`]'s deny-list keeps its meaning.
+    #[inline]
     #[must_use]
     pub fn agents_dir(&self) -> PathBuf {
         self.prefix.join("agents")
@@ -151,6 +155,7 @@ impl Layout {
 
     /// `agents/<tool>` — an agent program's front-of-`PATH` shim ([`Self::agents_dir`]);
     /// the same [`ToolName`] gate as [`Self::shim`].
+    #[inline]
     #[must_use]
     pub fn agent_shim(&self, tool: &ToolName) -> PathBuf {
         self.agents_dir().join(tool.shim_file())
@@ -159,6 +164,7 @@ impl Layout {
     /// `landing/`: where older passes wrote landing markers, which twins those clients laid
     /// still test for ([`crate::landing`]). No pass writes one now; every pass removes the
     /// directory ([`crate::landing::sweep`]).
+    #[inline]
     #[must_use]
     pub fn landing_dir(&self) -> PathBuf {
         self.prefix.join("landing")
@@ -167,6 +173,7 @@ impl Layout {
     /// `bin/<tool>`: a single shim, named by [`ToolName::shim_file`] (`bin/ay` on Unix,
     /// `bin/ay.cmd` on Windows). Taking a [`ToolName`] makes the [`shim_allowed`] gate
     /// unskippable: no file in `bin/` can be named without [`ToolName::new`].
+    #[inline]
     #[must_use]
     pub fn shim(&self, tool: &ToolName) -> PathBuf {
         self.bin_dir().join(tool.shim_file())
@@ -177,12 +184,14 @@ impl Layout {
     /// resolves it). Inside `store/<program>/`, so there is one per program, `uninstall`'s
     /// `remove_dir_all` of the program tree takes it with its builds, and it never collides
     /// with a build dir (`current` is not a `u64`; [`crate::ops::list_installed`] skips it).
+    #[inline]
     #[must_use]
     pub fn program_current(&self, program: &str) -> PathBuf {
         self.prefix.join("store").join(program).join("current")
     }
 
     /// `staging/<program>/` — the per-program download + stage scratch.
+    #[inline]
     #[must_use]
     pub fn staging_dir(&self, program: &str) -> PathBuf {
         self.prefix.join("staging").join(program)
@@ -193,6 +202,7 @@ impl Layout {
     /// Read together with [`Self::floor_generation`]; the pair is one value
     /// ([`crate::sig::BuildFloor`]), because `index_build` is a number a machine chooses and
     /// a floor set by a machine must not outlive the roster generation that revoked it.
+    #[inline]
     #[must_use]
     pub fn floor(&self) -> PathBuf {
         self.prefix.join("floor")
@@ -204,6 +214,7 @@ impl Layout {
     /// generation 0", which the strictly-newer rule re-bases on first contact. Missing or
     /// unreadable reads as `0`, a generation no real roster carries: the fail-closed
     /// direction, which never waives a floor for the generation that set it.
+    #[inline]
     #[must_use]
     pub fn floor_generation(&self) -> PathBuf {
         self.prefix.join("floor.gen")
@@ -217,6 +228,7 @@ impl Layout {
     /// atpkg's own rather than shared with `aterm-update`'s ratchet: the prefixes have
     /// different ownership and lifetimes, and uninstalling the store must not reset the app
     /// updater's replay defence. Each ratchet refuses only what it has itself seen superseded.
+    #[inline]
     #[must_use]
     pub fn roster_floor(&self) -> PathBuf {
         self.prefix.join("roster.floor")
@@ -225,12 +237,14 @@ impl Layout {
     /// `store.lock` — the `0600` store-wide single-writer advisory lock file
     /// ([`crate::lock`]). Try-acquired at the CLI edge by every verb that mutates the
     /// store, so exactly one process at a time stages/activates/discards builds here.
+    #[inline]
     #[must_use]
     pub fn store_lock(&self) -> PathBuf {
         self.prefix.join("store.lock")
     }
 
     /// `status.toml` — the aggregate observability record.
+    #[inline]
     #[must_use]
     pub fn status(&self) -> PathBuf {
         self.prefix.join("status.toml")
@@ -240,6 +254,7 @@ impl Layout {
     /// seconds, one line): a terminal session and a window opening claim it once a day
     /// between them ([`crate::machine::launch_apply_due`]) instead of walking `$HOME` at
     /// every launch.
+    #[inline]
     #[must_use]
     pub fn machine_apply_stamp(&self) -> PathBuf {
         self.prefix.join("machine-apply.stamp")
@@ -248,6 +263,7 @@ impl Layout {
     /// `session-pass.stamp` — when a terminal session last spawned its detached `aterm pkg
     /// update` (unix seconds, one line): claimed before the spawn, so tabs opened together
     /// start one pass, not one each.
+    #[inline]
     #[must_use]
     pub fn session_pass_stamp(&self) -> PathBuf {
         self.prefix.join("session-pass.stamp")
@@ -258,6 +274,7 @@ impl Layout {
     /// by the process holding the store flock (via `--progress-file`); read by the GUI
     /// card, the pending-program stubs (`atpkg __pending`), and anyone tailing it —
     /// all under the untrusted-reader rules the progress module documents.
+    #[inline]
     #[must_use]
     pub fn progress_file(&self) -> PathBuf {
         self.prefix.join("progress.json")
@@ -267,6 +284,7 @@ impl Layout {
     /// line, appended by pending-program stubs, consumed by the installer between
     /// items. Reorder-only by construction — the installer intersects it with the work
     /// the signed index already planned, so this file can never add work.
+    #[inline]
     #[must_use]
     pub fn bump_file(&self) -> PathBuf {
         self.prefix.join("bump")
@@ -276,6 +294,7 @@ impl Layout {
     /// planned yet ([`crate::progress::pass_owed`]): written under the store flock by the
     /// window's first-run seed and by a whole update, read by the pending-program stubs,
     /// so a stub run before `progress.json` exists waits for the pass instead of exiting.
+    #[inline]
     #[must_use]
     pub fn pass_owed_file(&self) -> PathBuf {
         self.prefix.join("pass-owed.json")
@@ -291,6 +310,7 @@ impl Layout {
     /// arrives (`cli::should_complete_set`). Cleared by `uninstall`, so set-completion never
     /// reinstalls what was removed; `[packages].exclude` drops one program while staying
     /// adopted. Existence-only; who adopted is [`Self::adopted_by_seed`].
+    #[inline]
     #[must_use]
     pub fn adopted(&self) -> PathBuf {
         self.prefix.join("adopted")
@@ -301,6 +321,7 @@ impl Layout {
     /// update pass say "installing aterm is the consent" and name `[packages].auto_install =
     /// false` as the switch that would have stopped it. Cleared with `adopted`;
     /// `install --default-set` never writes one.
+    #[inline]
     #[must_use]
     pub fn adopted_by_seed(&self) -> PathBuf {
         self.prefix.join("adopted-by-seed")
@@ -310,6 +331,7 @@ impl Layout {
     /// the resumable seed lane, which installs whatever the store lacks, would reinstall a
     /// targeted removal on the next launch. An explicit `install <program>` or
     /// `install --default-set` clears the relevant entries.
+    #[inline]
     #[must_use]
     pub fn removed(&self) -> PathBuf {
         self.prefix.join("removed")
@@ -337,6 +359,7 @@ impl Layout {
     /// `adopted` cannot carry it, since its absence means "never adopted", the state a first
     /// run installs from. Cleared by any explicit install (`install --default-set`,
     /// `install <program>`).
+    #[inline]
     #[must_use]
     pub fn declined(&self) -> PathBuf {
         self.prefix.join("declined")
@@ -347,12 +370,14 @@ impl Layout {
     /// line is the day (`YYYY-MM-DD`), which the `system: <path> — not managed by aterm
     /// (managed copy retired <date>)` state and `atpkg which` read back. Cleared when the
     /// program is uninstalled on purpose.
+    #[inline]
     #[must_use]
     pub fn retired_dir(&self) -> PathBuf {
         self.prefix.join("retired")
     }
 
     /// `retired/<program>`: one retirement marker; its callers gate the name by [`ToolName`].
+    #[inline]
     #[must_use]
     pub fn retired_marker(&self, program: &str) -> PathBuf {
         self.retired_dir().join(program)
@@ -447,6 +472,7 @@ impl Layout {
 
     /// `links/` — the per-program dev-link markers directory (§13). One `0600` marker per
     /// dev-linked program; its presence makes `update`/`apply` skip that program outright.
+    #[inline]
     #[must_use]
     pub fn links_dir(&self) -> PathBuf {
         self.prefix.join("links")
@@ -454,6 +480,7 @@ impl Layout {
 
     /// `links/<program>` — one dev-link marker. Only ever joined with a
     /// [`shim_allowed`]-shape program name (linkmode gates the name before calling).
+    #[inline]
     #[must_use]
     pub fn link_marker(&self, program: &str) -> PathBuf {
         self.links_dir().join(program)
@@ -690,8 +717,9 @@ impl Presence {
     /// True only when the path is provably not there. An `Unknown` answers `false`
     /// here on purpose: a caller asking "may I act as though this is gone?" must be
     /// told no when nobody looked.
+    #[inline]
     #[must_use]
-    pub fn is_absent(&self) -> bool {
+    pub const fn is_absent(&self) -> bool {
         matches!(self, Self::Absent)
     }
 }
@@ -1051,19 +1079,25 @@ impl StageRefusal {
     /// heals on the next attempt (`flow`'s
     /// `a_member_stage_failure_aborts_the_group_and_a_retry_heals_it`). Only a second
     /// identical verdict is evidence about the publication.
+    #[inline]
     #[must_use]
-    pub fn cooldown_secs(&self) -> i64 {
+    pub const fn cooldown_secs(&self) -> i64 {
         let Some(steps) = self.attempts.checked_sub(2) else {
             return 0;
         };
-        REFUSAL_COOLDOWN_BASE_SECS
-            .saturating_mul(1_i64 << steps.min(8))
-            .min(REFUSAL_COOLDOWN_CAP_SECS)
+        let shift = if steps < 8 { steps } else { 8 };
+        let scaled = REFUSAL_COOLDOWN_BASE_SECS.saturating_mul(1_i64 << shift);
+        if scaled < REFUSAL_COOLDOWN_CAP_SECS {
+            scaled
+        } else {
+            REFUSAL_COOLDOWN_CAP_SECS
+        }
     }
 
     /// The epoch second at which a new attempt is due.
+    #[inline]
     #[must_use]
-    pub fn retry_after(&self) -> i64 {
+    pub const fn retry_after(&self) -> i64 {
         self.at.saturating_add(self.cooldown_secs())
     }
 
@@ -1073,6 +1107,7 @@ impl StageRefusal {
     /// ([`Self::client`]), or whose cooldown lapsed binds nothing, and an unreadable clock
     /// (`i64::MAX`) lapses every cooldown. [`Self::signer`] and [`Self::held`] memos have
     /// no cooldown: they bind while the digests and the client hold.
+    #[inline]
     #[must_use]
     pub fn binds(&self, digest: (DigestAlg, &str), tree_root: &str, now_unix: i64) -> bool {
         self.same_digests(digest, tree_root)
@@ -1081,6 +1116,7 @@ impl StageRefusal {
     }
 
     /// Whether this record is about an artifact with these signed digests.
+    #[inline]
     fn same_digests(&self, (alg, digest): (DigestAlg, &str), tree_root: &str) -> bool {
         !self.digest.is_empty()
             && self.alg == alg
@@ -2190,6 +2226,7 @@ fn with_suffix(name: &str, suffix: &str) -> String {
 /// unchanged. On Windows a `bin/` entry may be `ay.cmd` (a shim this manager wrote) or `ay`
 /// (a hand-made file), and both must read back as `ay` so re-shimming replaces rather than
 /// writing `ay.cmd.cmd` beside it.
+#[inline]
 fn without_suffix<'a>(name: &'a str, suffix: &str) -> &'a str {
     name.strip_suffix(suffix).unwrap_or(name)
 }
@@ -2198,6 +2235,7 @@ impl ToolName {
     /// Admit `raw` as a tool name, or `None` when it fails [`shim_allowed`] (a sensitive
     /// command or a malformed name). Checking here rather than at each call site means no
     /// shim writer can forget the deny-list.
+    #[inline]
     #[must_use]
     pub fn new(raw: &str) -> Option<Self> {
         shim_allowed(raw).then(|| Self(raw.to_string()))
@@ -2205,6 +2243,7 @@ impl ToolName {
 
     /// The `bin/` **shim** file name: `<tool><SHIM_SUFFIX>` — `ay` on Unix (a bare symlink),
     /// `ay.cmd` on Windows (a batch wrapper).
+    #[inline]
     #[must_use]
     pub fn shim_file(&self) -> String {
         with_suffix(&self.0, crate::platform::SHIM_SUFFIX)
@@ -2213,6 +2252,7 @@ impl ToolName {
     /// The **executable** file name inside a build's `bin/`: `<tool><EXE_SUFFIX>` — `ay` on
     /// Unix, `ay.exe` on Windows. This is what a shim forwards to; it is never the shim's own
     /// name, and on Windows conflating the two yields `bin/ay.cmd` pointing at `bin\ay.cmd`.
+    #[inline]
     #[must_use]
     pub fn exe_file(&self) -> String {
         with_suffix(&self.0, crate::platform::EXE_SUFFIX)
@@ -2224,6 +2264,7 @@ impl ToolName {
     /// which append the suffix again. `None` for an entry this manager could never have
     /// written ([`shim_allowed`] refuses it), the fail-closed direction for the caller that
     /// deletes what it recognizes.
+    #[inline]
     #[must_use]
     pub fn from_shim_file(name: &str) -> Option<Self> {
         Self::new(without_suffix(name, crate::platform::SHIM_SUFFIX))
@@ -2231,6 +2272,7 @@ impl ToolName {
 
     /// The logical name, for reporting (`status.toml`, refusal lists, log lines). not for
     /// building a path — use [`shim_file`](Self::shim_file) / [`exe_file`](Self::exe_file).
+    #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -2238,6 +2280,7 @@ impl ToolName {
 
     /// Whether this is an [`ALIAS_PREFIX`]ed name (`alab-trust`), i.e. a shim that forwards
     /// to another tool's executable rather than to one of its own name.
+    #[inline]
     #[must_use]
     pub fn is_alias(&self) -> bool {
         self.0.starts_with(ALIAS_PREFIX)
@@ -2246,6 +2289,7 @@ impl ToolName {
     /// The `alab-<tool>` alias of this tool — `None` when the tool already carries the
     /// prefix (an alias never gets an alias; the name is unambiguous as it stands). Always
     /// `Some` otherwise: a base [`shim_allowed`] admits, the prefixed spelling admits too.
+    #[inline]
     #[must_use]
     pub fn alias(&self) -> Option<Self> {
         if self.is_alias() {
@@ -2257,6 +2301,7 @@ impl ToolName {
     }
 
     /// The tool an alias names: `alab-trust` → `trust`; `None` for a plain name.
+    #[inline]
     #[must_use]
     pub fn alias_base(&self) -> Option<Self> {
         self.0.strip_prefix(ALIAS_PREFIX).and_then(Self::new)

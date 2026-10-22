@@ -2340,7 +2340,8 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<TurnEndAction, Fail> {
         // The host withholds the continuations ([`IdleHost::withholds_turn_end`]):
         // nothing is typed, and the point is decided again once it lifts.
-        if host_withholds(opts) {
+        self.decided_withheld = host_withholds(opts);
+        if self.decided_withheld {
             if let Some(point) = shadow {
                 point.withheld = true;
             }
@@ -2843,6 +2844,9 @@ impl<C: Ctl> Session<'_, C> {
     ) -> Result<(), Fail> {
         let seq = point.screen.seq;
         self.nothing_decided = matches!(action, TurnEndAction::Nothing);
+        // The decision's own read of the host, taken: a point decided
+        // without one (another loop watching behind) reads none.
+        let withheld = std::mem::take(&mut self.decided_withheld);
         self.say_wall_refused(review);
         // A turn read where the books could not count the sleep before this
         // loop's first look, journaled once.
@@ -2873,6 +2877,20 @@ impl<C: Ctl> Session<'_, C> {
             self.set_due(at, WOKE);
             return Ok(());
         }
+        // THE POINT'S HOLD ([`super::HoldSaid`]): NOTHING decided is said
+        // once per change, and why; anything else decided ends the hold said.
+        // Why it was withheld is the decision's own read of the host, never a
+        // second look (a tape's replay serves each look from its own record).
+        let hold = matches!(action, TurnEndAction::Nothing).then(|| {
+            super::HoldSaid::Point(if withheld {
+                "withheld"
+            } else if !review.unattended() {
+                "attended"
+            } else {
+                "policy"
+            })
+        });
+        self.say_hold(seq, hold, review);
         let (text, rule) = match &action {
             TurnEndAction::Nothing | TurnEndAction::Escalate { .. } => return Ok(()),
             TurnEndAction::Restart {

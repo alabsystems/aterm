@@ -1139,6 +1139,10 @@ pub(crate) struct Reader {
     /// The counter reader's last level and when it was read, where the
     /// platform probe gives none.
     counter_throttle: Option<(Instant, Option<Thermal>)>,
+    /// The build slots' reader (`aterm_sysprobe::slots`, without a lock):
+    /// this thread's one, so `await sys slots>=…` and the occupancy board read
+    /// one proof ([`Self::set_occupancy_facts`]).
+    slots: aterm_sysprobe::slots::SlotReader,
     /// The machine's words, read once.
     pub(crate) machine: Machine,
 }
@@ -1179,13 +1183,17 @@ impl Reader {
             })
             .collect();
         let words = aterm_sysprobe::machine_words();
+        let home = aterm_types::dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         Self {
             probe: aterm_sysprobe::Probe::new(),
             clusters,
             vitals: aterm_vitals::Vitals::new(),
             jobs: crate::vitals_jobs::JobsPass::new(),
             epoch: Instant::now(),
-            home: aterm_types::dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
+            slots: aterm_sysprobe::slots::SlotReader::new(aterm_sysprobe::slots::default_dir(
+                &home,
+            )),
+            home,
             scratch: Vec::new(),
             uid: cfg!(unix).then(aterm_agent::harness::disk::discover::own_uid),
             survey,
@@ -1231,6 +1239,36 @@ impl Reader {
         }
     }
 
+    /// THE OCCUPANCY FACTS a snapshot carries beside the model's
+    /// (`docs/DESIGN-harness-occupancy-2026-10-20.md` §2, §4.2), set after
+    /// [`aterm_vitals::Vitals::absorb`], which leaves them unread: the memory
+    /// the machine can hand out without paging (`build-slot`'s admission
+    /// figure, [`aterm_sysprobe::machine_memory`]) and the build slots as this
+    /// thread's reader proved them. The slots are read again at most every
+    /// [`aterm_sysprobe::slots::PERIOD`] while an `await sys` names them
+    /// ([`crate::occupancy_host::SLOTS_ARMED`]), else every
+    /// [`aterm_sysprobe::slots::IDLE_PERIOD`]; between, the last reading
+    /// rides on with its age, which a wait judges by. The memory figure is
+    /// one host statistics call, read each time.
+    fn set_occupancy_facts(&mut self, snap: &mut Snapshot) {
+        snap.avail =
+            aterm_sysprobe::machine_memory().map(|m| m.available_mib.saturating_mul(1 << 20));
+        let machine = aterm_sysprobe::slots::Machine {
+            load5: snap.load.map(|l| l[1]),
+            ncpu: snap.total_cores(),
+        };
+        let now_us = aterm_time::since_epoch()
+            .and_then(|d| u64::try_from(d.as_micros()).ok())
+            .unwrap_or(0);
+        let now = Instant::now();
+        let armed = crate::occupancy_host::SLOTS_ARMED.armed();
+        let read = self.slots.read(now, now_us, &machine, armed);
+        snap.slots = Some(crate::occupancy_host::slots_view(&read));
+        snap.slots_age_ms = self.slots.read_at().map(|at| {
+            u64::try_from(now.saturating_duration_since(at).as_millis()).unwrap_or(u64::MAX)
+        });
+    }
+
     /// One full reading folded into the trends: the machine counters and the
     /// process sweep, and the stuck engine's pass over that sweep.
     pub(crate) fn read(&mut self, req: &Request) -> Snapshot {
@@ -1245,6 +1283,7 @@ impl Reader {
         sample.procs = observed.procs;
         sample.delegated = observed.delegated;
         let mut snap = self.vitals.absorb(&sample);
+        self.set_occupancy_facts(&mut snap);
         crate::resource_jobs::publish(
             sample
                 .procs
@@ -1275,6 +1314,7 @@ impl Reader {
         let mut sample = self.machine_sample(req);
         sample.machine_only = true;
         let mut snap = self.vitals.absorb(&sample);
+        self.set_occupancy_facts(&mut snap);
         snap.jobs = self.jobs.tick(
             sample.at_ns / 1_000_000,
             None,

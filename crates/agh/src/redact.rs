@@ -31,6 +31,7 @@ pub struct Redactor {
 }
 
 /// Whether `bytes` at `at` start with `prefix`, ASCII case-insensitively.
+#[inline]
 fn starts_ci(bytes: &[u8], at: usize, prefix: &[u8]) -> bool {
     bytes
         .get(at..at.saturating_add(prefix.len()))
@@ -89,6 +90,7 @@ enum Quote {
 }
 
 /// The quote that opens at `at`, and where the text after it starts.
+#[inline]
 fn open_quote(bytes: &[u8], at: usize) -> (Quote, usize) {
     match (bytes.get(at), bytes.get(at + 1)) {
         (Some(b'"'), _) => (Quote::Plain, at + 1),
@@ -182,6 +184,7 @@ fn bearer_at(bytes: &[u8], at: usize) -> Option<(usize, usize)> {
 
 impl Redactor {
     /// A redactor that has learned nothing.
+    #[inline]
     #[must_use]
     pub fn new() -> Redactor {
         Redactor::default()
@@ -201,6 +204,7 @@ impl Redactor {
     }
 
     /// Every learned value (longest first, where its bytes are UTF-8), then `shapes`.
+    #[inline]
     #[must_use]
     pub fn apply(&self, text: &str) -> String {
         Redactor::shapes(&self.learned(text))
@@ -211,6 +215,7 @@ impl Redactor {
     /// heartbeat): rules 2 and 3 read the text after a word, so over a joined line they would
     /// match across a field boundary (`repo=o/torchbearer as=anonymous`) and eat the next
     /// field. Neither a learned value nor a token can span a ` key=` boundary.
+    #[inline]
     #[must_use]
     pub fn learned_and_tokens(&self, text: &str) -> String {
         scan(&self.learned(text), false)
@@ -250,6 +255,7 @@ impl Redactor {
     /// or `the bearer of` is left alone. A run ends at ASCII whitespace, or at a `"` that no
     /// odd run of `\` escapes (after an opening `\"`, at the closing `\"`), so a quoted value
     /// keeps its closing quote and the scan of an already redacted text changes nothing.
+    #[inline]
     #[must_use]
     pub fn shapes(text: &str) -> String {
         scan(text, true)

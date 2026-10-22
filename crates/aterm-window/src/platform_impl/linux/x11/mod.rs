@@ -50,6 +50,8 @@ mod atoms;
 mod attention_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod background_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod bell_tests;
 
 /// Held by each test that makes windows on the process's one X11 connection
 /// (`X11_BACKEND`), so they take turns. Under an XIM server (IBus on the desk) two
@@ -78,6 +80,8 @@ mod focus_tests;
 mod glx_error_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod gone_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod held_frame_tests;
 mod ime;
 #[cfg(test)]
 mod ime_spot_tests;
@@ -94,6 +98,8 @@ mod startup_notify;
 mod sync_request;
 #[cfg(all(test, target_os = "linux"))]
 mod sync_request_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod theme_tests;
 mod util;
 mod window;
 mod xdisplay;

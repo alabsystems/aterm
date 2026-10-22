@@ -431,6 +431,30 @@ pub(super) fn read(pid: u32, want_fds: bool, lanes: Lanes) -> Option<ProcFacts> 
     Some(facts)
 }
 
+/// The device (`vst_dev`) and inode of every vnode `pid` holds a descriptor
+/// to, and whether the list was cut at [`MAX_FDS`]: the build-slot reader's
+/// proof that a process holds a slot file open (`crate::slots`). A
+/// descriptor closed between the list and its read is left out, as the
+/// process no longer holds it. `None` when the list is refused (gone, a
+/// zombie, another user's): libproc answers a refusal with no bytes, not an
+/// error, and a process the reader asks about holds at least its slot, so an
+/// empty list is read as the refusal it is, never as a process that holds
+/// nothing.
+pub(super) fn vnode_ids(pid: u32) -> Option<(Vec<(u32, u64)>, bool)> {
+    let p = c_int::try_from(pid).ok().filter(|p| *p > 0)?;
+    let (list, cut) = fd_list(p, MAX_FDS as u32).filter(|(list, _)| !list.is_empty())?;
+    let mut buf = vec![0u8; darwin::VNODE_PATH_SIZE];
+    let ids = list
+        .iter()
+        .filter(|f| i32::try_from(f.proc_fdtype).ok() == Some(libc::PROX_FDTYPE_VNODE))
+        .filter_map(|f| {
+            fd_info(p, f.proc_fd, darwin::PROC_PIDFDVNODEPATHINFO, &mut buf)?;
+            darwin::vnode(&buf).map(|v| (v.dev, v.ino))
+        })
+        .collect();
+    Some((ids, cut))
+}
+
 /// The kernel's path for `pid`'s descriptor `fd`, from its name cache.
 pub(super) fn fd_path(pid: u32, fd: i32) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;

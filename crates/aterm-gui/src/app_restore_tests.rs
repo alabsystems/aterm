@@ -54,6 +54,122 @@ fn the_tracker_keeps_the_normal_frame_through_a_maximize_and_restore() {
         (None, (30, 100))
     );
 }
+
+/// The tracker through an EDGE TILE (GNOME's Super+Left: X11 sets
+/// `_NET_WM_STATE_MAXIMIZED_VERT` alone, so the window is tiled, not
+/// maximized). The window is held off its normal frame while tiled, as while
+/// maximized: the tile's half-screen frame is never noted as the normal one,
+/// and the durable capture persists the frame from before the tile,
+/// unmaximized, so the window reopens floating where the user had it. The
+/// negative control is the rule this replaced, which held a window only while
+/// maximized in BOTH directions: it notes the tile's frame and persists it.
+#[test]
+fn a_tiled_window_persists_the_frame_it_had_before_the_tile() {
+    let normal = super::NormalFrame {
+        origin: Some((320, 210)),
+        rows: 30,
+        cols: 100,
+    };
+    let (tile_origin, tile_grid) = ((0, 0), (62, 118));
+    // (maximized, tiled) as the tile shows: the window manager moves it to the
+    // left edge and grows it to half the screen.
+    let (maximized, tiled) = (false, true);
+    let mut held = normal;
+    held.note_origin(maximized || tiled, tile_origin);
+    held.note_grid(maximized || tiled, tile_grid);
+    assert_eq!(held, normal, "the tile's frame is not the normal one");
+    let hold = super::captured_hold(false, Some(maximized), || maximized || tiled);
+    assert_eq!(
+        super::captured_frame(Some(tile_origin), tile_grid, hold, held),
+        (Some((320, 210)), (30, 100)),
+        "a tiled capture persists the frame from before the tile"
+    );
+    // Negative control: held only while maximized, the tile's frame is noted
+    // as the normal one and a capture persists it.
+    let mut both_flags = normal;
+    both_flags.note_origin(maximized, tile_origin);
+    both_flags.note_grid(maximized, tile_grid);
+    assert_eq!(
+        super::captured_frame(Some(tile_origin), tile_grid, Some(maximized), both_flags),
+        (Some(tile_origin), tile_grid),
+        "negative control: the both-flags rule persists the tiled frame"
+    );
+}
+
+/// The tracker through a FULL SCREEN (aterm's own, or the window manager's
+/// `_NET_WM_STATE_FULLSCREEN`), which is neither a maximize nor a tile: the
+/// screen's frame is never noted as the normal one, and a session that ends
+/// while the window is full screen persists the frame from before it,
+/// unmaximized, so the window reopens floating where the user had it. A
+/// seamless update carries the frame the window shows instead, the grid its
+/// adopted shells have (its successor cannot re-enter full screen off macOS),
+/// and a platform that tracks no normal frame (macOS: no maximize is captured)
+/// is left as it was. The negative control is the rule this replaced, which
+/// held a window only while maximized or tiled: it notes the screen's frame
+/// and persists it.
+#[test]
+fn a_full_screen_window_persists_the_frame_it_had_before_the_full_screen() {
+    let normal = super::NormalFrame {
+        origin: Some((320, 210)),
+        rows: 30,
+        cols: 100,
+    };
+    let (screen_origin, screen_grid) = ((0, 0), (68, 240));
+    // (maximized, tiled, full screen) as the full screen shows.
+    let (maximized, tiled, fullscreen) = (false, false, true);
+    let mut held = normal;
+    held.note_origin(maximized || tiled || fullscreen, screen_origin);
+    held.note_grid(maximized || tiled || fullscreen, screen_grid);
+    assert_eq!(held, normal, "the screen's frame is not the normal one");
+    let shows = || maximized || tiled || fullscreen;
+    assert_eq!(
+        super::captured_frame(
+            Some(screen_origin),
+            screen_grid,
+            super::captured_hold(false, Some(maximized), shows),
+            held
+        ),
+        (Some((320, 210)), (30, 100)),
+        "a quit or crash capture of a full-screen window persists the frame from before it"
+    );
+    assert_eq!(
+        super::captured_frame(
+            Some(screen_origin),
+            screen_grid,
+            super::captured_hold(true, Some(maximized), shows),
+            held
+        ),
+        (Some(screen_origin), screen_grid),
+        "a seamless update carries the frame the window shows"
+    );
+    assert_eq!(
+        super::captured_hold(false, None, || unreachable!("no normal frame is tracked")),
+        None,
+        "where no normal frame is tracked, nothing changes"
+    );
+    assert_eq!(
+        super::captured_hold(true, Some(true), || unreachable!(
+            "a maximize is held anyway"
+        )),
+        Some(true),
+        "a seamless update persists a maximized window's normal frame, as it did"
+    );
+    // Negative control: held only while maximized or tiled, the screen's frame
+    // is noted as the normal one and a capture persists it.
+    let mut replaced = normal;
+    replaced.note_origin(maximized || tiled, screen_origin);
+    replaced.note_grid(maximized || tiled, screen_grid);
+    assert_eq!(
+        super::captured_frame(
+            Some(screen_origin),
+            screen_grid,
+            Some(maximized || tiled),
+            replaced
+        ),
+        (Some(screen_origin), screen_grid),
+        "negative control: the maximized-or-tiled rule persists the screen's frame"
+    );
+}
 use crate::{App, CloseOutcome, WindowId, pane, restore};
 
 #[test]

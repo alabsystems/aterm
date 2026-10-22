@@ -24,6 +24,7 @@ pub enum Tier {
 
 impl Tier {
     /// `dev`, `release`, `external`.
+    #[inline]
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
@@ -34,6 +35,7 @@ impl Tier {
     }
 
     /// The tier `slug` names.
+    #[inline]
     #[must_use]
     pub fn parse(text: &str) -> Option<Tier> {
         match text {
@@ -59,6 +61,7 @@ pub enum Access {
 
 impl Access {
     /// `read`, `writer-read`, `write`.
+    #[inline]
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
@@ -69,6 +72,7 @@ impl Access {
     }
 
     /// The access `slug` names.
+    #[inline]
     #[must_use]
     pub fn parse(text: &str) -> Option<Access> {
         match text {
@@ -121,8 +125,9 @@ impl ExplicitTarget {
     }
 
     /// The repository it names.
+    #[inline]
     #[must_use]
-    pub fn slug(&self) -> &Slug {
+    pub const fn slug(&self) -> &Slug {
         &self.slug
     }
 }
@@ -160,8 +165,9 @@ pub struct RouteRequest {
 
 impl RouteRequest {
     /// A read of `target`.
+    #[inline]
     #[must_use]
-    pub fn read(target: RouteTarget) -> RouteRequest {
+    pub const fn read(target: RouteTarget) -> RouteRequest {
         RouteRequest {
             target,
             access: Access::Read,
@@ -172,6 +178,7 @@ impl RouteRequest {
     }
 
     /// A WriterRead of `target`.
+    #[inline]
     #[must_use]
     pub fn writer_read(target: RouteTarget) -> RouteRequest {
         RouteRequest {
@@ -181,6 +188,7 @@ impl RouteRequest {
     }
 
     /// A write of `target`. M1 decides it (`whoami --for … --op write`); no M1 path sends one.
+    #[inline]
     #[must_use]
     pub fn write(target: RouteTarget) -> RouteRequest {
         RouteRequest {
@@ -190,6 +198,7 @@ impl RouteRequest {
     }
 
     /// The same request with `anonymous`.
+    #[inline]
     #[must_use]
     pub fn with_anonymous(mut self, anonymous: bool) -> RouteRequest {
         self.anonymous = anonymous;
@@ -197,6 +206,7 @@ impl RouteRequest {
     }
 
     /// The same request with `as_profile`.
+    #[inline]
     #[must_use]
     pub fn with_as(mut self, profile: Option<String>) -> RouteRequest {
         self.as_profile = profile;
@@ -204,6 +214,7 @@ impl RouteRequest {
     }
 
     /// The same request with `named`.
+    #[inline]
     #[must_use]
     pub fn with_named(mut self, named: Named) -> RouteRequest {
         self.named = named;
@@ -211,6 +222,7 @@ impl RouteRequest {
     }
 
     /// The repository's owner, or the owner target's name.
+    #[inline]
     #[must_use]
     pub fn owner(&self) -> Option<&str> {
         match &self.target {
@@ -232,6 +244,7 @@ pub enum ChainStep {
 
 impl ChainStep {
     /// The profile's name, or `anonymous`.
+    #[inline]
     #[must_use]
     pub fn label(&self) -> &str {
         match self {
@@ -254,8 +267,9 @@ pub enum Presence {
 
 impl Presence {
     /// `present`, `absent`, or the unusable slug.
+    #[inline]
     #[must_use]
-    pub fn slug(&self) -> &'static str {
+    pub const fn slug(&self) -> &'static str {
         match self {
             Presence::Present => "present",
             Presence::Absent => "absent",
@@ -277,6 +291,7 @@ pub enum AnonymousWhy {
 
 impl AnonymousWhy {
     /// `asked`, `chain_fell_through`, `no_config`.
+    #[inline]
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
@@ -329,6 +344,7 @@ pub enum RefusalCode {
 impl RefusalCode {
     /// snake_case: `writer_absent`, `writer_unusable`, `chain_exhausted`, …, `tier_mismatch`,
     /// `method_not_read`, …
+    #[inline]
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
@@ -352,6 +368,7 @@ impl RefusalCode {
     }
 
     /// The first four → Unauthenticated; the next eight → Refused; the last four → Usage.
+    #[inline]
     #[must_use]
     pub const fn kind(self) -> Kind {
         match self {
@@ -533,22 +550,25 @@ pub struct Router {
 
 impl Router {
     /// No config: every read anonymous (`NoConfig`), every write refused.
+    #[inline]
     #[must_use]
-    pub fn empty() -> Router {
+    pub const fn empty() -> Router {
         Router { validated: None }
     }
 
     /// The rules of `validated`.
+    #[inline]
     #[must_use]
-    pub fn from_validated(validated: Validated) -> Router {
+    pub const fn from_validated(validated: Validated) -> Router {
         Router {
             validated: Some(validated),
         }
     }
 
     /// Whether an agh.toml stands behind it.
+    #[inline]
     #[must_use]
-    pub fn has_config(&self) -> bool {
+    pub const fn has_config(&self) -> bool {
         self.validated.is_some()
     }
 
@@ -589,6 +609,7 @@ impl Router {
     }
 
     /// The profile so named.
+    #[inline]
     #[must_use]
     pub fn profile(&self, name: &str) -> Option<&Profile> {
         self.validated.as_ref()?.profiles.get(name)
@@ -604,6 +625,7 @@ impl Router {
     }
 
     /// The `[targets]` row so named.
+    #[inline]
     #[must_use]
     pub fn target(&self, name: &str) -> Option<&Slug> {
         self.validated.as_ref()?.targets.get(name)

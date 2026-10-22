@@ -80,6 +80,7 @@ pub struct VerifiedBytes(Vec<u8>);
 impl VerifiedBytes {
     /// The verified raw bytes — the *same* bytes the signature was checked over, with
     /// no normalization or lossy conversion applied.
+    #[inline]
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
         &self.0
@@ -146,7 +147,8 @@ pub enum Reject {
 
 /// Translate the roster tier's verdict into atpkg's: one-to-one and total, with no catch-all,
 /// so a new [`RosterReject`] variant is a compile error here.
-fn from_roster(e: RosterReject) -> Reject {
+#[inline]
+const fn from_roster(e: RosterReject) -> Reject {
     match e {
         RosterReject::Disabled => Reject::Disabled,
         RosterReject::BadKey => Reject::BadKey,
@@ -197,8 +199,9 @@ impl Anchor {
     }
 
     /// An anchor over an explicit master keyset.
+    #[inline]
     #[must_use]
-    pub fn of(masters: Vec<String>, roster_floor: u64) -> Self {
+    pub const fn of(masters: Vec<String>, roster_floor: u64) -> Self {
         Self {
             masters,
             roster_floor,
@@ -209,6 +212,7 @@ impl Anchor {
     /// member is skipped by `verify_roster` (which reports `BadKey` if none was usable), so
     /// armedness is the slice being non-empty, the same rule as `aterm-update`'s
     /// `RosterPolicy`.
+    #[inline]
     #[must_use]
     pub fn is_armed(&self) -> bool {
         !self.masters.is_empty()
@@ -262,8 +266,9 @@ pub fn admit_roster(
 
 impl TrustedRoster {
     /// This generation's `roster_seq` — what the caller ratchets the durable floor to.
+    #[inline]
     #[must_use]
-    pub fn seq(&self) -> u64 {
+    pub const fn seq(&self) -> u64 {
         self.roster.roster_seq
     }
 
@@ -328,6 +333,7 @@ pub struct TrustedIndex {
 
 impl std::ops::Deref for TrustedIndex {
     type Target = crate::manifest::Index;
+    #[inline]
     fn deref(&self) -> &Self::Target {
         &self.index
     }
@@ -335,15 +341,17 @@ impl std::ops::Deref for TrustedIndex {
 
 impl TrustedIndex {
     /// Which machine signed this index, proved by its key rather than claimed by a label.
+    #[inline]
     #[must_use]
-    pub fn attribution(&self) -> &Attribution {
+    pub const fn attribution(&self) -> &Attribution {
         &self.attribution
     }
 
     /// The `roster_seq` that authorized it — what the caller ratchets the durable roster
     /// floor to once the index has actually been used.
+    #[inline]
     #[must_use]
-    pub fn roster_seq(&self) -> u64 {
+    pub const fn roster_seq(&self) -> u64 {
         self.roster.seq()
     }
 
@@ -356,6 +364,7 @@ impl TrustedIndex {
     /// old index with the owner's new roster re-bases the floor downward without forging
     /// anything. An index can declare only a generation the master has minted, so the
     /// master's rescue lever is unaffected.
+    #[inline]
     #[must_use]
     pub fn authorizing_seq(&self) -> u64 {
         // An index that declares no generation cannot waive a generation floor: 0 is never
@@ -498,16 +507,21 @@ pub struct BuildFloor {
 
 impl BuildFloor {
     /// A first-contact floor: nothing recorded, belonging to no generation.
+    #[inline]
     #[must_use]
-    pub fn none() -> Self {
-        Self::default()
+    pub const fn none() -> Self {
+        Self {
+            index_build: 0,
+            roster_seq: 0,
+        }
     }
 
     /// Whether an index at `index_build`, authorized by roster generation `roster_seq`,
     /// clears this floor. Only a strictly newer generation waives it: `!=` would waive it for
     /// an older one too, letting a replayed index in.
+    #[inline]
     #[must_use]
-    pub fn admits(&self, roster_seq: u64, index_build: u64) -> bool {
+    pub const fn admits(&self, roster_seq: u64, index_build: u64) -> bool {
         if roster_seq > self.roster_seq {
             return true;
         }
@@ -518,7 +532,8 @@ impl BuildFloor {
 /// Freshness gate (gate 2, §8): an index is fresh iff `now_unix < valid_until_unix`. Pure:
 /// the caller supplies the clock and the converted `valid_until`. A lapsed window is
 /// [`Reject::Stale`].
-pub fn check_freshness(now_unix: i64, valid_until_unix: i64) -> Result<(), Reject> {
+#[inline]
+pub const fn check_freshness(now_unix: i64, valid_until_unix: i64) -> Result<(), Reject> {
     if now_unix >= valid_until_unix {
         Err(Reject::Stale)
     } else {
@@ -538,13 +553,15 @@ pub struct Floor {
 impl Floor {
     /// A floor backed by `path`. Its parent directory must be private (owned by this uid,
     /// not group/other-writable) at write time; the file is published `0644`.
+    #[inline]
     #[must_use]
-    pub fn new(path: PathBuf) -> Self {
+    pub const fn new(path: PathBuf) -> Self {
         Self { path }
     }
 
     /// The recorded high-water floor (`0` if none or unreadable), for a caller that filters
     /// on it (§5) before advancing it with [`Self::check_and_record`].
+    #[inline]
     #[must_use]
     pub fn current(&self) -> u64 {
         self.read_floor()

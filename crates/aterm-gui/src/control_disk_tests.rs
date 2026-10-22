@@ -95,6 +95,14 @@ impl World {
     }
 }
 
+/// `text` through `await sys`'s one grammar to the wait this host runs.
+fn parse(text: &str) -> Result<SysWait, String> {
+    match aterm_vitals::sys::predicate::AwaitSys::parse(text)? {
+        aterm_vitals::sys::predicate::Parsed::Volume(v) => wait_of(v).map_err(str::to_owned),
+        other => panic!("{text} is no volume wait: {other:?}"),
+    }
+}
+
 fn run_in(shelf: &Shelf, wait: &str, who: &Who, world: &World) -> String {
     let w = parse(wait).expect("parses");
     let read = |_: &Path| Ok(reading(world.free.load(Ordering::SeqCst)));
@@ -113,12 +121,12 @@ fn run_in(shelf: &Shelf, wait: &str, who: &Who, world: &World) -> String {
     run(shelf, &w, who, &env)
 }
 
-/// THE GRAMMAR: a size needs its unit (a bare number is the usage line), a
-/// metric this build does not measure says so, `room` and the level words
-/// read, two terms join by `and`, `vol=` must be absolute, `timeout=` is the
-/// family's.
+/// THE WAIT THE ONE GRAMMAR HANDS OVER (`aterm_vitals::sys::predicate`
+/// holds the grammar and its table): its terms with the watch's levels, its
+/// `vol=` decoded, and `timeout=` the family's. A `vol=` that is not absolute
+/// is the usage line.
 #[test]
-fn the_grammar_reads_sizes_with_units_and_names_unknown_metrics() {
+fn the_grammar_hands_over_terms_levels_and_an_absolute_volume() {
     let w = parse("sys free>=5GiB").expect("a size");
     assert_eq!(
         w.terms,
@@ -128,16 +136,7 @@ fn the_grammar_reads_sizes_with_units_and_names_unknown_metrics() {
         }]
     );
     assert_eq!(w.timeout_ms, aterm_control::wire::WAIT_DEFAULT_MS);
-    assert_eq!(parse("sys free>=5000"), Err(USAGE), "a bare number");
-    assert_eq!(
-        parse("sys free>=5gb"),
-        Err(USAGE),
-        "units are spelled exactly"
-    );
-    assert_eq!(parse("sys cpu<50"), Err(UNKNOWN_METRIC));
-    assert_eq!(parse("sys mem_free>=1GiB"), Err(UNKNOWN_METRIC));
-    assert_eq!(parse("sys"), Err(USAGE));
-    assert_eq!(parse("sys disk=ok,nope"), Err(USAGE));
+    assert_eq!(w.vol, None);
     let w = parse(&format!(
         "sys free>room and disk=ok,low vol={} timeout=600000",
         abs("/Volumes/x")
@@ -155,20 +154,16 @@ fn the_grammar_reads_sizes_with_units_and_names_unknown_metrics() {
     );
     assert_eq!(w.vol, Some(PathBuf::from(abs("/Volumes/x"))));
     assert_eq!(w.timeout_ms, 600_000);
-    assert_eq!(parse("sys free>=1GB and"), Err(USAGE));
-    assert_eq!(parse("sys and free>=1GB"), Err(USAGE));
-    assert_eq!(
-        parse("sys free>=1GB disk=ok"),
-        Err(USAGE),
-        "terms join by `and`"
-    );
-    assert_eq!(parse("sys free>=1GB vol=rel"), Err(USAGE));
-    assert_eq!(parse("sys free>=1GB timeout=x"), Err(USAGE));
-    assert_eq!(
-        parse("sys free>=1KB and free>=2KB and free>=3KB"),
-        Err(USAGE),
-        "two terms at most"
-    );
+    let spaced = abs("/Volumes/a b");
+    let w = parse(&format!(
+        "sys disk=emergency,short vol={}",
+        aterm_control::wire::pct_encode(&spaced)
+    ))
+    .expect("an encoded volume");
+    assert_eq!(w.terms, [Term::Disk(vec![Level::Emergency, Level::Short])]);
+    assert_eq!(w.vol, Some(PathBuf::from(spaced)));
+    assert_eq!(parse("sys free>=1GB vol=rel").err().as_deref(), Some(USAGE));
+    assert_eq!(parse("sys free>=1GB vol=").err().as_deref(), Some(USAGE));
 }
 
 /// LATCHED: a condition already true answers at once, with no demand and no

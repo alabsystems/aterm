@@ -1315,6 +1315,59 @@ pub struct RowFacts {
     pub proc_limits: ProcLimits,
 }
 
+/// The machine's build slots (Trust's `build-slot` flock files) as the
+/// host's reader proved them: a slot is held only once two reads a second
+/// or more apart show the same live holder with the slot file open, and
+/// free only once two such reads show none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotsView {
+    /// Not read, and why.
+    Unread(SlotsUnread),
+    /// Read.
+    Read {
+        /// Slot files present.
+        n: u16,
+        /// Proven held.
+        held: u16,
+        /// Proven free.
+        free: u16,
+        /// Not proven either way yet (a first read, one sighting, a change).
+        pending: u16,
+        /// Whose record does not parse; never counted free.
+        unknown: u16,
+        /// Free slots counted busy: their wrapper is gone and its build
+        /// provably runs on.
+        discounted: u16,
+    },
+}
+
+/// Why the host read no build slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotsUnread {
+    /// No reader on this platform.
+    Unsupported,
+    /// No slot directory, or no slot in it.
+    NotSampled,
+    /// The directory, or every slot in it, refused to this user.
+    Refused,
+    /// No slot's record parses: `build-slot` changed its record.
+    UnreadFormat,
+}
+
+impl SlotsUnread {
+    /// The unavailable word (one of [`crate::sys::UNAVAILABLE_WORDS`]) a
+    /// term on the slots refuses with.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::NotSampled => "not_sampled",
+            Self::Refused => "refused",
+            Self::UnreadFormat => "unread_format",
+        }
+    }
+}
+
 /// Everything at one moment. Immutable once made; the host shares it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
@@ -1372,6 +1425,19 @@ pub struct Snapshot {
     pub thermal: Option<Thermal>,
     /// The 1, 5 and 15 minute load averages, where read.
     pub load: Option<[f64; 3]>,
+    /// Memory the machine can hand out without paging anything out, bytes
+    /// (free, inactive and purgeable: `build-slot`'s admission figure), where
+    /// the host read it. The host sets it after [`Vitals::absorb`], which
+    /// leaves it `None`, as it does [`Self::jobs`].
+    pub avail: Option<u64>,
+    /// The build slots, as the host's slot reader last proved them; `None`
+    /// where the host reads none. Set by the host after [`Vitals::absorb`],
+    /// which leaves it `None`.
+    pub slots: Option<SlotsView>,
+    /// How long before this snapshot [`Self::slots`] was read, ms: the reader
+    /// reads them every few seconds only while a wait names them, so a
+    /// snapshot may carry an older reading. `None`: read with the snapshot.
+    pub slots_age_ms: Option<u64>,
     /// This instance's pid.
     pub self_pid: u32,
     /// The events this sample raised ([`crate::events`]).
@@ -1874,6 +1940,9 @@ impl Vitals {
             procs_truncated: s.procs_truncated,
             thermal: s.thermal,
             load: s.load,
+            avail: None,
+            slots: None,
+            slots_age_ms: None,
             self_pid: s.self_pid,
             events: Vec::new(),
         };

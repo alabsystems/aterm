@@ -298,7 +298,7 @@ impl Word {
     }
 
     #[inline]
-    fn clear(&mut self) {
+    const fn clear(&mut self) {
         self.len = 0;
     }
 }
@@ -473,7 +473,7 @@ enum Outcome {
 /// that a `Confirm` folds into the tentative `Fire` it confirms, so `sit⏎` is
 /// one final fire.
 #[inline]
-fn fold(acc: Option<Outcome>, next: Option<Outcome>) -> Option<Outcome> {
+const fn fold(acc: Option<Outcome>, next: Option<Outcome>) -> Option<Outcome> {
     match (acc, next) {
         (acc, None) => acc,
         (
@@ -481,7 +481,7 @@ fn fold(acc: Option<Outcome>, next: Option<Outcome>) -> Option<Outcome> {
                 trick, back_chars, ..
             }),
             Some(Outcome::Confirm { trick: confirmed }),
-        ) if trick == confirmed => Some(Outcome::Fire {
+        ) if (trick as u8) == (confirmed as u8) => Some(Outcome::Fire {
             trick,
             back_chars,
             addressed: true,
@@ -496,13 +496,17 @@ fn fold(acc: Option<Outcome>, next: Option<Outcome>) -> Option<Outcome> {
 /// `since_end - fed` left of the caret; when negative the word lies right of
 /// the caret: distance 0 inside it, else what remains past its length.
 #[inline]
-fn back_chars(since_end: u32, fed: u32, word_chars: u32) -> u16 {
+const fn back_chars(since_end: u32, fed: u32, word_chars: u32) -> u16 {
     let distance = if fed <= since_end {
         since_end.saturating_sub(fed)
     } else {
         fed.saturating_sub(since_end).saturating_sub(word_chars)
     };
-    u16::try_from(distance).unwrap_or(u16::MAX)
+    if distance > u16::MAX as u32 {
+        u16::MAX
+    } else {
+        distance as u16
+    }
 }
 
 /// Everything a line reset clears. `Copy`: the boundary snapshot is one of

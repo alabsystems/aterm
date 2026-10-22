@@ -1344,6 +1344,7 @@ label_enum! {
         None => "none",
         GpuReconfigured => "gpu_reconfigured",
         GpuTimeout => "gpu_timeout",
+        GpuUnavailable => "gpu_unavailable",
         GpuOccluded => "gpu_occluded",
         GpuValidation => "gpu_validation",
         CpuResize => "cpu_resize",

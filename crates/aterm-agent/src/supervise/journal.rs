@@ -12,9 +12,9 @@
 //! {"t":<unix ms>,"sid":"<sid>"|null,
 //!  "kind":"event|approved|declined|dismissed|reconnect|timeout|exit|mail|extend|escalated|
 //!          cleared|continued|typed|restarted|waiting|skipped|unverified|limited|unproven|
-//!          dialog|chose|exception|probed|reset|probe|needs",
+//!          dialog|chose|exception|probed|reset|probe|needs|hold",
 //!  "phase":"idle|question|prompt|limited|survey|context|compacted|turn|idle-no-report|
-//!           <rule id>|resumed|still-limited|rebriefed|rebrief-failed|-",
+//!           <rule id>|resumed|still-limited|rebriefed|rebrief-failed|point|background|-",
 //!  "seq":<n>|null,"complete":0|1|null,"rows":<n>|null,"summary":"<the line's free-text tail>",
 //!  "line":"<the exact line>","turn":<id>|null,"report":<id>|null[,"mark":"<16 hex>"]
 //!  [,"ended":<unix ms>]}
@@ -35,7 +35,9 @@
 //!
 //! Some lines are journal-only, never printed (`Review::note`): `ESCALATED`, `CLEARED`,
 //! `NEEDS` (the worker's NEEDS YOU put on the person's screen: [`NEEDS`]),
-//! `WAITING`, `UNVERIFIED`, most `SKIPPED`, `UNPROVEN` (after a full-power `APPROVED`: why no
+//! `WAITING`, `HOLD` (where the loop typed nothing though the agent stood still, and why: a
+//! `point` decided nothing, a `background` break no host step was offered at; its door is
+//! its phase), `UNVERIFIED`, most `SKIPPED`, `UNPROVEN` (after a full-power `APPROVED`: why no
 //! safe rule proved the box), `DIALOG` (a question decision's rows joined by ` ⏎ `),
 //! `DECLINED`, `PROBED … /usage no sample (<word>)`, and every `RESET` but `used (<n> left)`.
 //! A due usage probe not run is the printed `SKIPPED seq=<n> rule=usage-probe@v1
@@ -293,6 +295,16 @@ impl JournalRecord {
                     rec.phase = rule.to_string();
                     tail = after;
                 }
+            }
+            "HOLD" => {
+                rec.kind = "hold".to_string();
+                if let Some((seq, after)) = take_num(rest, "seq") {
+                    rec.seq = Some(seq);
+                    tail = after;
+                }
+                let (door, after) = split_word(tail);
+                rec.phase = door.to_string();
+                tail = after;
             }
             "PROBE" => {
                 rec.kind = "probe".to_string();
@@ -708,6 +720,20 @@ mod tests {
                 "-",
                 Some(9),
                 "until=2026-09-19T18:10:00Z overloaded",
+            ),
+            (
+                "HOLD seq=9 point nothing why=withheld",
+                "hold",
+                "point",
+                Some(9),
+                "nothing why=withheld",
+            ),
+            (
+                "HOLD seq=12 background held why=act-untaken",
+                "hold",
+                "background",
+                Some(12),
+                "held why=act-untaken",
             ),
             (
                 "PROBE deferred seq=102 text is typed",

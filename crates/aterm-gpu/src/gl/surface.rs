@@ -43,7 +43,38 @@ use std::sync::Arc;
 use super::device::{EglBinding, GlDevice, GlShared, WindowSystem};
 use super::ffi::{self, EGLConfig, EGLSurface, EGLint, EglWindowFns, GLXDrawable};
 use super::resources::GlTexture;
+use crate::SurfacePresentFailure;
 use crate::device_layer::TexelFormat;
+
+/// A failed GL post and its frontend disposition. Only a window bind that has
+/// not reached the device-loss threshold may retry; other GL failures keep
+/// their validation disposition (a latched loss is recovered before retrying).
+#[derive(Debug)]
+pub(crate) struct GlPresentError {
+    pub(crate) kind: SurfacePresentFailure,
+    detail: String,
+}
+
+impl From<String> for GlPresentError {
+    fn from(detail: String) -> Self {
+        Self {
+            kind: SurfacePresentFailure::Validation,
+            detail,
+        }
+    }
+}
+
+impl From<&str> for GlPresentError {
+    fn from(detail: &str) -> Self {
+        detail.to_owned().into()
+    }
+}
+
+impl std::fmt::Display for GlPresentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
 
 /// The native window a surface is made on.
 #[derive(Clone, Copy, Debug)]
@@ -182,7 +213,8 @@ const BIND_FAILURES_LOST: u32 = 3;
 /// * [`BIND_FAILURES_LOST`] presents in a row failed: the failure persists.
 ///
 /// One failure of a window that posted before kills nothing: a window in
-/// teardown can be refused once, and its present just drops.
+/// teardown can be refused once. Its dropped present requests a bounded retry
+/// so an otherwise quiet window can reach this threshold too.
 const fn bind_failure_is_loss(in_a_row: u32, bound_before: bool, context_binds: bool) -> bool {
     !context_binds || !bound_before || in_a_row >= BIND_FAILURES_LOST
 }
@@ -477,7 +509,7 @@ impl GlWindowSurface {
     /// top-left, and swap. `Err` names the EGL, GLX or GL failure; a lost
     /// context, a reset one and a GLX window that keeps refusing its bind
     /// are latched on the device.
-    pub(crate) fn present(&mut self, dev: &GlDevice) -> Result<(), String> {
+    pub(crate) fn present(&mut self, dev: &GlDevice) -> Result<(), GlPresentError> {
         let standin = self
             .standin
             .as_ref()
@@ -517,7 +549,10 @@ impl GlWindowSurface {
                     // answers (and holds it until the guard releases it).
                     let context_binds = glx.make_current().is_ok();
                     if !bind_failure_is_loss(self.bind_failures, self.bound, context_binds) {
-                        return Err(e);
+                        return Err(GlPresentError {
+                            kind: SurfacePresentFailure::Unavailable,
+                            detail: e,
+                        });
                     }
                     let why = format!(
                         "{e} on its window ({} in a row; the window {} bound; the context {} \
@@ -531,7 +566,7 @@ impl GlWindowSurface {
                         },
                     );
                     cur.shared().latch_lost(&why);
-                    return Err(why);
+                    return Err(why.into());
                 }
                 self.bind_failures = 0;
                 self.bound = true;
@@ -609,7 +644,7 @@ impl GlWindowSurface {
         }
         cur.check("present blit")?;
         match &self.post {
-            Post::Egl { fns, surface, .. } => cur.swap(fns, *surface),
+            Post::Egl { fns, surface, .. } => cur.swap(fns, *surface).map_err(Into::into),
             Post::Glx { window, .. } => {
                 cur.glx()
                     .ok_or("gl: a GLX window on an EGL device")?

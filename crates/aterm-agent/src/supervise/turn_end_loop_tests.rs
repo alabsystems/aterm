@@ -17,6 +17,9 @@ use std::sync::PoisonError;
 #[path = "remembered_limit_tests.rs"]
 mod remembered_limit;
 
+#[path = "hold_journal_tests.rs"]
+mod hold_journal;
+
 #[path = "seed_matrix_tests.rs"]
 mod seed_matrix;
 

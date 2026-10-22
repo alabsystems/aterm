@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE COMMAND A BARRED BASH BOX DRAWS, TAKEN FROM THE AGENT'S TRANSCRIPT AND
-//! PROVEN BY DRAWING IT AGAIN (`docs/measured/breaker-transcript-and-zsh-2026-10-22.md`).
+//! A CANDIDATE COMMAND FOR A BARRED BASH BOX, TAKEN FROM THE AGENT'S TRANSCRIPT
+//! AND CHECKED FOR THE SAME DRAWN ROWS (`docs/measured/breaker-transcript-and-zsh-2026-10-22.md`).
 //!
 //! Claude Code draws a Bash command longer than 80 cells, or with a newline in
 //! it, in barred rows (` │ …`), and its renderer wraps a long line onto
@@ -21,7 +21,7 @@
 //!   (`sessions/<pid>.json`, its `procStart` checked, its `sessionId`, the
 //!   project folder of its `cwd`), as the footer and the wall reader do
 //!   (`crate::supervise::IdleHost::transcript_tail`).
-//! * THE CALL IS THE ONE WAITING: the main chain holds exactly one call with
+//! * THE CALL IS ALONE IN THE FILE: the main chain holds exactly one call with
 //!   no result, not spent on an earlier box, and it is a Bash call
 //!   ([`pending_bash`], which reads the conversation's own order where the
 //!   file's differs: MEASURED, a first turn's prompt row written after its
@@ -34,20 +34,14 @@
 //!   draws a barred box ([`barred_rows`]), is the box's rows between its
 //!   dashed rules, row for row and character for character ([`drawn_as`]).
 //!
-//! Then the policy judges that one command and no join. The transcript alone
-//! is never a proof: a candidate that does not draw as the box's rows is no
-//! reading, and the box is judged on the screen's readings as before.
-//!
-//! A call taken is spent when its box leaves or a new mount begins, so it
-//! answers no later box. What this does not close (the measured note's
-//! residual): an OLDER Bash call the loop never took (its box came and went
-//! between the loop's reads, or stood while the file named no call, and a
-//! person answered it) still shows no result because the agent's writer
-//! stalled past the settle, the new box's own call row is held back as
-//! long, and the older call's text draws exactly as the new box's rows (the
-//! same characters with a wrap where the box's call has a newline, or the
-//! reverse). A word named `rm` or `rmdir` is still refused there: it is the
-//! same characters.
+//! The policy keeps EVERY screen reading, even when the candidate draws the
+//! same rows. The transcript may add a reading but cannot remove one. A
+//! settle establishes stability, not current-box identity: an older call the
+//! loop never took can remain pending while its result and this box's call
+//! are delayed. A harmless one-line `echo ... touch path` can then draw as
+//! a new `echo ...\ntouch path` command, and waiting longer does not close
+//! that gap. The call's provenance, its pending state and shape agreement
+//! therefore never authorize narrowing the screen's alternatives.
 
 use std::collections::HashMap;
 

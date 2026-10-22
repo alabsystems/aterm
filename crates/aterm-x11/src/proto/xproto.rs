@@ -205,6 +205,16 @@ pub fn destroy_window(window: Window) -> Request<Void> {
     Writer::new(4, 0).u32(window).finish()
 }
 
+/// ReparentWindow (7).
+pub fn reparent_window(window: Window, parent: Window, x: i16, y: i16) -> Request<Void> {
+    Writer::new(7, 0)
+        .u32(window)
+        .u32(parent)
+        .i16(x)
+        .i16(y)
+        .finish()
+}
+
 /// MapWindow (8).
 pub fn map_window(window: Window) -> Request<Void> {
     Writer::new(8, 0).u32(window).finish()

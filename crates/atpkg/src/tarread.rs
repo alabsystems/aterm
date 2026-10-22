@@ -95,7 +95,8 @@ pub enum EntryType {
 
 impl EntryType {
     /// Classify a raw typeflag byte.
-    fn from_byte(b: u8) -> Self {
+    #[inline]
+    const fn from_byte(b: u8) -> Self {
         match b {
             b'0' | 0 => Self::Regular,
             b'7' => Self::Continuous,
@@ -148,12 +149,14 @@ fn bad(what: &str) -> io::Error {
 impl Header {
     /// A field's raw bytes, or an empty slice if the offsets were ever wrong: never an
     /// index panic.
+    #[inline]
     fn field(&self, (off, len): (usize, usize)) -> &[u8] {
         self.raw.get(off..off + len).unwrap_or(&[])
     }
 
     /// A field's bytes with the trailing NUL/space padding removed — the form
     /// every text field is stored in.
+    #[inline]
     fn trimmed(&self, spec: (usize, usize)) -> &[u8] {
         let f = self.field(spec);
         let end = f.iter().position(|&b| b == 0).unwrap_or(f.len());
@@ -163,6 +166,7 @@ impl Header {
     /// Is this a POSIX ustar header, i.e. does `prefix` mean anything? Magic and version,
     /// both exact: `starts_with(b"ustar")` is also true of a GNU header, whose bytes
     /// 345..500 are `atime`/`ctime`/`offset`.
+    #[inline]
     fn is_ustar(&self) -> bool {
         self.field(field::MAGIC) == b"ustar\0" && self.field(field::VERSION) == b"00"
     }
@@ -170,6 +174,7 @@ impl Header {
     /// Is this a GNU header (magic `"ustar "`, version `" \0"`)? It shares the first 345
     /// bytes with ustar and matters here only as one of the two magics that make an
     /// `L`/`K`/`x` typeflag an extension header.
+    #[inline]
     fn is_gnu(&self) -> bool {
         self.field(field::MAGIC) == b"ustar " && self.field(field::VERSION) == b" \0"
     }
@@ -178,11 +183,13 @@ impl Header {
     /// neither magic the byte is just a vendor typeflag and the block an ordinary entry,
     /// refused as [`EntryType::Other`]; otherwise a magic-less `L` would rename the entry
     /// after it.
+    #[inline]
     fn is_recognized(&self) -> bool {
         self.is_ustar() || self.is_gnu()
     }
 
     /// The entry's kind.
+    #[inline]
     #[must_use]
     pub fn entry_type(&self) -> EntryType {
         EntryType::from_byte(self.raw.get(field::TYPEFLAG).copied().unwrap_or(0))
@@ -190,6 +197,7 @@ impl Header {
 
     /// A recognized PAX global header, still yielded as an ordinary `Other`
     /// entry. It never changes the parser's name, size or link interpretation.
+    #[inline]
     pub(crate) fn is_global_pax(&self) -> bool {
         self.is_recognized() && self.raw.get(field::TYPEFLAG) == Some(&b'g')
     }
@@ -200,6 +208,7 @@ impl Header {
     /// When the field is not a valid number. The extractor treats a mode as a
     /// hint anyway — it writes its own sanitized `0o755`/`0o644` — but a
     /// malformed field still means a malformed archive.
+    #[inline]
     pub fn mode(&self) -> io::Result<u32> {
         let v = self.octal(field::MODE, "mode")?;
         // Modes live in 12 bits; anything wider is noise from a hostile or
@@ -211,11 +220,13 @@ impl Header {
     ///
     /// # Errors
     /// When the size field is not a valid number.
+    #[inline]
     pub fn entry_size(&self) -> io::Result<u64> {
         self.numeric(field::SIZE, "size")
     }
 
     /// The stored checksum field. Octal only: see [`Header::octal`].
+    #[inline]
     fn stored_checksum(&self) -> io::Result<u64> {
         self.octal(field::CHKSUM, "checksum")
     }
@@ -310,6 +321,7 @@ impl Header {
     }
 
     /// Is this block entirely zero — the archive's end marker?
+    #[inline]
     fn is_zero_block(&self) -> bool {
         self.raw.iter().all(|&b| b == 0)
     }
@@ -369,6 +381,7 @@ pub struct Archive<R> {
 
 impl<R: Read> Archive<R> {
     /// Wrap a reader positioned at the first header block.
+    #[inline]
     pub const fn new(reader: R) -> Self {
         Self { inner: reader }
     }
@@ -377,6 +390,7 @@ impl<R: Read> Archive<R> {
     ///
     /// # Errors
     /// Never at this point; the signature leaves room for a variant that can fail here.
+    #[inline]
     pub fn entries(&mut self) -> io::Result<Entries<'_, R>> {
         Ok(Entries {
             inner: &mut self.inner,
@@ -387,6 +401,7 @@ impl<R: Read> Archive<R> {
 
     /// The reader, positioned wherever the walk stopped: after the end marker's first
     /// block once [`Entries::next_entry`] has answered `None`.
+    #[inline]
     pub fn into_inner(self) -> R {
         self.inner
     }
@@ -664,6 +679,7 @@ impl<'a, R: Read> Entries<'a, R> {
 /// When the rounding would overflow a `u64` (a `size` within 511 of `u64::MAX`). Refused
 /// before the entry is yielded, as the `tar` crate does: saturating would hand the caller
 /// one entry another reader never produced.
+#[inline]
 fn advance_for(size: u64) -> io::Result<u64> {
     let block = BLOCK as u64;
     let rounded = size
@@ -673,7 +689,8 @@ fn advance_for(size: u64) -> io::Result<u64> {
 }
 
 /// Bytes of zero padding after `size` content bytes, rounding up to a block.
-fn padding_for(size: u64) -> u64 {
+#[inline]
+const fn padding_for(size: u64) -> u64 {
     let rem = size % BLOCK as u64;
     if rem == 0 { 0 } else { BLOCK as u64 - rem }
 }
@@ -776,6 +793,7 @@ pub struct Entry<'e, 'a, R> {
 
 impl<R: Read> Entry<'_, '_, R> {
     /// The entry's raw header.
+    #[inline]
     #[must_use]
     pub const fn header(&self) -> &Header {
         &self.header
@@ -784,6 +802,7 @@ impl<R: Read> Entry<'_, '_, R> {
     /// The entry's effective content length. Use this, never `header().entry_size()`: a
     /// PAX `size` record overrides the header field, and a caller trusting the header
     /// would describe bytes that are the next entry's. The walk advances by this number.
+    #[inline]
     #[must_use]
     pub const fn entry_size(&self) -> u64 {
         self.size
@@ -794,6 +813,7 @@ impl<R: Read> Entry<'_, '_, R> {
     ///
     /// # Errors
     /// Never; the fallible decode happened when the entry was read.
+    #[inline]
     pub fn path(&self) -> io::Result<std::borrow::Cow<'_, Path>> {
         Ok(std::borrow::Cow::Borrowed(self.path.as_path()))
     }
@@ -802,6 +822,7 @@ impl<R: Read> Entry<'_, '_, R> {
     ///
     /// # Errors
     /// Never, for the same reason as [`path`](Self::path).
+    #[inline]
     pub fn link_name(&self) -> io::Result<Option<std::borrow::Cow<'_, Path>>> {
         Ok(self.link_name.as_deref().map(std::borrow::Cow::Borrowed))
     }

@@ -275,7 +275,7 @@ fn a_resize_is_answered_by_the_frame_drawn_at_its_size() {
     // wrapper owns the counter. Exercise that scope with a real offered counter: the
     // Err drops it, while the display and this unrelated live counter remain alive.
     let failed_counter = Cell::new(None);
-    let failed: Result<(), ()> = (|| {
+    let failed: Result<(), ()> = {
         let _counter = SyncCounter::offer(&rig.window.xconn, rig.xwindow).expect("a counter");
         rig.window.xconn.sync_with_server().expect("the offer reaches the server");
         let (_, property) = rig.manager.property32(rig.xwindow, rig.manager.sync_request_counter);
@@ -283,7 +283,7 @@ fn a_resize_is_answered_by_the_frame_drawn_at_its_size() {
         assert_ne!(counter, rig.manager.counter, "a fresh counter was offered");
         failed_counter.set(Some(counter));
         Err(())
-    })();
+    };
     assert!(failed.is_err());
     rig.window.xconn.sync_with_server().expect("the failed scope's drop reaches the server");
     match rig

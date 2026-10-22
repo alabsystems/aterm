@@ -112,9 +112,9 @@ pub const RULE_RM_BREAKER: &str = "rm-breaker@v3";
 /// the read-only rule's own checks ([`breaker_read_only`]). Claude Code 2.1.307
 /// draws that box over any command with more than 64 command substitutions,
 /// rm or none, in a bypass session too (MEASURED,
-/// `docs/measured/claude-code-2.1.307-2026-10-21.md`). v2 judges the box's
-/// command as the agent's transcript holds it where it draws as the box's rows
-/// exactly ([`super::box_command`]), and admits a plain `$NAME`, `${NAME}` and
+/// `docs/measured/claude-code-2.1.307-2026-10-21.md`). v2 also judges a matching
+/// transcript command, without removing any screen reading, and admits a
+/// plain `$NAME`, `${NAME}` and
 /// `$(…)` under zsh (`docs/measured/breaker-transcript-and-zsh-2026-10-22.md`).
 pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v2";
 /// The rm circuit breaker the safe rules could not prove, approved with a
@@ -749,9 +749,10 @@ pub struct ApprovalCtx {
     /// ([`super::box_command::pending_bash`]), or why none was taken; `None`:
     /// not read. Read by the loop only for the rm breaker's too-many box over
     /// barred rows ([`super::box_command::may_prove`]) that the screen's
-    /// readings alone do not prove. [`breaker_read_only`] judges its command
+    /// readings alone do not prove. [`breaker_read_only`] adds its command
     /// only where it draws as the box's rows exactly
-    /// ([`super::box_command::drawn_as`]); never on the transcript alone.
+    /// ([`super::box_command::drawn_as`]); every screen reading is kept, since
+    /// neither matching rows nor elapsed time binds this call to this box.
     pub box_command: Option<Result<BoxCommand, String>>,
 }
 
@@ -2327,12 +2328,13 @@ const NESTED_UNPROVEN: &str = "the vendor draws this only over a shell keyword r
 /// removal out ([`breaker_not_ruled_out`]), which 2.1.307 draws over commands
 /// that name no rm. It is approved only where aterm's own reading proves the
 /// whole command a read, by the checks [`bash`]'s read-only rule trusts and
-/// with nothing narrowed. The command judged is the agent transcript's one
-/// pending Bash call ([`ApprovalCtx::box_command`]) where it draws as the
-/// box's rows exactly ([`box_command::drawn_as`]); otherwise every reading of
-/// the box's command ([`PromptV2::readings`]; a barred box's rows
-/// newline-joined too, since the screen cannot tell a wrap from a newline),
-/// and a refusal then says why the transcript's call was not taken. Each
+/// with nothing narrowed. Every reading of the box's command is judged
+/// ([`PromptV2::readings`]; a barred box's rows newline-joined too, since the
+/// screen cannot tell a wrap from a newline). A matching transcript call
+/// ([`ApprovalCtx::box_command`]) adds its reading, never removes one: an
+/// older call can remain pending while this box's call has not reached the
+/// file, even across the settle. Drawing alike is no current-box identity.
+/// A refusal also says why a transcript call was not taken. Each
 /// command judged classifies read-only, so every
 /// simple command in every substitution is a known read, no redirect writes,
 /// no word the line computes is a command's name and nothing evaluates text
@@ -2361,35 +2363,30 @@ fn breaker_read_only(
     if let Err(why) = yes_no_to_proceed(prompt, rows) {
         return refused(why);
     }
-    // The transcript's call where it draws as the box exactly; else the
-    // screen's readings, and why the call was not taken.
-    let screen = || command_readings(prompt, rows, false);
-    let (readings, subject, from_transcript, not_taken) = match &ctx.box_command {
+    // A stable transcript can still name an older call. Keep every screen
+    // reading, even where that call draws exactly the same rows.
+    let (mut readings, subject) = command_readings(prompt, rows, false);
+    let (from_transcript, not_taken) = match &ctx.box_command {
         Some(Ok(call)) => match box_command::drawn_as(prompt, rows, &call.command) {
-            Ok(()) => (vec![call.command.clone()], call.command.clone(), true, None),
+            Ok(()) => {
+                if !readings.contains(&call.command) {
+                    readings.push(call.command.clone());
+                }
+                (true, None)
+            }
             Err(why) => {
-                let (r, s) = screen();
                 let why = format!("the transcript's waiting Bash call is not the box's: {why}");
-                (r, s, false, Some(why))
+                (false, Some(why))
             }
         },
-        Some(Err(why)) => {
-            let (r, s) = screen();
-            (
-                r,
-                s,
-                false,
-                Some(format!("no transcript call taken: {why}")),
-            )
-        }
-        None => {
-            let (r, s) = screen();
-            (r, s, false, None)
-        }
+        Some(Err(why)) => (false, Some(format!("no transcript call taken: {why}"))),
+        None => (false, None),
     };
     let refused = |why: String| {
         refused(match (&not_taken, from_transcript) {
-            (_, true) => format!("{why} (judged on the transcript's command, drawn as the box)"),
+            (_, true) => {
+                format!("{why} (the matching transcript call does not remove screen readings)")
+            }
             (Some(not), false) => format!("{why}; {not}"),
             (None, false) => why,
         })

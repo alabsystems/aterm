@@ -60,6 +60,7 @@ pub const UNAVAILABLE_WORDS: &[&str] = &[
     "other_user",
     "too_broad",
     "walking",
+    "unread_format",
 ];
 
 /// Whether `word` is one of [`UNAVAILABLE_WORDS`] (a qualified one with a
@@ -402,6 +403,7 @@ mod tests {
             "lane_off:ioreport",
             "needs_privilege:root",
             "not_enabled:sys.snapshot_files",
+            "unread_format",
         ] {
             assert!(is_unavailable_word(w), "{w}");
         }

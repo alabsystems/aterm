@@ -629,6 +629,38 @@ impl Guard {
     }
 }
 
+/// A HOLD THE LOOP JOURNALS (`docs/DESIGN-harness-occupancy-2026-10-20.md`
+/// §6, the retro's cause 6): where the loop typed nothing though the agent
+/// stood still, and why, as its `HOLD seq=<n> …` line says it
+/// ([`Session::say_hold`]). Every one was silent before: a point decided
+/// NOTHING, and a break in the agent's own background work no host step was
+/// offered at — sixteen hours of a journal with no line. Said once per
+/// change; the memory is the loop's own, so a successor (a live upgrade's
+/// loop at the same screen) says its first again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HoldSaid {
+    /// An idle point decided NOTHING ([`TurnEndAction::Nothing`]): the host
+    /// withholds the turn ends (`withheld`), nobody runs the loop unattended
+    /// (`attended`), or the policy decided it (`policy`).
+    Point(&'static str),
+    /// A break the agent's own background work holds busy, and no host asks
+    /// for a step at it (none, or [`IdleHost::wants`] false).
+    NoHostStep,
+    /// A break a guard withheld from the host that asked for a step.
+    Held(Guard),
+}
+
+impl HoldSaid {
+    /// The line's words after its `seq=`.
+    fn words(self) -> String {
+        match self {
+            HoldSaid::Point(why) => format!("point nothing why={why}"),
+            HoldSaid::NoHostStep => "background no-host-step".to_string(),
+            HoldSaid::Held(guard) => format!("background held why={}", guard.word()),
+        }
+    }
+}
+
 /// The loop's wait as told to the host ([`IdleHost::waiting`]): when it ends,
 /// as a unix second, the policy's reason (`api-error retry 1`), and its kind
 /// ([`TurnEndAction::WaitUntil`]'s `wait`): an API wall's retry wait (the
@@ -3608,6 +3640,13 @@ pub struct Session<'a, C: Ctl> {
     /// that read the roster's word hears the accounts' news with no wait
     /// standing ([`Self::account_edge`]).
     nothing_decided: bool,
+    /// The point decided last was NOTHING because the host withheld the turn
+    /// ends ([`IdleHost::withholds_turn_end`], read by the decision): its
+    /// HOLD's `why=withheld` ([`HoldSaid::Point`]), which so asks the host
+    /// nothing more than the decision did. Taken by that point's act
+    /// ([`Self::turn_end_execute`]), so a point decided with no read of the
+    /// host says none.
+    decided_withheld: bool,
     /// The day count of Claude Code's expiry notice this loop last told its
     /// host ([`IdleHost::login_notice`]): each value is told once.
     login_notice_told: Option<u32>,
@@ -3766,6 +3805,11 @@ pub struct Session<'a, C: Ctl> {
     /// said once while it stands: `None` once a point was offered, or while
     /// the host asked for none.
     withheld: Option<Guard>,
+    /// The hold this loop last journaled ([`Self::say_hold`]), so each is
+    /// said once while it stands: `None` once the agent works again (a busy
+    /// read that is no break), a break was offered, or a point decided
+    /// anything but NOTHING. Never seeded: a successor says its first again.
+    hold_said: Option<HoldSaid>,
     /// A press was refused `ERR busy input-unread` or written with its
     /// `warn=input-unread` ([`CtlReply::warned_input_unread`]), or a `status`
     /// read for another reason reported a stall not held yet
@@ -3982,6 +4026,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             account_seen: None,
             roster_seen: None,
             nothing_decided: false,
+            decided_withheld: false,
             login_notice_told: None,
             account_stamp: None,
             account_news_at: None,
@@ -4019,6 +4064,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             usage_told: None,
             credits_kept: None,
             withheld: None,
+            hold_said: None,
             stall_suspect: false,
             stall_termed: false,
             stall_grace_s: SupervisorConfig::default().human_grace_s,
@@ -8839,11 +8885,21 @@ impl<C: Ctl> Session<'_, C> {
         if let Some(guard) = unfit {
             *since = None;
             self.withhold(host.as_ref(), guard);
+            // A busy read that is no break is the agent at work: the hold it
+            // said is over. A wall over a break holds it.
+            let hold = (guard == Guard::Wall).then_some(HoldSaid::Held(guard));
+            self.say_hold(screen.seq, hold, review);
             return;
         }
         let at = *since.get_or_insert_with(|| self.fx.mono());
         let Some(host) = host.filter(|h| h.wants()) else {
             self.withheld = None;
+            // As for a host that asks: the break's first moments, its
+            // settle, are no hold; what was said stands, and nothing is said
+            // yet.
+            if self.fx.since(at) >= self.setup.background_settle {
+                self.say_hold(screen.seq, Some(HoldSaid::NoHostStep), review);
+            }
             return;
         };
         let held = if self.fx.since(at) < self.setup.background_settle {
@@ -8865,10 +8921,17 @@ impl<C: Ctl> Session<'_, C> {
         };
         if let Some(guard) = held {
             self.withhold(Some(&host), guard);
+            // The break's settle is its own first moments, not a hold: what
+            // was said stands, and nothing is said yet.
+            if guard != Guard::Settle {
+                self.say_hold(screen.seq, Some(HoldSaid::Held(guard)), review);
+            }
             return;
         }
-        // Offered: the next guard, whatever it is, is said afresh.
+        // Offered: the next guard, whatever it is, is said afresh, and so is
+        // the next hold.
         self.withheld = None;
+        self.hold_said = None;
         if let Some((line, kind)) = host.at_background() {
             review.note(&format!("HOST seq={} background {line}", screen.seq));
             // A turn the host typed: its answer is the harness's, never the
@@ -9146,6 +9209,21 @@ impl<C: Ctl> Session<'_, C> {
         if self.withheld != Some(guard) {
             self.withheld = Some(guard);
             host.withheld(guard);
+        }
+    }
+
+    /// THE HOLD JOURNALED ONCE PER CHANGE ([`HoldSaid`]): `hold` is said as
+    /// `HOLD seq=<seq> <words>` (journal only, [`Review::note`]) when it is
+    /// not the hold said last; `None` ends the hold said, so the next one is
+    /// said afresh.
+    fn say_hold(&mut self, seq: u64, hold: Option<HoldSaid>, review: &mut dyn Review) {
+        let Some(hold) = hold else {
+            self.hold_said = None;
+            return;
+        };
+        if self.hold_said != Some(hold) {
+            self.hold_said = Some(hold);
+            review.note(&format!("HOLD seq={seq} {}", hold.words()));
         }
     }
 }

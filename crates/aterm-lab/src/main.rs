@@ -437,6 +437,8 @@ mod settings_witness;
 #[cfg(target_os = "macos")]
 mod sleep;
 #[cfg(target_os = "macos")]
+mod slot_lane;
+#[cfg(target_os = "macos")]
 mod stats;
 #[cfg(target_os = "macos")]
 mod stop;
@@ -877,6 +879,17 @@ Outside any lab (no jail, no stub):
                                  macOS may show a removable-volume consent dialog for the image where the terminal that
                                  runs it lacks Full Disk Access; exit 0 pass, 1 a check failed, 3 not run (no hdiutil, or
                                  under 24 GiB free here)
+  slot-capture [--watch DUR [--dir DIR]]
+                                 the build slots' record capture: the real build-slot (~/.local/bin, else $HOME/trust/scripts)
+                                 admits `true` into a scratch BUILD_SLOT_DIR, and its slot-0 must read as aterm's slot reader
+                                 reads it (the wrapper's pid, started in the run, Python's json.dumps spelling, cmd `true`,
+                                 cwd the scratch folder); exit 0 pass, 1 a field changed, 3 not run (no build-slot). --watch
+                                 DUR (30s, 20m, 24h): the reader beside lsof over the real ~/.cache/build-slot (or DIR)
+                                 every 5 s, read only; a holder one proves and the other does not show fails; an hourly line
+  slot-lane [--aterm PATH] [--keep]
+                                 `await sys slots>=1` on a headless instance whose HOME holds one slot a stand-in holds: it
+                                 times out while held and answers OK sys slots=1/1 once the stand-in is SIGKILLed; exit 0
+                                 pass, 1 a check failed, 3 not run (no aterm, or `sys` does not answer headless)
   trail-gallery [--aterm PATH] [--theme dark|light|both] [--scenario NAME[,NAME]]... [--extra 'key = value']...
                 [--columns N] [--lines N] [--font-px N] [--no-clean] <out_dir> [style ...]
                                  photograph cursor trail styles: one private headless aterm per style x theme x scenario
@@ -1124,6 +1137,8 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "instance" => instance::cmd_instance(args),
         "resource-attribution" => resource_attribution::cmd(args),
         "disk-lane" => disk_lane::cmd_disk_lane(args),
+        "slot-capture" => slot_lane::cmd_slot_capture(args),
+        "slot-lane" => slot_lane::cmd_slot_lane(args),
         "trail-gallery" => trail_gallery::cmd_trail_gallery(args),
         "trail-contrast" => trail_contrast::cmd_trail_contrast(args),
         "aos-repair" => aos_repair::cmd_aos_repair(args),
@@ -1221,6 +1236,8 @@ fn main() -> std::process::ExitCode {
                 "band-launch" => band::launch_main(rest),
                 "band-standin" => band::standin_main(rest),
                 "presence-standin" => presence::standin_main(rest),
+                // the build-slot holder `slot-lane` starts, this program again
+                slot_lane::HOLD_VERB => slot_lane::hold_main(rest),
                 "key-dump" => meta_keys::keydump_main(rest),
                 "mcp-standin" => codex_rig::mcp_main(rest),
                 _ => {

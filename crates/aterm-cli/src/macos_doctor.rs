@@ -1400,6 +1400,27 @@ fn durable_directory(directory: &Path) -> std::io::Result<()> {
     aterm_durable::seam::durable_fsync(&std::fs::File::open(directory)?)
 }
 
+#[cfg(not(test))]
+fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    aterm_machines::port::write_atomic(path, bytes, mode)
+}
+
+/// [`write_atomic`] under this crate's own unit tests: `aterm_machines::port::write_atomic`'s
+/// steps with [`durable_directory`]'s plain `fsync(2)` for both of its flushes. The setup
+/// tests' fault sweeps write records through it on every retry: alone,
+/// `a_workstation_stage_that_never_verifies_disrupts_twice_across_worker_retries` spent most
+/// of its 2.7 s in those two full flushes, and 9.6 s beside the rest of the `--lib` run.
+#[cfg(test)]
+fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+    aterm_machines::port::write_atomic_with(
+        path,
+        bytes,
+        mode,
+        aterm_durable::seam::durable_fsync,
+        durable_directory,
+    )
+}
+
 fn flush_record_with(
     path: &Path,
     mut flush: impl FnMut(&Path) -> std::io::Result<()>,
@@ -1426,8 +1447,7 @@ fn write_json_with_flush(
         .ok_or("doctor record has no parent directory")?;
     std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
     let bytes = aterm_json::to_vec(value).map_err(|e| e.to_string())?;
-    aterm_machines::port::write_atomic(path, &bytes, 0o600)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    write_atomic(path, &bytes, 0o600).map_err(|e| format!("{}: {e}", path.display()))?;
     flush_record_with(path, flush)
 }
 

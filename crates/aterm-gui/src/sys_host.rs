@@ -239,6 +239,13 @@ impl Shared {
         self.landed.notify_all();
     }
 
+    /// The newest whole snapshot as held, without pulling: the occupancy
+    /// board's ([`crate::occupancy_host::look`]), which reads the reading
+    /// the disk look asked for at its next look. `None` before the first.
+    pub(crate) fn held_now(&self) -> Option<Held> {
+        self.lock().held.clone()
+    }
+
     /// The cursor's head seq.
     fn head_seq(&self) -> u64 {
         self.lock().head_seq
@@ -1148,8 +1155,8 @@ pub(crate) fn cmd_await_sys(
     rest: &str,
 ) -> String {
     match AwaitSys::parse(rest) {
-        Ok(Parsed::Volume) => {
-            crate::control::control_disk::cmd_await_sys(term, store, session, scope, rest)
+        Ok(Parsed::Volume(wait)) => {
+            crate::control::control_disk::cmd_await_sys(term, store, session, scope, wait)
         }
         Ok(Parsed::Machine(wait)) => {
             let was_registered = store
@@ -1255,6 +1262,13 @@ pub(crate) fn await_reads_every_tab(rest: &str) -> bool {
 /// stamps. Answers met, refused (an explicit term this host cannot measure,
 /// a named job that ended without meeting it), gone (a named job nobody
 /// knows after [`GONE_AFTER_PASSES`] passes), exited, hung up or timed out.
+/// Whether `wait` names the build slots.
+fn names_slots(wait: &AwaitSys) -> bool {
+    wait.terms
+        .iter()
+        .any(|t| t.metric == aterm_vitals::sys::Metric::Slots)
+}
+
 fn await_machine(
     shared: &Shared,
     session: u64,
@@ -1262,6 +1276,10 @@ fn await_machine(
     exited: &dyn Fn() -> bool,
 ) -> String {
     let deadline = Instant::now() + Duration::from_millis(wait.timeout_ms);
+    // A wait on the build slots has them read every few seconds while it
+    // stands (`occupancy_host::SLOTS_ARMED`); a reading taken at rest is
+    // warming to it.
+    let _slots = names_slots(wait).then(|| crate::occupancy_host::SLOTS_ARMED.arm());
     let mut state = MachineWait::default();
     let mut seen: Option<u64> = None;
     loop {

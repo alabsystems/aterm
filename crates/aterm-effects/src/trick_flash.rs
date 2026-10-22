@@ -210,8 +210,8 @@ pub(crate) struct TrickFlash {
 
 impl TrickFlash {
     #[inline]
-    fn base_y_slice(&self) -> &[(Option<u64>, i64)] {
-        &self.base_y[..usize::from(self.base_y_len)]
+    const fn base_y_slice(&self) -> &[(Option<u64>, i64)] {
+        self.base_y.split_at(self.base_y_len as usize).0
     }
 
     /// The host's declaration for the one rescan it is about to run in `scope`,
@@ -278,15 +278,21 @@ impl TrickFlash {
         )
     )]
     #[inline]
-    pub(crate) fn found_in_a_pane(&self) -> bool {
-        self.slot
-            .is_some_and(|slot| slot.pane.is_some() && slot.located.is_some())
+    pub(crate) const fn found_in_a_pane(&self) -> bool {
+        matches!(
+            self.slot,
+            Some(Slot {
+                pane: Some(_),
+                located: Some(_),
+                ..
+            })
+        )
     }
 
     /// Drop the flash. Idempotent, so the engine's per-pane reset may call it per
     /// pane. The debounce clock and memo observe the keyboard and grid, and stay.
     #[inline]
-    pub(crate) fn clear(&mut self) {
+    pub(crate) const fn clear(&mut self) {
         self.slot = None;
     }
 
@@ -622,12 +628,14 @@ impl TrickFlash {
 /// What decides a flash's opening hue: the word and where it was typed, and
 /// nothing else — no clock and no counter, so a replay paints the same bytes.
 #[inline]
-fn hue_seed(caret: (u16, u16), chars: &[char]) -> u64 {
-    let at = fnv_mix_u64(
-        fnv_mix_u64(FNV64_OFFSET, u64::from(caret.0)),
-        u64::from(caret.1),
-    );
-    chars.iter().fold(at, |h, c| fnv_mix_u64(h, u64::from(*c)))
+const fn hue_seed(caret: (u16, u16), chars: &[char]) -> u64 {
+    let mut h = fnv_mix_u64(fnv_mix_u64(FNV64_OFFSET, caret.0 as u64), caret.1 as u64);
+    let mut i = 0;
+    while i < chars.len() {
+        h = fnv_mix_u64(h, chars[i] as u64);
+        i += 1;
+    }
+    h
 }
 
 /// The pane test every hook shares (and the typed-edit witness's): `None` on
@@ -652,23 +660,28 @@ fn millis_since(now: Instant, then: Instant) -> u64 {
 /// revoked — the short fade from the revoke, whichever ends first.
 #[inline]
 fn window_ms(loc: &Located, revoked_at: Option<Instant>) -> u64 {
-    let whole = u64::from(FLASH_MS);
-    revoked_at.map_or(whole, |at| {
-        (millis_since(at, loc.since) + u64::from(REVOKE_FADE_MS)).min(whole)
-    })
+    let whole = FLASH_MS as u64;
+    match revoked_at {
+        Some(at) => {
+            let faded = millis_since(at, loc.since) + REVOKE_FADE_MS as u64;
+            if faded < whole { faded } else { whole }
+        }
+        None => whole,
+    }
 }
 
 /// The tint envelope at `t` ms: smooth ramp in, hold, smoothstep fade over the
 /// last [`FADE_MS`]; zero at both ends. A revoke at `revoked_t` multiplies in
 /// its own short fade, continuous at the revoke, so revoking never pops.
 #[inline]
-fn envelope(t: u64, revoked_t: Option<u64>) -> f32 {
+const fn envelope(t: u64, revoked_t: Option<u64>) -> f32 {
     let t = t as f32;
     let ramp = smoothstep(t / RAMP_MS as f32);
     let fade = 1.0 - smoothstep((t - (FLASH_MS - FADE_MS) as f32) / FADE_MS as f32);
-    let revoke = revoked_t.map_or(1.0, |r| {
-        1.0 - smoothstep((t - r as f32) / REVOKE_FADE_MS as f32)
-    });
+    let revoke = match revoked_t {
+        Some(r) => 1.0 - smoothstep((t - r as f32) / REVOKE_FADE_MS as f32),
+        None => 1.0,
+    };
     ramp * fade * revoke
 }
 

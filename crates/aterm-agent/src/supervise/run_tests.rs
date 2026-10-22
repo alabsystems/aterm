@@ -7842,23 +7842,27 @@ fn watch_journals_every_line_it_prints() {
         records[0].line, "an older run",
         "the file is appended to, never truncated"
     );
-    // The journal-only lines (the escalation, and its clearing at the busy read after it) sit
-    // between the printed ones, in order.
+    // The journal-only lines (the escalation, its clearing at the busy read after it, and the
+    // idle point's hold) sit between the printed ones, in order.
     let (quiet, mine): (
         Vec<super::super::journal::JournalRecord>,
         Vec<super::super::journal::JournalRecord>,
     ) = records[1..]
         .iter()
         .cloned()
-        .partition(|r| r.kind == "escalated" || r.kind == "cleared");
+        .partition(|r| matches!(r.kind.as_str(), "escalated" | "cleared" | "hold"));
     assert_eq!(
         quiet
             .iter()
             .map(|r| (r.kind.as_str(), r.seq))
             .collect::<Vec<_>>(),
         // Cleared at the busy read after the question (105), not at the
-        // idle point that follows it (106).
-        [("escalated", Some(104)), ("cleared", Some(105))]
+        // idle point that follows it (106), where nothing was typed.
+        [
+            ("escalated", Some(104)),
+            ("cleared", Some(105)),
+            ("hold", Some(106))
+        ]
     );
     let mine = &mine[..];
     assert_eq!(
@@ -9154,7 +9158,11 @@ fn a_limit_escalates_once_and_extends_the_budget_once() {
             ("event", "limited"),
             ("escalated", "-"),
             ("extend", "-"),
+            // Each limited point typed nothing: a HOLD for each, since the
+            // busy read between them ended the first.
+            ("hold", "point"),
             ("event", "limited"),
+            ("hold", "point"),
             ("exit", "-"),
         ]
     );
@@ -9358,6 +9366,7 @@ fn at_the_reset_one_continuation_goes_with_the_rules_and_the_answer_closes_the_e
             ("continued", "usage-resume@v1", Some(102)),
             ("cleared", "-", Some(104)),
             ("event", "idle", Some(104)),
+            ("hold", "point", Some(104)),
             ("exit", "-", None),
         ]
     );

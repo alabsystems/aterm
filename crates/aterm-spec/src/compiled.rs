@@ -117,7 +117,8 @@ enum Atom {
 }
 
 impl Atom {
-    fn read(self, s: &[i64], locals: &[i64]) -> i64 {
+    #[inline(always)]
+    const fn read(self, s: &[i64], locals: &[i64]) -> i64 {
         match self {
             Atom::Int(i) => i,
             Atom::Slot(i) => s[i],
@@ -135,7 +136,8 @@ enum Cmp {
 }
 
 impl Cmp {
-    fn holds(self, a: i64, b: i64) -> bool {
+    #[inline(always)]
+    const fn holds(self, a: i64, b: i64) -> bool {
         match self {
             Cmp::Gt => a > b,
             Cmp::Le => a <= b,
@@ -152,7 +154,8 @@ enum Arith {
 }
 
 impl Arith {
-    fn apply(self, a: i64, b: i64) -> i64 {
+    #[inline(always)]
+    const fn apply(self, a: i64, b: i64) -> i64 {
         match self {
             Arith::Add => a.wrapping_add(b),
             Arith::Sub => a.wrapping_sub(b),
@@ -297,6 +300,7 @@ const STACK_SLOTS: usize = 8;
 /// for every other but one nesting `\A` deeper than [`STACK_SLOTS`].
 // Skip: a stack buffer or a heap one, handed to the caller's closure. Spec-model machinery.
 #[cfg_attr(trust_verify, trust::skip)]
+#[inline(always)]
 fn with_slots<R>(slots: usize, f: impl FnOnce(&mut [i64]) -> R) -> R {
     if slots == 0 {
         f(&mut [])
@@ -615,6 +619,7 @@ impl Compiled {
         CompiledExpr(whole, scope.depth.get())
     }
 
+    #[inline]
     pub(crate) fn init(&self) -> Vec<i64> {
         self.init.clone()
     }
@@ -622,6 +627,7 @@ impl Compiled {
     /// The index of state variable `name` in a value slice, if it is one.
     // Skip: a slice search over the model's own names.
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     pub(crate) fn slot(&self, name: &str) -> Option<usize> {
         // `names` is a `BTreeMap`'s key order: sorted, so searchable.
         self.names.binary_search(&name).ok()
@@ -630,6 +636,7 @@ impl Compiled {
     /// The state `s` is, as the interpreter's public [`crate::interp::State`].
     // Skip: a `collect` into a map.
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     pub(crate) fn state(&self, s: &[i64]) -> BTreeMap<&'static str, i64> {
         self.names.iter().copied().zip(s.iter().copied()).collect()
     }
@@ -637,12 +644,14 @@ impl Compiled {
     /// `Model::check_invariant_in` for invariant `i` at `s`.
     // Skip: drives the evaluator above.
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     pub(crate) fn holds(&self, i: usize, s: &[i64]) -> bool {
         with_slots(self.slots, |locals| self.invariants[i].check(s, locals))
     }
 
     /// How many values a state has: the length of every state slice.
-    pub(crate) fn width(&self) -> usize {
+    #[inline]
+    pub(crate) const fn width(&self) -> usize {
         self.names.len()
     }
 
@@ -731,7 +740,8 @@ impl Compiled {
 }
 
 /// Write `v` at `slot` of every `width`-long row in `rows`.
-fn write_slot(rows: &mut [i64], width: usize, slot: usize, v: i64) {
+#[inline]
+const fn write_slot(rows: &mut [i64], width: usize, slot: usize, v: i64) {
     let mut at = slot;
     while at < rows.len() {
         rows[at] = v;
@@ -746,6 +756,7 @@ impl CompiledExpr {
     /// The expression's value at `s` (`Expr::eval` over `eval_env(s)`).
     // Skip: drives the evaluator above.
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     pub(crate) fn eval(&self, s: &[i64]) -> Value {
         with_slots(self.1, |locals| self.0.eval(s, locals))
     }

@@ -62,7 +62,7 @@ pub const SING_BAR_SECONDS: f32 = SING_BEAT_SECONDS * SING_BAR_BEATS;
 /// every machine and session.
 #[inline]
 #[must_use]
-pub fn song_signature(ch: char) -> u32 {
+pub const fn song_signature(ch: char) -> u32 {
     let mut x = ch as u32;
     x ^= x >> 16;
     x = x.wrapping_mul(0x7feb_352d);
@@ -200,14 +200,17 @@ pub struct BarFan {
 /// on every [`BAR_RING_EVERY`]th bar.
 #[inline]
 #[must_use]
-pub fn bar_fan(bar: u64) -> BarFan {
+pub const fn bar_fan(bar: u64) -> BarFan {
     const {
         assert!(BAR_RING_EVERY > 0);
     }
-    let steps = u8::try_from(bar.min(u64::from(u8::MAX))).unwrap_or(u8::MAX);
-    let n = BAR_FAN_BASE
-        .saturating_add(BAR_FAN_STEP.saturating_mul(steps))
-        .min(BAR_FAN_CAP);
+    let steps = if bar > u8::MAX as u64 {
+        u8::MAX
+    } else {
+        bar as u8
+    };
+    let sum = BAR_FAN_BASE.saturating_add(BAR_FAN_STEP.saturating_mul(steps));
+    let n = if sum < BAR_FAN_CAP { sum } else { BAR_FAN_CAP };
     BarFan {
         bar,
         n,
@@ -352,11 +355,14 @@ impl KittySing {
     /// `trail_sound::design_celebration`), or [`NEUTRAL_SIGNATURE`] when nothing is held.
     #[inline]
     #[must_use]
-    pub fn signature(&self) -> u32 {
+    pub const fn signature(&self) -> u32 {
         if let Some(ext) = self.external {
             return ext.sig;
         }
-        self.run.map_or(NEUTRAL_SIGNATURE, song_signature)
+        match self.run {
+            Some(ch) => song_signature(ch),
+            None => NEUTRAL_SIGNATURE,
+        }
     }
 
     /// The derived "finger lifted" instant: one repeat gap after the last
@@ -604,7 +610,7 @@ impl KittySing {
     /// The pending arm, if any (a pure read — `fx status`).
     #[inline]
     #[must_use]
-    pub fn armed_external(&self) -> Option<ArmedCelebration> {
+    pub const fn armed_external(&self) -> Option<ArmedCelebration> {
         self.armed_external
     }
 
@@ -621,7 +627,7 @@ impl KittySing {
     /// down, until `settle`).
     #[inline]
     #[must_use]
-    pub fn external_live(&self) -> bool {
+    pub const fn external_live(&self) -> bool {
         self.external.is_some()
     }
 
@@ -846,7 +852,7 @@ impl Default for MusicNotes {
 
 impl MusicNotes {
     #[inline]
-    fn rnd(&mut self) -> u32 {
+    const fn rnd(&mut self) -> u32 {
         let mut x = self.rng;
         x ^= x << 13;
         x ^= x >> 17;
@@ -903,13 +909,13 @@ impl MusicNotes {
     /// until the field drains).
     #[inline]
     #[must_use]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.live != 0
     }
 
     /// Clear the field (style switch / hard reset): byte-identical off.
     #[inline]
-    pub fn clear(&mut self) {
+    pub const fn clear(&mut self) {
         if self.live != 0 {
             self.ring = [None; MAX_NOTES];
             self.live = 0;
@@ -1002,12 +1008,12 @@ const NOTE_HOST_SALT: u64 = 0x5150_9A7E_D1B2_C4F3;
 /// `FreeSprite::tint`, so the rainbow is cache-neutral.
 #[inline]
 #[must_use]
-pub fn note_host_id(kind: NoteKind, w: u16, h: u16) -> u64 {
+pub const fn note_host_id(kind: NoteKind, w: u16, h: u16) -> u64 {
     let k = match kind {
         NoteKind::Eighth => 1u64,
         NoteKind::Beamed => 2,
     };
-    let mut x = NOTE_HOST_SALT ^ (k << 32) ^ (u64::from(w) << 16) ^ u64::from(h);
+    let mut x = NOTE_HOST_SALT ^ (k << 32) ^ ((w as u64) << 16) ^ (h as u64);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)

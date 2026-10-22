@@ -185,7 +185,7 @@ pub struct CompanionAdmission {
 /// takes no [`super::Config`].
 #[inline]
 #[must_use]
-pub fn body_for(admitted: CompanionAdmission) -> Body {
+pub const fn body_for(admitted: CompanionAdmission) -> Body {
     if admitted.body_claimed {
         return Body::None;
     }
@@ -241,7 +241,7 @@ impl Flight {
     /// so a cat already at full momentum is not pulled down.
     #[inline]
     #[must_use]
-    pub fn disp_floor(&self) -> f32 {
+    pub const fn disp_floor(&self) -> f32 {
         FLYING_DISP_FLOOR
     }
 
@@ -344,7 +344,7 @@ fn arrival(t0: Instant, t_flight: std::time::Duration) -> Instant {
 /// and chimes only if the [`super::stardust::StarBudget`] has a token.
 #[inline]
 #[must_use]
-pub fn heroes_earned(impulse: CompanionImpulse) -> u8 {
+pub const fn heroes_earned(impulse: CompanionImpulse) -> u8 {
     match impulse {
         CompanionImpulse::Delight => 1,
         CompanionImpulse::Meteor { .. } | CompanionImpulse::Land | CompanionImpulse::Wince => 0,
@@ -558,8 +558,8 @@ struct Census {
 impl Census {
     /// A seat this span may be taken at without yielding.
     #[inline]
-    fn clear(self) -> bool {
-        !self.covers_caret && self.probe == Probe::Clear
+    const fn clear(self) -> bool {
+        !self.covers_caret && matches!(self.probe, Probe::Clear)
     }
 }
 
@@ -723,7 +723,7 @@ impl PetOnGlass {
     /// The body's column span, `[left, right]`, in fractional grid columns.
     #[inline]
     #[must_use]
-    pub fn span(&self) -> (f32, f32) {
+    pub const fn span(&self) -> (f32, f32) {
         (self.col, self.col + self.width.max(0.0))
     }
 
@@ -732,7 +732,7 @@ impl PetOnGlass {
     /// the first slow key after any run of thirteen cells.
     #[inline]
     #[must_use]
-    pub fn contented(&self) -> bool {
+    pub const fn contented(&self) -> bool {
         self.settled && (self.purr > 0.0 || self.contented)
     }
 
@@ -740,7 +740,7 @@ impl PetOnGlass {
     /// body.
     #[inline]
     #[must_use]
-    pub fn columns_to(&self, col: i32) -> f32 {
+    pub const fn columns_to(&self, col: i32) -> f32 {
         let (lo, hi) = self.span();
         let c = col as f32;
         (lo - c).max(c - hi).max(0.0)
@@ -785,7 +785,7 @@ impl PetOffer {
     /// True when this frame offers the pet nothing, the common case.
     #[must_use]
     #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.perk_at.is_none() && self.catch.is_none() && self.mote_t.is_none()
     }
 }

@@ -51,6 +51,10 @@
 //!   (groups, terminals, start times, argument words, the mapped image's
 //!   inode), without running either (the harness's job reads, `aterm
 //!   fabric`'s broker search).
+//! * [`slots`] — Trust's `build-slot` flock files, read without a lock:
+//!   which a live build holds, which are free, and which a dead wrapper's
+//!   orphaned build still occupies (the occupancy facts, `await sys
+//!   slots>=…`).
 //!
 //! # No timer
 //!
@@ -119,6 +123,7 @@ pub mod peb;
 /// reads it through (aterm-uds re-exports it as `aterm_uds::procargs`).
 pub mod procargs;
 pub mod procs;
+pub mod slots;
 pub mod volumes;
 #[cfg(all(windows, target_pointer_width = "64"))]
 mod win;

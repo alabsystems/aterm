@@ -213,10 +213,11 @@ pub(crate) struct Config {
     /// `trail_sound_volume` apply first.
     pub(crate) trail_sound_riff: Option<bool>,
     /// Audible terminal bell (default on). BEL rings the system alert sound
-    /// (`NSBeep` on macOS, `MessageBeep` on Windows), outside the trail synth's
-    /// volume controls. `false` suppresses the beep only; the visual bell and the
-    /// attention request stay. Inert off macOS/Windows, and in a `--headless`
-    /// instance, which never beeps (`App::on_bell`).
+    /// (`NSBeep` on macOS, `MessageBeep` on Windows, X11's bell request on
+    /// Linux), outside the trail synth's volume controls. `false` suppresses the
+    /// beep only; the visual bell and the attention request stay. Inert on
+    /// Wayland and other platforms, and in a `--headless` instance, which never
+    /// beeps (`App::on_bell`).
     pub(crate) bell_sound: Option<bool>,
     /// Trail colour, `#RRGGBB`. Unset, the style's automatic colour
     /// (`aterm_effects::cursor_fx::automatic_glow_color`): laser, beam, comet
@@ -3784,8 +3785,8 @@ impl Config {
     }
 
     /// Audible bell on/off (`bell_sound`, default on). Gates only the OS alert
-    /// sound (`NSBeep` / `MessageBeep`), not the visual bell or attention
-    /// request; `trail_sound_volume` does not apply.
+    /// sound (`NSBeep` / `MessageBeep` / the X11 bell), not the visual bell or
+    /// attention request; `trail_sound_volume` does not apply.
     pub(crate) fn bell_sound_or_default(&self) -> bool {
         self.bell_sound.unwrap_or(true)
     }

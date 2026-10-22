@@ -17,11 +17,13 @@ pub struct Slug {
 
 /// Whether `owner` is a GitHub owner name: 1-39 of `A-Z a-z 0-9 -`, not starting with `-`
 /// (L3's one rule, `config::is_owner_name`).
+#[inline]
 fn owner_ok(owner: &str) -> bool {
     crate::config::is_owner_name(owner)
 }
 
 /// Whether `repo` is a GitHub repository name: 1-100 of `A-Z a-z 0-9 . _ -`, not `.` or `..`.
+#[inline]
 fn repo_ok(repo: &str) -> bool {
     (1..=100).contains(&repo.len())
         && repo != "."
@@ -71,24 +73,28 @@ impl Slug {
     }
 
     /// The owner, as given.
+    #[inline]
     #[must_use]
     pub fn owner(&self) -> &str {
         &self.owner
     }
 
     /// The repository's name, as given.
+    #[inline]
     #[must_use]
     pub fn repo(&self) -> &str {
         &self.repo
     }
 
     /// The owner, lowercased.
+    #[inline]
     #[must_use]
     pub fn owner_key(&self) -> String {
         self.owner.to_ascii_lowercase()
     }
 
     /// `owner/repo`, lowercased.
+    #[inline]
     #[must_use]
     pub fn key(&self) -> String {
         format!("{}/{}", self.owner, self.repo).to_ascii_lowercase()
@@ -97,6 +103,7 @@ impl Slug {
 
 impl Slug {
     /// `key()`'s bytes, without building it: `owner`, `/`, `repo`, each lowercased.
+    #[inline]
     fn key_bytes(&self) -> impl Iterator<Item = u8> + '_ {
         self.owner
             .bytes()
@@ -107,6 +114,7 @@ impl Slug {
 }
 
 impl PartialEq for Slug {
+    #[inline]
     fn eq(&self, other: &Slug) -> bool {
         // `Slug::new` holds both halves to ASCII, so each half's case-insensitive equality is
         // `key()`'s equality.
@@ -117,6 +125,7 @@ impl PartialEq for Slug {
 impl Eq for Slug {}
 
 impl std::hash::Hash for Slug {
+    #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         for b in self.key_bytes() {
             state.write_u8(b);
@@ -125,12 +134,14 @@ impl std::hash::Hash for Slug {
 }
 
 impl PartialOrd for Slug {
+    #[inline]
     fn partial_cmp(&self, other: &Slug) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for Slug {
+    #[inline]
     fn cmp(&self, other: &Slug) -> std::cmp::Ordering {
         self.key_bytes().cmp(other.key_bytes())
     }
@@ -153,6 +164,7 @@ pub enum RepoArg {
 
 /// Whether `name` is a target name: `[a-z][a-z0-9-]{0,31}` (L10's one rule,
 /// `config::is_row_name`).
+#[inline]
 pub(crate) fn target_name_ok(name: &str) -> bool {
     crate::config::is_row_name(name)
 }

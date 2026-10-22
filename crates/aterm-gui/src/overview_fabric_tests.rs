@@ -612,8 +612,16 @@ fn a_kick_while_a_read_is_out_is_that_reads() {
 /// good read is older than `COUNT_FRESH` (the hand-set clock moved on), its
 /// chips are listed older and the title counts none. NEGATIVE CONTROL, run:
 /// a failed read that drops the snapshot lists no chip and fails it.
+/// A worker that unwinds also ends its read, keeps the last good snapshot,
+/// and allows the next read to replace it instead of leaving the card busy.
 #[test]
 fn a_failed_read_keeps_the_last_good_one_and_says_so() {
+    struct Panics;
+    impl FabricRunner for Panics {
+        fn run(&self) -> ReadAnswer {
+            panic!("injected fabric reader panic");
+        }
+    }
     let mut app = fabric_app(Answers::of(&[CAPTURED]), READ_AT);
     assert!(app.open_overview().is_ok());
     await_read(&app, 1);
@@ -660,6 +668,44 @@ fn a_failed_read_keeps_the_last_good_one_and_says_so() {
         "{lines:?}"
     );
     assert!(!title(&app).contains("need you"), "{}", title(&app));
+
+    let before = app.agents.overview_fabric.copy().snapshot;
+    app.agents.overview_fabric.runner = Some(Arc::new(Panics));
+    app.kick_fabric_read();
+    await_read(&app, 3);
+    app.on_fabric_read();
+    let slot = app.agents.overview_fabric.copy();
+    assert_eq!(slot.error, Some(ReadFail::Run));
+    assert_eq!(slot.snapshot, before, "an unwind keeps the last good read");
+    assert!(
+        app.overview_fabric_wake().is_some(),
+        "the card can read again"
+    );
+    let lines = app.read_aux_controls(AuxTarget::Overview);
+    assert!(
+        lines[0].ends_with(" fabric=3 fabric_error=run"),
+        "{lines:?}"
+    );
+
+    let closed = CAPTURED.replace(r#""need":"approval:bash""#, r#""need":null"#);
+    assert_ne!(closed, CAPTURED);
+    app.agents.overview_fabric.runner = Some(Answers::of(&[&closed]));
+    app.kick_fabric_read();
+    await_read(&app, 4);
+    app.on_fabric_read();
+    let slot = app.agents.overview_fabric.copy();
+    assert_eq!((slot.reads, slot.error, slot.reading), (4, None, false));
+    let lines = app.read_aux_controls(AuxTarget::Overview);
+    assert!(lines[0].ends_with(" fabric=2 fabric_error=-"), "{lines:?}");
+    assert!(
+        !lines.iter().any(|l| l.contains(" sid=s-appr ")),
+        "{lines:?}"
+    );
+    assert!(
+        title(&app).contains(" \u{b7} 2 need you"),
+        "{}",
+        title(&app)
+    );
 }
 
 /// ⏎ AND EVERY KEY ON A FABRIC CHIP REACH NO PROGRAM (App level, the

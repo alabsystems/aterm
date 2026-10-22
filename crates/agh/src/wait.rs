@@ -62,6 +62,7 @@ impl Backoff {
     };
 
     /// `start` after a change; else `current × factor`, clamped to `[floor, cap]`.
+    #[inline]
     #[must_use]
     pub fn next(&self, current: Duration, changed: bool) -> Duration {
         if changed {
@@ -318,6 +319,7 @@ const CONDITIONS: &str = "conditions: exists, published, prerelease, latest, not
 /// Whether `name` can name an asset: not empty, no dot-segment (`.` or `..`), which agh
 /// never sends in a download path, and no control byte (0x00-0x1F, 0x7F). No release asset
 /// is called any of these.
+#[inline]
 fn asset_name(name: &str) -> bool {
     !name.is_empty() && name != "." && name != ".." && !name.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
@@ -498,6 +500,7 @@ fn summary(release: Option<&ReleaseObject>) -> Value {
 }
 
 /// A verdict: `observed`, held or not.
+#[inline]
 fn verdict(holds: bool, observed: Value) -> Verdict {
     if holds {
         Verdict::Holds(observed)

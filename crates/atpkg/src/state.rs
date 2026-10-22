@@ -84,6 +84,7 @@ pub const TOOLSET_TRANSLATED: &str = "unavailable: running under Rosetta transla
 
 /// Whether `state` is the machine-wide no-build-for-this-architecture verdict
 /// ([`TOOLSET_UNSERVED`] / [`TOOLSET_UNSERVED_BLOCKED`]).
+#[inline]
 #[must_use]
 pub fn is_unserved_toolset(state: &str) -> bool {
     state == TOOLSET_UNSERVED || state == TOOLSET_UNSERVED_BLOCKED
@@ -498,6 +499,7 @@ pub fn held_unpublished(owner: Option<&str>, build: u64, target: &str, current: 
 
 /// The `<path>` of a `system: <path> — not managed by aterm…` state, or `None` for any
 /// other state. The inverse of [`system`]; the retirement note is dropped.
+#[inline]
 #[must_use]
 pub fn system_path(state: &str) -> Option<&str> {
     let rest = state.strip_prefix(SYSTEM_PREFIX)?;
@@ -506,6 +508,7 @@ pub fn system_path(state: &str) -> Option<&str> {
 }
 
 /// The `<date>` of a system state's ` (managed copy retired <date>)` note, if present.
+#[inline]
 #[must_use]
 pub fn system_retired(state: &str) -> Option<&str> {
     let rest = state.strip_prefix(SYSTEM_PREFIX)?;
@@ -515,6 +518,7 @@ pub fn system_retired(state: &str) -> Option<&str> {
 
 /// `Some((build, index))` for a `managed <build> — pinned by index <N>` state; `None`
 /// for a SHADOWED managed row and for every other state.
+#[inline]
 #[must_use]
 pub fn managed_pin(state: &str) -> Option<(u64, u64)> {
     let rest = state.strip_prefix(MANAGED_PREFIX)?;
@@ -536,6 +540,7 @@ pub fn shadowed_by(state: &str) -> Option<(u64, &str)> {
 }
 
 /// Whether `state` is a managed row of any spelling (pinned, vendor or SHADOWED).
+#[inline]
 #[must_use]
 pub fn is_managed(state: &str) -> bool {
     state.starts_with(MANAGED_PREFIX)

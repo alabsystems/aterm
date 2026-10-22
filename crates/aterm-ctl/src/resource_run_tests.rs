@@ -25,7 +25,7 @@ fn registered_exec_fixture() {
         }
         "fds" => r#"printf 'first-descriptor\n' >&3; printf 'second-descriptor\n' >&4; exit 37"#,
         "signal" => {
-            r#"trap 'printf "SIGNAL\n"; read release; exit 37' HUP INT TERM; printf 'READY pid=%s\n' "$$"; while :; do read request; done"#
+            r#"trap 'printf "SIGNAL\n"; while read release && [ "$release" != release ]; do :; done; exit 37' HUP INT TERM; printf 'READY pid=%s\n' "$$"; while :; do read request; done"#
         }
         _ => panic!("unknown fixture"),
     };
@@ -197,6 +197,9 @@ fn group_stops_wait_for_the_actual_commands_delayed_exit() {
         }
         assert_eq!(host.peer.recv_timeout(HANG).unwrap(), child.0.id());
         signal_group(child.0.id(), signal);
+        // bash runs a trap inside `read` only once read has armed it; one
+        // taken before that waits for a command to end, so a line ends it.
+        writeln!(child.0.stdin.as_mut().unwrap(), "wake").unwrap();
         loop {
             if lines.recv_timeout(HANG).unwrap() == "SIGNAL" {
                 break;

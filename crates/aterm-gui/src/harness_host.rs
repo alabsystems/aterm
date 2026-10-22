@@ -20953,6 +20953,13 @@ fn live_disk(store: Store, note: Arc<NoteFn>) -> Arc<DiskFn> {
     let watch = disk_watch(store, note, &LOOKING, run);
     let look: Arc<DiskFn> = Arc::new(move |sids: &[String]| {
         *DISK_SIDS.lock().unwrap_or_else(PoisonError::into_inner) = sids.to_vec();
+        // The occupancy board is taken at each look (its slice 0: stored and
+        // logged, nothing decided): the product's hook alone, so no test's
+        // look reaches it.
+        let unix_ms = aterm_time::unix_millis()
+            .and_then(|ms| i64::try_from(ms).ok())
+            .unwrap_or(0);
+        crate::occupancy_host::look(unix_ms);
         watch(sids);
     });
     // A POKE ([`aterm_agent::harness::disk::poke`]): whatever in this process

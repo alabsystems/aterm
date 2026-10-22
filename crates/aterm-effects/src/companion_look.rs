@@ -173,7 +173,7 @@ impl KittyTenure {
 
     /// The claim on glass (`None` = the base cat), without advancing the gate.
     #[inline]
-    pub fn worn(&self) -> Option<&AppIdentity> {
+    pub const fn worn(&self) -> Option<&AppIdentity> {
         self.worn.as_ref()
     }
 
@@ -270,7 +270,7 @@ impl KittyTenure {
 
     /// How loudly the most recent landing arrived; read, never advanced.
     #[inline]
-    pub fn arrival(&self) -> PetArrival {
+    pub const fn arrival(&self) -> PetArrival {
         self.arrival
     }
 
@@ -293,7 +293,7 @@ impl KittyTenure {
     /// can reveal an already-worn program cat, which must not then perform a
     /// ceremony authorised minutes ago. The roster and `last_hello` are kept.
     #[inline]
-    pub fn note_non_program_verdict(&mut self) {
+    pub const fn note_non_program_verdict(&mut self) {
         self.arrival = PetArrival::Quiet;
     }
 }
@@ -326,7 +326,7 @@ fn insert_lru(roster: &mut [Option<Homecoming>; HOMECOMING_SLOTS], id: &str, now
 /// The dwell a candidate claim must hold before it lands: a program arrives
 /// after [`TENURE`]; falling back to the base cat waits [`RELEASE`].
 #[inline]
-fn dwell_for(candidate: Option<&AppIdentity>) -> Duration {
+const fn dwell_for(candidate: Option<&AppIdentity>) -> Duration {
     if candidate.is_some() { TENURE } else { RELEASE }
 }
 
@@ -340,7 +340,7 @@ fn dwell_for(candidate: Option<&AppIdentity>) -> Duration {
 /// state. Returns the winning look and its [`CompanionRung`].
 #[inline]
 #[must_use]
-pub fn companion_precedence(
+pub const fn companion_precedence(
     favourite: Option<KittyLook>,
     app: Option<KittyLook>,
     launch: KittyLook,
@@ -406,20 +406,20 @@ impl LookPolicy {
     /// Which rung won the most recent verdict (`Launch` before any).
     #[inline]
     #[must_use]
-    pub fn rung(&self) -> CompanionRung {
+    pub const fn rung(&self) -> CompanionRung {
         self.rung
     }
 
     /// The tenure gate, for its readers.
     #[inline]
     #[must_use]
-    pub fn tenure(&self) -> &KittyTenure {
+    pub const fn tenure(&self) -> &KittyTenure {
         &self.tenure
     }
 
     /// The tenure gate, for [`KittyTenure::poll`] and [`KittyTenure::commit_hello`].
     #[inline]
-    pub fn tenure_mut(&mut self) -> &mut KittyTenure {
+    pub const fn tenure_mut(&mut self) -> &mut KittyTenure {
         &mut self.tenure
     }
 }

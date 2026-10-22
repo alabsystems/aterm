@@ -175,7 +175,7 @@ impl Flow {
 /// [`Flow::heat`] from a run length: the one site of the ease.
 #[inline]
 #[must_use]
-fn flow_heat(run: u32) -> f32 {
+const fn flow_heat(run: u32) -> f32 {
     let lo = FLOW_ENTRY_KEYS.saturating_sub(FLOW_OPEN_EASE_KEYS);
     smoothstep01(run.saturating_sub(lo) as f32 / FLOW_OPEN_EASE_KEYS as f32)
 }
@@ -462,7 +462,7 @@ impl Spine {
     /// resolve through it.
     #[inline]
     #[must_use]
-    pub fn disp(&self) -> f32 {
+    pub const fn disp(&self) -> f32 {
         self.disp
     }
 
@@ -471,7 +471,7 @@ impl Spine {
     #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn disp_peak(&self) -> f32 {
+    pub const fn disp_peak(&self) -> f32 {
         self.disp_peak
     }
 
@@ -484,7 +484,7 @@ impl Spine {
     /// buys continuity, not fireworks.
     #[inline]
     #[must_use]
-    pub fn birth_disp(&self) -> f32 {
+    pub const fn birth_disp(&self) -> f32 {
         // Floored again by the hot-resume door, which one key spends.
         let verdict = if self.verdict.is_some() {
             VERDICT_BIRTH_DISP
@@ -500,7 +500,7 @@ impl Spine {
     /// [`VERDICT_WINDOW_S`]. Draws nothing; it buys a price paid only by a key
     /// the user types. The caller decides what "green" and "a while" mean.
     #[inline]
-    pub fn note_verdict(&mut self, now: Instant) {
+    pub const fn note_verdict(&mut self, now: Instant) {
         self.verdict = Some(now);
     }
 
@@ -518,7 +518,7 @@ impl Spine {
     #[inline]
     #[must_use]
     #[cfg(test)]
-    pub fn erase_mark(&self) -> Option<EraseMark> {
+    pub const fn erase_mark(&self) -> Option<EraseMark> {
         self.mark
     }
 
@@ -541,7 +541,7 @@ impl Spine {
     /// ([`Flow`]). Pure, no clock, no allocation.
     #[inline]
     #[must_use]
-    pub fn flow(&self) -> Flow {
+    pub const fn flow(&self) -> Flow {
         Flow {
             heat: flow_heat(self.run),
             combo: self.run,
@@ -559,7 +559,7 @@ impl Spine {
     /// the key.
     #[inline]
     #[must_use]
-    pub fn surge(&self) -> f32 {
+    pub const fn surge(&self) -> f32 {
         if self.slamming {
             return 1.0;
         }
@@ -575,7 +575,7 @@ impl Spine {
     /// ribbon under that cell resolve one spectrum position.
     #[inline]
     #[must_use]
-    pub fn phase(&self) -> f32 {
+    pub const fn phase(&self) -> f32 {
         self.phase
     }
 

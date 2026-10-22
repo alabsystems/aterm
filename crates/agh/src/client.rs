@@ -49,6 +49,7 @@ pub enum Accept {
 impl Accept {
     /// `application/vnd.github+json`, `application/vnd.github.raw+json`,
     /// `application/vnd.github.sha`, `application/octet-stream`, or the media type.
+    #[inline]
     #[must_use]
     pub fn header_value(&self) -> &str {
         match self {
@@ -139,6 +140,7 @@ impl Call {
     }
 
     /// The same call on `origin`.
+    #[inline]
     #[must_use]
     pub fn origin(mut self, origin: OriginRole) -> Call {
         self.origin = origin;
@@ -146,6 +148,7 @@ impl Call {
     }
 
     /// The same call with one more query pair.
+    #[inline]
     #[must_use]
     pub fn query(mut self, key: &str, value: impl Into<String>) -> Call {
         self.query.push((key.to_string(), value.into()));
@@ -153,6 +156,7 @@ impl Call {
     }
 
     /// The same call with `accept`.
+    #[inline]
     #[must_use]
     pub fn accept(mut self, accept: Accept) -> Call {
         self.accept = accept;
@@ -160,6 +164,7 @@ impl Call {
     }
 
     /// The same call with `limit`.
+    #[inline]
     #[must_use]
     pub fn limit(mut self, limit: u64) -> Call {
         self.limit = limit;
@@ -167,6 +172,7 @@ impl Call {
     }
 
     /// The same call with `deadlines`.
+    #[inline]
     #[must_use]
     pub fn deadlines(mut self, deadlines: Deadlines) -> Call {
         self.deadlines = deadlines;
@@ -174,6 +180,7 @@ impl Call {
     }
 
     /// The same call with `If-None-Match`.
+    #[inline]
     #[must_use]
     pub fn if_none_match(mut self, etag: Option<String>) -> Call {
         self.if_none_match = etag;
@@ -181,6 +188,7 @@ impl Call {
     }
 
     /// The same call with the 404 probe on or off.
+    #[inline]
     #[must_use]
     pub fn probe_404(mut self, probe: bool) -> Call {
         self.probe_404 = probe;
@@ -188,6 +196,7 @@ impl Call {
     }
 
     /// The same call following a 301 or not.
+    #[inline]
     #[must_use]
     pub fn follow_moved(mut self, follow: bool) -> Call {
         self.follow_moved = follow;
@@ -195,6 +204,7 @@ impl Call {
     }
 
     /// The same call hopping or not (for `call_stream`; see the field).
+    #[inline]
     #[must_use]
     pub fn hop(mut self, hop: bool) -> Call {
         self.hop = hop;
@@ -202,6 +212,7 @@ impl Call {
     }
 
     /// The same call with its own retry policy.
+    #[inline]
     #[must_use]
     pub fn retry(mut self, policy: Option<RetryPolicy>) -> Call {
         self.retry = policy;
@@ -209,6 +220,7 @@ impl Call {
     }
 
     /// The same call answering any status or not.
+    #[inline]
     #[must_use]
     pub fn answer_any(mut self, any: bool) -> Call {
         self.answer_any = any;
@@ -264,6 +276,7 @@ impl Answered {
     }
 
     /// The first header so named, ASCII case-insensitively.
+    #[inline]
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
         header_in(&self.headers, name)
@@ -288,6 +301,7 @@ pub struct Streamed {
 
 impl Streamed {
     /// The first header so named, ASCII case-insensitively.
+    #[inline]
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
         header_in(&self.headers, name)
@@ -328,6 +342,7 @@ pub struct Meter {
 impl Meter {
     /// The last request's identity as a label: the profile's name, or `anonymous` (also when
     /// nothing was sent).
+    #[inline]
     pub(crate) fn label(&self) -> &str {
         self.as_.as_ref().map_or("anonymous", IdentityRef::label)
     }
@@ -528,48 +543,56 @@ impl Github {
     }
 
     /// The router.
+    #[inline]
     #[must_use]
     pub fn router(&self) -> &Router {
         &self.inner.router
     }
 
     /// The endpoints.
+    #[inline]
     #[must_use]
     pub fn endpoints(&self) -> &Endpoints {
         &self.inner.endpoints
     }
 
     /// The redactor.
+    #[inline]
     #[must_use]
     pub fn redactor(&self) -> &Redactor {
         &self.inner.redactor
     }
 
     /// `agh/{VERSION} ({caller})`.
+    #[inline]
     #[must_use]
     pub fn user_agent(&self) -> &str {
         &self.inner.user_agent
     }
 
     /// The environment.
+    #[inline]
     #[must_use]
     pub fn env(&self) -> &(dyn EnvSource + Send + Sync) {
         &*self.inner.env
     }
 
     /// The client's effect seam: waits and the receipt's timing read it.
+    #[inline]
     #[must_use]
     pub fn fx(&self) -> &Arc<Fx> {
         &self.inner.fx
     }
 
     /// The rate book.
+    #[inline]
     #[must_use]
     pub fn rate_book(&self) -> &RateBook {
         &self.inner.rate_book
     }
 
     /// The retry policy.
+    #[inline]
     #[must_use]
     pub fn retry_policy(&self) -> RetryPolicy {
         self.inner.retry

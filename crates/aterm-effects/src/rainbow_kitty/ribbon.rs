@@ -330,7 +330,7 @@ pub const SCAN_INK_SPREAD: u32 = 40;
 /// worst case. [`Ribbon::emit`]'s drawn count reads it.
 #[inline]
 #[must_use]
-pub fn reads_as_ink(rgb: u32) -> bool {
+pub const fn reads_as_ink(rgb: u32) -> bool {
     let (r, g, b) = ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
     // Compares, not `Ord::max`/`min`: `Ribbon::emit` asks this of every quad
     // it lays, and an unoptimized build calls those out of line.

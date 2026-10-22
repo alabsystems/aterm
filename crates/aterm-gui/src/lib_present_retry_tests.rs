@@ -956,6 +956,7 @@ fn persistent_drop_parks_and_past_deadline_is_rejected() {
     for reason in [
         PresentDropReason::GpuReconfigured,
         PresentDropReason::GpuTimeout,
+        PresentDropReason::GpuUnavailable,
         PresentDropReason::CpuResize,
         PresentDropReason::CpuAcquire,
         PresentDropReason::CpuCommit,

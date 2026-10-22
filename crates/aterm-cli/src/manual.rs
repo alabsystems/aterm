@@ -5519,9 +5519,12 @@ WAIT — `aterm ctl @self await sys <condition> [for=<dur>] [timeout=<ms>]`
   aterm ctl @self await sys 'cpu<30%' and mem=normal timeout=600000
   aterm ctl @self await sys 'free>50GB' timeout=600000
   aterm ctl @self await sys job=a40977 done,stuck timeout=600000
+  aterm ctl @self await sys 'slots>=1' and 'avail>=8GiB' for=20m timeout=600000
   Terms: cpu, cpu.<cluster>, aterm, tab, wait, gpu, mem (normal|warn|critical),
   swap, decompress, thrash, tab.mem, aterm.mem, throttle, jobs.stuck, jobs.quiet,
-  jobs.running; job=<id> or task=<id> then verdicts (done is exited) or
+  jobs.running, load (1-minute load per core), cores_idle (cores less the
+  5-minute load), avail (memory free without paging), slots (build slots
+  proven free); job=<id> or task=<id> then verdicts (done is exited) or
   class=<classes>; free/disk= alone wait on a volume. Quote a term with < or > (`'cpu<30%'`): the shell reads them as
   redirections. It answers `OK sys …` with the reading that met it, or
   `OK timeout` (exit 124) after at most 600 s. A job that exited meets done

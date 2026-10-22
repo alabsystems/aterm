@@ -458,6 +458,7 @@ pub struct Seen {
 
 impl Seen {
     /// The value of header `name`, ASCII case-insensitively.
+    #[inline]
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
         header_in(&self.headers, name)
@@ -466,6 +467,7 @@ impl Seen {
 
 /// The value of header `name` among `headers`, ASCII case-insensitively: the one lookup the
 /// answers, the requests, the server and the seen log share.
+#[inline]
 pub(crate) fn header_in<'h>(headers: &'h [(String, String)], name: &str) -> Option<&'h str> {
     headers
         .iter()
@@ -493,8 +495,9 @@ impl FakeGithub {
     }
 
     /// The four ports.
+    #[inline]
     #[must_use]
-    pub fn ports(&self) -> Ports {
+    pub const fn ports(&self) -> Ports {
         self.ports
     }
 

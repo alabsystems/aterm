@@ -378,6 +378,16 @@ impl Window {
     }
 
     #[inline]
+    pub fn is_tiled(&self) -> bool {
+        x11_or_wayland!(match self; Window(w) => w.is_tiled())
+    }
+
+    #[inline]
+    pub fn is_shown_fullscreen(&self) -> bool {
+        x11_or_wayland!(match self; Window(w) => w.is_shown_fullscreen())
+    }
+
+    #[inline]
     pub fn set_minimized(&self, minimized: bool) {
         x11_or_wayland!(match self; Window(w) => w.set_minimized(minimized))
     }

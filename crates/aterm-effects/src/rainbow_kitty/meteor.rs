@@ -151,7 +151,7 @@ pub const ARC_FRAME0_SWEEPS: f32 = 1.5;
 /// meteor's agree wherever they can.
 #[inline]
 #[must_use]
-pub fn arc_gain(cells: f32) -> f32 {
+pub const fn arc_gain(cells: f32) -> f32 {
     if !cells.is_finite() || cells <= 0.0 {
         return 1.0;
     }
@@ -498,7 +498,7 @@ pub fn ring_ms(cells: f32) -> f32 {
 /// impact. One function, so the emit path and the tests share it.
 #[inline]
 #[must_use]
-pub fn ring_full_radius(scale: f32, ch: f32) -> f32 {
+pub const fn ring_full_radius(scale: f32, ch: f32) -> f32 {
     let scale = if scale.is_finite() {
         scale.clamp(1.0, super::timing::IMPACT_MAX)
     } else {
@@ -1085,7 +1085,7 @@ impl Axis {
     /// The axis of a pixel-space delta, per D15's rule exactly.
     #[inline]
     #[must_use]
-    pub fn of(dx: f32, dy: f32) -> Self {
+    pub const fn of(dx: f32, dy: f32) -> Self {
         if dx.abs() >= dy.abs() {
             Self::Horizontal
         } else {
@@ -1174,7 +1174,7 @@ impl Meteor {
     /// The path vector in px.
     #[inline]
     #[must_use]
-    pub fn delta(&self) -> (f32, f32) {
+    pub const fn delta(&self) -> (f32, f32) {
         (self.x1 - self.x0, self.y1 - self.y0)
     }
 
@@ -1198,7 +1198,7 @@ impl Meteor {
     /// Which rasterizer this flight takes (D15).
     #[inline]
     #[must_use]
-    pub fn axis(&self) -> Axis {
+    pub const fn axis(&self) -> Axis {
         let (dx, dy) = self.delta();
         Axis::of(dx, dy)
     }
@@ -1207,7 +1207,7 @@ impl Meteor {
     /// itself is [`Meteor::retired_at`].
     #[must_use]
     #[cfg(test)]
-    pub fn retiring(&self) -> bool {
+    pub const fn retiring(&self) -> bool {
         self.retired_at.is_some()
     }
 
@@ -1444,8 +1444,8 @@ impl SkyMask {
     /// jets' gate.
     #[inline]
     #[must_use]
-    fn row_blank(self, k: i32) -> bool {
-        if !(-JET_PROBE_CELLS..=JET_PROBE_CELLS).contains(&k) {
+    const fn row_blank(self, k: i32) -> bool {
+        if k < -JET_PROBE_CELLS || k > JET_PROBE_CELLS {
             return false;
         }
         self.row & (1_u32 << (k + JET_PROBE_CELLS)) != 0
@@ -1454,7 +1454,7 @@ impl SkyMask {
     /// The flash's own three cells of the same row.
     #[inline]
     #[must_use]
-    fn flash_blank(self, k: i32) -> bool {
+    const fn flash_blank(self, k: i32) -> bool {
         self.row_blank(k)
     }
 }

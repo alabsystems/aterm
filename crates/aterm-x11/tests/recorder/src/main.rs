@@ -140,6 +140,15 @@ fn requests() {
         },
     );
     req(
+        "reparent_window",
+        ReparentWindowRequest {
+            window: 0x0060_0001,
+            parent: 0x123,
+            x: -5,
+            y: 7,
+        },
+    );
+    req(
         "map_window",
         MapWindowRequest {
             window: 0x0060_0001,

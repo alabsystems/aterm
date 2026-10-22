@@ -4,7 +4,7 @@
 //! The pure vocabulary of the astream message bus: the wire [`Frame`] codec,
 //! the [`Subject`] / [`Filter`] address grammar, the single canonical
 //! [`assign_partition`] function, [`Offset`] arithmetic, the Chandy-Lamport
-//! [`CausalCut`] frontier lattice, [`FabricReceipt`], and the
+//! [`CausalCut`] frontier lattice, the fabric receipts ([`V1Receipt`], [`FabricReceipt`]), and the
 //! [`steps`] record — astream's generic dense, versioned, CRC-framed opaque
 //! record — with its torn-tail-or-fault classifier.
 //!
@@ -56,7 +56,7 @@ pub use partition::{
     assign_partition, partition_in_bounds, partition_modulus_clamp, time_bucket, PartitionKey,
     TIME_BUCKET_MS,
 };
-pub use receipt::{deadline_elapsed, FabricReceipt, ReceiptError, ReceiptVerdict};
+pub use receipt::{deadline_elapsed, FabricReceipt, ReceiptError, ReceiptVerdict, V1Receipt};
 pub use steps::{step_prefix_advance, step_within_bounds};
 pub use subject::{
     filter_depth_contains, segment_depth_advance, Filter, FilterError, Subject, SubjectError,

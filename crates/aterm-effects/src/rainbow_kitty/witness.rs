@@ -117,7 +117,7 @@ impl Unit {
     /// True for a column holding no glyph.
     #[inline]
     #[must_use]
-    pub fn is_blank(self) -> bool {
+    pub const fn is_blank(self) -> bool {
         self.ch == ' '
     }
 }
@@ -416,7 +416,7 @@ impl Seen {
     /// Start over as if just armed where nothing was seen (every offset clear,
     /// no twin): the record now stands where its observations were not about.
     #[inline]
-    fn forget_evidence(&mut self) {
+    const fn forget_evidence(&mut self) {
         self.clear = ALL_OFFSETS;
         self.twin = 0;
         self.pending = 0;
@@ -427,7 +427,7 @@ impl Seen {
     /// twin testifies only about its own row
     /// (`a_twin_testifies_only_about_its_own_row`).
     #[inline]
-    fn arrivals(&self) -> u8 {
+    const fn arrivals(&self) -> u8 {
         self.clear & !self.twin & ALL_OFFSETS
     }
 }
@@ -725,7 +725,7 @@ impl Witness {
     /// already among [`FOLLOW_DRS`].
     #[inline]
     #[must_use]
-    pub fn scroll_carry(&self) -> u16 {
+    pub const fn scroll_carry(&self) -> u16 {
         if self.scroll_carry > 2 {
             self.scroll_carry
         } else {
@@ -752,8 +752,13 @@ impl Witness {
     /// the follow offsets, or equal to the scroll return, it adds nothing.
     /// Set before the follow pass and ended with it.
     #[inline]
-    pub(crate) fn carry_caret(&mut self, dr: i16) {
-        let ret = i16::try_from(self.scroll_carry()).unwrap_or(i16::MAX);
+    pub(crate) const fn carry_caret(&mut self, dr: i16) {
+        let scroll = self.scroll_carry();
+        let ret = if scroll > i16::MAX as u16 {
+            i16::MAX
+        } else {
+            scroll as i16
+        };
         self.caret_carry = if dr.unsigned_abs() > 2 && dr != ret {
             dr
         } else {
@@ -765,7 +770,7 @@ impl Witness {
     /// ([`Witness::carry_caret`]), `0` for none.
     #[inline]
     #[must_use]
-    pub(crate) fn caret_carry(&self) -> i16 {
+    pub(crate) const fn caret_carry(&self) -> i16 {
         self.caret_carry
     }
 
@@ -774,7 +779,7 @@ impl Witness {
     /// scroll's does at the walk, which a scroll's own frame skips
     /// (`CursorGlow::scroll_rows`).
     #[inline]
-    pub(crate) fn end_scroll_carry(&mut self) {
+    pub(crate) const fn end_scroll_carry(&mut self) {
         self.scroll_carry = 0;
         self.caret_carry = 0;
     }

@@ -958,6 +958,60 @@ impl Window {
         self.window.maybe_wait_on_main(|w| w.is_maximized())
     }
 
+    /// Whether the window manager shows the window tiled: against a screen edge, or maximized
+    /// in one direction only. Its frame is then the window manager's, not the one the window
+    /// returns to when the tile ends, yet [`Window::is_maximized`] says `false`.
+    ///
+    /// LOCAL PATCH (aterm), 2026-10-22: upstream has no such query, so a tiled window's frame
+    /// read as its normal one and a restored window reopened floating at the tile's size.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **X11:** maximized in exactly one direction (`_NET_WM_STATE_MAXIMIZED_VERT` or
+    ///   `_NET_WM_STATE_MAXIMIZED_HORZ` alone), as GNOME's edge tiling (Super+Left/Right, a
+    ///   drag to an edge) shows.
+    /// - **Wayland:** the compositor's `tiled_*` states, without `maximized`.
+    /// - **macOS / Windows:** always `false`.
+    #[inline]
+    pub fn is_tiled(&self) -> bool {
+        let _span = tracing::debug_span!("aterm_window::Window::is_tiled",).entered();
+        #[cfg(any(x11_platform, wayland_platform))]
+        {
+            self.window.maybe_wait_on_main(|w| w.is_tiled())
+        }
+        #[cfg(not(any(x11_platform, wayland_platform)))]
+        {
+            false
+        }
+    }
+
+    /// Whether the window shows full screen now, however it got there: through
+    /// [`Window::set_fullscreen`] or by the window manager's own hand. Its frame is then the
+    /// screen's, not the one the window returns to when full screen ends.
+    ///
+    /// LOCAL PATCH (aterm), 2026-10-22: on X11 [`Window::fullscreen`] says only what this window
+    /// asked for, so a full screen the window manager gave it (a key or rule of its own) read as
+    /// a normal frame.
+    ///
+    /// ## Platform-specific
+    ///
+    /// - **X11:** `_NET_WM_STATE_FULLSCREEN` in the window manager's state, or a full screen this
+    ///   window asked for ([`Window::fullscreen`]) that the window manager has not shown yet.
+    /// - **Wayland:** the compositor's `fullscreen` state, which [`Window::fullscreen`] reads too.
+    /// - **Elsewhere:** [`Window::fullscreen`] is `Some`.
+    #[inline]
+    pub fn is_shown_fullscreen(&self) -> bool {
+        let _span = tracing::debug_span!("aterm_window::Window::is_shown_fullscreen",).entered();
+        #[cfg(any(x11_platform, wayland_platform))]
+        {
+            self.window.maybe_wait_on_main(|w| w.is_shown_fullscreen())
+        }
+        #[cfg(not(any(x11_platform, wayland_platform)))]
+        {
+            self.window.maybe_wait_on_main(|w| w.fullscreen().is_some())
+        }
+    }
+
     /// Sets the window to fullscreen or back.
     ///
     /// ## Platform-specific
@@ -1214,8 +1268,9 @@ impl Window {
     ///
     /// - **Wayland:** Sets the theme for the client side decorations. Using `None` will use dbus to
     ///   get the system preference.
-    /// - **X11:** Sets `_GTK_THEME_VARIANT` hint to `dark` or `light` and if `None` is used, it
-    ///   will default to  [`Theme::Dark`].
+    /// - **X11:** Sets the `_GTK_THEME_VARIANT` hint to `dark` or `light`; `None` removes it, so
+    ///   the window manager's own default, the desktop's, applies (upstream set `dark`). GNOME
+    ///   46's mutter draws X11 frames in the desktop's colour scheme whatever the hint says.
     /// - **iOS / Android / Web / Orbital:** Unsupported.
     #[inline]
     pub fn set_theme(&self, theme: Option<Theme>) {

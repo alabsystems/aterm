@@ -53,7 +53,8 @@ impl TypedHit {
     /// Fold a second outcome in, keeping the strongest of each independent
     /// axis. Used across the chars of one IME commit.
     #[inline]
-    pub fn merge(self, other: Self) -> Self {
+    #[must_use]
+    pub const fn merge(self, other: Self) -> Self {
         Self {
             feline: self.feline || other.feline,
             records: self.records || other.records,

@@ -1710,12 +1710,13 @@ pub(crate) fn config_backend_capability_warnings(
                     .to_string(),
             });
         }
-        // The audible BEL is `NSBeep`/`MessageBeep`, so it belongs here, not in the
-        // macOS-only trail-audio block.
-        if config.bell_sound.is_some() {
+        // The audible BEL is `NSBeep`/`MessageBeep` and, on Linux, X11's bell
+        // request (`system_alert_sound`), so it belongs here, not in the macOS-only
+        // trail-audio block, and only where none of those exists.
+        if platform == ConfigCapabilityPlatform::Unsupported && config.bell_sound.is_some() {
             warnings.push(ConfigSemanticWarning {
                 key: crate::prefs::EDIT_BELL_SOUND,
-                message: "bell_sound is parsed and preserved but has nothing to suppress on this platform because the audible terminal bell is implemented only with the macOS and Windows system alert sound"
+                message: "bell_sound is parsed and preserved but has nothing to suppress on this platform because the audible terminal bell is implemented only with the macOS and Windows system alert sound and the X11 bell"
                     .to_string(),
             });
         }
@@ -3231,6 +3232,24 @@ mod tests {
                 "trail_sounds",
             ]),
         );
+
+        // `bell_sound` gates a beep on macOS, Windows and Linux (X11's bell), so
+        // only a platform with none of those calls it inert.
+        let bell = parsed("bell_sound = false\n");
+        for (platform, inert) in [
+            (ConfigCapabilityPlatform::MacOs, false),
+            (ConfigCapabilityPlatform::Windows, false),
+            (ConfigCapabilityPlatform::Linux, false),
+            (ConfigCapabilityPlatform::Unsupported, true),
+        ] {
+            assert_eq!(
+                config_backend_capability_warnings(&bell, true, platform)
+                    .iter()
+                    .any(|warning| warning.key == crate::prefs::EDIT_BELL_SOUND),
+                inert,
+                "{platform:?}"
+            );
+        }
     }
 
     #[test]

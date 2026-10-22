@@ -80,6 +80,7 @@ impl RateSnapshot {
 /// `code_search` for `/search/code`, `search` for any other `/search/…`, `graphql` for
 /// `/graphql`, else `core`. The web and CDN origins spend none, so the pipeline consults the
 /// rate book for api-origin calls only.
+#[inline]
 #[must_use]
 pub fn resource_for(path: &str) -> &'static str {
     if path == "/search/code" || path.starts_with("/search/code?") {
@@ -94,6 +95,7 @@ pub fn resource_for(path: &str) -> &'static str {
 }
 
 /// The identity's fingerprint, or `anonymous`.
+#[inline]
 #[must_use]
 pub fn book_key(identity: &IdentityRef) -> String {
     identity.fingerprint().unwrap_or("anonymous").to_string()
@@ -127,22 +129,25 @@ fn usable_key(key: &str) -> bool {
 
 impl RateBook {
     /// The book in `dir` (`Dirs::rate()`).
+    #[inline]
     #[must_use]
-    pub fn at(dir: PathBuf) -> RateBook {
+    pub const fn at(dir: PathBuf) -> RateBook {
         RateBook { dir: Some(dir) }
     }
 
     /// No book.
+    #[inline]
     #[must_use]
-    pub fn none() -> RateBook {
+    pub const fn none() -> RateBook {
         RateBook { dir: None }
     }
 
     /// Whether the book is consulted at all: made with `at`, on a platform that keeps one
     /// (unix; off unix the book is inert). The pipeline reads the clock for the book only when
     /// this holds, so a run with no book reads no clock for it.
+    #[inline]
     #[must_use]
-    pub(crate) fn enabled(&self) -> bool {
+    pub(crate) const fn enabled(&self) -> bool {
         cfg!(unix) && self.dir.is_some()
     }
 

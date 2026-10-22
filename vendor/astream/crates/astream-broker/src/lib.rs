@@ -145,7 +145,7 @@ mod storage;
 pub mod store;
 
 pub use astream_wire::{
-    CausalCut, CausalEdge, CutViolation, FabricReceipt, ReceiptError, ReceiptVerdict,
+    CausalCut, CausalEdge, CutViolation, FabricReceipt, ReceiptError, ReceiptVerdict, V1Receipt,
 };
 pub use brecord::{
     brecord_clamp_body_len, brecord_version_current, BrokerRecord, BREC_VERSION, COMMIT_TAG_RETIRE,

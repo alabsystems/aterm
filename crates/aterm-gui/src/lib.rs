@@ -687,6 +687,10 @@ mod message_inbox;
 mod message_reporters;
 mod messages_host;
 mod messages_store;
+/// The occupancy facts board (`docs/DESIGN-harness-occupancy-2026-10-20.md`
+/// slice 0): cores, load, memory, the home volume and the build slots at each
+/// disk look, stored and logged; nothing decided, nothing typed.
+mod occupancy_host;
 /// The control socket, token and `latest` alias this instance published, and
 /// the one rule every exit — the loop's, or a `SIGTERM`/`SIGINT`/`SIGHUP` —
 /// removes them by: only while each is still this instance's.
@@ -2082,8 +2086,10 @@ fn multi_click_window_is_the_system_double_click_time() {
 const BELL_BEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The system alert sound a bell plays once `App::on_bell`'s gates pass (the
-/// production `App::alert_sound`). Nothing off macOS and Windows.
-fn system_alert_sound() {
+/// production `App::alert_sound`). `window` is the window the bell rang for
+/// ([`App::bell_window`]), which X11's bell names; macOS and Windows play their
+/// system sound whichever it is. Nothing on Wayland or the other unixes.
+fn system_alert_sound(window: Option<&Window>) {
     // The user's configured macOS alert sound. AppKit is already in-process
     // (winit); safe to call from the main thread. `NSBeep` is a C function, not a
     // message, so `appkit::beep` is a plain call with no receiver, no selector and
@@ -2095,6 +2101,16 @@ fn system_alert_sound() {
     // including a muted one), behind the same rate-limit gate.
     #[cfg(windows)]
     win32::beep();
+    // Linux on X11: the bell request naming the window. The window manager plays
+    // the desktop's bell for it, as for GNOME Terminal: mutter plays the sound
+    // theme's bell, flashes the window under the visual bell, and stays silent
+    // when the desktop's audible bell is off. A no-op on Wayland.
+    #[cfg(target_os = "linux")]
+    if let Some(window) = window {
+        aterm_window::platform::x11::WindowExtX11::ring_x11_bell(window);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = window;
 }
 
 // Test-only count of the alert sounds the unit-test fixture's `App::alert_sound`
@@ -2108,7 +2124,7 @@ thread_local! {
 /// The unit-test fixture's `App::alert_sound`: counts the request and plays
 /// nothing.
 #[cfg(any(test, feature = "bench-support"))]
-fn count_alert_sound_for_test() {
+fn count_alert_sound_for_test(_window: Option<&Window>) {
     ALERT_SOUNDS_FOR_TEST.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
@@ -9011,6 +9027,7 @@ const fn autonomous_retry(reason: metrics::PresentDropReason) -> bool {
         reason,
         metrics::PresentDropReason::GpuReconfigured
             | metrics::PresentDropReason::GpuTimeout
+            | metrics::PresentDropReason::GpuUnavailable
             | metrics::PresentDropReason::CpuResize
             | metrics::PresentDropReason::CpuAcquire
             | metrics::PresentDropReason::CpuCommit
@@ -10378,30 +10395,36 @@ struct WindowState {
 }
 
 impl WindowState {
-    /// Is this window showing maximized right now — for the normal-frame
-    /// tracker only, so it answers `false` wherever that tracker is off
+    /// Is this window showing a frame the window manager holds right now —
+    /// maximized, tiled to a screen edge (GNOME's Super+Left/Right, which X11
+    /// shows as `_NET_WM_STATE_MAXIMIZED_VERT` alone) or full screen
+    /// ([`app_restore::frame_held`]) — for the normal-frame tracker only, so it
+    /// answers `false` wherever that tracker is off
     /// ([`app_restore::TRACKS_NORMAL_FRAME`]) or no OS window is attached.
-    fn tracked_maximized(&self) -> bool {
+    fn tracked_held(&self) -> bool {
         app_restore::TRACKS_NORMAL_FRAME
-            && self.os_window.as_ref().is_some_and(|w| w.is_maximized())
+            && self
+                .os_window
+                .as_ref()
+                .is_some_and(|w| app_restore::frame_held(w))
     }
 
-    /// The window moved: while it is not maximized, that origin is its normal one
-    /// ([`app_restore::NormalFrame::note_origin`]).
+    /// The window moved: while it is not held ([`Self::tracked_held`]), that
+    /// origin is its normal one ([`app_restore::NormalFrame::note_origin`]).
     fn note_normal_origin(&mut self, position: aterm_window::dpi::PhysicalPosition<i32>) {
         if app_restore::TRACKS_NORMAL_FRAME {
-            let maximized = self.tracked_maximized();
+            let held = self.tracked_held();
             self.normal_frame
-                .note_origin(maximized, (position.x, position.y));
+                .note_origin(held, (position.x, position.y));
         }
     }
 
-    /// The grid was just committed: while the window is not maximized, that grid
-    /// is its normal one ([`app_restore::NormalFrame::note_grid`]).
+    /// The grid was just committed: while the window is not held
+    /// ([`Self::tracked_held`]), that grid is its normal one
+    /// ([`app_restore::NormalFrame::note_grid`]).
     fn note_normal_grid(&mut self) {
-        let maximized = self.tracked_maximized();
-        self.normal_frame
-            .note_grid(maximized, (self.rows, self.cols));
+        let held = self.tracked_held();
+        self.normal_frame.note_grid(held, (self.rows, self.cols));
     }
 
     /// Drop this window's content-diffing raster caches on both renderers (the
@@ -14005,10 +14028,11 @@ struct App {
     /// Audible bell gate: one beep per [`BELL_BEEP_INTERVAL`] (the engine
     /// already throttles BEL callbacks to 10/s; this slows the sound further).
     bell_beep: BellRateLimiter,
-    /// What a bell that passes `on_bell`'s gates plays: [`system_alert_sound`],
-    /// or in the unit-test fixture a counter (`count_alert_sound_for_test`), so
-    /// a broken gate fails its test without a sound from the person's speakers.
-    alert_sound: fn(),
+    /// What a bell that passes `on_bell`'s gates plays, for the window it rang
+    /// for: [`system_alert_sound`], or in the unit-test fixture a counter
+    /// (`count_alert_sound_for_test`), so a broken gate fails its test without a
+    /// sound from the person's speakers.
+    alert_sound: fn(Option<&Window>),
     /// Trail sound output (`trail_audio.rs`); the device opens on the first cue.
     trail_audio: trail_audio::TrailAudio,
     /// Dedupe latch for the typing-sound audition: the voice last previewed, so the
@@ -21592,7 +21616,7 @@ impl App {
             && self.config.bell_sound_or_default()
             && self.bell_beep.try_fire(now)
         {
-            (self.alert_sound)();
+            (self.alert_sound)(self.bell_window(session).as_deref());
         }
         // Background iff in no visible pane of any window's active tab.
         let background = !self.is_visible_session(session);
@@ -21626,6 +21650,17 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The OS window a bell from `session` rings for: a window whose active tab
+    /// shows the session, else the frontmost window. X11's bell names it, so the
+    /// window manager's visual bell flashes that window.
+    fn bell_window(&self, session: u64) -> Option<Arc<Window>> {
+        self.windows
+            .values()
+            .find(|ws| active_tab_displays_session(ws, &self.view_store, session))
+            .or_else(|| self.frontmost_window.and_then(|wid| self.windows.get(&wid)))
+            .and_then(|ws| ws.os_window.clone())
     }
 
     /// Build the accessibility snapshot of window `id`'s grid from the just-rendered

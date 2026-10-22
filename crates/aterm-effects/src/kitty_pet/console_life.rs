@@ -224,7 +224,7 @@ impl VisibilityHold {
 
     /// Move the cover one step toward the held verdict.
     #[inline]
-    fn ramp(&mut self, dt: f32) -> f32 {
+    const fn ramp(&mut self, dt: f32) -> f32 {
         let target = if self.shown { 1.0 } else { 0.0 };
         let step = dt / VETO_FADE;
         self.cover = if self.cover < target {
@@ -238,7 +238,7 @@ impl VisibilityHold {
     /// Put the envelope where the glass already is: hidden and settled, with no
     /// run in flight. For the paths that yield at once by design.
     #[inline]
-    fn hide_now(&mut self, now: Instant) {
+    const fn hide_now(&mut self, now: Instant) {
         self.shown = false;
         self.cover = 0.0;
         self.contrary_since = None;
@@ -645,7 +645,7 @@ impl PetBrain {
 
     #[inline]
     #[must_use]
-    pub fn pose_name(&self) -> &'static str {
+    pub const fn pose_name(&self) -> &'static str {
         PET_GLYPHS[self.species.skin(self.last_pose) as usize].id
     }
 
@@ -1265,7 +1265,7 @@ impl PetBrain {
     /// The brain's own stream watch has the cat: a stare under way, or the
     /// vigil it armed (see `tick_console_resident`).
     #[inline]
-    fn watching_stream(&self) -> bool {
+    const fn watching_stream(&self) -> bool {
         (self.watch_heat >= WATCH_GATE && !self.watch_spent) || self.vigil_armed || self.vigil
     }
 
@@ -1872,7 +1872,7 @@ impl PetBrain {
     /// Pure projection for scheduler introspection and model conformance.
     #[inline]
     #[must_use]
-    pub fn console_legacy_motion_pending(&self) -> bool {
+    pub const fn console_legacy_motion_pending(&self) -> bool {
         self.flight.is_some()
             || self.land_t > 0.0
             || self.bound2.is_some()
@@ -1884,7 +1884,7 @@ impl PetBrain {
     /// Reading this latch never consumes it or advances the motion clock.
     #[inline]
     #[must_use]
-    pub fn console_resident_handoff_pending(&self) -> bool {
+    pub const fn console_resident_handoff_pending(&self) -> bool {
         self.console.resident_handoff
     }
 
@@ -2561,7 +2561,7 @@ impl PetBrain {
     /// [`CLEARANCE`] short at the feet, so the margin round it stops at the
     /// ground it stands on.
     #[inline]
-    fn on_its_feet(body: PetRect) -> PetRect {
+    const fn on_its_feet(body: PetRect) -> PetRect {
         PetRect::new(
             body.row,
             body.col,
@@ -2929,11 +2929,11 @@ impl PetBrain {
     /// resident's caret home ([`Self::console_caret_home`]) is built from it,
     /// so escort and resident agree on the seat.
     #[inline]
-    fn console_stand_rect(desired: (f32, f32), rows: u16, width: f32) -> PetRect {
+    const fn console_stand_rect(desired: (f32, f32), rows: u16, width: f32) -> PetRect {
         PetRect::new(
             (desired.1 + 1.0 - ART_ROWS).clamp(
                 CLEARANCE,
-                (f32::from(rows) - ART_ROWS - CLEARANCE).max(CLEARANCE),
+                (rows as f32 - ART_ROWS - CLEARANCE).max(CLEARANCE),
             ),
             desired.0,
             ART_ROWS,
@@ -3058,18 +3058,21 @@ impl PetBrain {
     /// `body_px`'s rounding at cell heights of 4 px or more; a body between
     /// rows is mid-hop).
     #[inline]
-    fn at_console_stand(body: PetRect, stand: PetRect) -> bool {
+    const fn at_console_stand(body: PetRect, stand: PetRect) -> bool {
         (body.col - stand.col).abs() <= ARRIVED && (body.row - stand.row).abs() < 0.25
     }
 
     #[inline]
-    fn near_console_home(rect: PetRect, home: Option<PetRect>) -> bool {
-        home.is_none_or(|home| {
-            (rect.col - home.col)
-                .abs()
-                .max((rect.row - home.row).abs() * 2.0)
-                <= HOME_REACH
-        })
+    const fn near_console_home(rect: PetRect, home: Option<PetRect>) -> bool {
+        match home {
+            None => true,
+            Some(home) => {
+                (rect.col - home.col)
+                    .abs()
+                    .max((rect.row - home.row).abs() * 2.0)
+                    <= HOME_REACH
+            }
+        }
     }
 
     /// Protected cells constrain every emitted body, including a pose hold or
@@ -3515,7 +3518,7 @@ impl PetBrain {
     }
 
     #[inline]
-    pub(super) fn console_hold_settled(&self) -> bool {
+    pub(super) const fn console_hold_settled(&self) -> bool {
         self.console.hold.settled()
     }
 

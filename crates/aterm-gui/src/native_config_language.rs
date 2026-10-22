@@ -6385,7 +6385,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         // The BEL is the one sound trail_sound_volume does NOT reach — say so
         // where a Manual author is looking for the level control.
         crate::prefs::EDIT_BELL_SOUND => {
-            " · the OS alert sound (macOS NSBeep / Windows MessageBeep), so trail_sound_volume does not scale it · false keeps the visual bell flash and the urgent-window request · other platforms emit no beep"
+            " · the OS alert sound (macOS NSBeep / Windows MessageBeep / the X11 bell, which the window manager plays as the desktop's bell), so trail_sound_volume does not scale it · false keeps the visual bell flash and the urgent-window request · Wayland and other platforms emit no beep"
         }
         crate::prefs::EDIT_SPARKLE_BONK | crate::prefs::EDIT_SPARKLE_BONK_DETONATION => {
             " · scaled by trail_sound_volume and silent with the window unfocused, reduced motion, or the sparkle-words master off · audio playback is macOS-only"

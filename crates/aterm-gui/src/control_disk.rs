@@ -11,6 +11,10 @@
 //! <word>  := ok | low | short | emergency
 //! ```
 //!
+//! The grammar is `await sys`'s one (`aterm_vitals::sys::predicate`, design
+//! `DESIGN-harness-occupancy-2026-10-20.md` §3.1): it parses these terms, and
+//! this module runs the wait it hands over ([`wait_of`]).
+//!
 //! LEVEL-TRIGGERED AND LATCHED: at arm time the wait reads a reading at most
 //! [`ARM_FRESH`] old, and a condition already true answers at once. Otherwise it
 //! parks on the disk board (`crate::disk_board`), which the watch notifies
@@ -45,17 +49,12 @@ use std::time::{Duration, Instant};
 
 use aterm_agent::harness::disk::Level;
 use aterm_sysprobe::volumes::{Reading, Unread, VolumeKey};
+use aterm_vitals::sys::predicate::{DiskWord, VolumeTerm, VolumeWait};
 
 use crate::disk_board::{Board, PassSummary, Shelf, VolumeRow, Watch};
 
-/// The usage line.
-pub(crate) const USAGE: &str = "ERR usage: await sys <free>=<size>|free><size>|free>=room|\
-                                disk=<ok|low|short|emergency>[,…]> [and <term>] \
-                                [vol=<path>] [timeout=<ms>] (<size>: <n>B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)\n";
-
-/// A metric the system-awareness grammar names that this build does not
-/// measure: the vocabulary grows, a second grammar never appears.
-pub(crate) const UNKNOWN_METRIC: &str = "ERR usage: this build's await sys knows free and disk\n";
+/// A `vol=` this wait cannot read: not an absolute path once decoded.
+pub(crate) const USAGE: &str = aterm_vitals::sys::predicate::USAGE;
 
 /// A beat this old, while the watch runs, is a stalled watch: two of the
 /// watch's look periods (`harness_host::DISK_TICK`), so the gap between two
@@ -78,14 +77,7 @@ pub(crate) const SPENT_RECENT: Duration = Duration::from_secs(60);
 /// refused (`why=too-large`).
 pub(crate) const DEMAND_CAP_PCT: u64 = 25;
 
-/// What a `free` term needs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Need {
-    /// So many bytes.
-    Bytes(u64),
-    /// The volume's room, as `status disk_room_mb=` prints it.
-    Room,
-}
+pub(crate) use aterm_vitals::sys::predicate::Need;
 
 /// One term of the wait.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +88,7 @@ pub(crate) enum Term {
     Disk(Vec<Level>),
 }
 
-/// A parsed `await sys`.
+/// A volume wait as this host runs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SysWait {
     /// One or two terms, all of which must hold.
@@ -107,122 +99,47 @@ pub(crate) struct SysWait {
     pub(crate) timeout_ms: u64,
 }
 
-/// A size with its unit: `<n>B|KB|MB|GB|TB|KiB|MiB|GiB|TiB`.
-fn size(text: &str) -> Option<u64> {
-    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
-    let (n, unit) = text.split_at(digits);
-    let n: u64 = n.parse().ok()?;
-    let scale: u64 = match unit {
-        "B" => 1,
-        "KB" => 1_000,
-        "MB" => 1_000_000,
-        "GB" => 1_000_000_000,
-        "TB" => 1_000_000_000_000,
-        "KiB" => 1 << 10,
-        "MiB" => 1 << 20,
-        "GiB" => 1 << 30,
-        "TiB" => 1 << 40,
-        _ => return None,
-    };
-    n.checked_mul(scale)
+/// The disk watch's level a `disk=` word names.
+fn level(word: DiskWord) -> Level {
+    match word {
+        DiskWord::Ok => Level::Ok,
+        DiskWord::Low => Level::Low,
+        DiskWord::Short => Level::Short,
+        DiskWord::Emergency => Level::Emergency,
+    }
 }
 
-/// One level word.
-fn level(word: &str) -> Option<Level> {
-    Some(match word {
-        "ok" => Level::Ok,
-        "low" => Level::Low,
-        "short" => Level::Short,
-        "emergency" => Level::Emergency,
-        _ => return None,
-    })
-}
-
-/// One term, or the reply that refuses it.
-fn term(tok: &str) -> Result<Term, &'static str> {
-    for (op, strict) in [(">=", false), (">", true)] {
-        if let Some(value) = tok.strip_prefix("free").and_then(|t| t.strip_prefix(op)) {
-            let need = if value == "room" {
-                Need::Room
-            } else {
-                Need::Bytes(size(value).ok_or(USAGE)?)
-            };
-            return Ok(Term::Free { strict, need });
-        }
-    }
-    if let Some(words) = tok.strip_prefix("disk=") {
-        let levels: Option<Vec<Level>> = words.split(',').map(level).collect();
-        return levels
-            .filter(|l| !l.is_empty())
-            .map(Term::Disk)
-            .ok_or(USAGE);
-    }
-    // `<metric><op>…` of a metric this build does not measure.
-    let metric: String = tok
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-    let rest = &tok[metric.len()..];
-    if !metric.is_empty() && ["=", ">", "<"].iter().any(|op| rest.starts_with(op)) {
-        return Err(UNKNOWN_METRIC);
-    }
-    Err(USAGE)
-}
-
-/// Parse `rest` (`sys <term> [and <term>] [vol=<path>] [timeout=<ms>]`).
+/// The wait `await sys`'s one grammar parsed (`aterm_vitals::sys::predicate`,
+/// [`Parsed::Volume`](aterm_vitals::sys::predicate::Parsed::Volume)), its
+/// `vol=` decoded; a `vol=` that is not absolute is refused with the usage
+/// line.
 ///
 /// # Errors
 ///
-/// The reply that refuses it: the usage line, or [`UNKNOWN_METRIC`].
-pub(crate) fn parse(rest: &str) -> Result<SysWait, &'static str> {
-    let mut toks = rest.split_whitespace();
-    if toks.next() != Some("sys") {
-        return Err(USAGE);
-    }
-    let mut terms = Vec::new();
-    let mut vol = None;
-    let mut timeout_ms = aterm_control::wire::WAIT_DEFAULT_MS;
-    let mut joined = true;
-    while let Some(tok) = toks.next() {
-        let timeout = if let Some(v) = tok.strip_prefix("timeout=") {
-            Some(v)
-        } else if tok == "timeout" {
-            Some(toks.next().ok_or(USAGE)?)
-        } else {
-            None
-        };
-        if let Some(v) = timeout {
-            timeout_ms = aterm_control::wire::wait_ms(v).ok_or(USAGE)?;
-            continue;
-        }
-        if let Some(path) = tok.strip_prefix("vol=") {
-            let path = PathBuf::from(aterm_control::wire::pct_decode(path));
+/// The reply that refuses it: [`USAGE`].
+pub(crate) fn wait_of(parsed: VolumeWait) -> Result<SysWait, &'static str> {
+    let vol = match parsed.vol {
+        Some(v) => {
+            let path = PathBuf::from(aterm_control::wire::pct_decode(&v));
             if !path.is_absolute() {
                 return Err(USAGE);
             }
-            vol = Some(path);
-            continue;
+            Some(path)
         }
-        if tok == "and" {
-            if joined || terms.is_empty() {
-                return Err(USAGE);
-            }
-            joined = true;
-            continue;
-        }
-        if !joined {
-            return Err(USAGE);
-        }
-        terms.push(term(tok)?);
-        joined = false;
-    }
-    if terms.is_empty() || terms.len() > 2 || joined {
-        return Err(USAGE);
-    }
+        None => None,
+    };
+    let terms = parsed
+        .terms
+        .into_iter()
+        .map(|t| match t {
+            VolumeTerm::Free { strict, need } => Term::Free { strict, need },
+            VolumeTerm::Disk(words) => Term::Disk(words.into_iter().map(level).collect()),
+        })
+        .collect();
     Ok(SysWait {
         terms,
         vol,
-        timeout_ms,
+        timeout_ms: parsed.timeout_ms,
     })
 }
 
@@ -703,9 +620,9 @@ pub(crate) fn cmd_await_sys(
     store: &crate::session_store::Store,
     session: u64,
     scope: super::Scope,
-    rest: &str,
+    parsed: VolumeWait,
 ) -> String {
-    let wait = match parse(rest) {
+    let wait = match wait_of(parsed) {
         Ok(w) => w,
         Err(reply) => return reply.to_owned(),
     };

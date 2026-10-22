@@ -27,6 +27,7 @@ fn encode(text: &str) -> String {
 }
 
 /// One segment.
+#[inline]
 #[must_use]
 pub fn segment(text: &str) -> String {
     encode(text)
@@ -57,6 +58,7 @@ pub fn ref_path(reference: &str) -> String {
 /// that normalises paths would resolve, so a request would leave the route it was decided
 /// for. Their callers refuse such a text first; percent-encoding is no cure, because URL
 /// parsers read `%2e%2e` as a dot-segment too.
+#[inline]
 #[must_use]
 pub fn has_dot_segment(text: &str) -> bool {
     text.split('/').any(|part| part == "." || part == "..")
@@ -109,6 +111,7 @@ pub(crate) fn refuse_encoded_dot_segment(what: &str, text: &str) -> Result<()> {
 /// Whether `tag` cannot be named in a release path: empty, with an empty `/`-part (`v1/`,
 /// `a//b`, which a slash-merging server reads as another tag), or with a dot-segment. Git
 /// refuses all three as a ref name, so no release has such a tag.
+#[inline]
 #[must_use]
 pub(crate) fn bad_tag(tag: &str) -> bool {
     tag.split('/').any(str::is_empty) || has_dot_segment(tag)
@@ -129,6 +132,7 @@ pub(crate) fn refuse_bad_tag(tag: &str) -> Result<()> {
 }
 
 /// One query value (the same encoding as `segment`).
+#[inline]
 #[must_use]
 pub fn query_value(text: &str) -> String {
     encode(text)
@@ -145,12 +149,14 @@ pub fn query(pairs: &[(String, String)]) -> String {
 }
 
 /// Whether `text` is one or more ASCII digits and nothing else.
+#[inline]
 pub(crate) fn is_digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `text` as a `T` when it is one or more ASCII digits and nothing else (`str::parse` alone
 /// would take a leading `+`); `None` otherwise, or when it does not fit `T`.
+#[inline]
 pub(crate) fn digits<T: std::str::FromStr>(text: &str) -> Option<T> {
     if is_digits(text) {
         text.parse().ok()

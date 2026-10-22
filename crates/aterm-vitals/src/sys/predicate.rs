@@ -19,10 +19,28 @@
 //! (per second), `thrash` (`yes`/`no`), `tab.mem` and `aterm.mem` (footprint
 //! bytes), `throttle` (ordered `none < light < heavy < severe`).
 //!
-//! `free` and `disk=` are the volume wait (`aterm-gui`'s `control_disk`): a
-//! predicate of only those routes there whole ([`Parsed::Volume`]); one that
-//! mixes them with machine metrics is refused, since the two waits park on
-//! different boards. `eta`, `growth` and `walk` are design P5's: they wait
+//! The occupancy facts (`DESIGN-harness-occupancy-2026-10-20.md` §3.1):
+//! `load` (the 1-minute load average per logical core, a bare ratio, as the
+//! fleet's `cpu_busy_pct` reads it but uncapped), `cores_idle` (logical cores
+//! less the 5-minute load, cores-worth, so a one-minute spike does not read
+//! as lost cores), `avail` (bytes the machine can hand out without paging:
+//! free, inactive and purgeable, `build-slot`'s admission figure) and `slots`
+//! (build slots proven free, less those a live orphaned build still fills;
+//! the reply says `slots=<usable>/<n>`). A slot reader that has proven no
+//! slot either way yet is warming, and so is a reading older than
+//! [`SLOTS_FRESH_MS`]. A slot not proven either way may be free or not, so a
+//! `slots` term holds only when it holds whichever way each such slot turns
+//! out: `slots>=1` on the slots proven free, `slots<1` only once no slot is
+//! left unproven that could be free.
+//!
+//! `free` and `disk=` are the volume wait (`aterm-gui`'s `control_disk`),
+//! parsed here like every other term (one grammar,
+//! `DESIGN-harness-occupancy-2026-10-20.md` §3.1): `free>=<size>`,
+//! `free><size>` or `free>=room` (a size needs its unit), `disk=<ok|low|short|
+//! emergency>[,…]`, at most two joined by `and`, with `vol=<path>` and
+//! `timeout=` and nothing else, handed over parsed ([`Parsed::Volume`]). One
+//! that mixes them with machine metrics is refused, since the two waits park
+//! on different boards. `eta`, `growth` and `walk` are design P5's: they wait
 //! on the folder walker's growth, which needs its change feed and walk cache
 //! (§19; the walker `sys disk` reads re-walks on demand only), so each
 //! answers `ERR unavailable <metric> why=not_sampled` at arm time rather
@@ -54,7 +72,7 @@
 //! `dur` by their stamps ([`Latch`]).
 
 use crate::jobs::{Class, JobRow, Verdict};
-use crate::model::{Snapshot, Throttle};
+use crate::model::{SlotsUnread, SlotsView, Snapshot, Throttle};
 
 /// The usage line.
 pub const USAGE: &str = "ERR usage: await sys <predicate> [for=<dur>] [scope=tab|aterm] \
@@ -62,13 +80,22 @@ pub const USAGE: &str = "ERR usage: await sys <predicate> [for=<dur>] [scope=tab
                          <predicate> := quiet [<term> …] | <term> [and <term> …]; \
                          <term> := <metric><op><value> with <op> < <= > >= = != and <metric> \
                          cpu cpu.l<n> aterm tab wait gpu mem swap decompress thrash tab.mem \
-                         aterm.mem throttle jobs.stuck jobs.quiet jobs.running; or \
+                         aterm.mem throttle jobs.stuck jobs.quiet jobs.running load \
+                         cores_idle avail slots; or \
                          (job|task)=<id> <verdict>[,…]|class=<class>[,…]; or \
-                         free>=<size>|disk=<word> (with vol=, alone)\n";
+                         free>=<size>|free><size>|free>=room|disk=<ok|low|short|emergency>[,…] \
+                         (a size with its unit B KB MB GB TB KiB MiB GiB TiB; at most two, \
+                         with vol=<path>, alone)\n";
 
 /// The refusal of a predicate that mixes the volume wait with the machine's.
 pub const MIXED: &str = "ERR usage: await sys: free and disk= wait on their volume alone; \
                          wait for the machine terms in a second await\n";
+
+/// A snapshot whose slots were read longer ago than this reads `slots` as
+/// warming: twice the period the host's reader reads them at while a wait
+/// names them (`aterm_sysprobe::slots::PERIOD`; at rest it reads once a
+/// minute).
+pub const SLOTS_FRESH_MS: u64 = 10_000;
 
 /// `timeout=` when not given, ms (the `await` family's default).
 pub const TIMEOUT_DEFAULT_MS: u64 = 30_000;
@@ -115,6 +142,14 @@ pub enum Metric {
     Jobs(JobCount),
     /// One job, by its id or its agent task id.
     Job(JobRef),
+    /// The 1-minute load average per logical core, a bare ratio.
+    Load,
+    /// Logical cores less the 5-minute load average, cores-worth.
+    CoresIdle,
+    /// Memory the machine can hand out without paging, bytes.
+    Avail,
+    /// Build slots proven free, less those an orphaned build still fills.
+    Slots,
 }
 
 /// Which count a `jobs.<word>` term reads.
@@ -206,6 +241,10 @@ impl Metric {
             Self::Throttle => "throttle".into(),
             Self::Jobs(c) => format!("jobs.{}", c.word()),
             Self::Job(_) => "job".into(),
+            Self::Load => "load".into(),
+            Self::CoresIdle => "cores_idle".into(),
+            Self::Avail => "avail".into(),
+            Self::Slots => "slots".into(),
         }
     }
 
@@ -219,14 +258,15 @@ impl Metric {
         match self {
             Self::Cpu => Kind::CpuPct,
             Self::CpuLevel { .. } | Self::Gpu => Kind::Pct,
-            Self::Aterm | Self::Tab | Self::Wait => Kind::Cores,
+            Self::Aterm | Self::Tab | Self::Wait | Self::CoresIdle => Kind::Cores,
             Self::Mem | Self::Throttle => Kind::Ordered,
             Self::Swap => Kind::Bps,
             Self::Decompress => Kind::PerS,
             Self::Thrash => Kind::YesNo,
-            Self::TabMem | Self::AtermMem => Kind::Bytes,
-            Self::Jobs(_) => Kind::Count,
+            Self::TabMem | Self::AtermMem | Self::Avail => Kind::Bytes,
+            Self::Jobs(_) | Self::Slots => Kind::Count,
             Self::Job(_) => Kind::Job,
+            Self::Load => Kind::Ratio,
         }
     }
 
@@ -252,6 +292,9 @@ enum Kind {
     Bytes,
     Count,
     Job,
+    /// A bare ratio (`load`): no unit, so `%` is refused rather than read
+    /// as a hundred times the value.
+    Ratio,
 }
 
 /// A comparison.
@@ -393,8 +436,112 @@ impl EndedJob {
 pub enum Parsed {
     /// A wait on the machine's metrics.
     Machine(AwaitSys),
-    /// The volume wait (`free`/`disk=` alone): handed whole to its parser.
-    Volume,
+    /// The volume wait (`free`/`disk=` alone), parsed.
+    Volume(VolumeWait),
+}
+
+/// A volume's level, as `disk=` names it (the disk watch's levels; the host
+/// maps each to its own).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskWord {
+    /// `ok`.
+    Ok,
+    /// `low`.
+    Low,
+    /// `short`.
+    Short,
+    /// `emergency`.
+    Emergency,
+}
+
+/// What a `free` term needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Need {
+    /// So many bytes.
+    Bytes(u64),
+    /// The volume's room, as `status disk_room_mb=` prints it.
+    Room,
+}
+
+/// One term of the volume wait.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VolumeTerm {
+    /// Free space at least (`free>=`) or above (`free>`) the need.
+    Free {
+        /// `>` rather than `>=`.
+        strict: bool,
+        /// What it needs.
+        need: Need,
+    },
+    /// The volume at one of these levels.
+    Disk(Vec<DiskWord>),
+}
+
+/// The volume wait, parsed: one or two terms, all of which must hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumeWait {
+    /// The terms.
+    pub terms: Vec<VolumeTerm>,
+    /// `vol=` as given (percent-encoded; the host decodes it, and refuses
+    /// one that is not absolute), else the session's own volume.
+    pub vol: Option<String>,
+    /// The caller's patience, ms.
+    pub timeout_ms: u64,
+}
+
+/// A size with its unit, whole: `<n>(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB)`; a bare
+/// number or a fraction is no size.
+fn whole_size(text: &str) -> Option<u64> {
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    let (n, unit) = text.split_at(digits);
+    let n: u64 = n.parse().ok()?;
+    let scale: u64 = match unit {
+        "B" => 1,
+        "KB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "TB" => 1_000_000_000_000,
+        "KiB" => 1 << 10,
+        "MiB" => 1 << 20,
+        "GiB" => 1 << 30,
+        "TiB" => 1 << 40,
+        _ => return None,
+    };
+    n.checked_mul(scale)
+}
+
+/// A `free` or `disk` term (`name`, `op`, `value`).
+fn volume_term(name: &str, op: Op, value: &str) -> Result<VolumeTerm, String> {
+    let usage = || USAGE.to_owned();
+    match (name, op) {
+        ("free", Op::Ge | Op::Gt) => Ok(VolumeTerm::Free {
+            strict: op == Op::Gt,
+            need: if value == "room" {
+                Need::Room
+            } else {
+                Need::Bytes(whole_size(value).ok_or_else(usage)?)
+            },
+        }),
+        ("disk", Op::Eq) => {
+            let words: Option<Vec<DiskWord>> = value
+                .split(',')
+                .map(|w| {
+                    Some(match w {
+                        "ok" => DiskWord::Ok,
+                        "low" => DiskWord::Low,
+                        "short" => DiskWord::Short,
+                        "emergency" => DiskWord::Emergency,
+                        _ => return None,
+                    })
+                })
+                .collect();
+            words
+                .filter(|w| !w.is_empty())
+                .map(VolumeTerm::Disk)
+                .ok_or_else(usage)
+        }
+        _ => Err(usage()),
+    }
 }
 
 /// A decimal number.
@@ -462,7 +609,7 @@ fn want(metric: &Metric, op: Op, value: &str) -> Result<Want, String> {
             let (v, cores) = match (kind, unit) {
                 (Kind::CpuPct, "%") | (Kind::Pct, "%") => (n, false),
                 (Kind::CpuPct, "c") => (n, true),
-                (Kind::Count, "") => (n, false),
+                (Kind::Count | Kind::Ratio, "") => (n, false),
                 (Kind::Cores, "c" | "") | (Kind::PerS, "" | "/s") => (n, false),
                 (Kind::Bytes, u) => (n * size_unit(u).ok_or_else(usage)?, false),
                 (Kind::Bps, u) => (
@@ -484,7 +631,7 @@ fn not_sampled(metric: &str) -> String {
 /// One `<metric><op><value>` token.
 enum Tok {
     Term(Term),
-    Volume,
+    Volume(VolumeTerm),
     /// `job=<id>` or `task=<id>`: its words are the next token.
     Job(JobRef),
 }
@@ -531,7 +678,7 @@ fn term(tok: &str) -> Result<Tok, String> {
         return Err(USAGE.to_owned());
     };
     let metric = match name {
-        "free" | "disk" => return Ok(Tok::Volume),
+        "free" | "disk" => return volume_term(name, op, value).map(Tok::Volume),
         "eta" | "growth" | "walk" => return Err(not_sampled(name)),
         "job" | "task" => {
             let id = job_id(value).filter(|_| op == Op::Eq).ok_or(USAGE)?;
@@ -556,6 +703,10 @@ fn term(tok: &str) -> Result<Tok, String> {
         "tab.mem" => Metric::TabMem,
         "aterm.mem" => Metric::AtermMem,
         "throttle" => Metric::Throttle,
+        "load" => Metric::Load,
+        "cores_idle" => Metric::CoresIdle,
+        "avail" => Metric::Avail,
+        "slots" => Metric::Slots,
         n => match n.strip_prefix("cpu.") {
             Some(label)
                 if !label.is_empty()
@@ -625,12 +776,14 @@ impl AwaitSys {
             return Err(USAGE.to_owned());
         }
         let mut terms: Vec<Term> = Vec::new();
-        let mut volume = false;
-        let mut vol_given = false;
+        let mut volume: Vec<VolumeTerm> = Vec::new();
+        let mut vol: Option<String> = None;
         let mut quiet = false;
         let mut for_ms = 0u64;
         let mut timeout_ms = TIMEOUT_DEFAULT_MS;
         let mut scope_aterm = false;
+        // `for=` and `scope=` given: the volume wait takes neither.
+        let mut machine_words = false;
         // `and` joins two terms; after `quiet` terms follow with or without
         // it. `after_and`: the last word was `and`; `first`: no term or
         // `quiet` yet.
@@ -648,6 +801,7 @@ impl AwaitSys {
             }
             if let Some(v) = tok.strip_prefix("for=") {
                 for_ms = duration_ms(v).ok_or(USAGE)?;
+                machine_words = true;
                 continue;
             }
             if let Some(v) = tok.strip_prefix("scope=") {
@@ -656,10 +810,11 @@ impl AwaitSys {
                     "aterm" => true,
                     _ => return Err(USAGE.to_owned()),
                 };
+                machine_words = true;
                 continue;
             }
-            if tok.starts_with("vol=") {
-                vol_given = true;
+            if let Some(v) = tok.strip_prefix("vol=") {
+                vol = Some(v.to_owned());
                 continue;
             }
             if tok == "quiet" {
@@ -683,7 +838,7 @@ impl AwaitSys {
             first = false;
             after_and = false;
             match term(tok)? {
-                Tok::Volume => volume = true,
+                Tok::Volume(t) => volume.push(t),
                 Tok::Term(t) => terms.push(t),
                 Tok::Job(job) => {
                     let want = job_want(toks.next().ok_or(USAGE)?)?;
@@ -698,14 +853,21 @@ impl AwaitSys {
         if after_and {
             return Err(USAGE.to_owned());
         }
-        if volume {
-            return if terms.is_empty() && !quiet {
-                Ok(Parsed::Volume)
-            } else {
-                Err(MIXED.to_owned())
-            };
+        if !volume.is_empty() {
+            if !terms.is_empty() || quiet {
+                return Err(MIXED.to_owned());
+            }
+            // One or two terms, with `vol=` and `timeout=` alone.
+            if machine_words || volume.len() > 2 {
+                return Err(USAGE.to_owned());
+            }
+            return Ok(Parsed::Volume(VolumeWait {
+                terms: volume,
+                vol,
+                timeout_ms,
+            }));
         }
-        if vol_given || (terms.is_empty() && !quiet) {
+        if vol.is_some() || (terms.is_empty() && !quiet) {
             return Err(USAGE.to_owned());
         }
         if quiet {
@@ -858,6 +1020,41 @@ fn read(metric: &Metric, s: &Snapshot, tab_keys: &[u64], cores_want: bool) -> Re
                 Throttle::Severe => 3,
             })
         }),
+        Metric::Load | Metric::CoresIdle => {
+            let Some(l) = s.load else {
+                return Reading::Unavailable("unsupported");
+            };
+            // The cores are known once two core readings exist.
+            let Some(cores) = s.total_cores().filter(|c| *c > 0) else {
+                return Reading::Warming;
+            };
+            let cores = cores as f64;
+            if *metric == Metric::Load {
+                Reading::Num(l[0] / cores)
+            } else {
+                Reading::Num((cores - l[1]).max(0.0))
+            }
+        }
+        Metric::Avail => s.avail.map_or(Reading::Unavailable("unsupported"), |b| {
+            Reading::Num(b as f64)
+        }),
+        Metric::Slots => match s.slots {
+            None => Reading::Unavailable(SlotsUnread::NotSampled.word()),
+            // Read at rest, before any wait named the slots: the reader reads
+            // them again for this one.
+            Some(_) if s.slots_age_ms.is_some_and(|a| a > SLOTS_FRESH_MS) => Reading::Warming,
+            Some(SlotsView::Unread(why)) => Reading::Unavailable(why.word()),
+            // The reader reads no slot files as unread; a count of none is
+            // the same fact.
+            Some(SlotsView::Read { n: 0, .. }) => {
+                Reading::Unavailable(SlotsUnread::NotSampled.word())
+            }
+            // Not one slot proven either way yet: the first read.
+            Some(SlotsView::Read { n, pending, .. }) if pending >= n => Reading::Warming,
+            Some(SlotsView::Read {
+                free, discounted, ..
+            }) => Reading::Num(f64::from(free.saturating_sub(discounted))),
+        },
     }
 }
 
@@ -975,8 +1172,18 @@ fn value_word(metric: &Metric, r: Reading, cores_want: bool) -> String {
             Kind::PerS => format!("{:.0}/s", v.round()),
             Kind::Bytes => size_word(v),
             Kind::Count => format!("{v:.0}"),
+            Kind::Ratio => format!("{v:.2}"),
             Kind::Ordered | Kind::YesNo | Kind::Job => "-".into(),
         },
+    }
+}
+
+/// A term's `<value>` on `s`: [`value_word`], but `slots` says how many of
+/// how many (`slots=1/3`).
+fn term_word(metric: &Metric, r: Reading, cores_want: bool, s: &Snapshot) -> String {
+    match (metric, r, s.slots) {
+        (Metric::Slots, Reading::Num(v), Some(SlotsView::Read { n, .. })) => format!("{v:.0}/{n}"),
+        _ => value_word(metric, r, cores_want),
     }
 }
 
@@ -996,6 +1203,28 @@ pub struct Outcome {
     /// nor the ring holds: not read yet, or gone; the host says `ERR gone`
     /// once the engine has looked again and still not found it.
     pub absent: Vec<String>,
+}
+
+/// The slots `s` has not proven either way (pending and unknown): each may
+/// turn out free.
+fn unproven_slots(s: &Snapshot) -> u16 {
+    match s.slots {
+        Some(SlotsView::Read {
+            pending, unknown, ..
+        }) => pending.saturating_add(unknown),
+        _ => 0,
+    }
+}
+
+/// Whether `op v` holds on every count of usable slots from `lo` (those
+/// proven free) to `hi` (every unproven one free too): proven whichever way
+/// each unproven slot turns out.
+fn holds_on_every(op: Op, v: f64, lo: f64, hi: f64) -> bool {
+    match op {
+        // No whole count in `lo..=hi` is `v`.
+        Op::Ne => v.fract() != 0.0 || !(lo..=hi).contains(&v),
+        _ => op.holds(lo, v) && op.holds(hi, v),
+    }
 }
 
 fn holds(want: &Want, r: Reading) -> Option<bool> {
@@ -1101,9 +1330,18 @@ pub fn evaluate_with(
         out.values.push(format!(
             "{}={}",
             t.metric.name(),
-            value_word(&t.metric, r, cores_want)
+            term_word(&t.metric, r, cores_want, s)
         ));
-        if holds(&t.want, r) != Some(true) {
+        let met = match (&t.metric, &t.want, r) {
+            (Metric::Slots, Want::Num { op, v, .. }, Reading::Num(lo)) => Some(holds_on_every(
+                *op,
+                *v,
+                lo,
+                lo + f64::from(unproven_slots(s)),
+            )),
+            _ => holds(&t.want, r),
+        };
+        if met != Some(true) {
             out.holds = false;
         }
     }
@@ -1169,7 +1407,7 @@ mod tests {
     fn machine(s: &str) -> AwaitSys {
         match AwaitSys::parse(s).unwrap() {
             Parsed::Machine(w) => w,
-            Parsed::Volume => panic!("{s} routed to the volume"),
+            Parsed::Volume(_) => panic!("{s} routed to the volume"),
         }
     }
 
@@ -1494,15 +1732,85 @@ mod tests {
         assert!(o.refused.is_none() && !o.holds, "{o:?}");
     }
 
+    /// THE VOLUME WAIT IN THE ONE GRAMMAR (design §3.1; `aterm-gui`'s
+    /// `control_disk` runs it): a size needs its unit, spelled exactly, and
+    /// is whole; `room` and the level words read; one or two terms joined by
+    /// `and`; `vol=` and `timeout=` and none of the machine wait's words
+    /// (`for=`, `scope=`); never mixed with machine terms.
     #[test]
-    fn the_volume_wait_routes_whole() {
-        for v in [
-            "sys free>=10GB",
-            "sys free>room vol=/System/Volumes/Data",
-            "sys disk=ok,low and free>1GB timeout=5000",
+    fn the_volume_wait_is_parsed_by_the_one_grammar() {
+        let volume = |s: &str| match AwaitSys::parse(s) {
+            Ok(Parsed::Volume(v)) => v,
+            other => panic!("{s}: {other:?}"),
+        };
+        assert_eq!(
+            volume("sys free>=5GiB"),
+            VolumeWait {
+                terms: vec![VolumeTerm::Free {
+                    strict: false,
+                    need: Need::Bytes(5 << 30),
+                }],
+                vol: None,
+                timeout_ms: TIMEOUT_DEFAULT_MS,
+            }
+        );
+        assert_eq!(
+            volume("sys free>room and disk=ok,low vol=/Volumes/x timeout=600000"),
+            VolumeWait {
+                terms: vec![
+                    VolumeTerm::Free {
+                        strict: true,
+                        need: Need::Room,
+                    },
+                    VolumeTerm::Disk(vec![DiskWord::Ok, DiskWord::Low]),
+                ],
+                vol: Some("/Volumes/x".to_owned()),
+                timeout_ms: 600_000,
+            }
+        );
+        assert_eq!(
+            volume("sys free>=10GB timeout=99999999999").timeout_ms,
+            TIMEOUT_MAX_MS
+        );
+        assert_eq!(
+            volume("sys disk=emergency,short timeout 5000"),
+            VolumeWait {
+                terms: vec![VolumeTerm::Disk(vec![DiskWord::Emergency, DiskWord::Short])],
+                vol: None,
+                timeout_ms: 5_000,
+            }
+        );
+        for bad in [
+            "sys free>=5000",
+            "sys free>=5gb",
+            "sys free>=1.5GiB",
+            "sys free<5GiB",
+            "sys free=5GiB",
+            "sys disk>=ok",
+            "sys disk=ok,nope",
+            "sys disk=",
+            "sys free>=1GB and",
+            "sys and free>=1GB",
+            "sys free>=1GB disk=ok",
+            "sys free>=1GB timeout=x",
+            "sys free>=1KB and free>=2KB and free>=3KB",
+            "sys free>=5GiB for=20m",
+            "sys disk=ok scope=aterm",
+            "sys mem_free>=1GiB",
+            "sys cpu<50",
+            "sys",
         ] {
-            assert_eq!(AwaitSys::parse(v), Ok(Parsed::Volume), "{v}");
+            assert_eq!(AwaitSys::parse(bad), Err(USAGE.to_owned()), "{bad}");
         }
+        for mixed in [
+            "sys free>=5GiB and slots>=1",
+            "sys quiet free>=1GB",
+            "sys disk=ok and jobs.stuck=0",
+        ] {
+            assert_eq!(AwaitSys::parse(mixed), Err(MIXED.to_owned()), "{mixed}");
+        }
+        // `vol=` is the volume wait's alone.
+        assert_eq!(AwaitSys::parse("sys cpu<50% vol=/x"), Err(USAGE.to_owned()));
     }
 
     #[test]
@@ -1647,5 +1955,271 @@ mod tests {
         assert_eq!(size_word(1_234.0), "1.2KB");
         assert_eq!(size_word(310e6), "310MB");
         assert_eq!(size_word(7.1e6), "7.1MB");
+    }
+
+    /// A snapshot of `cores` logical cores, these load averages, `avail`
+    /// bytes and these slots.
+    fn occupancy(
+        cores: usize,
+        load: Option<[f64; 3]>,
+        avail: Option<u64>,
+        slots: Option<SlotsView>,
+    ) -> Snapshot {
+        Snapshot {
+            at_ns: 5_000_000_000,
+            cpu: Some(CpuView {
+                cores: vec![CoreView::default(); cores],
+                ..CpuView::default()
+            }),
+            load,
+            avail,
+            slots,
+            ..Snapshot::default()
+        }
+    }
+
+    fn read_slots(n: u16, held: u16, free: u16, pending: u16, discounted: u16) -> SlotsView {
+        SlotsView::Read {
+            n,
+            held,
+            free,
+            pending,
+            unknown: n - held - free - pending,
+            discounted,
+        }
+    }
+
+    #[test]
+    fn the_occupancy_terms_parse_with_their_units() {
+        let num = |op, v| Want::Num {
+            op,
+            v,
+            cores: false,
+        };
+        for (text, metric, want) in [
+            ("sys load<0.5", Metric::Load, num(Op::Lt, 0.5)),
+            ("sys cores_idle>=4", Metric::CoresIdle, num(Op::Ge, 4.0)),
+            ("sys cores_idle>=4c", Metric::CoresIdle, num(Op::Ge, 4.0)),
+            (
+                "sys avail>=8GiB",
+                Metric::Avail,
+                num(Op::Ge, 8_589_934_592.0),
+            ),
+            ("sys avail>8GB", Metric::Avail, num(Op::Gt, 8e9)),
+            ("sys slots>=1", Metric::Slots, num(Op::Ge, 1.0)),
+            ("sys cpu<50%", Metric::Cpu, num(Op::Lt, 50.0)),
+        ] {
+            let w = machine(text);
+            assert_eq!(w.terms.len(), 1, "{text}");
+            assert_eq!(w.terms[0].metric, metric, "{text}");
+            assert_eq!(w.terms[0].want, want, "{text}");
+        }
+        assert_eq!(machine("sys slots>=1 for=20m").for_ms, 1_200_000);
+        let w = machine("sys slots>=1 and avail>=8GiB and load<0.5 and mem<critical");
+        assert_eq!(
+            w.terms.iter().map(|t| t.metric.name()).collect::<Vec<_>>(),
+            ["slots", "avail", "load", "mem"]
+        );
+        // Each takes its own unit and no other. `cpu` keeps §13.8's: a bare
+        // number is refused, not read as percent.
+        for bad in [
+            "sys avail>=8",
+            "sys avail>=8%",
+            "sys slots>=1c",
+            "sys slots>=1GB",
+            "sys load<50%",
+            "sys load<0.5c",
+            "sys cores_idle>=4%",
+            "sys cpu<50",
+            "sys slots=free",
+        ] {
+            assert_eq!(AwaitSys::parse(bad), Err(USAGE.to_owned()), "{bad}");
+        }
+        // The volume wait still never mixes with the machine's.
+        assert_eq!(
+            AwaitSys::parse("sys free>=5GiB and slots>=1"),
+            Err(MIXED.to_owned())
+        );
+    }
+
+    #[test]
+    fn the_occupancy_terms_read_load_cores_memory_and_slots() {
+        let s = occupancy(
+            18,
+            Some([2.0, 4.0, 1.0]),
+            Some(96 << 30),
+            Some(read_slots(3, 2, 1, 0, 0)),
+        );
+        let o = evaluate(
+            &machine("sys load<0.5 and cores_idle>=14 and avail>=8GiB and slots>=1"),
+            &s,
+            &[],
+        );
+        assert!(o.holds, "{o:?}");
+        assert_eq!(
+            o.values,
+            ["load=0.11", "cores_idle=14.00c", "avail=103GB", "slots=1/3"]
+        );
+        // NEGATIVE CONTROL: each term fails on its own side of the line.
+        for (text, value) in [
+            ("sys load<0.1", "load=0.11"),
+            ("sys cores_idle>14", "cores_idle=14.00c"),
+            ("sys avail>=100GiB", "avail=103GB"),
+            ("sys slots>=2", "slots=1/3"),
+        ] {
+            let o = evaluate(&machine(text), &s, &[]);
+            assert!(!o.holds && o.refused.is_none(), "{text}: {o:?}");
+            assert_eq!(o.values, [value], "{text}");
+        }
+        // Idle cores never read below none, whatever the load.
+        let busy = occupancy(4, Some([30.0, 30.0, 30.0]), None, None);
+        assert_eq!(
+            evaluate(&machine("sys cores_idle<1"), &busy, &[]).values,
+            ["cores_idle=0.00c"]
+        );
+        // A free slot an orphaned build still fills is not usable.
+        let s = occupancy(18, None, None, Some(read_slots(3, 2, 1, 0, 1)));
+        let o = evaluate(&machine("sys slots>=1"), &s, &[]);
+        assert!(!o.holds && o.refused.is_none(), "{o:?}");
+        assert_eq!(o.values, ["slots=0/3"]);
+        // Slots still pending count neither way; one proven free is enough.
+        let s = occupancy(18, None, None, Some(read_slots(3, 0, 1, 2, 0)));
+        assert!(evaluate(&machine("sys slots>=1"), &s, &[]).holds);
+    }
+
+    #[test]
+    fn an_occupancy_term_the_host_cannot_read_refuses_and_a_first_read_warms() {
+        let refused = |s: &Snapshot, text: &str| evaluate(&machine(text), s, &[]).refused;
+        for (slots, why) in [
+            (
+                Some(SlotsView::Unread(SlotsUnread::UnreadFormat)),
+                "unread_format",
+            ),
+            (Some(SlotsView::Unread(SlotsUnread::Refused)), "refused"),
+            (
+                Some(SlotsView::Unread(SlotsUnread::Unsupported)),
+                "unsupported",
+            ),
+            (Some(read_slots(0, 0, 0, 0, 0)), "not_sampled"),
+            (None, "not_sampled"),
+        ] {
+            let s = occupancy(18, Some([1.0; 3]), Some(1 << 30), slots);
+            assert_eq!(
+                refused(&s, "sys slots>=1").as_deref(),
+                Some(format!("ERR unavailable slots why={why}\n").as_str()),
+                "{slots:?}"
+            );
+        }
+        let s = occupancy(18, None, None, None);
+        assert_eq!(
+            refused(&s, "sys load<0.5").as_deref(),
+            Some("ERR unavailable load why=unsupported\n")
+        );
+        assert_eq!(
+            refused(&s, "sys cores_idle>=4").as_deref(),
+            Some("ERR unavailable cores_idle why=unsupported\n")
+        );
+        assert_eq!(
+            refused(&s, "sys avail>=8GiB").as_deref(),
+            Some("ERR unavailable avail why=unsupported\n")
+        );
+        // Every slot still pending, and load before the cores are known, park.
+        let mut s = occupancy(18, Some([1.0; 3]), None, Some(read_slots(3, 0, 0, 3, 0)));
+        s.cpu = None;
+        let o = evaluate(
+            &machine("sys slots>=1 and load<0.5 and cores_idle>=1"),
+            &s,
+            &[],
+        );
+        assert!(!o.holds && o.refused.is_none(), "{o:?}");
+        assert_eq!(
+            o.values,
+            ["slots=warming", "load=warming", "cores_idle=warming"]
+        );
+    }
+
+    /// A SLOT NOT PROVEN EITHER WAY may be free or not: a slots term holds
+    /// only when it holds whichever way each turns out. `slots>=1` reads the
+    /// proven free; `slots<1`, `slots=0`, `slots<=0` and `slots!=1` hold only
+    /// once no unproven slot could make them false. NEGATIVE CONTROL: the
+    /// same terms on slots all proven.
+    #[test]
+    fn a_slots_term_holds_only_on_slots_proven_either_way() {
+        let on = |slots: SlotsView, text: &str| {
+            evaluate(&machine(text), &occupancy(18, None, None, Some(slots)), &[]).holds
+        };
+        // One slot, unknown (`n` 1, nothing proven): 0 proven free, 1 at most.
+        let unknown = read_slots(1, 0, 0, 0, 0);
+        // Three: two pending and one unknown, read once already (no warming).
+        let unproven = read_slots(3, 0, 0, 2, 0);
+        for text in ["sys slots<1", "sys slots=0", "sys slots<=0", "sys slots!=1"] {
+            assert!(!on(unknown, text), "{text} on one unknown slot");
+            assert!(!on(unproven, text), "{text} on three unproven slots");
+        }
+        assert!(!on(unknown, "sys slots>=1"));
+        assert!(on(unknown, "sys slots<2"), "even free it is one");
+        assert!(on(unproven, "sys slots!=4"), "no count reaches four");
+        // One proven free and one unproven: at least one, at most two.
+        let one_or_two = read_slots(3, 1, 1, 1, 0);
+        assert!(on(one_or_two, "sys slots>=1"));
+        assert!(!on(one_or_two, "sys slots=1"));
+        assert!(on(one_or_two, "sys slots<3"));
+        // Negative control: every slot proven, each term reads its count.
+        let none_free = read_slots(1, 1, 0, 0, 0);
+        for text in ["sys slots<1", "sys slots=0", "sys slots<=0", "sys slots!=1"] {
+            assert!(on(none_free, text), "{text} on one held slot");
+        }
+        assert!(on(read_slots(3, 2, 1, 0, 0), "sys slots=1"));
+    }
+
+    /// A SLOTS READING THE HOST READ AT REST is older than a wait may judge
+    /// by: the snapshot carries its age, and past [`SLOTS_FRESH_MS`] it is
+    /// warming, an unread one included. NEGATIVE CONTROL: the same reading,
+    /// fresh, holds or refuses.
+    #[test]
+    fn a_slots_reading_older_than_the_armed_period_is_warming() {
+        let at = |slots: SlotsView, age_ms: Option<u64>| {
+            let mut s = occupancy(18, None, None, Some(slots));
+            s.slots_age_ms = age_ms;
+            s
+        };
+        let free = read_slots(3, 2, 1, 0, 0);
+        let w = machine("sys slots>=1");
+        for age in [None, Some(0), Some(SLOTS_FRESH_MS)] {
+            assert!(evaluate(&w, &at(free, age), &[]).holds, "{age:?}");
+        }
+        let o = evaluate(&w, &at(free, Some(SLOTS_FRESH_MS + 1)), &[]);
+        assert!(!o.holds && o.refused.is_none(), "{o:?}");
+        assert_eq!(o.values, ["slots=warming"]);
+        let unread = SlotsView::Unread(SlotsUnread::NotSampled);
+        let o = evaluate(&w, &at(unread, Some(60_000)), &[]);
+        assert!(
+            o.refused.is_none() && o.values == ["slots=warming"],
+            "{o:?}"
+        );
+        let o = evaluate(&w, &at(unread, Some(0)), &[]);
+        assert_eq!(
+            o.refused.as_deref(),
+            Some("ERR unavailable slots why=not_sampled\n")
+        );
+    }
+
+    #[test]
+    fn a_slots_wait_for_twenty_minutes_holds_only_across_stamps_that_span_them() {
+        let w = machine("sys slots>=1 for=20m");
+        let min = 60_000_000_000u64;
+        let at = |t: u64, free: u16| {
+            let mut s = occupancy(18, None, None, Some(read_slots(1, 1 - free, free, 0, 0)));
+            s.at_ns = t;
+            s
+        };
+        let mut l = Latch::default();
+        let mut feed = |s: Snapshot| l.step(evaluate(&w, &s, &[]).holds, s.at_ns, w.for_ms);
+        assert_eq!(feed(at(0, 1)), None);
+        assert_eq!(feed(at(10 * min, 1)), None);
+        assert_eq!(feed(at(15 * min, 0)), None, "a held read restarts the hold");
+        assert_eq!(feed(at(20 * min, 1)), None);
+        assert_eq!(feed(at(39 * min, 1)), None);
+        assert_eq!(feed(at(40 * min, 1)), Some(1_200_000));
     }
 }

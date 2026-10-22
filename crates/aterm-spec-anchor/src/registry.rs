@@ -73,6 +73,7 @@ pub struct Node<T: Sync + 'static> {
 
 impl<T: Sync> Node<T> {
     #[doc(hidden)]
+    #[inline]
     pub const fn new(value: T) -> Self {
         Self {
             value,
@@ -88,6 +89,7 @@ impl<T: Sync> Registry<T> {
         clippy::new_without_default,
         reason = "built only in a `static` by `collect!`, where `Default` cannot run"
     )]
+    #[inline]
     pub const fn new() -> Self {
         Self {
             head: AtomicPtr::new(ptr::null_mut()),
@@ -119,6 +121,7 @@ impl<T: Sync> Registry<T> {
     }
 
     /// Every value submitted so far, newest first.
+    #[inline]
     pub fn iter(&'static self) -> Iter<T> {
         Iter {
             // SAFETY: null or a `&'static Node<T>` (the `Registry` invariant).
@@ -128,6 +131,7 @@ impl<T: Sync> Registry<T> {
 }
 
 /// Every value of `T` the binary submitted, newest first.
+#[inline]
 pub fn iter<T: Collect>() -> Iter<T> {
     T::registry().iter()
 }
@@ -140,6 +144,7 @@ pub struct Iter<T: Sync + 'static> {
 impl<T: Sync> Iterator for Iter<T> {
     type Item = &'static T;
 
+    #[inline]
     fn next(&mut self) -> Option<&'static T> {
         let node = self.next?;
         // SAFETY: null or a `&'static Node<T>` (the `Registry` invariant).

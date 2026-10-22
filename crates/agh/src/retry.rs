@@ -55,6 +55,7 @@ impl RetryPolicy {
 /// 4. `Sub::Primary` or `Sub::PreRefused` → None;
 /// 5. Server, or CouldNotRun with `Sub::Wire(_)` → `pauses[min(attempt - 1, 1)]`;
 /// 6. anything else → None.
+#[inline]
 #[must_use]
 pub fn should_retry(
     policy: &RetryPolicy,

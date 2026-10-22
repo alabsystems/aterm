@@ -25,6 +25,7 @@ pub enum Consistency {
 
 impl Consistency {
     /// `snapshot`, `as-read`.
+    #[inline]
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
@@ -63,24 +64,28 @@ impl ListOpts {
     pub const CAS: ListOpts = ListOpts::STANDARD;
 
     /// The same options with `limit`.
+    #[inline]
     #[must_use]
     pub const fn with_limit(self, limit: Option<usize>) -> ListOpts {
         ListOpts { limit, ..self }
     }
 
     /// The same options with `partial`.
+    #[inline]
     #[must_use]
     pub const fn with_partial(self, partial: bool) -> ListOpts {
         ListOpts { partial, ..self }
     }
 
     /// The same options with `max_pages`.
+    #[inline]
     #[must_use]
     pub const fn with_max_pages(self, max_pages: u32) -> ListOpts {
         ListOpts { max_pages, ..self }
     }
 
     /// The same options with `consistency`.
+    #[inline]
     #[must_use]
     pub const fn with_consistency(self, consistency: Consistency) -> ListOpts {
         ListOpts {
@@ -90,6 +95,7 @@ impl ListOpts {
     }
 
     /// The same options with `per_page`.
+    #[inline]
     #[must_use]
     pub const fn with_per_page(self, per_page: u8) -> ListOpts {
         ListOpts { per_page, ..self }
@@ -214,9 +220,10 @@ impl<T> Listing<T> {
     }
 
     /// Whether it ended `Complete`.
+    #[inline]
     #[must_use]
-    pub fn is_complete(&self) -> bool {
-        self.end == End::Complete
+    pub const fn is_complete(&self) -> bool {
+        matches!(self.end, End::Complete)
     }
 
     /// Each item through `f`.

@@ -3284,32 +3284,29 @@ pub(crate) fn sixty_five(swaps: &[(usize, &str)]) -> Vec<String> {
     lines
 }
 
-/// THE TOO-MANY BOX IS JUDGED ON THE TRANSCRIPT'S COMMAND WHERE IT DRAWS AS THE
-/// BOX (`breaker-read-only@v2`, MEASURED 2026-10-22): the MEASURED box itself,
-/// `echo` and 65 `$(true)` as one line wrapped into four barred rows, which no
-/// reading of the screen proves (its newline reading puts a `$(true)` where a
-/// command's name goes), is pressed `1` under the safe rules, in bypass and
-/// out, under bash and under a shell that may be zsh, where the agent's
-/// transcript holds that one line as its pending Bash call
-/// ([`ApprovalCtx::box_command`]) and it draws as the box's rows
-/// ([`super::super::box_command::drawn_as`]); the subject is that command.
-///
-/// NEGATIVE CONTROLS, each escalated under the safe rules, its reason led by
-/// the breaker's label:
-/// * the transcript holds the box's NEWLINE TWIN (captured: the same rows on
-///   screen): it draws as the box too, and is judged as written, so its
-///   `$(true)` in a command's name is refused, said to be the transcript's;
-/// * the transcript holds another command (a captured probe's): it does not
-///   draw as the box, so the screen's readings are judged and the reason says
-///   why the call was not taken;
-/// * the transcript named no call (`2 calls waiting`): the screen's readings,
-///   and the reason names why;
-/// * the box drawn from a subagent (` · from …` in its title): no call is
-///   matched to it;
-/// * nothing read (`None`): the screen's readings alone, as before.
+/// Commands with identical box rows but different effects. These strings are
+/// never executed: the one-line echo has only true substitutions, while a
+/// newline before touch makes a second command with a write.
+pub(crate) fn stale_box_commands() -> (String, String) {
+    let harmless = format!(
+        "echo{} {} touch /tmp/aterm-source-only-counterexample",
+        " $(true)".repeat(65),
+        "x".repeat(23)
+    );
+    let writing = harmless.replace(" touch ", "\ntouch ");
+    (harmless, writing)
+}
+
+/// A transcript call never removes another plausible reading, even when it
+/// draws the exact same rows. The measured one-line echo and its newline
+/// twin both escalate. An older harmless echo also draws exactly as a new
+/// newline-touch command: pending/stable/shape agreement cannot approve it.
+/// Controls retain mismatched/missing/subagent refusal diagnostics and the
+/// existing unambiguous per-row echo approval, including under zsh.
 #[test]
-fn the_too_many_box_is_judged_on_the_transcripts_command_where_it_draws_as_the_box() {
+fn a_transcript_call_cannot_remove_the_boxes_other_readings() {
     use super::super::box_command::tests::command_of;
+    use super::super::box_command::{barred_rows, drawn_as};
     use phase_fixtures::{
         BOX_RM_TOO_MANY_NO_RM_2_1_307, BOX_RM_TOO_MANY_NO_RM_BYPASS_2_1_307, screen,
     };
@@ -3339,23 +3336,11 @@ fn the_too_many_box_is_judged_on_the_transcripts_command_where_it_draws_as_the_b
                 ..base.clone()
             },
         ] {
-            match on_screen(&rows, &c) {
-                Decision::Approve {
-                    rule_id,
-                    choice,
-                    subject,
-                    unproven,
-                    ..
-                } => {
-                    assert_eq!(
-                        (rule_id, choice),
-                        (RULE_BREAKER_READ_ONLY, Choice::Digit(1))
-                    );
-                    assert_eq!(unproven, None);
-                    assert_eq!(subject, space);
-                }
-                d => panic!("{d:?}"),
-            }
+            let d = on_screen(&rows, &c);
+            assert!(
+                reason(&d).contains("not read-only (newline reading)"),
+                "{d:?}"
+            );
         }
         // NEGATIVE CONTROLS
         let twin = command_of("Probe too-many-newline-twin");
@@ -3371,8 +3356,7 @@ fn the_too_many_box_is_judged_on_the_transcripts_command_where_it_draws_as_the_b
                 "the newline twin",
                 rows.clone(),
                 call(&twin),
-                "not read-only (newline reading): a command whose name this check cannot read \
-                 ($(…)) (judged on the transcript's command, drawn as the box)",
+                "not read-only (newline reading): a command whose name this check cannot read",
             ),
             (
                 "another command",
@@ -3406,6 +3390,39 @@ fn the_too_many_box_is_judged_on_the_transcripts_command_where_it_draws_as_the_b
             let r = reason(&on_screen(&rows, &c)).to_string();
             assert!(r.starts_with(&format!("{label}: ")), "{what}: {r}");
             assert!(r.contains(why), "{what}: {r}");
+        }
+
+        let (harmless, writing) = stale_box_commands();
+        assert!(classify_command(&harmless).read_only);
+        assert!(!classify_command(&writing).read_only);
+        let displayed = barred_rows(&writing, 140).expect("ASCII box rows");
+        let stale_rows = too_many_box(&displayed, base.bypass_mode);
+        let prompt = aterm_phase::prompt::parse_prompt_v2(&stale_rows).expect("the box");
+        assert_eq!(drawn_as(&prompt, &stale_rows, &harmless), Ok(()));
+        assert_eq!(drawn_as(&prompt, &stale_rows, &writing), Ok(()));
+        let c = ApprovalCtx {
+            box_command: call(&harmless),
+            ..base.clone()
+        };
+        let d = on_screen(&stale_rows, &c);
+        assert!(matches!(d, Decision::Escalate { .. }), "{d:?}");
+
+        // A box whose every reading is a read remains approved, with or
+        // without the corresponding transcript and with a zsh startup.
+        let lines = sixty_five(&[]);
+        let unambiguous = too_many_box(&lines, base.bypass_mode);
+        let command = lines.join("\n");
+        for box_command in [None, call(&command)] {
+            let d = on_screen(
+                &unambiguous,
+                &ApprovalCtx {
+                    box_command,
+                    shell: zsh(),
+                    ..base.clone()
+                },
+            );
+            assert_eq!(pressed(&d), (RULE_BREAKER_READ_ONLY, Choice::Digit(1)));
+            assert_eq!(unproven_of(&d), None);
         }
     }
 }

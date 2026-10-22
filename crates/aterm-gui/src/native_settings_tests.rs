@@ -25346,7 +25346,7 @@ fn native_sound_menu_is_one_box_on_one_route() {
     // The audible BEL row appears exactly where a beep call exists to suppress.
     assert_eq!(
         shown.contains(&prefs::EDIT_BELL_SOUND),
-        cfg!(any(target_os = "macos", windows)),
+        cfg!(any(target_os = "macos", windows, target_os = "linux")),
         "the terminal bell row must not promise a beep this platform never makes"
     );
 

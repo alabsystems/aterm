@@ -498,8 +498,11 @@ impl App {
     /// compositor's own frame, or aterm's header where it leaves the window
     /// undecorated, `crate::client_frame`) only has a light/dark variant, and
     /// winit's Wayland backend never delivers `ThemeChanged`. So on Linux `Auto` resolves to the active terminal
-    /// theme's darkness ([`crate::tab_bar::theme_is_dark`]); explicit Light/Dark
-    /// still override. `apply_theme_live` re-pushes it on Linux.
+    /// theme's darkness ([`crate::tab_bar::theme_is_dark`]), the Windows caption's rule;
+    /// explicit Light/Dark still override. `apply_theme_live` re-pushes it on Linux, so an OS
+    /// flip of a `dark:…,light:…` theme flips it too
+    /// (`linux_auto_chrome_follows_the_os_through_the_theme_it_draws`). GNOME 46's mutter
+    /// ignores the X11 hint and draws X11 frames in the desktop's colour scheme.
     pub(crate) fn chrome_theme_for_apprt(&self) -> crate::app_config::WindowTheme {
         #[cfg(target_os = "linux")]
         if self.window_theme == crate::app_config::WindowTheme::Auto {

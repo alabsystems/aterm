@@ -85,6 +85,10 @@ fn cases() -> BTreeMap<String, String> {
         hx(xproto::get_window_attributes(0x0060_0001)),
     );
     put("destroy_window", hx(xproto::destroy_window(0x0060_0001)));
+    put(
+        "reparent_window",
+        hx(xproto::reparent_window(0x0060_0001, 0x123, -5, 7)),
+    );
     put("map_window", hx(xproto::map_window(0x0060_0001)));
     put("unmap_window", hx(xproto::unmap_window(0x0060_0001)));
     put(

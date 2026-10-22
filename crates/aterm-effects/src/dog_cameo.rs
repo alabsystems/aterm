@@ -143,7 +143,7 @@ impl DogCameo {
     /// Stays set through the fade-out so a mid-fade frame keeps its sprite.
     #[inline]
     #[must_use]
-    pub fn look(&self) -> Option<DogLook> {
+    pub const fn look(&self) -> Option<DogLook> {
         self.look
     }
 }

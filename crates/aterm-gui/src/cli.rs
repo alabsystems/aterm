@@ -312,7 +312,7 @@ const HELP_TAIL: &str = concat!(
     "              crackle | mechanical | typewriter | marimba | felt), tone_melody,\n",
     "              trail_sound_bed (the ambient texture; default on),\n",
     "              trail_sound_riff (the sing-along song — the loudest voice),\n",
-    "              bell_sound (the audible BEL beep; macOS/Windows),\n",
+    "              bell_sound (the audible BEL beep; macOS/Windows/X11),\n",
     "              sparkle_words.profanity.bonk[_detonation] (the curse bonk).\n",
     "  Text        ligatures, font_features, bidi, ambiguous_width,\n",
     "              text_blending (linear-corrected | linear), font_thicken (macOS),\n",
@@ -509,7 +509,7 @@ const STARTER_CONFIG: &str = concat!(
 # tone_melody = true               # the melody leans with the typed line's inferred mood (on-device, typed input only); default ON and deliberately subtle
 # trail_sound_bed = true           # the continuous ambient BED texture behind the notes (default ON; false silences the bed)
 # trail_sound_riff = true          # the held-key SING-ALONG song (the loudest voice); false quiets just the song and keeps its visuals (default ON)
-# bell_sound = true                # the audible BEL beep (macOS NSBeep / Windows MessageBeep); false keeps the visual flash and window attention (default ON)
+# bell_sound = true                # the audible BEL beep (macOS NSBeep / Windows MessageBeep / the X11 bell); false keeps the visual flash and window attention (default ON)
 # cursor_trail_bloom = true            # GPU-only soft halo around the comet (default ON)
 # cursor_trail_bloom_strength = 0.85   # 0..=3 (halo intensity)
 # cursor_trail_bloom_radius = 2.2      # 0.5..=8 half-res blur texels; default 2.2, 1.8 for rainbow kitty; set to override

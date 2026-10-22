@@ -96,10 +96,12 @@ pub(crate) const EDIT_TRAIL_SOUND_STYLE: &str = "trail_sound_style";
 /// and window focus.
 pub(crate) const EDIT_TRAIL_SOUND_RIFF: &str = "trail_sound_riff";
 /// Audible terminal bell (`Config::bell_sound`, default ON): the BEL beep
-/// (`NSBeep` on macOS, `MessageBeep` on Windows), an OS alert sound outside
-/// `trail_sound_volume`. OFF suppresses only the beep; the visual bell flash and
-/// the attention request stay. Inert on other platforms (no beep call), as
-/// [`super::native_settings`]' Advanced gate and [`crate::diagnostics`] say.
+/// (`NSBeep` on macOS, `MessageBeep` on Windows, X11's bell request on Linux,
+/// which the window manager plays as the desktop's bell), an OS alert sound
+/// outside `trail_sound_volume`. OFF suppresses only the beep; the visual bell
+/// flash and the attention request stay. Inert on other platforms and on Wayland
+/// (no beep call), as [`super::native_settings`]' Advanced gate and
+/// [`crate::diagnostics`] say.
 pub(crate) const EDIT_BELL_SOUND: &str = "bell_sound";
 /// The curse BONK's two gates, named so the Sound menu, the section router and
 /// the visibility allowlist all spell them once. They are `[sparkle_words]`
@@ -6135,7 +6137,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             placeholder: String::new(),
         },
         EditField {
-            // The BEL beep: an OS alert sound (NSBeep / MessageBeep), not a synth
+            // The BEL beep: an OS alert sound (NSBeep / MessageBeep / the X11 bell), not a synth
             // voice, so outside `trail_sound_volume`. Off silences only the beep.
             label: "Terminal bell sound",
             key: EDIT_BELL_SOUND,

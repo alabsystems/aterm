@@ -9,16 +9,19 @@ use crate::retry::Idempotency;
 use crate::wire::{Method, Phase, WireError, header_in};
 
 /// The first header so named, ASCII case-insensitively, its value trimmed.
+#[inline]
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     header_in(headers, name).map(str::trim)
 }
 
 /// A header's value as a number of seconds or a Unix time.
+#[inline]
 fn number(headers: &[(String, String)], name: &str) -> Option<u64> {
     header(headers, name).and_then(|v| v.parse::<u64>().ok())
 }
 
 /// Whether `x-ratelimit-remaining` says the budget is spent.
+#[inline]
 fn spent(headers: &[(String, String)]) -> bool {
     number(headers, "x-ratelimit-remaining") == Some(0)
 }
@@ -42,6 +45,7 @@ fn secondary(error: Error, headers: &[(String, String)]) -> Error {
 }
 
 /// The comma-separated items of a scope header, each trimmed; empty items dropped.
+#[inline]
 fn scopes(text: &str) -> impl Iterator<Item = &str> {
     text.split(',').map(str::trim).filter(|s| !s.is_empty())
 }
@@ -58,6 +62,7 @@ pub(crate) fn missing_scope(headers: &[(String, String)]) -> Option<String> {
 }
 
 /// The `next` that names a missing OAuth scope.
+#[inline]
 pub(crate) fn scope_next(scope: &str) -> String {
     format!("the token lacks the {scope} scope; a person re-issues it with {scope}")
 }

@@ -28,8 +28,10 @@ aterm-vitals = { workspace = true }
 # reads): the path-user scan compares through it and nothing else; and the one
 # reader of another process's image and environment block (`peb`), which names
 # each scanned process's image and working directory. Pure Rust, libc on Unix
-# and kernel32/ntdll FFI on Windows, so the transport stays auditable; its own
-# dependency on this crate is dev-only.
+# and kernel32/ntdll FFI on Windows, so the transport stays auditable; beside
+# libc its one dependency is first-party aterm-json (with first-party serde, no
+# derive), for its build-slot record parse; its own dependency on this crate is
+# dev-only.
 aterm-sysprobe = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

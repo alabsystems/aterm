@@ -79,6 +79,15 @@ pub struct SharedState {
     pub exposed: bool,
 }
 
+/// The `_NET_WM_STATE` atoms that say the window manager, not the window, gives the window its
+/// frame (`UnownedWindow::shown_state`).
+#[derive(Clone, Copy, Debug, Default)]
+struct ShownState {
+    maximized_horz: bool,
+    maximized_vert: bool,
+    fullscreen: bool,
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Visibility {
     No,
@@ -181,6 +190,16 @@ macro_rules! leap {
 
 /// `NorthWestGravity` (X11 protocol): a resize keeps the window's contents at its top-left.
 const NORTH_WEST_GRAVITY: u32 = 1;
+
+/// The `_GTK_THEME_VARIANT` a window's `theme` asks for: `dark` or `light`, and none for `None`
+/// (the desktop's own), where upstream asked for `dark` whatever the desktop showed.
+pub(super) fn theme_variant(theme: Option<Theme>) -> Option<&'static str> {
+    match theme {
+        Some(Theme::Dark) => Some("dark"),
+        Some(Theme::Light) => Some("light"),
+        None => None,
+    }
+}
 
 /// `rgb` (`0x00RRGGBB`) as a pixel of `visual`, one of `screen`'s visuals, whose class must
 /// be `TrueColor` or `DirectColor` (a pixel of any other class is a colormap entry the
@@ -588,14 +607,17 @@ impl UnownedWindow {
         flusher.map(Some)
     }
 
+    /// Set the window's `_GTK_THEME_VARIANT` to `theme`'s variant ([`theme_variant`]), or, for
+    /// `None`, remove it, so the window manager draws the window's frame in its own default, the
+    /// desktop's. (GNOME 46's mutter draws an X11 window's frame in the desktop's colour scheme
+    /// whatever the hint says; a window manager that reads it, as mutter did before its frames
+    /// left the compositor in GNOME 44, follows it.)
     pub fn set_theme_inner(&self, theme: Option<Theme>) -> Result<VoidCookie<'_>, X11Error> {
         let atoms = self.xconn.atoms();
         let hint_atom = atoms[_GTK_THEME_VARIANT];
         let utf8_atom = atoms[UTF8_STRING];
-        let variant = match theme {
-            Some(Theme::Dark) => "dark",
-            Some(Theme::Light) => "light",
-            None => "dark",
+        let Some(variant) = theme_variant(theme) else {
+            return self.xconn.send_void(xproto::delete_property(self.xwindow, hint_atom));
         };
         let variant = CString::new(variant).expect("`_GTK_THEME_VARIANT` contained null byte");
         self.xconn.change_property(
@@ -898,18 +920,41 @@ impl UnownedWindow {
 
     #[inline]
     pub fn is_maximized(&self) -> bool {
+        let shown = self.shown_state();
+        shown.maximized_horz && shown.maximized_vert
+    }
+
+    /// Maximized in exactly one direction: how GNOME's edge tiling shows. mutter sets
+    /// `_NET_WM_STATE_MAXIMIZED_VERT` alone for Super+Left/Right and a drag to a side edge (the
+    /// tiled edges go in `_GTK_EDGE_CONSTRAINTS`, and its tiles always carry the flag), and a
+    /// window manager's maximize-vertically or -horizontally is the same state.
+    #[inline]
+    pub fn is_tiled(&self) -> bool {
+        let shown = self.shown_state();
+        shown.maximized_horz != shown.maximized_vert
+    }
+
+    /// Full screen as the window manager shows it (`_NET_WM_STATE_FULLSCREEN`, whoever asked for
+    /// it: a window manager's own key or rule sets it without [`Self::fullscreen`] knowing), or a
+    /// full screen this window asked for and the window manager has not shown yet: the move to
+    /// the monitor's origin goes out before the state, so its `Moved` can come before the state.
+    #[inline]
+    pub fn is_shown_fullscreen(&self) -> bool {
+        self.fullscreen().is_some() || self.shown_state().fullscreen
+    }
+
+    /// What `_NET_WM_STATE` holds of the states that give the window manager's frame, in one
+    /// read; none where it cannot be read.
+    fn shown_state(&self) -> ShownState {
         let atoms = self.xconn.atoms();
         let state_atom = atoms[_NET_WM_STATE];
-        let state = self.xconn.get_property(self.xwindow, state_atom, atom::ATOM);
-        let horz_atom = atoms[_NET_WM_STATE_MAXIMIZED_HORZ];
-        let vert_atom = atoms[_NET_WM_STATE_MAXIMIZED_VERT];
-        match state {
-            Ok(atoms) => {
-                let horz_maximized = atoms.contains(&horz_atom);
-                let vert_maximized = atoms.contains(&vert_atom);
-                horz_maximized && vert_maximized
+        match self.xconn.get_property(self.xwindow, state_atom, atom::ATOM) {
+            Ok(state) => ShownState {
+                maximized_horz: state.contains(&atoms[_NET_WM_STATE_MAXIMIZED_HORZ]),
+                maximized_vert: state.contains(&atoms[_NET_WM_STATE_MAXIMIZED_VERT]),
+                fullscreen: state.contains(&atoms[_NET_WM_STATE_FULLSCREEN]),
             },
-            _ => false,
+            Err(_) => ShownState::default(),
         }
     }
 
@@ -1439,6 +1484,20 @@ impl UnownedWindow {
             return;
         }
         self.set_urgent(request_type.is_some());
+    }
+
+    /// Ring the bell for this window: XKB's bell request naming it (`XkbBell`, which libX11 turns
+    /// into the core `Bell` where the server has no XKB). The server tells every client that
+    /// selected XKB's `BellNotify` which window rang; mutter answers with the desktop's bell, the
+    /// theme's sound or its visual bell, as it does for GNOME Terminal. On a display that has gone,
+    /// Xlib returns at once.
+    pub fn ring_bell(&self) {
+        // SAFETY: the connection's live `Display`; the window is this one's, alive while `self`
+        // is; percent 0 is the bell's base volume and name `None` the default bell.
+        unsafe {
+            (self.xconn.xlib.XkbBell)(self.xconn.display, self.xwindow as ffi::Window, 0, 0);
+            (self.xconn.xlib.XFlush)(self.xconn.display);
+        }
     }
 
     /// The window gained focus: clear the urgency hint a request for attention set.

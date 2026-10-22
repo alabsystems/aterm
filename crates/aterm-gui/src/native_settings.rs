@@ -9618,8 +9618,13 @@ fn row_available_here(key: &str, availability: SettingsAvailability) -> bool {
         | prefs::EDIT_WINDOW_COLORSPACE
         | prefs::EDIT_MACHINE_UNIVERSAL_CONTROL => availability.macos,
         // Windows presents EDR through scRGB; Linux presents SDR by design.
-        prefs::EDIT_BACKGROUND_MATERIAL | prefs::EDIT_BELL_SOUND | prefs::EDIT_HDR_GLOW => {
+        prefs::EDIT_BACKGROUND_MATERIAL | prefs::EDIT_HDR_GLOW => {
             availability.macos || availability.windows
+        }
+        // The beep `bell_sound` gates: `NSBeep`, `MessageBeep`, and on Linux X11's
+        // bell request (`system_alert_sound`).
+        prefs::EDIT_BELL_SOUND => {
+            availability.macos || availability.windows || cfg!(target_os = "linux")
         }
         prefs::EDIT_UPDATE_ENABLED | "update.auto_apply" => {
             availability.macos || (!availability.windows && cfg!(target_os = "linux"))
@@ -9871,13 +9876,14 @@ fn advanced_effect_of(key: &str) -> Option<AdvancedEffectPath> {
         // each frame, beside Matrix rain in the Effects group.
         | prefs::EDIT_OUTPUT_STREAK_ENABLED => Some(Effect::EffectsRuntime),
         // THE AUDIBLE BEL. Unlike every key above it is NOT a synth voice —
-        // it is the OS alert sound (`NSBeep` / `MessageBeep`), which is why
-        // `trail_sound_volume` never reached it and why it had no key at all.
-        // Platform-gated: macOS and Windows have a beep call to suppress,
-        // other platforms have none, so the row appears only where turning it
-        // off does something.
+        // it is the OS alert sound (`NSBeep` / `MessageBeep` / the X11 bell),
+        // which is why `trail_sound_volume` never reached it and why it had no
+        // key at all. Platform-gated: macOS, Windows and Linux have a beep call
+        // to suppress, other platforms have none, so the row appears only where
+        // turning it off does something.
         prefs::EDIT_BELL_SOUND => {
-            cfg!(any(target_os = "macos", windows)).then_some(Effect::TerminalRuntime)
+            cfg!(any(target_os = "macos", windows, target_os = "linux"))
+                .then_some(Effect::TerminalRuntime)
         }
         prefs::EDIT_RESTORE_SESSION | prefs::EDIT_SESSION_LOG_CLAUSE => Some(Effect::SessionRuntime),
         prefs::EDIT_KEEPER_ENABLED | prefs::EDIT_SESSION_LOG_JOURNAL => {

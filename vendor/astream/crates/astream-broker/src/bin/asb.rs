@@ -2663,11 +2663,11 @@ fn cmd_ack(cli: &Cli) -> Result<(), AsbErr> {
     let verdict = cli.at(5, "verdict")?;
     cli.no_more_than(6)?;
     cli.only_net("ack", &["--id"])?;
-    if !["handled", "refused", "deferred"].contains(&verdict.as_str()) {
+    let Ok(verdict) = astream_wire::ReceiptVerdict::parse(&verdict) else {
         return Err(AsbErr::Exit(usage_error(&format!(
             "<verdict> is handled|refused|deferred, got {verdict:?}"
         ))));
-    }
+    };
     let caps = cli.caps()?;
     // `ack`'s dedup key is (producer_id, 2^63 | input offset). A per-invocation
     // producer id would make every retry a fresh record — the exact property
@@ -2678,10 +2678,17 @@ fn cmd_ack(cli: &Cli) -> Result<(), AsbErr> {
             "<offset> must be below 2^63: `ack` publishes under producer sequence 2^63|<input offset>, and a larger offset has no sequence left to name",
         )));
     }
-    // The body is DESIGN-aterm-fabric.md §4.2's `in/…` ack: the word rides
-    // `verdict=`, the one key an aterm asker decodes. (It rode `state=`, which no
-    // reader decoded, so a refusal arrived as an ack with no word.)
-    let body = format!("v=1 t={} re={offset} verdict={verdict}", now_millis());
+    // The body is DESIGN-aterm-fabric.md §4.2's `in/…` ack, written by the codec
+    // astream reads receipts with (`astream_wire::V1Receipt`, kind `ack` from the
+    // subject): `v=1 t=<ms> re=<offset> verdict=<word>`, the word on `verdict=`,
+    // the one key an aterm asker decodes. (It rode `state=`, which no reader
+    // decoded, so a refusal arrived as an ack with no word.)
+    let body = astream_wire::V1Receipt::Ack {
+        re: astream_wire::Offset(offset),
+        verdict: Some(verdict),
+        sender_t_ms: Some(now_millis()),
+    }
+    .encode();
     let (mut c, _) = connect_attached(cli, &ep, &caps)?;
     // `<offset>` names a record the consumer acted on, so it must name a record
     // that EXISTS. The read-process-write advances the group past it in the same

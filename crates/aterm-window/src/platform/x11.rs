@@ -18,9 +18,9 @@
 //! `WM_CLASS` and startup token are set through `platform::wayland::WindowAttributesExtWayland`,
 //! whose attributes both backends read. aterm adds the window's background
 //! ([`WindowAttributesExtX11`], [`WindowExtX11`]), whether a redraw is the server's
-//! ([`redraw_is_exposure`]), and the application's word that a frame is on the window
+//! ([`redraw_is_exposure`]), the application's word that a frame is on the window
 //! ([`WindowExtX11::x11_frame_presented`]), which the window manager's resize sync request
-//! waits for.
+//! waits for, and its bell ([`WindowExtX11::ring_x11_bell`]).
 
 /// The X server timestamp (milliseconds on the server's clock) of the key event whose
 /// `WindowEvent::KeyboardInput` is being dispatched right now.
@@ -144,6 +144,13 @@ pub trait WindowExtX11 {
     /// screen stays. No effect on Wayland.
     fn set_x11_background(&self, rgb: u32);
 
+    /// Ring the bell for this window: XKB's bell request naming it, the core `Bell` where the
+    /// server has no XKB. The X server announces it (XKB's `BellNotify`, with the window) and the
+    /// window manager plays the desktop's bell: mutter plays the sound theme's bell, or flashes
+    /// the window under GNOME's visual bell, and stays silent when the desktop's audible bell is
+    /// off. No effect on Wayland, which has no bell that compositors widely implement.
+    fn ring_x11_bell(&self);
+
     /// The application has presented a frame of the window (its swap or its image put returned).
     /// Call it after every present. A window manager that resizes the window with EWMH's
     /// `_NET_WM_SYNC_REQUEST` (mutter) keeps showing the window's last frame until the window
@@ -159,6 +166,15 @@ impl WindowExtX11 for Window {
     fn set_x11_background(&self, rgb: u32) {
         match &self.window {
             crate::platform_impl::Window::X(window) => window.set_background(rgb),
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(_) => {},
+        }
+    }
+
+    #[inline]
+    fn ring_x11_bell(&self) {
+        match &self.window {
+            crate::platform_impl::Window::X(window) => window.ring_bell(),
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(_) => {},
         }

@@ -241,7 +241,7 @@ pub struct SingSync {
 
 /// Smoothstep ramp of `x` across `[lo, hi]` → `0..=1` (eased at both ends).
 #[inline]
-fn smoothstep(lo: f32, hi: f32, x: f32) -> f32 {
+const fn smoothstep(lo: f32, hi: f32, x: f32) -> f32 {
     let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
@@ -413,8 +413,9 @@ impl CatFrame {
 
     /// Quantized fingerprint folded into the frame's repaint key so the fade +
     /// bob + exit fx invalidate frames while active and settle (0) when hidden.
+    #[must_use]
     #[inline]
-    pub fn fp(&self) -> u64 {
+    pub const fn fp(&self) -> u64 {
         if self.alpha == 0 {
             return 0;
         }
@@ -442,18 +443,21 @@ impl CatFrame {
         let lead_q = ((self.pose.lead * 512.0) as i64) as u64;
         // Fine enough that the sing crossfade re-presents smoothly.
         let sing_q = ((self.sing * 128.0) as i64) as u64;
-        let mut h = aterm_hash::FNV64_OFFSET;
-        for value in [
-            u64::from(self.alpha),
+        let acc = match self.look.accessory {
+            Some(a) => a as u64 + 1,
+            None => 0,
+        };
+        let values = [
+            self.alpha as u64,
             (self.fade_out * 255.0) as u64,
             e,
             reaction,
             self.discovery as u64,
             self.collection_hello as u64,
             self.look.variant as u64,
-            self.look.accessory.map_or(0, |a| a as u64 + 1),
-            u64::from(self.look.coat),
-            u64::from(self.look.iris),
+            acc,
+            self.look.coat as u64,
+            self.look.iris as u64,
             self.look.age as u64,
             bob_q,
             eyes_q,
@@ -461,8 +465,12 @@ impl CatFrame {
             sy_q,
             lead_q,
             sing_q,
-        ] {
-            h = aterm_hash::fnv_mix_u64(h, value);
+        ];
+        let mut h = aterm_hash::FNV64_OFFSET;
+        let mut i = 0;
+        while i < values.len() {
+            h = aterm_hash::fnv_mix_u64(h, values[i]);
+            i += 1;
         }
         h
     }
@@ -471,7 +479,7 @@ impl CatFrame {
 /// The inert hidden/retired frame: alpha 0, plain exit, no reaction, STILL
 /// pose — byte-identical across frames, so [`CatFrame::fp`] settles to 0.
 #[inline]
-fn hidden_frame(look: KittyLook) -> CatFrame {
+const fn hidden_frame(look: KittyLook) -> CatFrame {
     CatFrame {
         alpha: 0,
         exit: CatExit::Plain,
@@ -733,7 +741,7 @@ impl CursorCat {
     /// sampled under the old footprint. A collection hello or singing appearance continues
     /// at the live caret.
     #[inline]
-    pub fn rebase_placement(&mut self) {
+    pub const fn rebase_placement(&mut self) {
         self.colors = None;
         self.fold = None;
         self.facing_left = false;
@@ -907,14 +915,14 @@ impl CursorCat {
     /// The display spine (0..1) the pose banks on.
     #[cfg(test)]
     #[must_use]
-    pub fn spine(&self) -> f32 {
+    pub const fn spine(&self) -> f32 {
         self.disp
     }
 
     /// The instant the landing squash is booked for, if pending or playing.
     #[cfg(test)]
     #[must_use]
-    pub fn land_at(&self) -> Option<Instant> {
+    pub const fn land_at(&self) -> Option<Instant> {
         self.land_at
     }
 
@@ -1383,7 +1391,7 @@ impl CursorCat {
     /// disarms and any landing bounce clears, so the next hidden frame is
     /// byte-identical.
     #[inline]
-    fn reset_spine(&mut self) {
+    const fn reset_spine(&mut self) {
         self.disp = 0.0;
         self.disp_at = None;
         self.land_at = None;
@@ -1555,7 +1563,7 @@ impl CursorCat {
     /// so every frame after the first is an O(1) hit.
     #[must_use]
     #[inline]
-    pub fn episode_colors(&self) -> Option<CatColorKey> {
+    pub const fn episode_colors(&self) -> Option<CatColorKey> {
         self.colors
     }
 
@@ -1710,7 +1718,7 @@ impl CursorCat {
     /// On screen (fading or shown) ⇒ keep the host's 60 fps re-arm going.
     #[must_use]
     #[inline]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         !matches!(self.state, State::Hidden)
     }
 
@@ -1727,7 +1735,7 @@ impl CursorCat {
         self.momentum.value(now)
     }
     #[inline]
-    fn xorshift(&mut self) -> u32 {
+    const fn xorshift(&mut self) -> u32 {
         let mut x = self.rng;
         x ^= x << 13;
         x ^= x >> 17;
@@ -1737,7 +1745,7 @@ impl CursorCat {
     }
     /// 20% star wink, 20% heart meow, else a plain fade.
     #[inline]
-    fn roll_exit(&mut self) -> CatExit {
+    const fn roll_exit(&mut self) -> CatExit {
         match self.xorshift() % 5 {
             0 => CatExit::StarWink,
             1 => CatExit::HeartMeow,
@@ -1805,10 +1813,10 @@ pub fn emit_exit_fx(
                     return;
                 }
                 // 7×6 heart, drawn as scaled per-row spans of additive light.
-                let rows: [(i32, i32); 6] = [(1, 2), (0, 6), (0, 6), (1, 5), (2, 4), (3, 3)];
-                let bumps = [(4, 5)]; // second top bump on row 0
+                const ROWS: [(i32, i32); 6] = [(1, 2), (0, 6), (0, 6), (1, 5), (2, 4), (3, 3)];
+                const BUMPS: [(i32, i32); 1] = [(4, 5)]; // second top bump on row 0
                 let pink = premul_rgb(EXIT_HEART_PINK, cov);
-                for (ry, &(x0, x1)) in rows.iter().enumerate() {
+                for (ry, &(x0, x1)) in ROWS.iter().enumerate() {
                     push_fx_rect(
                         out,
                         geom,
@@ -1819,7 +1827,7 @@ pub fn emit_exit_fx(
                         pink,
                     );
                 }
-                for &(x0, x1) in &bumps {
+                for &(x0, x1) in &BUMPS {
                     push_fx_rect(out, geom, hx + x0 * u, hy, (x1 - x0 + 1) * u, u, pink);
                 }
             } else {

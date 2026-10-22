@@ -59,7 +59,7 @@ pub const FLIGHT_MAX_MS: f32 = 120.0;
 /// to [`FLIGHT_MIN_MS`]: 8 → 60, 40 → 90, 200 → 120.
 #[inline]
 #[must_use]
-pub fn flight_ms(cells: f32) -> f32 {
+pub const fn flight_ms(cells: f32) -> f32 {
     if !cells.is_finite() || cells <= 0.0 {
         return FLIGHT_MIN_MS;
     }
@@ -179,7 +179,7 @@ pub const IOI_EMA_ALPHA: f32 = 0.5;
 /// the ribbon's grace (`Ribbon::rest_s`).
 #[inline]
 #[must_use]
-pub fn phrase_rest_ms(ioi_ms: f32) -> f32 {
+pub const fn phrase_rest_ms(ioi_ms: f32) -> f32 {
     let ioi = if ioi_ms.is_finite() {
         ioi_ms.clamp(IOI_MIN_MS, IOI_MAX_MS)
     } else {
@@ -191,7 +191,7 @@ pub fn phrase_rest_ms(ioi_ms: f32) -> f32 {
 /// Whether a gap of `gap_ms` since the last key is a rest at tempo `ioi_ms`.
 #[inline]
 #[must_use]
-pub fn phrase_rest_reached(gap_ms: u32, ioi_ms: f32) -> bool {
+pub const fn phrase_rest_reached(gap_ms: u32, ioi_ms: f32) -> bool {
     gap_ms as f32 >= phrase_rest_ms(ioi_ms)
 }
 
@@ -202,7 +202,7 @@ pub fn phrase_rest_reached(gap_ms: u32, ioi_ms: f32) -> bool {
 /// clamped gap.
 #[inline]
 #[must_use]
-pub fn ioi_next(ioi_ms: f32, gap_ms: u32, first: bool, rest: bool) -> f32 {
+pub const fn ioi_next(ioi_ms: f32, gap_ms: u32, first: bool, rest: bool) -> f32 {
     if first || gap_ms >= IOI_RESET_MS {
         IOI_DEFAULT_MS
     } else if rest {
@@ -233,11 +233,18 @@ pub const SHED_CELLS_PER: f32 = 12.0;
 /// landing fan (D6). Shared because §6.5 sizes the quad budget from it.
 #[inline]
 #[must_use]
-pub fn shed_n(cells: f32) -> u16 {
+pub const fn shed_n(cells: f32) -> u16 {
     if !cells.is_finite() || cells <= 0.0 {
         return SHED_MIN;
     }
-    ((cells / SHED_CELLS_PER) as u16).clamp(SHED_MIN, SHED_MAX)
+    let n = (cells / SHED_CELLS_PER) as u16;
+    if n < SHED_MIN {
+        SHED_MIN
+    } else if n > SHED_MAX {
+        SHED_MAX
+    } else {
+        n
+    }
 }
 
 /// `FAN_HERO_N = 5` (§8.1, D6): the landing fan always carries 1 gold m1 + 4
@@ -262,7 +269,7 @@ pub const RAIN_SPACING_MAX_MS: f32 = 24.0;
 /// (D19): a function of the flight clock, so retuning [`flight_ms`] retunes it.
 #[inline]
 #[must_use]
-pub fn rain_spacing_ms(flight_ms: f32) -> f32 {
+pub const fn rain_spacing_ms(flight_ms: f32) -> f32 {
     if !flight_ms.is_finite() {
         return RAIN_SPACING_MIN_MS;
     }
@@ -292,16 +299,16 @@ const KILL_RETRACT_PER_CELL_S: f32 = KILL_RETRACT_PER_CELL_MS / 1000.0;
 /// The kill's retract span in ms, `240 + 12·cells` — the sky's clock.
 #[inline]
 #[must_use]
-pub fn kill_span_ms(cells: u16) -> f32 {
-    KILL_RETRACT_BASE_MS + KILL_RETRACT_PER_CELL_MS * f32::from(cells)
+pub const fn kill_span_ms(cells: u16) -> f32 {
+    KILL_RETRACT_BASE_MS + KILL_RETRACT_PER_CELL_MS * (cells as f32)
 }
 
 /// The kill's retract span in seconds, `0.012·cells + 0.240` — the ribbon's
 /// clock, in the operation order its retract was baked with.
 #[inline]
 #[must_use]
-pub fn kill_span_s(cells: u16) -> f32 {
-    KILL_RETRACT_PER_CELL_S * f32::from(cells) + KILL_RETRACT_BASE_S
+pub const fn kill_span_s(cells: u16) -> f32 {
+    KILL_RETRACT_PER_CELL_S * (cells as f32) + KILL_RETRACT_BASE_S
 }
 
 // ---------------------------------------------------------------------------
@@ -339,7 +346,7 @@ pub const EDGE_IN_S: f32 = 0.018;
 /// span is fixed by [`EDGE_IN_S`].
 #[inline]
 #[must_use]
-pub fn edge_in(age_s: f32) -> f32 {
+pub const fn edge_in(age_s: f32) -> f32 {
     smoothstep01(age_s / EDGE_IN_S)
 }
 
@@ -367,7 +374,7 @@ pub fn suck_in(u: f32) -> f32 {
 /// ember (§8.2); paired with [`suck_in`] for position.
 #[inline]
 #[must_use]
-pub fn spend(u: f32) -> f32 {
+pub const fn spend(u: f32) -> f32 {
     let v = 1.0 - clamp01(u);
     v * v
 }
@@ -537,14 +544,14 @@ const _: () = assert!(
 /// runs first, so a non-finite age can never propagate into a coverage byte.
 #[inline]
 #[must_use]
-pub fn clamp01(t: f32) -> f32 {
+pub const fn clamp01(t: f32) -> f32 {
     if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) }
 }
 
 /// Hermite smoothstep on `[0, 1]`, clamped: `3u² − 2u³`.
 #[inline]
 #[must_use]
-pub fn smoothstep01(t: f32) -> f32 {
+pub const fn smoothstep01(t: f32) -> f32 {
     let u = clamp01(t);
     u * u * (3.0 - 2.0 * u)
 }

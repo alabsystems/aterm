@@ -16,9 +16,12 @@
 //!
 //! A stand-in window manager on its own connection plays the window manager's part: it unmaps
 //! and maps the window, writes its `_NET_WM_STATE`, and sends the VisibilityNotify a server
-//! without compositing would. The window is made override-redirect first, so a real window
-//! manager on the display (`:7` may run mutter) leaves it alone: its map is not redirected, and
-//! nothing rewrites its state between the stand-in's write and the window's read of it. The test
+//! without compositing would. The window is first reparented into an unmapped window of the
+//! stand-in's, so a real window manager on the display (`:7` may run mutter) never sees it: its
+//! map is not redirected, and nothing rewrites its state between the stand-in's write and the
+//! window's read of it. An override-redirect window is not enough: mutter writes the
+//! `_NET_WM_STATE` of one at each map and deletes it at each unmap, and a write that landed after
+//! the stand-in's took the window's HIDDEN back (2026-10-22, about one run in twenty). The test
 //! pumps the window's event loop until the event it waits for comes, then fences: a round trip
 //! of the stand-in, then of the window's connection, puts every event the stand-in's requests made
 //! in the window's queue, and one more pump handles them, so what was reported is all there is.
@@ -34,7 +37,7 @@
 use std::sync::MutexGuard;
 use std::time::{Duration, Instant};
 
-use aterm_x11::proto::xproto::{self, cw, PropMode};
+use aterm_x11::proto::xproto::{self, window_class, PropMode};
 use aterm_x11::proto::{atom, Request, ValueList, Void};
 use aterm_x11::Connection;
 
@@ -52,7 +55,8 @@ const UNOBSCURED: u8 = 0;
 const FULLY_OBSCURED: u8 = 2;
 
 /// A window of the backend and a stand-in window manager on its own connection. The window holds
-/// the shared connection's turn while it lives. Fields drop in order: the window before its loop.
+/// the shared connection's turn while it lives. Fields drop in order: the window before its loop,
+/// and both before the stand-in, whose closing destroys the window it put the window in.
 struct Rig {
     window: Window,
     event_loop: EventLoop<()>,
@@ -67,8 +71,8 @@ struct Rig {
 }
 
 impl Rig {
-    /// The window, made override-redirect and shown; `None`, after saying SKIP, where no X
-    /// server is named.
+    /// The window, moved into an unmapped window of the stand-in's and shown; `None`, after
+    /// saying SKIP, where no X server is named.
     fn new() -> Option<Rig> {
         if std::env::var_os("DISPLAY").is_none() {
             eprintln!("SKIP: no DISPLAY");
@@ -82,21 +86,38 @@ impl Rig {
         let window = Window::new(target, WindowAttributes::default().with_visible(false))
             .expect("an X11 window");
         let xwindow = window.id().0 as u32;
-        let (stand_in, _) =
+        let (stand_in, screen) =
             Connection::connect(None).expect("DISPLAY is set: the connection must open");
+        let root = stand_in.setup().roots[screen].root;
         let [net_wm_state, hidden] =
             stand_in.intern_atoms(&[b"_NET_WM_STATE", b"_NET_WM_STATE_HIDDEN"]).unwrap()[..]
         else {
             unreachable!()
         };
+        // Never mapped, so no window manager tracks it or the window in it.
+        let parent = stand_in.generate_id().unwrap();
         stand_in
-            .send_void(xproto::change_window_attributes(
-                xwindow,
-                &ValueList::new().set(cw::OVERRIDE_REDIRECT, 1),
+            .send_void(xproto::create_window(
+                0,
+                parent,
+                root,
+                0,
+                0,
+                1,
+                1,
+                0,
+                window_class::INPUT_OUTPUT,
+                0,
+                &ValueList::new(),
             ))
             .unwrap()
             .check()
-            .expect("the window made override-redirect");
+            .expect("the stand-in's parent window");
+        stand_in
+            .send_void(xproto::reparent_window(xwindow, parent, 0, 0))
+            .unwrap()
+            .check()
+            .expect("the window moved into the stand-in's");
         let mut rig = Rig {
             window,
             event_loop,

@@ -54,6 +54,7 @@ pub type DeclaredModes = BTreeMap<Vec<u8>, u32>;
 /// extraction-time fold ([`crate::extract::rel_bytes_under`]). On Unix that is
 /// [`crate::platform::os_str_bytes`] unchanged; on Windows a `\` can never be part of a
 /// file name, so every `\` is a separator and becomes `/`.
+#[inline]
 #[must_use]
 pub(crate) fn rel_line_bytes(rel: &Path) -> Vec<u8> {
     let raw = crate::platform::os_str_bytes(rel.as_os_str());
@@ -86,6 +87,7 @@ pub(crate) fn rel_line_bytes(rel: &Path) -> Vec<u8> {
 /// The mode slot is the inode's stored bits; on a filesystem that stores none (Windows)
 /// this folds `0` for every file and matches no signed root, so callers with the stage's
 /// declared modes use [`tree_root_declared`].
+#[inline]
 pub fn tree_root(root: &Path) -> io::Result<String> {
     tree_root_declared(root, &DeclaredModes::new())
 }
@@ -134,6 +136,7 @@ pub(crate) fn root_of_entry_lines(mut entries: Vec<Vec<u8>>) -> String {
 /// [`crate::platform::folded_mode`]'s answer, masked to `0o7777` by the caller: on Unix the
 /// bits read back (not the ones requested, so a filesystem that stores something else
 /// fails closed); on Windows the mode the extractor was asked to apply.
+#[inline]
 pub(crate) fn entry_line(rel_bytes: &[u8], mode: u32, content_sha_hex: &str) -> Vec<u8> {
     framed_line(rel_bytes, oct_mode(mode).as_bytes(), content_sha_hex)
 }
@@ -143,6 +146,7 @@ pub(crate) fn entry_line(rel_bytes: &[u8], mode: u32, content_sha_hex: &str) -> 
 pub(crate) const SYMLINK_TAG: &str = "symlink";
 
 /// Lowercase-hex SHA-256 of a symlink's raw target bytes — the digest slot of its line.
+#[inline]
 pub(crate) fn symlink_target_sha(target_bytes: &[u8]) -> String {
     sha256_bytes(target_bytes)
 }
@@ -151,6 +155,7 @@ pub(crate) fn symlink_target_sha(target_bytes: &[u8]) -> String {
 /// <lowercase-hex sha256 of the raw target bytes> 0x0A`. `target_sha_hex` comes from
 /// [`symlink_target_sha`]; both producers of the digest (the on-disk walk and the
 /// extraction-time fold in [`crate::extract`]) go through this one function.
+#[inline]
 pub(crate) fn symlink_line(rel_bytes: &[u8], target_sha_hex: &str) -> Vec<u8> {
     framed_line(rel_bytes, SYMLINK_TAG.as_bytes(), target_sha_hex)
 }
@@ -272,12 +277,14 @@ fn collect_line_names(root: &Path, dir: &Path, out: &mut Vec<Vec<u8>>) -> io::Re
 /// Render the masked permission bits in octal: minimal digits, no leading zeros, so `0`
 /// renders as `"0"` and `0o644` as `"644"`. The declared-mode record beside a build
 /// (`store::write_declared_modes`) spells its numbers the same way.
+#[inline]
 pub(crate) fn oct_mode(mode: u32) -> String {
     format!("{:o}", mode & 0o7777)
 }
 
 /// SHA-256 of bytes in memory → lowercase hex: [`sha256_file`]'s digest of a file
 /// holding exactly these bytes.
+#[inline]
 #[must_use]
 pub fn sha256_bytes(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
@@ -287,6 +294,7 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
 
 /// Streamed SHA-256 of a file's contents → lowercase hex (public producer helper: the
 /// publish pipeline computes a manifest's `sha256` with the *same* hash the client checks).
+#[inline]
 pub fn sha256_file(path: &Path) -> io::Result<String> {
     file_sha256(path)
 }
@@ -320,15 +328,18 @@ fn file_sha256_with(path: &Path, buf: &mut [u8]) -> io::Result<String> {
 pub(crate) struct BulkSha256(ring::digest::Context);
 
 impl BulkSha256 {
+    #[inline]
     pub(crate) fn new() -> Self {
         Self(ring::digest::Context::new(&ring::digest::SHA256))
     }
 
+    #[inline]
     pub(crate) fn update(&mut self, bytes: &[u8]) {
         self.0.update(bytes);
     }
 
     /// The digest as lowercase hex.
+    #[inline]
     pub(crate) fn finalize_hex(self) -> String {
         aterm_codec::hex::encode_lower(self.0.finish().as_ref())
     }

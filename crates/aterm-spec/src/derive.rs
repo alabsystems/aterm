@@ -190,61 +190,80 @@ pub enum Expr {
 }
 
 /// Convenience constructors (keep model definitions terse).
-pub fn int(i: i64) -> Expr {
+#[inline]
+pub const fn int(i: i64) -> Expr {
     Expr::Int(i)
 }
-pub fn var(n: &'static str) -> Expr {
+#[inline]
+pub const fn var(n: &'static str) -> Expr {
     Expr::Var(n)
 }
-pub fn cst(n: &'static str) -> Expr {
+#[inline]
+pub const fn cst(n: &'static str) -> Expr {
     Expr::ConstRef(n)
 }
+#[inline]
 pub fn add(a: Expr, b: Expr) -> Expr {
     Expr::Add(Box::new(a), Box::new(b))
 }
+#[inline]
 pub fn sub(a: Expr, b: Expr) -> Expr {
     Expr::Sub(Box::new(a), Box::new(b))
 }
+#[inline]
 pub fn gt(a: Expr, b: Expr) -> Expr {
     Expr::Gt(Box::new(a), Box::new(b))
 }
+#[inline]
 pub fn le(a: Expr, b: Expr) -> Expr {
     Expr::Le(Box::new(a), Box::new(b))
 }
+#[inline]
 pub fn eq(a: Expr, b: Expr) -> Expr {
     Expr::Eq(Box::new(a), Box::new(b))
 }
+#[inline]
 pub fn or_(a: Expr, b: Expr) -> Expr {
     Expr::Or(Box::new(a), Box::new(b))
 }
+#[inline]
 pub fn and_(a: Expr, b: Expr) -> Expr {
     Expr::And(Box::new(a), Box::new(b))
 }
+#[inline]
 pub fn if_(c: Expr, a: Expr, b: Expr) -> Expr {
     Expr::If(Box::new(c), Box::new(a), Box::new(b))
 }
+#[inline]
 pub fn iff(a: Expr, b: Expr) -> Expr {
     Expr::Iff(Box::new(a), Box::new(b))
 }
+#[inline]
 pub fn forall(idx: &'static str, lo: Expr, hi: Expr, body: Expr) -> Expr {
     Expr::Forall(idx, Box::new(lo), Box::new(hi), Box::new(body))
 }
+#[inline]
 pub fn fn_access(f: &'static str, index: Expr) -> Expr {
     Expr::FnAccess(f, Box::new(index))
 }
+#[inline]
 pub fn except(f: &'static str, index: Expr, value: Expr) -> Expr {
     Expr::Except(f, Box::new(index), Box::new(value))
 }
+#[inline]
 pub fn comprehension(idx: &'static str, lo: Expr, hi: Expr, body: Expr) -> Expr {
     Expr::Comprehension(idx, Box::new(lo), Box::new(hi), Box::new(body))
 }
-pub fn bool_lit(b: bool) -> Expr {
+#[inline]
+pub const fn bool_lit(b: bool) -> Expr {
     Expr::Bool(b)
 }
+#[inline]
 pub fn neq(a: Expr, b: Expr) -> Expr {
     Expr::Neq(Box::new(a), Box::new(b))
 }
 /// `lo..hi`, the nondeterministic update RHS ([`Expr::InRange`]).
+#[inline]
 pub fn in_range(lo: Expr, hi: Expr) -> Expr {
     Expr::InRange(Box::new(lo), Box::new(hi))
 }

@@ -109,6 +109,7 @@ pub struct Program {
 impl Program {
     /// Whether the signed row names the retired `requires` relation; the install door and the
     /// update pass both refuse such a program ([`crate::FlowError::RequiresRetired`]).
+    #[inline]
     #[must_use]
     pub fn names_requires(&self) -> bool {
         !self.requires.is_empty()
@@ -157,6 +158,7 @@ impl Channel {
     /// Every floor comparison goes through here ([`crate::gate::decide`],
     /// [`crate::gate::current_build_ok`], [`crate::flow::rollback`]'s target predicate): a
     /// build number is comparable only to another build of the same program.
+    #[inline]
     #[must_use]
     pub fn min_build_for(&self, program: &str) -> u64 {
         self.min_build
@@ -197,12 +199,14 @@ impl Index {
 
     /// The named program, iff the verified index names it. `None` ⇒ the repo is unreachable
     /// (R4): anything unlisted is never named, so exclusion is by construction.
+    #[inline]
     #[must_use]
     pub fn program(&self, name: &str) -> Option<&Program> {
         self.programs.get(name)
     }
 
     /// Whether `name` is a program the index names (§5): an unlisted name is not installable.
+    #[inline]
     #[must_use]
     pub fn is_program(&self, name: &str) -> bool {
         self.programs.contains_key(name)
@@ -382,6 +386,7 @@ impl Artifact {
     /// The signed digest that gates this row's download: whichever one of `sha256` and
     /// `sha512` it sets ([`one_digest`]). `None` (which no file matches) when it sets neither
     /// or both.
+    #[inline]
     #[must_use]
     pub fn digest(&self) -> Option<(DigestAlg, &str)> {
         one_digest(&self.sha256, &self.sha512)
@@ -399,6 +404,7 @@ pub enum DigestAlg {
 
 impl DigestAlg {
     /// The key a digest of this algorithm is spelled under (`sha256 = …`, `sha512=…`).
+    #[inline]
     #[must_use]
     pub const fn key(self) -> &'static str {
         match self {
@@ -408,6 +414,7 @@ impl DigestAlg {
     }
 
     /// Whether `hex` is one digest of this algorithm, in lowercase hex.
+    #[inline]
     #[must_use]
     pub fn is_lower_hex(self, hex: &str) -> bool {
         let len = match self {
@@ -419,6 +426,7 @@ impl DigestAlg {
 }
 
 impl std::fmt::Display for DigestAlg {
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.key())
     }
@@ -427,6 +435,7 @@ impl std::fmt::Display for DigestAlg {
 /// The one digest a `sha256`/`sha512` pair names (a signed row's, a log entry's, a record's):
 /// `(algorithm, value)` when exactly one is non-empty, `None` otherwise. The value is as
 /// written; its shape is the caller's check.
+#[inline]
 #[must_use]
 pub fn one_digest<'a>(sha256: &'a str, sha512: &'a str) -> Option<(DigestAlg, &'a str)> {
     match (sha256.is_empty(), sha512.is_empty()) {
@@ -516,12 +525,14 @@ impl PkgManifest {
     /// The admitted shim environment ([`crate::shim_env::ShimEnv`]). [`parse_pkg`] already
     /// refused a list that breaks the rule; a hand-built manifest's bad list reads as no
     /// environment.
+    #[inline]
     #[must_use]
     pub fn shim_env(&self) -> crate::shim_env::ShimEnv {
         crate::shim_env::ShimEnv::admit(&self.shim_env).unwrap_or_default()
     }
 
     /// The artifact for `target`, if this build ships one. `None` is the clean skip (§6).
+    #[inline]
     #[must_use]
     pub fn artifact_for(&self, target: &str) -> Option<&Artifact> {
         self.artifacts.iter().find(|a| a.target == target)
@@ -529,6 +540,7 @@ impl PkgManifest {
 
     /// Whether the signed `program` field is `name`: the anti-replay bind (§4.2). A manifest
     /// signed for program A must be refused when fetched as B, so fail closed on `false`.
+    #[inline]
     #[must_use]
     pub fn is_for(&self, name: &str) -> bool {
         self.program == name

@@ -1172,4 +1172,41 @@ mod appearance_source {
         assert_eq!(field(&record, "theme_side"), Some("-"), "{record}");
         assert_eq!(field(&record, "reported_scheme"), Some("dark"), "{record}");
     }
+
+    /// Linux `window_theme = "auto"`: the variant the window's chrome takes
+    /// (`chrome_theme_for_apprt`, X11's `_GTK_THEME_VARIANT` and the Wayland
+    /// header) follows an OS light/dark flip through the side of a split
+    /// `theme` it draws, and a single theme keeps its own side whatever the OS
+    /// shows: the title bar matches the terminal under it, the Windows caption's
+    /// rule (`platform_win::resolve_chrome_theme`) and what macOS's transparent
+    /// title bar shows. The window layer never gets `Auto` on Linux. Negative
+    /// control: the dark reading takes the chrome back to dark.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_auto_chrome_follows_the_os_through_the_theme_it_draws() {
+        let mut app = App::headless_for_test();
+        app.config = aterm_toml::from_str(SPLIT).expect("toml");
+        app.window_theme = app.config.window_theme_or_default();
+        assert_eq!(app.window_theme, WindowTheme::Auto, "the default chrome");
+        app.install_resolved_colors(super::ThemeChange::ConfigReload);
+        assert_eq!(app.chrome_theme_for_apprt(), WindowTheme::Dark);
+
+        app.on_os_appearance(Appearance::Light);
+        assert_eq!(
+            app.chrome_theme_for_apprt(),
+            WindowTheme::Light,
+            "a light desktop draws the light side, and its title bar"
+        );
+        app.on_os_appearance(Appearance::Dark);
+        assert_eq!(app.chrome_theme_for_apprt(), WindowTheme::Dark);
+
+        app.config = aterm_toml::from_str("theme = \"Dracula\"\n").expect("toml");
+        app.install_resolved_colors(super::ThemeChange::ConfigReload);
+        app.on_os_appearance(Appearance::Light);
+        assert_eq!(
+            app.chrome_theme_for_apprt(),
+            WindowTheme::Dark,
+            "a dark theme on a light desktop keeps a dark title bar over it"
+        );
+    }
 }

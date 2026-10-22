@@ -77,6 +77,10 @@ clean {
     -- 3. TLA+ Protocol Specification: Fabric Receipts & Deadlines (R8)
     --    Directly over `UInt64` timestamps, `_root_.monotone_clock_tick`, and
     --    `deadline_elapsed_isl`
+    --    SCOPE: one request whose deadline is an ABSOLUTE `dlMs` on the clock
+    --    that stamps `btMs`. The bus's deadline is a RELATIVE `dl=` the asker's
+    --    bridge judges on its own clock, and no record carries that instant or a
+    --    `bt=`, so this model does not cover it (receipt.rs, `V1Receipt`).
     -- ========================================================================
     namespace Astream
     namespace Wire

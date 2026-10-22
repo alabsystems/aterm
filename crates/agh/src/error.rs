@@ -70,6 +70,7 @@ impl Kind {
     ];
 
     /// 1 to 15 in declaration order; `Interrupted` is 130.
+    #[inline]
     #[must_use]
     pub const fn exit(self) -> u8 {
         match self {
@@ -95,6 +96,7 @@ impl Kind {
     /// `refused`, `usage`, `could_not_run`, `unauthenticated`, `forbidden`, `not_found`,
     /// `not_visible`, `pending`, `conflict`, `invalid`, `rate_limited`, `server`,
     /// `outcome_unknown`, `incomplete`, `failed`, `interrupted`.
+    #[inline]
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
@@ -118,6 +120,7 @@ impl Kind {
     }
 
     /// The meaning column of the exit table.
+    #[inline]
     #[must_use]
     pub const fn meaning(self) -> &'static str {
         match self {
@@ -143,6 +146,7 @@ impl Kind {
     }
 
     /// The next-action column of the exit table.
+    #[inline]
     #[must_use]
     pub const fn next_action(self) -> &'static str {
         match self {
@@ -173,6 +177,7 @@ impl Kind {
 
     /// True for CouldNotRun, Pending, RateLimited, Server and OutcomeUnknown (exits 3, 8, 11,
     /// 12, 13).
+    #[inline]
     #[must_use]
     pub const fn retriable(self) -> bool {
         matches!(
@@ -187,6 +192,7 @@ impl Kind {
 
     /// The gh dialect's exit (M4): Unauthenticated → 4; Pending → 8 when `pending_is_8`, else
     /// 1; Interrupted → 2; every other kind → 1.
+    #[inline]
     #[must_use]
     pub const fn gh_exit(self, pending_is_8: bool) -> u8 {
         match self {
@@ -199,6 +205,7 @@ impl Kind {
 }
 
 impl std::fmt::Display for Kind {
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.slug())
     }
@@ -249,6 +256,7 @@ pub enum SideEffect {
 
 impl SideEffect {
     /// `none`, `unknown`, `applied`.
+    #[inline]
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
@@ -289,6 +297,7 @@ pub enum Forbid {
 impl Forbid {
     /// `forbid.permission`, `forbid.sso`, `forbid.no_push`, `forbid.drafts_unproven`,
     /// `forbid.blocked`, `forbid.other`.
+    #[inline]
     #[must_use]
     pub const fn slug(&self) -> &'static str {
         match self {
@@ -339,6 +348,7 @@ pub enum Replay {
 impl Replay {
     /// `exhausted`, `kind`, `path`, `door`, `request`, `output`, `unrecorded`, `argv`,
     /// `unconsumed`, `body_not_taped`, `stream_not_taped`, `format`.
+    #[inline]
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
@@ -360,8 +370,9 @@ impl Replay {
     /// The variant for astream's divergence: `Exhausted`, `KindMismatch`, `PathDiverged`,
     /// `DoorDiverged`, `RequestDiverged`, `OutputDiverged` and `Unrecorded` one to one,
     /// `Unreached{..}` → `Unconsumed`.
+    #[inline]
     #[must_use]
-    pub fn of(divergence: &astream_effects::ReplayDivergence) -> Replay {
+    pub const fn of(divergence: &astream_effects::ReplayDivergence) -> Replay {
         use astream_effects::ReplayDivergence as D;
         match divergence {
             D::Exhausted { .. } => Replay::Exhausted,
@@ -635,6 +646,7 @@ pub enum IdentityRef {
 
 impl IdentityRef {
     /// The profile's name, or `anonymous`.
+    #[inline]
     #[must_use]
     pub fn label(&self) -> &str {
         match self {
@@ -644,6 +656,7 @@ impl IdentityRef {
     }
 
     /// The profile's fingerprint; `None` when anonymous.
+    #[inline]
     #[must_use]
     pub fn fingerprint(&self) -> Option<&str> {
         match self {
@@ -688,18 +701,21 @@ pub struct Error(Box<ErrorData>);
 impl std::ops::Deref for Error {
     type Target = ErrorData;
 
+    #[inline]
     fn deref(&self) -> &ErrorData {
         &self.0
     }
 }
 
 impl std::ops::DerefMut for Error {
+    #[inline]
     fn deref_mut(&mut self) -> &mut ErrorData {
         &mut self.0
     }
 }
 
 impl From<ErrorData> for Error {
+    #[inline]
     fn from(data: ErrorData) -> Error {
         Error(Box::new(data))
     }
@@ -757,27 +773,32 @@ impl Error {
     }
 
     /// The data, unboxed.
+    #[inline]
     #[must_use]
     pub fn into_data(self) -> ErrorData {
         *self.0
     }
 
     /// A Refused error.
+    #[inline]
     pub fn refused(why: impl Into<String>) -> Error {
         Error::new(Kind::Refused, why)
     }
 
     /// A Usage error.
+    #[inline]
     pub fn usage(why: impl Into<String>) -> Error {
         Error::new(Kind::Usage, why)
     }
 
     /// A CouldNotRun error.
+    #[inline]
     pub fn could_not_run(why: impl Into<String>) -> Error {
         Error::new(Kind::CouldNotRun, why)
     }
 
     /// A CouldNotRun `Sub::Protocol` error: an answer outside what agh reads.
+    #[inline]
     pub(crate) fn protocol(why: impl Into<String>) -> Error {
         Error::could_not_run(why).with_sub(Sub::Protocol)
     }

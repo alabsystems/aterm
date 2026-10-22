@@ -334,11 +334,17 @@ impl CompanionFootprint {
     /// Is the cat rect `(x, w, top..bottom)` stacked on any companion rect?
     #[inline]
     #[must_use]
-    pub(crate) fn stacked_on(&self, x: i32, w: i32, top: i32, bottom: i32) -> bool {
-        self.rects
-            .iter()
-            .flatten()
-            .any(|rect| cat_is_stacked_on(*rect, x, w, top, bottom))
+    pub(crate) const fn stacked_on(&self, x: i32, w: i32, top: i32, bottom: i32) -> bool {
+        let mut i = 0;
+        while i < self.rects.len() {
+            if let Some(rect) = self.rects[i]
+                && cat_is_stacked_on(rect, x, w, top, bottom)
+            {
+                return true;
+            }
+            i += 1;
+        }
+        false
     }
 }
 
@@ -622,7 +628,7 @@ impl DecoConfig {
 /// SelfGlow, Emphasis = TwoTone. TwoTone defaults carry the class base pair and
 /// are genome-hue-nudged at emission (custom TwoTone colors apply raw, see
 /// `Occurrence::custom`).
-fn class_default_spec(class: Class, cfg: &DecoConfig) -> WordEffectSpec {
+const fn class_default_spec(class: Class, cfg: &DecoConfig) -> WordEffectSpec {
     match class {
         Class::Profanity => WordEffectSpec {
             graphic: None,
@@ -641,7 +647,11 @@ fn class_default_spec(class: Class, cfg: &DecoConfig) -> WordEffectSpec {
             burst: Some(match cfg.profanity_style {
                 ProfanityStyle::Rainbow => BurstSpec {
                     kind: BurstKind::SuperNova,
-                    chance_pct: cfg.supernova_chance.min(100),
+                    chance_pct: if cfg.supernova_chance < 100 {
+                        cfg.supernova_chance
+                    } else {
+                        100
+                    },
                 },
                 ProfanityStyle::Nova => BurstSpec {
                     kind: BurstKind::Nova,
@@ -7977,18 +7987,23 @@ struct CatTick<'a> {
 /// up from a few rows below grazes the caret's row by ~5 %, while a genuine
 /// stack covers most of the sprite. A third separates the two.
 #[inline]
-fn cat_is_stacked_on(a: (i32, i32, i32, i32), x: i32, w: i32, top: i32, bottom: i32) -> bool {
+const fn cat_is_stacked_on(a: (i32, i32, i32, i32), x: i32, w: i32, top: i32, bottom: i32) -> bool {
     let (x0, x1, y0, y1) = a;
-    let iw = (x + w).min(x1) - x.max(x0);
-    let ih = bottom.min(y1) - top.max(y0);
+    let right = x + w;
+    let ix1 = if right < x1 { right } else { x1 };
+    let ix0 = if x > x0 { x } else { x0 };
+    let iy1 = if bottom < y1 { bottom } else { y1 };
+    let iy0 = if top > y0 { top } else { y0 };
+    let iw = ix1 - ix0;
+    let ih = iy1 - iy0;
     if iw <= 0 || ih <= 0 {
         return false;
     }
-    let cat_area = i64::from(w) * i64::from(bottom - top);
+    let cat_area = (w as i64) * ((bottom - top) as i64);
     if cat_area <= 0 {
         return false;
     }
-    i64::from(iw) * i64::from(ih) * 3 >= cat_area
+    (iw as i64) * (ih as i64) * 3 >= cat_area
 }
 
 /// v3 §1.2: the episode-backed view of one feline occurrence's peek state,
@@ -8426,7 +8441,7 @@ fn feline_glow_env(t_ms: u64, window_ms: u64, amp: f32) -> f32 {
 /// §4.2 specular lobe at gradient position `u` for sweep center `center`:
 /// `smoothstep(1 − min(1, |u − center|/0.28))²` — 28% wide, 0 outside.
 #[inline]
-fn spec_lobe(u: f32, center: f32) -> f32 {
+const fn spec_lobe(u: f32, center: f32) -> f32 {
     let d = (u - center).abs() / 0.28;
     if d >= 1.0 {
         return 0.0;
@@ -8827,17 +8842,12 @@ fn emit_rainbow_sparkles(
 /// Fold an ink cell's visible fields into the frame fingerprint (FNV-1a chain,
 /// the `fold_deco` sibling).
 #[inline]
-pub(crate) fn fold_ink(mut h: u64, c: &InkCell) -> u64 {
-    for x in [
-        u64::from(c.row),
-        u64::from(c.col),
-        u64::from(c.color[0]),
-        u64::from(c.color[1]),
-        u64::from(c.color[2]),
-    ] {
-        h = fnv_mix_u64(h, x);
-    }
-    h
+pub(crate) const fn fold_ink(mut h: u64, c: &InkCell) -> u64 {
+    h = fnv_mix_u64(h, c.row as u64);
+    h = fnv_mix_u64(h, c.col as u64);
+    h = fnv_mix_u64(h, c.color[0] as u64);
+    h = fnv_mix_u64(h, c.color[1] as u64);
+    fnv_mix_u64(h, c.color[2] as u64)
 }
 
 /// Scale a `0x00RRGGBB` colour's channels by `f` (the §6.1 dip envelope).
@@ -9191,12 +9201,10 @@ fn contrast_ratio(a: u32, b: u32) -> f32 {
 /// equality independently guards every adoption, so this hash is never treated
 /// as proof that two different lexical surfaces are equal.
 #[inline]
-fn seed_of(start_col: u16, class: Class, form_hash: u64) -> u64 {
-    let mut h = FNV64_OFFSET;
-    for x in [u64::from(start_col), class_tag(class), form_hash] {
-        h = fnv_mix_u64(h, x);
-    }
-    h
+const fn seed_of(start_col: u16, class: Class, form_hash: u64) -> u64 {
+    let h = fnv_mix_u64(FNV64_OFFSET, start_col as u64);
+    let h = fnv_mix_u64(h, class_tag(class));
+    fnv_mix_u64(h, form_hash)
 }
 
 #[inline]
@@ -9228,20 +9236,15 @@ const fn glyph_id(g: DecoGlyph) -> u64 {
 
 /// Fold a decoration's visible fields into the frame fingerprint.
 #[inline]
-fn fold_deco(mut h: u64, d: &WordDecoration) -> u64 {
-    for x in [
-        u64::from(d.row),
-        u64::from(d.col),
-        u64::from(d.dx as u8),
-        u64::from(d.dy as u8),
-        u64::from(d.color),
-        u64::from(d.alpha),
-        glyph_id(d.glyph),
-        u64::from(matches!(d.blend, DecoBlend::Add)),
-    ] {
-        h = fnv_mix_u64(h, x);
-    }
-    h
+const fn fold_deco(mut h: u64, d: &WordDecoration) -> u64 {
+    h = fnv_mix_u64(h, d.row as u64);
+    h = fnv_mix_u64(h, d.col as u64);
+    h = fnv_mix_u64(h, (d.dx as u8) as u64);
+    h = fnv_mix_u64(h, (d.dy as u8) as u64);
+    h = fnv_mix_u64(h, d.color as u64);
+    h = fnv_mix_u64(h, d.alpha as u64);
+    h = fnv_mix_u64(h, glyph_id(d.glyph));
+    fnv_mix_u64(h, matches!(d.blend, DecoBlend::Add) as u64)
 }
 
 /// Fold one [`FreeSprite`] into the frame fingerprint, every field: `z` and
@@ -9249,42 +9252,32 @@ fn fold_deco(mut h: u64, d: &WordDecoration) -> u64 {
 /// early-out would swallow it), and the signed `x`/`y` as i32 bit patterns.
 /// The paired `free_atlas` version is folded once per tick.
 #[inline]
-fn fold_free(mut h: u64, s: &FreeSprite) -> u64 {
-    for x in [
-        u64::from(s.x as u32), // i32 bit pattern (signed off-grid origins)
-        u64::from(s.y as u32),
-        u64::from(s.w),
-        u64::from(s.h),
-        u64::from(s.ax),
-        u64::from(s.ay),
-        u64::from(s.aw),
-        u64::from(s.ah),
-        u64::from(s.tint),
-        u64::from(s.alpha),
-        u64::from(s.flip_x),
-        s.z as u64,
-        s.sampler as u64,
-    ] {
-        h = fnv_mix_u64(h, x);
-    }
-    h
+const fn fold_free(mut h: u64, s: &FreeSprite) -> u64 {
+    h = fnv_mix_u64(h, (s.x as u32) as u64); // i32 bit pattern (signed off-grid origins)
+    h = fnv_mix_u64(h, (s.y as u32) as u64);
+    h = fnv_mix_u64(h, s.w as u64);
+    h = fnv_mix_u64(h, s.h as u64);
+    h = fnv_mix_u64(h, s.ax as u64);
+    h = fnv_mix_u64(h, s.ay as u64);
+    h = fnv_mix_u64(h, s.aw as u64);
+    h = fnv_mix_u64(h, s.ah as u64);
+    h = fnv_mix_u64(h, s.tint as u64);
+    h = fnv_mix_u64(h, s.alpha as u64);
+    h = fnv_mix_u64(h, s.flip_x as u64);
+    h = fnv_mix_u64(h, s.z as u64);
+    fnv_mix_u64(h, s.sampler as u64)
 }
 
 /// Fold a supernova light quad's visible fields into the frame fingerprint
 /// (the `fold_free`/`fold_deco` sibling for the §6 `nova_add` stream).
 #[inline]
-fn fold_glow(mut h: u64, q: &GlowQuad) -> u64 {
-    for x in [
-        u64::from(q.row),
-        u64::from(q.x),
-        u64::from(q.y),
-        u64::from(q.w),
-        u64::from(q.h),
-        u64::from(q.color),
-    ] {
-        h = fnv_mix_u64(h, x);
-    }
-    h
+const fn fold_glow(mut h: u64, q: &GlowQuad) -> u64 {
+    h = fnv_mix_u64(h, q.row as u64);
+    h = fnv_mix_u64(h, q.x as u64);
+    h = fnv_mix_u64(h, q.y as u64);
+    h = fnv_mix_u64(h, q.w as u64);
+    h = fnv_mix_u64(h, q.h as u64);
+    fnv_mix_u64(h, q.color as u64)
 }
 
 /// Pick a sparkle colour: a palette entry if configured, else a hue rotation.

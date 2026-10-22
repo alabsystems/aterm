@@ -1566,14 +1566,14 @@ impl CompanionOwner {
     /// Accepted input intentions observed by this brain; reading does not tick.
     #[must_use]
     #[inline]
-    pub fn console_input_seq(&self) -> u64 {
+    pub const fn console_input_seq(&self) -> u64 {
         self.pet.console_input_seq()
     }
 
     /// Most recent classified input intention; no display-edit claim is implied.
     #[must_use]
     #[inline]
-    pub fn console_input_kind(&self) -> Option<PetInputKind> {
+    pub const fn console_input_kind(&self) -> Option<PetInputKind> {
         self.pet.console_input_kind()
     }
 

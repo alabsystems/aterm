@@ -69,18 +69,21 @@ impl Dirs {
     }
 
     /// `<config>/tokens`.
+    #[inline]
     #[must_use]
     pub fn tokens(&self) -> PathBuf {
         self.config.join("tokens")
     }
 
     /// `<state>/rate`.
+    #[inline]
     #[must_use]
     pub fn rate(&self) -> PathBuf {
         self.state.join("rate")
     }
 
     /// `<config>/agh.toml`.
+    #[inline]
     #[must_use]
     pub fn config_file(&self) -> PathBuf {
         self.config.join(CONFIG_FILE)
@@ -207,24 +210,28 @@ pub struct Validated {
 
 impl Validated {
     /// The profiles, by name.
+    #[inline]
     #[must_use]
     pub fn profiles(&self) -> &BTreeMap<String, Profile> {
         &self.profiles
     }
 
     /// The owners' rows, keyed by the lowercased owner name.
+    #[inline]
     #[must_use]
     pub fn owners(&self) -> &BTreeMap<String, OwnerRule> {
         &self.owners
     }
 
     /// `[default] read`.
+    #[inline]
     #[must_use]
     pub fn default_read(&self) -> &[ChainStep] {
         &self.default_read
     }
 
     /// `[targets]`, by name.
+    #[inline]
     #[must_use]
     pub fn targets(&self) -> &BTreeMap<String, Slug> {
         &self.targets
@@ -363,6 +370,7 @@ const ANONYMOUS: &str = "anonymous";
 const NONE: &str = "none";
 
 /// `[A-Za-z0-9][A-Za-z0-9-]{0,38}`: a GitHub owner name (L3).
+#[inline]
 pub(crate) fn is_owner_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     (1..=39).contains(&bytes.len())
@@ -373,6 +381,7 @@ pub(crate) fn is_owner_name(name: &str) -> bool {
 }
 
 /// `[a-z][a-z0-9-]{0,31}`: a profile or target name (L10).
+#[inline]
 pub(crate) fn is_row_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     (1..=32).contains(&bytes.len())
@@ -407,6 +416,7 @@ pub(crate) fn no_profile(name: &str, next: &str) -> crate::error::Error {
 }
 
 /// 12 lowercase hex characters: a fingerprint (`identity::fingerprint`).
+#[inline]
 fn is_fingerprint(text: &str) -> bool {
     text.len() == 12
         && text
@@ -415,6 +425,7 @@ fn is_fingerprint(text: &str) -> bool {
 }
 
 /// Whether `owner` is on the release floor, ASCII case-insensitively.
+#[inline]
 pub(crate) fn on_floor(owner: &str) -> bool {
     RELEASE_FLOOR_OWNERS
         .iter()

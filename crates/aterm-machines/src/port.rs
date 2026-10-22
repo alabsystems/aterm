@@ -1635,6 +1635,40 @@ pub fn staging_file<'s>(sys: &'s dyn System, bytes: &[u8]) -> io::Result<Staged<
 /// # Errors
 /// The underlying I/O error.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    write_atomic_flushing(
+        path,
+        bytes,
+        mode,
+        aterm_durable::durable,
+        aterm_durable::durable_dir,
+    )
+}
+
+/// [`write_atomic`] with its two flushes passed in: `file` on the payload before the rename,
+/// `dir` on the destination's directory after it. A caller's test arm passes a plain
+/// `fsync(2)` (`aterm_durable::seam::durable_fsync`) where the drive-cache barrier only holds
+/// up its suite; every other step is [`write_atomic`]'s own.
+///
+/// # Errors
+/// As [`write_atomic`].
+#[cfg(any(test, debug_assertions))]
+pub fn write_atomic_with(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    file: impl FnOnce(&std::fs::File) -> io::Result<()>,
+    dir: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    write_atomic_flushing(path, bytes, mode, file, dir)
+}
+
+fn write_atomic_flushing(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    file: impl FnOnce(&std::fs::File) -> io::Result<()>,
+    dir: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let parent = path
@@ -1656,10 +1690,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
         .open(&tmp)?;
     f.write_all(bytes)?;
     f.set_permissions(std::fs::Permissions::from_mode(mode))?;
-    aterm_durable::durable(&f)?;
+    file(&f)?;
     drop(f);
     std::fs::rename(&tmp, path)?;
-    aterm_durable::durable_dir(parent)
+    dir(parent)
 }
 
 #[cfg(test)]

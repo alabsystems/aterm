@@ -76,6 +76,13 @@ pub(crate) fn macos_kinfo(pid: std::ffi::c_int) -> Option<darwin::Kinfo> {
     macos::kinfo(pid)
 }
 
+/// The device and inode of every vnode `pid` holds open, and whether the list
+/// was cut (the build-slot reader's holder proof, `crate::slots`).
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_vnode_ids(pid: u32) -> Option<(Vec<(u32, u64)>, bool)> {
+    macos::vnode_ids(pid)
+}
+
 /// At most this many threads are read per process.
 pub const MAX_THREADS: usize = 256;
 /// At most this many descriptors are listed per process.

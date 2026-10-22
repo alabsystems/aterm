@@ -92,6 +92,7 @@ pub struct Downloaded {
 pub(crate) const PART_SUFFIX: &str = ".agh-part";
 
 /// `<dest>.agh-part`.
+#[inline]
 #[must_use]
 pub fn part_path(dest: &std::path::Path) -> std::path::PathBuf {
     let mut name = dest.as_os_str().to_os_string();
@@ -103,6 +104,7 @@ pub fn part_path(dest: &std::path::Path) -> std::path::PathBuf {
 /// of another destination, which a download of that destination removes before it starts. The
 /// case is ignored because a case-insensitive volume (APFS's default, NTFS) gives
 /// `X.AGH-PART` and `X.agh-part` one file.
+#[inline]
 #[must_use]
 pub fn is_part_name(path: &Path) -> bool {
     path.file_name().is_some_and(|name| {
@@ -115,6 +117,7 @@ pub fn is_part_name(path: &Path) -> bool {
 /// Whether `name` is one plain path component that names itself (no separator, no `.` or
 /// `..`, no root or drive prefix; on Windows no `:`, an alternate data stream's mark), so
 /// `dir.join(name)` stays in `dir`.
+#[inline]
 #[must_use]
 pub fn plain_file_name(name: &str) -> bool {
     if cfg!(windows) && name.contains(':') {

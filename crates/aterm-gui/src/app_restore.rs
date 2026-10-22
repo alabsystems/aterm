@@ -301,15 +301,45 @@ impl CarriedDraftsLedger {
 /// of `is_maximized` on every `Moved`/`Resized`); if intermediate frames do
 /// read false, the tracker needs a settle rule (commit a frame as normal only
 /// once no maximize follows it within the animation) before this flips. Until
-/// then a macOS window reopens at the frame it was showing, zoomed or not. (The Linux wiring — `note_normal_origin`
-/// on `Moved`, `note_normal_grid` at the grid commit — is likewise unrun on a
-/// Linux host; the tracker's rule is [`NormalFrame::note_origin`] /
-/// [`NormalFrame::note_grid`], tested here.)
+/// then a macOS window reopens at the frame it was showing, zoomed or not.
+///
+/// A window TILED to a screen edge or FULL SCREEN is held off its normal frame
+/// too, without being maximized ([`frame_held`]): GNOME's edge tiling
+/// (Super+Left/Right, a drag to an edge) sets `_NET_WM_STATE_MAXIMIZED_VERT`
+/// alone on X11 (`tiled_*` states on Wayland), and full screen is a state of
+/// its own, both of which `is_maximized` reads as not maximized, so the tile's
+/// half-screen frame or the screen's was recorded as the normal one and the
+/// window reopened floating at it. `WindowState::note_normal_origin` /
+/// `note_normal_grid` skip a held window, and a held window's durable capture
+/// persists its normal frame unmaximized ([`captured_frame`]): it reopens
+/// floating where it was before the tile or the full screen (re-tiling it is
+/// the window manager's, and out of reach; re-entering full screen is macOS's
+/// show state, `crate::window_show`, alone). aterm-window's
+/// `x11::held_frame_tests` drives the X11 half on a display: at every `Moved`
+/// and `Resized` a stand-in window manager's tile or full screen sends, the
+/// window reads as held, so the tracker keeps the frame from before it. The
+/// tracker's rule is [`NormalFrame::note_origin`] / [`NormalFrame::note_grid`],
+/// tested here.
 pub(crate) const TRACKS_NORMAL_FRAME: bool = !cfg!(target_os = "macos");
 
-/// A window's last NOT-maximized frame: its origin (when the platform reports
-/// one — Wayland does not) and its grid. Updated on every `Moved` and every
-/// committed grid while the window is not maximized.
+/// Whether `window` shows a frame the window manager holds rather than its
+/// normal one: maximized, tiled to a screen edge (`Window::is_tiled`), or full
+/// screen however it got there (`Window::is_shown_fullscreen`, which on X11
+/// reads the window manager's `_NET_WM_STATE_FULLSCREEN` as well as what aterm
+/// asked for). Read only where [`TRACKS_NORMAL_FRAME`]. Windows keeps the
+/// maximize alone, as it was: its capture reads the maximize and the origin
+/// together from `GetWindowPlacement`, and a full-screen window's normal
+/// placement is the one aterm-window saved when it went full screen, which that
+/// capture does not read, so holding the grid alone there would persist a
+/// normal grid at the screen's origin.
+pub(crate) fn frame_held(window: &aterm_window::window::Window) -> bool {
+    window.is_maximized() || window.is_tiled() || (!cfg!(windows) && window.is_shown_fullscreen())
+}
+
+/// A window's last NORMAL frame, the one it shows neither maximized, tiled nor
+/// full screen ([`frame_held`]): its origin (when the platform reports one —
+/// Wayland does not) and its grid. Updated on every `Moved` and every committed
+/// grid while the window is in its normal state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NormalFrame {
     pub(crate) origin: Option<(i32, i32)>,
@@ -318,39 +348,68 @@ pub(crate) struct NormalFrame {
 }
 
 impl NormalFrame {
-    /// The window moved to `origin` while showing `maximized`: only a move of
-    /// the NOT-maximized window is its normal origin (a maximize moves it to the
-    /// monitor corner, which restore-down must not return to).
-    pub(crate) fn note_origin(&mut self, maximized: bool, origin: (i32, i32)) {
-        if !maximized {
+    /// The window moved to `origin` while `held` ([`frame_held`]): only a move
+    /// of the window in its normal state is its normal origin (a maximize or a
+    /// full screen moves it to the monitor corner and a tile to a screen edge,
+    /// none of which restore-down must return to).
+    pub(crate) fn note_origin(&mut self, held: bool, origin: (i32, i32)) {
+        if !held {
             self.origin = Some(origin);
         }
     }
 
-    /// A grid of `(rows, cols)` was committed while showing `maximized`: only
-    /// the NOT-maximized window's grid is its normal one.
-    pub(crate) fn note_grid(&mut self, maximized: bool, (rows, cols): (u16, u16)) {
-        if !maximized {
+    /// A grid of `(rows, cols)` was committed while `held` ([`frame_held`]):
+    /// only the grid of the window in its normal state is its normal one.
+    pub(crate) fn note_grid(&mut self, held: bool, (rows, cols): (u16, u16)) {
+        if !held {
             self.rows = rows;
             self.cols = cols;
         }
     }
 }
 
+/// Whether a capture persists a window's NORMAL frame ([`captured_frame`]'s
+/// `held`), given the maximize it persists (`None` where no normal frame is
+/// tracked) and whether the window shows a held frame ([`frame_held`], read
+/// only when it matters). A maximized window always does: the apply side
+/// re-maximizes it. A tiled or full-screen one is not maximized, so it persists
+/// no maximize, but its frame is the window manager's: the durable capture
+/// (quit, crash journal) persists its normal frame, and it reopens floating
+/// there. A seamless update's successor carries the frame it shows, the grid
+/// its adopted shells have: it can neither re-tile the window nor (off macOS)
+/// re-enter full screen, so that frame is the one that keeps the window where
+/// it was. Windows takes its maximize from `GetWindowPlacement` and holds no
+/// other state ([`frame_held`]), so only the tests read this there.
+#[cfg(any(not(windows), test))]
+#[must_use]
+pub(crate) fn captured_hold(
+    handoff: bool,
+    maximized: Option<bool>,
+    held: impl FnOnce() -> bool,
+) -> Option<bool> {
+    match maximized {
+        Some(maximized) if !handoff => Some(maximized || held()),
+        maximized => maximized,
+    }
+}
+
 /// What a restore capture persists for one window's frame: `(origin, (rows,
-/// cols))`. A window that is showing MAXIMIZED persists its normal frame (the
-/// apply side re-maximizes it after placing that frame, so restore-down lands
-/// where the user had it); every other window persists what it is showing. A
-/// maximized window with no known normal origin persists none, letting the
-/// window manager place it, rather than the maximized frame's corner.
+/// cols))`. A window `held` off its normal frame — MAXIMIZED, or (in a durable
+/// capture) tiled to a screen edge or full screen — persists its normal frame
+/// (the apply side re-maximizes a maximized one after placing that frame, so
+/// restore-down lands where the user had it, and places a tiled or full-screen
+/// one there unmaximized); every other window persists what it is showing. A
+/// held window with no known normal origin persists none, letting the window
+/// manager place it, rather than the maximized frame's corner, the tile's edge
+/// or the screen's origin.
 #[must_use]
 pub(crate) fn captured_frame(
     live_origin: Option<(i32, i32)>,
     live_grid: (u16, u16),
-    maximized: Option<bool>,
+    held: Option<bool>,
     normal: NormalFrame,
 ) -> (Option<(i32, i32)>, (u16, u16)) {
-    if maximized == Some(true) {
+    if held == Some(true) {
         (normal.origin, (normal.rows, normal.cols))
     } else {
         (live_origin, live_grid)
@@ -568,10 +627,10 @@ impl App {
     ///
     /// This is the DURABLE capture (quit, crash journal): it carries no unsaved
     /// Settings text. It does carry each window's raw inner size
-    /// ([`restore::WindowLayout::inner_px`]) — not a maximized or full-screen
-    /// window's — so a cold restore brings every further window back at its
-    /// own grid, and at that size when it still holds the grid. The seamless
-    /// update's layout is [`Self::capture_handoff_layout`].
+    /// ([`restore::WindowLayout::inner_px`]) — not a maximized, tiled or
+    /// full-screen window's — so a cold restore brings every further window
+    /// back at its own grid, and at that size when it still holds the grid. The
+    /// seamless update's layout is [`Self::capture_handoff_layout`].
     pub(crate) fn capture_restore_manifest(&self) -> restore::RestoreManifest {
         self.capture_manifest(false)
     }
@@ -659,14 +718,15 @@ impl App {
                     }
                 };
                 // Off Windows: the show state is winit's, and a maximized
-                // window's origin is its tracked NORMAL origin
-                // (`captured_frame`). macOS captures no maximized bit by design
-                // (`TRACKS_NORMAL_FRAME`); its full-screen, minimized and stack
+                // window's origin (in the durable capture a tiled or
+                // full-screen one's too: `captured_hold`) is its tracked
+                // NORMAL origin (`captured_frame`). macOS captures no maximized
+                // bit by design (`TRACKS_NORMAL_FRAME`); its full-screen, minimized and stack
                 // state is the `show` capture below. The Unix seamless commit's topology
                 // equality normalizes the bit (`commit_layout_topology`), so a
                 // zoom during a handoff never reads as a structural change.
                 #[cfg(not(windows))]
-                let (pos, maximized) = {
+                let (pos, maximized, held) = {
                     let live = os_window
                         .and_then(|w| w.outer_position().ok())
                         .map(|p| (p.x, p.y));
@@ -675,17 +735,26 @@ impl App {
                     } else {
                         None
                     };
+                    let held = captured_hold(handoff, maximized, || {
+                        os_window.is_some_and(|w| frame_held(w))
+                    });
                     let (origin, _) =
-                        captured_frame(live, (ws.rows, ws.cols), maximized, ws.normal_frame);
+                        captured_frame(live, (ws.rows, ws.cols), held, ws.normal_frame);
                     (
                         origin.map(|(x, y)| aterm_window::dpi::PhysicalPosition::new(x, y)),
                         maximized,
+                        held,
                     )
                 };
-                // The GRID half, on every platform: a maximized window persists
-                // its normal grid, so restore-down is the size the user had.
+                // Windows reports no tile and holds no full screen
+                // ([`frame_held`]): its placement's maximize is the one held
+                // state.
+                #[cfg(windows)]
+                let held = maximized;
+                // The GRID half, on every platform: a held window persists its
+                // normal grid, so restore-down is the size the user had.
                 let (rows, cols) =
-                    captured_frame(None, (ws.rows, ws.cols), maximized, ws.normal_frame).1;
+                    captured_frame(None, (ws.rows, ws.cols), held, ws.normal_frame).1;
                 // THE macOS SHOW STATE (gap #29): full screen and minimized off
                 // the window itself — winit's full-screen state, and
                 // `isMiniaturized` through this window's own handle, reached
@@ -775,8 +844,9 @@ impl App {
                 }
                 // THE RAW INNER SIZE, for the next process to recreate this
                 // window at: an update's successor (P6 finding 4) and a cold
-                // restore alike. Never a maximized window's: its row persists
-                // the NORMAL grid, which that size does not hold. Nor, in the
+                // restore alike. Never a held window's (maximized, or in the
+                // durable capture tiled or full screen): its row persists the
+                // NORMAL grid, which that size does not hold. Nor, in the
                 // durable capture, a full-screen window's: that size is the
                 // screen's, and a cold restore brings the window back as it
                 // always has (the macOS show state re-enters full screen). An
@@ -787,7 +857,7 @@ impl App {
                 let inner_px = ws
                     .win_px
                     .filter(|size| {
-                        maximized != Some(true)
+                        held != Some(true)
                             && (handoff || !fullscreen)
                             && size.width > 0
                             && size.height > 0

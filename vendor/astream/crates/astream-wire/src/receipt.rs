@@ -1,46 +1,77 @@
-//! A header-first receipt and deadline grammar (`REQUIREMENTS` R8,
-//! `DESIGN-aterm-fabric` §4.2 `ack`, §6.4 `dl=` / `expired`), and the Clean-origin
-//! kernels it is built on:
+//! Fabric receipts (`REQUIREMENTS` R8, `DESIGN-aterm-fabric` §4.1, §4.2 `ack`, §6.4 `dl=` /
+//! `expired`): [`V1Receipt`], the view of the `ack` and `expired` records the bridges write
+//! on an `in` lane, and [`FabricReceipt`], a header-first grammar no writer emits, kept for
+//! the Clean-origin kernels it is built on.
+//!
+//! ## What is on the bus: [`V1Receipt`]
+//!
+//! A receipt on a real fabric is an `in`-lane record, `/f/<F>/in/<node>/<sid>/<src>/<kind>`,
+//! whose body is a §4.1 `v=1 key=value` line. Its KIND is that subject's last segment, never
+//! a word in the body. [`V1Receipt::decode`] reads one under the kind its subject names:
+//!
+//! ```text
+//! ack      v=1 t=<ms> re=<off> [verdict=handled|refused|deferred]
+//! expired  v=1 t=<ms> re=<off> dl=<ms>
+//! ```
+//!
+//! - `re=` is the log offset of the `ask` or `task` the record settles.
+//! - `verdict=`, on an `ack`, is what the recipient did with it, one of
+//!   [`ReceiptVerdict::ALL`]. It is OPTIONAL. The receipt a recipient's bridge writes on
+//!   `inbox seen` carries one, and so does `asb ack`'s line. A session's own
+//!   `post kind=ack re=<off>` carries none: its words are in `text=`. The asker's bridge
+//!   counts both as settling the ask, as it counts an `answer` or a `report`, so the view
+//!   reads both. A verdict-less `ack` is [`V1Receipt::Ack`] with `verdict: None`.
+//! - `dl=`, on an `expired`, is the deadline the ask carried. It is RELATIVE: a span in ms
+//!   that the asker's bridge counts from when it recorded the ask, on its own clock. It is
+//!   not an instant, so nothing here can hold it against a time.
+//! - `t=` is the SENDER's wall clock, informational ([`V1Receipt::sender_t_ms`]). No
+//!   broker stamps a time yet (R3), so there is no `bt=`.
+//!
+//! The view reads every `ack` and `expired` record the bridges write on an `in` lane. It
+//! ignores `from=` (a node's attested session), `text=` (the pct-encoded words aterm always
+//! appends), `dl=` and `via=` on an `ack`, and every key it does not know, in any order, as
+//! aterm-link's own total decoder ignores what it does not know. The line ends at the first
+//! `\n`; what follows is a `len=` raw tail, which no receipt has. It refuses a body with no
+//! `v=1` or another version, no `re=` (an `ack` posted without one settles nothing), an
+//! `ack` whose `verdict=` is not one of the three words, an `expired` without a `dl=`, a
+//! malformed number, and a field it reads given twice. It never panics.
+//!
+//! Another face's `ack` is not a receipt, and this view is not for it: the halt answer a
+//! node writes on `/f/<F>/pub/<node>/node/ack` (`v=1 t=<ms> re=<halt> state=held|ready`,
+//! §5.3) and a barrier answer on `pub/…/ack/<B>` (§5.4). The body alone does not tell them
+//! from an `in`-lane `ack` (the halt answer reads as one with no verdict), so the caller
+//! takes the kind from an `in` subject.
+//!
+//! The writers it reads, byte for byte (`what_aterm_and_asb_write_is_this_view`):
+//!
+//! ```text
+//! asb ack                 v=1 t=<ms> re=<off> verdict=<word>                 (V1Receipt::encode)
+//! aterm, on `inbox seen`  v=1 t=<ms> from=<sid> re=<off> verdict=<word> text=marked%20<word>%20by%20the%20recipient
+//! aterm, a posted `ack`   v=1 t=<ms> from=<sid> [via=<chain>] re=<off> [dl=<ms>] text=<pct>
+//! aterm, a deadline       v=1 t=<ms> re=<off> dl=<ms> text=no%20reply%20within%20<span>
+//! ```
+//!
+//! aterm keeps its own lossless decoder (`aterm-link`'s `Body::decode`, which carries what
+//! this view ignores), and its tests decode the bytes its bridge writes with this view.
+//!
+//! ## What nothing writes: [`FabricReceipt`]
 //!
 //! ```text
 //! ack re=<off> verdict=handled|refused|deferred bt=<ms>
 //! expired re=<off> dl=<ms> bt=<ms>
 //! ```
 //!
-//! - `ack`: a message at log offset `<off>` was acted upon (`handled`, `refused`, or
-//!   `deferred`) at broker timestamp `bt=<ms>`.
-//! - `expired`: the asker's deadline `dl=<ms>` passed at `bt=<ms>` (`bt >= dl`) with no
-//!   `answer`, `report`, or `ack` referencing `re=<off>`. The broker holds no timers; both
-//!   would be ordinary durable log entries.
-//!
-//! NOTHING WRITES THIS GRAMMAR. The receipts on a real fabric are §4.1 bodies — one
-//! `v=1 key=value` line, the kind in the subject's last segment, never a header word.
-//! aterm's bridge renders every body with its own codec (`aterm-link`'s `Body::encode`),
-//! which always ends in a pct-encoded `text=`, and reads them back with the same total
-//! decoder. Its receipt on `inbox seen` (`from=` the session that answered) and its
-//! `expired` verdict (`dl=` relative, as the ask carried it) are:
-//!
-//! ```text
-//! v=1 t=<ms> from=<sid> re=<off> verdict=<word> text=marked%20<word>%20by%20the%20recipient
-//! v=1 t=<ms> re=<off> dl=<ms> text=no%20reply%20within%20<span>
-//! ```
-//!
-//! `asb ack` writes the bare `v=1 t=<ms> re=<off> verdict=<word>`. [`FabricReceipt::decode`]
-//! refuses all three: its `v=1` arm reads only `t=`, `re=` and `state=` (the spelling
-//! `asb ack` has retired), so `verdict=`, `dl=`, `from=` and `text=` are each an unknown
-//! field, and a decoder taught `verdict=` would take `asb ack`'s body and still refuse both
-//! of aterm's. That arm also maps `t=` to [`FabricReceipt::bt_ms`], which contradicts R3:
-//! `t=` is the SENDER's clock, and no broker stamps a `bt=` yet (R3 is partly built). The
-//! test `what_aterm_and_asb_write_is_not_this_grammar` decodes those exact bytes and pins
-//! each fact. Owning the real §4.1 codec — the kind from the subject, `dl=` relative, no
-//! `bt=` until R3 — is deferred; until then this module is not the bus's receipt format,
-//! and no writer should be pointed at it as if it were.
+//! A header word, an ABSOLUTE `dl=`, and a broker time `bt=` that no broker stamps. No
+//! writer emits this grammar, and [`FabricReceipt::decode`] refuses every receipt on the
+//! bus: the first token of each is `v=1`, which it does not read. (Its `v=1` arm read only
+//! the `state=` spelling `asb ack` retired, and took that body's `t=`, the sender's clock,
+//! for `bt=`, which R3 says it is not; it is gone.) No writer should be pointed at this
+//! grammar as if it were the bus's.
 //!
 //! It stays because its kernels are proved and exercised: [`deadline_elapsed`] and
 //! [`monotone_clock_tick`] are Clean-origin, and `verify.clean-origin-tla-protocols`
 //! exercises them beside [`FabricReceipt::new_expired`], [`FabricReceipt::tick_clock`]
-//! and an encoded [`FabricReceipt::Ack`]. [`FabricReceipt::encode`] emits the
-//! header-first grammar only.
+//! and an encoded [`FabricReceipt::Ack`].
 //!
 //! ## Formal Verification (Embedded Clean Island + TLA+ Specification)
 //!
@@ -53,6 +84,14 @@
 //!    terminal states are mutually exclusive and immutable under clock ticks.
 //! 2. `deadline_elapsed`: kernel-certified two-language contract (`clean-kernel-defeq`)
 //!    proving `dl_ms <= bt_ms` matches `deadline_elapsed_isl`.
+//!
+//! WHAT THE MODEL DOES NOT COVER: the bus's deadlines. It judges one request whose deadline
+//! is an absolute `dlMs` on the same monotone clock that stamps `btMs`. On the bus the
+//! deadline is a relative `dl=` that the asker's bridge turns into an instant on its own
+//! clock, and no record carries that instant or a `bt=`, so neither the instant nor the
+//! check that a recorded `expired` came after it is anything this model or this module
+//! sees. The asker-judged deadline is the bridge's (aterm-link's deadline sweep, and its
+//! tests).
 
 use crate::Offset;
 use core::fmt;
@@ -90,6 +129,10 @@ pub enum ReceiptVerdict {
 }
 
 impl ReceiptVerdict {
+    /// Every verdict, in wire order: the whole vocabulary [`Self::parse_bytes`] and
+    /// [`V1Receipt::decode`] read, so a writer can hold its own list to it both ways.
+    pub const ALL: [Self; 3] = [Self::Handled, Self::Refused, Self::Deferred];
+
     /// Canonical lowercase wire token (`handled`, `refused`, `deferred`).
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -100,14 +143,16 @@ impl ReceiptVerdict {
         }
     }
 
-    /// Parse a canonical verdict byte slice (`handled`, `refused`, `deferred`).
+    /// Parse a canonical verdict byte slice: the [`Self::as_str`] of one of [`Self::ALL`].
     pub const fn parse_bytes(s: &[u8]) -> Result<Self, ReceiptError> {
-        match s {
-            b"handled" => Ok(Self::Handled),
-            b"refused" => Ok(Self::Refused),
-            b"deferred" => Ok(Self::Deferred),
-            _ => Err(ReceiptError::InvalidVerdict),
+        let mut rest: &[Self] = &Self::ALL;
+        while let &[verdict, ref tail @ ..] = rest {
+            if bytes_eq(s, verdict.as_str().as_bytes()) {
+                return Ok(verdict);
+            }
+            rest = tail;
         }
+        Err(ReceiptError::InvalidVerdict)
     }
 
     /// Parse a canonical verdict token.
@@ -125,13 +170,19 @@ impl fmt::Display for ReceiptVerdict {
 /// Why a fabric receipt or deadline-expiry body failed to parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptError {
-    /// First token was neither `ack`, `expired`, nor legacy `v=1`.
+    /// A [`FabricReceipt`]'s first token was neither `ack` nor `expired`, or the kind a
+    /// [`V1Receipt`] was read under (its subject's last segment) was neither.
     UnknownKind,
-    /// A required field (`re=`, `verdict=`, `dl=`, `bt=`) was missing or repeated.
+    /// A required field (`v=`, `re=`, `verdict=`, `dl=`, `bt=`) was missing, or a field
+    /// the decoder reads (those and `t=`) was repeated.
     MissingOrDuplicateField(&'static str),
-    /// An unknown `key=value` token appeared in the body.
+    /// An unknown `key=value` token appeared in a [`FabricReceipt`] body. (A
+    /// [`V1Receipt`] ignores one.)
     UnknownField,
-    /// A numeric field (`re=`, `dl=`, `bt=`) was not a valid unsigned 64-bit integer.
+    /// A [`V1Receipt`]'s `v=` was not `1`: a reader that does not know a body's version
+    /// does not read it.
+    UnknownVersion,
+    /// A numeric field (`t=`, `re=`, `dl=`, `bt=`) was not a valid unsigned 64-bit integer.
     InvalidNumber(&'static str),
     /// The `verdict=` value was not `handled|refused|deferred`.
     InvalidVerdict,
@@ -142,11 +193,12 @@ pub enum ReceiptError {
 impl fmt::Display for ReceiptError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownKind => write!(f, "expected 'ack' or 'expired' receipt header"),
+            Self::UnknownKind => write!(f, "expected an 'ack' or 'expired' receipt"),
             Self::MissingOrDuplicateField(k) => {
                 write!(f, "missing or duplicate receipt field '{k}'")
             }
             Self::UnknownField => write!(f, "unknown field in receipt body"),
+            Self::UnknownVersion => write!(f, "receipt body version is not v=1"),
             Self::InvalidNumber(k) => write!(f, "invalid u64 in receipt field '{k}'"),
             Self::InvalidVerdict => {
                 write!(
@@ -164,7 +216,8 @@ impl fmt::Display for ReceiptError {
 
 impl std::error::Error for ReceiptError {}
 
-/// A canonical fabric receipt or deadline-expiry record body (`REQUIREMENTS` R8).
+/// The header-first receipt grammar that NO WRITER EMITS (the module doc says why it
+/// stays). The receipts on the bus are [`V1Receipt`]s.
 #[derive(Debug, Clone, Eq)]
 pub enum FabricReceipt {
     /// `ack re=<off> verdict=handled|refused|deferred bt=<ms>`
@@ -217,6 +270,21 @@ impl PartialEq for FabricReceipt {
             (Self::Ack { .. }, Self::Expired { .. }) | (Self::Expired { .. }, Self::Ack { .. }) => {
                 false
             }
+        }
+    }
+}
+
+/// Whether `a` and `b` are the same bytes.
+const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    let (mut a, mut b) = (a, b);
+    loop {
+        match (a, b) {
+            ([], []) => return true,
+            (&[x, ref a_tail @ ..], &[y, ref b_tail @ ..]) if x == y => {
+                a = a_tail;
+                b = b_tail;
+            }
+            _ => return false,
         }
     }
 }
@@ -318,7 +386,6 @@ const fn parse_verdict_space_token(
 enum ReceiptHeaderKind {
     Ack,
     Expired,
-    LegacyV1,
 }
 
 #[derive(Clone, Copy)]
@@ -373,24 +440,6 @@ const fn parse_expired_field(rem: &[u8]) -> Result<ExpiredField<'_>, ReceiptErro
     }
 }
 
-const fn parse_legacy_v1_field(rem: &[u8]) -> Result<AckField<'_>, ReceiptError> {
-    match *rem {
-        [b'r', b'e', b'=', ref v @ ..] => match parse_u64_space_token(v, "re") {
-            Ok((val, next)) => Ok(AckField::Re(val, next)),
-            Err(e) => Err(e),
-        },
-        [b's', b't', b'a', b't', b'e', b'=', ref v @ ..] => match parse_verdict_space_token(v) {
-            Ok((val, next)) => Ok(AckField::Verdict(val, next)),
-            Err(e) => Err(e),
-        },
-        [b't', b'=', ref v @ ..] => match parse_u64_space_token(v, "bt") {
-            Ok((val, next)) => Ok(AckField::Bt(val, next)),
-            Err(e) => Err(e),
-        },
-        _ => Err(ReceiptError::UnknownField),
-    }
-}
-
 impl FabricReceipt {
     /// Advance a bridge/broker monotone clock `now_ms` by `sample_ms`
     /// (`max(now_ms, sample_ms)`), backed directly by the Clean-origin
@@ -429,7 +478,7 @@ impl FabricReceipt {
         }
     }
 
-    /// Format into the canonical `REQUIREMENTS` R8 wire string.
+    /// Format into the header-first grammar (which no writer emits).
     #[must_use]
     pub fn encode(&self) -> String {
         match self {
@@ -442,8 +491,9 @@ impl FabricReceipt {
         }
     }
 
-    /// Decode a canonical R8 receipt (`ack re=...` or `expired re=...`) or legacy
-    /// `asb ack` body (`v=1 t=... re=... state=...`) from a byte slice.
+    /// Decode a header-first `ack re=…` or `expired re=…` line from a byte slice. A `v=1`
+    /// body, which every receipt on the bus is, is [`ReceiptError::UnknownKind`] here:
+    /// read it with [`V1Receipt::decode`].
     pub const fn decode_bytes(input: &[u8]) -> Result<Self, ReceiptError> {
         let (kind, mut rest_opt) = match input {
             b"ack" => (ReceiptHeaderKind::Ack, None),
@@ -452,8 +502,6 @@ impl FabricReceipt {
             &[b'e', b'x', b'p', b'i', b'r', b'e', b'd', b' ', ref tail @ ..] => {
                 (ReceiptHeaderKind::Expired, Some(tail))
             }
-            b"v=1" => (ReceiptHeaderKind::LegacyV1, None),
-            &[b'v', b'=', b'1', b' ', ref tail @ ..] => (ReceiptHeaderKind::LegacyV1, Some(tail)),
             _ => return Err(ReceiptError::UnknownKind),
         };
         match kind {
@@ -539,52 +587,10 @@ impl FabricReceipt {
                 };
                 Self::new_expired(re, dl_ms, bt_ms)
             }
-            ReceiptHeaderKind::LegacyV1 => {
-                let mut re: Option<Offset> = None;
-                let mut verdict: Option<ReceiptVerdict> = None;
-                let mut bt_ms: Option<u64> = None;
-                while let Some(rem) = rest_opt {
-                    match parse_legacy_v1_field(rem) {
-                        Ok(AckField::Re(val, next_rest)) => {
-                            if re.is_some() {
-                                return Err(ReceiptError::MissingOrDuplicateField("re"));
-                            }
-                            re = Some(Offset(val));
-                            rest_opt = next_rest;
-                        }
-                        Ok(AckField::Verdict(val, next_rest)) => {
-                            if verdict.is_some() {
-                                return Err(ReceiptError::MissingOrDuplicateField("verdict"));
-                            }
-                            verdict = Some(val);
-                            rest_opt = next_rest;
-                        }
-                        Ok(AckField::Bt(val, next_rest)) => {
-                            if bt_ms.is_some() {
-                                return Err(ReceiptError::MissingOrDuplicateField("bt"));
-                            }
-                            bt_ms = Some(val);
-                            rest_opt = next_rest;
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                let Some(re) = re else {
-                    return Err(ReceiptError::MissingOrDuplicateField("re"));
-                };
-                let Some(verdict) = verdict else {
-                    return Err(ReceiptError::MissingOrDuplicateField("verdict"));
-                };
-                let Some(bt_ms) = bt_ms else {
-                    return Err(ReceiptError::MissingOrDuplicateField("bt"));
-                };
-                Ok(Self::Ack { re, verdict, bt_ms })
-            }
         }
     }
 
-    /// Decode a canonical R8 receipt (`ack re=...` or `expired re=...`) or legacy
-    /// `asb ack` body (`v=1 t=... re=... state=...`).
+    /// Decode a header-first `ack re=…` or `expired re=…` line ([`Self::decode_bytes`]).
     pub const fn decode(input: &str) -> Result<Self, ReceiptError> {
         Self::decode_bytes(input.as_bytes())
     }
@@ -596,9 +602,295 @@ impl fmt::Display for FabricReceipt {
     }
 }
 
+/// A receipt as the bridges write it: a §4.1 `v=1` body on an `in` lane, read under the
+/// kind its subject's last segment names. The module doc has the grammar, what the view
+/// ignores and refuses, and the writers it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum V1Receipt {
+    /// Kind `ack`: `v=1 t=<ms> re=<off> [verdict=handled|refused|deferred]`.
+    Ack {
+        /// Log offset of the `ask` or `task` the recipient settled.
+        re: Offset,
+        /// What the recipient did with it: `Some` on the receipt `inbox seen` and
+        /// `asb ack` write, `None` on a session's own `post kind=ack`, which settles the
+        /// ask with words (`text=`) and no verdict.
+        verdict: Option<ReceiptVerdict>,
+        /// The sender's wall clock (`t=`), informational, never a broker time; `None` when
+        /// the body has no `t=`.
+        sender_t_ms: Option<u64>,
+    },
+    /// Kind `expired`: `v=1 t=<ms> re=<off> dl=<ms>`.
+    Expired {
+        /// Log offset of the `ask` or `task` whose deadline passed unanswered.
+        re: Offset,
+        /// The deadline the ask carried, RELATIVE: a span in ms the asker's bridge counted
+        /// on its own clock, not an instant.
+        dl_ms: u64,
+        /// The sender's wall clock (`t=`), informational, never a broker time; `None` when
+        /// the body has no `t=`.
+        sender_t_ms: Option<u64>,
+    },
+}
+
+/// The rest of a §4.1 line after the value at the front of `bytes`: the bytes after the
+/// next ` `, or `None` at the line's end (the end of the bytes, or a `\n`).
+const fn after_value(bytes: &[u8]) -> Option<&[u8]> {
+    let mut rest = bytes;
+    while let &[b, ref tail @ ..] = rest {
+        if b == b' ' {
+            return Some(tail);
+        }
+        if b == b'\n' {
+            return None;
+        }
+        rest = tail;
+    }
+    None
+}
+
+/// Whether the value at the front of `bytes` is exactly `word`: `Some` of what follows it
+/// (as [`after_value`] answers), `None` when the value is anything else.
+const fn whole_value<'a>(bytes: &'a [u8], word: &[u8]) -> Option<Option<&'a [u8]>> {
+    let mut rest = bytes;
+    let mut want = word;
+    while let &[w, ref want_tail @ ..] = want {
+        match rest {
+            &[b, ref tail @ ..] if b == w => {
+                rest = tail;
+                want = want_tail;
+            }
+            _ => return None,
+        }
+    }
+    match rest {
+        [] | [b'\n', ..] => Some(None),
+        &[b' ', ref tail @ ..] => Some(Some(tail)),
+        _ => None,
+    }
+}
+
+/// The decimal `u64` at the front of `bytes`, and what follows it (as [`after_value`]
+/// answers). Digits only: no sign, no space, at least one, no overflow.
+const fn view_u64<'a>(
+    bytes: &'a [u8],
+    field: &'static str,
+) -> Result<(u64, Option<&'a [u8]>), ReceiptError> {
+    let mut rest = bytes;
+    let mut acc = 0u64;
+    let mut has_digit = false;
+    while let &[b, ref tail @ ..] = rest {
+        if b == b' ' || b == b'\n' {
+            if !has_digit {
+                return Err(ReceiptError::InvalidNumber(field));
+            }
+            return Ok((acc, if b == b' ' { Some(tail) } else { None }));
+        }
+        let Some(digit) = decode_decimal_digit(b) else {
+            return Err(ReceiptError::InvalidNumber(field));
+        };
+        let Some(mul) = acc.checked_mul(10) else {
+            return Err(ReceiptError::InvalidNumber(field));
+        };
+        let Some(next) = mul.checked_add(digit) else {
+            return Err(ReceiptError::InvalidNumber(field));
+        };
+        acc = next;
+        has_digit = true;
+        rest = tail;
+    }
+    if !has_digit {
+        return Err(ReceiptError::InvalidNumber(field));
+    }
+    Ok((acc, None))
+}
+
+/// The verdict word at the front of `bytes`, one of [`ReceiptVerdict::ALL`], and what
+/// follows it.
+const fn view_verdict(bytes: &[u8]) -> Result<(ReceiptVerdict, Option<&[u8]>), ReceiptError> {
+    let mut rest: &[ReceiptVerdict] = &ReceiptVerdict::ALL;
+    while let &[verdict, ref tail @ ..] = rest {
+        if let Some(next) = whole_value(bytes, verdict.as_str().as_bytes()) {
+            return Ok((verdict, next));
+        }
+        rest = tail;
+    }
+    Err(ReceiptError::InvalidVerdict)
+}
+
+impl V1Receipt {
+    /// Read a §4.1 receipt `body` under `kind`, the last segment of its subject (`ack` or
+    /// `expired`; anything else is [`ReceiptError::UnknownKind`]).
+    ///
+    /// It needs `v=1` and `re=`, and `dl=` on an `expired`; it reads an `ack`'s `verdict=`
+    /// when there is one, and keeps `t=` as [`Self::sender_t_ms`]. Every other key
+    /// (`from=`, `text=`, one it does not know, and the other kind's field) is skipped
+    /// unread, in any order, and the line ends at the first `\n`. `kind` must come from an
+    /// `in` subject: another face's `ack` (a node's halt answer) is not a receipt.
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiptError::UnknownKind`] for another kind, [`ReceiptError::UnknownVersion`] for a
+    /// `v=` other than `1`, [`ReceiptError::MissingOrDuplicateField`] for a required field
+    /// that is absent or a field it reads given twice, [`ReceiptError::InvalidNumber`] for
+    /// a malformed `t=`, `re=` or `dl=`, and [`ReceiptError::InvalidVerdict`] for a word
+    /// outside the three.
+    pub const fn decode(kind: &str, body: &[u8]) -> Result<Self, ReceiptError> {
+        let ack = match kind.as_bytes() {
+            b"ack" => true,
+            b"expired" => false,
+            _ => return Err(ReceiptError::UnknownKind),
+        };
+        let mut v1 = false;
+        let mut sender_t_ms: Option<u64> = None;
+        let mut re: Option<Offset> = None;
+        let mut verdict: Option<ReceiptVerdict> = None;
+        let mut dl_ms: Option<u64> = None;
+        let mut rest = Some(body);
+        while let Some(rem) = rest {
+            rest = match *rem {
+                [] | [b'\n', ..] => None,
+                [b' ', ref tail @ ..] => Some(tail),
+                [b'v', b'=', ref val @ ..] => {
+                    if v1 {
+                        return Err(ReceiptError::MissingOrDuplicateField("v"));
+                    }
+                    let Some(next) = whole_value(val, b"1") else {
+                        return Err(ReceiptError::UnknownVersion);
+                    };
+                    v1 = true;
+                    next
+                }
+                [b't', b'=', ref val @ ..] => {
+                    if sender_t_ms.is_some() {
+                        return Err(ReceiptError::MissingOrDuplicateField("t"));
+                    }
+                    match view_u64(val, "t") {
+                        Ok((t, next)) => {
+                            sender_t_ms = Some(t);
+                            next
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                [b'r', b'e', b'=', ref val @ ..] => {
+                    if re.is_some() {
+                        return Err(ReceiptError::MissingOrDuplicateField("re"));
+                    }
+                    match view_u64(val, "re") {
+                        Ok((off, next)) => {
+                            re = Some(Offset(off));
+                            next
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                [b'v', b'e', b'r', b'd', b'i', b'c', b't', b'=', ref val @ ..] if ack => {
+                    if verdict.is_some() {
+                        return Err(ReceiptError::MissingOrDuplicateField("verdict"));
+                    }
+                    match view_verdict(val) {
+                        Ok((word, next)) => {
+                            verdict = Some(word);
+                            next
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                [b'd', b'l', b'=', ref val @ ..] if !ack => {
+                    if dl_ms.is_some() {
+                        return Err(ReceiptError::MissingOrDuplicateField("dl"));
+                    }
+                    match view_u64(val, "dl") {
+                        Ok((dl, next)) => {
+                            dl_ms = Some(dl);
+                            next
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                _ => after_value(rem),
+            };
+        }
+        if !v1 {
+            return Err(ReceiptError::MissingOrDuplicateField("v"));
+        }
+        let Some(re) = re else {
+            return Err(ReceiptError::MissingOrDuplicateField("re"));
+        };
+        if ack {
+            Ok(Self::Ack {
+                re,
+                verdict,
+                sender_t_ms,
+            })
+        } else {
+            let Some(dl_ms) = dl_ms else {
+                return Err(ReceiptError::MissingOrDuplicateField("dl"));
+            };
+            Ok(Self::Expired {
+                re,
+                dl_ms,
+                sender_t_ms,
+            })
+        }
+    }
+
+    /// The bare line, every field the view reads and nothing else:
+    /// `v=1 t=<ms> re=<off> verdict=<word>` for an `ack` (what `asb ack` writes), with no
+    /// `verdict=` when there is none, and `v=1 t=<ms> re=<off> dl=<ms>` for an `expired`,
+    /// with no `t=` when there is no [`Self::sender_t_ms`]. [`Self::decode`] under
+    /// [`Self::kind`] gives `self` back.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let t = match self.sender_t_ms() {
+            Some(t) => format!(" t={t}"),
+            None => String::new(),
+        };
+        match self {
+            Self::Ack { re, verdict, .. } => match verdict {
+                Some(verdict) => format!("v=1{t} re={} verdict={}", re.0, verdict.as_str()),
+                None => format!("v=1{t} re={}", re.0),
+            },
+            Self::Expired { re, dl_ms, .. } => format!("v=1{t} re={} dl={dl_ms}", re.0),
+        }
+    }
+
+    /// The subject's last segment this receipt is published under: `ack` or `expired`.
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Ack { .. } => "ack",
+            Self::Expired { .. } => "expired",
+        }
+    }
+
+    /// The offset of the `ask` or `task` the receipt settles (`re=`).
+    #[must_use]
+    pub const fn re(&self) -> Offset {
+        match self {
+            Self::Ack { re, .. } | Self::Expired { re, .. } => *re,
+        }
+    }
+
+    /// The sender's wall clock (`t=`), informational: no broker stamps a time yet (R3).
+    #[must_use]
+    pub const fn sender_t_ms(&self) -> Option<u64> {
+        match self {
+            Self::Ack { sender_t_ms, .. } | Self::Expired { sender_t_ms, .. } => *sender_t_ms,
+        }
+    }
+}
+
+impl fmt::Display for V1Receipt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.encode())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn r8_ack_and_expired_grammar_conformance() {
@@ -642,28 +934,12 @@ mod tests {
                 bt_ms: 1_700_000_004_999,
             })
         );
-
-        // The retired `asb ack` spelling (`state=`) decodes into `FabricReceipt::Ack`,
-        // its sender's `t=` read as `bt_ms` (the module doc says why that is wrong).
-        let legacy = "v=1 t=1700000000999 re=7 state=handled";
-        assert_eq!(
-            FabricReceipt::decode(legacy).unwrap(),
-            FabricReceipt::Ack {
-                re: Offset(7),
-                verdict: ReceiptVerdict::Handled,
-                bt_ms: 1_700_000_000_999,
-            }
-        );
     }
 
     #[test]
     fn rejects_malformed_receipts() {
-        // Ordinary canonical/legacy records and CR/LF endings remain valid.
-        let valid = [
-            "ack re=1 verdict=handled bt=10",
-            "expired bt=10 re=1 dl=9",
-            "v=1 t=10 re=1 state=deferred",
-        ];
+        // Header-first records and CR/LF endings remain valid.
+        let valid = ["ack re=1 verdict=handled bt=10", "expired bt=10 re=1 dl=9"];
         for wire in valid {
             let expected = FabricReceipt::decode(wire).unwrap();
             for ending in ["", "\n", "\r\n", "\r\n\r"] {
@@ -677,6 +953,12 @@ mod tests {
         }
         assert_eq!(
             FabricReceipt::decode("unknown re=1"),
+            Err(ReceiptError::UnknownKind)
+        );
+        // The `v=1` arm is retired: the spelling `asb ack` used to write (`state=`) is
+        // no header-first record either, and its sender `t=` is no longer read as `bt=`.
+        assert_eq!(
+            FabricReceipt::decode("v=1 t=10 re=1 state=deferred"),
             Err(ReceiptError::UnknownKind)
         );
         assert_eq!(
@@ -708,54 +990,317 @@ mod tests {
         }
     }
 
-    /// WHAT THE MODULE DOC SAYS OF THE BUS, PINNED ON THE WRITERS' OWN BYTES. aterm's
-    /// bridge renders a receipt and an `expired` verdict through `aterm-link`'s
-    /// `Body::encode` — `from=` on a receipt, and a pct-encoded `text=` on both, always —
-    /// and `asb ack` (asb.rs `cmd_ack`) writes the bare `v=1 t= re= verdict=` line. All
-    /// three are refused. The receipt's `verdict=` is not the only reason: spelled with
-    /// the retired `state=` it is still refused, on `from=` alone and on `text=` alone,
-    /// while the same line without those two decodes (the negative control). So a
-    /// decoder taught `verdict=` decodes `asb ack`'s line and still refuses aterm's, and
-    /// this test says which. The control also shows the retired spelling reading the
-    /// SENDER's `t=` as `bt_ms`, the R3 contradiction the module doc names. Any change
-    /// that makes one of these lines decode owes the module doc, `REQUIREMENTS` R8 and
-    /// the `wire.cut.consistent-lattice` claim a rewrite naming that line, and only the
-    /// two aterm lines here can show that aterm's receipts decode.
+    /// The bytes `asb ack` (asb.rs `cmd_ack`) and aterm's bridge (`aterm-link`'s
+    /// `Body::encode`: `from=` on a receipt, a pct-encoded `text=` on both) write.
+    const ASB_ACK: &str = "v=1 t=1700000000999 re=7 verdict=handled";
+    const ATERM_RECEIPT: &str = "v=1 t=1700000000999 from=s-host re=41 verdict=handled \
+                                 text=marked%20handled%20by%20the%20recipient";
+    const ATERM_EXPIRED: &str =
+        "v=1 t=1700000000999 re=7 dl=240000 text=no%20reply%20within%20240%20s";
+    /// A session's own `post to=<asker> kind=ack re=41 text=got it`, as aterm's bridge
+    /// publishes it on the asker's `…/ack` lane (`drain_post`): no `verdict=`.
+    const ATERM_POSTED_ACK: &str = "v=1 t=1700000000999 from=s-b re=41 text=got%20it";
+
+    /// WHAT THE MODULE DOC SAYS OF THE BUS, PINNED ON THE WRITERS' OWN BYTES. Each of
+    /// the four lines decodes under the kind its subject names, field for field: `re=`,
+    /// the verdict (none on a session's own posted `ack`) or the RELATIVE `dl=`, and `t=`
+    /// as the sender's clock. `asb ack`'s line is exactly what [`V1Receipt::encode`]
+    /// writes. [`FabricReceipt`] refuses all four (the header-first grammar is not the
+    /// bus's). aterm's own tests decode its bridge's real bytes with this view; these
+    /// copies say what the view reads, not that aterm still writes them.
     #[test]
-    fn what_aterm_and_asb_write_is_not_this_grammar() {
-        const ASB_ACK: &str = "v=1 t=1700000000999 re=7 verdict=handled";
-        const ATERM_RECEIPT: &str = "v=1 t=1700000000999 from=s-host re=41 verdict=handled \
-                                     text=marked%20handled%20by%20the%20recipient";
-        const ATERM_EXPIRED: &str =
-            "v=1 t=1700000000999 re=7 dl=240000 text=no%20reply%20within%20240%20s";
-        for wire in [ASB_ACK, ATERM_RECEIPT, ATERM_EXPIRED] {
+    fn what_aterm_and_asb_write_is_this_view() {
+        let asb = V1Receipt::Ack {
+            re: Offset(7),
+            verdict: Some(ReceiptVerdict::Handled),
+            sender_t_ms: Some(1_700_000_000_999),
+        };
+        assert_eq!(V1Receipt::decode("ack", ASB_ACK.as_bytes()), Ok(asb));
+        assert_eq!(asb.encode(), ASB_ACK, "asb ack writes the view's bare line");
+        assert_eq!(asb.kind(), "ack");
+
+        let receipt = V1Receipt::decode("ack", ATERM_RECEIPT.as_bytes()).expect("aterm's receipt");
+        assert_eq!(
+            receipt,
+            V1Receipt::Ack {
+                re: Offset(41),
+                verdict: Some(ReceiptVerdict::Handled),
+                sender_t_ms: Some(1_700_000_000_999),
+            }
+        );
+        assert_eq!(receipt.re(), Offset(41));
+
+        // A session's own `post kind=ack re=41`: it settles ask 41 for aterm's asker, so
+        // the view reads it, with no verdict.
+        let posted =
+            V1Receipt::decode("ack", ATERM_POSTED_ACK.as_bytes()).expect("aterm's posted ack");
+        assert_eq!(
+            posted,
+            V1Receipt::Ack {
+                re: Offset(41),
+                verdict: None,
+                sender_t_ms: Some(1_700_000_000_999),
+            }
+        );
+        assert_eq!(posted.encode(), "v=1 t=1700000000999 re=41");
+
+        let expired =
+            V1Receipt::decode("expired", ATERM_EXPIRED.as_bytes()).expect("aterm's verdict");
+        assert_eq!(
+            expired,
+            V1Receipt::Expired {
+                re: Offset(7),
+                dl_ms: 240_000,
+                sender_t_ms: Some(1_700_000_000_999),
+            }
+        );
+        assert_eq!(expired.kind(), "expired");
+        assert_eq!(expired.sender_t_ms(), Some(1_700_000_000_999));
+
+        for wire in [ASB_ACK, ATERM_RECEIPT, ATERM_POSTED_ACK, ATERM_EXPIRED] {
             assert_eq!(
                 FabricReceipt::decode(wire),
-                Err(ReceiptError::UnknownField),
+                Err(ReceiptError::UnknownKind),
                 "{wire:?}"
             );
         }
-        // aterm's receipt with its word in the retired spelling: refused on its own
-        // `from=` and `text=`, each alone.
-        const FROM: &str = "from=s-host ";
-        const TEXT: &str = " text=marked%20handled%20by%20the%20recipient";
-        let retired_word = ATERM_RECEIPT.replace("verdict=", "state=");
-        let without_from = retired_word.replace(FROM, "");
-        let without_text = retired_word.replace(TEXT, "");
-        let bare = without_from.replace(TEXT, "");
-        for wire in [&retired_word, &without_from, &without_text] {
+    }
+
+    /// [`ReceiptVerdict::ALL`] is the vocabulary: every word in it parses back to itself
+    /// and is read by the view, the words are distinct, and nothing else is a verdict.
+    /// The match below is exhaustive: a verdict added to the enum fails to compile here,
+    /// and belongs in `ALL` at the index it is given.
+    #[test]
+    fn all_is_every_verdict_and_the_views_vocabulary() {
+        const fn index(v: ReceiptVerdict) -> usize {
+            match v {
+                ReceiptVerdict::Handled => 0,
+                ReceiptVerdict::Refused => 1,
+                ReceiptVerdict::Deferred => 2,
+            }
+        }
+        for (i, verdict) in ReceiptVerdict::ALL.into_iter().enumerate() {
+            assert_eq!(index(verdict), i, "{verdict}");
+            assert_eq!(ReceiptVerdict::parse(verdict.as_str()), Ok(verdict));
+            let body = format!("v=1 re=3 verdict={verdict}");
             assert_eq!(
-                FabricReceipt::decode(wire),
-                Err(ReceiptError::UnknownField),
-                "{wire:?}"
+                V1Receipt::decode("ack", body.as_bytes()),
+                Ok(V1Receipt::Ack {
+                    re: Offset(3),
+                    verdict: Some(verdict),
+                    sender_t_ms: None,
+                })
             );
         }
-        // Control: with neither, the retired spelling decodes, its sender clock taken
-        // for `bt=`.
-        assert_eq!(bare, "v=1 t=1700000000999 re=41 state=handled");
-        let retired = FabricReceipt::decode(&bare).expect("the retired `state=` spelling decodes");
-        assert_eq!(retired.re(), Offset(41));
-        assert_eq!(retired.bt_ms(), 1_700_000_000_999);
+        for word in ["", "handle", "handledd", "HANDLED", "cancelled"] {
+            assert_eq!(
+                ReceiptVerdict::parse(word),
+                Err(ReceiptError::InvalidVerdict),
+                "{word:?}"
+            );
+        }
+    }
+
+    /// What the view refuses, each beside the line it refuses being read (the negative
+    /// controls are the three writers' lines above, which decode).
+    #[test]
+    fn the_view_refuses_what_is_not_a_receipt() {
+        let refused = |kind: &str, body: &str| V1Receipt::decode(kind, body.as_bytes());
+        // The kind is the subject's, and only the two receipt kinds have a view.
+        for kind in ["answer", "ask", "", "ACK", "ack "] {
+            assert_eq!(
+                refused(kind, ASB_ACK),
+                Err(ReceiptError::UnknownKind),
+                "{kind:?}"
+            );
+        }
+        // The other kind's field does not stand in for this kind's: an `expired` needs its
+        // `dl=`, and an `ack`'s `dl=` is skipped unread (on an `ack` lane, an expired-shaped
+        // body is a verdict-less `ack`, as aterm's asker reads it).
+        for ack_body in [ASB_ACK, ATERM_RECEIPT, ATERM_POSTED_ACK] {
+            assert_eq!(
+                refused("expired", ack_body),
+                Err(ReceiptError::MissingOrDuplicateField("dl")),
+                "{ack_body:?}"
+            );
+        }
+        assert_eq!(
+            refused("ack", ATERM_EXPIRED),
+            Ok(V1Receipt::Ack {
+                re: Offset(7),
+                verdict: None,
+                sender_t_ms: Some(1_700_000_000_999),
+            })
+        );
+        // No `re=`: nothing to settle, with a verdict or without one (a session's
+        // `post kind=ack` with no `re=` settles no ask on aterm's side either).
+        for body in [ATERM_RECEIPT, ATERM_POSTED_ACK] {
+            let no_re = body.replace("re=41 ", "");
+            assert_eq!(
+                refused("ack", &no_re),
+                Err(ReceiptError::MissingOrDuplicateField("re")),
+                "{no_re:?}"
+            );
+        }
+        // The version is required, and only `1` is read.
+        assert_eq!(
+            refused("ack", "t=1 re=7 verdict=handled"),
+            Err(ReceiptError::MissingOrDuplicateField("v"))
+        );
+        for v in ["v=2", "v=", "v=11", "v=01", "v=1x"] {
+            let body = ASB_ACK.replacen("v=1", v, 1);
+            assert_eq!(
+                refused("ack", &body),
+                Err(ReceiptError::UnknownVersion),
+                "{body:?}"
+            );
+        }
+        // The retired spelling carries no verdict: its `state=` is skipped, and the line is
+        // a verdict-less `ack` (what aterm's asker read from it, which is why it was
+        // retired). A `verdict=` the view reads must be one of the three.
+        assert_eq!(
+            refused("ack", "v=1 t=1 re=7 state=refused"),
+            Ok(V1Receipt::Ack {
+                re: Offset(7),
+                verdict: None,
+                sender_t_ms: Some(1),
+            })
+        );
+        for word in ["maybe", "handled%20now", "Handled", "", "handledx"] {
+            let body = format!("v=1 t=1 re=7 verdict={word}");
+            assert_eq!(
+                refused("ack", &body),
+                Err(ReceiptError::InvalidVerdict),
+                "{body:?}"
+            );
+        }
+        // Numbers: digits only, in range.
+        for (body, field) in [
+            ("v=1 re=+7 verdict=handled", "re"),
+            ("v=1 re= verdict=handled", "re"),
+            ("v=1 re=7x verdict=handled", "re"),
+            ("v=1 re=18446744073709551616 verdict=handled", "re"),
+            ("v=1 t=-1 re=7 verdict=handled", "t"),
+            ("v=1 re=7 dl=4m", "dl"),
+        ] {
+            let kind = if body.contains("dl=") {
+                "expired"
+            } else {
+                "ack"
+            };
+            assert_eq!(
+                refused(kind, body),
+                Err(ReceiptError::InvalidNumber(field)),
+                "{body:?}"
+            );
+        }
+        assert_eq!(
+            refused("ack", "v=1 re=18446744073709551615 verdict=handled"),
+            Ok(V1Receipt::Ack {
+                re: Offset(u64::MAX),
+                verdict: Some(ReceiptVerdict::Handled),
+                sender_t_ms: None,
+            })
+        );
+        // A field the view reads, given twice, is ambiguous.
+        for (kind, body, field) in [
+            ("ack", "v=1 v=1 re=7 verdict=handled", "v"),
+            ("ack", "v=1 t=1 t=2 re=7 verdict=handled", "t"),
+            ("ack", "v=1 re=7 re=8 verdict=handled", "re"),
+            ("ack", "v=1 re=7 verdict=handled verdict=handled", "verdict"),
+            ("expired", "v=1 re=7 dl=1 dl=1", "dl"),
+        ] {
+            assert_eq!(
+                refused(kind, body),
+                Err(ReceiptError::MissingOrDuplicateField(field)),
+                "{body:?}"
+            );
+        }
+    }
+
+    /// What the view ignores: `from=`, `text=`, unknown keys, keys without `=`, empty
+    /// tokens and the other kind's field, in any order; the line ends at the first `\n`.
+    #[test]
+    fn the_view_ignores_what_it_does_not_read() {
+        let want = V1Receipt::Ack {
+            re: Offset(41),
+            verdict: Some(ReceiptVerdict::Deferred),
+            sender_t_ms: None,
+        };
+        for body in [
+            "v=1 re=41 verdict=deferred",
+            "text=x%20re=9 lang=en verdict=deferred from=s-a  re=41 v=1 dl=oops",
+            "bare v=1 re=41 verdict=deferred ",
+            "v=1 re=41 verdict=deferred\nre=9 verdict=refused",
+            "v=1 re=41 verdict=deferred\n",
+            "v=1 re=41 verdict=deferred text=",
+        ] {
+            assert_eq!(
+                V1Receipt::decode("ack", body.as_bytes()),
+                Ok(want),
+                "{body:?}"
+            );
+        }
+        // Past the `\n` is not the line: a field there is not read.
+        assert_eq!(
+            V1Receipt::decode("ack", b"v=1 verdict=deferred\nre=41"),
+            Err(ReceiptError::MissingOrDuplicateField("re"))
+        );
+        // `verdict=` on an `expired` is skipped unread, malformed or not.
+        assert_eq!(
+            V1Receipt::decode("expired", b"v=1 re=7 dl=9 verdict=maybe"),
+            Ok(V1Receipt::Expired {
+                re: Offset(7),
+                dl_ms: 9,
+                sender_t_ms: None,
+            })
+        );
+    }
+
+    fn any_receipt() -> impl Strategy<Value = V1Receipt> {
+        let verdict = proptest::option::of(proptest::sample::select(ReceiptVerdict::ALL.to_vec()));
+        prop_oneof![
+            (any::<u64>(), verdict, any::<Option<u64>>()).prop_map(|(re, verdict, t)| {
+                V1Receipt::Ack {
+                    re: Offset(re),
+                    verdict,
+                    sender_t_ms: t,
+                }
+            }),
+            (any::<u64>(), any::<u64>(), any::<Option<u64>>()).prop_map(|(re, dl, t)| {
+                V1Receipt::Expired {
+                    re: Offset(re),
+                    dl_ms: dl,
+                    sender_t_ms: t,
+                }
+            }),
+        ]
+    }
+
+    proptest! {
+        /// Every receipt the view can hold encodes to a line it reads back under its own
+        /// kind, with `from=` and `text=` around it as aterm writes them or not.
+        #[test]
+        fn a_receipt_round_trips_under_its_kind(r in any_receipt(), from in any::<bool>()) {
+            let line = r.encode();
+            prop_assert_eq!(V1Receipt::decode(r.kind(), line.as_bytes()), Ok(r));
+            let dressed = if from {
+                line.replacen("v=1", "v=1 from=s-x", 1) + " text=some%20words"
+            } else {
+                line + " text=some%20words"
+            };
+            prop_assert_eq!(V1Receipt::decode(r.kind(), dressed.as_bytes()), Ok(r));
+        }
+
+        /// The view is total: any bytes, under either kind, give an answer, never a panic.
+        #[test]
+        fn the_view_is_total_over_any_bytes(
+            body in proptest::collection::vec(any::<u8>(), 0..96),
+            ack in any::<bool>(),
+        ) {
+            let kind = if ack { "ack" } else { "expired" };
+            let _ = V1Receipt::decode(kind, &body);
+        }
     }
 
     #[test]

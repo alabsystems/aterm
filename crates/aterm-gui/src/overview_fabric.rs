@@ -287,6 +287,43 @@ pub(crate) struct FabricSlot {
     pub(crate) reads: u64,
 }
 
+/// Own one claimed read until it answers, fails to spawn, or unwinds. Armed
+/// before the worker is spawned, so dropping its closure also ends the read.
+/// A failure keeps the last good snapshot; the wake is posted after unlocking.
+struct ReadCompletion {
+    slot: Arc<Mutex<FabricSlot>>,
+    proxy: Option<aterm_window::event_loop::EventLoopProxy<crate::Wake>>,
+    answer: Option<Result<Arc<FabricSnapshot>, ReadFail>>,
+}
+
+impl ReadCompletion {
+    /// Finish through this owner, which publishes the answer as it drops.
+    fn complete(mut self, answer: Result<Arc<FabricSnapshot>, ReadFail>) {
+        self.answer = Some(answer);
+        drop(self);
+    }
+}
+
+impl Drop for ReadCompletion {
+    fn drop(&mut self) {
+        {
+            let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
+            slot.reading = false;
+            slot.reads = slot.reads.saturating_add(1);
+            match self.answer.take().unwrap_or(Err(ReadFail::Run)) {
+                Ok(snapshot) => {
+                    slot.snapshot = Some(snapshot);
+                    slot.error = None;
+                }
+                Err(why) => slot.error = Some(why),
+            }
+        }
+        if let Some(proxy) = &self.proxy {
+            let _ = proxy.send_event(crate::Wake::FabricRead);
+        }
+    }
+}
+
 /// The App's side of the group: the slot, and the test arms.
 #[derive(Default)]
 pub(crate) struct FabricGlance {
@@ -397,49 +434,38 @@ impl crate::App {
             return;
         }
         let glance = &self.agents.overview_fabric;
-        {
+        let completion = {
             let mut slot = glance.slot.lock().unwrap_or_else(|p| p.into_inner());
             if slot.reading {
                 return;
             }
+            let completion = ReadCompletion {
+                slot: Arc::clone(&glance.slot),
+                proxy: self.proxy.clone(),
+                answer: None,
+            };
             slot.reading = true;
-        }
-        let slot = Arc::clone(&glance.slot);
+            completion
+        };
         let runner = glance.runner();
         let clock = glance.clock();
-        let proxy = self.proxy.clone();
         self.agents.overview_fabric.kicked_at = Some(Instant::now());
         #[cfg(test)]
         {
             self.agents.overview_fabric.started += 1;
         }
-        let thread_slot = Arc::clone(&slot);
-        let spawned = crate::qos::spawn_lane_thread(
+        let _ = crate::qos::spawn_lane_thread(
             "aterm-fabric-brief",
             crate::qos::Role::Background,
             move || {
-                let answer = runner.run();
-                let parsed = answer.and_then(|json| parse(&json, now_ms(clock)));
-                {
-                    let mut slot = thread_slot.lock().unwrap_or_else(|p| p.into_inner());
-                    slot.reading = false;
-                    slot.reads += 1;
-                    match parsed {
-                        Ok(snapshot) => {
-                            slot.snapshot = Some(Arc::new(snapshot));
-                            slot.error = None;
-                        }
-                        Err(why) => slot.error = Some(why),
-                    }
-                }
-                if let Some(proxy) = proxy {
-                    let _ = proxy.send_event(crate::Wake::FabricRead);
-                }
+                completion.complete(
+                    runner
+                        .run()
+                        .and_then(|json| parse(&json, now_ms(clock)))
+                        .map(Arc::new),
+                );
             },
         );
-        if spawned.is_err() {
-            slot.lock().unwrap_or_else(|p| p.into_inner()).reading = false;
-        }
     }
 
     /// THE MINUTE'S WAKE (the event loop's `WaitUntil`, owner

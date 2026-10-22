@@ -925,7 +925,7 @@ impl GpuRenderer {
         let posted = win.measure_surface_acquire(|| gs.present(&live.dev));
         posted.map_err(|e| {
             gl_arm_note(&format!("armed present: the post failed ({e})"));
-            SurfacePresentFailure::Validation
+            e.kind
         })?;
         self.gl_maybe_inject_loss();
         Ok(())

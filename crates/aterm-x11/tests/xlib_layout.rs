@@ -104,6 +104,10 @@ fn layouts() -> Vec<Layout> {
             compat_state, grab_mods, compat_grab_mods, lookup_mods, compat_lookup_mods,
             ptr_buttons, keycode, event_type, req_major, req_minor
         }),
+        layout!(XkbBellNotifyEvent, "XkbBellNotifyEvent" {
+            type_ = "type", serial, send_event, display, time, xkb_type, device, percent, pitch,
+            duration, bell_class, bell_id, name, window, event_only
+        }),
         layout!(XkbStateRec, "XkbStateRec" {
             group, locked_group, base_group, latched_group, mods, base_mods, latched_mods,
             locked_mods, compat_state, grab_mods, compat_grab_mods, lookup_mods,
@@ -192,6 +196,7 @@ fn constants() -> Vec<(&'static str, i64)> {
         ),
         ("XkbMapNotify", i64::from(xkb_event::MAP_NOTIFY)),
         ("XkbStateNotify", i64::from(xkb_event::STATE_NOTIFY)),
+        ("XkbBellNotify", i64::from(xkb_event::BELL_NOTIFY)),
         ("XIMPreeditArea", xim_style::PREEDIT_AREA as i64),
         ("XIMPreeditCallbacks", xim_style::PREEDIT_CALLBACKS as i64),
         ("XIMPreeditPosition", xim_style::PREEDIT_POSITION as i64),

@@ -5092,7 +5092,13 @@ pub const VERBS: &[VerbSpec] = &[
          wait (cores' worth waiting for a core), gpu (%), mem (normal<warn<critical), swap \
          (bytes/s: a size unit, /s optional), decompress (/s), thrash (yes|no), tab.mem and \
          aterm.mem (a size), throttle (none<light<heavy<severe), jobs.stuck, jobs.quiet and \
-         jobs.running (counts of the target tab's jobs), or one job: `job=<id>` (or \
+         jobs.running (counts of the target tab's jobs), load (the 1-minute load average per \
+         core, a bare ratio: `load<0.5`), cores_idle (cores less the 5-minute load, c), avail \
+         (a size the machine can hand out without paging: free, inactive and purgeable, \
+         build-slot's figure), slots (build slots proven free by two reads a second apart, \
+         less those an orphaned build still fills, answering `slots=<usable>/<n>`; warming \
+         until a slot is proven either way, `why=unread_format` when no slot record \
+         parses, a record that does not parse never counted free), or one job: `job=<id>` (or \
          `task=<id>`, the agent's task id) then `<verdict>[,…]` (`done` = exited) or \
          `class=<class>[,…]`, never both (a class word given bare is `ERR usage: <word> is a \
          class`), answering `job=<id> verdict= class= [wait=] [quiet_ms=] [phi=] [exit=]`; a \

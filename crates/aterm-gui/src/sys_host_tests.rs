@@ -293,7 +293,7 @@ fn the_machine_wait_meets_refuses_times_out_and_sees_its_session_exit() {
     );
     let wait = |s: &str| match AwaitSys::parse(s).unwrap() {
         Parsed::Machine(w) => w,
-        Parsed::Volume => panic!("{s}"),
+        Parsed::Volume(_) => panic!("{s}"),
     };
     let alive = || false;
     let met = await_machine(&shared, 0, &wait("sys cpu<25% and mem=normal"), &alive);
@@ -385,7 +385,7 @@ fn the_machine_wait_meets_refuses_times_out_and_sees_its_session_exit() {
 fn machine(s: &str) -> AwaitSys {
     match AwaitSys::parse(s).unwrap() {
         Parsed::Machine(w) => w,
-        Parsed::Volume => panic!("{s} routed to the volume"),
+        Parsed::Volume(_) => panic!("{s} routed to the volume"),
     }
 }
 
@@ -530,6 +530,85 @@ fn a_machine_wait_reads_its_tab_or_with_scope_aterm_every_tab() {
     );
 }
 
+/// THE SLOTS WAIT over the snapshots the probe thread fills (`vitals_host`'s
+/// one slot reader): parked while the one slot is held, met on the snapshot
+/// that frees it (`slots=1/1`), refused where the reader could not read the
+/// slots, and `for=` held only across stamps that span it. NEGATIVE CONTROL:
+/// a free slot an orphaned build still fills (discounted) parks.
+#[test]
+fn a_slots_wait_latches_on_the_snapshot_that_frees_a_slot() {
+    use aterm_vitals::model::SlotsView;
+    let one_slot = |seq: u64, held: u16, free: u16, discounted: u16| {
+        let mut s = synthetic(seq, 0.1);
+        s.slots = Some(SlotsView::Read {
+            n: 1,
+            held,
+            free,
+            pending: 0,
+            unknown: 0,
+            discounted,
+        });
+        s
+    };
+    let wait = machine("sys slots>=1");
+    let mut w = MachineWait::default();
+    assert_eq!(w.step(&wait, &one_slot(1, 1, 0, 0), 0, &[], &[]), None);
+    assert_eq!(
+        w.step(&wait, &one_slot(2, 0, 1, 1), 0, &[], &[]),
+        None,
+        "an orphan's slot is no free one"
+    );
+    let met = w
+        .step(&wait, &one_slot(3, 0, 1, 0), 0, &[], &[])
+        .expect("the snapshot that frees the slot meets it");
+    assert!(
+        met.starts_with("OK sys slots=1/1 held_ms=0 as_of="),
+        "{met}"
+    );
+    let mut unread = synthetic(4, 0.1);
+    unread.slots = Some(SlotsView::Unread(
+        aterm_vitals::model::SlotsUnread::UnreadFormat,
+    ));
+    assert_eq!(
+        MachineWait::default()
+            .step(&wait, &unread, 0, &[], &[])
+            .as_deref(),
+        Some("ERR unavailable slots why=unread_format\n")
+    );
+    let wait = machine("sys slots>=1 for=20s");
+    let mut w = MachineWait::default();
+    assert_eq!(w.step(&wait, &one_slot(1, 0, 1, 0), 0, &[], &[]), None);
+    assert_eq!(w.step(&wait, &one_slot(20, 0, 1, 0), 0, &[], &[]), None);
+    let met = w
+        .step(&wait, &one_slot(21, 0, 1, 0), 0, &[], &[])
+        .expect("held twenty seconds");
+    assert!(met.contains(" held_ms=20000 "), "{met}");
+}
+
+/// A wait arms the slots' few-second cadence only when it names them; the
+/// gauge counts every armed wait and is at rest once the last is dropped.
+/// NEGATIVE CONTROL: a wait on the machine's other terms arms nothing.
+#[test]
+fn a_wait_naming_the_slots_arms_their_cadence_while_it_stands() {
+    for (text, names) in [
+        ("sys slots>=1", true),
+        ("sys load<0.5 and slots>=2 for=20m", true),
+        ("sys load<0.5 and avail>=8GiB", false),
+        ("sys quiet", false),
+    ] {
+        assert_eq!(names_slots(&machine(text)), names, "{text}");
+    }
+    let gauge = crate::occupancy_host::Arming::new();
+    assert!(!gauge.armed());
+    let one = gauge.arm();
+    let two = gauge.arm();
+    assert!(gauge.armed());
+    drop(one);
+    assert!(gauge.armed(), "one wait still stands");
+    drop(two);
+    assert!(!gauge.armed());
+}
+
 #[test]
 fn for_holds_across_snapshots_before_the_wait_answers() {
     let shared = Arc::new(Shared::new());
@@ -549,7 +628,7 @@ fn for_holds_across_snapshots_before_the_wait_answers() {
     };
     let w = match AwaitSys::parse("sys cpu<25% for=2s timeout=60000").unwrap() {
         Parsed::Machine(w) => w,
-        Parsed::Volume => unreachable!(),
+        Parsed::Volume(_) => unreachable!(),
     };
     let reply = await_machine(&shared, 0, &w, &|| false);
     stop.store(true, std::sync::atomic::Ordering::Relaxed);

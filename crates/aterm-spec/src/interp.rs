@@ -60,13 +60,15 @@ impl Seen {
     /// State number `i`.
     // Skip: slice indexing over the table's own buffer (absent std bodies).
     #[cfg_attr(trust_verify, trust::skip)]
+    #[inline]
     fn key(&self, i: usize) -> &[i64] {
         &self.values[i * self.width..(i + 1) * self.width]
     }
 
     /// Where a key whose hash's top half is `tag` starts its probe: the hash's top bits,
     /// which its last multiply mixed from every value.
-    fn home(&self, tag: u64) -> usize {
+    #[inline]
+    const fn home(&self, tag: u64) -> usize {
         // A power-of-two length of at least 16 and below 2^32 slots: `tag >> shift` is a
         // slot.
         (tag >> (64 - self.table.len().trailing_zeros())) as usize
@@ -130,10 +132,13 @@ impl Seen {
 /// construction). Keys are small integer vectors from the walk itself, never
 /// adversarial input, so a fast mix serves better than `SipHash`'s flood
 /// resistance.
-fn key_hash(key: &[i64]) -> u64 {
+#[inline]
+const fn key_hash(key: &[i64]) -> u64 {
     let mut h = key.len() as u64;
-    for &v in key {
-        h = (h.rotate_left(5) ^ v as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    let mut i = 0;
+    while i < key.len() {
+        h = (h.rotate_left(5) ^ key[i] as u64).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        i += 1;
     }
     h
 }
@@ -147,12 +152,14 @@ struct Upto {
     end: usize,
 }
 
-fn upto(end: usize) -> Upto {
+#[inline]
+const fn upto(end: usize) -> Upto {
     Upto { at: 0, end }
 }
 
 impl Iterator for Upto {
     type Item = usize;
+    #[inline]
     fn next(&mut self) -> Option<usize> {
         if self.at < self.end {
             self.at += 1;

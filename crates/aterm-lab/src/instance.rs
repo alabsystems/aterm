@@ -166,6 +166,12 @@ impl World {
         Ok(())
     }
 
+    /// The instance's state root (`ATERM_STATE_HOME`): its `logs/` among it.
+    #[must_use]
+    pub fn state(&self) -> PathBuf {
+        private_state_home(&self.home)
+    }
+
     /// The environment an instance in this world gets: nothing inherited.
     #[must_use]
     pub fn env(&self) -> Vec<(String, String)> {
@@ -180,10 +186,7 @@ impl World {
             ("XDG_CACHE_HOME".into(), s(&self.home.join(".cache"))),
             ("XDG_DATA_HOME".into(), s(&self.home.join(".local/share"))),
             ("XDG_STATE_HOME".into(), s(&self.home.join(".local/state"))),
-            (
-                "ATERM_STATE_HOME".into(),
-                s(&private_state_home(&self.home)),
-            ),
+            ("ATERM_STATE_HOME".into(), s(&self.state())),
             ("TMPDIR".into(), s(&self.home.join("tmp"))),
             ("TMP".into(), s(&self.home.join("tmp"))),
             ("TEMP".into(), s(&self.home.join("tmp"))),
